@@ -262,6 +262,31 @@ fn write_ppm(w: usize, h: usize, data: &[f32], fname: &str) -> Result<()> {
     Ok(())
 }
 
+use png::*;
+
+fn write_png(width: usize, height: usize, data: &[f32], fname: &str) -> Result<()> {
+    let gamma = 0.0;
+    let file = std::fs::File::create(fname)?;
+    let ref mut w = BufWriter::new(file);
+
+    let mut bytes = vec![0; width * height * 4];
+    for i in (0..bytes.len()).step_by(4) {
+        bytes[i] = to_byte(data[i], gamma);
+        bytes[i + 1] = to_byte(data[i + 1], gamma);
+        bytes[i + 2] = to_byte(data[i + 2], gamma);
+        bytes[i + 3] = 255;
+    }
+
+    let mut encoder = png::Encoder::new(w, width as u32, height as u32);
+    encoder.set_color(ColorType::RGBA);
+    encoder.set_depth(BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+
+    writer.write_image_data(&bytes)?;
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -366,7 +391,7 @@ fn main() -> Result<()> {
         }
     }
 
-    write_ppm(width, height, &img, "image.ppm")?;
+    write_png(width, height, &img, "image.png")?;
 
     Ok(())
 }
