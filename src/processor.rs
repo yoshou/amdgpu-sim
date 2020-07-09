@@ -2189,6 +2189,109 @@ fn v_cmp_u32(cu: &mut ComputeUnit, op: OP8, s0: usize, s1: usize) {
     }
 }
 
+fn flat_load_dword(cu: &mut ComputeUnit, d: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        let data = cu.read_mem_u32(addr_val);
+        cu.write_vgpr(elem, d, data);
+    }
+}
+
+fn flat_load_dwordx2(cu: &mut ComputeUnit, d: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        for i in 0..2 {
+            let data = cu.read_mem_u32(addr_val + (i * 4) as u64);
+            cu.write_vgpr(elem, d + i, data);
+        }
+    }
+}
+
+fn flat_load_dwordx4(cu: &mut ComputeUnit, d: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        for i in 0..4 {
+            let data = cu.read_mem_u32(addr_val + (i * 4) as u64);
+            cu.write_vgpr(elem, d + i, data);
+        }
+    }
+}
+
+fn flat_load_ubyte(cu: &mut ComputeUnit, d: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr);
+        let data = cu.read_mem_u8(addr_val);
+        cu.write_vgpr(elem, d, data as u32);
+    }
+}
+
+fn flat_load_ushort(cu: &mut ComputeUnit, d: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        let data = cu.read_mem_u16(addr_val);
+        cu.write_vgpr(elem, d, data as u32);
+    }
+}
+
+fn flat_store_byte(cu: &mut ComputeUnit, s: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        let data = cu.vgprs.get(elem, s) as u8;
+        cu.write_mem_u8(addr_val, data);
+    }
+}
+fn flat_store_short(cu: &mut ComputeUnit, s: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        let data = cu.vgprs.get(elem, s) as u16;
+        cu.write_mem_u16(addr_val, data);
+    }
+}
+fn flat_store_dword(cu: &mut ComputeUnit, s: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+        let data = cu.vgprs.get(elem, s);
+        cu.write_mem_u32(addr_val, data);
+    }
+}
+fn flat_store_dwordx4(cu: &mut ComputeUnit, s: usize, addr: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
+
+        for i in 0..4 {
+            let data = cu.vgprs.get(elem, s + i);
+            cu.write_mem_u32(addr_val + (i * 4) as u64, data);
+        }
+    }
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -2978,131 +3081,38 @@ impl ComputeUnit {
         unsafe { *ptr }
     }
     fn execute_flat(&mut self, inst: FLAT) -> bool {
+        let s = inst.DATA as usize;
+        let d = inst.VDST as usize;
+        let addr = inst.ADDR as usize;
+
         // Flat scratch memory is not supported yet.
         match inst.OP {
             I::FLAT_LOAD_DWORD => {
-                let d = inst.VDST as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    let data = self.read_mem_u32(addr_val);
-                    self.write_vgpr(elem, d, data);
-                }
+                flat_load_dword(self, d, addr);
             }
             I::FLAT_LOAD_DWORDX2 => {
-                let d = inst.VDST as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    for i in 0..2 {
-                        let data = self.read_mem_u32(addr_val + (i * 4) as u64);
-                        self.write_vgpr(elem, d + i, data);
-                    }
-                }
+                flat_load_dwordx2(self, d, addr);
             }
             I::FLAT_LOAD_DWORDX4 => {
-                let d = inst.VDST as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    for i in 0..4 {
-                        let data = self.read_mem_u32(addr_val + (i * 4) as u64);
-                        self.write_vgpr(elem, d + i, data);
-                    }
-                }
+                flat_load_dwordx4(self, d, addr);
             }
             I::FLAT_LOAD_UBYTE => {
-                let d = inst.VDST as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr);
-                    let data = self.read_mem_u8(addr_val);
-                    self.write_vgpr(elem, d, data as u32);
-                }
+                flat_load_ubyte(self, d, addr);
             }
             I::FLAT_LOAD_USHORT => {
-                let d = inst.VDST as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    let data = self.read_mem_u16(addr_val);
-                    self.write_vgpr(elem, d, data as u32);
-                }
+                flat_load_ushort(self, d, addr);
             }
             I::FLAT_STORE_BYTE => {
-                let s = inst.DATA as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    let data = self.vgprs.get(elem, s) as u8;
-                    self.write_mem_u8(addr_val, data);
-                }
+                flat_store_byte(self, s, addr);
             }
             I::FLAT_STORE_SHORT => {
-                let s = inst.DATA as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    let data = self.vgprs.get(elem, s) as u16;
-                    self.write_mem_u16(addr_val, data);
-                }
+                flat_store_short(self, s, addr);
             }
             I::FLAT_STORE_DWORD => {
-                let s = inst.DATA as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-                    let data = self.vgprs.get(elem, s);
-                    self.write_mem_u32(addr_val, data);
-                }
+                flat_store_dword(self, s, addr);
             }
             I::FLAT_STORE_DWORDX4 => {
-                let s = inst.DATA as usize;
-                let addr = inst.ADDR as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let addr_val = self.read_vgpr_pair(elem, addr) as u64;
-
-                    for i in 0..4 {
-                        let data = self.vgprs.get(elem, s + i);
-                        self.write_mem_u32(addr_val + (i * 4) as u64, data);
-                    }
-                }
+                flat_store_dwordx4(self, s, addr);
             }
             _ => unimplemented!(),
         }
