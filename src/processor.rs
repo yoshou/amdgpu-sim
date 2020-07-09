@@ -1556,6 +1556,603 @@ fn v_max_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     }
 }
 
+fn v_cmp_class_f32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg: u8) {
+    let s0_values = (0..64)
+        .map(|elem| u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0))
+        .collect::<Vec<f32>>();
+    let s1_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s1))
+        .collect::<Vec<u32>>();
+
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = s0_values[elem];
+        let s1_value = s1_values[elem];
+        let d_value = cmp_class_f32(s0_value, s1_value);
+        cu.set_sgpr_bit(d, elem, d_value);
+    }
+}
+
+fn v_cmp_op_f32_e64(
+    cu: &mut ComputeUnit,
+    op: OP16,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+) {
+    let s0_values = (0..64)
+        .map(|elem| u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0))
+        .collect::<Vec<f32>>();
+
+    let s1_values = (0..64)
+        .map(|elem| u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1))
+        .collect::<Vec<f32>>();
+
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = s0_values[elem];
+        let s1_value = s1_values[elem];
+        let d_value = cmp_f32(s0_value, s1_value, op);
+        cu.set_sgpr_bit(d, elem, d_value);
+    }
+}
+
+fn v_cmp_op_u16_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usize) {
+    let s0_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s0))
+        .collect::<Vec<u32>>();
+
+    let s1_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s1))
+        .collect::<Vec<u32>>();
+
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = s0_values[elem] as u16;
+        let s1_value = s1_values[elem] as u16;
+        let d_value = cmp_u16(s0_value, s1_value, op);
+        cu.set_sgpr_bit(d, elem, d_value);
+    }
+}
+
+fn v_cmp_op_u32_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usize) {
+    let s0_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s0))
+        .collect::<Vec<u32>>();
+
+    let s1_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s1))
+        .collect::<Vec<u32>>();
+
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = s0_values[elem];
+        let s1_value = s1_values[elem];
+        let d_value = cmp_u32(s0_value, s1_value, op);
+        cu.set_sgpr_bit(d, elem, d_value);
+    }
+}
+
+fn v_cmp_op_i32_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usize) {
+    let s0_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s0))
+        .collect::<Vec<u32>>();
+
+    let s1_values = (0..64)
+        .map(|elem| cu.read_vop_src(elem, s1))
+        .collect::<Vec<u32>>();
+
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = s0_values[elem] as i32;
+        let s1_value = s1_values[elem] as i32;
+        let d_value = cmp_i32(s0_value, s1_value, op);
+        cu.set_sgpr_bit(d, elem, d_value);
+    }
+}
+
+fn v_cndmask_b32_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    abs: u8,
+    neg: u8,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
+        let d_value = if cu.get_sgpr_bit(s2, elem) {
+            s1_value
+        } else {
+            s0_value
+        };
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_mac_f32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg: u8) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
+        let d_value = u32_to_f32(cu.read_vgpr(elem, d));
+        let d_value = s0_value * s1_value + d_value;
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_lshrrev_b32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s1_value >> (s0_value & 0x1F);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_lshlrev_b32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s1_value << (s0_value & 0x1F);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_max_f32_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
+        let d_value = if s0_value >= s1_value {
+            s0_value
+        } else {
+            s1_value
+        };
+        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+    }
+}
+
+fn v_trunc_f32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, abs: u8, neg: u8, clamp: bool) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let d_value = (s0_value as i32) as f32;
+        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+    }
+}
+
+fn v_mad_f32_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
+        let s2_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s2), abs, neg, 2);
+        let d_value = fma(s0_value, s1_value, s2_value);
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_add_f64_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
+        let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
+        let d_value = f64_to_u64(s0_value + s1_value);
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_mul_f64_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
+        let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
+        let d_value = f64_to_u64(s0_value * s1_value);
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_mul_lo_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = mul_u32(s0_value, s1_value);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_lshlrev_b64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src_pair(elem, s1);
+
+        let d_value = s1_value << (s0_value & 0x3F);
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_lshrrev_b64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src_pair(elem, s1);
+
+        let d_value = s1_value >> (s0_value & 0x3F);
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_bfe_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let s2_value = cu.read_vop_src(elem, s2);
+        let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_bfe_i32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as i32;
+        let s1_value = cu.read_vop_src(elem, s1);
+        let s2_value = cu.read_vop_src(elem, s2);
+        let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
+        cu.write_vgpr(elem, d, d_value as u32);
+    }
+}
+
+fn v_bfi_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let s2_value = cu.read_vop_src(elem, s2);
+        let d_value = (s0_value & s1_value) | ((!s0_value) & s2_value);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_mul_hi_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = (((s0_value as u64) * (s1_value as u64)) >> 32) as u32;
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_alignbit_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as u64;
+        let s1_value = cu.read_vop_src(elem, s1) as u64;
+        let s2_value = cu.read_vop_src(elem, s2);
+        let d_value = ((((s1_value << 32) | s0_value) >> (s2_value & 0x1F)) & 0xFFFFFFFF) as u32;
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_fma_f64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
+        let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
+        let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
+        let d_value = fma(s0_value, s1_value, s2_value);
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+    }
+}
+
+fn v_div_fmas_f64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
+        let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
+        let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
+        let d_value = if cu.get_vcc(elem) {
+            64f64.exp2() * fma(s0_value, s1_value, s2_value)
+        } else {
+            fma(s0_value, s1_value, s2_value)
+        };
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+    }
+}
+
+fn v_div_fixup_f64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
+        let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
+        let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
+        let d_value = div_fixup_f64(s0_value, s1_value, s2_value);
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+    }
+}
+
+fn v_mad_i32_i24(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize, clamp: bool) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as i64;
+        let s1_value = cu.read_vop_src(elem, s1) as i64;
+        let s2_value = cu.read_vop_src(elem, s2) as i64;
+        let d_value = fma(s0_value, s1_value, s2_value) as i32;
+        cu.write_vgpr(elem, d, d_value as u32);
+    }
+}
+
+fn v_ldexp_f32(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let s1_value = cu.read_vop_src(elem, s1) as i32;
+        let d_value = f32_to_u32(s0_value * (s1_value as f32).exp2());
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_writelane_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1) as usize;
+    let d_value = s0_value;
+    cu.write_vgpr(s1_value, d, d_value);
+}
+
+fn v_readlane_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s1_value = cu.read_sop_src(s1) as usize;
+    let s0_value = cu.read_vop_src(s1_value, s0);
+    let d_value = s0_value;
+    cu.write_sgpr(d, d_value);
+}
+
+fn v_med3_f32(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
+        let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
+        let s2_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s2), abs, neg, 2);
+        let d_value = if s0_value.is_nan() || s1_value.is_nan() || s2_value.is_nan() {
+            s0_value.min(s1_value).min(s2_value)
+        } else if s0_value.max(s1_value).max(s2_value) == s0_value {
+            s1_value.max(s2_value)
+        } else if s0_value.max(s1_value).max(s2_value) == s1_value {
+            s0_value.max(s2_value)
+        } else {
+            s0_value.max(s1_value)
+        };
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_add_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, clamp: bool) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let (d_value, carry) = add_u32(s0_value, s1_value, 0);
+        cu.write_vgpr(elem, d, d_value);
+        cu.set_sgpr_bit(sdst, elem, carry);
+    }
+}
+
+fn v_sub_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, clamp: bool) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
+        cu.write_vgpr(elem, d, d_value);
+        cu.set_sgpr_bit(sdst, elem, carry);
+    }
+}
+
+fn v_addc_u32_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    sdst: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    clamp: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let s2_value = cu.read_vop_src(elem, s2);
+        let (d_value, carry) = add_u32(s0_value, s1_value, s2_value);
+        cu.write_vgpr(elem, d, d_value);
+        cu.set_sgpr_bit(sdst, elem, carry);
+    }
+}
+
+fn v_div_scale_f32(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, s2: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let s1_value = u32_to_f32(cu.read_vop_src(elem, s1));
+        let s2_value = u32_to_f32(cu.read_vop_src(elem, s2));
+        let (d_value, vcc) = div_scale_f32(s0_value, s1_value, s2_value);
+
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+        cu.set_sgpr_bit(sdst, elem, vcc);
+    }
+}
+
+fn v_div_scale_f64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, s2: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let s1_value = u64_to_f64(cu.read_vop_src_pair(elem, s1));
+        let s2_value = u64_to_f64(cu.read_vop_src_pair(elem, s2));
+        let (d_value, vcc) = div_scale_f64(s0_value, s1_value, s2_value);
+
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        cu.set_sgpr_bit(sdst, elem, vcc);
+    }
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -2145,432 +2742,100 @@ impl ComputeUnit {
         let s0 = inst.SRC0 as usize;
         let s1 = inst.SRC1 as usize;
         let s2 = inst.SRC2 as usize;
+        let abs = inst.ABS;
+        let neg = inst.NEG;
+        let clamp = inst.CLAMP != 0;
+        let omod = inst.OMOD;
         match inst.OP {
             I::V_CMP_CLASS_F32 => {
-                let s0_values = (0..64)
-                    .map(|elem| {
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0)
-                    })
-                    .collect::<Vec<f32>>();
-                let s1_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s1))
-                    .collect::<Vec<u32>>();
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = s0_values[elem];
-                    let s1_value = s1_values[elem];
-                    let d_value = cmp_class_f32(s0_value, s1_value);
-                    self.set_sgpr_bit(d, elem, d_value);
-                }
+                v_cmp_class_f32_e64(self, d, s0, s1, abs, neg);
             }
             I::V_CMP_F32(op16) => {
-                let s0_values = (0..64)
-                    .map(|elem| {
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0)
-                    })
-                    .collect::<Vec<f32>>();
-
-                let s1_values = (0..64)
-                    .map(|elem| {
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 0)
-                    })
-                    .collect::<Vec<f32>>();
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = s0_values[elem];
-                    let s1_value = s1_values[elem];
-                    u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 1);
-                    let d_value = cmp_f32(s0_value, s1_value, op16);
-                    self.set_sgpr_bit(d, elem, d_value);
-                }
+                v_cmp_op_f32_e64(self, op16, d, s0, s1, abs, neg);
             }
             I::V_CMP_U16(op8) => {
-                let s0_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s0))
-                    .collect::<Vec<u32>>();
-
-                let s1_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s1))
-                    .collect::<Vec<u32>>();
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = s0_values[elem] as u16;
-                    let s1_value = s1_values[elem] as u16;
-                    let d_value = cmp_u16(s0_value, s1_value, op8);
-                    self.set_sgpr_bit(d, elem, d_value);
-                }
+                v_cmp_op_u16_e64(self, op8, d, s0, s1);
             }
             I::V_CMP_U32(op8) => {
-                let s0_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s0))
-                    .collect::<Vec<u32>>();
-
-                let s1_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s1))
-                    .collect::<Vec<u32>>();
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = s0_values[elem];
-                    let s1_value = s1_values[elem];
-                    let d_value = cmp_u32(s0_value, s1_value, op8);
-                    self.set_sgpr_bit(d, elem, d_value);
-                }
+                v_cmp_op_u32_e64(self, op8, d, s0, s1);
             }
             I::V_CMP_I32(op8) => {
-                let s0_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s0))
-                    .collect::<Vec<u32>>();
-
-                let s1_values = (0..64)
-                    .map(|elem| self.read_vop_src(elem, s1))
-                    .collect::<Vec<u32>>();
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = s0_values[elem] as i32;
-                    let s1_value = s1_values[elem] as i32;
-                    let d_value = cmp_i32(s0_value, s1_value, op8);
-                    self.set_sgpr_bit(d, elem, d_value);
-                }
+                v_cmp_op_i32_e64(self, op8, d, s0, s1);
             }
             I::V_CNDMASK_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 1);
-                    let d_value = if self.get_sgpr_bit(s2, elem) {
-                        s1_value
-                    } else {
-                        s0_value
-                    };
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_cndmask_b32_e64(self, d, s0, s1, s2, abs, neg);
             }
             I::V_MAC_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 1);
-                    let d_value = u32_to_f32(self.read_vgpr(elem, d));
-                    let d_value = s0_value * s1_value + d_value;
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_mac_f32_e64(self, d, s0, s1, abs, neg);
             }
             I::V_LSHRREV_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let d_value = s1_value >> (s0_value & 0x1F);
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_lshrrev_b32_e64(self, d, s0, s1);
             }
             I::V_LSHLREV_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let d_value = s1_value << (s0_value & 0x1F);
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_lshlrev_b32_e64(self, d, s0, s1);
             }
             I::V_MAX_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 1);
-                    let d_value = if s0_value >= s1_value {
-                        s0_value
-                    } else {
-                        s1_value
-                    };
-                    self.write_vgpr(elem, d, f32_to_u32_clamp(d_value, inst.CLAMP != 0));
-                }
+                v_max_f32_e64(self, d, s0, s1, abs, neg, clamp);
             }
             I::V_TRUNC_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let d_value = (s0_value as i32) as f32;
-                    self.write_vgpr(elem, d, f32_to_u32_clamp(d_value, inst.CLAMP != 0));
-                }
+                v_trunc_f32_e64(self, d, s0, abs, neg, clamp);
             }
             I::V_MAD_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 1);
-                    let s2_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s2), inst.ABS, inst.NEG, 2);
-                    let d_value = fma(s0_value, s1_value, s2_value);
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_mad_f32_e64(self, d, s0, s1, s2, abs, neg, clamp);
             }
             I::V_ADD_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), inst.ABS, inst.NEG, 1);
-                    let d_value = f64_to_u64(s0_value + s1_value);
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_add_f64_e64(self, d, s0, s1, abs, neg, clamp);
             }
             I::V_MUL_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), inst.ABS, inst.NEG, 1);
-                    let d_value = f64_to_u64(s0_value * s1_value);
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_mul_f64_e64(self, d, s0, s1, abs, neg, clamp);
             }
             I::V_MUL_LO_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let d_value = mul_u32(s0_value, s1_value);
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_mul_lo_u32(self, d, s0, s1);
             }
             I::V_LSHLREV_B64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src_pair(elem, s1);
-
-                    let d_value = s1_value << (s0_value & 0x3F);
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_lshlrev_b64(self, d, s0, s1);
             }
             I::V_LSHRREV_B64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src_pair(elem, s1);
-
-                    let d_value = s1_value >> (s0_value & 0x3F);
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_lshrrev_b64(self, d, s0, s1);
             }
             I::V_BFE_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let s2_value = self.read_vop_src(elem, s2);
-                    let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_bfe_u32(self, d, s0, s1, s2);
             }
             I::V_BFE_I32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0) as i32;
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let s2_value = self.read_vop_src(elem, s2);
-                    let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
-                    self.write_vgpr(elem, d, d_value as u32);
-                }
+                v_bfe_i32(self, d, s0, s1, s2);
             }
             I::V_BFI_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let s2_value = self.read_vop_src(elem, s2);
-                    let d_value = (s0_value & s1_value) | ((!s0_value) & s2_value);
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_bfi_b32(self, d, s0, s1, s2);
             }
             I::V_MUL_HI_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let d_value = (((s0_value as u64) * (s1_value as u64)) >> 32) as u32;
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_mul_hi_u32(self, d, s0, s1);
             }
             I::V_ALIGNBIT_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0) as u64;
-                    let s1_value = self.read_vop_src(elem, s1) as u64;
-                    let s2_value = self.read_vop_src(elem, s2);
-                    let d_value =
-                        ((((s1_value << 32) | s0_value) >> (s2_value & 0x1F)) & 0xFFFFFFFF) as u32;
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_alignbit_b32(self, d, s0, s1, s2);
             }
             I::V_FMA_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), inst.ABS, inst.NEG, 1);
-                    let s2_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), inst.ABS, inst.NEG, 2);
-                    let d_value = fma(s0_value, s1_value, s2_value);
-                    self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
-                }
+                v_fma_f64(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             I::V_DIV_FMAS_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), inst.ABS, inst.NEG, 1);
-                    let s2_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), inst.ABS, inst.NEG, 2);
-                    let d_value = if self.get_vcc(elem) {
-                        64f64.exp2() * fma(s0_value, s1_value, s2_value)
-                    } else {
-                        fma(s0_value, s1_value, s2_value)
-                    };
-                    self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
-                }
+                v_div_fmas_f64(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             I::V_DIV_FIXUP_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), inst.ABS, inst.NEG, 1);
-                    let s2_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), inst.ABS, inst.NEG, 2);
-                    let d_value = div_fixup_f64(s0_value, s1_value, s2_value);
-                    self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
-                }
+                v_div_fixup_f64(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             I::V_MAD_I32_I24 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0) as i64;
-                    let s1_value = self.read_vop_src(elem, s1) as i64;
-                    let s2_value = self.read_vop_src(elem, s2) as i64;
-                    let d_value = fma(s0_value, s1_value, s2_value) as i32;
-                    self.write_vgpr(elem, d, d_value as u32);
-                }
+                v_mad_i32_i24(self, d, s0, s1, s2, clamp);
             }
             I::V_LDEXP_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value = self.read_vop_src(elem, s1) as i32;
-                    let d_value = f32_to_u32(s0_value * (s1_value as f32).exp2());
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_ldexp_f32(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_WRITELANE_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1) as usize;
-                let d_value = s0_value;
-                self.write_vgpr(s1_value, d, d_value);
+                v_writelane_b32(self, d, s0, s1);
             }
             I::V_READLANE_B32 => {
-                let s1_value = self.read_sop_src(s1) as usize;
-                let s0_value = self.read_vop_src(s1_value, s0);
-                let d_value = s0_value;
-                self.write_sgpr(d, d_value);
+                v_readlane_b32(self, d, s0, s1);
             }
             I::V_MED3_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s0), inst.ABS, inst.NEG, 0);
-                    let s1_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s1), inst.ABS, inst.NEG, 1);
-                    let s2_value =
-                        u32_to_f32_abs_neg(self.read_vop_src(elem, s2), inst.ABS, inst.NEG, 2);
-                    let d_value = if s0_value.is_nan() || s1_value.is_nan() || s2_value.is_nan() {
-                        s0_value.min(s1_value).min(s2_value)
-                    } else if s0_value.max(s1_value).max(s2_value) == s0_value {
-                        s1_value.max(s2_value)
-                    } else if s0_value.max(s1_value).max(s2_value) == s1_value {
-                        s0_value.max(s2_value)
-                    } else {
-                        s0_value.max(s1_value)
-                    };
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_med3_f32(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             _ => unimplemented!(),
         }
@@ -2582,74 +2847,24 @@ impl ComputeUnit {
         let s0 = inst.SRC0 as usize;
         let s1 = inst.SRC1 as usize;
         let s2 = inst.SRC2 as usize;
+        let clamp = inst.CLAMP != 0;
+        let neg = inst.NEG;
+        let omod = inst.OMOD;
         match inst.OP {
             I::V_ADD_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let (d_value, carry) = add_u32(s0_value, s1_value, 0);
-                    self.write_vgpr(elem, d, d_value);
-                    self.set_sgpr_bit(sd, elem, carry);
-                }
+                v_add_u32_e64(self, d, sd, s0, s1, clamp);
             }
             I::V_SUB_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
-                    self.write_vgpr(elem, d, d_value);
-                    self.set_sgpr_bit(sd, elem, carry);
-                }
+                v_sub_u32_e64(self, d, sd, s0, s1, clamp);
             }
             I::V_ADDC_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vop_src(elem, s1);
-                    let s2_value = self.read_vop_src(elem, s2);
-                    let (d_value, carry) = add_u32(s0_value, s1_value, s2_value);
-                    self.write_vgpr(elem, d, d_value);
-                    self.set_sgpr_bit(sd, elem, carry);
-                }
+                v_addc_u32_e64(self, d, sd, s0, s1, s2, clamp);
             }
             I::V_DIV_SCALE_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32_abs_neg(self.read_vop_src(elem, s0), 0, inst.NEG, 0);
-                    let s1_value = u32_to_f32_abs_neg(self.read_vop_src(elem, s1), 0, inst.NEG, 1);
-                    let s2_value = u32_to_f32_abs_neg(self.read_vop_src(elem, s2), 0, inst.NEG, 2);
-                    let (d_value, vcc) = div_scale_f32(s0_value, s1_value, s2_value);
-
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                    self.set_sgpr_bit(sd, elem, vcc);
-                }
+                v_div_scale_f32(self, d, sd, s0, s1, s2);
             }
             I::V_DIV_SCALE_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), 0, inst.NEG, 0);
-                    let s1_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), 0, inst.NEG, 1);
-                    let s2_value =
-                        u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), 0, inst.NEG, 2);
-                    let (d_value, vcc) = div_scale_f64(s0_value, s1_value, s2_value);
-
-                    self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
-                    self.set_sgpr_bit(sd, elem, vcc);
-                }
+                v_div_scale_f64(self, d, sd, s0, s1, s2);
             }
             _ => unimplemented!(),
         }
