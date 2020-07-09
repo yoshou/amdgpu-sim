@@ -1049,6 +1049,31 @@ fn s_cmp_lg_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     cu.scc = s0_value != s1_value;
 }
 
+fn s_load_dword(cu: &mut ComputeUnit, sdata: usize, sbase: usize, soffset: u64) {
+    let sbase_val = cu.read_sgpr_pair(sbase);
+    let ptr = (sbase_val + soffset) as *const u32;
+    let data = unsafe { *ptr };
+    cu.write_sgpr(sdata, data);
+}
+
+fn s_load_dwordx2(cu: &mut ComputeUnit, sdata: usize, sbase: usize, soffset: u64) {
+    let sbase_val = cu.read_sgpr_pair(sbase);
+    for i in 0..2 {
+        let ptr = (sbase_val + soffset + (i * 4) as u64) as *const u32;
+        let data = unsafe { *ptr };
+        cu.write_sgpr(sdata + i, data);
+    }
+}
+
+fn s_load_dwordx4(cu: &mut ComputeUnit, sdata: usize, sbase: usize, soffset: u64) {
+    let sbase_val = cu.read_sgpr_pair(sbase);
+    for i in 0..4 {
+        let ptr = (sbase_val + soffset + (i * 4) as u64) as *const u32;
+        let data = unsafe { *ptr };
+        cu.write_sgpr(sdata + i, data);
+    }
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -1397,37 +1422,18 @@ impl ComputeUnit {
         true
     }
     fn execute_smem(&mut self, inst: SMEM) -> bool {
+        let sdata = inst.SDATA as usize;
+        let soffset = inst.OFFSET as u64;
+        let sbase = (inst.SBASE * 2) as usize;
         match inst.OP {
             I::S_LOAD_DWORD => {
-                let sdata = inst.SDATA as usize;
-                let sbase = self.read_sgpr_pair((inst.SBASE * 2) as usize);
-                let offset = inst.OFFSET as u64;
-
-                let ptr = (sbase + offset) as *const u32;
-                let data = unsafe { *ptr };
-                self.write_sgpr(sdata, data);
+                s_load_dword(self, sdata, sbase, soffset);
             }
             I::S_LOAD_DWORDX2 => {
-                let sdata = inst.SDATA as usize;
-                let sbase = self.read_sgpr_pair((inst.SBASE * 2) as usize);
-                let offset = inst.OFFSET as u64;
-
-                for i in 0..2 {
-                    let ptr = (sbase + offset + (i * 4) as u64) as *const u32;
-                    let data = unsafe { *ptr };
-                    self.write_sgpr(sdata + i, data);
-                }
+                s_load_dwordx2(self, sdata, sbase, soffset);
             }
             I::S_LOAD_DWORDX4 => {
-                let sdata = inst.SDATA as usize;
-                let sbase = self.read_sgpr_pair((inst.SBASE * 2) as usize);
-                let offset = inst.OFFSET as u64;
-
-                for i in 0..4 {
-                    let ptr = (sbase + offset + (i * 4) as u64) as *const u32;
-                    let data = unsafe { *ptr };
-                    self.write_sgpr(sdata + i, data);
-                }
+                s_load_dwordx4(self, sdata, sbase, soffset);
             }
             _ => unimplemented!(),
         }
