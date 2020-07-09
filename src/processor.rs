@@ -907,6 +907,63 @@ impl<'a> SISimulator<'a> {
     }
 }
 
+fn s_mov_b32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let d_value = s0_value;
+    cu.write_sop_dst(d, d_value);
+}
+
+fn s_mov_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let d_value = s0_value;
+    cu.write_sop_dst_pair(d, d_value);
+}
+
+fn s_brev_b32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let d_value = s0_value.reverse_bits();
+    cu.write_sop_dst(d, d_value);
+}
+
+fn s_and_saveexec_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let exec_value = u64_from_u32_u32(cu.exec_lo, cu.exec_hi);
+
+    cu.write_sop_dst_pair(d, exec_value);
+
+    let exec_value = s0_value & exec_value;
+
+    cu.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
+    cu.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
+    cu.scc = exec_value != 0;
+}
+fn s_or_saveexec_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let exec_value = u64_from_u32_u32(cu.exec_lo, cu.exec_hi);
+
+    cu.write_sop_dst_pair(d, exec_value);
+
+    let exec_value = s0_value | exec_value;
+
+    cu.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
+    cu.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
+    cu.scc = exec_value != 0;
+}
+fn s_getpc_b64(cu: &mut ComputeUnit, d: usize) {
+    let d_value = (cu.get_pc() + 4) as u64;
+    cu.write_sop_dst_pair(d, d_value);
+}
+fn s_swappc_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let d_value = (cu.get_pc() + 4) as u64;
+    cu.write_sop_dst_pair(d, d_value);
+    cu.next_pc = s0_value as usize;
+}
+fn s_setpc_b64(cu: &mut ComputeUnit, s0: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    cu.next_pc = s0_value as usize;
+}
+
 fn s_add_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0);
     let s1_value = cu.read_sop_src(s1);
@@ -2706,57 +2763,28 @@ impl ComputeUnit {
 
         match inst.OP {
             I::S_MOV_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let d_value = s0_value;
-                self.write_sop_dst(d, d_value);
+                s_mov_b32(self, d, s0);
             }
             I::S_MOV_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let d_value = s0_value;
-                self.write_sop_dst_pair(d, d_value);
+                s_mov_b64(self, d, s0);
             }
             I::S_BREV_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let d_value = s0_value.reverse_bits();
-                self.write_sop_dst(d, d_value);
+                s_brev_b32(self, d, s0);
             }
             I::S_AND_SAVEEXEC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let exec_value = u64_from_u32_u32(self.exec_lo, self.exec_hi);
-
-                self.write_sop_dst_pair(d, exec_value);
-
-                let exec_value = s0_value & exec_value;
-
-                self.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
-                self.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
-                self.scc = exec_value != 0;
+                s_and_saveexec_b64(self, d, s0);
             }
             I::S_OR_SAVEEXEC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let exec_value = u64_from_u32_u32(self.exec_lo, self.exec_hi);
-
-                self.write_sop_dst_pair(d, exec_value);
-
-                let exec_value = s0_value | exec_value;
-
-                self.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
-                self.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
-                self.scc = exec_value != 0;
+                s_or_saveexec_b64(self, d, s0);
             }
             I::S_GETPC_B64 => {
-                let d_value = (self.get_pc() + 4) as u64;
-                self.write_sop_dst_pair(d, d_value);
+                s_getpc_b64(self, d);
             }
             I::S_SWAPPC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let d_value = (self.get_pc() + 4) as u64;
-                self.write_sop_dst_pair(d, d_value);
-                self.next_pc = s0_value as usize;
+                s_swappc_b64(self, d, s0);
             }
             I::S_SETPC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                self.next_pc = s0_value as usize;
+                s_setpc_b64(self, s0);
             }
             _ => unimplemented!(),
         }
