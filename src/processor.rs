@@ -2291,7 +2291,64 @@ fn flat_store_dwordx4(cu: &mut ComputeUnit, s: usize, addr: usize) {
         }
     }
 }
+fn buffer_load_dword(
+    cu: &mut ComputeUnit,
+    d: usize,
+    vaddr: usize,
+    srsrc: usize,
+    soffset: usize,
+    offset: u16,
+    offen: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let offset = if offen {
+            cu.vgprs.get(elem, vaddr) as usize
+        } else {
+            offset as usize
+        };
+        let base_addr_val = cu.get_buffer_resource_constant_base(srsrc);
+        let stride_val = cu.get_buffer_resource_constant_stride(srsrc);
+        let soffset_val = cu.read_sop_src(soffset) as usize;
 
+        let ptr = (base_addr_val + soffset_val + offset + stride_val * elem) as *const u32;
+
+        let data = unsafe { *ptr };
+        cu.write_vgpr(elem, d, data);
+    }
+}
+fn buffer_store_dword(
+    cu: &mut ComputeUnit,
+    s: usize,
+    vaddr: usize,
+    srsrc: usize,
+    soffset: usize,
+    offset: u16,
+    offen: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let offset = if offen {
+            cu.vgprs.get(elem, vaddr) as usize
+        } else {
+            offset as usize
+        };
+        let base_addr_val = cu.get_buffer_resource_constant_base(srsrc);
+        let stride_val = cu.get_buffer_resource_constant_stride(srsrc);
+        let soffset_val = cu.read_sop_src(soffset) as usize;
+
+        let ptr = (base_addr_val + soffset_val + offset + stride_val * elem) as *mut u32;
+
+        let data = cu.vgprs.get(elem, s);
+        unsafe {
+            *ptr = data;
+        }
+    }
+}
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -3127,60 +3184,19 @@ impl ComputeUnit {
         (w0 >> 48) & ((1 << 14) - 1)
     }
     fn execute_mubuf(&mut self, inst: MUBUF) -> bool {
+        let d = inst.VDATA as usize;
+        let s = inst.VDATA as usize;
+        let vaddr = inst.VADDR as usize;
+        let srsrc = inst.SRSRC as usize;
+        let soffset = inst.SOFFSET as usize;
+        let offset = inst.OFFSET;
+        let offen = inst.OFFEN != 0;
         match inst.OP {
             I::BUFFER_LOAD_DWORD => {
-                let d = inst.VDATA as usize;
-                let vaddr = inst.VADDR as usize;
-                let srsrc = inst.SRSRC as usize;
-                let soffset = inst.SOFFSET as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let offset = if inst.OFFEN != 0 {
-                        self.vgprs.get(elem, vaddr) as usize
-                    } else {
-                        inst.OFFSET as usize
-                    };
-                    let base_addr_val = self.get_buffer_resource_constant_base(srsrc);
-                    let stride_val = self.get_buffer_resource_constant_stride(srsrc);
-                    let soffset_val = self.read_sop_src(soffset) as usize;
-
-                    let ptr =
-                        (base_addr_val + soffset_val + offset + stride_val * elem) as *const u32;
-
-                    let data = unsafe { *ptr };
-                    self.write_vgpr(elem, d, data);
-                }
+                buffer_load_dword(self, d, vaddr, srsrc, soffset, offset, offen);
             }
             I::BUFFER_STORE_DWORD => {
-                let s = inst.VDATA as usize;
-                let vaddr = inst.VADDR as usize;
-                let srsrc = inst.SRSRC as usize;
-                let soffset = inst.SOFFSET as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let offset = if inst.OFFEN != 0 {
-                        self.vgprs.get(elem, vaddr) as usize
-                    } else {
-                        inst.OFFSET as usize
-                    };
-                    let base_addr_val = self.get_buffer_resource_constant_base(srsrc);
-                    let stride_val = self.get_buffer_resource_constant_stride(srsrc);
-                    let soffset_val = self.read_sop_src(soffset) as usize;
-
-                    let ptr =
-                        (base_addr_val + soffset_val + offset + stride_val * elem) as *mut u32;
-
-                    let data = self.vgprs.get(elem, s);
-                    unsafe {
-                        *ptr = data;
-                    }
-                }
+                buffer_store_dword(self, s, vaddr, srsrc, soffset, offset, offen);
             }
             _ => unimplemented!(),
         }
