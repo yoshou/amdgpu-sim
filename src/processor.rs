@@ -1025,6 +1025,30 @@ fn s_bfm_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     cu.write_sop_dst(d, d_value);
 }
 
+fn s_cmp_eq_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    cu.scc = s0_value == s1_value;
+}
+
+fn s_cmp_gt_i32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0) as i32;
+    let s1_value = cu.read_sop_src(s1) as i32;
+    cu.scc = s0_value > s1_value;
+}
+
+fn s_cmp_lt_i32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0) as i32;
+    let s1_value = cu.read_sop_src(s1) as i32;
+    cu.scc = s0_value < s1_value;
+}
+
+fn s_cmp_lg_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    cu.scc = s0_value != s1_value;
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -1357,24 +1381,16 @@ impl ComputeUnit {
 
         match inst.OP {
             I::S_CMP_EQ_U32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                self.scc = s0_value == s1_value;
+                s_cmp_eq_u32_e32(self, s0, s1);
             }
             I::S_CMP_GT_I32 => {
-                let s0_value = self.read_sop_src(s0) as i32;
-                let s1_value = self.read_sop_src(s1) as i32;
-                self.scc = s0_value > s1_value;
+                s_cmp_gt_i32_e32(self, s0, s1);
             }
             I::S_CMP_LT_I32 => {
-                let s0_value = self.read_sop_src(s0) as i32;
-                let s1_value = self.read_sop_src(s1) as i32;
-                self.scc = s0_value < s1_value;
+                s_cmp_lt_i32_e32(self, s0, s1);
             }
             I::S_CMP_LG_U32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                self.scc = s0_value != s1_value;
+                s_cmp_lg_u32_e32(self, s0, s1);
             }
             _ => unimplemented!(),
         }
