@@ -2397,128 +2397,8 @@ impl ComputeUnit {
     fn is_vccnz(&self) -> bool {
         !self.is_vccz()
     }
-    fn execute_sopp(&mut self, inst: SOPP) -> bool {
-        let simm16 = inst.SIMM16 as i16;
-        match inst.OP {
-            I::S_NOP => {}
-            I::S_ENDPGM => return false,
-            I::S_WAITCNT => {}
-            I::S_BARRIER => {}
-            I::S_CBRANCH_VCCNZ => {
-                if self.is_vccnz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
-                }
-            }
-            I::S_CBRANCH_VCCZ => {
-                if self.is_vccz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
-                }
-            }
-            I::S_CBRANCH_EXECZ => {
-                if self.is_execz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
-                }
-            }
-            I::S_BRANCH => {
-                self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
-            }
-            I::S_CBRANCH_SCC0 => {
-                if !self.scc {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
-                }
-            }
-            I::S_CBRANCH_SCC1 => {
-                if self.scc {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
-                }
-            }
-            _ => unimplemented!(),
-        }
-        true
-    }
     fn set_hw_reg(&mut self, id: usize, offset: usize, size: usize, value: u32) {
         // ignore
-    }
-    fn execute_sopk(&mut self, inst: SOPK) -> bool {
-        let simm16 = inst.SIMM16 as i16;
-        let d = inst.SDST as usize;
-        match inst.OP {
-            I::S_MOVK_I32 => {
-                self.write_sop_dst(d, (simm16 as i32) as u32);
-            }
-            I::S_SETREG_IMM32_B32 => {
-                let size = (simm16 as u32) & 0x3F;
-                let offset = ((simm16 as u32) >> 6) & 0x1F;
-                let hw_reg_id = ((simm16 as u32) >> 11) & 0x1F;
-                let value = self.fetch_literal_constant();
-                self.set_hw_reg(hw_reg_id as usize, offset as usize, size as usize, value);
-            }
-            _ => unimplemented!(),
-        }
-        true
-    }
-    fn execute_sop1(&mut self, inst: SOP1) -> bool {
-        let d = inst.SDST as usize;
-        let s0 = inst.SSRC0 as usize;
-
-        match inst.OP {
-            I::S_MOV_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let d_value = s0_value;
-                self.write_sop_dst(d, d_value);
-            }
-            I::S_MOV_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let d_value = s0_value;
-                self.write_sop_dst_pair(d, d_value);
-            }
-            I::S_BREV_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let d_value = s0_value.reverse_bits();
-                self.write_sop_dst(d, d_value);
-            }
-            I::S_AND_SAVEEXEC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let exec_value = u64_from_u32_u32(self.exec_lo, self.exec_hi);
-
-                self.write_sop_dst_pair(d, exec_value);
-
-                let exec_value = s0_value & exec_value;
-
-                self.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
-                self.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
-                self.scc = exec_value != 0;
-            }
-            I::S_OR_SAVEEXEC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let exec_value = u64_from_u32_u32(self.exec_lo, self.exec_hi);
-
-                self.write_sop_dst_pair(d, exec_value);
-
-                let exec_value = s0_value | exec_value;
-
-                self.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
-                self.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
-                self.scc = exec_value != 0;
-            }
-            I::S_GETPC_B64 => {
-                let d_value = (self.get_pc() + 4) as u64;
-                self.write_sop_dst_pair(d, d_value);
-            }
-            I::S_SWAPPC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let d_value = (self.get_pc() + 4) as u64;
-                self.write_sop_dst_pair(d, d_value);
-                self.next_pc = s0_value as usize;
-            }
-            I::S_SETPC_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                self.next_pc = s0_value as usize;
-            }
-            _ => unimplemented!(),
-        }
-
-        true
     }
     fn read_sgpr(&self, idx: usize) -> u32 {
         self.sgprs.get(0, idx)
@@ -2620,6 +2500,269 @@ impl ComputeUnit {
         self.write_sop_dst(addr, (value & 0xFFFFFFFF) as u32);
         self.write_sop_dst(addr + 1, ((value >> 32) & 0xFFFFFFFF) as u32);
     }
+    fn read_vop_src(&self, elem: usize, addr: usize) -> u32 {
+        match addr {
+            0..=101 => self.read_sgpr(addr),
+            128 => 0,
+            129..=192 => (addr - 128) as u32,
+            193..=208 => -((addr - 192) as i32) as u32,
+            240 => 0x3f000000, // 0.5
+            241 => 0xbf000000, // -0.5
+            242 => 0x3f800000, // 1.0
+            243 => 0xbf800000, // -1.0
+            244 => 0x40000000, // 2.0
+            245 => 0xc0000000, // -2.0
+            246 => 0x40800000, // 4.0
+            247 => 0xc0800000, // -4.0
+            248 => 0x3e22f983, // 1/(2*PI)
+            255 => self.fetch_literal_constant(),
+            256..=511 => self.vgprs.get(elem, addr - 256),
+            _ => panic!(),
+        }
+    }
+    fn read_vop_src_pair(&self, elem: usize, addr: usize) -> u64 {
+        match addr {
+            0..=101 => self.read_sgpr_pair(addr),
+            128 => 0,
+            129..=192 => (addr - 128) as u64,
+            193..=208 => (-((addr - 192) as i64)) as u64,
+            240 => 0x3fe0000000000000, // 0.5
+            241 => 0xbfe0000000000000, // -0.5
+            242 => 0x3ff0000000000000, // 1.0
+            243 => 0xbff0000000000000, // -1.0
+            244 => 0x4000000000000000, // 2.0
+            245 => 0xc000000000000000, // -2.0
+            246 => 0x4010000000000000, // 4.0
+            247 => 0xc010000000000000, // -4.0
+            248 => 0x3fc45f306dc8bdc4, // 1/(2*PI)
+            255 => self.fetch_literal_constant() as u64,
+            256..=511 => self.read_vgpr_pair(elem, addr - 256),
+            _ => panic!(),
+        }
+    }
+    fn read_vgpr(&self, elem: usize, idx: usize) -> u32 {
+        self.vgprs.get(elem, idx)
+    }
+    fn read_vgpr_pair(&self, elem: usize, idx: usize) -> u64 {
+        u64_from_u32_u32(self.vgprs.get(elem, idx), self.vgprs.get(elem, idx + 1))
+    }
+    fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
+        // if idx == 0 {
+        //     println!(
+        //         "Write v[{}][{}] with {:08X} at {:012X}",
+        //         idx, elem, value, self.pc
+        //     );
+        // }
+        self.vgprs.set(elem, idx, value);
+    }
+    fn write_vgpr_pair(&mut self, elem: usize, idx: usize, value: u64) {
+        self.write_vgpr(elem, idx, (value & 0xFFFFFFFF) as u32);
+        self.write_vgpr(elem, idx + 1, ((value >> 32) & 0xFFFFFFFF) as u32);
+    }
+    fn get_sgpr_bit(&self, idx: usize, bit: usize) -> bool {
+        if bit >= 32 {
+            let value = self.read_sop_src(idx + 1);
+            ((value >> (bit - 32)) & 1) != 0
+        } else {
+            let value = self.read_sop_src(idx);
+            ((value >> bit) & 1) != 0
+        }
+    }
+    fn set_sgpr_bit(&mut self, idx: usize, bit: usize, value: bool) {
+        if bit >= 32 {
+            let mask = 1 << (bit - 32);
+            let old_value = self.read_sop_src(idx + 1);
+            self.write_sop_dst(
+                idx + 1,
+                (old_value & !mask) | ((value as u32) << (bit - 32)),
+            );
+        } else {
+            let mask = 1 << bit;
+            let old_value = self.read_sop_src(idx);
+            self.write_sop_dst(idx, (old_value & !mask) | ((value as u32) << bit));
+        }
+    }
+    fn set_vcc(&mut self, elem: usize, value: bool) {
+        if elem >= 32 {
+            let mask: u32 = 1 << (elem - 32);
+            self.set_vcc_hi((self.get_vcc_hi() & !mask) | ((value as u32) << (elem - 32)));
+        } else {
+            let mask: u32 = 1 << elem;
+            self.set_vcc_lo((self.get_vcc_lo() & !mask) | ((value as u32) << elem));
+        }
+    }
+    fn get_vcc(&self, elem: usize) -> bool {
+        if elem >= 32 {
+            ((self.get_vcc_hi() >> (elem - 32)) & 1) != 0
+        } else {
+            ((self.get_vcc_lo() >> elem) & 1) != 0
+        }
+    }
+    fn get_exec(&self, elem: usize) -> bool {
+        if elem >= 32 {
+            ((self.exec_hi >> (elem - 32)) & 1) != 0
+        } else {
+            ((self.exec_lo >> elem) & 1) != 0
+        }
+    }
+    fn read_mem_u8(&mut self, addr: u64) -> u8 {
+        let ptr = addr as *mut u8;
+        unsafe { *ptr }
+    }
+    fn write_mem_u8(&mut self, addr: u64, data: u8) {
+        let ptr = addr as *mut u8;
+        unsafe {
+            *ptr = data;
+        }
+    }
+    fn read_mem_u16(&mut self, addr: u64) -> u16 {
+        let ptr = addr as *mut u16;
+        unsafe { *ptr }
+    }
+    fn write_mem_u16(&mut self, addr: u64, data: u16) {
+        let ptr = addr as *mut u16;
+        unsafe {
+            *ptr = data;
+        }
+    }
+    fn write_mem_u32(&mut self, addr: u64, data: u32) {
+        let ptr = addr as *mut u32;
+        unsafe {
+            *ptr = data;
+        }
+    }
+    fn read_mem_u32(&mut self, addr: u64) -> u32 {
+        let ptr = addr as *mut u32;
+        unsafe { *ptr }
+    }
+    fn get_buffer_resource_constant_base(&self, idx: usize) -> usize {
+        let w0 = self.read_sgpr_pair(idx) as usize;
+        w0 & ((1 << 48) - 1)
+    }
+    fn get_buffer_resource_constant_stride(&self, idx: usize) -> usize {
+        let w0 = self.read_sgpr_pair(idx) as usize;
+        (w0 >> 48) & ((1 << 14) - 1)
+    }
+    fn execute_sopp(&mut self, inst: SOPP) -> bool {
+        let simm16 = inst.SIMM16 as i16;
+        match inst.OP {
+            I::S_NOP => {}
+            I::S_ENDPGM => return false,
+            I::S_WAITCNT => {}
+            I::S_BARRIER => {}
+            I::S_CBRANCH_VCCNZ => {
+                if self.is_vccnz() {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
+            I::S_CBRANCH_VCCZ => {
+                if self.is_vccz() {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
+            I::S_CBRANCH_EXECZ => {
+                if self.is_execz() {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
+            I::S_BRANCH => {
+                self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+            }
+            I::S_CBRANCH_SCC0 => {
+                if !self.scc {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
+            I::S_CBRANCH_SCC1 => {
+                if self.scc {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
+            _ => unimplemented!(),
+        }
+        true
+    }
+    fn execute_sopk(&mut self, inst: SOPK) -> bool {
+        let simm16 = inst.SIMM16 as i16;
+        let d = inst.SDST as usize;
+        match inst.OP {
+            I::S_MOVK_I32 => {
+                self.write_sop_dst(d, (simm16 as i32) as u32);
+            }
+            I::S_SETREG_IMM32_B32 => {
+                let size = (simm16 as u32) & 0x3F;
+                let offset = ((simm16 as u32) >> 6) & 0x1F;
+                let hw_reg_id = ((simm16 as u32) >> 11) & 0x1F;
+                let value = self.fetch_literal_constant();
+                self.set_hw_reg(hw_reg_id as usize, offset as usize, size as usize, value);
+            }
+            _ => unimplemented!(),
+        }
+        true
+    }
+    fn execute_sop1(&mut self, inst: SOP1) -> bool {
+        let d = inst.SDST as usize;
+        let s0 = inst.SSRC0 as usize;
+
+        match inst.OP {
+            I::S_MOV_B32 => {
+                let s0_value = self.read_sop_src(s0);
+                let d_value = s0_value;
+                self.write_sop_dst(d, d_value);
+            }
+            I::S_MOV_B64 => {
+                let s0_value = self.read_sop_src_pair(s0);
+                let d_value = s0_value;
+                self.write_sop_dst_pair(d, d_value);
+            }
+            I::S_BREV_B32 => {
+                let s0_value = self.read_sop_src(s0);
+                let d_value = s0_value.reverse_bits();
+                self.write_sop_dst(d, d_value);
+            }
+            I::S_AND_SAVEEXEC_B64 => {
+                let s0_value = self.read_sop_src_pair(s0);
+                let exec_value = u64_from_u32_u32(self.exec_lo, self.exec_hi);
+
+                self.write_sop_dst_pair(d, exec_value);
+
+                let exec_value = s0_value & exec_value;
+
+                self.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
+                self.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
+                self.scc = exec_value != 0;
+            }
+            I::S_OR_SAVEEXEC_B64 => {
+                let s0_value = self.read_sop_src_pair(s0);
+                let exec_value = u64_from_u32_u32(self.exec_lo, self.exec_hi);
+
+                self.write_sop_dst_pair(d, exec_value);
+
+                let exec_value = s0_value | exec_value;
+
+                self.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
+                self.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
+                self.scc = exec_value != 0;
+            }
+            I::S_GETPC_B64 => {
+                let d_value = (self.get_pc() + 4) as u64;
+                self.write_sop_dst_pair(d, d_value);
+            }
+            I::S_SWAPPC_B64 => {
+                let s0_value = self.read_sop_src_pair(s0);
+                let d_value = (self.get_pc() + 4) as u64;
+                self.write_sop_dst_pair(d, d_value);
+                self.next_pc = s0_value as usize;
+            }
+            I::S_SETPC_B64 => {
+                let s0_value = self.read_sop_src_pair(s0);
+                self.next_pc = s0_value as usize;
+            }
+            _ => unimplemented!(),
+        }
+
+        true
+    }
     fn execute_sop2(&mut self, inst: SOP2) -> bool {
         let d = inst.SDST as usize;
         let s0 = inst.SSRC0 as usize;
@@ -2713,65 +2856,6 @@ impl ComputeUnit {
             _ => unimplemented!(),
         }
         true
-    }
-    fn read_vop_src(&self, elem: usize, addr: usize) -> u32 {
-        match addr {
-            0..=101 => self.read_sgpr(addr),
-            128 => 0,
-            129..=192 => (addr - 128) as u32,
-            193..=208 => -((addr - 192) as i32) as u32,
-            240 => 0x3f000000, // 0.5
-            241 => 0xbf000000, // -0.5
-            242 => 0x3f800000, // 1.0
-            243 => 0xbf800000, // -1.0
-            244 => 0x40000000, // 2.0
-            245 => 0xc0000000, // -2.0
-            246 => 0x40800000, // 4.0
-            247 => 0xc0800000, // -4.0
-            248 => 0x3e22f983, // 1/(2*PI)
-            255 => self.fetch_literal_constant(),
-            256..=511 => self.vgprs.get(elem, addr - 256),
-            _ => panic!(),
-        }
-    }
-    fn read_vop_src_pair(&self, elem: usize, addr: usize) -> u64 {
-        match addr {
-            0..=101 => self.read_sgpr_pair(addr),
-            128 => 0,
-            129..=192 => (addr - 128) as u64,
-            193..=208 => (-((addr - 192) as i64)) as u64,
-            240 => 0x3fe0000000000000, // 0.5
-            241 => 0xbfe0000000000000, // -0.5
-            242 => 0x3ff0000000000000, // 1.0
-            243 => 0xbff0000000000000, // -1.0
-            244 => 0x4000000000000000, // 2.0
-            245 => 0xc000000000000000, // -2.0
-            246 => 0x4010000000000000, // 4.0
-            247 => 0xc010000000000000, // -4.0
-            248 => 0x3fc45f306dc8bdc4, // 1/(2*PI)
-            255 => self.fetch_literal_constant() as u64,
-            256..=511 => self.read_vgpr_pair(elem, addr - 256),
-            _ => panic!(),
-        }
-    }
-    fn read_vgpr(&self, elem: usize, idx: usize) -> u32 {
-        self.vgprs.get(elem, idx)
-    }
-    fn read_vgpr_pair(&self, elem: usize, idx: usize) -> u64 {
-        u64_from_u32_u32(self.vgprs.get(elem, idx), self.vgprs.get(elem, idx + 1))
-    }
-    fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
-        // if idx == 0 {
-        //     println!(
-        //         "Write v[{}][{}] with {:08X} at {:012X}",
-        //         idx, elem, value, self.pc
-        //     );
-        // }
-        self.vgprs.set(elem, idx, value);
-    }
-    fn write_vgpr_pair(&mut self, elem: usize, idx: usize, value: u64) {
-        self.write_vgpr(elem, idx, (value & 0xFFFFFFFF) as u32);
-        self.write_vgpr(elem, idx + 1, ((value >> 32) & 0xFFFFFFFF) as u32);
     }
     fn execute_vop1(&mut self, inst: VOP1) -> bool {
         let d = inst.VDST as usize;
@@ -2909,29 +2993,6 @@ impl ComputeUnit {
         }
         true
     }
-    fn get_sgpr_bit(&self, idx: usize, bit: usize) -> bool {
-        if bit >= 32 {
-            let value = self.read_sop_src(idx + 1);
-            ((value >> (bit - 32)) & 1) != 0
-        } else {
-            let value = self.read_sop_src(idx);
-            ((value >> bit) & 1) != 0
-        }
-    }
-    fn set_sgpr_bit(&mut self, idx: usize, bit: usize, value: bool) {
-        if bit >= 32 {
-            let mask = 1 << (bit - 32);
-            let old_value = self.read_sop_src(idx + 1);
-            self.write_sop_dst(
-                idx + 1,
-                (old_value & !mask) | ((value as u32) << (bit - 32)),
-            );
-        } else {
-            let mask = 1 << bit;
-            let old_value = self.read_sop_src(idx);
-            self.write_sop_dst(idx, (old_value & !mask) | ((value as u32) << bit));
-        }
-    }
 
     fn execute_vop3a(&mut self, inst: VOP3A) -> bool {
         let d = inst.VDST as usize;
@@ -3066,29 +3127,6 @@ impl ComputeUnit {
         }
         true
     }
-    fn set_vcc(&mut self, elem: usize, value: bool) {
-        if elem >= 32 {
-            let mask: u32 = 1 << (elem - 32);
-            self.set_vcc_hi((self.get_vcc_hi() & !mask) | ((value as u32) << (elem - 32)));
-        } else {
-            let mask: u32 = 1 << elem;
-            self.set_vcc_lo((self.get_vcc_lo() & !mask) | ((value as u32) << elem));
-        }
-    }
-    fn get_vcc(&self, elem: usize) -> bool {
-        if elem >= 32 {
-            ((self.get_vcc_hi() >> (elem - 32)) & 1) != 0
-        } else {
-            ((self.get_vcc_lo() >> elem) & 1) != 0
-        }
-    }
-    fn get_exec(&self, elem: usize) -> bool {
-        if elem >= 32 {
-            ((self.exec_hi >> (elem - 32)) & 1) != 0
-        } else {
-            ((self.exec_lo >> elem) & 1) != 0
-        }
-    }
     fn execute_vopc(&mut self, inst: VOPC) -> bool {
         let s0 = inst.SRC0 as usize;
         let s1 = inst.VSRC1 as usize;
@@ -3106,36 +3144,6 @@ impl ComputeUnit {
             _ => unimplemented!(),
         }
         true
-    }
-    fn read_mem_u8(&mut self, addr: u64) -> u8 {
-        let ptr = addr as *mut u8;
-        unsafe { *ptr }
-    }
-    fn write_mem_u8(&mut self, addr: u64, data: u8) {
-        let ptr = addr as *mut u8;
-        unsafe {
-            *ptr = data;
-        }
-    }
-    fn read_mem_u16(&mut self, addr: u64) -> u16 {
-        let ptr = addr as *mut u16;
-        unsafe { *ptr }
-    }
-    fn write_mem_u16(&mut self, addr: u64, data: u16) {
-        let ptr = addr as *mut u16;
-        unsafe {
-            *ptr = data;
-        }
-    }
-    fn write_mem_u32(&mut self, addr: u64, data: u32) {
-        let ptr = addr as *mut u32;
-        unsafe {
-            *ptr = data;
-        }
-    }
-    fn read_mem_u32(&mut self, addr: u64) -> u32 {
-        let ptr = addr as *mut u32;
-        unsafe { *ptr }
     }
     fn execute_flat(&mut self, inst: FLAT) -> bool {
         let s = inst.DATA as usize;
@@ -3174,14 +3182,6 @@ impl ComputeUnit {
             _ => unimplemented!(),
         }
         true
-    }
-    fn get_buffer_resource_constant_base(&self, idx: usize) -> usize {
-        let w0 = self.read_sgpr_pair(idx) as usize;
-        w0 & ((1 << 48) - 1)
-    }
-    fn get_buffer_resource_constant_stride(&self, idx: usize) -> usize {
-        let w0 = self.read_sgpr_pair(idx) as usize;
-        (w0 >> 48) & ((1 << 14) - 1)
     }
     fn execute_mubuf(&mut self, inst: MUBUF) -> bool {
         let d = inst.VDATA as usize;
