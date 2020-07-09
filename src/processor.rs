@@ -1074,6 +1074,234 @@ fn s_load_dwordx4(cu: &mut ComputeUnit, sdata: usize, sbase: usize, soffset: u64
     }
 }
 
+fn v_mov_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let d_value = s0_value;
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_bfrev_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let d_value = s0_value.reverse_bits();
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_rsq_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = 1.0 / s0_value.sqrt();
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_rcp_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = 1.0 / s0_value;
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_rcp_f64_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let d_value = f64_to_u64(1.0 / s0_value);
+
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_sqrt_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = s0_value.sqrt();
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_ffbh_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let d_value = if s0_value == 0 {
+            0xFFFFFFFF
+        } else {
+            s0_value.leading_zeros()
+        };
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_cvt_f32_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let d_value = f32_to_u32(s0_value as f32);
+
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_cvt_f64_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as i32;
+        let d_value = f64_to_u64(s0_value as f64);
+
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_cvt_f64_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let d_value = f64_to_u64(s0_value as f64);
+
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_cvt_f64_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = f64_to_u64(s0_value as f64);
+
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_cvt_f32_f64_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let d_value = f32_to_u32(s0_value as f32);
+
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_cvt_i32_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = s0_value as i32;
+
+        cu.write_vgpr(elem, d, d_value as u32);
+    }
+}
+
+fn v_cvt_f32_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as i32;
+        let d_value = f32_to_u32(s0_value as f32);
+
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_frexp_mant_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let (d_value, _) = frexp_f32(s0_value);
+
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_frexp_exp_i32_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let (_, d_value) = frexp_f32(s0_value);
+
+        cu.write_vgpr(elem, d, d_value as u32);
+    }
+}
+
+fn v_rndne_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let mut d_value = (s0_value + 0.5).floor();
+        if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
+            d_value -= 1.0;
+        }
+
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_fract_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = s0_value.fract();
+
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_rcp_iflag_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = 1.0 / s0_value;
+        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -1503,225 +1731,61 @@ impl ComputeUnit {
         let s0 = inst.SRC0 as usize;
         match inst.OP {
             I::V_MOV_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let d_value = s0_value;
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_mov_b32_e32(self, d, s0);
             }
             I::V_BFREV_B32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let d_value = s0_value.reverse_bits();
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_bfrev_b32_e32(self, d, s0);
             }
             I::V_RSQ_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = 1.0 / s0_value.sqrt();
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_rsq_f32_e32(self, d, s0);
             }
             I::V_RCP_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = 1.0 / s0_value;
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_rcp_f32_e32(self, d, s0);
             }
             I::V_RCP_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u64_to_f64(self.read_vop_src_pair(elem, s0));
-                    let d_value = f64_to_u64(1.0 / s0_value);
-
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_rcp_f64_e32(self, d, s0);
             }
             I::V_SQRT_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = s0_value.sqrt();
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_sqrt_f32_e32(self, d, s0);
             }
             I::V_FFBH_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let d_value = if s0_value == 0 {
-                        0xFFFFFFFF
-                    } else {
-                        s0_value.leading_zeros()
-                    };
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_ffbh_u32_e32(self, d, s0);
             }
             I::V_CVT_F32_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let d_value = f32_to_u32(s0_value as f32);
-
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_cvt_f32_u32_e32(self, d, s0);
             }
             I::V_CVT_F64_I32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0) as i32;
-                    let d_value = f64_to_u64(s0_value as f64);
-
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_cvt_f64_i32_e32(self, d, s0);
             }
             I::V_CVT_F64_U32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let d_value = f64_to_u64(s0_value as f64);
-
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_cvt_f64_u32_e32(self, d, s0);
             }
             I::V_CVT_F64_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = f64_to_u64(s0_value as f64);
-
-                    self.write_vgpr_pair(elem, d, d_value);
-                }
+                v_cvt_f64_f32_e32(self, d, s0);
             }
             I::V_CVT_F32_F64 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u64_to_f64(self.read_vop_src_pair(elem, s0));
-                    let d_value = f32_to_u32(s0_value as f32);
-
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_cvt_f32_f64_e32(self, d, s0);
             }
             I::V_CVT_I32_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = s0_value as i32;
-
-                    self.write_vgpr(elem, d, d_value as u32);
-                }
+                v_cvt_i32_f32_e32(self, d, s0);
             }
             I::V_CVT_F32_I32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0) as i32;
-                    let d_value = f32_to_u32(s0_value as f32);
-
-                    self.write_vgpr(elem, d, d_value);
-                }
+                v_cvt_f32_i32_e32(self, d, s0);
             }
             I::V_FREXP_MANT_F32 => {
-                let d = inst.VDST as usize;
-                let s0 = inst.SRC0 as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let (d_value, _) = frexp_f32(s0_value);
-
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_frexp_mant_f32_e32(self, d, s0);
             }
             I::V_FREXP_EXP_I32_F32 => {
-                let d = inst.VDST as usize;
-                let s0 = inst.SRC0 as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let (_, d_value) = frexp_f32(s0_value);
-
-                    self.write_vgpr(elem, d, d_value as u32);
-                }
+                v_frexp_exp_i32_f32_e32(self, d, s0);
             }
             I::V_RNDNE_F32 => {
-                let d = inst.VDST as usize;
-                let s0 = inst.SRC0 as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let mut d_value = (s0_value + 0.5).floor();
-                    if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
-                        d_value -= 1.0;
-                    }
-
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_rndne_f32_e32(self, d, s0);
             }
             I::V_FRACT_F32 => {
-                let d = inst.VDST as usize;
-                let s0 = inst.SRC0 as usize;
-
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = s0_value.fract();
-
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_fract_f32_e32(self, d, s0);
             }
             I::V_RCP_IFLAG_F32 => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let d_value = 1.0 / s0_value;
-                    self.write_vgpr(elem, d, f32_to_u32(d_value));
-                }
+                v_rcp_iflag_f32_e32(self, d, s0);
             }
             _ => unimplemented!(),
         }
