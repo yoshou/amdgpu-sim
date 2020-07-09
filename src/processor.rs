@@ -907,6 +907,17 @@ impl<'a> SISimulator<'a> {
     }
 }
 
+fn s_movk_i32(cu: &mut ComputeUnit, d: usize, simm16: i16) {
+    cu.write_sop_dst(d, (simm16 as i32) as u32);
+}
+
+fn s_setreg_imm32_b32(cu: &mut ComputeUnit, simm16: i16, imm32: u32) {
+    let size = (simm16 as u32) & 0x3F;
+    let offset = ((simm16 as u32) >> 6) & 0x1F;
+    let hw_reg_id = ((simm16 as u32) >> 11) & 0x1F;
+    cu.set_hw_reg(hw_reg_id as usize, offset as usize, size as usize, imm32);
+}
+
 fn s_mov_b32(cu: &mut ComputeUnit, d: usize, s0: usize) {
     let s0_value = cu.read_sop_src(s0);
     let d_value = s0_value;
@@ -2744,14 +2755,11 @@ impl ComputeUnit {
         let d = inst.SDST as usize;
         match inst.OP {
             I::S_MOVK_I32 => {
-                self.write_sop_dst(d, (simm16 as i32) as u32);
+                s_movk_i32(self, d, simm16);
             }
             I::S_SETREG_IMM32_B32 => {
-                let size = (simm16 as u32) & 0x3F;
-                let offset = ((simm16 as u32) >> 6) & 0x1F;
-                let hw_reg_id = ((simm16 as u32) >> 11) & 0x1F;
-                let value = self.fetch_literal_constant();
-                self.set_hw_reg(hw_reg_id as usize, offset as usize, size as usize, value);
+                let imm32 = self.fetch_literal_constant();
+                s_setreg_imm32_b32(self, simm16, imm32);
             }
             _ => unimplemented!(),
         }
