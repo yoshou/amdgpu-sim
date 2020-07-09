@@ -2153,6 +2153,42 @@ fn v_div_scale_f64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: u
     }
 }
 
+fn v_cmp_f32(cu: &mut ComputeUnit, op: OP16, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let s1_value = u32_to_f32(cu.read_vgpr(elem, s1));
+        let result = cmp_f32(s0_value, s1_value, op);
+        cu.set_vcc(elem, result);
+    }
+}
+
+fn v_cmp_i32(cu: &mut ComputeUnit, op: OP8, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as i32;
+        let s1_value = cu.read_vgpr(elem, s1) as i32;
+        let result = cmp_i32(s0_value, s1_value, op);
+        cu.set_vcc(elem, result);
+    }
+}
+
+fn v_cmp_u32(cu: &mut ComputeUnit, op: OP8, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vgpr(elem, s1);
+        let result = cmp_u32(s0_value, s1_value, op);
+        cu.set_vcc(elem, result);
+    }
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -2899,37 +2935,13 @@ impl ComputeUnit {
 
         match inst.OP {
             I::V_CMP_F32(op16) => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = u32_to_f32(self.read_vop_src(elem, s0));
-                    let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
-                    let result = cmp_f32(s0_value, s1_value, op16);
-                    self.set_vcc(elem, result);
-                }
+                v_cmp_f32(self, op16, s0, s1);
             }
             I::V_CMP_I32(op8) => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0) as i32;
-                    let s1_value = self.read_vgpr(elem, s1) as i32;
-                    let result = cmp_i32(s0_value, s1_value, op8);
-                    self.set_vcc(elem, result);
-                }
+                v_cmp_i32(self, op8, s0, s1);
             }
             I::V_CMP_U32(op8) => {
-                for elem in 0..64 {
-                    if !self.get_exec(elem) {
-                        continue;
-                    }
-                    let s0_value = self.read_vop_src(elem, s0);
-                    let s1_value = self.read_vgpr(elem, s1);
-                    let result = cmp_u32(s0_value, s1_value, op8);
-                    self.set_vcc(elem, result);
-                }
+                v_cmp_u32(self, op8, s0, s1);
             }
             _ => unimplemented!(),
         }
