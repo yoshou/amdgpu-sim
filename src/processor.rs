@@ -907,6 +907,124 @@ impl<'a> SISimulator<'a> {
     }
 }
 
+fn s_add_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let (d_value, carry) = add_u32(s0_value, s1_value, 0);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.scc = carry;
+}
+
+fn s_sub_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.scc = carry;
+}
+
+fn s_add_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0) as i32;
+    let s1_value = cu.read_sop_src(s1) as i32;
+    let (d_value, overflow) = add_i32(s0_value, s1_value);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.scc = overflow;
+}
+
+fn s_addc_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let (d_value, carry) = add_u32(s0_value, s1_value, cu.scc as u32);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.scc = carry;
+}
+
+fn s_sub_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0) as i32;
+    let s1_value = cu.read_sop_src(s1) as i32;
+    let (d_value, overflow) = sub_i32(s0_value, s1_value);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.scc = overflow;
+}
+
+fn s_and_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let d_value = s0_value & s1_value;
+    cu.write_sop_dst(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_and_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src_pair(s1);
+    let d_value = s0_value & s1_value;
+    cu.write_sop_dst_pair(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_andn2_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src_pair(s1);
+    let d_value = s0_value & !s1_value;
+    cu.write_sop_dst_pair(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_or_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src_pair(s1);
+    let d_value = s0_value | s1_value;
+    cu.write_sop_dst_pair(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_orn2_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src_pair(s1);
+    let d_value = s0_value | !s1_value;
+    cu.write_sop_dst_pair(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_xor_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src_pair(s1);
+    let d_value = s0_value ^ s1_value;
+    cu.write_sop_dst_pair(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_mul_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0) as i32;
+    let s1_value = cu.read_sop_src(s1) as i32;
+    let d_value = mul_i32(s0_value, s1_value);
+    cu.write_sop_dst(d, d_value as u32);
+}
+
+fn s_lshl_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0) as i32;
+    let s1_value = cu.read_sop_src(s1) as i32;
+    let d_value = s0_value << ((s1_value) & 0x1F);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.scc = d_value != 0;
+}
+
+fn s_lshr_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let d_value = s0_value >> (s1_value & 0x1F);
+    cu.write_sop_dst(d, d_value);
+    cu.scc = d_value != 0;
+}
+
+fn s_bfm_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let d_value = ((1 << ((s0_value) & 0x1F)) - 1) << ((s1_value) & 0x1F);
+    cu.write_sop_dst(d, d_value);
+}
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -1185,107 +1303,49 @@ impl ComputeUnit {
 
         match inst.OP {
             I::S_ADD_U32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                let (d_value, carry) = add_u32(s0_value, s1_value, 0);
-                self.write_sop_dst(d, d_value as u32);
-                self.scc = carry;
+                s_add_u32_e32(self, d, s0, s1);
             }
             I::S_SUB_U32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
-                self.write_sop_dst(d, d_value as u32);
-                self.scc = carry;
+                s_sub_u32_e32(self, d, s0, s1);
             }
             I::S_ADD_I32 => {
-                let s0_value = self.read_sop_src(s0) as i32;
-                let s1_value = self.read_sop_src(s1) as i32;
-                let (d_value, overflow) = add_i32(s0_value, s1_value);
-                self.write_sop_dst(d, d_value as u32);
-                self.scc = overflow;
+                s_add_i32_e32(self, d, s0, s1);
             }
             I::S_ADDC_U32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                let (d_value, carry) = add_u32(s0_value, s1_value, self.scc as u32);
-                self.write_sop_dst(d, d_value as u32);
-                self.scc = carry;
+                s_addc_u32_e32(self, d, s0, s1);
             }
             I::S_SUB_I32 => {
-                let s0_value = self.read_sop_src(s0) as i32;
-                let s1_value = self.read_sop_src(s1) as i32;
-                let (d_value, overflow) = sub_i32(s0_value, s1_value);
-                self.write_sop_dst(d, d_value as u32);
-                self.scc = overflow;
+                s_sub_i32_e32(self, d, s0, s1);
             }
             I::S_AND_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                let d_value = s0_value & s1_value;
-                self.write_sop_dst(d, d_value);
-                self.scc = d_value != 0;
+                s_and_b32_e32(self, d, s0, s1);
             }
             I::S_AND_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let s1_value = self.read_sop_src_pair(s1);
-                let d_value = s0_value & s1_value;
-                self.write_sop_dst_pair(d, d_value);
-                self.scc = d_value != 0;
+                s_and_b64_e32(self, d, s0, s1);
             }
             I::S_ANDN2_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let s1_value = self.read_sop_src_pair(s1);
-                let d_value = s0_value & !s1_value;
-                self.write_sop_dst_pair(d, d_value);
-                self.scc = d_value != 0;
+                s_andn2_b64_e32(self, d, s0, s1);
             }
             I::S_OR_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let s1_value = self.read_sop_src_pair(s1);
-                let d_value = s0_value | s1_value;
-                self.write_sop_dst_pair(d, d_value);
-                self.scc = d_value != 0;
+                s_or_b64_e32(self, d, s0, s1);
             }
             I::S_ORN2_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let s1_value = self.read_sop_src_pair(s1);
-                let d_value = s0_value | !s1_value;
-                self.write_sop_dst_pair(d, d_value);
-                self.scc = d_value != 0;
+                s_orn2_b64_e32(self, d, s0, s1);
             }
             I::S_XOR_B64 => {
-                let s0_value = self.read_sop_src_pair(s0);
-                let s1_value = self.read_sop_src_pair(s1);
-                let d_value = s0_value ^ s1_value;
-                self.write_sop_dst_pair(d, d_value);
-                self.scc = d_value != 0;
+                s_xor_b64_e32(self, d, s0, s1);
             }
             I::S_MUL_I32 => {
-                let s0_value = self.read_sop_src(s0) as i32;
-                let s1_value = self.read_sop_src(s1) as i32;
-                let d_value = mul_i32(s0_value, s1_value);
-                self.write_sop_dst(d, d_value as u32);
+                s_mul_i32_e32(self, d, s0, s1);
             }
             I::S_LSHL_B32 => {
-                let s0_value = self.read_sop_src(s0) as i32;
-                let s1_value = self.read_sop_src(s1) as i32;
-                let d_value = s0_value << ((s1_value) & 0x1F);
-                self.write_sop_dst(d, d_value as u32);
-                self.scc = d_value != 0;
+                s_lshl_i32_e32(self, d, s0, s1);
             }
             I::S_LSHR_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                let d_value = s0_value >> (s1_value & 0x1F);
-                self.write_sop_dst(d, d_value);
-                self.scc = d_value != 0;
+                s_lshr_i32_e32(self, d, s0, s1);
             }
             I::S_BFM_B32 => {
-                let s0_value = self.read_sop_src(s0);
-                let s1_value = self.read_sop_src(s1);
-                let d_value = ((1 << ((s0_value) & 0x1F)) - 1) << ((s1_value) & 0x1F);
-                self.write_sop_dst(d, d_value);
+                s_bfm_b32_e32(self, d, s0, s1);
             }
             _ => unimplemented!(),
         }
