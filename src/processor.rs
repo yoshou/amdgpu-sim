@@ -48,25 +48,38 @@ impl<T: Copy> RegisterFile<T> for RegisterFileImpl<T> {
     }
 }
 
+pub enum Signals {
+    None,
+    EndOfProgram,
+    Switch,
+    Unknown,
+}
+
 pub trait Processor {
-    fn step(&mut self) -> bool;
+    fn step(&mut self) -> Signals;
+}
+
+#[derive(Copy, Clone, Debug)]
+struct Context {
+    id: usize,
+    pc: usize,
+    scc: bool,
+    exec_lo: u32,
+    exec_hi: u32,
 }
 
 struct ComputeUnit {
-    pc: usize,
+    ctx: Context,
     next_pc: usize,
     insts: Vec<u8>,
     pub sgprs: RegisterFileImpl<u32>,
     pub vgprs: RegisterFileImpl<u32>,
-    scc: bool,
-    exec_lo: u32,
-    exec_hi: u32,
     num_sgprs: usize,
     num_vgprs: usize,
 }
 
 impl Processor for ComputeUnit {
-    fn step(&mut self) -> bool {
+    fn step(&mut self) -> Signals {
         if let Ok((inst, size)) = decode_v3(self.fetch_inst()) {
             self.next_pc = self.get_pc() as usize + size;
             let result = self.execute_inst(inst);
@@ -74,7 +87,7 @@ impl Processor for ComputeUnit {
             result
         } else {
             println!("Unknown instruction.");
-            false
+            Signals::Unknown
         }
     }
 }
@@ -258,8 +271,8 @@ struct KernelDescriptor {
     is_xnack_enabled: bool,
     kernel_code_entry_byte_offset: usize,
     // compute_pgm_rsrc1
-    // granulated_workitem_vgpr_count: usize,
-    // granulated_wavefront_sgpr_count: usize,
+    granulated_workitem_vgpr_count: usize,
+    granulated_wavefront_sgpr_count: usize,
     // priority: u8,
     // float_mode_round_32: u8,
     // float_mode_round_16_64: u8,
@@ -308,7 +321,7 @@ fn get_bit(buffer: &[u8], offset: usize, bit: usize) -> bool {
 }
 
 fn get_bits(buffer: &[u8], offset: usize, bit: usize, size: usize) -> u8 {
-    (buffer[offset + (bit >> 3)] >> (bit & 0x7)) & ((1 << size) - 1)
+    ((get_u32(buffer, offset + (bit >> 3)) >> (bit & 0x7)) & ((1 << size) - 1)) as u8
 }
 
 fn get_u8(buffer: &[u8], offset: usize) -> u8 {
@@ -619,6 +632,8 @@ fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
         enable_sgpr_grid_workgroup_count_x: get_bit(kd, 56, 7),
         enable_sgpr_grid_workgroup_count_y: get_bit(kd, 57, 0),
         enable_sgpr_grid_workgroup_count_z: get_bit(kd, 57, 1),
+        granulated_workitem_vgpr_count: (get_bits(kd, 48, 0, 6) as usize + 1) * 4,
+        granulated_wavefront_sgpr_count: (get_bits(kd, 48, 6, 4) as usize + 1) * 8,
         enable_sgpr_private_segment_wave_offset: get_bit(kd, 52, 0),
         user_sgpr_count: get_bits(kd, 52, 1, 5) as usize,
         enable_trap_handler: get_bit(kd, 52, 6),
@@ -691,8 +706,8 @@ impl<'a> SISimulator<'a> {
             let cu = Arc::new(Mutex::new(ComputeUnit::new(
                 kd + kernel_desc.kernel_code_entry_byte_offset,
                 aql.kernel_object.object.to_vec(),
-                100 + 4,
-                256,
+                kernel_desc.granulated_wavefront_sgpr_count,
+                kernel_desc.granulated_workitem_vgpr_count,
             )));
 
             cunits.push(cu);
@@ -723,7 +738,7 @@ impl<'a> SISimulator<'a> {
         workgroup_id_y: u32,
         workgroup_id_z: u32,
         workitem_offset: usize,
-    ) -> ([u32; 16], [[u32; 64]; 16], usize) {
+    ) -> ([u32; 16], [[u32; 64]; 16]) {
         let private_seg_ptr = if self.private_seg_buffer.len() > 0 {
             (&self.private_seg_buffer[0] as *const u8) as u64
         } else {
@@ -843,7 +858,7 @@ impl<'a> SISimulator<'a> {
         }
 
         // initialize pc
-        (sgprs, vgprs, self.entry_address)
+        (sgprs, vgprs)
     }
 
     pub fn execute(&mut self) {
@@ -884,14 +899,14 @@ impl<'a> SISimulator<'a> {
                     ));
                 }
 
+                let entry_address = self.entry_address;
+
                 let cu = Arc::clone(&self.cunits[cu_idx]);
                 use std::thread;
 
                 let handle = thread::spawn(move || {
                     if let Ok(mut v) = cu.lock() {
-                        for s in setup_data {
-                            v.dispatch(s);
-                        }
+                        v.dispatch(entry_address, setup_data, workgroup_size / 64);
                     }
                 });
                 thread_handles.push(handle);
@@ -938,27 +953,27 @@ fn s_brev_b32(cu: &mut ComputeUnit, d: usize, s0: usize) {
 
 fn s_and_saveexec_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
     let s0_value = cu.read_sop_src_pair(s0);
-    let exec_value = u64_from_u32_u32(cu.exec_lo, cu.exec_hi);
+    let exec_value = u64_from_u32_u32(cu.ctx.exec_lo, cu.ctx.exec_hi);
 
     cu.write_sop_dst_pair(d, exec_value);
 
     let exec_value = s0_value & exec_value;
 
-    cu.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
-    cu.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
-    cu.scc = exec_value != 0;
+    cu.ctx.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
+    cu.ctx.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
+    cu.ctx.scc = exec_value != 0;
 }
 fn s_or_saveexec_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
     let s0_value = cu.read_sop_src_pair(s0);
-    let exec_value = u64_from_u32_u32(cu.exec_lo, cu.exec_hi);
+    let exec_value = u64_from_u32_u32(cu.ctx.exec_lo, cu.ctx.exec_hi);
 
     cu.write_sop_dst_pair(d, exec_value);
 
     let exec_value = s0_value | exec_value;
 
-    cu.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
-    cu.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
-    cu.scc = exec_value != 0;
+    cu.ctx.exec_lo = (exec_value & 0xFFFFFFFF) as u32;
+    cu.ctx.exec_hi = ((exec_value >> 32) & 0xFFFFFFFF) as u32;
+    cu.ctx.scc = exec_value != 0;
 }
 fn s_getpc_b64(cu: &mut ComputeUnit, d: usize) {
     let d_value = (cu.get_pc() + 4) as u64;
@@ -980,7 +995,7 @@ fn s_add_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1);
     let (d_value, carry) = add_u32(s0_value, s1_value, 0);
     cu.write_sop_dst(d, d_value as u32);
-    cu.scc = carry;
+    cu.ctx.scc = carry;
 }
 
 fn s_sub_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -988,7 +1003,7 @@ fn s_sub_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1);
     let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
     cu.write_sop_dst(d, d_value as u32);
-    cu.scc = carry;
+    cu.ctx.scc = carry;
 }
 
 fn s_add_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -996,15 +1011,15 @@ fn s_add_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1) as i32;
     let (d_value, overflow) = add_i32(s0_value, s1_value);
     cu.write_sop_dst(d, d_value as u32);
-    cu.scc = overflow;
+    cu.ctx.scc = overflow;
 }
 
 fn s_addc_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0);
     let s1_value = cu.read_sop_src(s1);
-    let (d_value, carry) = add_u32(s0_value, s1_value, cu.scc as u32);
+    let (d_value, carry) = add_u32(s0_value, s1_value, cu.ctx.scc as u32);
     cu.write_sop_dst(d, d_value as u32);
-    cu.scc = carry;
+    cu.ctx.scc = carry;
 }
 
 fn s_sub_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1012,7 +1027,7 @@ fn s_sub_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1) as i32;
     let (d_value, overflow) = sub_i32(s0_value, s1_value);
     cu.write_sop_dst(d, d_value as u32);
-    cu.scc = overflow;
+    cu.ctx.scc = overflow;
 }
 
 fn s_and_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1020,7 +1035,7 @@ fn s_and_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1);
     let d_value = s0_value & s1_value;
     cu.write_sop_dst(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_and_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1028,7 +1043,7 @@ fn s_and_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src_pair(s1);
     let d_value = s0_value & s1_value;
     cu.write_sop_dst_pair(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_andn2_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1036,7 +1051,7 @@ fn s_andn2_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src_pair(s1);
     let d_value = s0_value & !s1_value;
     cu.write_sop_dst_pair(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_or_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1044,7 +1059,7 @@ fn s_or_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src_pair(s1);
     let d_value = s0_value | s1_value;
     cu.write_sop_dst_pair(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_orn2_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1052,7 +1067,7 @@ fn s_orn2_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src_pair(s1);
     let d_value = s0_value | !s1_value;
     cu.write_sop_dst_pair(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_xor_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1060,7 +1075,7 @@ fn s_xor_b64_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src_pair(s1);
     let d_value = s0_value ^ s1_value;
     cu.write_sop_dst_pair(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_mul_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1075,7 +1090,7 @@ fn s_lshl_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1) as i32;
     let d_value = s0_value << ((s1_value) & 0x1F);
     cu.write_sop_dst(d, d_value as u32);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_lshr_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1083,7 +1098,7 @@ fn s_lshr_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1);
     let d_value = s0_value >> (s1_value & 0x1F);
     cu.write_sop_dst(d, d_value);
-    cu.scc = d_value != 0;
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_bfm_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1096,25 +1111,25 @@ fn s_bfm_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
 fn s_cmp_eq_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0);
     let s1_value = cu.read_sop_src(s1);
-    cu.scc = s0_value == s1_value;
+    cu.ctx.scc = s0_value == s1_value;
 }
 
 fn s_cmp_gt_i32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0) as i32;
     let s1_value = cu.read_sop_src(s1) as i32;
-    cu.scc = s0_value > s1_value;
+    cu.ctx.scc = s0_value > s1_value;
 }
 
 fn s_cmp_lt_i32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0) as i32;
     let s1_value = cu.read_sop_src(s1) as i32;
-    cu.scc = s0_value < s1_value;
+    cu.ctx.scc = s0_value < s1_value;
 }
 
 fn s_cmp_lg_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0);
     let s1_value = cu.read_sop_src(s1);
-    cu.scc = s0_value != s1_value;
+    cu.ctx.scc = s0_value != s1_value;
 }
 
 fn s_load_dword(cu: &mut ComputeUnit, sdata: usize, sbase: usize, soffset: u64) {
@@ -2322,7 +2337,7 @@ fn flat_store_byte(cu: &mut ComputeUnit, s: usize, addr: usize) {
             continue;
         }
         let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
-        let data = cu.vgprs.get(elem, s) as u8;
+        let data = cu.read_vgpr(elem, s) as u8;
         cu.write_mem_u8(addr_val, data);
     }
 }
@@ -2332,7 +2347,7 @@ fn flat_store_short(cu: &mut ComputeUnit, s: usize, addr: usize) {
             continue;
         }
         let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
-        let data = cu.vgprs.get(elem, s) as u16;
+        let data = cu.read_vgpr(elem, s) as u16;
         cu.write_mem_u16(addr_val, data);
     }
 }
@@ -2342,7 +2357,7 @@ fn flat_store_dword(cu: &mut ComputeUnit, s: usize, addr: usize) {
             continue;
         }
         let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
-        let data = cu.vgprs.get(elem, s);
+        let data = cu.read_vgpr(elem, s);
         cu.write_mem_u32(addr_val, data);
     }
 }
@@ -2354,7 +2369,7 @@ fn flat_store_dwordx4(cu: &mut ComputeUnit, s: usize, addr: usize) {
         let addr_val = cu.read_vgpr_pair(elem, addr) as u64;
 
         for i in 0..4 {
-            let data = cu.vgprs.get(elem, s + i);
+            let data = cu.read_vgpr(elem, s + i);
             cu.write_mem_u32(addr_val + (i * 4) as u64, data);
         }
     }
@@ -2373,7 +2388,7 @@ fn buffer_load_dword(
             continue;
         }
         let offset = if offen {
-            cu.vgprs.get(elem, vaddr) as usize
+            cu.read_vgpr(elem, vaddr) as usize
         } else {
             offset as usize
         };
@@ -2401,7 +2416,7 @@ fn buffer_store_dword(
             continue;
         }
         let offset = if offen {
-            cu.vgprs.get(elem, vaddr) as usize
+            cu.read_vgpr(elem, vaddr) as usize
         } else {
             offset as usize
         };
@@ -2411,7 +2426,7 @@ fn buffer_store_dword(
 
         let ptr = (base_addr_val + soffset_val + offset + stride_val * elem) as *mut u32;
 
-        let data = cu.vgprs.get(elem, s);
+        let data = cu.read_vgpr(elem, s);
         unsafe {
             *ptr = data;
         }
@@ -2421,20 +2436,27 @@ impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
         ComputeUnit {
-            pc: pc,
+            ctx: Context {
+                id: 0,
+                pc: pc,
+                scc: true,
+                exec_lo: 0xFFFFFFFF,
+                exec_hi: 0xFFFFFFFF,
+            },
             next_pc: 0,
             insts: insts,
-            sgprs: RegisterFileImpl::new(1, num_sgprs, 0),
-            vgprs: RegisterFileImpl::new(64, num_vgprs, 0),
-            scc: true,
-            exec_lo: 0xFFFFFFFF,
-            exec_hi: 0xFFFFFFFF,
+            sgprs: RegisterFileImpl::new(1, 512, 0),
+            vgprs: RegisterFileImpl::new(64, 256, 0),
             num_sgprs: num_sgprs,
             num_vgprs: num_vgprs,
         }
     }
-    pub fn dispatch(&mut self, setup_data: ([u32; 16], [[u32; 64]; 16], usize)) {
-        let (sgprs, vgprs, entry_addr) = setup_data;
+    pub fn dispatch(
+        &mut self,
+        entry_addr: usize,
+        setup_data: Vec<([u32; 16], [[u32; 64]; 16])>,
+        num_wavefronts: usize,
+    ) {
         for i in 0..self.num_sgprs {
             self.sgprs.set(0, i, 0);
         }
@@ -2443,24 +2465,58 @@ impl ComputeUnit {
                 self.vgprs.set(elem, i, 0);
             }
         }
-        for i in 0..16 {
-            self.sgprs.set(0, i, sgprs[i]);
-        }
-        for i in 0..16 {
-            for elem in 0..64 {
-                self.vgprs.set(elem, i, vgprs[i][elem]);
+        for wavefront in 0..num_wavefronts {
+            let (sgprs, vgprs) = setup_data[wavefront];
+            for i in 0..16 {
+                self.sgprs.set(0, wavefront * self.num_sgprs + i, sgprs[i]);
+            }
+            for i in 0..16 {
+                for elem in 0..64 {
+                    self.vgprs
+                        .set(elem, wavefront * self.num_vgprs + i, vgprs[i][elem]);
+                }
             }
         }
 
-        self.pc = entry_addr;
+        use std::collections::VecDeque;
 
-        while self.step() {}
+        let mut ctxs = VecDeque::new();
+        for wavefront in 0..num_wavefronts {
+            ctxs.push_back(Context {
+                id: wavefront,
+                pc: entry_addr,
+                exec_lo: 0xFFFFFFFF,
+                exec_hi: 0xFFFFFFFF,
+                scc: false,
+            })
+        }
+
+        let is_signal_none = |signal: &Signals| match signal {
+            Signals::None => true,
+            _ => false,
+        };
+
+        while !ctxs.is_empty() {
+            if let Some(ctx) = ctxs.pop_front() {
+                self.ctx = ctx;
+            }
+            let mut signal = self.step();
+            while is_signal_none(&signal) {
+                signal = self.step();
+            }
+
+            match signal {
+                Signals::EndOfProgram => {}
+                Signals::Switch => ctxs.push_back(self.ctx),
+                _ => panic!(),
+            }
+        }
     }
     fn is_vccz(&self) -> bool {
         (self.get_vcc_hi() == 0) && (self.get_vcc_lo() == 0)
     }
     fn is_execz(&self) -> bool {
-        (self.exec_hi == 0) && (self.exec_lo == 0)
+        (self.ctx.exec_hi == 0) && (self.ctx.exec_lo == 0)
     }
     fn is_vccnz(&self) -> bool {
         !self.is_vccz()
@@ -2469,7 +2525,10 @@ impl ComputeUnit {
         // ignore
     }
     fn read_sgpr(&self, idx: usize) -> u32 {
-        self.sgprs.get(0, idx)
+        if idx >= self.num_sgprs {
+            panic!();
+        }
+        self.sgprs.get(0, self.num_sgprs * self.ctx.id + idx)
     }
     fn read_sgpr_pair(&self, idx: usize) -> u64 {
         u64_from_u32_u32(self.read_sgpr(idx), self.read_sgpr(idx + 1))
@@ -2478,7 +2537,10 @@ impl ComputeUnit {
         // if idx == 8 {
         //     println!("Write s[{}] with {:08X} at {:012X}", idx, value, self.pc);
         // }
-        self.sgprs.set(0, idx, value);
+        if idx >= self.num_sgprs {
+            panic!();
+        }
+        self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx, value);
     }
     fn get_flat_scratch_lo(&self) -> u32 {
         self.read_sgpr(self.num_sgprs - 4)
@@ -2512,8 +2574,8 @@ impl ComputeUnit {
             103 => self.get_flat_scratch_hi(),
             106 => self.get_vcc_lo(),
             107 => self.get_vcc_hi(),
-            126 => self.exec_lo,
-            127 => self.exec_hi,
+            126 => self.ctx.exec_lo,
+            127 => self.ctx.exec_hi,
             128 => 0,
             129..=192 => (addr - 128) as u32,
             193..=208 => (-((addr - 192) as i32)) as u32,
@@ -2535,7 +2597,7 @@ impl ComputeUnit {
             0..=101 => u64_from_u32_u32(self.read_sgpr(addr), self.read_sgpr(addr + 1)),
             102 => u64_from_u32_u32(self.get_flat_scratch_lo(), self.get_flat_scratch_hi()),
             106 => u64_from_u32_u32(self.get_vcc_lo(), self.get_vcc_hi()),
-            126 => u64_from_u32_u32(self.exec_lo, self.exec_hi),
+            126 => u64_from_u32_u32(self.ctx.exec_lo, self.ctx.exec_hi),
             128 => 0,
             129..=192 => (addr - 128) as u64,
             193..=208 => (-((addr - 192) as i64)) as u64,
@@ -2559,8 +2621,8 @@ impl ComputeUnit {
             103 => self.set_flat_scratch_hi(value),
             106 => self.set_vcc_lo(value),
             107 => self.set_vcc_hi(value),
-            126 => self.exec_lo = value,
-            127 => self.exec_hi = value,
+            126 => self.ctx.exec_lo = value,
+            127 => self.ctx.exec_hi = value,
             _ => panic!(),
         }
     }
@@ -2584,7 +2646,7 @@ impl ComputeUnit {
             247 => 0xc0800000, // -4.0
             248 => 0x3e22f983, // 1/(2*PI)
             255 => self.fetch_literal_constant(),
-            256..=511 => self.vgprs.get(elem, addr - 256),
+            256..=511 => self.read_vgpr(elem, addr - 256),
             _ => panic!(),
         }
     }
@@ -2609,10 +2671,13 @@ impl ComputeUnit {
         }
     }
     fn read_vgpr(&self, elem: usize, idx: usize) -> u32 {
-        self.vgprs.get(elem, idx)
+        if idx >= self.num_vgprs {
+            panic!();
+        }
+        self.vgprs.get(elem, self.num_vgprs * self.ctx.id + idx)
     }
     fn read_vgpr_pair(&self, elem: usize, idx: usize) -> u64 {
-        u64_from_u32_u32(self.vgprs.get(elem, idx), self.vgprs.get(elem, idx + 1))
+        u64_from_u32_u32(self.read_vgpr(elem, idx), self.read_vgpr(elem, idx + 1))
     }
     fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
         // if idx == 0 {
@@ -2621,7 +2686,11 @@ impl ComputeUnit {
         //         idx, elem, value, self.pc
         //     );
         // }
-        self.vgprs.set(elem, idx, value);
+        if idx >= self.num_vgprs {
+            panic!();
+        }
+        self.vgprs
+            .set(elem, self.num_vgprs * self.ctx.id + idx, value);
     }
     fn write_vgpr_pair(&mut self, elem: usize, idx: usize, value: u64) {
         self.write_vgpr(elem, idx, (value & 0xFFFFFFFF) as u32);
@@ -2668,9 +2737,9 @@ impl ComputeUnit {
     }
     fn get_exec(&self, elem: usize) -> bool {
         if elem >= 32 {
-            ((self.exec_hi >> (elem - 32)) & 1) != 0
+            ((self.ctx.exec_hi >> (elem - 32)) & 1) != 0
         } else {
-            ((self.exec_lo >> elem) & 1) != 0
+            ((self.ctx.exec_lo >> elem) & 1) != 0
         }
     }
     fn read_mem_u8(&mut self, addr: u64) -> u8 {
@@ -2711,11 +2780,11 @@ impl ComputeUnit {
         let w0 = self.read_sgpr_pair(idx) as usize;
         (w0 >> 48) & ((1 << 14) - 1)
     }
-    fn execute_sopp(&mut self, inst: SOPP) -> bool {
+    fn execute_sopp(&mut self, inst: SOPP) -> Signals {
         let simm16 = inst.SIMM16 as i16;
         match inst.OP {
             I::S_NOP => {}
-            I::S_ENDPGM => return false,
+            I::S_ENDPGM => return Signals::EndOfProgram,
             I::S_WAITCNT => {}
             I::S_BARRIER => {}
             I::S_CBRANCH_VCCNZ => {
@@ -2737,20 +2806,20 @@ impl ComputeUnit {
                 self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
             }
             I::S_CBRANCH_SCC0 => {
-                if !self.scc {
+                if !self.ctx.scc {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
                 }
             }
             I::S_CBRANCH_SCC1 => {
-                if self.scc {
+                if self.ctx.scc {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
                 }
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_sopk(&mut self, inst: SOPK) -> bool {
+    fn execute_sopk(&mut self, inst: SOPK) -> Signals {
         let simm16 = inst.SIMM16 as i16;
         let d = inst.SDST as usize;
         match inst.OP {
@@ -2763,9 +2832,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_sop1(&mut self, inst: SOP1) -> bool {
+    fn execute_sop1(&mut self, inst: SOP1) -> Signals {
         let d = inst.SDST as usize;
         let s0 = inst.SSRC0 as usize;
 
@@ -2797,9 +2866,9 @@ impl ComputeUnit {
             _ => unimplemented!(),
         }
 
-        true
+        Signals::None
     }
-    fn execute_sop2(&mut self, inst: SOP2) -> bool {
+    fn execute_sop2(&mut self, inst: SOP2) -> Signals {
         let d = inst.SDST as usize;
         let s0 = inst.SSRC0 as usize;
         let s1 = inst.SSRC1 as usize;
@@ -2852,9 +2921,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_sopc(&mut self, inst: SOPC) -> bool {
+    fn execute_sopc(&mut self, inst: SOPC) -> Signals {
         let s0 = inst.SSRC0 as usize;
         let s1 = inst.SSRC1 as usize;
 
@@ -2873,9 +2942,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_smem(&mut self, inst: SMEM) -> bool {
+    fn execute_smem(&mut self, inst: SMEM) -> Signals {
         let sdata = inst.SDATA as usize;
         let soffset = inst.OFFSET as u64;
         let sbase = (inst.SBASE * 2) as usize;
@@ -2891,9 +2960,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_vop1(&mut self, inst: VOP1) -> bool {
+    fn execute_vop1(&mut self, inst: VOP1) -> Signals {
         let d = inst.VDST as usize;
         let s0 = inst.SRC0 as usize;
         match inst.OP {
@@ -2956,9 +3025,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_vop2(&mut self, inst: VOP2) -> bool {
+    fn execute_vop2(&mut self, inst: VOP2) -> Signals {
         let d = inst.VDST as usize;
         let s0 = inst.SRC0 as usize;
         let s1 = inst.VSRC1 as usize;
@@ -3027,10 +3096,10 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
 
-    fn execute_vop3a(&mut self, inst: VOP3A) -> bool {
+    fn execute_vop3a(&mut self, inst: VOP3A) -> Signals {
         let d = inst.VDST as usize;
         let s0 = inst.SRC0 as usize;
         let s1 = inst.SRC1 as usize;
@@ -3132,9 +3201,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_vop3b(&mut self, inst: VOP3B) -> bool {
+    fn execute_vop3b(&mut self, inst: VOP3B) -> Signals {
         let d = inst.VDST as usize;
         let sd = inst.SDST as usize;
         let s0 = inst.SRC0 as usize;
@@ -3161,9 +3230,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_vopc(&mut self, inst: VOPC) -> bool {
+    fn execute_vopc(&mut self, inst: VOPC) -> Signals {
         let s0 = inst.SRC0 as usize;
         let s1 = inst.VSRC1 as usize;
 
@@ -3179,9 +3248,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_flat(&mut self, inst: FLAT) -> bool {
+    fn execute_flat(&mut self, inst: FLAT) -> Signals {
         let s = inst.DATA as usize;
         let d = inst.VDST as usize;
         let addr = inst.ADDR as usize;
@@ -3217,9 +3286,9 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
-    fn execute_mubuf(&mut self, inst: MUBUF) -> bool {
+    fn execute_mubuf(&mut self, inst: MUBUF) -> Signals {
         let d = inst.VDATA as usize;
         let s = inst.VDATA as usize;
         let vaddr = inst.VADDR as usize;
@@ -3236,16 +3305,16 @@ impl ComputeUnit {
             }
             _ => unimplemented!(),
         }
-        true
+        Signals::None
     }
     fn get_pc(&self) -> u64 {
-        (&self.insts[self.pc] as *const u8) as u64
+        (&self.insts[self.ctx.pc] as *const u8) as u64
     }
     fn set_pc(&mut self, value: u64) {
         let base_ptr = (&self.insts[0] as *const u8) as u64;
-        self.pc = (value - base_ptr) as usize;
+        self.ctx.pc = (value - base_ptr) as usize;
     }
-    fn execute_inst(&mut self, inst: InstFormat) -> bool {
+    fn execute_inst(&mut self, inst: InstFormat) -> Signals {
         // println!("{:012X}: {:?}", self.pc, inst);
         // if self.pc == 0x000000001B58 {
         //     println!("");
@@ -3269,9 +3338,9 @@ impl ComputeUnit {
     }
 
     fn fetch_inst(&mut self) -> u64 {
-        get_u64(&self.insts, self.pc)
+        get_u64(&self.insts, self.ctx.pc)
     }
     fn fetch_literal_constant(&self) -> u32 {
-        get_u32(&self.insts, self.pc + 4)
+        get_u32(&self.insts, self.ctx.pc + 4)
     }
 }
