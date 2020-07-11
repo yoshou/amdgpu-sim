@@ -2786,7 +2786,7 @@ impl ComputeUnit {
             I::S_NOP => {}
             I::S_ENDPGM => return Signals::EndOfProgram,
             I::S_WAITCNT => {}
-            I::S_BARRIER => {}
+            I::S_BARRIER => return Signals::Switch,
             I::S_CBRANCH_VCCNZ => {
                 if self.is_vccnz() {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
