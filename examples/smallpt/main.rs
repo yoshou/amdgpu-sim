@@ -303,7 +303,7 @@ fn main() -> Result<()> {
     let nb_samples = if matches.opt_present("nb_samples") { matches.opt_str("nb_samples").unwrap().parse::<i32>().unwrap() / 4 } else { 1 };
     let arch = if matches.opt_present("arch") { matches.opt_str("arch").unwrap() } else { "gfx803".to_string() };
 
-    let program_filename = format!("examples/simplept/kernel_{}.o", arch);
+    let program_filename = format!("examples/smallpt/kernel_{}.o", arch);
     let width = 1024;
     let height = 768;
     let nb_pixels = width * height;
