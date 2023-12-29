@@ -128,13 +128,15 @@ fn clamp(x: f32, low: f32, high: f32) -> f32 {
     }
 }
 
-fn to_byte(x: f32, gamma: f32) -> u8 {
+fn gamma(x: f32) -> f32 {
+    x.powf(1.0 / 2.2)
+}
+
+fn to_byte(x: f32) -> u8 {
     clamp(255.0 * x, 0.0, 255.0) as u8
-    // return (uint8_t)clamp(255.0 * pow(x, 1.0 / gamma), 0.0, 255.0);
 }
 
 fn write_ppm(w: usize, h: usize, data: &[f32], fname: &str) -> Result<()> {
-    let gamma = 0.0;
     let mut f = std::fs::File::create(fname)?;
 
     f.write(format!("P3\n{} {}\n{}\n", w, h, 255).as_bytes())?;
@@ -143,9 +145,9 @@ fn write_ppm(w: usize, h: usize, data: &[f32], fname: &str) -> Result<()> {
         f.write(
             format!(
                 "{} {} {} ",
-                to_byte(data[i], gamma),
-                to_byte(data[i + 1], gamma),
-                to_byte(data[i + 2], gamma)
+                to_byte(gamma(data[i])),
+                to_byte(gamma(data[i + 1])),
+                to_byte(gamma(data[i + 2]))
             )
             .as_bytes(),
         )?;
@@ -155,15 +157,14 @@ fn write_ppm(w: usize, h: usize, data: &[f32], fname: &str) -> Result<()> {
 }
 
 fn write_png(width: usize, height: usize, data: &[f32], fname: &str) -> Result<()> {
-    let gamma = 0.0;
     let file = std::fs::File::create(fname)?;
     let ref mut w = BufWriter::new(file);
 
     let mut bytes = vec![0; width * height * 4];
     for i in (0..bytes.len()).step_by(4) {
-        bytes[i] = to_byte(data[i], gamma);
-        bytes[i + 1] = to_byte(data[i + 1], gamma);
-        bytes[i + 2] = to_byte(data[i + 2], gamma);
+        bytes[i] = to_byte(gamma(data[i]));
+        bytes[i + 1] = to_byte(gamma(data[i + 1]));
+        bytes[i + 2] = to_byte(gamma(data[i + 2]));
         bytes[i + 3] = 255;
     }
 
