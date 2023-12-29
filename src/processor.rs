@@ -322,6 +322,20 @@ fn cmp_u32(a: u32, b: u32, op: OP8) -> bool {
     }
 }
 
+fn cmp_u64(a: u64, b: u64, op: OP8) -> bool {
+    match op {
+        OP8::F => false,
+        OP8::LT => a < b,
+        OP8::EQ => a == b,
+        OP8::LE => a <= b,
+        OP8::GT => a > b,
+        OP8::LG => a != b,
+        OP8::GE => a >= b,
+        OP8::TRU => true,
+        _ => panic!(),
+    }
+}
+
 use num_traits::ops::mul_add::MulAdd;
 
 #[inline(always)]
@@ -613,9 +627,9 @@ fn div_scale_f64(s0: f64, s1: f64, s2: f64) -> (f64, bool) {
 
 fn div_fixup_f32(s0: f32, s1: f32, s2: f32) -> f32 {
     let sign_out = s1.is_sign_negative() != s2.is_sign_negative();
-    if s2 == f32::NAN {
+    if s2.is_nan() {
         s2
-    } else if s1 == f32::NAN {
+    } else if s1.is_nan() {
         s1
     } else if s1 == 0.0 && s2 == 0.0 {
         // 0/0
@@ -652,9 +666,9 @@ fn div_fixup_f32(s0: f32, s1: f32, s2: f32) -> f32 {
 
 fn div_fixup_f64(s0: f64, s1: f64, s2: f64) -> f64 {
     let sign_out = s1.is_sign_negative() != s2.is_sign_negative();
-    if s2 == f64::NAN {
+    if s2.is_nan() {
         s2
-    } else if s1 == f64::NAN {
+    } else if s1.is_nan() {
         s1
     } else if s1 == 0.0 && s2 == 0.0 {
         // 0/0
@@ -1186,15 +1200,15 @@ fn s_mul_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     cu.write_sop_dst(d, d_value as u32);
 }
 
-fn s_lshl_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
-    let s0_value = cu.read_sop_src(s0) as i32;
-    let s1_value = cu.read_sop_src(s1) as i32;
+fn s_lshl_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
     let d_value = s0_value << ((s1_value) & 0x1F);
-    cu.write_sop_dst(d, d_value as u32);
+    cu.write_sop_dst(d, d_value);
     cu.ctx.scc = d_value != 0;
 }
 
-fn s_lshr_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+fn s_lshr_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0);
     let s1_value = cu.read_sop_src(s1);
     let d_value = s0_value >> (s1_value & 0x1F);
@@ -1214,6 +1228,22 @@ fn s_cselect_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let s1_value = cu.read_sop_src(s1);
     let d_value = if cu.ctx.scc { s0_value } else { s1_value };
     cu.write_sop_dst(d, d_value);
+}
+
+fn s_lshl_b64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let d_value = s0_value << ((s1_value) & 0x3F);
+    cu.write_sop_dst_pair(d, d_value);
+    cu.ctx.scc = d_value != 0;
+}
+
+fn s_lshr_b64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src_pair(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let d_value = s0_value >> ((s1_value) & 0x3F);
+    cu.write_sop_dst_pair(d, d_value);
+    cu.ctx.scc = d_value != 0;
 }
 
 fn s_cselect_b64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -1824,6 +1854,7 @@ fn v_cmp_class_f64_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs
         .map(|elem| cu.read_vop_src(elem, s1))
         .collect::<Vec<u32>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1831,7 +1862,13 @@ fn v_cmp_class_f64_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs
         let s0_value = s0_values[elem];
         let s1_value = s1_values[elem];
         let d_value = cmp_class_f64(s0_value, s1_value);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -1843,6 +1880,7 @@ fn v_cmp_class_f32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs
         .map(|elem| cu.read_vop_src(elem, s1))
         .collect::<Vec<u32>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1850,7 +1888,13 @@ fn v_cmp_class_f32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs
         let s0_value = s0_values[elem];
         let s1_value = s1_values[elem];
         let d_value = cmp_class_f32(s0_value, s1_value);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -1871,6 +1915,7 @@ fn v_cmp_op_f64_e64(
         .map(|elem| u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1))
         .collect::<Vec<f64>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1878,7 +1923,13 @@ fn v_cmp_op_f64_e64(
         let s0_value = s0_values[elem];
         let s1_value = s1_values[elem];
         let d_value = cmp_f64(s0_value, s1_value, op);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -1899,6 +1950,7 @@ fn v_cmp_op_f32_e64(
         .map(|elem| u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1))
         .collect::<Vec<f32>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1906,7 +1958,13 @@ fn v_cmp_op_f32_e64(
         let s0_value = s0_values[elem];
         let s1_value = s1_values[elem];
         let d_value = cmp_f32(s0_value, s1_value, op);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -1919,6 +1977,7 @@ fn v_cmp_op_u16_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usiz
         .map(|elem| cu.read_vop_src(elem, s1))
         .collect::<Vec<u32>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1926,7 +1985,13 @@ fn v_cmp_op_u16_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usiz
         let s0_value = s0_values[elem] as u16;
         let s1_value = s1_values[elem] as u16;
         let d_value = cmp_u16(s0_value, s1_value, op);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -1939,6 +2004,7 @@ fn v_cmp_op_u32_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usiz
         .map(|elem| cu.read_vop_src(elem, s1))
         .collect::<Vec<u32>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1946,7 +2012,40 @@ fn v_cmp_op_u32_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usiz
         let s0_value = s0_values[elem];
         let s1_value = s1_values[elem];
         let d_value = cmp_u32(s0_value, s1_value, op);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+    }
+}
+
+fn v_cmp_op_u64_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usize) {
+    let s0_values = (0..64)
+        .map(|elem| cu.read_vop_src_pair(elem, s0))
+        .collect::<Vec<u64>>();
+
+    let s1_values = (0..64)
+        .map(|elem| cu.read_vop_src_pair(elem, s1))
+        .collect::<Vec<u64>>();
+
+    let mut vcc = 0u64;
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = s0_values[elem];
+        let s1_value = s1_values[elem];
+        let d_value = cmp_u64(s0_value, s1_value, op);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -1959,6 +2058,7 @@ fn v_cmp_op_i32_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usiz
         .map(|elem| cu.read_vop_src(elem, s1))
         .collect::<Vec<u32>>();
 
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -1966,7 +2066,13 @@ fn v_cmp_op_i32_e64(cu: &mut ComputeUnit, op: OP8, d: usize, s0: usize, s1: usiz
         let s0_value = s0_values[elem] as i32;
         let s1_value = s1_values[elem] as i32;
         let d_value = cmp_i32(s0_value, s1_value, op);
-        cu.set_sgpr_bit(d, elem, d_value);
+        vcc |= (d_value as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -2027,6 +2133,42 @@ fn v_lshlrev_b32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
         let s0_value = cu.read_vop_src(elem, s0);
         let s1_value = cu.read_vop_src(elem, s1);
         let d_value = s1_value << (s0_value & 0x1F);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_and_b32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s0_value & s1_value;
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_or_b32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s0_value | s1_value;
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_xor_b32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s1_value ^ s0_value;
         cu.write_vgpr(elem, d, d_value);
     }
 }
@@ -2373,12 +2515,91 @@ fn v_max_f64(
         }
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
-        let d_value = if s0_value >= s1_value {
-            s0_value
-        } else {
-            s1_value
-        };
+        let d_value = s0_value.max(s1_value);
         cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+    }
+}
+
+fn v_min_f64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
+        let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
+        let d_value = s0_value.min(s1_value);
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+    }
+}
+
+fn v_rsq_f64_e64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let d_value = 1.0 / s0_value.sqrt();
+
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+    }
+}
+
+fn v_rcp_f64_e64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let d_value = 1.0 / s0_value;
+
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+    }
+}
+
+fn v_cvt_f64_u32_e64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let d_value = f64_to_u64(s0_value as f64);
+
+        cu.write_vgpr_pair(elem, d, d_value);
+    }
+}
+
+fn v_cvt_i32_f64_e64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let d_value = s0_value as i32;
+
+        cu.write_vgpr(elem, d, d_value as u32);
+    }
+}
+
+fn v_rndne_f64_e64(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
+        let mut d_value = (s0_value + 0.5).floor();
+        if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
+            d_value -= 1.0;
+        }
+
+        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
     }
 }
 
@@ -2445,12 +2666,14 @@ fn v_mad_u64_u32(
         let s0_value = cu.read_vop_src(elem, s0);
         let s1_value = cu.read_vop_src(elem, s1);
         let s2_value = cu.read_vop_src_pair(elem, s2);
-        let d_value = s0_value as u64 * s1_value as u64 + s2_value;
+        let (d_value, carry) = (s0_value as u64 * s1_value as u64).overflowing_add(s2_value);
         cu.write_vgpr_pair(elem, d, d_value);
+        cu.set_vcc(elem, carry);
     }
 }
 
 fn v_add_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, clamp: bool) {
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2459,11 +2682,18 @@ fn v_add_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usi
         let s1_value = cu.read_vop_src(elem, s1);
         let (d_value, carry) = add_u32(s0_value, s1_value, 0);
         cu.write_vgpr(elem, d, d_value);
-        cu.set_sgpr_bit(sdst, elem, carry);
+        vcc |= (carry as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
 fn v_sub_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, clamp: bool) {
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2472,7 +2702,13 @@ fn v_sub_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usi
         let s1_value = cu.read_vop_src(elem, s1);
         let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
         cu.write_vgpr(elem, d, d_value);
-        cu.set_sgpr_bit(sdst, elem, carry);
+        vcc |= (carry as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -2485,20 +2721,28 @@ fn v_addc_u32_e64(
     s2: usize,
     clamp: bool,
 ) {
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
         }
         let s0_value = cu.read_vop_src(elem, s0);
         let s1_value = cu.read_vop_src(elem, s1);
-        let s2_value = cu.read_vop_src(elem, s2);
+        let s2_value = cu.get_sgpr_bit(s2, elem) as u32;
         let (d_value, carry) = add_u32(s0_value, s1_value, s2_value);
         cu.write_vgpr(elem, d, d_value);
-        cu.set_sgpr_bit(sdst, elem, carry);
+        vcc |= (carry as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
 fn v_div_scale_f32(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, s2: usize) {
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2506,14 +2750,21 @@ fn v_div_scale_f32(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: u
         let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
         let s1_value = u32_to_f32(cu.read_vop_src(elem, s1));
         let s2_value = u32_to_f32(cu.read_vop_src(elem, s2));
-        let (d_value, vcc) = div_scale_f32(s0_value, s1_value, s2_value);
+        let (d_value, flag) = div_scale_f32(s0_value, s1_value, s2_value);
 
         cu.write_vgpr(elem, d, f32_to_u32(d_value));
-        cu.set_sgpr_bit(sdst, elem, vcc);
+        vcc |= (flag as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
 fn v_div_scale_f64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, s2: usize) {
+    let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2521,10 +2772,16 @@ fn v_div_scale_f64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: u
         let s0_value = u64_to_f64(cu.read_vop_src_pair(elem, s0));
         let s1_value = u64_to_f64(cu.read_vop_src_pair(elem, s1));
         let s2_value = u64_to_f64(cu.read_vop_src_pair(elem, s2));
-        let (d_value, vcc) = div_scale_f64(s0_value, s1_value, s2_value);
+        let (d_value, flag) = div_scale_f64(s0_value, s1_value, s2_value);
 
         cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
-        cu.set_sgpr_bit(sdst, elem, vcc);
+        vcc |= (flag as u64) << elem;
+    }
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        cu.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
     }
 }
 
@@ -2850,6 +3107,9 @@ impl ComputeUnit {
     fn is_vccnz(&self) -> bool {
         !self.is_vccz()
     }
+    fn is_execnz(&self) -> bool {
+        !self.is_execz()
+    }
     fn set_hw_reg(&mut self, id: usize, offset: usize, size: usize, value: u32) {
         // ignore
     }
@@ -2870,6 +3130,10 @@ impl ComputeUnit {
             panic!();
         }
         self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx, value);
+    }
+    fn write_sgpr_pair(&mut self, idx: usize, value: u64) {
+        self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx, (value & 0xFFFFFFFF) as u32);
+        self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx + 1, ((value >> 32) & 0xFFFFFFFF) as u32);
     }
     fn get_flat_scratch_lo(&self) -> u32 {
         self.read_sgpr(self.num_sgprs - 4)
@@ -3126,6 +3390,11 @@ impl ComputeUnit {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
                 }
             }
+            I::S_CBRANCH_EXECNZ => {
+                if self.is_execnz() {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
             I::S_CBRANCH_EXECZ => {
                 if self.is_execz() {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
@@ -3243,16 +3512,22 @@ impl ComputeUnit {
                 s_mul_i32_e32(self, d, s0, s1);
             }
             I::S_LSHL_B32 => {
-                s_lshl_i32_e32(self, d, s0, s1);
+                s_lshl_b32(self, d, s0, s1);
             }
             I::S_LSHR_B32 => {
-                s_lshr_i32_e32(self, d, s0, s1);
+                s_lshr_b32(self, d, s0, s1);
             }
             I::S_BFM_B32 => {
                 s_bfm_b32_e32(self, d, s0, s1);
             }
             I::S_CSELECT_B32 => {
                 s_cselect_b32(self, d, s0, s1);
+            }
+            I::S_LSHL_B64 => {
+                s_lshl_b64(self, d, s0, s1);
+            }
+            I::S_LSHR_B64 => {
+                s_lshr_b64(self, d, s0, s1);
             }
             I::S_CSELECT_B64 => {
                 s_cselect_b64(self, d, s0, s1);
@@ -3483,6 +3758,9 @@ impl ComputeUnit {
             I::V_CMP_U32(op8) => {
                 v_cmp_op_u32_e64(self, op8, d, s0, s1);
             }
+            I::V_CMP_U64(op8) => {
+                v_cmp_op_u64_e64(self, op8, d, s0, s1);
+            }
             I::V_CMP_I32(op8) => {
                 v_cmp_op_i32_e64(self, op8, d, s0, s1);
             }
@@ -3497,6 +3775,15 @@ impl ComputeUnit {
             }
             I::V_LSHLREV_B32 => {
                 v_lshlrev_b32_e64(self, d, s0, s1);
+            }
+            I::V_AND_B32 => {
+                v_and_b32_e64(self, d, s0, s1);
+            }
+            I::V_OR_B32 => {
+                v_or_b32_e64(self, d, s0, s1);
+            }
+            I::V_XOR_B32 => {
+                v_xor_b32_e64(self, d, s0, s1);
             }
             I::V_MAX_F32 => {
                 v_max_f32_e64(self, d, s0, s1, abs, neg, clamp);
@@ -3570,7 +3857,25 @@ impl ComputeUnit {
             I::V_MAX_F64 => {
                 v_max_f64(self, d, s0, s1, abs, neg, clamp);
             }
-            _ => unimplemented!()
+            I::V_MIN_F64 => {
+                v_min_f64(self, d, s0, s1, abs, neg, clamp);
+            }
+            I::V_RSQ_F64 => {
+                v_rsq_f64_e64(self, d, s0);
+            }
+            I::V_RCP_F64 => {
+                v_rcp_f64_e64(self, d, s0);
+            }
+            I::V_CVT_F64_U32 => {
+                v_cvt_f64_u32_e64(self, d, s0);
+            }
+            I::V_RNDNE_F64 => {
+                v_rndne_f64_e64(self, d, s0);
+            }
+            I::V_CVT_I32_F64 => {
+                v_cvt_i32_f64_e64(self, d, s0);
+            }
+            _ => unimplemented!(),
         }
         Signals::None
     }
