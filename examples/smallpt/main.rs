@@ -1,7 +1,9 @@
 use yaml_rust::yaml::*;
 
 use object::*;
+use amdgpu_sim::processor::*;
 use amdgpu_sim::gcn_processor::*;
+use amdgpu_sim::rdna_processor::*;
 use std::env;
 use std::fs::File;
 use std::io::*;
@@ -324,7 +326,7 @@ fn main() -> Result<()> {
             .unwrap();
 
         let metadata = decode_note_metadata(note_section_data.data()).unwrap();
-        let (kernarg_seg_size, private_segment_size) = if let Metadata::Yaml(metadata) = metadata {
+        let (kernarg_seg_size, private_segment_size, wavefront_size) = if let Metadata::Yaml(metadata) = metadata {
             let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
             let metadata = &metadatas[0];
 
@@ -352,8 +354,15 @@ fn main() -> Result<()> {
 
             let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
             let private_segment_size = private_seg_fixed_size + stack_size;
+            let wavefront_size = if let Yaml::Integer(integer) =
+                metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
+            {
+                integer
+            } else {
+                panic!("Wavefront size not found in metadata")
+            } as usize;
 
-            (kernarg_seg_size, private_segment_size)
+            (kernarg_seg_size, private_segment_size, wavefront_size)
         } else if let Metadata::MessagePack(metadata) = metadata {
             let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
             if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
@@ -366,13 +375,12 @@ fn main() -> Result<()> {
                 } else {
                     false
                 };
-
-                assert_eq!(map.amdhsa_kernels[0].wavefront_size, 64);
                 
                 let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
                 let private_segment_size = private_seg_fixed_size + stack_size;
+                let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
 
-                (kernarg_seg_size, private_segment_size)
+                (kernarg_seg_size, private_segment_size, wavefront_size)
             } else {
                 panic!()
             }
@@ -415,7 +423,7 @@ fn main() -> Result<()> {
             let size = segment.size() as usize;
             let new_size = mem.len().max(offset + size);
             mem.resize(new_size, 0);
-            mem[offset..(offset + size)].copy_from_slice(segment.data());
+            mem[offset..(offset + size.min(segment.data().len()))].copy_from_slice(segment.data());
         }
 
         if let Some(kernel_sym) = elffile
@@ -438,17 +446,31 @@ fn main() -> Result<()> {
                 kernel_object: Pointer::new(&data, kernel_addr),
                 kernarg_address: Pointer::new(&arg_buffer, 0),
             };
-            let mut processor = GCNProcessor::new(&aql, 16, &mem);
 
-            use std::time::Instant;
-            let start = Instant::now();
-            processor.execute();
-            let end = start.elapsed();
-            println!(
-                "Elapsed time: {}.{:03} [ms]",
-                end.as_secs(),
-                end.subsec_nanos() / 1_000
-            );
+            if (arch == "gfx803") && (wavefront_size != 64) {
+                println!("Wavefront size must be 64 for gfx803 architectures.");
+                return Ok(());
+            }
+
+            if arch == "gfx803" {
+                let mut processor = GCNProcessor::new(&aql, 16, &mem);
+
+                use std::time::Instant;
+                let start = Instant::now();
+                processor.execute();
+                let end = start.elapsed();
+                println!(
+                    "Elapsed time: {}.{:03} [ms]",
+                    end.as_secs(),
+                    end.subsec_nanos() / 1_000
+                );
+            } else if "gfx1200" == arch {
+                let mut processor = RDNAProcessor::new(&aql, 32, &mem);
+                processor.execute();
+            } else {
+                println!("Unsupported architecture: {}", arch);
+                return Ok(());
+            }
         }
     }
 

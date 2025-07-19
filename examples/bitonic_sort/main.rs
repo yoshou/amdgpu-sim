@@ -1,6 +1,7 @@
 use yaml_rust::yaml::*;
 
 use object::*;
+use amdgpu_sim::processor::*;
 use amdgpu_sim::gcn_processor::*;
 use std::env;
 use std::fs::File;
