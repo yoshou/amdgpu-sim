@@ -782,246 +782,6 @@ pub struct hsa_kernel_dispatch_packet_s<'a> {
     // hsa_signal_t completion_signal;
 }
 
-use std::sync::{Arc, Mutex, RwLock};
-
-pub struct SISimulator<'a> {
-    cunits: Vec<Arc<Mutex<ComputeUnit>>>,
-    entry_address: usize,
-    kernel_desc: KernelDescriptor,
-    aql_packet_address: u64,
-    kernel_args_ptr: u64,
-    aql: hsa_kernel_dispatch_packet_s<'a>,
-    private_seg_buffer: Vec<u8>,
-}
-
-impl<'a> SISimulator<'a> {
-    pub fn new(aql: &hsa_kernel_dispatch_packet_s<'a>, num_cunits: usize, mem: &Vec<u8>) -> Self {
-        let insts = aql.kernel_object.object.to_vec();
-        let kd = aql.kernel_object.offset;
-        let kernel_desc = decode_kernel_desc(&insts[kd..(kd + 64)]);
-        let aql_packet_address = (aql as *const hsa_kernel_dispatch_packet_s) as u64;
-
-        let mut cunits = vec![];
-        for _ in 0..num_cunits {
-            let cu = Arc::new(Mutex::new(ComputeUnit::new(
-                kd + kernel_desc.kernel_code_entry_byte_offset,
-                mem.clone(),
-                kernel_desc.granulated_wavefront_sgpr_count,
-                kernel_desc.granulated_workitem_vgpr_count,
-            )));
-
-            cunits.push(cu);
-        }
-
-        let kernel_args_ptr = aql.kernarg_address.address();
-        let entry_address = kd + kernel_desc.kernel_code_entry_byte_offset;
-
-        let private_segment_size = aql.private_segment_size as usize;
-        let private_seg_buffer: Vec<u8> = vec![0u8; private_segment_size * 256 * num_cunits];
-
-        // create instance
-        SISimulator {
-            cunits: cunits,
-            kernel_desc: kernel_desc,
-            kernel_args_ptr: kernel_args_ptr,
-            aql_packet_address: aql_packet_address,
-            entry_address: entry_address,
-            aql: *aql,
-            private_seg_buffer: private_seg_buffer,
-        }
-    }
-
-    fn dispatch(
-        &self,
-        thread_id: u32,
-        workgroup_id_x: u32,
-        workgroup_id_y: u32,
-        workgroup_id_z: u32,
-        workitem_offset: usize,
-    ) -> ([u32; 16], [[u32; 64]; 16]) {
-        let private_seg_ptr = if self.private_seg_buffer.len() > 0 {
-            (&self.private_seg_buffer[0] as *const u8) as u64
-        } else {
-            0
-        };
-
-        let kernel_args_ptr = self.kernel_args_ptr;
-        let aql_packet_address = self.aql_packet_address;
-        let kernel_desc = &self.kernel_desc;
-        let private_seg_size = self.aql.private_segment_size as u64;
-        // initialize sgprs
-        let mut sgprs = [0u32; 16];
-        let mut sgprs_pos = 0;
-        if kernel_desc.enable_sgpr_private_segment_buffer {
-            let mut desc_w0 = 0;
-            desc_w0 |=
-                (private_seg_ptr + (thread_id as u64) * private_seg_size * 256) & ((1 << 48) - 1);
-            desc_w0 |= (private_seg_size & ((1 << 14) - 1)) << 48;
-            for i in 0..2 {
-                sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
-            }
-            // println!(
-            //     "s[{}..{}]: Private Segment Buffer",
-            //     sgprs_pos,
-            //     sgprs_pos + 3
-            // );
-            sgprs_pos += 4;
-        }
-        if kernel_desc.enable_sgpr_dispatch_ptr {
-            sgprs[sgprs_pos] = (aql_packet_address & 0xFFFFFFFF) as u32;
-            sgprs[sgprs_pos + 1] = ((aql_packet_address >> 32) & 0xFFFFFFFF) as u32;
-            // println!("s[{}..{}]: Dispatch Ptr", sgprs_pos, sgprs_pos + 1);
-            sgprs_pos += 2;
-        }
-        if kernel_desc.enable_sgpr_queue_ptr {
-            // println!("s[{}..{}]: Queue Ptr", sgprs_pos, sgprs_pos + 1);
-            sgprs_pos += 2;
-        }
-        if kernel_desc.enable_sgpr_kernarg_segment_ptr {
-            sgprs[sgprs_pos] = (kernel_args_ptr & 0xFFFFFFFF) as u32;
-            sgprs[sgprs_pos + 1] = ((kernel_args_ptr >> 32) & 0xFFFFFFFF) as u32;
-            // println!("s[{}..{}]: Kernarg Segment Ptr", sgprs_pos, sgprs_pos + 1);
-            sgprs_pos += 2;
-        }
-        if kernel_desc.enable_sgpr_dispatch_id {
-            // println!("s[{}..{}]: Dispatch Id", sgprs_pos, sgprs_pos + 1);
-            sgprs_pos += 2;
-        }
-        if kernel_desc.enable_sgpr_flat_scratch_init {
-            sgprs[sgprs_pos] = thread_id * self.aql.private_segment_size;
-            sgprs[sgprs_pos + 1] = self.aql.private_segment_size;
-            // println!("s[{}..{}]: Flat Scratch Init", sgprs_pos, sgprs_pos + 1);
-            sgprs_pos += 2;
-        }
-        if kernel_desc.enable_sgpr_grid_workgroup_count_x && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count X", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_grid_workgroup_count_y && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count Y", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_grid_workgroup_count_z && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count Z", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_workgroup_id_x {
-            sgprs[sgprs_pos] = workgroup_id_x;
-            // println!("s[{}]: Work-Group Id X", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_workgroup_id_y {
-            sgprs[sgprs_pos] = workgroup_id_y;
-            // println!("s[{}]: Work-Group Id Y", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_workgroup_id_z {
-            sgprs[sgprs_pos] = workgroup_id_z;
-            // println!("s[{}]: Work-Group Id Z", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_workgroup_info {
-            sgprs[sgprs_pos] = 0;
-            // println!("s[{}]: Work-Group Info", sgprs_pos);
-            sgprs_pos += 1;
-        }
-        if kernel_desc.enable_sgpr_private_segment_wave_offset {
-            sgprs[sgprs_pos] = 0;
-            // println!("s[{}]: Scratch Wave Offset", sgprs_pos);
-            sgprs_pos += 1;
-        }
-
-        // initialize vgprs
-        let mut vgprs = [[0u32; 64]; 16];
-        let mut vgprs_pos = 0;
-        for i in 0..64 {
-            let id_x = (i + workitem_offset) % self.aql.workgroup_size_x as usize;
-            vgprs[vgprs_pos][i] = id_x as u32;
-        }
-        vgprs_pos += 1;
-        if kernel_desc.enable_vgpr_workitem_id > 0 {
-            for i in 0..64 {
-                let id_y = ((i + workitem_offset) / self.aql.workgroup_size_x as usize)
-                    % self.aql.workgroup_size_y as usize;
-                vgprs[vgprs_pos][i] = id_y as u32;
-            }
-            vgprs_pos += 1;
-        }
-        if kernel_desc.enable_vgpr_workitem_id > 1 {
-            for i in 0..64 {
-                let id_z = ((i + workitem_offset)
-                    / (self.aql.workgroup_size_x * self.aql.workgroup_size_y) as usize)
-                    % self.aql.workgroup_size_z as usize;
-                vgprs[vgprs_pos][i] = id_z as u32;
-            }
-            vgprs_pos += 1;
-        }
-
-        // initialize pc
-        (sgprs, vgprs)
-    }
-
-    pub fn execute(&mut self) {
-        let workgroup_size_x = self.aql.workgroup_size_x as u32;
-        let workgroup_size_y = self.aql.workgroup_size_y as u32;
-        let workgroup_size_z = self.aql.workgroup_size_z as u32;
-
-        let workgroup_size = (workgroup_size_x * workgroup_size_y * workgroup_size_z) as usize;
-
-        let num_workgroup_x = (self.aql.grid_size_x + workgroup_size_x - 1) / workgroup_size_x;
-        let num_workgroup_y = (self.aql.grid_size_y + workgroup_size_y - 1) / workgroup_size_y;
-        let num_workgroup_z = (self.aql.grid_size_z + workgroup_size_z - 1) / workgroup_size_z;
-
-        let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
-
-        use indicatif::ProgressBar;
-        let bar = ProgressBar::new(num_workgroups as u64);
-
-        let num_cunits = self.cunits.len();
-
-        for workgroup_id_base in (0..num_workgroups).step_by(num_cunits) {
-            let mut thread_handles = vec![];
-            for cu_idx in 0..num_cunits {
-                let workgroup_id = workgroup_id_base + cu_idx as u32;
-                let workgroup_id_x = workgroup_id % num_workgroup_x;
-                let workgroup_id_y = (workgroup_id / num_workgroup_x) % num_workgroup_y;
-                let workgroup_id_z =
-                    (workgroup_id / (num_workgroup_x * num_workgroup_y)) % num_workgroup_z;
-
-                let mut setup_data = vec![];
-                for workitem_id in (0..workgroup_size).step_by(64) {
-                    setup_data.push(self.dispatch(
-                        cu_idx as u32,
-                        workgroup_id_x,
-                        workgroup_id_y,
-                        workgroup_id_z,
-                        workitem_id,
-                    ));
-                }
-
-                let entry_address = self.entry_address;
-
-                let cu = Arc::clone(&self.cunits[cu_idx]);
-                use std::thread;
-
-                let handle = thread::spawn(move || {
-                    if let Ok(mut v) = cu.lock() {
-                        v.dispatch(entry_address, setup_data, workgroup_size / 64);
-                    }
-                });
-                thread_handles.push(handle);
-            }
-
-            for t in thread_handles {
-                t.join();
-                bar.inc(1);
-            }
-        }
-
-        bar.finish();
-    }
-}
-
 fn s_movk_i32(cu: &mut ComputeUnit, d: usize, simm16: i16) {
     cu.write_sop_dst(d, (simm16 as i32) as u32);
 }
@@ -2500,15 +2260,7 @@ fn v_ldexp_f64(
     }
 }
 
-fn v_max_f64(
-    cu: &mut ComputeUnit,
-    d: usize,
-    s0: usize,
-    s1: usize,
-    abs: u8,
-    neg: u8,
-    clamp: bool,
-) {
+fn v_max_f64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg: u8, clamp: bool) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2520,15 +2272,7 @@ fn v_max_f64(
     }
 }
 
-fn v_min_f64(
-    cu: &mut ComputeUnit,
-    d: usize,
-    s0: usize,
-    s1: usize,
-    abs: u8,
-    neg: u8,
-    clamp: bool,
-) {
+fn v_min_f64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg: u8, clamp: bool) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -3132,8 +2876,16 @@ impl ComputeUnit {
         self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx, value);
     }
     fn write_sgpr_pair(&mut self, idx: usize, value: u64) {
-        self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx, (value & 0xFFFFFFFF) as u32);
-        self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx + 1, ((value >> 32) & 0xFFFFFFFF) as u32);
+        self.sgprs.set(
+            0,
+            self.num_sgprs * self.ctx.id + idx,
+            (value & 0xFFFFFFFF) as u32,
+        );
+        self.sgprs.set(
+            0,
+            self.num_sgprs * self.ctx.id + idx + 1,
+            ((value >> 32) & 0xFFFFFFFF) as u32,
+        );
     }
     fn get_flat_scratch_lo(&self) -> u32 {
         self.read_sgpr(self.num_sgprs - 4)
@@ -3559,7 +3311,7 @@ impl ComputeUnit {
             I::S_CMP_EQ_U64 => {
                 s_cmp_eq_u64(self, s0, s1);
             }
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -3577,7 +3329,7 @@ impl ComputeUnit {
             I::S_LOAD_DWORDX4 => {
                 s_load_dwordx4(self, sdata, sbase, soffset);
             }
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -3654,7 +3406,7 @@ impl ComputeUnit {
             I::V_RNDNE_F64 => {
                 v_rndne_f64_e32(self, d, s0);
             }
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -3928,7 +3680,7 @@ impl ComputeUnit {
             I::V_CMP_CLASS_F64 => {
                 v_cmp_class_f64(self, s0, s1);
             }
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -3969,7 +3721,7 @@ impl ComputeUnit {
             I::FLAT_STORE_DWORDX4 => {
                 flat_store_dwordx4(self, s, addr);
             }
-            _ => unimplemented!()
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -4024,5 +3776,245 @@ impl ComputeUnit {
     }
     fn fetch_literal_constant(&self) -> u32 {
         get_u32(&self.insts, self.ctx.pc + 4)
+    }
+}
+
+use std::sync::{Arc, Mutex};
+
+pub struct GCNProcessor<'a> {
+    cunits: Vec<Arc<Mutex<ComputeUnit>>>,
+    entry_address: usize,
+    kernel_desc: KernelDescriptor,
+    aql_packet_address: u64,
+    kernel_args_ptr: u64,
+    aql: hsa_kernel_dispatch_packet_s<'a>,
+    private_seg_buffer: Vec<u8>,
+}
+
+impl<'a> GCNProcessor<'a> {
+    pub fn new(aql: &hsa_kernel_dispatch_packet_s<'a>, num_cunits: usize, mem: &Vec<u8>) -> Self {
+        let insts = aql.kernel_object.object.to_vec();
+        let kd = aql.kernel_object.offset;
+        let kernel_desc = decode_kernel_desc(&insts[kd..(kd + 64)]);
+        let aql_packet_address = (aql as *const hsa_kernel_dispatch_packet_s) as u64;
+
+        let mut cunits = vec![];
+        for _ in 0..num_cunits {
+            let cu = Arc::new(Mutex::new(ComputeUnit::new(
+                kd + kernel_desc.kernel_code_entry_byte_offset,
+                mem.clone(),
+                kernel_desc.granulated_wavefront_sgpr_count,
+                kernel_desc.granulated_workitem_vgpr_count,
+            )));
+
+            cunits.push(cu);
+        }
+
+        let kernel_args_ptr = aql.kernarg_address.address();
+        let entry_address = kd + kernel_desc.kernel_code_entry_byte_offset;
+
+        let private_segment_size = aql.private_segment_size as usize;
+        let private_seg_buffer: Vec<u8> = vec![0u8; private_segment_size * 256 * num_cunits];
+
+        // create instance
+        GCNProcessor {
+            cunits: cunits,
+            kernel_desc: kernel_desc,
+            kernel_args_ptr: kernel_args_ptr,
+            aql_packet_address: aql_packet_address,
+            entry_address: entry_address,
+            aql: *aql,
+            private_seg_buffer: private_seg_buffer,
+        }
+    }
+
+    fn dispatch(
+        &self,
+        thread_id: u32,
+        workgroup_id_x: u32,
+        workgroup_id_y: u32,
+        workgroup_id_z: u32,
+        workitem_offset: usize,
+    ) -> ([u32; 16], [[u32; 64]; 16]) {
+        let private_seg_ptr = if self.private_seg_buffer.len() > 0 {
+            (&self.private_seg_buffer[0] as *const u8) as u64
+        } else {
+            0
+        };
+
+        let kernel_args_ptr = self.kernel_args_ptr;
+        let aql_packet_address = self.aql_packet_address;
+        let kernel_desc = &self.kernel_desc;
+        let private_seg_size = self.aql.private_segment_size as u64;
+        // initialize sgprs
+        let mut sgprs = [0u32; 16];
+        let mut sgprs_pos = 0;
+        if kernel_desc.enable_sgpr_private_segment_buffer {
+            let mut desc_w0 = 0;
+            desc_w0 |=
+                (private_seg_ptr + (thread_id as u64) * private_seg_size * 256) & ((1 << 48) - 1);
+            desc_w0 |= (private_seg_size & ((1 << 14) - 1)) << 48;
+            for i in 0..2 {
+                sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
+            }
+            // println!(
+            //     "s[{}..{}]: Private Segment Buffer",
+            //     sgprs_pos,
+            //     sgprs_pos + 3
+            // );
+            sgprs_pos += 4;
+        }
+        if kernel_desc.enable_sgpr_dispatch_ptr {
+            sgprs[sgprs_pos] = (aql_packet_address & 0xFFFFFFFF) as u32;
+            sgprs[sgprs_pos + 1] = ((aql_packet_address >> 32) & 0xFFFFFFFF) as u32;
+            // println!("s[{}..{}]: Dispatch Ptr", sgprs_pos, sgprs_pos + 1);
+            sgprs_pos += 2;
+        }
+        if kernel_desc.enable_sgpr_queue_ptr {
+            // println!("s[{}..{}]: Queue Ptr", sgprs_pos, sgprs_pos + 1);
+            sgprs_pos += 2;
+        }
+        if kernel_desc.enable_sgpr_kernarg_segment_ptr {
+            sgprs[sgprs_pos] = (kernel_args_ptr & 0xFFFFFFFF) as u32;
+            sgprs[sgprs_pos + 1] = ((kernel_args_ptr >> 32) & 0xFFFFFFFF) as u32;
+            // println!("s[{}..{}]: Kernarg Segment Ptr", sgprs_pos, sgprs_pos + 1);
+            sgprs_pos += 2;
+        }
+        if kernel_desc.enable_sgpr_dispatch_id {
+            // println!("s[{}..{}]: Dispatch Id", sgprs_pos, sgprs_pos + 1);
+            sgprs_pos += 2;
+        }
+        if kernel_desc.enable_sgpr_flat_scratch_init {
+            sgprs[sgprs_pos] = thread_id * self.aql.private_segment_size;
+            sgprs[sgprs_pos + 1] = self.aql.private_segment_size;
+            // println!("s[{}..{}]: Flat Scratch Init", sgprs_pos, sgprs_pos + 1);
+            sgprs_pos += 2;
+        }
+        if kernel_desc.enable_sgpr_grid_workgroup_count_x && sgprs_pos < 16 {
+            // println!("s[{}]: Grid Work-Group Count X", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_grid_workgroup_count_y && sgprs_pos < 16 {
+            // println!("s[{}]: Grid Work-Group Count Y", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_grid_workgroup_count_z && sgprs_pos < 16 {
+            // println!("s[{}]: Grid Work-Group Count Z", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_workgroup_id_x {
+            sgprs[sgprs_pos] = workgroup_id_x;
+            // println!("s[{}]: Work-Group Id X", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_workgroup_id_y {
+            sgprs[sgprs_pos] = workgroup_id_y;
+            // println!("s[{}]: Work-Group Id Y", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_workgroup_id_z {
+            sgprs[sgprs_pos] = workgroup_id_z;
+            // println!("s[{}]: Work-Group Id Z", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_workgroup_info {
+            sgprs[sgprs_pos] = 0;
+            // println!("s[{}]: Work-Group Info", sgprs_pos);
+            sgprs_pos += 1;
+        }
+        if kernel_desc.enable_sgpr_private_segment_wave_offset {
+            sgprs[sgprs_pos] = 0;
+            // println!("s[{}]: Scratch Wave Offset", sgprs_pos);
+            sgprs_pos += 1;
+        }
+
+        // initialize vgprs
+        let mut vgprs = [[0u32; 64]; 16];
+        let mut vgprs_pos = 0;
+        for i in 0..64 {
+            let id_x = (i + workitem_offset) % self.aql.workgroup_size_x as usize;
+            vgprs[vgprs_pos][i] = id_x as u32;
+        }
+        vgprs_pos += 1;
+        if kernel_desc.enable_vgpr_workitem_id > 0 {
+            for i in 0..64 {
+                let id_y = ((i + workitem_offset) / self.aql.workgroup_size_x as usize)
+                    % self.aql.workgroup_size_y as usize;
+                vgprs[vgprs_pos][i] = id_y as u32;
+            }
+            vgprs_pos += 1;
+        }
+        if kernel_desc.enable_vgpr_workitem_id > 1 {
+            for i in 0..64 {
+                let id_z = ((i + workitem_offset)
+                    / (self.aql.workgroup_size_x * self.aql.workgroup_size_y) as usize)
+                    % self.aql.workgroup_size_z as usize;
+                vgprs[vgprs_pos][i] = id_z as u32;
+            }
+            vgprs_pos += 1;
+        }
+
+        // initialize pc
+        (sgprs, vgprs)
+    }
+
+    pub fn execute(&mut self) {
+        let workgroup_size_x = self.aql.workgroup_size_x as u32;
+        let workgroup_size_y = self.aql.workgroup_size_y as u32;
+        let workgroup_size_z = self.aql.workgroup_size_z as u32;
+
+        let workgroup_size = (workgroup_size_x * workgroup_size_y * workgroup_size_z) as usize;
+
+        let num_workgroup_x = (self.aql.grid_size_x + workgroup_size_x - 1) / workgroup_size_x;
+        let num_workgroup_y = (self.aql.grid_size_y + workgroup_size_y - 1) / workgroup_size_y;
+        let num_workgroup_z = (self.aql.grid_size_z + workgroup_size_z - 1) / workgroup_size_z;
+
+        let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
+
+        use indicatif::ProgressBar;
+        let bar = ProgressBar::new(num_workgroups as u64);
+
+        let num_cunits = self.cunits.len();
+
+        for workgroup_id_base in (0..num_workgroups).step_by(num_cunits) {
+            let mut thread_handles = vec![];
+            for cu_idx in 0..num_cunits {
+                let workgroup_id = workgroup_id_base + cu_idx as u32;
+                let workgroup_id_x = workgroup_id % num_workgroup_x;
+                let workgroup_id_y = (workgroup_id / num_workgroup_x) % num_workgroup_y;
+                let workgroup_id_z =
+                    (workgroup_id / (num_workgroup_x * num_workgroup_y)) % num_workgroup_z;
+
+                let mut setup_data = vec![];
+                for workitem_id in (0..workgroup_size).step_by(64) {
+                    setup_data.push(self.dispatch(
+                        cu_idx as u32,
+                        workgroup_id_x,
+                        workgroup_id_y,
+                        workgroup_id_z,
+                        workitem_id,
+                    ));
+                }
+
+                let entry_address = self.entry_address;
+
+                let cu = Arc::clone(&self.cunits[cu_idx]);
+                use std::thread;
+
+                let handle = thread::spawn(move || {
+                    if let Ok(mut v) = cu.lock() {
+                        v.dispatch(entry_address, setup_data, workgroup_size / 64);
+                    }
+                });
+                thread_handles.push(handle);
+            }
+
+            for t in thread_handles {
+                t.join();
+                bar.inc(1);
+            }
+        }
+
+        bar.finish();
     }
 }

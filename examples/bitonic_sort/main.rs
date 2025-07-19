@@ -1,7 +1,7 @@
 use yaml_rust::yaml::*;
 
 use object::*;
-use si_isa_sim::processor::*;
+use amdgpu_sim::gcn_processor::*;
 use std::env;
 use std::fs::File;
 use std::io::*;
@@ -240,8 +240,8 @@ fn main() -> Result<()> {
                             kernel_object: Pointer::new(&data, kernel_addr),
                             kernarg_address: Pointer::new(&arg_buffer, 0),
                         };
-                        let mut emu = SISimulator::new(&aql, 1, &mem);
-                        emu.execute();
+                        let mut processor = GCNProcessor::new(&aql, 1, &mem);
+                        processor.execute();
                     }
                 }
             }

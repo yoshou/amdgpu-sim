@@ -1,5 +1,5 @@
 [package]
-name = "si_isa_sim"
+name = "amdgpu_sim"
 version = "0.1.0"
 authors = ["yoshou"]
 edition = "2018"
