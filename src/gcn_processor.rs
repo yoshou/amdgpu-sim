@@ -2926,8 +2926,8 @@ impl ComputeUnit {
         (w0 >> 48) & ((1 << 14) - 1)
     }
     fn execute_sopp(&mut self, inst: SOPP) -> Signals {
-        let simm16 = inst.SIMM16 as i16;
-        match inst.OP {
+        let simm16 = inst.simm16 as i16;
+        match inst.op {
             I::S_NOP => {}
             I::S_ENDPGM => return Signals::EndOfProgram,
             I::S_WAITCNT => {}
@@ -2970,9 +2970,9 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_sopk(&mut self, inst: SOPK) -> Signals {
-        let simm16 = inst.SIMM16 as i16;
-        let d = inst.SDST as usize;
-        match inst.OP {
+        let simm16 = inst.simm16 as i16;
+        let d = inst.sdst as usize;
+        match inst.op {
             I::S_MOVK_I32 => {
                 s_movk_i32(self, d, simm16);
             }
@@ -2985,10 +2985,10 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_sop1(&mut self, inst: SOP1) -> Signals {
-        let d = inst.SDST as usize;
-        let s0 = inst.SSRC0 as usize;
+        let d = inst.sdst as usize;
+        let s0 = inst.ssrc0 as usize;
 
-        match inst.OP {
+        match inst.op {
             I::S_MOV_B32 => {
                 s_mov_b32(self, d, s0);
             }
@@ -3022,11 +3022,11 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_sop2(&mut self, inst: SOP2) -> Signals {
-        let d = inst.SDST as usize;
-        let s0 = inst.SSRC0 as usize;
-        let s1 = inst.SSRC1 as usize;
+        let d = inst.sdst as usize;
+        let s0 = inst.ssrc0 as usize;
+        let s1 = inst.ssrc1 as usize;
 
-        match inst.OP {
+        match inst.op {
             I::S_ADD_U32 => {
                 s_add_u32_e32(self, d, s0, s1);
             }
@@ -3089,10 +3089,10 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_sopc(&mut self, inst: SOPC) -> Signals {
-        let s0 = inst.SSRC0 as usize;
-        let s1 = inst.SSRC1 as usize;
+        let s0 = inst.ssrc0 as usize;
+        let s1 = inst.ssrc1 as usize;
 
-        match inst.OP {
+        match inst.op {
             I::S_CMP_EQ_U32 => {
                 s_cmp_eq_u32_e32(self, s0, s1);
             }
@@ -3116,10 +3116,10 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_smem(&mut self, inst: SMEM) -> Signals {
-        let sdata = inst.SDATA as usize;
-        let soffset = inst.OFFSET as u64;
-        let sbase = (inst.SBASE * 2) as usize;
-        match inst.OP {
+        let sdata = inst.sdata as usize;
+        let soffset = inst.offset as u64;
+        let sbase = (inst.sbase * 2) as usize;
+        match inst.op {
             I::S_LOAD_DWORD => {
                 s_load_dword(self, sdata, sbase, soffset);
             }
@@ -3134,9 +3134,9 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_vop1(&mut self, inst: VOP1) -> Signals {
-        let d = inst.VDST as usize;
-        let s0 = inst.SRC0 as usize;
-        match inst.OP {
+        let d = inst.vdst as usize;
+        let s0 = inst.src0 as usize;
+        match inst.op {
             I::V_MOV_B32 => {
                 v_mov_b32_e32(self, d, s0);
             }
@@ -3211,11 +3211,11 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_vop2(&mut self, inst: VOP2) -> Signals {
-        let d = inst.VDST as usize;
-        let s0 = inst.SRC0 as usize;
-        let s1 = inst.VSRC1 as usize;
+        let d = inst.vdst as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.vsrc1 as usize;
 
-        match inst.OP {
+        match inst.op {
             I::V_CNDMASK_B32 => {
                 v_cndmask_b32_e32(self, d, s0, s1);
             }
@@ -3283,15 +3283,15 @@ impl ComputeUnit {
     }
 
     fn execute_vop3a(&mut self, inst: VOP3A) -> Signals {
-        let d = inst.VDST as usize;
-        let s0 = inst.SRC0 as usize;
-        let s1 = inst.SRC1 as usize;
-        let s2 = inst.SRC2 as usize;
-        let abs = inst.ABS;
-        let neg = inst.NEG;
-        let clamp = inst.CLAMP != 0;
-        let omod = inst.OMOD;
-        match inst.OP {
+        let d = inst.vdst as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.src1 as usize;
+        let s2 = inst.src2 as usize;
+        let abs = inst.abs;
+        let neg = inst.neg;
+        let clamp = inst.clamp != 0;
+        let omod = inst.omod;
+        match inst.op {
             I::V_CMP_CLASS_F64 => {
                 v_cmp_class_f64_e64(self, d, s0, s1, abs, neg);
             }
@@ -3432,12 +3432,12 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_vop3b(&mut self, inst: VOP3B) -> Signals {
-        let d = inst.VDST as usize;
-        let sd = inst.SDST as usize;
-        let s0 = inst.SRC0 as usize;
-        let s1 = inst.SRC1 as usize;
-        let s2 = inst.SRC2 as usize;
-        match inst.OP {
+        let d = inst.vdst as usize;
+        let sd = inst.sdst as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.src1 as usize;
+        let s2 = inst.src2 as usize;
+        match inst.op {
             I::V_ADD_U32 => {
                 v_add_u32_e64(self, d, sd, s0, s1);
             }
@@ -3458,10 +3458,10 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_vopc(&mut self, inst: VOPC) -> Signals {
-        let s0 = inst.SRC0 as usize;
-        let s1 = inst.VSRC1 as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.vsrc1 as usize;
 
-        match inst.OP {
+        match inst.op {
             I::V_CMP_F64(op16) => {
                 v_cmp_f64(self, op16, s0, s1);
             }
@@ -3482,12 +3482,12 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_flat(&mut self, inst: FLAT) -> Signals {
-        let s = inst.DATA as usize;
-        let d = inst.VDST as usize;
-        let addr = inst.ADDR as usize;
+        let s = inst.data as usize;
+        let d = inst.vdst as usize;
+        let addr = inst.addr as usize;
 
         // Flat scratch memory is not supported yet.
-        match inst.OP {
+        match inst.op {
             I::FLAT_LOAD_DWORD => {
                 flat_load_dword(self, d, addr);
             }
@@ -3523,14 +3523,14 @@ impl ComputeUnit {
         Signals::None
     }
     fn execute_mubuf(&mut self, inst: MUBUF) -> Signals {
-        let d = inst.VDATA as usize;
-        let s = inst.VDATA as usize;
-        let vaddr = inst.VADDR as usize;
-        let srsrc = inst.SRSRC as usize;
-        let soffset = inst.SOFFSET as usize;
-        let offset = inst.OFFSET;
-        let offen = inst.OFFEN != 0;
-        match inst.OP {
+        let d = inst.vdata as usize;
+        let s = inst.vdata as usize;
+        let vaddr = inst.vaddr as usize;
+        let srsrc = inst.srsrc as usize;
+        let soffset = inst.soffset as usize;
+        let offset = inst.offset;
+        let offen = inst.offen != 0;
+        match inst.op {
             I::BUFFER_LOAD_DWORD => {
                 buffer_load_dword(self, d, vaddr, srsrc, soffset, offset, offen);
             }

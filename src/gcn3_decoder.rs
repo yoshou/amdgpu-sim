@@ -665,9 +665,9 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_sop1_opcode_gcn3(get_bits(inst, 15, 8) as u32)?;
         Ok((
             InstFormat::SOP1(SOP1 {
-                SSRC0: ssrc0,
-                OP: op,
-                SDST: get_bits(inst, 22, 16) as u8,
+                ssrc0,
+                op,
+                sdst: get_bits(inst, 22, 16) as u8,
             }),
             if ssrc0 == 255 { max(8, size) } else { size },
         ))
@@ -675,9 +675,9 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_sopc_opcode_gcn3(get_bits(inst, 22, 16) as u32)?;
         Ok((
             InstFormat::SOPC(SOPC {
-                SSRC0: get_bits(inst, 7, 0) as u8,
-                SSRC1: get_bits(inst, 15, 8) as u8,
-                OP: op,
+                ssrc0: get_bits(inst, 7, 0) as u8,
+                ssrc1: get_bits(inst, 15, 8) as u8,
+                op,
             }),
             size,
         ))
@@ -685,8 +685,8 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_sopp_opcode_gcn3(get_bits(inst, 22, 16) as u32)?;
         Ok((
             InstFormat::SOPP(SOPP {
-                SIMM16: get_bits(inst, 15, 0) as u16,
-                OP: op,
+                simm16: get_bits(inst, 15, 0) as u16,
+                op,
             }),
             size,
         ))
@@ -694,9 +694,9 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_sopk_opcode_gcn3(get_bits(inst, 27, 23) as u32)?;
         Ok((
             InstFormat::SOPK(SOPK {
-                SIMM16: get_bits(inst, 15, 0) as u16,
-                SDST: get_bits(inst, 22, 16) as u8,
-                OP: op,
+                simm16: get_bits(inst, 15, 0) as u16,
+                sdst: get_bits(inst, 22, 16) as u8,
+                op,
             }),
             size,
         ))
@@ -705,10 +705,10 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_sop2_opcode_gcn3(get_bits(inst, 29, 23) as u32)?;
         Ok((
             InstFormat::SOP2(SOP2 {
-                SSRC0: get_bits(inst, 7, 0) as u8,
-                SSRC1: ssrc1,
-                SDST: get_bits(inst, 22, 16) as u8,
-                OP: op,
+                ssrc0: get_bits(inst, 7, 0) as u8,
+                ssrc1,
+                sdst: get_bits(inst, 22, 16) as u8,
+                op,
             }),
             if ssrc1 == 255 { max(8, size) } else { size },
         ))
@@ -719,15 +719,15 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
                 let (op, size) = decode_vop3b_opcode_gcn3(op)?;
                 Ok((
                     InstFormat::VOP3B(VOP3B {
-                        VDST: get_bits(inst, 7, 0) as u8,
-                        SDST: get_bits(inst, 14, 8) as u8,
-                        CLAMP: get_bits(inst, 15, 15) as u8,
-                        OP: op,
-                        SRC0: get_bits(inst, 40, 32) as u16,
-                        SRC1: get_bits(inst, 49, 41) as u16,
-                        SRC2: get_bits(inst, 58, 50) as u16,
-                        OMOD: get_bits(inst, 60, 59) as u8,
-                        NEG: get_bits(inst, 63, 61) as u8,
+                        vdst: get_bits(inst, 7, 0) as u8,
+                        sdst: get_bits(inst, 14, 8) as u8,
+                        clamp: get_bits(inst, 15, 15) as u8,
+                        op,
+                        src0: get_bits(inst, 40, 32) as u16,
+                        src1: get_bits(inst, 49, 41) as u16,
+                        src2: get_bits(inst, 58, 50) as u16,
+                        omod: get_bits(inst, 60, 59) as u8,
+                        neg: get_bits(inst, 63, 61) as u8,
                     }),
                     size,
                 ))
@@ -736,15 +736,15 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
                 let (op, size) = decode_vop3a_opcode_gcn3(op)?;
                 Ok((
                     InstFormat::VOP3A(VOP3A {
-                        VDST: get_bits(inst, 7, 0) as u8,
-                        ABS: get_bits(inst, 10, 8) as u8,
-                        CLAMP: get_bits(inst, 15, 15) as u8,
-                        OP: op,
-                        SRC0: get_bits(inst, 40, 32) as u16,
-                        SRC1: get_bits(inst, 49, 41) as u16,
-                        SRC2: get_bits(inst, 58, 50) as u16,
-                        OMOD: get_bits(inst, 60, 59) as u8,
-                        NEG: get_bits(inst, 63, 61) as u8,
+                        vdst: get_bits(inst, 7, 0) as u8,
+                        abs: get_bits(inst, 10, 8) as u8,
+                        clamp: get_bits(inst, 15, 15) as u8,
+                        op,
+                        src0: get_bits(inst, 40, 32) as u16,
+                        src1: get_bits(inst, 49, 41) as u16,
+                        src2: get_bits(inst, 58, 50) as u16,
+                        omod: get_bits(inst, 60, 59) as u8,
+                        neg: get_bits(inst, 63, 61) as u8,
                     }),
                     size,
                 ))
@@ -754,9 +754,9 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_vopc_opcode_gcn3(get_bits(inst, 24, 17) as u32)?;
         Ok((
             InstFormat::VOPC(VOPC {
-                SRC0: get_bits(inst, 8, 0) as u16,
-                VSRC1: get_bits(inst, 16, 9) as u8,
-                OP: op,
+                src0: get_bits(inst, 8, 0) as u16,
+                vsrc1: get_bits(inst, 16, 9) as u8,
+                op,
             }),
             size,
         ))
@@ -765,9 +765,9 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_vop1_opcode_gcn3(get_bits(inst, 16, 9) as u32)?;
         Ok((
             InstFormat::VOP1(VOP1 {
-                SRC0: src0,
-                OP: op,
-                VDST: get_bits(inst, 24, 17) as u8,
+                src0,
+                op,
+                vdst: get_bits(inst, 24, 17) as u8,
             }),
             if src0 == 255 { max(8, size) } else { size },
         ))
@@ -776,10 +776,10 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_vop2_opcode_gcn3(get_bits(inst, 30, 25) as u32)?;
         Ok((
             InstFormat::VOP2(VOP2 {
-                SRC0: src0,
-                VSRC1: get_bits(inst, 16, 9) as u8,
-                VDST: get_bits(inst, 24, 17) as u8,
-                OP: op,
+                src0,
+                vsrc1: get_bits(inst, 16, 9) as u8,
+                vdst: get_bits(inst, 24, 17) as u8,
+                op,
             }),
             if src0 == 255 { max(8, size) } else { size },
         ))
@@ -787,12 +787,12 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_smem_opcode_gcn3(get_bits(inst, 25, 18) as u32)?;
         Ok((
             InstFormat::SMEM(SMEM {
-                SBASE: get_bits(inst, 5, 0) as u8,
-                SDATA: get_bits(inst, 12, 6) as u8,
-                GLC: get_bits(inst, 16, 16) as u8,
-                IMM: get_bits(inst, 17, 17) as u8,
-                OP: op,
-                OFFSET: get_bits(inst, 51, 32) as u8,
+                sbase: get_bits(inst, 5, 0) as u8,
+                sdata: get_bits(inst, 12, 6) as u8,
+                glc: get_bits(inst, 16, 16) as u8,
+                imm: get_bits(inst, 17, 17) as u8,
+                op,
+                offset: get_bits(inst, 51, 32) as u8,
             }),
             size,
         ))
@@ -800,13 +800,13 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_flat_opcode_gcn3(get_bits(inst, 24, 18) as u32)?;
         Ok((
             InstFormat::FLAT(FLAT {
-                GLC: get_bits(inst, 16, 16) as u8,
-                SLC: get_bits(inst, 17, 17) as u8,
-                OP: op,
-                ADDR: get_bits(inst, 39, 32) as u8,
-                DATA: get_bits(inst, 47, 40) as u8,
-                TFE: get_bits(inst, 55, 55) as u8,
-                VDST: get_bits(inst, 63, 56) as u8,
+                glc: get_bits(inst, 16, 16) as u8,
+                slc: get_bits(inst, 17, 17) as u8,
+                op,
+                addr: get_bits(inst, 39, 32) as u8,
+                data: get_bits(inst, 47, 40) as u8,
+                tfe: get_bits(inst, 55, 55) as u8,
+                vdst: get_bits(inst, 63, 56) as u8,
             }),
             size,
         ))
@@ -814,18 +814,18 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
         let (op, size) = decode_mubuf_opcode_gcn3(get_bits(inst, 24, 18) as u32)?;
         Ok((
             InstFormat::MUBUF(MUBUF {
-                OFFSET: get_bits(inst, 11, 0) as u16,
-                OFFEN: get_bits(inst, 12, 12) as u8,
-                IDXEN: get_bits(inst, 13, 13) as u8,
-                GLC: get_bits(inst, 14, 14) as u8,
-                LDS: get_bits(inst, 16, 16) as u8,
-                SLC: get_bits(inst, 17, 17) as u8,
-                OP: op,
-                VADDR: get_bits(inst, 39, 32) as u8,
-                VDATA: get_bits(inst, 47, 40) as u8,
-                SRSRC: get_bits(inst, 52, 48) as u8,
-                TFE: get_bits(inst, 55, 55) as u8,
-                SOFFSET: get_bits(inst, 63, 56) as u8,
+                offset: get_bits(inst, 11, 0) as u16,
+                offen: get_bits(inst, 12, 12) as u8,
+                idxen: get_bits(inst, 13, 13) as u8,
+                glc: get_bits(inst, 14, 14) as u8,
+                lds: get_bits(inst, 16, 16) as u8,
+                slc: get_bits(inst, 17, 17) as u8,
+                op,
+                vaddr: get_bits(inst, 39, 32) as u8,
+                vdata: get_bits(inst, 47, 40) as u8,
+                srsrc: get_bits(inst, 52, 48) as u8,
+                tfe: get_bits(inst, 55, 55) as u8,
+                soffset: get_bits(inst, 63, 56) as u8,
             }),
             size,
         ))

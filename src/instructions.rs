@@ -1,3 +1,4 @@
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone)]
 pub enum I {
     S_MOV_B32,
@@ -583,64 +584,64 @@ pub enum OP8 {
 
 #[derive(Debug, Clone)]
 pub struct VOP2 {
-    pub SRC0: u16,
-    pub VSRC1: u8,
-    pub VDST: u8,
-    pub OP: I,
+    pub src0: u16,
+    pub vsrc1: u8,
+    pub vdst: u8,
+    pub op: I,
 }
 
 #[derive(Debug, Clone)]
 pub struct VOP1 {
-    pub SRC0: u16,
-    pub OP: I,
-    pub VDST: u8,
+    pub src0: u16,
+    pub op: I,
+    pub vdst: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct VOPC {
-    pub SRC0: u16,
-    pub VSRC1: u8,
-    pub OP: I,
+    pub src0: u16,
+    pub vsrc1: u8,
+    pub op: I,
 }
 
 #[derive(Debug, Clone)]
 pub struct VOP3 {
-    pub VDST: u8,
-    pub ABS: u8,
-    pub OPSEL: u8,
-    pub CM: u8,
-    pub OP: I,
-    pub SRC0: u16,
-    pub SRC1: u16,
-    pub SRC2: u16,
-    pub OMOD: u8,
-    pub NEG: u8,
+    pub vdst: u8,
+    pub abs: u8,
+    pub opsel: u8,
+    pub cm: u8,
+    pub op: I,
+    pub src0: u16,
+    pub src1: u16,
+    pub src2: u16,
+    pub omod: u8,
+    pub neg: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct VOP3A {
-    pub VDST: u8,
-    pub ABS: u8,
-    pub CLAMP: u8,
-    pub OP: I,
-    pub SRC0: u16,
-    pub SRC1: u16,
-    pub SRC2: u16,
-    pub OMOD: u8,
-    pub NEG: u8,
+    pub vdst: u8,
+    pub abs: u8,
+    pub clamp: u8,
+    pub op: I,
+    pub src0: u16,
+    pub src1: u16,
+    pub src2: u16,
+    pub omod: u8,
+    pub neg: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct VOP3B {
-    pub VDST: u8,
-    pub SDST: u8,
-    pub CLAMP: u8,
-    pub OP: I,
-    pub SRC0: u16,
-    pub SRC1: u16,
-    pub SRC2: u16,
-    pub OMOD: u8,
-    pub NEG: u8,
+    pub vdst: u8,
+    pub sdst: u8,
+    pub clamp: u8,
+    pub op: I,
+    pub src0: u16,
+    pub src1: u16,
+    pub src2: u16,
+    pub omod: u8,
+    pub neg: u8,
 }
 
 pub const VOPC_ENCODE: u32 = 0b0111110;
@@ -651,37 +652,37 @@ pub const VOP3AB_ENCODE: u32 = 0b110100;
 
 #[derive(Debug, Clone)]
 pub struct SOP2 {
-    pub SSRC0: u8,
-    pub SSRC1: u8,
-    pub SDST: u8,
-    pub OP: I,
+    pub ssrc0: u8,
+    pub ssrc1: u8,
+    pub sdst: u8,
+    pub op: I,
 }
 
 #[derive(Debug, Clone)]
 pub struct SOPK {
-    pub SIMM16: u16,
-    pub SDST: u8,
-    pub OP: I,
+    pub simm16: u16,
+    pub sdst: u8,
+    pub op: I,
 }
 
 #[derive(Debug, Clone)]
 pub struct SOP1 {
-    pub SSRC0: u8,
-    pub OP: I,
-    pub SDST: u8,
+    pub ssrc0: u8,
+    pub op: I,
+    pub sdst: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct SOPC {
-    pub SSRC0: u8,
-    pub SSRC1: u8,
-    pub OP: I,
+    pub ssrc0: u8,
+    pub ssrc1: u8,
+    pub op: I,
 }
 
 #[derive(Debug, Clone)]
 pub struct SOPP {
-    pub SIMM16: u16,
-    pub OP: I,
+    pub simm16: u16,
+    pub op: I,
 }
 
 pub const SOP2_ENCODE: u32 = 0b10;
@@ -692,21 +693,21 @@ pub const SOPP_ENCODE: u32 = 0b101111111;
 
 #[derive(Debug, Clone)]
 pub struct SMRD {
-    pub OFFSET: u8,
-    pub IMM: u8,
-    pub SBASE: u8,
-    pub SDST: u8,
-    pub OP: u8,
+    pub offset: u8,
+    pub imm: u8,
+    pub sbase: u8,
+    pub sdst: u8,
+    pub op: u8,
 }
 
 #[derive(Debug, Clone)]
 pub struct SMEM {
-    pub SBASE: u8,
-    pub SDATA: u8,
-    pub GLC: u8,
-    pub IMM: u8,
-    pub OP: I,
-    pub OFFSET: u8,
+    pub sbase: u8,
+    pub sdata: u8,
+    pub glc: u8,
+    pub imm: u8,
+    pub op: I,
+    pub offset: u8,
 }
 
 pub const SMRD_ENCODE: u32 = 0b11000;
@@ -714,31 +715,31 @@ pub const SMEM_ENCODE: u32 = 0b110000;
 
 #[derive(Debug, Clone)]
 pub struct FLAT {
-    pub GLC: u8,
-    pub SLC: u8,
-    pub OP: I,
-    pub ADDR: u8,
-    pub DATA: u8,
-    pub TFE: u8,
-    pub VDST: u8,
+    pub glc: u8,
+    pub slc: u8,
+    pub op: I,
+    pub addr: u8,
+    pub data: u8,
+    pub tfe: u8,
+    pub vdst: u8,
 }
 
 pub const FLAT_ENCODE: u32 = 0b110111;
 
 #[derive(Debug, Clone)]
 pub struct MUBUF {
-    pub OFFSET: u16,
-    pub OFFEN: u8,
-    pub IDXEN: u8,
-    pub GLC: u8,
-    pub LDS: u8,
-    pub SLC: u8,
-    pub OP: I,
-    pub VADDR: u8,
-    pub VDATA: u8,
-    pub SRSRC: u8,
-    pub TFE: u8,
-    pub SOFFSET: u8,
+    pub offset: u16,
+    pub offen: u8,
+    pub idxen: u8,
+    pub glc: u8,
+    pub lds: u8,
+    pub slc: u8,
+    pub op: I,
+    pub vaddr: u8,
+    pub vdata: u8,
+    pub srsrc: u8,
+    pub tfe: u8,
+    pub soffset: u8,
 }
 
 pub const MUBUF_ENCODE: u32 = 0b111000;

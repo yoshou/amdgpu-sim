@@ -290,10 +290,10 @@ impl SIMD32 {
     }
 
     fn execute_sop1(&mut self, inst: SOP1) -> Signals {
-        let d = inst.SDST as usize;
-        let s0 = inst.SSRC0 as usize;
+        let d = inst.sdst as usize;
+        let s0 = inst.ssrc0 as usize;
 
-        match inst.OP {
+        match inst.op {
             I::S_MOV_B32 => {
                 self.s_mov_b32(d, s0);
             }
@@ -307,10 +307,10 @@ impl SIMD32 {
     }
 
     fn execute_vop3(&mut self, inst: VOP3) -> Signals {
-        let d = inst.VDST as usize;
-        let s0 = inst.SRC0 as usize;
-        let s1 = inst.SRC1 as usize;
-        match inst.OP {
+        let d = inst.vdst as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.src1 as usize;
+        match inst.op {
             I::V_READLANE_B32 => {
                 self.v_readlane_b32(d, s0, s1);
             }
