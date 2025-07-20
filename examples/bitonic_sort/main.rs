@@ -7,10 +7,6 @@ use std::env;
 use std::fs::File;
 use std::io::*;
 
-fn get_u8(buffer: &[u8], offset: usize) -> u8 {
-    buffer[offset]
-}
-
 fn get_u32(buffer: &[u8], offset: usize) -> u32 {
     let b0 = buffer[offset] as u32;
     let b1 = buffer[offset + 1] as u32;
@@ -18,34 +14,6 @@ fn get_u32(buffer: &[u8], offset: usize) -> u32 {
     let b3 = buffer[offset + 3] as u32;
 
     b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-}
-
-fn get_u64(buffer: &[u8], offset: usize) -> u64 {
-    let b0 = buffer[offset] as u64;
-    let b1 = buffer[offset + 1] as u64;
-    let b2 = buffer[offset + 2] as u64;
-    let b3 = buffer[offset + 3] as u64;
-    let b4 = buffer[offset + 4] as u64;
-    let b5 = buffer[offset + 5] as u64;
-    let b6 = buffer[offset + 6] as u64;
-    let b7 = buffer[offset + 7] as u64;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
-}
-
-fn get_f32(buffer: &[u8], offset: usize) -> f32 {
-    let arr: [u8; 4] = [
-        buffer[offset],
-        buffer[offset + 1],
-        buffer[offset + 2],
-        buffer[offset + 3],
-    ];
-    unsafe { std::mem::transmute::<[u8; 4], f32>(arr) }
-}
-
-fn set_u16(buffer: &mut [u8], offset: usize, value: u16) {
-    buffer[offset] = (value & 0xFF) as u8;
-    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8;
 }
 
 fn set_u32(buffer: &mut [u8], offset: usize, value: u32) {
@@ -64,10 +32,6 @@ fn set_u64(buffer: &mut [u8], offset: usize, value: u64) {
     buffer[offset + 5] = ((value >> 40) & 0xFF) as u8;
     buffer[offset + 6] = ((value >> 48) & 0xFF) as u8;
     buffer[offset + 7] = ((value >> 56) & 0xFF) as u8;
-}
-
-fn set_f32(buffer: &mut [u8], offset: usize, value: f32) {
-    unsafe { set_u32(buffer, offset, std::mem::transmute::<f32, u32>(value)) };
 }
 
 fn get_str(buffer: &[u8], offset: usize, size: usize) -> String {
@@ -99,7 +63,7 @@ fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
         pos += 4;
         let note_type = get_u32(buffer, pos) as usize;
         pos += 4;
-        let name = get_str(buffer, pos, name_size);
+        let _name = get_str(buffer, pos, name_size);
         pos += name_size;
         pos = align(pos, 4);
         let data = get_bytes(buffer, pos, data_size);
@@ -184,6 +148,8 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        } else if let Metadata::MessagePack(_metadata) = metadata {
+            unimplemented!()
         } else {
             panic!()
         }
