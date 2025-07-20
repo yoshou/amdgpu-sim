@@ -64,7 +64,6 @@ pub trait Processor {
 struct Context {
     id: usize,
     pc: usize,
-    scc: bool,
 }
 
 struct SIMD32 {
@@ -91,11 +90,7 @@ impl ComputeUnit {
                 sgprs.set(i, 127, 0xFFFFFFFF); // EXEC_HI
             }
             simds.push(SIMD32 {
-                ctx: Context {
-                    id: 0,
-                    pc: pc,
-                    scc: true,
-                },
+                ctx: Context { id: 0, pc: pc },
                 next_pc: 0,
                 insts: insts.clone(),
                 sgprs: sgprs,
@@ -205,7 +200,6 @@ impl SIMD32 {
             ctxs.push_back(Context {
                 id: wavefront,
                 pc: entry_addr,
-                scc: false,
             })
         }
 
@@ -263,10 +257,6 @@ impl SIMD32 {
         self.sgprs.get(self.ctx.id, idx)
     }
 
-    fn read_sgpr_pair(&self, idx: usize) -> u64 {
-        u64_from_u32_u32(self.read_sgpr(idx), self.read_sgpr(idx + 1))
-    }
-
     fn write_sgpr(&mut self, idx: usize, value: u32) {
         self.sgprs.set(self.ctx.id, idx, value);
     }
@@ -276,10 +266,6 @@ impl SIMD32 {
             panic!();
         }
         self.vgprs.get(elem, self.num_vgprs * self.ctx.id + idx)
-    }
-
-    fn read_vgpr_pair(&self, elem: usize, idx: usize) -> u64 {
-        u64_from_u32_u32(self.read_vgpr(elem, idx), self.read_vgpr(elem, idx + 1))
     }
 
     fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
@@ -324,11 +310,6 @@ impl SIMD32 {
         let d = inst.VDST as usize;
         let s0 = inst.SRC0 as usize;
         let s1 = inst.SRC1 as usize;
-        let s2 = inst.SRC2 as usize;
-        let abs = inst.ABS;
-        let neg = inst.NEG;
-        let clamp = inst.CM != 0;
-        let omod = inst.OMOD;
         match inst.OP {
             I::V_READLANE_B32 => {
                 self.v_readlane_b32(d, s0, s1);
@@ -423,27 +404,6 @@ impl SIMD32 {
             248 => 0x3e22f983, // 1/(2*PI)
             // 255 => self.fetch_literal_constant(),
             256..=511 => self.read_vgpr(elem, addr - 256),
-            _ => panic!(),
-        }
-    }
-
-    fn read_vop_src_pair(&self, elem: usize, addr: usize) -> u64 {
-        match addr {
-            0..=101 => self.read_sgpr_pair(addr),
-            128 => 0,
-            129..=192 => (addr - 128) as u64,
-            193..=208 => (-((addr - 192) as i64)) as u64,
-            240 => 0x3fe0000000000000, // 0.5
-            241 => 0xbfe0000000000000, // -0.5
-            242 => 0x3ff0000000000000, // 1.0
-            243 => 0xbff0000000000000, // -1.0
-            244 => 0x4000000000000000, // 2.0
-            245 => 0xc000000000000000, // -2.0
-            246 => 0x4010000000000000, // 4.0
-            247 => 0xc010000000000000, // -4.0
-            248 => 0x3fc45f306dc8bdc4, // 1/(2*PI)
-            // 255 => self.fetch_literal_constant() as u64,
-            256..=511 => self.read_vgpr_pair(elem, addr - 256),
             _ => panic!(),
         }
     }
@@ -600,7 +560,8 @@ impl<'a> RDNAProcessor<'a> {
         let aql_packet_address = self.aql_packet_address;
         let kernel_desc = &self.kernel_desc;
         let private_seg_size = self.aql.private_segment_size as u64;
-        // initialize sgprs
+
+        // Initialize SGPRS
         let mut sgprs = [0u32; 16];
         let mut sgprs_pos = 0;
         if kernel_desc.enable_sgpr_private_segment_buffer {
@@ -611,78 +572,59 @@ impl<'a> RDNAProcessor<'a> {
             for i in 0..2 {
                 sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
             }
-            // println!(
-            //     "s[{}..{}]: Private Segment Buffer",
-            //     sgprs_pos,
-            //     sgprs_pos + 3
-            // );
             sgprs_pos += 4;
         }
         if kernel_desc.enable_sgpr_dispatch_ptr {
             sgprs[sgprs_pos] = (aql_packet_address & 0xFFFFFFFF) as u32;
             sgprs[sgprs_pos + 1] = ((aql_packet_address >> 32) & 0xFFFFFFFF) as u32;
-            // println!("s[{}..{}]: Dispatch Ptr", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_queue_ptr {
-            // println!("s[{}..{}]: Queue Ptr", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_kernarg_segment_ptr {
             sgprs[sgprs_pos] = (kernel_args_ptr & 0xFFFFFFFF) as u32;
             sgprs[sgprs_pos + 1] = ((kernel_args_ptr >> 32) & 0xFFFFFFFF) as u32;
-            // println!("s[{}..{}]: Kernarg Segment Ptr", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_dispatch_id {
-            // println!("s[{}..{}]: Dispatch Id", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_flat_scratch_init {
             sgprs[sgprs_pos] = thread_id * self.aql.private_segment_size;
             sgprs[sgprs_pos + 1] = self.aql.private_segment_size;
-            // println!("s[{}..{}]: Flat Scratch Init", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_grid_workgroup_count_x && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count X", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_grid_workgroup_count_y && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count Y", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_grid_workgroup_count_z && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count Z", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_id_x {
             sgprs[sgprs_pos] = workgroup_id_x;
-            // println!("s[{}]: Work-Group Id X", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_id_y {
             sgprs[sgprs_pos] = workgroup_id_y;
-            // println!("s[{}]: Work-Group Id Y", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_id_z {
             sgprs[sgprs_pos] = workgroup_id_z;
-            // println!("s[{}]: Work-Group Id Z", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_info {
             sgprs[sgprs_pos] = 0;
-            // println!("s[{}]: Work-Group Info", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_private_segment_wave_offset {
             sgprs[sgprs_pos] = 0;
-            // println!("s[{}]: Scratch Wave Offset", sgprs_pos);
-            sgprs_pos += 1;
         }
 
-        // initialize vgprs
+        // Initialize VGPRS
         let mut vgprs = [[0u32; 32]; 16];
         let mut vgprs_pos = 0;
         for i in 0..32 {
@@ -705,10 +647,8 @@ impl<'a> RDNAProcessor<'a> {
                     % self.aql.workgroup_size_z as usize;
                 vgprs[vgprs_pos][i] = id_z as u32;
             }
-            vgprs_pos += 1;
         }
 
-        // initialize pc
         RegisterSetupData {
             user_sgpr_count: kernel_desc.user_sgpr_count,
             sgprs: sgprs,
@@ -735,7 +675,6 @@ impl<'a> RDNAProcessor<'a> {
         let num_wgps = self.wgps.len();
 
         for workgroup_id_base in (0..num_workgroups).step_by(num_wgps) {
-            // let mut thread_handles = vec![];
             for wgp_idx in 0..num_wgps {
                 let workgroup_id = workgroup_id_base + wgp_idx as u32;
                 let workgroup_id_x = workgroup_id % num_workgroup_x;
@@ -767,15 +706,9 @@ impl<'a> RDNAProcessor<'a> {
                             v.dispatch(entry_address, setup_data);
                         }
                     });
-                    handle.join();
-                    // thread_handles.push(handle);
+                    handle.join().unwrap();
                 }
             }
-
-            // for t in thread_handles {
-            //     t.join();
-            //     bar.inc(1);
-            // }
         }
 
         bar.finish();
