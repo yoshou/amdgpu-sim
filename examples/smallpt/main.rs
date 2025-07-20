@@ -10,10 +10,6 @@ use std::env;
 use std::fs::File;
 use std::io::*;
 
-fn get_u8(buffer: &[u8], offset: usize) -> u8 {
-    buffer[offset]
-}
-
 fn get_u32(buffer: &[u8], offset: usize) -> u32 {
     let b0 = buffer[offset] as u32;
     let b1 = buffer[offset + 1] as u32;
@@ -21,29 +17,6 @@ fn get_u32(buffer: &[u8], offset: usize) -> u32 {
     let b3 = buffer[offset + 3] as u32;
 
     b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-}
-
-fn get_u64(buffer: &[u8], offset: usize) -> u64 {
-    let b0 = buffer[offset] as u64;
-    let b1 = buffer[offset + 1] as u64;
-    let b2 = buffer[offset + 2] as u64;
-    let b3 = buffer[offset + 3] as u64;
-    let b4 = buffer[offset + 4] as u64;
-    let b5 = buffer[offset + 5] as u64;
-    let b6 = buffer[offset + 6] as u64;
-    let b7 = buffer[offset + 7] as u64;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
-}
-
-fn get_f32(buffer: &[u8], offset: usize) -> f32 {
-    let arr: [u8; 4] = [
-        buffer[offset],
-        buffer[offset + 1],
-        buffer[offset + 2],
-        buffer[offset + 3],
-    ];
-    unsafe { std::mem::transmute::<[u8; 4], f32>(arr) }
 }
 
 fn set_u16(buffer: &mut [u8], offset: usize, value: u16) {
@@ -67,10 +40,6 @@ fn set_u64(buffer: &mut [u8], offset: usize, value: u64) {
     buffer[offset + 5] = ((value >> 40) & 0xFF) as u8;
     buffer[offset + 6] = ((value >> 48) & 0xFF) as u8;
     buffer[offset + 7] = ((value >> 56) & 0xFF) as u8;
-}
-
-fn set_f32(buffer: &mut [u8], offset: usize, value: f32) {
-    unsafe { set_u32(buffer, offset, std::mem::transmute::<f32, u32>(value)) };
 }
 
 fn get_str(buffer: &[u8], offset: usize, size: usize) -> String {
@@ -102,7 +71,7 @@ fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
         pos += 4;
         let note_type = get_u32(buffer, pos) as usize;
         pos += 4;
-        let name = get_str(buffer, pos, name_size);
+        let _name = get_str(buffer, pos, name_size);
         pos += name_size;
         pos = align(pos, 4);
         let data = get_bytes(buffer, pos, data_size);
@@ -138,26 +107,6 @@ fn gamma(x: f32) -> f32 {
 
 fn to_byte(x: f32) -> u8 {
     clamp(255.0 * x, 0.0, 255.0) as u8
-}
-
-fn write_ppm(w: usize, h: usize, data: &[f32], fname: &str) -> Result<()> {
-    let mut f = std::fs::File::create(fname)?;
-
-    f.write(format!("P3\n{} {}\n{}\n", w, h, 255).as_bytes())?;
-
-    for i in (0..(w * h * 4)).step_by(4) {
-        f.write(
-            format!(
-                "{} {} {} ",
-                to_byte(gamma(data[i])),
-                to_byte(gamma(data[i + 1])),
-                to_byte(gamma(data[i + 2]))
-            )
-            .as_bytes(),
-        )?;
-    }
-
-    Ok(())
 }
 
 fn write_png(width: usize, height: usize, data: &[f32], fname: &str) -> Result<()> {
@@ -272,7 +221,7 @@ pub struct Sphere {
     reflection_type: ReflectionType,
 }
 
-static g_spheres: [Sphere; 9] = [
+static SPHERES: [Sphere; 9] = [
     Sphere {
         r: 1e5,
         p: Vector3 {
@@ -491,7 +440,7 @@ fn main() -> Result<()> {
     let nb_pixels = width * height;
     let kernel_name = "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd";
 
-    let mut ls = vec![
+    let ls = vec![
         Vector3 {
             x: 0.0,
             y: 0.0,
@@ -580,10 +529,10 @@ fn main() -> Result<()> {
         let mut arg_buffer = vec![0u8; kernarg_seg_size];
 
         let ls_ptr = (&ls[0] as *const Vector3) as u64;
-        let spheres_ptr = (&g_spheres[0] as *const Sphere) as u64;
+        let spheres_ptr = (&SPHERES[0] as *const Sphere) as u64;
 
         set_u64(&mut arg_buffer, 0, spheres_ptr);
-        set_u64(&mut arg_buffer, 8, g_spheres.len() as u64);
+        set_u64(&mut arg_buffer, 8, SPHERES.len() as u64);
         set_u32(&mut arg_buffer, 16, width as u32);
         set_u32(&mut arg_buffer, 20, height as u32);
         set_u64(&mut arg_buffer, 24, ls_ptr);
