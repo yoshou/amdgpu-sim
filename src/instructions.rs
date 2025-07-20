@@ -604,6 +604,20 @@ pub struct VOPC {
 }
 
 #[derive(Debug, Clone)]
+pub struct VOP3 {
+    pub VDST: u8,
+    pub ABS: u8,
+    pub OPSEL: u8,
+    pub CM: u8,
+    pub OP: I,
+    pub SRC0: u16,
+    pub SRC1: u16,
+    pub SRC2: u16,
+    pub OMOD: u8,
+    pub NEG: u8,
+}
+
+#[derive(Debug, Clone)]
 pub struct VOP3A {
     pub VDST: u8,
     pub ABS: u8,
@@ -632,7 +646,8 @@ pub struct VOP3B {
 pub const VOPC_ENCODE: u32 = 0b0111110;
 pub const VOP1_ENCODE: u32 = 0b0111111;
 pub const VOP2_ENCODE: u32 = 0b0;
-pub const VOP3_ENCODE: u32 = 0b110100;
+pub const VOP3_ENCODE: u32 = 0b110101;
+pub const VOP3AB_ENCODE: u32 = 0b110100;
 
 #[derive(Debug, Clone)]
 pub struct SOP2 {
@@ -739,6 +754,7 @@ pub enum InstFormat {
     SMEM(SMEM),
     VOP1(VOP1),
     VOP2(VOP2),
+    VOP3(VOP3),
     VOPC(VOPC),
     VOP3A(VOP3A),
     VOP3B(VOP3B),

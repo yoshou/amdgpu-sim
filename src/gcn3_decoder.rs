@@ -708,7 +708,7 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
             }),
             if ssrc1 == 255 { max(8, size) } else { size },
         ))
-    } else if (get_bits(inst, 31, 26) as u32) == VOP3_ENCODE {
+    } else if (get_bits(inst, 31, 26) as u32) == VOP3AB_ENCODE {
         let op = get_bits(inst, 25, 16) as u32;
         match op {
             (281..=286) | (480..=481) => {

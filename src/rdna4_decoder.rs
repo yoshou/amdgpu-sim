@@ -4,6 +4,7 @@ use crate::utils::*;
 fn decode_sop1_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
         0 => Ok((I::S_MOV_B32, 4)),
+        1 => Ok((I::S_MOV_B64, 4)),
         _ => Err(()),
     }
 }
@@ -40,6 +41,14 @@ fn decode_vop1_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
 
 fn decode_vop2_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
+        _ => Err(()),
+    }
+}
+
+fn decode_vop3_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
+    match opcode {
+        864 => Ok((I::V_READLANE_B32, 8)),
+        865 => Ok((I::V_WRITELANE_B32, 8)),
         _ => Err(()),
     }
 }
@@ -149,6 +158,24 @@ pub fn decode_rdna4(inst: u64) -> Result<(InstFormat, usize), ()> {
                 OP: op,
             }),
             if src0 == 255 { max(8, size) } else { size },
+        ))
+    } else if (get_bits(inst, 31, 26) as u32) == VOP3_ENCODE {
+        let src0 = get_bits(inst, 8, 0) as u16;
+        let (op, size) = decode_vop3_opcode_rdna4(get_bits(inst, 25, 16) as u32)?;
+        Ok((
+            InstFormat::VOP3(VOP3 {
+                VDST: get_bits(inst, 7, 0) as u8,
+                ABS: get_bits(inst, 10, 8) as u8,
+                OPSEL: get_bits(inst, 14, 1) as u8,
+                CM: get_bits(inst, 15, 15) as u8,
+                OP: op,
+                SRC0: get_bits(inst, 40, 32) as u16,
+                SRC1: get_bits(inst, 49, 41) as u16,
+                SRC2: get_bits(inst, 58, 50) as u16,
+                OMOD: get_bits(inst, 60, 59) as u8,
+                NEG: get_bits(inst, 63, 61) as u8,
+            }),
+            size,
         ))
     } else if (get_bits(inst, 31, 26) as u32) == SMEM_ENCODE {
         let (op, size) = decode_smem_opcode_rdna4(get_bits(inst, 25, 18) as u32)?;
