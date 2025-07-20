@@ -465,7 +465,7 @@ fn main() -> Result<()> {
                     end.subsec_nanos() / 1_000
                 );
             } else if "gfx1200" == arch {
-                let mut processor = RDNAProcessor::new(&aql, 32, &mem);
+                let mut processor = RDNAProcessor::new(&aql, 32, 32, &mem);
                 processor.execute();
             } else {
                 println!("Unsupported architecture: {}", arch);

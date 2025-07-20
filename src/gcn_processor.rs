@@ -1,4 +1,4 @@
-use crate::decoders::*;
+use crate::gcn3_decoder::*;
 use crate::instructions::*;
 use crate::processor::*;
 
@@ -81,7 +81,7 @@ struct ComputeUnit {
 
 impl Processor for ComputeUnit {
     fn step(&mut self) -> Signals {
-        if let Ok((inst, size)) = decode_v3(self.fetch_inst()) {
+        if let Ok((inst, size)) = decode_gcn3(self.fetch_inst()) {
             self.next_pc = self.get_pc() as usize + size;
             let result = self.execute_inst(inst);
             self.set_pc(self.next_pc as u64);
