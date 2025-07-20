@@ -132,7 +132,7 @@ pub struct RDNAProcessor<'a> {
     kernel_desc: KernelDescriptor,
     aql_packet_address: u64,
     kernel_args_ptr: u64,
-    aql: hsa_kernel_dispatch_packet_s<'a>,
+    aql: HsaKernelDispatchPacket<'a>,
     private_seg_buffer: Vec<u8>,
 }
 
@@ -532,7 +532,7 @@ fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
 
 impl<'a> RDNAProcessor<'a> {
     pub fn new(
-        aql: &hsa_kernel_dispatch_packet_s<'a>,
+        aql: &HsaKernelDispatchPacket<'a>,
         num_cunits: usize,
         wavefront_size: usize,
         mem: &Vec<u8>,
@@ -540,7 +540,7 @@ impl<'a> RDNAProcessor<'a> {
         let insts = aql.kernel_object.object.to_vec();
         let kd = aql.kernel_object.offset;
         let kernel_desc = decode_kernel_desc(&insts[kd..(kd + 64)]);
-        let aql_packet_address = (aql as *const hsa_kernel_dispatch_packet_s) as u64;
+        let aql_packet_address = (aql as *const HsaKernelDispatchPacket) as u64;
         let num_wgps = num_cunits / 2;
 
         assert!(num_cunits % 2 == 0, "Number of compute units must be even.");

@@ -3666,16 +3666,16 @@ pub struct GCNProcessor<'a> {
     kernel_desc: KernelDescriptor,
     aql_packet_address: u64,
     kernel_args_ptr: u64,
-    aql: hsa_kernel_dispatch_packet_s<'a>,
+    aql: HsaKernelDispatchPacket<'a>,
     private_seg_buffer: Vec<u8>,
 }
 
 impl<'a> GCNProcessor<'a> {
-    pub fn new(aql: &hsa_kernel_dispatch_packet_s<'a>, num_cunits: usize, mem: &Vec<u8>) -> Self {
+    pub fn new(aql: &HsaKernelDispatchPacket<'a>, num_cunits: usize, mem: &Vec<u8>) -> Self {
         let insts = aql.kernel_object.object.to_vec();
         let kd = aql.kernel_object.offset;
         let kernel_desc = decode_kernel_desc(&insts[kd..(kd + 64)]);
-        let aql_packet_address = (aql as *const hsa_kernel_dispatch_packet_s) as u64;
+        let aql_packet_address = (aql as *const HsaKernelDispatchPacket) as u64;
 
         let mut cunits = vec![];
         for _ in 0..num_cunits {

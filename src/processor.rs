@@ -147,7 +147,7 @@ impl<'a> Pointer<'a> {
 
 #[derive(Debug, Copy, Clone)]
 #[repr(C)]
-pub struct hsa_kernel_dispatch_packet_s<'a> {
+pub struct HsaKernelDispatchPacket<'a> {
     pub header: u16,
     pub setup: u16,
     pub workgroup_size_x: u16,

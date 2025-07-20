@@ -621,7 +621,7 @@ fn main() -> Result<()> {
         {
             let kernel_addr = kernel_sym.address() as usize;
 
-            let aql = hsa_kernel_dispatch_packet_s {
+            let aql = HsaKernelDispatchPacket {
                 header: 0,
                 setup: 0,
                 workgroup_size_x: 16,

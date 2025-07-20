@@ -229,7 +229,7 @@ fn main() -> Result<()> {
 
                     for pass_of_stage in 0..(stage + 1) {
                         set_u32(&mut arg_buffer, 12, pass_of_stage);
-                        let aql = hsa_kernel_dispatch_packet_s {
+                        let aql = HsaKernelDispatchPacket {
                             header: 0,
                             setup: 0,
                             workgroup_size_x: 256,
