@@ -1,3 +1,4 @@
+use crate::gcn_instructions::*;
 use crate::instructions::*;
 
 fn decode_sop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {

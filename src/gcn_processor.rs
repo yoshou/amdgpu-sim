@@ -1,4 +1,5 @@
 use crate::gcn3_decoder::*;
+use crate::gcn_instructions::*;
 use crate::instructions::*;
 use crate::processor::*;
 

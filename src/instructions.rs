@@ -96,6 +96,49 @@ pub enum I {
     S_ABSDIFF_I32,
     S_RFE_RESTORE_B64,
 
+    S_ADD_CO_U32,
+    S_SUB_CO_U32,
+    S_ADD_CO_I32,
+    S_SUB_CO_I32,
+    S_ADD_CO_CI_U32,
+    S_SUB_CO_CI_U32,
+    S_LSHL1_ADD_U32,
+    S_LSHL2_ADD_U32,
+    S_LSHL3_ADD_U32,
+    S_LSHL4_ADD_U32,
+    S_AND_NOT1_B32,
+    S_AND_NOT1_B64,
+    S_OR_NOT1_B32,
+    S_OR_NOT1_B64,
+    S_MUL_HI_U32,
+    S_MUL_HI_I32,
+    S_PACK_LL_B32_B16,
+    S_PACK_LH_B32_B16,
+    S_PACK_HH_B32_B16,
+    S_PACK_HL_B32_B16,
+    S_ADD_F32,
+    S_SUB_F32,
+    S_MIN_NUM_F32,
+    S_MAX_NUM_F32,
+    S_MUL_F32,
+    S_FMAAK_F32,
+    S_FMAMK_F32,
+    S_FMAC_F32,
+    S_CVT_PK_RTZ_F16_F32,
+    S_ADD_F16,
+    S_SUB_F16,
+    S_MIN_NUM_F16,
+    S_MAX_NUM_F16,
+    S_MUL_F16,
+    S_FMAC_F16,
+    S_MINIMUM_F32,
+    S_MAXIMUM_F32,
+    S_MINIMUM_F16,
+    S_MAXIMUM_F16,
+    S_ADD_NC_U64,
+    S_SUB_NC_U64,
+    S_MUL_U64,
+
     S_MOVK_I32,
     S_CMOVK_I32,
     S_CMPK_EQ_I32,
@@ -169,6 +212,26 @@ pub enum I {
     S_ENDPGM_SAVED,
     S_SET_GPR_IDX_OFF,
     S_SET_GPR_IDX_MODE,
+
+    S_CLAUSE,
+    S_DELAY_ALU,
+    S_WAIT_ALU,
+    S_WAIT_IDLE,
+    S_WAIT_EVENT,
+    S_ROUND_MODE,
+    S_DENORM_MODE,
+    S_BARRIER_WAIT,
+    S_CODE_END,
+    S_WAKEUP,
+    S_WAIT_LOADCNT,
+    S_WAIT_STORECNT,
+    S_WAIT_SAMPLECNT,
+    S_WAIT_BVHCNT,
+    S_WAIT_EXPCNT,
+    S_WAIT_DSCNT,
+    S_WAIT_KMCNT,
+    S_WAIT_LOADCNT_DSCNT,
+    S_WAIT_STORECNT_DSCNT,
 
     V_CNDMASK_B32,
     V_ADD_F32,
@@ -450,6 +513,32 @@ pub enum I {
     S_ATC_PROBE,
     S_ATC_PROBE_BUFFER,
 
+    S_LOAD_B32,
+    S_LOAD_B64,
+    S_LOAD_B128,
+    S_LOAD_B256,
+    S_LOAD_B512,
+    S_LOAD_B96,
+    S_LOAD_I8,
+    S_LOAD_U8,
+    S_LOAD_I16,
+    S_LOAD_U16,
+    S_BUFFER_LOAD_B32,
+    S_BUFFER_LOAD_B64,
+    S_BUFFER_LOAD_B128,
+    S_BUFFER_LOAD_B256,
+    S_BUFFER_LOAD_B512,
+    S_BUFFER_LOAD_B96,
+    S_BUFFER_LOAD_I8,
+    S_BUFFER_LOAD_U8,
+    S_BUFFER_LOAD_I16,
+    S_BUFFER_LOAD_U16,
+    S_PREFETCH_INST,
+    S_PREFETCH_INST_PC_REL,
+    S_PREFETCH_DATA,
+    S_BUFFER_PREFETCH_DATA,
+    S_PREFETCH_DATA_PC_REL,
+
     FLAT_LOAD_UBYTE,
     FLAT_LOAD_SBYTE,
     FLAT_LOAD_USHORT,
@@ -605,20 +694,6 @@ pub struct VOPC {
 }
 
 #[derive(Debug, Clone)]
-pub struct VOP3 {
-    pub vdst: u8,
-    pub abs: u8,
-    pub opsel: u8,
-    pub cm: u8,
-    pub op: I,
-    pub src0: u16,
-    pub src1: u16,
-    pub src2: u16,
-    pub omod: u8,
-    pub neg: u8,
-}
-
-#[derive(Debug, Clone)]
 pub struct VOP3A {
     pub vdst: u8,
     pub abs: u8,
@@ -647,7 +722,6 @@ pub struct VOP3B {
 pub const VOPC_ENCODE: u32 = 0b0111110;
 pub const VOP1_ENCODE: u32 = 0b0111111;
 pub const VOP2_ENCODE: u32 = 0b0;
-pub const VOP3_ENCODE: u32 = 0b110101;
 pub const VOP3AB_ENCODE: u32 = 0b110100;
 
 #[derive(Debug, Clone)]
@@ -700,18 +774,7 @@ pub struct SMRD {
     pub op: u8,
 }
 
-#[derive(Debug, Clone)]
-pub struct SMEM {
-    pub sbase: u8,
-    pub sdata: u8,
-    pub glc: u8,
-    pub imm: u8,
-    pub op: I,
-    pub offset: u8,
-}
-
 pub const SMRD_ENCODE: u32 = 0b11000;
-pub const SMEM_ENCODE: u32 = 0b110000;
 
 #[derive(Debug, Clone)]
 pub struct FLAT {
@@ -743,22 +806,3 @@ pub struct MUBUF {
 }
 
 pub const MUBUF_ENCODE: u32 = 0b111000;
-
-#[derive(Debug)]
-pub enum InstFormat {
-    SOP1(SOP1),
-    SOP2(SOP2),
-    SOPK(SOPK),
-    SOPC(SOPC),
-    SOPP(SOPP),
-    SMRD(SMRD),
-    SMEM(SMEM),
-    VOP1(VOP1),
-    VOP2(VOP2),
-    VOP3(VOP3),
-    VOPC(VOPC),
-    VOP3A(VOP3A),
-    VOP3B(VOP3B),
-    FLAT(FLAT),
-    MUBUF(MUBUF),
-}

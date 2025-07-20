@@ -1,6 +1,7 @@
 use crate::instructions::*;
 use crate::processor::*;
 use crate::rdna4_decoder::*;
+use crate::rdna_instructions::*;
 
 pub trait RegisterFile<T: Copy> {
     fn new(num_elems: usize, count: usize, default: T) -> Self;
@@ -84,16 +85,11 @@ impl ComputeUnit {
         let mut simds = vec![];
         for _ in 0..2 {
             let num_wave_slot = 16;
-            let mut sgprs = RegisterFileImpl::new(num_wave_slot, 128, 0);
-            for i in 0..num_wave_slot {
-                sgprs.set(i, 126, 0xFFFFFFFF); // EXEC_LO
-                sgprs.set(i, 127, 0xFFFFFFFF); // EXEC_HI
-            }
             simds.push(SIMD32 {
                 ctx: Context { id: 0, pc: pc },
                 next_pc: 0,
                 insts: insts.clone(),
-                sgprs: sgprs,
+                sgprs: RegisterFileImpl::new(num_wave_slot, 128, 0),
                 vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
                 num_vgprs: num_vgprs,
             });
@@ -180,6 +176,8 @@ impl SIMD32 {
             for i in 0..user_sgpr_count {
                 self.sgprs.set(wavefront, i, sgprs[i]);
             }
+            self.sgprs.set(wavefront, 126, 0xFFFFFFFF); // EXEC_LO
+            self.sgprs.set(wavefront, 127, 0xFFFFFFFF); // EXEC_HI
             self.sgprs.set(wavefront, 117, sgprs[user_sgpr_count]); // TTMP9
             self.sgprs.set(
                 wavefront,
@@ -229,7 +227,10 @@ impl SIMD32 {
         let inst = self.fetch_inst();
         println!("Fetched instruction: 0x{:08X}", inst & 0xFFFFFFFF);
         if let Ok((inst, size)) = decode_rdna4(inst) {
-            println!("Executing instruction: {:?}", inst);
+            println!(
+                "Executing instruction: {:?} at PC: 0x{:08X}",
+                inst, self.ctx.pc
+            );
             self.next_pc = self.get_pc() as usize + size;
             let result = self.execute_inst(inst);
             self.set_pc(self.next_pc as u64);
@@ -253,8 +254,20 @@ impl SIMD32 {
         self.ctx.pc = (value - base_ptr) as usize;
     }
 
+    fn get_exec(&self, elem: usize) -> bool {
+        if elem >= 32 {
+            ((self.read_sgpr(127) >> (elem - 32)) & 1) != 0
+        } else {
+            ((self.read_sgpr(126) >> elem) & 1) != 0
+        }
+    }
+
     fn read_sgpr(&self, idx: usize) -> u32 {
         self.sgprs.get(self.ctx.id, idx)
+    }
+
+    fn read_sgpr_pair(&self, idx: usize) -> u64 {
+        u64_from_u32_u32(self.read_sgpr(idx), self.read_sgpr(idx + 1))
     }
 
     fn write_sgpr(&mut self, idx: usize, value: u32) {
@@ -280,13 +293,20 @@ impl SIMD32 {
         // println!("{:012X}: {:?}", self.ctx.pc, inst);
         match inst {
             InstFormat::SOP1(fields) => self.execute_sop1(fields),
+            InstFormat::SOP2(fields) => self.execute_sop2(fields),
             InstFormat::VOP3(fields) => self.execute_vop3(fields),
+            InstFormat::SMEM(fields) => self.execute_smem(fields),
+            InstFormat::SOPP(fields) => self.execute_sopp(fields),
             _ => unimplemented!(),
         }
     }
 
     fn fetch_inst(&mut self) -> u64 {
         get_u64(&self.insts, self.ctx.pc)
+    }
+
+    fn fetch_literal_constant(&self) -> u32 {
+        get_u32(&self.insts, self.ctx.pc + 4)
     }
 
     fn execute_sop1(&mut self, inst: SOP1) -> Signals {
@@ -305,6 +325,19 @@ impl SIMD32 {
 
         Signals::None
     }
+    fn execute_sop2(&mut self, inst: SOP2) -> Signals {
+        let d = inst.sdst as usize;
+        let s0 = inst.ssrc0 as usize;
+        let s1 = inst.ssrc1 as usize;
+
+        match inst.op {
+            I::S_ADD_NC_U64 => {
+                self.s_add_nc_u64(d, s0, s1);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
 
     fn execute_vop3(&mut self, inst: VOP3) -> Signals {
         let d = inst.vdst as usize;
@@ -317,6 +350,59 @@ impl SIMD32 {
             I::V_WRITELANE_B32 => {
                 self.v_writelane_b32(d, s0, s1);
             }
+            I::V_AND_B32 => {
+                self.v_and_b32_e64(d, s0, s1);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn execute_smem(&mut self, inst: SMEM) -> Signals {
+        let sdata = inst.sdata as usize;
+        let ioffset = inst.ioffset as u64;
+        let sbase = (inst.sbase * 2) as usize;
+        match inst.op {
+            I::S_LOAD_B32 => {
+                self.s_load_b32(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_B64 => {
+                self.s_load_b64(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_B128 => {
+                self.s_load_b128(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_B256 => {
+                self.s_load_b256(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_B512 => {
+                self.s_load_b512(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_B96 => {
+                self.s_load_b96(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_I8 => {
+                self.s_load_i8(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_U8 => {
+                self.s_load_u8(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_I16 => {
+                self.s_load_i16(sdata, sbase, ioffset);
+            }
+            I::S_LOAD_U16 => {
+                self.s_load_u16(sdata, sbase, ioffset);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn execute_sopp(&mut self, inst: SOPP) -> Signals {
+        match inst.op {
+            I::S_NOP => {}
+            I::S_WAIT_ALU => {}
+            I::S_WAIT_KMCNT => {}
             _ => unimplemented!(),
         }
         Signals::None
@@ -342,7 +428,7 @@ impl SIMD32 {
             246 => 0x40800000, // 4.0
             247 => 0xc0800000, // -4.0
             248 => 0x3e22f983, // 1/(2*PI)
-            // 255 => self.fetch_literal_constant(),
+            255 => self.fetch_literal_constant(),
             _ => panic!(),
         }
     }
@@ -365,7 +451,7 @@ impl SIMD32 {
             246 => 0x4010000000000000, // 4.0
             247 => 0xc010000000000000, // -4.0
             248 => 0x3fc45f306dc8bdc4, // 1/(2*PI)
-            // 255 => self.fetch_literal_constant() as u64,
+            255 => self.fetch_literal_constant() as u64,
             _ => panic!(),
         }
     }
@@ -402,7 +488,7 @@ impl SIMD32 {
             246 => 0x40800000, // 4.0
             247 => 0xc0800000, // -4.0
             248 => 0x3e22f983, // 1/(2*PI)
-            // 255 => self.fetch_literal_constant(),
+            255 => self.fetch_literal_constant(),
             256..=511 => self.read_vgpr(elem, addr - 256),
             _ => panic!(),
         }
@@ -432,6 +518,105 @@ impl SIMD32 {
         let s1_value = self.read_sop_src(s1) as usize;
         let d_value = s0_value;
         self.write_vgpr(s1_value, d, d_value);
+    }
+
+    fn v_and_b32_e64(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vop_src(elem, s1);
+            let d_value = s0_value & s1_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn s_load_b32(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        let ptr = (sbase_val + ioffset) as *const u32;
+        let data = unsafe { *ptr };
+        self.write_sgpr(sdata, data);
+    }
+
+    fn s_load_b64(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        for i in 0..2 {
+            let ptr = (sbase_val + ioffset + (i * 4) as u64) as *const u32;
+            let data = unsafe { *ptr };
+            self.write_sgpr(sdata + i, data);
+        }
+    }
+
+    fn s_load_b128(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        for i in 0..4 {
+            let ptr = (sbase_val + ioffset + (i * 4) as u64) as *const u32;
+            let data = unsafe { *ptr };
+            self.write_sgpr(sdata + i, data);
+        }
+    }
+
+    fn s_load_b256(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        for i in 0..8 {
+            let ptr = (sbase_val + ioffset + (i * 4) as u64) as *const u32;
+            let data = unsafe { *ptr };
+            self.write_sgpr(sdata + i, data);
+        }
+    }
+
+    fn s_load_b512(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        for i in 0..16 {
+            let ptr = (sbase_val + ioffset + (i * 4) as u64) as *const u32;
+            let data = unsafe { *ptr };
+            self.write_sgpr(sdata + i, data);
+        }
+    }
+
+    fn s_load_b96(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        for i in 0..3 {
+            let ptr = (sbase_val + ioffset + (i * 4) as u64) as *const u32;
+            let data = unsafe { *ptr };
+            self.write_sgpr(sdata + i, data);
+        }
+    }
+
+    fn s_load_i8(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        let ptr = (sbase_val + ioffset) as *const i8;
+        let data = unsafe { *ptr };
+        self.write_sgpr(sdata, (data as i32) as u32);
+    }
+
+    fn s_load_u8(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        let ptr = (sbase_val + ioffset) as *const u8;
+        let data = unsafe { *ptr };
+        self.write_sgpr(sdata, data as u32);
+    }
+
+    fn s_load_i16(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        let ptr = (sbase_val + ioffset) as *const i16;
+        let data = unsafe { *ptr };
+        self.write_sgpr(sdata, (data as i32) as u32);
+    }
+
+    fn s_load_u16(&mut self, sdata: usize, sbase: usize, ioffset: u64) {
+        let sbase_val = self.read_sgpr_pair(sbase);
+        let ptr = (sbase_val + ioffset) as *const u16;
+        let data = unsafe { *ptr };
+        self.write_sgpr(sdata, data as u32);
+    }
+
+    fn s_add_nc_u64(&mut self, d: usize, s0: usize, s1: usize) {
+        let s0_value = self.read_sop_src_pair(s0);
+        let s1_value = self.read_sop_src_pair(s1);
+        let d_value = s0_value + s1_value;
+        self.write_sop_dst_pair(d, d_value);
     }
 }
 
