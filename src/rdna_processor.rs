@@ -1,6 +1,6 @@
+use crate::instructions::*;
 use crate::processor::*;
 use crate::rdna4_decoder::*;
-use crate::instructions::*;
 
 pub trait RegisterFile<T: Copy> {
     fn new(num_elems: usize, count: usize, default: T) -> Self;
@@ -90,8 +90,7 @@ impl ComputeUnit {
                 sgprs.set(i, 126, 0xFFFFFFFF); // EXEC_LO
                 sgprs.set(i, 127, 0xFFFFFFFF); // EXEC_HI
             }
-            simds.push(
-                SIMD32 {
+            simds.push(SIMD32 {
                 ctx: Context {
                     id: 0,
                     pc: pc,
@@ -105,18 +104,17 @@ impl ComputeUnit {
             });
         }
 
-        ComputeUnit {
-            simds: simds,
-        }
+        ComputeUnit { simds: simds }
     }
-    
-    pub fn dispatch(
-        &mut self,
-        entry_addr: usize,
-        setup_data: Vec<RegisterSetupData>,
-    ) {
+
+    pub fn dispatch(&mut self, entry_addr: usize, setup_data: Vec<RegisterSetupData>) {
         for simd_idx in 0..self.simds.len() {
-            let setup_data = setup_data.iter().skip(simd_idx).step_by(self.simds.len()).cloned().collect();
+            let setup_data = setup_data
+                .iter()
+                .skip(simd_idx)
+                .step_by(self.simds.len())
+                .cloned()
+                .collect();
             self.simds[simd_idx].dispatch(entry_addr, setup_data);
         }
     }
@@ -166,13 +164,9 @@ fn u64_from_u32_u32(lo: u32, hi: u32) -> u64 {
 }
 
 impl SIMD32 {
-    pub fn dispatch(
-        &mut self,
-        entry_addr: usize,
-        setup_data: Vec<RegisterSetupData>
-    ) {
+    pub fn dispatch(&mut self, entry_addr: usize, setup_data: Vec<RegisterSetupData>) {
         let num_wavefronts = setup_data.len();
-        
+
         for i in 0..128 {
             for slot in 0..16 {
                 self.sgprs.set(slot, i, 0);
@@ -192,7 +186,11 @@ impl SIMD32 {
                 self.sgprs.set(wavefront, i, sgprs[i]);
             }
             self.sgprs.set(wavefront, 117, sgprs[user_sgpr_count]); // TTMP9
-            self.sgprs.set(wavefront, 115, sgprs[user_sgpr_count + 1] << 16 | sgprs[user_sgpr_count + 2]); // TTMP7
+            self.sgprs.set(
+                wavefront,
+                115,
+                sgprs[user_sgpr_count + 1] << 16 | sgprs[user_sgpr_count + 2],
+            ); // TTMP7
             for i in 0..16 {
                 for elem in 0..32 {
                     self.vgprs.set(elem, vgpr_offset + i, vgprs[i][elem]);
@@ -243,7 +241,11 @@ impl SIMD32 {
             self.set_pc(self.next_pc as u64);
             result
         } else {
-            println!("Unknown instruction 0x{:08X} at PC: 0x{:08X}", inst & 0xFFFFFFFF, self.ctx.pc);
+            println!(
+                "Unknown instruction 0x{:08X} at PC: 0x{:08X}",
+                inst & 0xFFFFFFFF,
+                self.ctx.pc
+            );
             Signals::Unknown
         }
     }
@@ -268,18 +270,18 @@ impl SIMD32 {
     fn write_sgpr(&mut self, idx: usize, value: u32) {
         self.sgprs.set(self.ctx.id, idx, value);
     }
-    
+
     fn read_vgpr(&self, elem: usize, idx: usize) -> u32 {
         if idx >= self.num_vgprs {
             panic!();
         }
         self.vgprs.get(elem, self.num_vgprs * self.ctx.id + idx)
     }
-    
+
     fn read_vgpr_pair(&self, elem: usize, idx: usize) -> u64 {
         u64_from_u32_u32(self.read_vgpr(elem, idx), self.read_vgpr(elem, idx + 1))
     }
-    
+
     fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
         if idx >= self.num_vgprs {
             panic!();
@@ -301,7 +303,6 @@ impl SIMD32 {
         get_u64(&self.insts, self.ctx.pc)
     }
 
-    
     fn execute_sop1(&mut self, inst: SOP1) -> Signals {
         let d = inst.SDST as usize;
         let s0 = inst.SSRC0 as usize;
@@ -446,7 +447,7 @@ impl SIMD32 {
             _ => panic!(),
         }
     }
-    
+
     fn s_mov_b32(&mut self, d: usize, s0: usize) {
         let s0_value = self.read_sop_src(s0);
         let d_value = s0_value;
@@ -530,7 +531,12 @@ fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
 }
 
 impl<'a> RDNAProcessor<'a> {
-    pub fn new(aql: &hsa_kernel_dispatch_packet_s<'a>, num_cunits: usize, wavefront_size: usize, mem: &Vec<u8>) -> Self {
+    pub fn new(
+        aql: &hsa_kernel_dispatch_packet_s<'a>,
+        num_cunits: usize,
+        wavefront_size: usize,
+        mem: &Vec<u8>,
+    ) -> Self {
         let insts = aql.kernel_object.object.to_vec();
         let kd = aql.kernel_object.offset;
         let kernel_desc = decode_kernel_desc(&insts[kd..(kd + 64)]);

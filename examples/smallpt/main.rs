@@ -1,14 +1,14 @@
 use yaml_rust::yaml::*;
 
-use object::*;
-use amdgpu_sim::processor::*;
 use amdgpu_sim::gcn_processor::*;
+use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_processor::*;
+use getopts::Options;
+use object::*;
+use png::*;
 use std::env;
 use std::fs::File;
 use std::io::*;
-use png::*;
-use getopts::Options;
 
 fn get_u8(buffer: &[u8], offset: usize) -> u8 {
     buffer[offset]
@@ -110,7 +110,9 @@ fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
         pos = align(pos, 4);
 
         if note_type == 10 {
-            return Some(Metadata::Yaml(data.iter().map(|&s| s as char).collect::<String>()));
+            return Some(Metadata::Yaml(
+                data.iter().map(|&s| s as char).collect::<String>(),
+            ));
         }
         if note_type == 32 {
             return Some(Metadata::MessagePack(data));
@@ -182,68 +184,68 @@ fn write_png(width: usize, height: usize, data: &[f32], fname: &str) -> Result<(
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct KernelArgumentMetadataMapV5 {
-  #[serde(alias = ".name")]
-  name: Option<String>,
-  #[serde(alias = ".type_name")]
-  type_name: Option<String>,
-  #[serde(alias = ".size")]
-  size: i32,
-  #[serde(alias = ".offset")]
-  offset: i32,
-  #[serde(alias = ".value_kind")]
-  value_kind: String,
-  #[serde(alias = ".value_type")]
-  value_type: Option<String>,
+    #[serde(alias = ".name")]
+    name: Option<String>,
+    #[serde(alias = ".type_name")]
+    type_name: Option<String>,
+    #[serde(alias = ".size")]
+    size: i32,
+    #[serde(alias = ".offset")]
+    offset: i32,
+    #[serde(alias = ".value_kind")]
+    value_kind: String,
+    #[serde(alias = ".value_type")]
+    value_type: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct KernelMetadataMapV5 {
-  #[serde(alias = ".name")]
-  name: String,
-  #[serde(alias = ".symbol")]
-  symbol: String,
-  #[serde(alias = ".language")]
-  language: Option<String>,
-  #[serde(alias = ".language_version")]
-  language_version: Option<Vec<i32>>,
-  #[serde(alias = ".args")]
-  args: Option<Vec<KernelArgumentMetadataMapV5>>,
-  #[serde(alias = ".kernarg_segment_size")]
-  kernarg_segment_size: i64,
-  #[serde(alias = ".group_segment_fixed_size")]
-  group_segment_fixed_size: i64,
-  #[serde(alias = ".private_segment_fixed_size")]
-  private_segment_fixed_size: i64,
-  #[serde(alias = ".kernarg_segment_align")]
-  kernarg_segment_align: i64,
-  #[serde(alias = ".wavefront_size")]
-  wavefront_size: i64,
-  #[serde(alias = ".sgpr_count")]
-  sgpr_count: i64,
-  #[serde(alias = ".vgpr_count")]
-  vgpr_count: i64,
-  #[serde(alias = ".agpr_count")]
-  agpr_count: Option<i64>,
-  #[serde(alias = ".max_flat_workgroup_size")]
-  max_flat_workgroup_size: i64,
-  #[serde(alias = ".uses_dynamic_stack")]
-  uses_dynamic_stack: Option<bool>,
+    #[serde(alias = ".name")]
+    name: String,
+    #[serde(alias = ".symbol")]
+    symbol: String,
+    #[serde(alias = ".language")]
+    language: Option<String>,
+    #[serde(alias = ".language_version")]
+    language_version: Option<Vec<i32>>,
+    #[serde(alias = ".args")]
+    args: Option<Vec<KernelArgumentMetadataMapV5>>,
+    #[serde(alias = ".kernarg_segment_size")]
+    kernarg_segment_size: i64,
+    #[serde(alias = ".group_segment_fixed_size")]
+    group_segment_fixed_size: i64,
+    #[serde(alias = ".private_segment_fixed_size")]
+    private_segment_fixed_size: i64,
+    #[serde(alias = ".kernarg_segment_align")]
+    kernarg_segment_align: i64,
+    #[serde(alias = ".wavefront_size")]
+    wavefront_size: i64,
+    #[serde(alias = ".sgpr_count")]
+    sgpr_count: i64,
+    #[serde(alias = ".vgpr_count")]
+    vgpr_count: i64,
+    #[serde(alias = ".agpr_count")]
+    agpr_count: Option<i64>,
+    #[serde(alias = ".max_flat_workgroup_size")]
+    max_flat_workgroup_size: i64,
+    #[serde(alias = ".uses_dynamic_stack")]
+    uses_dynamic_stack: Option<bool>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MetadataMapV5 {
-  #[serde(alias = "amdhsa.version")]
-  amdhsa_version: Vec<i32>,
-  #[serde(alias = "amdhsa.printf")]
-  amdhsa_printf: Option<Vec<String>>,
-  #[serde(alias = "amdhsa.kernels")]
-  amdhsa_kernels: Vec<KernelMetadataMapV5>
+    #[serde(alias = "amdhsa.version")]
+    amdhsa_version: Vec<i32>,
+    #[serde(alias = "amdhsa.printf")]
+    amdhsa_printf: Option<Vec<String>>,
+    #[serde(alias = "amdhsa.kernels")]
+    amdhsa_kernels: Vec<KernelMetadataMapV5>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct MetadataMapVersion {
-  #[serde(alias = "amdhsa.version")]
-  amdhsa_version: Vec<i32>,
+    #[serde(alias = "amdhsa.version")]
+    amdhsa_version: Vec<i32>,
 }
 
 #[repr(C)]
@@ -256,30 +258,192 @@ pub enum ReflectionType {
 #[derive(Debug, Clone)]
 #[repr(C)]
 pub struct Vector3 {
-  x: f64,
-  y: f64,
-  z: f64,
+    x: f64,
+    y: f64,
+    z: f64,
 }
 
 #[repr(C)]
 pub struct Sphere {
-  r: f64,
-  p: Vector3,
-  e: Vector3,
-  f: Vector3,
-  reflection_type: ReflectionType,
+    r: f64,
+    p: Vector3,
+    e: Vector3,
+    f: Vector3,
+    reflection_type: ReflectionType,
 }
 
 static g_spheres: [Sphere; 9] = [
-    Sphere { r: 1e5,  p: Vector3 { x: 1e5 + 1.0, y: 40.8, z: 81.6 }, e: Vector3 { x: 0.0, y: 0.0, z: 0.0}, f: Vector3{x: 0.75, y: 0.25, z: 0.25}, reflection_type: ReflectionType::Diffuse },	 //Left
-    Sphere { r: 1e5,  p: Vector3{ x: -1e5 + 99.0, y: 40.8, z: 81.6}, e: Vector3{x: 0.0, y: 0.0, z: 0.0},   f: Vector3{x: 0.25, y: 0.25, z: 0.75}, reflection_type: ReflectionType::Diffuse},	 //Right
-    Sphere { r: 1e5, p: Vector3{ x: 50.0, y: 40.8, z: 1e5},         e: Vector3{x: 0.0, y: 0.0, z: 0.0},   f: Vector3{x: 0.75, y: 0.75, z: 0.75},reflection_type: ReflectionType::Diffuse},	 //Back
-    Sphere { r: 1e5, p: Vector3{ x: 50.0, y: 40.8, z: -1e5 + 170.0}, e:  Vector3{x: 0.0, y: 0.0, z: 0.0},  f:  Vector3{x: 0.0, y: 0.0, z: 0.0},reflection_type: ReflectionType::Diffuse},	 //Front
-    Sphere { r: 1e5, p: Vector3{ x: 50.0, y: 1e5, z: 81.6},        e:  Vector3{x: 0.0, y: 0.0, z: 0.0},   f: Vector3{x: 0.75, y: 0.75, z: 0.75},reflection_type: ReflectionType::Diffuse},	 //Bottom
-    Sphere { r: 1e5,  p: Vector3{ x: 50.0, y: -1e5 + 81.6, z: 81.6},e:  Vector3{x: 0.0, y: 0.0, z: 0.0},  f:  Vector3{x: 0.75, y: 0.75, z: 0.75},reflection_type: ReflectionType::Diffuse},	 //Top
-    Sphere { r: 16.5, p: Vector3{ x: 27.0, y: 16.5, z: 47.0},         e:  Vector3{x: 0.0, y: 0.0, z: 0.0}, f:   Vector3{x: 0.999, y: 0.999, z: 0.999},reflection_type: ReflectionType::Specular},	 //Mirror
-    Sphere { r: 16.5, p: Vector3{ x: 73.0, y: 16.5, z: 78.0},          e: Vector3{x: 0.0, y: 0.0, z: 0.0},  f:  Vector3{x: 0.999, y: 0.999, z: 0.999},reflection_type: ReflectionType::Refractive},//Glass
-    Sphere { r: 600.0,p: Vector3{ x: 50.0, y: 681.6 - 0.27, z: 81.6}, e: Vector3{x: 12.0, y: 12.0, z: 12.0},f:  Vector3{x: 0.0, y: 0.0, z: 0.0},reflection_type: ReflectionType::Diffuse}	 //Light
+    Sphere {
+        r: 1e5,
+        p: Vector3 {
+            x: 1e5 + 1.0,
+            y: 40.8,
+            z: 81.6,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.75,
+            y: 0.25,
+            z: 0.25,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Left
+    Sphere {
+        r: 1e5,
+        p: Vector3 {
+            x: -1e5 + 99.0,
+            y: 40.8,
+            z: 81.6,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.25,
+            y: 0.25,
+            z: 0.75,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Right
+    Sphere {
+        r: 1e5,
+        p: Vector3 {
+            x: 50.0,
+            y: 40.8,
+            z: 1e5,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.75,
+            y: 0.75,
+            z: 0.75,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Back
+    Sphere {
+        r: 1e5,
+        p: Vector3 {
+            x: 50.0,
+            y: 40.8,
+            z: -1e5 + 170.0,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Front
+    Sphere {
+        r: 1e5,
+        p: Vector3 {
+            x: 50.0,
+            y: 1e5,
+            z: 81.6,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.75,
+            y: 0.75,
+            z: 0.75,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Bottom
+    Sphere {
+        r: 1e5,
+        p: Vector3 {
+            x: 50.0,
+            y: -1e5 + 81.6,
+            z: 81.6,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.75,
+            y: 0.75,
+            z: 0.75,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Top
+    Sphere {
+        r: 16.5,
+        p: Vector3 {
+            x: 27.0,
+            y: 16.5,
+            z: 47.0,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.999,
+            y: 0.999,
+            z: 0.999,
+        },
+        reflection_type: ReflectionType::Specular,
+    }, //Mirror
+    Sphere {
+        r: 16.5,
+        p: Vector3 {
+            x: 73.0,
+            y: 16.5,
+            z: 78.0,
+        },
+        e: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        f: Vector3 {
+            x: 0.999,
+            y: 0.999,
+            z: 0.999,
+        },
+        reflection_type: ReflectionType::Refractive,
+    }, //Glass
+    Sphere {
+        r: 600.0,
+        p: Vector3 {
+            x: 50.0,
+            y: 681.6 - 0.27,
+            z: 81.6,
+        },
+        e: Vector3 {
+            x: 12.0,
+            y: 12.0,
+            z: 12.0,
+        },
+        f: Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        reflection_type: ReflectionType::Diffuse,
+    }, //Light
 ];
 
 fn print_usage(program: &str, opts: Options) {
@@ -295,24 +459,46 @@ fn main() -> Result<()> {
     opts.optopt("", "arch", "Architecture", "ARCH");
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
-        Ok(m) => { m }
-        Err(f) => { panic!("{}", f.to_string()) }
+        Ok(m) => m,
+        Err(f) => {
+            panic!("{}", f.to_string())
+        }
     };
     if matches.opt_present("h") {
         print_usage(&program, opts);
-        return Ok(())
+        return Ok(());
     }
-    
-    let nb_samples = if matches.opt_present("nb_samples") { matches.opt_str("nb_samples").unwrap().parse::<i32>().unwrap() / 4 } else { 1 };
-    let arch = if matches.opt_present("arch") { matches.opt_str("arch").unwrap() } else { "gfx803".to_string() };
+
+    let nb_samples = if matches.opt_present("nb_samples") {
+        matches
+            .opt_str("nb_samples")
+            .unwrap()
+            .parse::<i32>()
+            .unwrap()
+            / 4
+    } else {
+        1
+    };
+    let arch = if matches.opt_present("arch") {
+        matches.opt_str("arch").unwrap()
+    } else {
+        "gfx803".to_string()
+    };
 
     let program_filename = format!("examples/smallpt/kernel_{}.o", arch);
     let width = 1024;
     let height = 768;
     let nb_pixels = width * height;
     let kernel_name = "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd";
-    
-    let mut ls = vec![Vector3 {x: 0.0, y: 0.0, z: 0.0}; nb_pixels];
+
+    let mut ls = vec![
+        Vector3 {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0
+        };
+        nb_pixels
+    ];
 
     let mut file = File::open(program_filename).unwrap();
     let mut data = vec![];
@@ -326,70 +512,73 @@ fn main() -> Result<()> {
             .unwrap();
 
         let metadata = decode_note_metadata(note_section_data.data()).unwrap();
-        let (kernarg_seg_size, private_segment_size, wavefront_size) = if let Metadata::Yaml(metadata) = metadata {
-            let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
-            let metadata = &metadatas[0];
+        let (kernarg_seg_size, private_segment_size, wavefront_size) =
+            if let Metadata::Yaml(metadata) = metadata {
+                let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
+                let metadata = &metadatas[0];
 
-            let kernarg_seg_size = if let Yaml::Integer(integer) =
-                metadata["Kernels"][0]["CodeProps"]["KernargSegmentSize"]
-            {
-                integer
-            } else {
-                1
-            } as usize;
-            let private_seg_fixed_size = if let Yaml::Integer(integer) =
-                metadata["Kernels"][0]["CodeProps"]["PrivateSegmentFixedSize"]
-            {
-                integer
-            } else {
-                1
-            } as usize;
-            let is_dynamic_call_stack = if let Yaml::Boolean(integer) =
-                metadata["Kernels"][0]["CodeProps"]["IsDynamicCallStack"]
-            {
-                integer
-            } else {
-                false
-            };
-
-            let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
-            let private_segment_size = private_seg_fixed_size + stack_size;
-            let wavefront_size = if let Yaml::Integer(integer) =
-                metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
-            {
-                integer
-            } else {
-                panic!("Wavefront size not found in metadata")
-            } as usize;
-
-            (kernarg_seg_size, private_segment_size, wavefront_size)
-        } else if let Metadata::MessagePack(metadata) = metadata {
-            let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
-            if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
-                let map: MetadataMapV5 = rmp_serde::from_slice(&metadata).unwrap();
-                let kernarg_seg_size = map.amdhsa_kernels[0].kernarg_segment_size as usize;
-                let private_seg_fixed_size = map.amdhsa_kernels[0].private_segment_fixed_size as usize;
-                
-                let is_dynamic_call_stack = if let Some(value) = map.amdhsa_kernels[0].uses_dynamic_stack {
-                    value
+                let kernarg_seg_size = if let Yaml::Integer(integer) =
+                    metadata["Kernels"][0]["CodeProps"]["KernargSegmentSize"]
+                {
+                    integer
+                } else {
+                    1
+                } as usize;
+                let private_seg_fixed_size = if let Yaml::Integer(integer) =
+                    metadata["Kernels"][0]["CodeProps"]["PrivateSegmentFixedSize"]
+                {
+                    integer
+                } else {
+                    1
+                } as usize;
+                let is_dynamic_call_stack = if let Yaml::Boolean(integer) =
+                    metadata["Kernels"][0]["CodeProps"]["IsDynamicCallStack"]
+                {
+                    integer
                 } else {
                     false
                 };
-                
+
                 let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
                 let private_segment_size = private_seg_fixed_size + stack_size;
-                let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
+                let wavefront_size = if let Yaml::Integer(integer) =
+                    metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
+                {
+                    integer
+                } else {
+                    panic!("Wavefront size not found in metadata")
+                } as usize;
 
                 (kernarg_seg_size, private_segment_size, wavefront_size)
+            } else if let Metadata::MessagePack(metadata) = metadata {
+                let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
+                if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
+                    let map: MetadataMapV5 = rmp_serde::from_slice(&metadata).unwrap();
+                    let kernarg_seg_size = map.amdhsa_kernels[0].kernarg_segment_size as usize;
+                    let private_seg_fixed_size =
+                        map.amdhsa_kernels[0].private_segment_fixed_size as usize;
+
+                    let is_dynamic_call_stack =
+                        if let Some(value) = map.amdhsa_kernels[0].uses_dynamic_stack {
+                            value
+                        } else {
+                            false
+                        };
+
+                    let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
+                    let private_segment_size = private_seg_fixed_size + stack_size;
+                    let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
+
+                    (kernarg_seg_size, private_segment_size, wavefront_size)
+                } else {
+                    panic!()
+                }
             } else {
                 panic!()
-            }
-        } else {
-            panic!()
-        };
+            };
 
         let mut arg_buffer = vec![0u8; kernarg_seg_size];
-        
+
         let ls_ptr = (&ls[0] as *const Vector3) as u64;
         let spheres_ptr = (&g_spheres[0] as *const Sphere) as u64;
 
@@ -399,11 +588,11 @@ fn main() -> Result<()> {
         set_u32(&mut arg_buffer, 20, height as u32);
         set_u64(&mut arg_buffer, 24, ls_ptr);
         set_u32(&mut arg_buffer, 32, nb_samples as u32);
-        
+
         set_u32(&mut arg_buffer, 40, (width / 16) as u32);
         set_u32(&mut arg_buffer, 44, (height / 16) as u32);
         set_u32(&mut arg_buffer, 48, 1);
-        
+
         set_u16(&mut arg_buffer, 52, 16);
         set_u16(&mut arg_buffer, 54, 16);
         set_u16(&mut arg_buffer, 56, 1);

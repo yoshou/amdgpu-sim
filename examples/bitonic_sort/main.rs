@@ -1,8 +1,8 @@
 use yaml_rust::yaml::*;
 
-use object::*;
-use amdgpu_sim::processor::*;
 use amdgpu_sim::gcn_processor::*;
+use amdgpu_sim::processor::*;
+use object::*;
 use std::env;
 use std::fs::File;
 use std::io::*;
@@ -107,7 +107,9 @@ fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
         pos = align(pos, 4);
 
         if note_type == 10 {
-            return Some(Metadata::Yaml(data.iter().map(|&s| s as char).collect::<String>()));
+            return Some(Metadata::Yaml(
+                data.iter().map(|&s| s as char).collect::<String>(),
+            ));
         }
         if note_type == 32 {
             return Some(Metadata::MessagePack(data));
