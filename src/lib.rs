@@ -4,4 +4,3 @@ pub mod instructions;
 pub mod processor;
 pub mod rdna4_decoder;
 pub mod rdna_processor;
-pub mod utils;

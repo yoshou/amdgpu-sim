@@ -1,5 +1,3 @@
-use crate::utils::*;
-
 #[derive(Debug, Clone)]
 pub struct KernelDescriptor {
     pub group_segment_fixed_size: usize,

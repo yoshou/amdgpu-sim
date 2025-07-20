@@ -1,5 +1,4 @@
 use crate::instructions::*;
-use crate::utils::*;
 
 fn decode_sop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
@@ -647,12 +646,17 @@ fn decode_mubuf_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-pub fn max<T: std::cmp::Ord>(a: T, b: T) -> T {
+fn max<T: std::cmp::Ord>(a: T, b: T) -> T {
     if a > b {
         a
     } else {
         b
     }
+}
+
+fn get_bits(value: u64, to: usize, from: usize) -> u64 {
+    let num = to + 1 - from;
+    (value >> from) & ((1u64 << num) - 1)
 }
 
 pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
