@@ -255,7 +255,6 @@ fn cmp_f64(a: f64, b: f64, op: OP16) -> bool {
         OP16::NGE => !(a >= b),
         OP16::O => !a.is_nan() && !b.is_nan(),
         OP16::U => a.is_nan() || b.is_nan(),
-        _ => unimplemented!(),
     }
 }
 
@@ -277,7 +276,6 @@ fn cmp_f32(a: f32, b: f32, op: OP16) -> bool {
         OP16::NGE => !(a >= b),
         OP16::O => !a.is_nan() && !b.is_nan(),
         OP16::U => a.is_nan() || b.is_nan(),
-        _ => unimplemented!(),
     }
 }
 
@@ -291,7 +289,6 @@ fn cmp_i32(a: i32, b: i32, op: OP8) -> bool {
         OP8::LG => a != b,
         OP8::GE => a >= b,
         OP8::TRU => true,
-        _ => panic!(),
     }
 }
 
@@ -305,7 +302,6 @@ fn cmp_u16(a: u16, b: u16, op: OP8) -> bool {
         OP8::LG => a != b,
         OP8::GE => a >= b,
         OP8::TRU => true,
-        _ => panic!(),
     }
 }
 
@@ -319,7 +315,6 @@ fn cmp_u32(a: u32, b: u32, op: OP8) -> bool {
         OP8::LG => a != b,
         OP8::GE => a >= b,
         OP8::TRU => true,
-        _ => panic!(),
     }
 }
 
@@ -333,7 +328,6 @@ fn cmp_u64(a: u64, b: u64, op: OP8) -> bool {
         OP8::LG => a != b,
         OP8::GE => a >= b,
         OP8::TRU => true,
-        _ => panic!(),
     }
 }
 
@@ -342,25 +336,6 @@ use num_traits::ops::mul_add::MulAdd;
 #[inline(always)]
 fn fma<T: MulAdd<Output = T>>(a: T, b: T, c: T) -> T {
     a.mul_add(b, c)
-}
-
-fn get_bit(buffer: &[u8], offset: usize, bit: usize) -> bool {
-    ((buffer[offset + (bit >> 3)] >> (bit & 0x7)) & 1) == 1
-}
-
-fn get_bits(buffer: &[u8], offset: usize, bit: usize, size: usize) -> u8 {
-    ((get_u32(buffer, offset + (bit >> 3)) >> (bit & 0x7)) & ((1 << size) - 1)) as u8
-}
-
-fn get_u8(buffer: &[u8], offset: usize) -> u8 {
-    buffer[offset]
-}
-
-fn get_u16(buffer: &[u8], offset: usize) -> u16 {
-    let b0 = buffer[offset] as u16;
-    let b1 = buffer[offset + 1] as u16;
-
-    b0 | (b1 << 8)
 }
 
 fn get_u32(buffer: &[u8], offset: usize) -> u32 {
@@ -387,33 +362,33 @@ fn get_u64(buffer: &[u8], offset: usize) -> u64 {
 
 #[inline(always)]
 fn u32_to_f32(value: u32) -> f32 {
-    unsafe { std::mem::transmute::<u32, f32>(value) }
+    f32::from_bits(value)
 }
 
 #[inline(always)]
 fn f32_to_u32(value: f32) -> u32 {
-    unsafe { std::mem::transmute::<f32, u32>(value) }
+    f32::to_bits(value)
 }
 
 #[inline(always)]
 fn u64_to_f64(value: u64) -> f64 {
-    unsafe { std::mem::transmute::<u64, f64>(value) }
+    f64::from_bits(value)
 }
 
 #[inline(always)]
 fn f64_to_u64(value: f64) -> u64 {
-    unsafe { std::mem::transmute::<f64, u64>(value) }
+    f64::to_bits(value)
 }
 
 #[inline(always)]
 fn u32_to_f32_abs_neg(value: u32, abs: u8, neg: u8, idx: usize) -> f32 {
-    let result = unsafe { std::mem::transmute::<u32, f32>(value) };
+    let result = f32::from_bits(value);
     abs_neg(result, abs, neg, idx)
 }
 
 #[inline(always)]
 fn u64_to_f64_abs_neg(value: u64, abs: u8, neg: u8, idx: usize) -> f64 {
-    let result = unsafe { std::mem::transmute::<u64, f64>(value) };
+    let result = f64::from_bits(value);
     abs_neg(result, abs, neg, idx)
 }
 
@@ -443,7 +418,7 @@ fn f32_to_u32_clamp(value: f32, clamp: bool) -> u32 {
     } else {
         value
     };
-    unsafe { std::mem::transmute::<f32, u32>(value) }
+    f32::to_bits(value)
 }
 
 fn f64_to_u64_clamp(value: f64, clamp: bool) -> u64 {
@@ -452,7 +427,7 @@ fn f64_to_u64_clamp(value: f64, clamp: bool) -> u64 {
     } else {
         value
     };
-    unsafe { std::mem::transmute::<f64, u64>(value) }
+    f64::to_bits(value)
 }
 
 #[inline(always)]
@@ -461,37 +436,13 @@ fn u64_from_u32_u32(lo: u32, hi: u32) -> u64 {
 }
 
 fn get_exp_f64(val: f64) -> i16 {
-    let bits: u64 = unsafe { std::mem::transmute(val) };
+    let bits: u64 = f64::to_bits(val);
     ((bits >> 52) & 0x7ff) as i16
 }
 
 fn get_exp_f32(val: f32) -> i16 {
-    let bits: u32 = unsafe { std::mem::transmute(val) };
+    let bits: u32 = f32::to_bits(val);
     ((bits >> 23) & 0xff) as i16
-}
-
-fn get_sign_f32(val: f32) -> bool {
-    let bits: u32 = unsafe { std::mem::transmute(val) };
-    ((bits >> 31) & 0x1) != 0
-}
-
-fn get_sign_f64(val: f64) -> bool {
-    let bits: u64 = unsafe { std::mem::transmute(val) };
-    ((bits >> 63) & 0x1) != 0
-}
-
-fn get_mantissa_f32(val: f32) -> u32 {
-    let bits: u32 = unsafe { std::mem::transmute(val) };
-    bits & ((1 << 23) - 1)
-}
-
-fn get_mantissa_f64(val: f64) -> u64 {
-    let bits: u64 = unsafe { std::mem::transmute(val) };
-    bits & ((1 << 53) - 1)
-}
-
-fn frexp_f64(value: f64) -> (f64, i32) {
-    libm::frexp(value)
 }
 
 fn frexp_f32(value: f32) -> (f32, i32) {
@@ -570,45 +521,6 @@ fn div_scale_f64(s0: f64, s1: f64, s2: f64) -> (f64, bool) {
         d = s0 * 128f64.exp2();
     }
     (d, vcc)
-}
-
-fn div_fixup_f32(s0: f32, s1: f32, s2: f32) -> f32 {
-    let sign_out = s1.is_sign_negative() != s2.is_sign_negative();
-    if s2.is_nan() {
-        s2
-    } else if s1.is_nan() {
-        s1
-    } else if s1 == 0.0 && s2 == 0.0 {
-        // 0/0
-        u32_to_f32(0xffc00000)
-    } else if s1.abs().is_infinite() && s2.abs().is_infinite() {
-        // inf/inf
-        u32_to_f32(0xffc00000)
-    } else if s1 == 0.0 || s2.abs().is_infinite() {
-        // x/0, or inf/y
-        if sign_out {
-            f32::NEG_INFINITY
-        } else {
-            f32::INFINITY
-        }
-    } else if s1.abs().is_infinite() || s2 == 0.0 {
-        // x/inf, 0/y
-        if sign_out {
-            -0.0
-        } else {
-            0.0
-        }
-    } else if (get_exp_f32(s2) - get_exp_f32(s1)) < -150 {
-        panic!();
-    } else if get_exp_f32(s1) == 255 {
-        panic!();
-    } else {
-        if sign_out {
-            -s0.abs()
-        } else {
-            s0.abs()
-        }
-    }
 }
 
 fn div_fixup_f64(s0: f64, s1: f64, s2: f64) -> f64 {
@@ -1865,7 +1777,7 @@ fn v_mad_f32_e64(
         let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
         let s2_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s2), abs, neg, 2);
         let d_value = fma(s0_value, s1_value, s2_value);
-        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
     }
 }
 
@@ -1884,8 +1796,8 @@ fn v_add_f64_e64(
         }
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
-        let d_value = f64_to_u64(s0_value + s1_value);
-        cu.write_vgpr_pair(elem, d, d_value);
+        let d_value = s0_value + s1_value;
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
     }
 }
 
@@ -1904,8 +1816,8 @@ fn v_mul_f64_e64(
         }
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
-        let d_value = f64_to_u64(s0_value * s1_value);
-        cu.write_vgpr_pair(elem, d, d_value);
+        let d_value = s0_value * s1_value;
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
     }
 }
 
@@ -2030,7 +1942,7 @@ fn v_fma_f64(
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
         let d_value = fma(s0_value, s1_value, s2_value);
-        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
     }
 }
 
@@ -2057,7 +1969,7 @@ fn v_div_fmas_f64(
         } else {
             fma(s0_value, s1_value, s2_value)
         };
-        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
     }
 }
 
@@ -2080,7 +1992,7 @@ fn v_div_fixup_f64(
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
         let d_value = div_fixup_f64(s0_value, s1_value, s2_value);
-        cu.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
     }
 }
 
@@ -2113,8 +2025,8 @@ fn v_ldexp_f32(
         }
         let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
         let s1_value = cu.read_vop_src(elem, s1) as i32;
-        let d_value = f32_to_u32(s0_value * (s1_value as f32).exp2());
-        cu.write_vgpr(elem, d, d_value);
+        let d_value = s0_value * (s1_value as f32).exp2();
+        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
     }
 }
 
@@ -2134,8 +2046,8 @@ fn v_ldexp_f64(
         }
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = cu.read_vop_src(elem, s1) as i32;
-        let d_value = f64_to_u64(s0_value * (s1_value as f64).exp2());
-        cu.write_vgpr_pair(elem, d, d_value);
+        let d_value = s0_value * (s1_value as f64).exp2();
+        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
     }
 }
 
@@ -2267,7 +2179,7 @@ fn v_med3_f32(
         } else {
             s0_value.max(s1_value)
         };
-        cu.write_vgpr(elem, d, f32_to_u32(d_value));
+        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
     }
 }
 
@@ -2733,7 +2645,7 @@ impl ComputeUnit {
     fn is_execnz(&self) -> bool {
         !self.is_execz()
     }
-    fn set_hw_reg(&mut self, id: usize, offset: usize, size: usize, value: u32) {
+    fn set_hw_reg(&mut self, _id: usize, _offset: usize, _size: usize, _value: u32) {
         // ignore
     }
     fn read_sgpr(&self, idx: usize) -> u32 {
@@ -2746,25 +2658,10 @@ impl ComputeUnit {
         u64_from_u32_u32(self.read_sgpr(idx), self.read_sgpr(idx + 1))
     }
     fn write_sgpr(&mut self, idx: usize, value: u32) {
-        // if idx == 8 {
-        //     println!("Write s[{}] with {:08X} at {:012X}", idx, value, self.pc);
-        // }
         if idx >= self.num_sgprs {
             panic!();
         }
         self.sgprs.set(0, self.num_sgprs * self.ctx.id + idx, value);
-    }
-    fn write_sgpr_pair(&mut self, idx: usize, value: u64) {
-        self.sgprs.set(
-            0,
-            self.num_sgprs * self.ctx.id + idx,
-            (value & 0xFFFFFFFF) as u32,
-        );
-        self.sgprs.set(
-            0,
-            self.num_sgprs * self.ctx.id + idx + 1,
-            ((value >> 32) & 0xFFFFFFFF) as u32,
-        );
     }
     fn get_flat_scratch_lo(&self) -> u32 {
         self.read_sgpr(self.num_sgprs - 4)
@@ -3517,8 +3414,6 @@ impl ComputeUnit {
         let s1 = inst.SRC1 as usize;
         let s2 = inst.SRC2 as usize;
         let clamp = inst.CLAMP != 0;
-        let neg = inst.NEG;
-        let omod = inst.OMOD;
         match inst.OP {
             I::V_ADD_U32 => {
                 v_add_u32_e64(self, d, sd, s0, s1, clamp);
@@ -3725,7 +3620,8 @@ impl<'a> GCNProcessor<'a> {
         let aql_packet_address = self.aql_packet_address;
         let kernel_desc = &self.kernel_desc;
         let private_seg_size = self.aql.private_segment_size as u64;
-        // initialize sgprs
+
+        // Initialize SGPRS
         let mut sgprs = [0u32; 16];
         let mut sgprs_pos = 0;
         if kernel_desc.enable_sgpr_private_segment_buffer {
@@ -3736,78 +3632,59 @@ impl<'a> GCNProcessor<'a> {
             for i in 0..2 {
                 sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
             }
-            // println!(
-            //     "s[{}..{}]: Private Segment Buffer",
-            //     sgprs_pos,
-            //     sgprs_pos + 3
-            // );
             sgprs_pos += 4;
         }
         if kernel_desc.enable_sgpr_dispatch_ptr {
             sgprs[sgprs_pos] = (aql_packet_address & 0xFFFFFFFF) as u32;
             sgprs[sgprs_pos + 1] = ((aql_packet_address >> 32) & 0xFFFFFFFF) as u32;
-            // println!("s[{}..{}]: Dispatch Ptr", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_queue_ptr {
-            // println!("s[{}..{}]: Queue Ptr", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_kernarg_segment_ptr {
             sgprs[sgprs_pos] = (kernel_args_ptr & 0xFFFFFFFF) as u32;
             sgprs[sgprs_pos + 1] = ((kernel_args_ptr >> 32) & 0xFFFFFFFF) as u32;
-            // println!("s[{}..{}]: Kernarg Segment Ptr", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_dispatch_id {
-            // println!("s[{}..{}]: Dispatch Id", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_flat_scratch_init {
             sgprs[sgprs_pos] = thread_id * self.aql.private_segment_size;
             sgprs[sgprs_pos + 1] = self.aql.private_segment_size;
-            // println!("s[{}..{}]: Flat Scratch Init", sgprs_pos, sgprs_pos + 1);
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_grid_workgroup_count_x && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count X", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_grid_workgroup_count_y && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count Y", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_grid_workgroup_count_z && sgprs_pos < 16 {
-            // println!("s[{}]: Grid Work-Group Count Z", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_id_x {
             sgprs[sgprs_pos] = workgroup_id_x;
-            // println!("s[{}]: Work-Group Id X", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_id_y {
             sgprs[sgprs_pos] = workgroup_id_y;
-            // println!("s[{}]: Work-Group Id Y", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_id_z {
             sgprs[sgprs_pos] = workgroup_id_z;
-            // println!("s[{}]: Work-Group Id Z", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_workgroup_info {
             sgprs[sgprs_pos] = 0;
-            // println!("s[{}]: Work-Group Info", sgprs_pos);
             sgprs_pos += 1;
         }
         if kernel_desc.enable_sgpr_private_segment_wave_offset {
             sgprs[sgprs_pos] = 0;
-            // println!("s[{}]: Scratch Wave Offset", sgprs_pos);
-            sgprs_pos += 1;
         }
 
-        // initialize vgprs
+        // Initialize VGPRs
         let mut vgprs = [[0u32; 64]; 16];
         let mut vgprs_pos = 0;
         for i in 0..64 {
@@ -3830,10 +3707,8 @@ impl<'a> GCNProcessor<'a> {
                     % self.aql.workgroup_size_z as usize;
                 vgprs[vgprs_pos][i] = id_z as u32;
             }
-            vgprs_pos += 1;
         }
 
-        // initialize pc
         (sgprs, vgprs)
     }
 
@@ -3889,7 +3764,7 @@ impl<'a> GCNProcessor<'a> {
             }
 
             for t in thread_handles {
-                t.join();
+                t.join().unwrap();
                 bar.inc(1);
             }
         }
