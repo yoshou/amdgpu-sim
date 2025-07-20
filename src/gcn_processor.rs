@@ -412,7 +412,13 @@ fn clamp_f64(value: f64, min_value: f64, max_value: f64) -> f64 {
     }
 }
 
-fn f32_to_u32_clamp(value: f32, clamp: bool) -> u32 {
+fn f32_to_u32_omod_clamp(value: f32, omod: u8, clamp: bool) -> u32 {
+    let value = match omod {
+        1 => value * 2.0,
+        2 => value * 4.0,
+        3 => value * 0.5,
+        _ => value,
+    };
     let value = if clamp {
         clamp_f32(value, 0.0, 1.0)
     } else {
@@ -421,7 +427,13 @@ fn f32_to_u32_clamp(value: f32, clamp: bool) -> u32 {
     f32::to_bits(value)
 }
 
-fn f64_to_u64_clamp(value: f64, clamp: bool) -> u64 {
+fn f64_to_u64_omod_clamp(value: f64, omod: u8, clamp: bool) -> u64 {
+    let value = match omod {
+        1 => value * 2.0,
+        2 => value * 4.0,
+        3 => value * 0.5,
+        _ => value,
+    };
     let value = if clamp {
         clamp_f64(value, 0.0, 1.0)
     } else {
@@ -1732,6 +1744,7 @@ fn v_max_f32_e64(
     abs: u8,
     neg: u8,
     clamp: bool,
+    omod: u8,
 ) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -1744,18 +1757,26 @@ fn v_max_f32_e64(
         } else {
             s1_value
         };
-        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+        cu.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 }
 
-fn v_trunc_f32_e64(cu: &mut ComputeUnit, d: usize, s0: usize, abs: u8, neg: u8, clamp: bool) {
+fn v_trunc_f32_e64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
         }
         let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
         let d_value = (s0_value as i32) as f32;
-        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+        cu.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -1768,6 +1789,7 @@ fn v_mad_f32_e64(
     abs: u8,
     neg: u8,
     clamp: bool,
+    omod: u8,
 ) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -1777,7 +1799,7 @@ fn v_mad_f32_e64(
         let s1_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s1), abs, neg, 1);
         let s2_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s2), abs, neg, 2);
         let d_value = fma(s0_value, s1_value, s2_value);
-        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+        cu.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -1789,6 +1811,7 @@ fn v_add_f64_e64(
     abs: u8,
     neg: u8,
     clamp: bool,
+    omod: u8,
 ) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -1797,7 +1820,7 @@ fn v_add_f64_e64(
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let d_value = s0_value + s1_value;
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -1809,6 +1832,7 @@ fn v_mul_f64_e64(
     abs: u8,
     neg: u8,
     clamp: bool,
+    omod: u8,
 ) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -1817,7 +1841,7 @@ fn v_mul_f64_e64(
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let d_value = s0_value * s1_value;
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -1942,7 +1966,7 @@ fn v_fma_f64(
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
         let d_value = fma(s0_value, s1_value, s2_value);
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -1969,7 +1993,7 @@ fn v_div_fmas_f64(
         } else {
             fma(s0_value, s1_value, s2_value)
         };
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -1992,11 +2016,11 @@ fn v_div_fixup_f64(
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let s2_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s2), abs, neg, 2);
         let d_value = div_fixup_f64(s0_value, s1_value, s2_value);
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
-fn v_mad_i32_i24(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize, clamp: bool) {
+fn v_mad_i32_i24(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2026,7 +2050,7 @@ fn v_ldexp_f32(
         let s0_value = u32_to_f32_abs_neg(cu.read_vop_src(elem, s0), abs, neg, 0);
         let s1_value = cu.read_vop_src(elem, s1) as i32;
         let d_value = s0_value * (s1_value as f32).exp2();
-        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+        cu.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -2047,11 +2071,20 @@ fn v_ldexp_f64(
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = cu.read_vop_src(elem, s1) as i32;
         let d_value = s0_value * (s1_value as f64).exp2();
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
-fn v_max_f64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg: u8, clamp: bool) {
+fn v_max_f64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2059,11 +2092,20 @@ fn v_max_f64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg:
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let d_value = s0_value.max(s1_value);
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
-fn v_min_f64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg: u8, clamp: bool) {
+fn v_min_f64(
+    cu: &mut ComputeUnit,
+    d: usize,
+    s0: usize,
+    s1: usize,
+    abs: u8,
+    neg: u8,
+    clamp: bool,
+    omod: u8,
+) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2071,7 +2113,7 @@ fn v_min_f64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, abs: u8, neg:
         let s0_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s0), abs, neg, 0);
         let s1_value = u64_to_f64_abs_neg(cu.read_vop_src_pair(elem, s1), abs, neg, 1);
         let d_value = s0_value.min(s1_value);
-        cu.write_vgpr_pair(elem, d, f64_to_u64_clamp(d_value, clamp));
+        cu.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
     }
 }
 
@@ -2179,21 +2221,11 @@ fn v_med3_f32(
         } else {
             s0_value.max(s1_value)
         };
-        cu.write_vgpr(elem, d, f32_to_u32_clamp(d_value, clamp));
+        cu.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 }
 
-fn v_mad_u64_u32(
-    cu: &mut ComputeUnit,
-    d: usize,
-    s0: usize,
-    s1: usize,
-    s2: usize,
-    abs: u8,
-    neg: u8,
-    clamp: bool,
-    omod: u8,
-) {
+fn v_mad_u64_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
             continue;
@@ -2207,7 +2239,7 @@ fn v_mad_u64_u32(
     }
 }
 
-fn v_add_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, clamp: bool) {
+fn v_add_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize) {
     let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -2227,7 +2259,7 @@ fn v_add_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usi
     }
 }
 
-fn v_sub_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, clamp: bool) {
+fn v_sub_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize) {
     let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -2247,15 +2279,7 @@ fn v_sub_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usi
     }
 }
 
-fn v_addc_u32_e64(
-    cu: &mut ComputeUnit,
-    d: usize,
-    sdst: usize,
-    s0: usize,
-    s1: usize,
-    s2: usize,
-    clamp: bool,
-) {
+fn v_addc_u32_e64(cu: &mut ComputeUnit, d: usize, sdst: usize, s0: usize, s1: usize, s2: usize) {
     let mut vcc = 0u64;
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -3314,19 +3338,19 @@ impl ComputeUnit {
                 v_xor_b32_e64(self, d, s0, s1);
             }
             I::V_MAX_F32 => {
-                v_max_f32_e64(self, d, s0, s1, abs, neg, clamp);
+                v_max_f32_e64(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_TRUNC_F32 => {
-                v_trunc_f32_e64(self, d, s0, abs, neg, clamp);
+                v_trunc_f32_e64(self, d, s0, abs, neg, clamp, omod);
             }
             I::V_MAD_F32 => {
-                v_mad_f32_e64(self, d, s0, s1, s2, abs, neg, clamp);
+                v_mad_f32_e64(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             I::V_ADD_F64 => {
-                v_add_f64_e64(self, d, s0, s1, abs, neg, clamp);
+                v_add_f64_e64(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_MUL_F64 => {
-                v_mul_f64_e64(self, d, s0, s1, abs, neg, clamp);
+                v_mul_f64_e64(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_MUL_LO_U32 => {
                 v_mul_lo_u32(self, d, s0, s1);
@@ -3362,7 +3386,7 @@ impl ComputeUnit {
                 v_div_fixup_f64(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             I::V_MAD_I32_I24 => {
-                v_mad_i32_i24(self, d, s0, s1, s2, clamp);
+                v_mad_i32_i24(self, d, s0, s1, s2);
             }
             I::V_LDEXP_F32 => {
                 v_ldexp_f32(self, d, s0, s1, abs, neg, clamp, omod);
@@ -3377,16 +3401,16 @@ impl ComputeUnit {
                 v_med3_f32(self, d, s0, s1, s2, abs, neg, clamp, omod);
             }
             I::V_MAD_U64_U32 => {
-                v_mad_u64_u32(self, d, s0, s1, s2, abs, neg, clamp, omod);
+                v_mad_u64_u32(self, d, s0, s1, s2);
             }
             I::V_LDEXP_F64 => {
                 v_ldexp_f64(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_MAX_F64 => {
-                v_max_f64(self, d, s0, s1, abs, neg, clamp);
+                v_max_f64(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_MIN_F64 => {
-                v_min_f64(self, d, s0, s1, abs, neg, clamp);
+                v_min_f64(self, d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_RSQ_F64 => {
                 v_rsq_f64_e64(self, d, s0);
@@ -3413,16 +3437,15 @@ impl ComputeUnit {
         let s0 = inst.SRC0 as usize;
         let s1 = inst.SRC1 as usize;
         let s2 = inst.SRC2 as usize;
-        let clamp = inst.CLAMP != 0;
         match inst.OP {
             I::V_ADD_U32 => {
-                v_add_u32_e64(self, d, sd, s0, s1, clamp);
+                v_add_u32_e64(self, d, sd, s0, s1);
             }
             I::V_SUB_U32 => {
-                v_sub_u32_e64(self, d, sd, s0, s1, clamp);
+                v_sub_u32_e64(self, d, sd, s0, s1);
             }
             I::V_ADDC_U32 => {
-                v_addc_u32_e64(self, d, sd, s0, s1, s2, clamp);
+                v_addc_u32_e64(self, d, sd, s0, s1, s2);
             }
             I::V_DIV_SCALE_F32 => {
                 v_div_scale_f32(self, d, sd, s0, s1, s2);
