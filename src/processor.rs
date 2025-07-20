@@ -60,17 +60,6 @@ fn get_bits(buffer: &[u8], offset: usize, bit: usize, size: usize) -> u8 {
     ((get_u32(buffer, offset + (bit >> 3)) >> (bit & 0x7)) & ((1 << size) - 1)) as u8
 }
 
-fn get_u8(buffer: &[u8], offset: usize) -> u8 {
-    buffer[offset]
-}
-
-fn get_u16(buffer: &[u8], offset: usize) -> u16 {
-    let b0 = buffer[offset] as u16;
-    let b1 = buffer[offset + 1] as u16;
-
-    b0 | (b1 << 8)
-}
-
 fn get_u32(buffer: &[u8], offset: usize) -> u32 {
     let b0 = buffer[offset] as u32;
     let b1 = buffer[offset + 1] as u32;
