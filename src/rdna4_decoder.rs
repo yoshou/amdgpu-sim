@@ -164,7 +164,6 @@ pub fn decode_rdna4(inst: u64) -> Result<(InstFormat, usize), ()> {
             if src0 == 255 { max(8, size) } else { size },
         ))
     } else if (get_bits(inst, 31, 26) as u32) == VOP3_ENCODE {
-        let src0 = get_bits(inst, 8, 0) as u16;
         let (op, size) = decode_vop3_opcode_rdna4(get_bits(inst, 25, 16) as u32)?;
         Ok((
             InstFormat::VOP3(VOP3 {
