@@ -1,3 +1,5 @@
+use crate::buffer::*;
+
 #[derive(Debug, Clone)]
 pub struct KernelDescriptor {
     pub group_segment_fixed_size: usize,
@@ -50,36 +52,6 @@ pub struct KernelDescriptor {
     pub enable_sgpr_grid_workgroup_count_x: bool,
     pub enable_sgpr_grid_workgroup_count_y: bool,
     pub enable_sgpr_grid_workgroup_count_z: bool,
-}
-
-fn get_bit(buffer: &[u8], offset: usize, bit: usize) -> bool {
-    ((buffer[offset + (bit >> 3)] >> (bit & 0x7)) & 1) == 1
-}
-
-fn get_bits(buffer: &[u8], offset: usize, bit: usize, size: usize) -> u8 {
-    ((get_u32(buffer, offset + (bit >> 3)) >> (bit & 0x7)) & ((1 << size) - 1)) as u8
-}
-
-fn get_u32(buffer: &[u8], offset: usize) -> u32 {
-    let b0 = buffer[offset] as u32;
-    let b1 = buffer[offset + 1] as u32;
-    let b2 = buffer[offset + 2] as u32;
-    let b3 = buffer[offset + 3] as u32;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-}
-
-fn get_u64(buffer: &[u8], offset: usize) -> u64 {
-    let b0 = buffer[offset] as u64;
-    let b1 = buffer[offset + 1] as u64;
-    let b2 = buffer[offset + 2] as u64;
-    let b3 = buffer[offset + 3] as u64;
-    let b4 = buffer[offset + 4] as u64;
-    let b5 = buffer[offset + 5] as u64;
-    let b6 = buffer[offset + 6] as u64;
-    let b7 = buffer[offset + 7] as u64;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
 }
 
 pub fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {

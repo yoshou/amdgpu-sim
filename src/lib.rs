@@ -1,3 +1,5 @@
+pub mod bit;
+pub mod buffer;
 pub mod gcn3_decoder;
 pub mod gcn_instructions;
 pub mod gcn_processor;

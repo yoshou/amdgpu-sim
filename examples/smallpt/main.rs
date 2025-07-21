@@ -1,5 +1,6 @@
 use yaml_rust::yaml::*;
 
+use amdgpu_sim::buffer::*;
 use amdgpu_sim::gcn_processor::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_processor::*;
@@ -9,48 +10,6 @@ use png::*;
 use std::env;
 use std::fs::File;
 use std::io::*;
-
-fn get_u32(buffer: &[u8], offset: usize) -> u32 {
-    let b0 = buffer[offset] as u32;
-    let b1 = buffer[offset + 1] as u32;
-    let b2 = buffer[offset + 2] as u32;
-    let b3 = buffer[offset + 3] as u32;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
-}
-
-fn set_u16(buffer: &mut [u8], offset: usize, value: u16) {
-    buffer[offset] = (value & 0xFF) as u8;
-    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8;
-}
-
-fn set_u32(buffer: &mut [u8], offset: usize, value: u32) {
-    buffer[offset] = (value & 0xFF) as u8;
-    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8;
-    buffer[offset + 2] = ((value >> 16) & 0xFF) as u8;
-    buffer[offset + 3] = ((value >> 24) & 0xFF) as u8;
-}
-
-fn set_u64(buffer: &mut [u8], offset: usize, value: u64) {
-    buffer[offset] = (value & 0xFF) as u8;
-    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8;
-    buffer[offset + 2] = ((value >> 16) & 0xFF) as u8;
-    buffer[offset + 3] = ((value >> 24) & 0xFF) as u8;
-    buffer[offset + 4] = ((value >> 32) & 0xFF) as u8;
-    buffer[offset + 5] = ((value >> 40) & 0xFF) as u8;
-    buffer[offset + 6] = ((value >> 48) & 0xFF) as u8;
-    buffer[offset + 7] = ((value >> 56) & 0xFF) as u8;
-}
-
-fn get_str(buffer: &[u8], offset: usize, size: usize) -> String {
-    let bytes: &[u8] = &buffer[offset..(offset + size)];
-    bytes.iter().map(|&s| s as char).collect::<String>()
-}
-
-fn get_bytes(buffer: &[u8], offset: usize, size: usize) -> Vec<u8> {
-    let bytes: &[u8] = &buffer[offset..(offset + size)];
-    bytes.to_vec()
-}
 
 fn align(value: usize, align: usize) -> usize {
     ((value + align - 1) / align) * align

@@ -1,3 +1,4 @@
+use crate::bit::*;
 use crate::gcn_instructions::*;
 use crate::instructions::*;
 
@@ -653,11 +654,6 @@ fn max<T: std::cmp::Ord>(a: T, b: T) -> T {
     } else {
         b
     }
-}
-
-fn get_bits(value: u64, to: usize, from: usize) -> u64 {
-    let num = to + 1 - from;
-    (value >> from) & ((1u64 << num) - 1)
 }
 
 pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
