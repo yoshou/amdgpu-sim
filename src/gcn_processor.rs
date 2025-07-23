@@ -2564,7 +2564,7 @@ impl ComputeUnit {
             ctx: Context {
                 id: 0,
                 pc: pc,
-                scc: true,
+                scc: false,
                 exec_lo: 0xFFFFFFFF,
                 exec_hi: 0xFFFFFFFF,
             },
