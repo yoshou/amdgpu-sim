@@ -66,6 +66,8 @@ pub trait Processor {
 struct Context {
     id: usize,
     pc: usize,
+    scc: bool,
+    scratch_base: u64,
 }
 
 struct SIMD32 {
@@ -87,7 +89,12 @@ impl ComputeUnit {
         for _ in 0..2 {
             let num_wave_slot = 16;
             simds.push(SIMD32 {
-                ctx: Context { id: 0, pc: pc },
+                ctx: Context {
+                    id: 0,
+                    pc: pc,
+                    scc: false,
+                    scratch_base: 0,
+                },
                 next_pc: 0,
                 insts: insts.clone(),
                 sgprs: RegisterFileImpl::new(num_wave_slot, 128, 0),
@@ -97,18 +104,6 @@ impl ComputeUnit {
         }
 
         ComputeUnit { simds: simds }
-    }
-
-    pub fn dispatch(&mut self, entry_addr: usize, setup_data: Vec<RegisterSetupData>) {
-        for simd_idx in 0..self.simds.len() {
-            let setup_data = setup_data
-                .iter()
-                .skip(simd_idx)
-                .step_by(self.simds.len())
-                .cloned()
-                .collect();
-            self.simds[simd_idx].dispatch(entry_addr, setup_data);
-        }
     }
 }
 
@@ -186,6 +181,8 @@ impl SIMD32 {
             ctxs.push_back(Context {
                 id: wavefront,
                 pc: entry_addr,
+                scc: false,
+                scratch_base: setup_data[wavefront].scratch_base,
             })
         }
 
@@ -214,7 +211,10 @@ impl SIMD32 {
     fn step(&mut self) -> Signals {
         let inst = self.fetch_inst();
         println!("Fetched instruction: 0x{:08X}", inst & 0xFFFFFFFF);
-        if let Ok((inst, size)) = decode_rdna4(inst) {
+        let inst_stream = InstructionStream {
+            insts: &self.insts[self.ctx.pc..],
+        };
+        if let Ok((inst, size)) = decode_rdna4(inst_stream) {
             println!(
                 "Executing instruction: {:?} at PC: 0x{:08X}",
                 inst, self.ctx.pc
@@ -250,8 +250,16 @@ impl SIMD32 {
         }
     }
 
+    fn set_vcc(&mut self, elem: usize, value: bool) {
+        self.set_sgpr_bit(106, elem, value);
+    }
+
     fn read_sgpr(&self, idx: usize) -> u32 {
-        self.sgprs.get(self.ctx.id, idx)
+        if idx == 124 {
+            0 // NULL
+        } else {
+            self.sgprs.get(self.ctx.id, idx)
+        }
     }
 
     fn read_sgpr_pair(&self, idx: usize) -> u64 {
@@ -269,6 +277,10 @@ impl SIMD32 {
         self.vgprs.get(elem, self.num_vgprs * self.ctx.id + idx)
     }
 
+    fn read_vgpr_pair(&self, elem: usize, idx: usize) -> u64 {
+        u64_from_u32_u32(self.read_vgpr(elem, idx), self.read_vgpr(elem, idx + 1))
+    }
+
     fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
         if idx >= self.num_vgprs {
             panic!();
@@ -277,14 +289,37 @@ impl SIMD32 {
             .set(elem, self.num_vgprs * self.ctx.id + idx, value);
     }
 
+    fn write_vgpr_pair(&mut self, elem: usize, idx: usize, value: u64) {
+        self.write_vgpr(elem, idx, (value & 0xFFFFFFFF) as u32);
+        self.write_vgpr(elem, idx + 1, ((value >> 32) & 0xFFFFFFFF) as u32);
+    }
+
+    fn set_sgpr_bit(&mut self, idx: usize, bit: usize, value: bool) {
+        if bit >= 32 {
+            let mask = 1 << (bit - 32);
+            let old_value = self.read_sop_src(idx + 1);
+            self.write_sop_dst(
+                idx + 1,
+                (old_value & !mask) | ((value as u32) << (bit - 32)),
+            );
+        } else {
+            let mask = 1 << bit;
+            let old_value = self.read_sop_src(idx);
+            self.write_sop_dst(idx, (old_value & !mask) | ((value as u32) << bit));
+        }
+    }
+
     fn execute_inst(&mut self, inst: InstFormat) -> Signals {
         // println!("{:012X}: {:?}", self.ctx.pc, inst);
         match inst {
             InstFormat::SOP1(fields) => self.execute_sop1(fields),
             InstFormat::SOP2(fields) => self.execute_sop2(fields),
+            InstFormat::VOP1(fields) => self.execute_vop1(fields),
             InstFormat::VOP3(fields) => self.execute_vop3(fields),
+            InstFormat::VOP3SD(fields) => self.execute_vop3sd(fields),
             InstFormat::SMEM(fields) => self.execute_smem(fields),
             InstFormat::SOPP(fields) => self.execute_sopp(fields),
+            InstFormat::VSCRATCH(fields) => self.execute_vscratch(fields),
             _ => unimplemented!(),
         }
     }
@@ -322,6 +357,21 @@ impl SIMD32 {
             I::S_ADD_NC_U64 => {
                 self.s_add_nc_u64(d, s0, s1);
             }
+            I::S_AND_B32 => {
+                self.s_and_b32(d, s0, s1);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn execute_vop1(&mut self, inst: VOP1) -> Signals {
+        let d = inst.vdst as usize;
+        let s0 = inst.src0 as usize;
+        match inst.op {
+            I::V_MOV_B32 => {
+                self.v_mov_b32_e32(d, s0);
+            }
             _ => unimplemented!(),
         }
         Signals::None
@@ -331,6 +381,7 @@ impl SIMD32 {
         let d = inst.vdst as usize;
         let s0 = inst.src0 as usize;
         let s1 = inst.src1 as usize;
+        let s2 = inst.src2 as usize;
         match inst.op {
             I::V_READLANE_B32 => {
                 self.v_readlane_b32(d, s0, s1);
@@ -340,6 +391,27 @@ impl SIMD32 {
             }
             I::V_AND_B32 => {
                 self.v_and_b32_e64(d, s0, s1);
+            }
+            I::V_BFE_U32 => {
+                self.v_bfe_u32(d, s0, s1, s2);
+            }
+            I::V_CMP_LT_U32 => {
+                self.v_cmp_lt_u32_e64(d, s0, s1, s2);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn execute_vop3sd(&mut self, inst: VOP3SD) -> Signals {
+        let d0 = inst.vdst as usize;
+        let d1 = inst.sdst as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.src1 as usize;
+        let s2 = inst.src2 as usize;
+        match inst.op {
+            I::V_MAD_CO_U64_U32 => {
+                self.v_mad_co_u64_u32(d0, d1, s0, s1, s2);
             }
             _ => unimplemented!(),
         }
@@ -386,6 +458,20 @@ impl SIMD32 {
         Signals::None
     }
 
+    fn execute_vscratch(&mut self, inst: VSCRATCH) -> Signals {
+        let saddr = inst.saddr as usize;
+        let vaddr = inst.vaddr as usize;
+        let vsrc = inst.vsrc as usize;
+        let ioffset = inst.ioffset as u32;
+        match inst.op {
+            I::SCRATCH_STORE_B32 => {
+                self.scratch_store_b32(vaddr, vsrc, saddr, ioffset);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
     fn execute_sopp(&mut self, inst: SOPP) -> Signals {
         match inst.op {
             I::S_NOP => {}
@@ -402,6 +488,8 @@ impl SIMD32 {
             106 => self.read_sgpr(addr),
             107 => self.read_sgpr(addr),
             108..=123 => self.read_sgpr(addr),
+            124 => 0,
+            125 => self.read_sgpr(addr), // M0
             126 => self.read_sgpr(addr), // EXEC_LO
             127 => self.read_sgpr(addr), // EXEC_HI
             128 => 0,
@@ -482,6 +570,27 @@ impl SIMD32 {
         }
     }
 
+    fn read_vop_src_pair(&self, elem: usize, addr: usize) -> u64 {
+        match addr {
+            0..=101 => self.read_sgpr_pair(addr),
+            128 => 0,
+            129..=192 => (addr - 128) as u64,
+            193..=208 => (-((addr - 192) as i64)) as u64,
+            240 => 0x3fe0000000000000, // 0.5
+            241 => 0xbfe0000000000000, // -0.5
+            242 => 0x3ff0000000000000, // 1.0
+            243 => 0xbff0000000000000, // -1.0
+            244 => 0x4000000000000000, // 2.0
+            245 => 0xc000000000000000, // -2.0
+            246 => 0x4010000000000000, // 4.0
+            247 => 0xc010000000000000, // -4.0
+            248 => 0x3fc45f306dc8bdc4, // 1/(2*PI)
+            255 => self.fetch_literal_constant() as u64,
+            256..=511 => self.read_vgpr_pair(elem, addr - 256),
+            _ => panic!(),
+        }
+    }
+
     fn s_mov_b32(&mut self, d: usize, s0: usize) {
         let s0_value = self.read_sop_src(s0);
         let d_value = s0_value;
@@ -508,6 +617,17 @@ impl SIMD32 {
         self.write_vgpr(s1_value, d, d_value);
     }
 
+    fn v_mov_b32_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..64 {
+            if !self.get_exec(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let d_value = s0_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
     fn v_and_b32_e64(&mut self, d: usize, s0: usize, s1: usize) {
         for elem in 0..32 {
             if !self.get_exec(elem) {
@@ -517,6 +637,63 @@ impl SIMD32 {
             let s1_value = self.read_vop_src(elem, s1);
             let d_value = s0_value & s1_value;
             self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_bfe_u32(&mut self, d: usize, s0: usize, s1: usize, s2: usize) {
+        for elem in 0..32 {
+            if !self.get_exec(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vop_src(elem, s1);
+            let s2_value = self.read_vop_src(elem, s2);
+            let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_cmp_lt_u32_e64(&mut self, d: usize, s0: usize, s1: usize, s2: usize) {
+        for elem in 0..32 {
+            if !self.get_exec(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vop_src(elem, s1);
+            let d_value = s0_value < s1_value;
+            self.set_sgpr_bit(d, elem, d_value);
+        }
+    }
+
+    fn v_mad_co_u64_u32(&mut self, d0: usize, d1: usize, s0: usize, s1: usize, s2: usize) {
+        for elem in 0..32 {
+            if !self.get_exec(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0) as u64;
+            let s1_value = self.read_vop_src(elem, s1) as u64;
+            let s2_value = self.read_vop_src_pair(elem, s2);
+            let (d0_value, d1_value) = (s0_value * s1_value).overflowing_add(s2_value);
+            self.write_vgpr_pair(elem, d0, d0_value);
+            self.set_sgpr_bit(d1, elem, d1_value);
+        }
+    }
+
+    fn scratch_store_b32(&mut self, vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        for elem in 0..32 {
+            if !self.get_exec(elem) {
+                continue;
+            }
+            let data = self.read_vgpr(elem, vsrc);
+            let vaddr_val = self.read_vgpr(elem, vaddr) as u64;
+            let saddr_val = self.read_sgpr(saddr) as u64;
+            let offset = ((vaddr_val + saddr_val + ioffset as u64) / 4 * 32 + elem as u64) * 4;
+            let addr = self.ctx.scratch_base + offset;
+
+            let ptr = addr as *mut u32;
+            unsafe {
+                *ptr = data;
+            }
         }
     }
 
@@ -606,6 +783,14 @@ impl SIMD32 {
         let d_value = s0_value + s1_value;
         self.write_sop_dst_pair(d, d_value);
     }
+
+    fn s_and_b32(&mut self, d: usize, s0: usize, s1: usize) {
+        let s0_value = self.read_sop_src(s0);
+        let s1_value = self.read_sop_src(s1);
+        let d_value = s0_value & s1_value;
+        self.write_sop_dst(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -613,6 +798,7 @@ struct RegisterSetupData {
     user_sgpr_count: usize,
     sgprs: [u32; 16],
     vgprs: [[u32; 32]; 16],
+    scratch_base: u64,
 }
 
 fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
@@ -700,7 +886,6 @@ impl<'a> RDNAProcessor<'a> {
 
     fn dispatch(
         &self,
-        thread_id: u32,
         workgroup_id_x: u32,
         workgroup_id_y: u32,
         workgroup_id_z: u32,
@@ -722,8 +907,8 @@ impl<'a> RDNAProcessor<'a> {
         let mut sgprs_pos = 0;
         if kernel_desc.enable_sgpr_private_segment_buffer {
             let mut desc_w0 = 0;
-            desc_w0 |=
-                (private_seg_ptr + (thread_id as u64) * private_seg_size * 256) & ((1 << 48) - 1);
+            desc_w0 |= (private_seg_ptr + (workitem_offset as u64 / 32) * private_seg_size * 256)
+                & ((1 << 48) - 1);
             desc_w0 |= (private_seg_size & ((1 << 14) - 1)) << 48;
             for i in 0..2 {
                 sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
@@ -747,7 +932,7 @@ impl<'a> RDNAProcessor<'a> {
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_flat_scratch_init {
-            sgprs[sgprs_pos] = thread_id * self.aql.private_segment_size;
+            sgprs[sgprs_pos] = (workitem_offset as u32 / 32) * self.aql.private_segment_size;
             sgprs[sgprs_pos + 1] = self.aql.private_segment_size;
             sgprs_pos += 2;
         }
@@ -809,6 +994,7 @@ impl<'a> RDNAProcessor<'a> {
             user_sgpr_count: kernel_desc.user_sgpr_count,
             sgprs: sgprs,
             vgprs: vgprs,
+            scratch_base: private_seg_ptr + (workitem_offset as u64 / 32) * private_seg_size * 128,
         }
     }
 
@@ -838,31 +1024,29 @@ impl<'a> RDNAProcessor<'a> {
                 let workgroup_id_z =
                     (workgroup_id / (num_workgroup_x * num_workgroup_y)) % num_workgroup_z;
 
-                let mut setup_data = vec![];
-                for workitem_id in (0..workgroup_size).step_by(32) {
-                    setup_data.push(self.dispatch(
-                        wgp_idx as u32,
-                        workgroup_id_x,
-                        workgroup_id_y,
-                        workgroup_id_z,
-                        workitem_id,
-                    ));
-                }
-
                 let entry_address = self.entry_address;
 
                 for cu_idx in 0..2 {
-                    let cu = Arc::clone(&self.wgps[wgp_idx].lock().unwrap().cunits[cu_idx]);
-                    let setup_data = setup_data.iter().skip(cu_idx).step_by(2).cloned().collect();
-
-                    use std::thread;
-
-                    let handle = thread::spawn(move || {
-                        if let Ok(mut v) = cu.lock() {
-                            v.dispatch(entry_address, setup_data);
+                    for simd_idx in 0..2 {
+                        let mut setup_data = vec![];
+                        for workitem_id in (0..workgroup_size).step_by(32 * 2 * 2) {
+                            setup_data.push(self.dispatch(
+                                workgroup_id_x,
+                                workgroup_id_y,
+                                workgroup_id_z,
+                                workitem_id,
+                            ));
                         }
-                    });
-                    handle.join().unwrap();
+
+                        let cu = Arc::clone(&self.wgps[wgp_idx].lock().unwrap().cunits[cu_idx]);
+
+                        let handle = std::thread::spawn(move || {
+                            if let Ok(mut v) = cu.lock() {
+                                v.simds[simd_idx].dispatch(entry_address, setup_data);
+                            }
+                        });
+                        handle.join().unwrap();
+                    }
                 }
             }
         }
