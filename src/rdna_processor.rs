@@ -86,7 +86,7 @@ struct SIMD32 {
 }
 
 struct ComputeUnit {
-    simds: Vec<SIMD32>,
+    simds: Vec<Arc<Mutex<SIMD32>>>,
 }
 
 impl ComputeUnit {
@@ -94,7 +94,7 @@ impl ComputeUnit {
         let mut simds = vec![];
         for _ in 0..2 {
             let num_wave_slot = 16;
-            simds.push(SIMD32 {
+            simds.push(Arc::new(Mutex::new(SIMD32 {
                 ctx: Context {
                     id: 0,
                     pc: pc,
@@ -106,7 +106,7 @@ impl ComputeUnit {
                 sgprs: RegisterFileImpl::new(num_wave_slot, 128, 0),
                 vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
                 num_vgprs: num_vgprs,
-            });
+            })));
         }
 
         ComputeUnit { simds: simds }
@@ -114,28 +114,19 @@ impl ComputeUnit {
 }
 
 struct WorkgroupProcessor {
-    cunits: Vec<Arc<Mutex<ComputeUnit>>>,
+    cunits: Vec<ComputeUnit>,
 }
 
 use std::sync::{Arc, Mutex};
 
 pub struct RDNAProcessor<'a> {
-    wgps: Vec<Arc<Mutex<WorkgroupProcessor>>>,
+    wgps: Vec<WorkgroupProcessor>,
     entry_address: usize,
     kernel_desc: KernelDescriptor,
     aql_packet_address: u64,
     kernel_args_ptr: u64,
     aql: HsaKernelDispatchPacket<'a>,
     private_seg_buffer: Vec<u8>,
-}
-
-impl Processor for ComputeUnit {
-    fn step(&mut self) -> Signals {
-        for simd in &mut self.simds {
-            simd.step();
-        }
-        Signals::None
-    }
 }
 
 #[inline(always)]
@@ -360,7 +351,7 @@ impl SIMD32 {
                 self.sgprs.set(slot, i, 0);
             }
         }
-        for i in 0..self.num_vgprs {
+        for i in 0..(num_wavefronts * self.num_vgprs) {
             for elem in 0..32 {
                 self.vgprs.set(elem, i, 0);
             }
@@ -2379,16 +2370,16 @@ impl<'a> RDNAProcessor<'a> {
         for _ in 0..num_wgps {
             let mut cunits_in_wgp = vec![];
             for _ in 0..2 {
-                let cu = Arc::new(Mutex::new(ComputeUnit::new(
+                let cu = ComputeUnit::new(
                     kd + kernel_desc.kernel_code_entry_byte_offset,
                     mem.clone(),
                     kernel_desc.granulated_workitem_vgpr_count,
-                )));
+                );
                 cunits_in_wgp.push(cu);
             }
-            let wgp = Arc::new(Mutex::new(WorkgroupProcessor {
+            let wgp = WorkgroupProcessor {
                 cunits: cunits_in_wgp,
-            }));
+            };
 
             wgps.push(wgp);
         }
@@ -2397,7 +2388,8 @@ impl<'a> RDNAProcessor<'a> {
         let entry_address = kd + kernel_desc.kernel_code_entry_byte_offset;
 
         let private_segment_size = aql.private_segment_size as usize;
-        let private_seg_buffer: Vec<u8> = vec![0u8; private_segment_size * 256 * num_cunits];
+        let private_seg_buffer: Vec<u8> =
+            vec![0u8; private_segment_size * num_cunits * 2 * 32 * 16];
 
         // create instance
         RDNAProcessor {
@@ -2434,8 +2426,8 @@ impl<'a> RDNAProcessor<'a> {
         let mut sgprs_pos = 0;
         if kernel_desc.enable_sgpr_private_segment_buffer {
             let mut desc_w0 = 0;
-            desc_w0 |= (private_seg_ptr + (workitem_offset as u64 / 32) * private_seg_size * 256)
-                & ((1 << 48) - 1);
+            desc_w0 |=
+                (private_seg_ptr + workitem_offset as u64 * private_seg_size) & ((1 << 48) - 1);
             desc_w0 |= (private_seg_size & ((1 << 14) - 1)) << 48;
             for i in 0..2 {
                 sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
@@ -2459,7 +2451,7 @@ impl<'a> RDNAProcessor<'a> {
             sgprs_pos += 2;
         }
         if kernel_desc.enable_sgpr_flat_scratch_init {
-            sgprs[sgprs_pos] = (workitem_offset as u32 / 32) * self.aql.private_segment_size;
+            sgprs[sgprs_pos] = workitem_offset as u32 * self.aql.private_segment_size;
             sgprs[sgprs_pos + 1] = self.aql.private_segment_size;
             sgprs_pos += 2;
         }
@@ -2519,7 +2511,7 @@ impl<'a> RDNAProcessor<'a> {
             user_sgpr_count: kernel_desc.user_sgpr_count,
             sgprs: sgprs,
             vgprs: vgprs,
-            scratch_base: private_seg_ptr + (workitem_offset as u64 / 32) * private_seg_size * 128,
+            scratch_base: private_seg_ptr + workitem_offset as u64 * private_seg_size,
         }
     }
 
@@ -2542,6 +2534,7 @@ impl<'a> RDNAProcessor<'a> {
         let num_wgps = self.wgps.len();
 
         for workgroup_id_base in (0..num_workgroups).step_by(num_wgps) {
+            let mut thread_handles = vec![];
             for wgp_idx in 0..num_wgps {
                 let workgroup_id = workgroup_id_base + wgp_idx as u32;
                 let workgroup_id_x = workgroup_id % num_workgroup_x;
@@ -2559,22 +2552,30 @@ impl<'a> RDNAProcessor<'a> {
                                 workgroup_id_x,
                                 workgroup_id_y,
                                 workgroup_id_z,
-                                workitem_id + cu_idx * 64 + simd_idx * 32,
+                                workitem_id
+                                    + cu_idx * 64
+                                    + simd_idx * 32
+                                    + wgp_idx * workgroup_size,
                             ));
                         }
 
-                        let cu = Arc::clone(&self.wgps[wgp_idx].lock().unwrap().cunits[cu_idx]);
+                        let simd: Arc<Mutex<SIMD32>> =
+                            Arc::clone(&self.wgps[wgp_idx].cunits[cu_idx].simds[simd_idx]);
 
                         let handle = std::thread::spawn(move || {
-                            if let Ok(mut v) = cu.lock() {
-                                v.simds[simd_idx].dispatch(entry_address, setup_data);
+                            if let Ok(mut v) = simd.lock() {
+                                v.dispatch(entry_address, setup_data);
                             }
                         });
-                        handle.join().unwrap();
+                        thread_handles.push(handle);
                     }
                 }
 
                 bar.inc(1);
+            }
+
+            for t in thread_handles {
+                t.join().unwrap();
             }
         }
 
