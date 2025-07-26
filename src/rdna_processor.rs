@@ -85,50 +85,6 @@ struct SIMD32 {
     num_vgprs: usize,
 }
 
-struct ComputeUnit {
-    simds: Vec<Arc<Mutex<SIMD32>>>,
-}
-
-impl ComputeUnit {
-    pub fn new(pc: usize, insts: Vec<u8>, num_vgprs: usize) -> Self {
-        let mut simds = vec![];
-        for _ in 0..2 {
-            let num_wave_slot = 16;
-            simds.push(Arc::new(Mutex::new(SIMD32 {
-                ctx: Context {
-                    id: 0,
-                    pc: pc,
-                    scc: false,
-                    scratch_base: 0,
-                },
-                next_pc: 0,
-                insts: insts.clone(),
-                sgprs: RegisterFileImpl::new(num_wave_slot, 128, 0),
-                vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
-                num_vgprs: num_vgprs,
-            })));
-        }
-
-        ComputeUnit { simds: simds }
-    }
-}
-
-struct WorkgroupProcessor {
-    cunits: Vec<ComputeUnit>,
-}
-
-use std::sync::{Arc, Mutex};
-
-pub struct RDNAProcessor<'a> {
-    wgps: Vec<WorkgroupProcessor>,
-    entry_address: usize,
-    kernel_desc: KernelDescriptor,
-    aql_packet_address: u64,
-    kernel_args_ptr: u64,
-    aql: HsaKernelDispatchPacket<'a>,
-    private_seg_buffer: Vec<u8>,
-}
-
 #[inline(always)]
 fn u64_from_u32_u32(lo: u32, hi: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
@@ -2348,6 +2304,50 @@ fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
         enable_sgpr_workgroup_info: get_bit(kd, 52, 10),
         enable_vgpr_workitem_id: get_bits(kd, 52, 11, 2),
     }
+}
+
+struct ComputeUnit {
+    simds: Vec<Arc<Mutex<SIMD32>>>,
+}
+
+impl ComputeUnit {
+    pub fn new(pc: usize, insts: Vec<u8>, num_vgprs: usize) -> Self {
+        let mut simds = vec![];
+        for _ in 0..2 {
+            let num_wave_slot = 16;
+            simds.push(Arc::new(Mutex::new(SIMD32 {
+                ctx: Context {
+                    id: 0,
+                    pc: pc,
+                    scc: false,
+                    scratch_base: 0,
+                },
+                next_pc: 0,
+                insts: insts.clone(),
+                sgprs: RegisterFileImpl::new(num_wave_slot, 128, 0),
+                vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
+                num_vgprs: num_vgprs,
+            })));
+        }
+
+        ComputeUnit { simds: simds }
+    }
+}
+
+struct WorkgroupProcessor {
+    cunits: Vec<ComputeUnit>,
+}
+
+use std::sync::{Arc, Mutex};
+
+pub struct RDNAProcessor<'a> {
+    wgps: Vec<WorkgroupProcessor>,
+    entry_address: usize,
+    kernel_desc: KernelDescriptor,
+    aql_packet_address: u64,
+    kernel_args_ptr: u64,
+    aql: HsaKernelDispatchPacket<'a>,
+    private_seg_buffer: Vec<u8>,
 }
 
 impl<'a> RDNAProcessor<'a> {
