@@ -101,6 +101,7 @@ pub enum InstFormat {
     VOP3(VOP3),
     VOP3SD(VOP3SD),
     VOPC(VOPC),
+    VOPD(VOPD),
     VFLAT(VFLAT),
     VGLOBAL(VGLOBAL),
     VSCRATCH(VSCRATCH),

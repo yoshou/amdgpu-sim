@@ -495,6 +495,18 @@ impl SIMD32 {
         }
     }
 
+    fn set_exec_bit(&mut self, elem: usize, value: bool) {
+        if elem >= 32 {
+            let mask = 1 << (elem - 32);
+            let old_value = self.read_sop_src(127);
+            self.write_sgpr(127, (old_value & !mask) | ((value as u32) << (elem - 32)));
+        } else {
+            let mask = 1 << elem;
+            let old_value = self.read_sop_src(126);
+            self.write_sgpr(126, (old_value & !mask) | ((value as u32) << elem));
+        }
+    }
+
     fn get_vcc(&self) -> u32 {
         self.read_sgpr(106)
     }
@@ -507,14 +519,29 @@ impl SIMD32 {
         }
     }
 
+    fn set_vcc_bit(&mut self, elem: usize, value: bool) {
+        if elem >= 32 {
+            let mask = 1 << (elem - 32);
+            let old_value = self.read_sop_src(107);
+            self.write_sgpr(107, (old_value & !mask) | ((value as u32) << (elem - 32)));
+        } else {
+            let mask = 1 << elem;
+            let old_value = self.read_sop_src(106);
+            self.write_sgpr(106, (old_value & !mask) | ((value as u32) << elem));
+        }
+    }
+
     fn execute_inst(&mut self, inst: InstFormat) -> Signals {
         match inst {
             InstFormat::SOP1(fields) => self.execute_sop1(fields),
             InstFormat::SOP2(fields) => self.execute_sop2(fields),
             InstFormat::SOPC(fields) => self.execute_sopc(fields),
             InstFormat::VOP1(fields) => self.execute_vop1(fields),
+            InstFormat::VOP2(fields) => self.execute_vop2(fields),
             InstFormat::VOP3(fields) => self.execute_vop3(fields),
             InstFormat::VOP3SD(fields) => self.execute_vop3sd(fields),
+            InstFormat::VOPC(fields) => self.execute_vopc(fields),
+            InstFormat::VOPD(fields) => self.execute_vopd(fields),
             InstFormat::SMEM(fields) => self.execute_smem(fields),
             InstFormat::SOPP(fields) => self.execute_sopp(fields),
             InstFormat::VSCRATCH(fields) => self.execute_vscratch(fields),
@@ -531,6 +558,10 @@ impl SIMD32 {
         get_u32(&self.insts, self.ctx.pc + 4)
     }
 
+    fn fetch_literal_constant_e64(&self) -> u32 {
+        get_u32(&self.insts, self.ctx.pc + 8)
+    }
+
     fn execute_sop1(&mut self, inst: SOP1) -> Signals {
         let d = inst.sdst as usize;
         let s0 = inst.ssrc0 as usize;
@@ -542,8 +573,14 @@ impl SIMD32 {
             I::S_MOV_B64 => {
                 self.s_mov_b64(d, s0);
             }
+            I::S_AND_SAVEEXEC_B32 => {
+                self.s_and_saveexec_b32(d, s0);
+            }
             I::S_OR_SAVEEXEC_B32 => {
                 self.s_or_saveexec_b32(d, s0);
+            }
+            I::S_AND_NOT1_SAVEEXEC_B32 => {
+                self.s_and_not1_saveexec_b32(d, s0);
             }
             _ => unimplemented!(),
         }
@@ -584,6 +621,9 @@ impl SIMD32 {
             I::S_MUL_I32 => {
                 self.s_mul_i32(d, s0, s1);
             }
+            I::S_LSHR_B32 => {
+                self.s_lshr_b32(d, s0, s1);
+            }
             _ => unimplemented!(),
         }
         Signals::None
@@ -615,6 +655,64 @@ impl SIMD32 {
             I::V_NOP => {}
             I::V_MOV_B32 => {
                 self.v_mov_b32_e32(d, s0);
+            }
+            I::V_CVT_F64_U32 => {
+                self.v_cvt_f64_u32_e32(d, s0);
+            }
+            I::V_RCP_F64 => {
+                self.v_rcp_f64_e32(d, s0);
+            }
+            I::V_RSQ_F64 => {
+                self.v_rsq_f64_e32(d, s0);
+            }
+            I::V_FRACT_F64 => {
+                self.v_fract_f64_e32(d, s0);
+            }
+            I::V_CVT_I32_F64 => {
+                self.v_cvt_i32_f64_e32(d, s0);
+            }
+            I::V_CVT_F64_I32 => {
+                self.v_cvt_f64_i32_e32(d, s0);
+            }
+            I::V_RNDNE_F64 => {
+                self.v_rndne_f64_e32(d, s0);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn execute_vop2(&mut self, inst: VOP2) -> Signals {
+        let d = inst.vdst as usize;
+        let s0 = inst.src0 as usize;
+        let s1 = inst.vsrc1 as usize;
+        match inst.op {
+            I::V_AND_B32 => {
+                self.v_and_b32_e32(d, s0, s1);
+            }
+            I::V_XOR_B32 => {
+                self.v_xor_b32_e32(d, s0, s1);
+            }
+            I::V_CNDMASK_B32 => {
+                self.v_cndmask_b32_e32(d, s0, s1);
+            }
+            I::V_ADD_NC_U32 => {
+                self.v_add_nc_u32_e32(d, s0, s1);
+            }
+            I::V_MUL_F64 => {
+                self.v_mul_f64_e32(d, s0, s1);
+            }
+            I::V_ADD_F64 => {
+                self.v_add_f64_e32(d, s0, s1);
+            }
+            I::V_MAX_NUM_F64 => {
+                self.v_max_num_f64_e32(d, s0, s1);
+            }
+            I::V_LSHLREV_B32 => {
+                self.v_lshlrev_b32_e32(d, s0, s1);
+            }
+            I::V_LSHRREV_B32 => {
+                self.v_lshrrev_b32_e32(d, s0, s1);
             }
             _ => unimplemented!(),
         }
@@ -712,6 +810,12 @@ impl SIMD32 {
             I::V_CMP_NGE_F64 => {
                 self.v_cmp_nge_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
+            I::V_CMP_LE_F64 => {
+                self.v_cmp_le_f64_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CMP_NEQ_F64 => {
+                self.v_cmp_neq_f64_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
             I::V_CNDMASK_B32 => {
                 self.v_cndmask_b32_e64(d, s0, s1, s2, abs, neg, clamp, omod);
             }
@@ -760,6 +864,9 @@ impl SIMD32 {
             I::V_CMP_LT_U64 => {
                 self.v_cmp_lt_u64_e64(d, s0, s1);
             }
+            I::V_TRIG_PREOP_F64 => {
+                self.v_trig_preop_f64(d, s0, s1);
+            }
             _ => unimplemented!(),
         }
         Signals::None
@@ -786,6 +893,131 @@ impl SIMD32 {
             }
             I::V_DIV_SCALE_F64 => {
                 self.v_div_scale_f64(d0, d1, s0, s1, s2, 0, neg, clamp, omod);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn execute_vopc(&mut self, inst: VOPC) -> Signals {
+        let s0 = inst.src0 as usize;
+        let s1 = inst.vsrc1 as usize;
+        match inst.op {
+            I::V_CMP_GT_U32 => {
+                self.v_cmp_gt_u32_e32(s0, s1);
+            }
+            I::V_CMP_NE_U32 => {
+                self.v_cmp_ne_u32_e32(s0, s1);
+            }
+            I::V_CMP_EQ_U32 => {
+                self.v_cmp_eq_u32_e32(s0, s1);
+            }
+            I::V_CMP_LT_U32 => {
+                self.v_cmp_lt_u32_e32(s0, s1);
+            }
+            I::V_CMPX_LT_U32 => {
+                self.v_cmpx_lt_u32_e32(s0, s1);
+            }
+            I::V_CMPX_EQ_U32 => {
+                self.v_cmpx_eq_u32_e32(s0, s1);
+            }
+            I::V_CMPX_LT_I32 => {
+                self.v_cmpx_lt_i32_e32(s0, s1);
+            }
+            I::V_CMP_GT_U64 => {
+                self.v_cmp_gt_u64_e32(s0, s1);
+            }
+            I::V_CMP_GT_F64 => {
+                self.v_cmp_gt_f64_e32(s0, s1);
+            }
+            I::V_CMP_NLT_F64 => {
+                self.v_cmp_nlt_f64_e32(s0, s1);
+            }
+            I::V_CMP_LT_F64 => {
+                self.v_cmp_lt_f64_e32(s0, s1);
+            }
+            I::V_CMP_LE_F64 => {
+                self.v_cmp_le_f64_e32(s0, s1);
+            }
+            I::V_CMP_NGT_F64 => {
+                self.v_cmp_ngt_f64_e32(s0, s1);
+            }
+            I::V_CMPX_NGT_F64 => {
+                self.v_cmpx_ngt_f64_e32(s0, s1);
+            }
+            I::V_CMPX_NGE_F64 => {
+                self.v_cmpx_nge_f64_e32(s0, s1);
+            }
+            I::V_CMPX_NLT_F64 => {
+                self.v_cmpx_nlt_f64_e32(s0, s1);
+            }
+            _ => {
+                unimplemented!()
+            }
+        }
+        Signals::None
+    }
+
+    fn execute_vopd(&mut self, inst: VOPD) -> Signals {
+        let mut dual_result0_u32 = [0u32; 32];
+        let mut dual_result1_u32 = [0u32; 32];
+
+        let s0 = inst.src0x as usize;
+        let s1 = inst.vsrc1x as usize;
+        match inst.opx {
+            I::V_DUAL_CNDMASK_B32 => {
+                self.v_dual_cndmask_b32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_MOV_B32 => {
+                self.v_dual_mov_b32(&mut dual_result0_u32, s0);
+            }
+            _ => unimplemented!(),
+        }
+        let s0 = inst.src0y as usize;
+        let s1 = inst.vsrc1y as usize;
+        match inst.opy {
+            I::V_DUAL_CNDMASK_B32 => {
+                self.v_dual_cndmask_b32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_MOV_B32 => {
+                self.v_dual_mov_b32(&mut dual_result1_u32, s0);
+            }
+            I::V_DUAL_LSHLREV_B32 => {
+                self.v_dual_lshlrev_b32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_ADD_NC_U32 => {
+                self.v_dual_add_nc_u32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_AND_B32 => {
+                self.v_dual_and_b32(&mut dual_result1_u32, s0, s1);
+            }
+            _ => unimplemented!(),
+        }
+        let d = inst.vdstx as usize;
+        match inst.opx {
+            I::V_DUAL_CNDMASK_B32 | I::V_DUAL_MOV_B32 => {
+                for elem in 0..32 {
+                    if !self.get_exec_bit(elem) {
+                        continue;
+                    }
+                    self.write_vgpr(elem, d, dual_result0_u32[elem]);
+                }
+            }
+            _ => unimplemented!(),
+        }
+        let d = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as usize;
+        match inst.opy {
+            I::V_DUAL_CNDMASK_B32
+            | I::V_DUAL_MOV_B32
+            | I::V_DUAL_LSHLREV_B32
+            | I::V_DUAL_ADD_NC_U32
+            | I::V_DUAL_AND_B32 => {
+                for elem in 0..32 {
+                    if !self.get_exec_bit(elem) {
+                        continue;
+                    }
+                    self.write_vgpr(elem, d, dual_result1_u32[elem]);
+                }
             }
             _ => unimplemented!(),
         }
@@ -869,11 +1101,17 @@ impl SIMD32 {
             I::GLOBAL_STORE_B64 => {
                 self.global_store_b64(vaddr, vsrc, saddr, ioffset);
             }
+            I::GLOBAL_STORE_B128 => {
+                self.global_store_b128(vaddr, vsrc, saddr, ioffset);
+            }
             I::GLOBAL_LOAD_B32 => {
                 self.global_load_b32(vaddr, vdst, saddr, ioffset);
             }
             I::GLOBAL_LOAD_B64 => {
                 self.global_load_b64(vaddr, vdst, saddr, ioffset);
+            }
+            I::GLOBAL_LOAD_B128 => {
+                self.global_load_b128(vaddr, vdst, saddr, ioffset);
             }
             _ => unimplemented!(),
         }
@@ -888,6 +1126,9 @@ impl SIMD32 {
             I::S_WAIT_ALU => {}
             I::S_WAIT_KMCNT => {}
             I::S_WAIT_LOADCNT => {}
+            I::S_CLAUSE => {}
+            I::S_DELAY_ALU => {}
+            I::S_SENDMSG => {}
             I::S_CBRANCH_EXECZ => {
                 if self.is_execz() {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
@@ -898,8 +1139,18 @@ impl SIMD32 {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
                 }
             }
+            I::S_CBRANCH_VCCZ => {
+                if self.is_vccz() {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
             I::S_CBRANCH_VCCNZ => {
                 if self.is_vccnz() {
+                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                }
+            }
+            I::S_CBRANCH_SCC0 => {
+                if !self.ctx.scc {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
                 }
             }
@@ -919,10 +1170,10 @@ impl SIMD32 {
     fn read_sop_src(&self, addr: usize) -> u32 {
         match addr {
             0..=105 => self.read_sgpr(addr),
-            106 => self.read_sgpr(addr),
-            107 => self.read_sgpr(addr),
+            106 => self.read_sgpr(addr), // VCC_LO
+            107 => self.read_sgpr(addr), // VCC_HI
             108..=123 => self.read_sgpr(addr),
-            124 => 0,
+            124 => 0,                    // NULL
             125 => self.read_sgpr(addr), // M0
             126 => self.read_sgpr(addr), // EXEC_LO
             127 => self.read_sgpr(addr), // EXEC_HI
@@ -972,6 +1223,7 @@ impl SIMD32 {
             106 => self.write_sgpr(addr, value),
             107 => self.write_sgpr(addr, value),
             108..=123 => self.write_sgpr(addr, value),
+            124 => {}                            // NULL
             126 => self.write_sgpr(addr, value), // EXEC_LO
             127 => self.write_sgpr(addr, value), // EXEC_HI
             _ => panic!(),
@@ -1004,6 +1256,27 @@ impl SIMD32 {
         }
     }
 
+    fn read_vop_src_e64(&self, elem: usize, addr: usize) -> u32 {
+        match addr {
+            0..=127 => self.read_sgpr(addr),
+            128 => 0,
+            129..=192 => (addr - 128) as u32,
+            193..=208 => -((addr - 192) as i32) as u32,
+            240 => 0x3f000000, // 0.5
+            241 => 0xbf000000, // -0.5
+            242 => 0x3f800000, // 1.0
+            243 => 0xbf800000, // -1.0
+            244 => 0x40000000, // 2.0
+            245 => 0xc0000000, // -2.0
+            246 => 0x40800000, // 4.0
+            247 => 0xc0800000, // -4.0
+            248 => 0x3e22f983, // 1/(2*PI)
+            255 => self.fetch_literal_constant_e64(),
+            256..=511 => self.read_vgpr(elem, addr - 256),
+            _ => panic!(),
+        }
+    }
+
     fn read_vop_src_pair(&self, elem: usize, addr: usize) -> u64 {
         match addr {
             0..=127 => self.read_sgpr_pair(addr),
@@ -1025,6 +1298,43 @@ impl SIMD32 {
         }
     }
 
+    fn read_vop_src_pair_f64(&self, elem: usize, addr: usize) -> f64 {
+        if addr == 255 {
+            u64_to_f64((self.fetch_literal_constant() as u64) << 32)
+        } else {
+            u64_to_f64(self.read_vop_src_pair(elem, addr))
+        }
+    }
+
+    fn read_vop_src_pair_e64(&self, elem: usize, addr: usize) -> u64 {
+        match addr {
+            0..=127 => self.read_sgpr_pair(addr),
+            128 => 0,
+            129..=192 => (addr - 128) as u64,
+            193..=208 => (-((addr - 192) as i64)) as u64,
+            240 => 0x3fe0000000000000, // 0.5
+            241 => 0xbfe0000000000000, // -0.5
+            242 => 0x3ff0000000000000, // 1.0
+            243 => 0xbff0000000000000, // -1.0
+            244 => 0x4000000000000000, // 2.0
+            245 => 0xc000000000000000, // -2.0
+            246 => 0x4010000000000000, // 4.0
+            247 => 0xc010000000000000, // -4.0
+            248 => 0x3fc45f306dc8bdc4, // 1/(2*PI)
+            255 => self.fetch_literal_constant_e64() as u64,
+            256..=511 => self.read_vgpr_pair(elem, addr - 256),
+            _ => panic!(),
+        }
+    }
+
+    fn read_vop_src_pair_e64_f64(&self, elem: usize, addr: usize) -> f64 {
+        if addr == 255 {
+            u64_to_f64((self.fetch_literal_constant_e64() as u64) << 32)
+        } else {
+            u64_to_f64(self.read_vop_src_pair_e64(elem, addr))
+        }
+    }
+
     fn s_mov_b32(&mut self, d: usize, s0: usize) {
         let s0_value = self.read_sop_src(s0);
         let d_value = s0_value;
@@ -1037,6 +1347,18 @@ impl SIMD32 {
         self.write_sop_dst_pair(d, d_value);
     }
 
+    fn s_and_saveexec_b32(&mut self, d: usize, s0: usize) {
+        let s0_value = self.read_sop_src(s0);
+        let exec_value = self.get_exec();
+
+        self.write_sop_dst(d, exec_value);
+
+        let exec_value = s0_value & exec_value;
+
+        self.set_exec(exec_value);
+        self.ctx.scc = exec_value != 0;
+    }
+
     fn s_or_saveexec_b32(&mut self, d: usize, s0: usize) {
         let s0_value = self.read_sop_src(s0);
         let exec_value = self.get_exec();
@@ -1044,6 +1366,18 @@ impl SIMD32 {
         self.write_sop_dst(d, exec_value);
 
         let exec_value = s0_value | exec_value;
+
+        self.set_exec(exec_value);
+        self.ctx.scc = exec_value != 0;
+    }
+
+    fn s_and_not1_saveexec_b32(&mut self, d: usize, s0: usize) {
+        let s0_value = self.read_sop_src(s0);
+        let exec_value = self.get_exec();
+
+        self.write_sop_dst(d, exec_value);
+
+        let exec_value = s0_value & !exec_value;
 
         self.set_exec(exec_value);
         self.ctx.scc = exec_value != 0;
@@ -1070,6 +1404,205 @@ impl SIMD32 {
             }
             let s0_value = self.read_vop_src(elem, s0);
             let d_value = s0_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_cvt_f64_u32_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let d_value = s0_value as f64;
+
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_rcp_f64_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let d_value = 1.0 / s0_value;
+
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_rsq_f64_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let d_value = 1.0 / s0_value.sqrt();
+
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_fract_f64_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let d_value = s0_value.fract();
+
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_cvt_i32_f64_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let d_value = s0_value as i32;
+
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    fn v_cvt_f64_i32_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0) as i32;
+            let d_value = s0_value as f64;
+
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_rndne_f64_e32(&mut self, d: usize, s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let mut d_value = (s0_value + 0.5).floor();
+            if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
+                d_value -= 1.0;
+            }
+
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_and_b32_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value & s1_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_xor_b32_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value ^ s1_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_cndmask_b32_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = if self.get_vcc_bit(elem) {
+                s1_value
+            } else {
+                s0_value
+            };
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_add_nc_u32_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value.wrapping_add(s1_value);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_mul_f64_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value * s1_value;
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_add_f64_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value + s1_value;
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_max_num_f64_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value.max(s1_value);
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_lshlrev_b32_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s1_value << (s0_value & 0x1F);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_lshrrev_b32_e32(&mut self, d: usize, s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s1_value >> (s0_value & 0x1F);
             self.write_vgpr(elem, d, d_value);
         }
     }
@@ -1123,8 +1656,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = mul_u32(s0_value, s1_value);
             self.write_vgpr(elem, d, d_value);
         }
@@ -1150,7 +1683,7 @@ impl SIMD32 {
             let s0_value = self.read_vop_src(elem, s0);
             let s1_value = self.read_vop_src(elem, s1);
             let s2_value = self.read_vop_src(elem, s2);
-            let d_value = s0_value ^ s1_value ^ s2_value;
+            let d_value = (s0_value ^ s1_value) ^ s2_value;
             self.write_vgpr(elem, d, d_value);
         }
     }
@@ -1172,10 +1705,10 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
-            let s2_value = self.read_vop_src(elem, s2);
-            let d_value = s0_value.wrapping_add(s1_value).wrapping_add(s2_value);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
+            let s2_value = self.read_vop_src_e64(elem, s2);
+            let (d_value, _) = add_u32(s0_value, s1_value, s2_value);
             self.write_vgpr(elem, d, d_value);
         }
     }
@@ -1197,7 +1730,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64(self.read_vop_src_pair(elem, s0));
+            let s0_value = self.read_vop_src_pair_e64_f64(elem, s0);
             let d_value = s0_value as i32;
 
             self.write_vgpr(elem, d, d_value as u32);
@@ -1286,9 +1819,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
-            let s2_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), abs, neg, 2);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s2), abs, neg, 2);
             let d_value = fma(s0_value, s1_value, s2_value);
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
@@ -1336,9 +1869,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
-            let s2_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), abs, neg, 2);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s2), abs, neg, 2);
             let d_value = div_fixup_f64(s0_value, s1_value, s2_value);
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
@@ -1391,9 +1924,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0) as u64;
-            let s1_value = self.read_vop_src(elem, s1) as u64;
-            let s2_value = self.read_vop_src_pair(elem, s2);
+            let s0_value = self.read_vop_src_e64(elem, s0) as u64;
+            let s1_value = self.read_vop_src_e64(elem, s1) as u64;
+            let s2_value = self.read_vop_src_pair_e64(elem, s2);
             let (d0_value, d1_value) = (s0_value * s1_value).overflowing_add(s2_value);
             self.write_vgpr_pair(elem, d0, d0_value);
             vcc |= (d1_value as u32) << elem;
@@ -1423,9 +1956,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
-            let s2_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), abs, neg, 2);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s2), abs, neg, 2);
             let (d_value, flag) = div_scale_f64(s0_value, s1_value, s2_value);
 
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
@@ -1454,8 +1987,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -1482,8 +2015,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = !(s0_value > s1_value);
             vcc |= (d_value as u32) << elem;
         }
@@ -1510,8 +2043,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -1538,8 +2071,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = !(s0_value < s1_value);
             vcc |= (d_value as u32) << elem;
         }
@@ -1566,8 +2099,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -1594,9 +2127,65 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = !(s0_value >= s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_le_f64_e64(
+        &mut self,
+        d: usize,
+        s0: usize,
+        s1: usize,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
+            let d_value = s0_value <= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_neq_f64_e64(
+        &mut self,
+        d: usize,
+        s0: usize,
+        s1: usize,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
+            let d_value = !(s0_value == s1_value);
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
@@ -1622,8 +2211,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u32_to_f32_abs_neg(self.read_vop_src(elem, s0), abs, neg, 0);
-            let s1_value = u32_to_f32_abs_neg(self.read_vop_src(elem, s1), abs, neg, 1);
+            let s0_value = u32_to_f32_abs_neg(self.read_vop_src_e64(elem, s0), abs, neg, 0);
+            let s1_value = u32_to_f32_abs_neg(self.read_vop_src_e64(elem, s1), abs, neg, 1);
             let d_value = if self.get_sgpr_bit(s2, elem) {
                 s1_value
             } else {
@@ -1707,9 +2296,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = self.read_vop_src(elem, s1) as i32;
-            let d_value = s0_value * (s1_value as f64).exp2();
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = self.read_vop_src_e64(elem, s1) as i32;
+            let d_value = libm::ldexp(s0_value, s1_value);
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
@@ -1737,10 +2326,10 @@ impl SIMD32 {
         _omod: u8,
     ) {
         let s0_values = (0..32)
-            .map(|elem| u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0))
+            .map(|elem| u64_to_f64_abs_neg(self.read_vop_src_pair_e64(elem, s0), abs, neg, 0))
             .collect::<Vec<f64>>();
         let s1_values = (0..32)
-            .map(|elem| self.read_vop_src(elem, s1))
+            .map(|elem| self.read_vop_src_e64(elem, s1))
             .collect::<Vec<u32>>();
 
         let mut vcc = 0u32;
@@ -1882,6 +2471,54 @@ impl SIMD32 {
         }
     }
 
+    fn v_trig_preop_f64(&mut self, d: usize, s0: usize, s1: usize) {
+        const TWO_OVER_PI_FRACTION: [u64; 20] = [
+            0xBA10AC06608DF8F6,
+            0x25D4D7F6BF623F1A,
+            0xE2F67A0E73EF14A5,
+            0xD45AEA4F758FD7CB,
+            0x136E9E8C7ECD3CBF,
+            0xDA3EDA6CFD9E4F96,
+            0x301FDE5E2316B414,
+            0x50763FF12FFFBC0B,
+            0x73E93908BF177BF2,
+            0xFC827323AC7306A6,
+            0x8909D338E04D68BE,
+            0x4E7DD1046BEA5D76,
+            0x2439FC3BD6396253,
+            0xA5C00C925DD413A3,
+            0x8AC36E48DC74849B,
+            0x2083FCA2C757BD77,
+            0xBB81B6C52B327887,
+            0x2A53F84EAFA3EA69,
+            0x000145F306DC9C88,
+            0x0000000000000000,
+        ];
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = u64_to_f64(self.read_vop_src_pair(elem, s0));
+            let s1_value = self.read_vop_src(elem, s1);
+
+            let mut shift = (s1_value & 0x1F) as i32 * 53;
+            if get_exp_f64(s0_value) > 1077 {
+                shift += get_exp_f64(s0_value) as i32 - 1077;
+            }
+
+            let result = get_bits_u64(&TWO_OVER_PI_FRACTION, (1201 - 53 - shift) as usize, 53);
+            let mut scale = -53 - shift;
+
+            if get_exp_f64(s0_value) >= 1968 {
+                scale += 128;
+            }
+
+            let d_value = libm::ldexp(result as f64, scale);
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
     fn v_min_num_f64_e64(
         &mut self,
         d: usize,
@@ -1921,6 +2558,373 @@ impl SIMD32 {
             let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
             let d_value = s0_value.max(s1_value);
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_cmp_gt_u32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_ne_u32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value != s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_eq_u32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value == s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_lt_u32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_lt_u32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_eq_u32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value == s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_lt_i32_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0) as i32;
+            let s1_value = self.read_vgpr(elem, s1) as i32;
+            let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_gt_u64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair(elem, s0);
+            let s1_value = self.read_vgpr_pair(elem, s1);
+            let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_gt_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_nlt_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = !(s0_value < s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_lt_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_le_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value <= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_ngt_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = !(s0_value > s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_ngt_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = !(s0_value > s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_nge_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = !(s0_value >= s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_nlt_f64_e32(&mut self, s0: usize, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_pair_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = !(s0_value < s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_dual_cndmask_b32(&mut self, d_values: &mut [u32], s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = if self.get_vcc_bit(elem) {
+                s1_value
+            } else {
+                s0_value
+            };
+            d_values[elem] = d_value;
+        }
+    }
+
+    fn v_dual_mov_b32(&mut self, d_values: &mut [u32], s0: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let d_value = s0_value;
+            d_values[elem] = d_value;
+        }
+    }
+
+    fn v_dual_lshlrev_b32(&mut self, d_values: &mut [u32], s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s1_value << (s0_value & 0x1F);
+            d_values[elem] = d_value;
+        }
+    }
+
+    fn v_dual_add_nc_u32(&mut self, d_values: &mut [u32], s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value.wrapping_add(s1_value);
+            d_values[elem] = d_value;
+        }
+    }
+
+    fn v_dual_and_b32(&mut self, d_values: &mut [u32], s0: usize, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value & s1_value;
+            d_values[elem] = d_value;
         }
     }
 
@@ -2052,6 +3056,33 @@ impl SIMD32 {
         }
     }
 
+    fn global_store_b128(&mut self, vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for i in 0..4 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let data = self.read_vgpr(elem, vsrc + i);
+                let addr = offset[elem] + (ioffset as u64) + (i as u64 * 4);
+
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
     fn global_load_b32(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
         let offset = (0..32)
             .map(|elem| {
@@ -2092,6 +3123,32 @@ impl SIMD32 {
                     continue;
                 }
                 let addr = offset[elem] + (ioffset as u64) + (i as u64 * 4);
+
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn global_load_b128(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for i in 0..4 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let addr = offset[elem] as i64 + (ioffset as i64) + (i as i64 * 4);
 
                 let ptr = addr as *mut u32;
                 let data = unsafe { *ptr };
@@ -2246,6 +3303,14 @@ impl SIMD32 {
         let s1_value = self.read_sop_src(s1) as i32;
         let d_value = s0_value * s1_value;
         self.write_sop_dst(d, d_value as u32);
+    }
+
+    fn s_lshr_b32(&mut self, d: usize, s0: usize, s1: usize) {
+        let s0_value = self.read_sop_src(s0) as i32;
+        let s1_value = self.read_sop_src(s1) as i32;
+        let d_value = s0_value >> (s1_value & 0x1F);
+        self.write_sop_dst(d, d_value as u32);
+        self.ctx.scc = d_value != 0;
     }
 
     fn s_cmp_lg_u32(&mut self, s0: usize, s1: usize) {

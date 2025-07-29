@@ -376,6 +376,55 @@ fn decode_vop1_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
 
 fn decode_vop2_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
+        1 => Ok((I::V_CNDMASK_B32, 4)),
+        2 => Ok((I::V_ADD_F64, 4)),
+        3 => Ok((I::V_ADD_F32, 4)),
+        4 => Ok((I::V_SUB_F32, 4)),
+        5 => Ok((I::V_SUBREV_F32, 4)),
+        6 => Ok((I::V_MUL_F64, 4)),
+        7 => Ok((I::V_MUL_DX9_ZERO_F32, 4)),
+        8 => Ok((I::V_MUL_F32, 4)),
+        9 => Ok((I::V_MUL_I32_I24, 4)),
+        10 => Ok((I::V_MUL_HI_I32_I24, 4)),
+        11 => Ok((I::V_MUL_U32_U24, 4)),
+        12 => Ok((I::V_MUL_HI_U32_U24, 4)),
+        13 => Ok((I::V_MIN_NUM_F64, 4)),
+        14 => Ok((I::V_MAX_NUM_F64, 4)),
+        17 => Ok((I::V_MIN_I32, 4)),
+        18 => Ok((I::V_MAX_I32, 4)),
+        19 => Ok((I::V_MIN_U32, 4)),
+        20 => Ok((I::V_MAX_U32, 4)),
+        21 => Ok((I::V_MIN_NUM_F32, 4)),
+        22 => Ok((I::V_MAX_NUM_F32, 4)),
+        24 => Ok((I::V_LSHLREV_B32, 4)),
+        25 => Ok((I::V_LSHRREV_B32, 4)),
+        26 => Ok((I::V_ASHRREV_I32, 4)),
+        27 => Ok((I::V_AND_B32, 4)),
+        28 => Ok((I::V_OR_B32, 4)),
+        29 => Ok((I::V_XOR_B32, 4)),
+        30 => Ok((I::V_XNOR_B32, 4)),
+        31 => Ok((I::V_LSHLREV_B64, 4)),
+        32 => Ok((I::V_ADD_CO_CI_U32, 4)),
+        33 => Ok((I::V_SUB_CO_CI_U32, 4)),
+        34 => Ok((I::V_SUBREV_CO_CI_U32, 4)),
+        37 => Ok((I::V_ADD_NC_U32, 4)),
+        38 => Ok((I::V_SUB_NC_U32, 4)),
+        39 => Ok((I::V_SUBREV_NC_U32, 4)),
+        43 => Ok((I::V_FMAC_F32, 4)),
+        44 => Ok((I::V_FMAMK_F32, 4)),
+        45 => Ok((I::V_FMAAK_F32, 4)),
+        47 => Ok((I::V_CVT_PK_RTZ_F16_F32, 4)),
+        48 => Ok((I::V_MIN_NUM_F16, 4)),
+        49 => Ok((I::V_MAX_NUM_F16, 4)),
+        50 => Ok((I::V_ADD_F16, 4)),
+        51 => Ok((I::V_SUB_F16, 4)),
+        52 => Ok((I::V_SUBREV_F16, 4)),
+        53 => Ok((I::V_MUL_F16, 4)),
+        54 => Ok((I::V_FMAC_F16, 4)),
+        55 => Ok((I::V_FMAMK_F16, 4)),
+        56 => Ok((I::V_FMAAK_F16, 4)),
+        59 => Ok((I::V_LDEXP_F16, 4)),
+        60 => Ok((I::V_PK_FMAC_F16, 4)),
         _ => Err(()),
     }
 }
@@ -833,6 +882,211 @@ fn decode_vop3_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
 
 fn decode_vopc_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
+        1 => Ok((I::V_CMP_LT_F16, 4)),
+        2 => Ok((I::V_CMP_EQ_F16, 4)),
+        3 => Ok((I::V_CMP_LE_F16, 4)),
+        4 => Ok((I::V_CMP_GT_F16, 4)),
+        5 => Ok((I::V_CMP_LG_F16, 4)),
+        6 => Ok((I::V_CMP_GE_F16, 4)),
+        7 => Ok((I::V_CMP_O_F16, 4)),
+        8 => Ok((I::V_CMP_U_F16, 4)),
+        9 => Ok((I::V_CMP_NGE_F16, 4)),
+        10 => Ok((I::V_CMP_NLG_F16, 4)),
+        11 => Ok((I::V_CMP_NGT_F16, 4)),
+        12 => Ok((I::V_CMP_NLE_F16, 4)),
+        13 => Ok((I::V_CMP_NEQ_F16, 4)),
+        14 => Ok((I::V_CMP_NLT_F16, 4)),
+        17 => Ok((I::V_CMP_LT_F32, 4)),
+        18 => Ok((I::V_CMP_EQ_F32, 4)),
+        19 => Ok((I::V_CMP_LE_F32, 4)),
+        20 => Ok((I::V_CMP_GT_F32, 4)),
+        21 => Ok((I::V_CMP_LG_F32, 4)),
+        22 => Ok((I::V_CMP_GE_F32, 4)),
+        23 => Ok((I::V_CMP_O_F32, 4)),
+        24 => Ok((I::V_CMP_U_F32, 4)),
+        25 => Ok((I::V_CMP_NGE_F32, 4)),
+        26 => Ok((I::V_CMP_NLG_F32, 4)),
+        27 => Ok((I::V_CMP_NGT_F32, 4)),
+        28 => Ok((I::V_CMP_NLE_F32, 4)),
+        29 => Ok((I::V_CMP_NEQ_F32, 4)),
+        30 => Ok((I::V_CMP_NLT_F32, 4)),
+        33 => Ok((I::V_CMP_LT_F64, 4)),
+        34 => Ok((I::V_CMP_EQ_F64, 4)),
+        35 => Ok((I::V_CMP_LE_F64, 4)),
+        36 => Ok((I::V_CMP_GT_F64, 4)),
+        37 => Ok((I::V_CMP_LG_F64, 4)),
+        38 => Ok((I::V_CMP_GE_F64, 4)),
+        39 => Ok((I::V_CMP_O_F64, 4)),
+        40 => Ok((I::V_CMP_U_F64, 4)),
+        41 => Ok((I::V_CMP_NGE_F64, 4)),
+        42 => Ok((I::V_CMP_NLG_F64, 4)),
+        43 => Ok((I::V_CMP_NGT_F64, 4)),
+        44 => Ok((I::V_CMP_NLE_F64, 4)),
+        45 => Ok((I::V_CMP_NEQ_F64, 4)),
+        46 => Ok((I::V_CMP_NLT_F64, 4)),
+        49 => Ok((I::V_CMP_LT_I16, 4)),
+        50 => Ok((I::V_CMP_EQ_I16, 4)),
+        51 => Ok((I::V_CMP_LE_I16, 4)),
+        52 => Ok((I::V_CMP_GT_I16, 4)),
+        53 => Ok((I::V_CMP_NE_I16, 4)),
+        54 => Ok((I::V_CMP_GE_I16, 4)),
+        57 => Ok((I::V_CMP_LT_U16, 4)),
+        58 => Ok((I::V_CMP_EQ_U16, 4)),
+        59 => Ok((I::V_CMP_LE_U16, 4)),
+        60 => Ok((I::V_CMP_GT_U16, 4)),
+        61 => Ok((I::V_CMP_NE_U16, 4)),
+        62 => Ok((I::V_CMP_GE_U16, 4)),
+        65 => Ok((I::V_CMP_LT_I32, 4)),
+        66 => Ok((I::V_CMP_EQ_I32, 4)),
+        67 => Ok((I::V_CMP_LE_I32, 4)),
+        68 => Ok((I::V_CMP_GT_I32, 4)),
+        69 => Ok((I::V_CMP_NE_I32, 4)),
+        70 => Ok((I::V_CMP_GE_I32, 4)),
+        73 => Ok((I::V_CMP_LT_U32, 4)),
+        74 => Ok((I::V_CMP_EQ_U32, 4)),
+        75 => Ok((I::V_CMP_LE_U32, 4)),
+        76 => Ok((I::V_CMP_GT_U32, 4)),
+        77 => Ok((I::V_CMP_NE_U32, 4)),
+        78 => Ok((I::V_CMP_GE_U32, 4)),
+        81 => Ok((I::V_CMP_LT_I64, 4)),
+        82 => Ok((I::V_CMP_EQ_I64, 4)),
+        83 => Ok((I::V_CMP_LE_I64, 4)),
+        84 => Ok((I::V_CMP_GT_I64, 4)),
+        85 => Ok((I::V_CMP_NE_I64, 4)),
+        86 => Ok((I::V_CMP_GE_I64, 4)),
+        89 => Ok((I::V_CMP_LT_U64, 4)),
+        90 => Ok((I::V_CMP_EQ_U64, 4)),
+        91 => Ok((I::V_CMP_LE_U64, 4)),
+        92 => Ok((I::V_CMP_GT_U64, 4)),
+        93 => Ok((I::V_CMP_NE_U64, 4)),
+        94 => Ok((I::V_CMP_GE_U64, 4)),
+        125 => Ok((I::V_CMP_CLASS_F16, 4)),
+        126 => Ok((I::V_CMP_CLASS_F32, 4)),
+        127 => Ok((I::V_CMP_CLASS_F64, 4)),
+        129 => Ok((I::V_CMPX_LT_F16, 4)),
+        130 => Ok((I::V_CMPX_EQ_F16, 4)),
+        131 => Ok((I::V_CMPX_LE_F16, 4)),
+        132 => Ok((I::V_CMPX_GT_F16, 4)),
+        133 => Ok((I::V_CMPX_LG_F16, 4)),
+        134 => Ok((I::V_CMPX_GE_F16, 4)),
+        135 => Ok((I::V_CMPX_O_F16, 4)),
+        136 => Ok((I::V_CMPX_U_F16, 4)),
+        137 => Ok((I::V_CMPX_NGE_F16, 4)),
+        138 => Ok((I::V_CMPX_NLG_F16, 4)),
+        139 => Ok((I::V_CMPX_NGT_F16, 4)),
+        140 => Ok((I::V_CMPX_NLE_F16, 4)),
+        141 => Ok((I::V_CMPX_NEQ_F16, 4)),
+        142 => Ok((I::V_CMPX_NLT_F16, 4)),
+        145 => Ok((I::V_CMPX_LT_F32, 4)),
+        146 => Ok((I::V_CMPX_EQ_F32, 4)),
+        147 => Ok((I::V_CMPX_LE_F32, 4)),
+        148 => Ok((I::V_CMPX_GT_F32, 4)),
+        149 => Ok((I::V_CMPX_LG_F32, 4)),
+        150 => Ok((I::V_CMPX_GE_F32, 4)),
+        151 => Ok((I::V_CMPX_O_F32, 4)),
+        152 => Ok((I::V_CMPX_U_F32, 4)),
+        153 => Ok((I::V_CMPX_NGE_F32, 4)),
+        154 => Ok((I::V_CMPX_NLG_F32, 4)),
+        155 => Ok((I::V_CMPX_NGT_F32, 4)),
+        156 => Ok((I::V_CMPX_NLE_F32, 4)),
+        157 => Ok((I::V_CMPX_NEQ_F32, 4)),
+        158 => Ok((I::V_CMPX_NLT_F32, 4)),
+        161 => Ok((I::V_CMPX_LT_F64, 4)),
+        162 => Ok((I::V_CMPX_EQ_F64, 4)),
+        163 => Ok((I::V_CMPX_LE_F64, 4)),
+        164 => Ok((I::V_CMPX_GT_F64, 4)),
+        165 => Ok((I::V_CMPX_LG_F64, 4)),
+        166 => Ok((I::V_CMPX_GE_F64, 4)),
+        167 => Ok((I::V_CMPX_O_F64, 4)),
+        168 => Ok((I::V_CMPX_U_F64, 4)),
+        169 => Ok((I::V_CMPX_NGE_F64, 4)),
+        170 => Ok((I::V_CMPX_NLG_F64, 4)),
+        171 => Ok((I::V_CMPX_NGT_F64, 4)),
+        172 => Ok((I::V_CMPX_NLE_F64, 4)),
+        173 => Ok((I::V_CMPX_NEQ_F64, 4)),
+        174 => Ok((I::V_CMPX_NLT_F64, 4)),
+        177 => Ok((I::V_CMPX_LT_I16, 4)),
+        178 => Ok((I::V_CMPX_EQ_I16, 4)),
+        179 => Ok((I::V_CMPX_LE_I16, 4)),
+        180 => Ok((I::V_CMPX_GT_I16, 4)),
+        181 => Ok((I::V_CMPX_NE_I16, 4)),
+        182 => Ok((I::V_CMPX_GE_I16, 4)),
+        185 => Ok((I::V_CMPX_LT_U16, 4)),
+        186 => Ok((I::V_CMPX_EQ_U16, 4)),
+        187 => Ok((I::V_CMPX_LE_U16, 4)),
+        188 => Ok((I::V_CMPX_GT_U16, 4)),
+        189 => Ok((I::V_CMPX_NE_U16, 4)),
+        190 => Ok((I::V_CMPX_GE_U16, 4)),
+        193 => Ok((I::V_CMPX_LT_I32, 4)),
+        194 => Ok((I::V_CMPX_EQ_I32, 4)),
+        195 => Ok((I::V_CMPX_LE_I32, 4)),
+        196 => Ok((I::V_CMPX_GT_I32, 4)),
+        197 => Ok((I::V_CMPX_NE_I32, 4)),
+        198 => Ok((I::V_CMPX_GE_I32, 4)),
+        201 => Ok((I::V_CMPX_LT_U32, 4)),
+        202 => Ok((I::V_CMPX_EQ_U32, 4)),
+        203 => Ok((I::V_CMPX_LE_U32, 4)),
+        204 => Ok((I::V_CMPX_GT_U32, 4)),
+        205 => Ok((I::V_CMPX_NE_U32, 4)),
+        206 => Ok((I::V_CMPX_GE_U32, 4)),
+        209 => Ok((I::V_CMPX_LT_I64, 4)),
+        210 => Ok((I::V_CMPX_EQ_I64, 4)),
+        211 => Ok((I::V_CMPX_LE_I64, 4)),
+        212 => Ok((I::V_CMPX_GT_I64, 4)),
+        213 => Ok((I::V_CMPX_NE_I64, 4)),
+        214 => Ok((I::V_CMPX_GE_I64, 4)),
+        217 => Ok((I::V_CMPX_LT_U64, 4)),
+        218 => Ok((I::V_CMPX_EQ_U64, 4)),
+        219 => Ok((I::V_CMPX_LE_U64, 4)),
+        220 => Ok((I::V_CMPX_GT_U64, 4)),
+        221 => Ok((I::V_CMPX_NE_U64, 4)),
+        222 => Ok((I::V_CMPX_GE_U64, 4)),
+        253 => Ok((I::V_CMPX_CLASS_F16, 4)),
+        254 => Ok((I::V_CMPX_CLASS_F32, 4)),
+        255 => Ok((I::V_CMPX_CLASS_F64, 4)),
+        _ => Err(()),
+    }
+}
+
+fn decode_opx_opcode_rdna4(opcode: u32) -> Result<I, ()> {
+    match opcode {
+        0 => Ok(I::V_DUAL_FMAC_F32),
+        1 => Ok(I::V_DUAL_FMAAK_F32),
+        2 => Ok(I::V_DUAL_FMAMK_F32),
+        3 => Ok(I::V_DUAL_MUL_F32),
+        4 => Ok(I::V_DUAL_ADD_F32),
+        5 => Ok(I::V_DUAL_SUB_F32),
+        6 => Ok(I::V_DUAL_SUBREV_F32),
+        7 => Ok(I::V_DUAL_MUL_DX9_ZERO_F32),
+        8 => Ok(I::V_DUAL_MOV_B32),
+        9 => Ok(I::V_DUAL_CNDMASK_B32),
+        10 => Ok(I::V_DUAL_MAX_NUM_F32),
+        11 => Ok(I::V_DUAL_MIN_NUM_F32),
+        12 => Ok(I::V_DUAL_DOT2ACC_F32_F16),
+        13 => Ok(I::V_DUAL_DOT2ACC_F32_BF16),
+        _ => Err(()),
+    }
+}
+
+fn decode_opy_opcode_rdna4(opcode: u32) -> Result<I, ()> {
+    match opcode {
+        0 => Ok(I::V_DUAL_FMAC_F32),
+        1 => Ok(I::V_DUAL_FMAAK_F32),
+        2 => Ok(I::V_DUAL_FMAMK_F32),
+        3 => Ok(I::V_DUAL_MUL_F32),
+        4 => Ok(I::V_DUAL_ADD_F32),
+        5 => Ok(I::V_DUAL_SUB_F32),
+        6 => Ok(I::V_DUAL_SUBREV_F32),
+        7 => Ok(I::V_DUAL_MUL_DX9_ZERO_F32),
+        8 => Ok(I::V_DUAL_MOV_B32),
+        9 => Ok(I::V_DUAL_CNDMASK_B32),
+        10 => Ok(I::V_DUAL_MAX_NUM_F32),
+        11 => Ok(I::V_DUAL_MIN_NUM_F32),
+        12 => Ok(I::V_DUAL_DOT2ACC_F32_F16),
+        13 => Ok(I::V_DUAL_DOT2ACC_F32_BF16),
+        16 => Ok(I::V_DUAL_ADD_NC_U32),
+        17 => Ok(I::V_DUAL_LSHLREV_B32),
+        18 => Ok(I::V_DUAL_AND_B32),
         _ => Err(()),
     }
 }
@@ -1006,14 +1260,16 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
             if ssrc0 == 255 { max(8, size) } else { size },
         ))
     } else if (get_bits(inst, 31, 23) as u32) == SOPC_ENCODE {
+        let ssrc0 = get_bits(inst, 7, 0) as u8;
+        let ssrc1 = get_bits(inst, 15, 8) as u8;
         let (op, size) = decode_sopc_opcode_rdna4(get_bits(inst, 22, 16) as u32)?;
         Ok((
-            InstFormat::SOPC(SOPC {
-                ssrc0: get_bits(inst, 7, 0) as u8,
-                ssrc1: get_bits(inst, 15, 8) as u8,
-                op,
-            }),
-            size,
+            InstFormat::SOPC(SOPC { ssrc0, ssrc1, op }),
+            if ssrc0 == 255 || ssrc1 == 255 {
+                max(8, size)
+            } else {
+                size
+            },
         ))
     } else if (get_bits(inst, 31, 23) as u32) == SOPP_ENCODE {
         let (op, size) = decode_sopp_opcode_rdna4(get_bits(inst, 22, 16) as u32)?;
@@ -1035,26 +1291,59 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
             size,
         ))
     } else if (get_bits(inst, 31, 30) as u32) == SOP2_ENCODE {
+        let ssrc0 = get_bits(inst, 7, 0) as u8;
         let ssrc1 = get_bits(inst, 15, 8) as u8;
         let (op, size) = decode_sop2_opcode_rdna4(get_bits(inst, 29, 23) as u32)?;
         Ok((
             InstFormat::SOP2(SOP2 {
-                ssrc0: get_bits(inst, 7, 0) as u8,
+                ssrc0,
                 ssrc1,
                 sdst: get_bits(inst, 22, 16) as u8,
                 op,
             }),
-            if ssrc1 == 255 { max(8, size) } else { size },
+            if ssrc0 == 255 || ssrc1 == 255 {
+                max(8, size)
+            } else {
+                size
+            },
         ))
     } else if (get_bits(inst, 31, 25) as u32) == VOPC_ENCODE {
         let (op, size) = decode_vopc_opcode_rdna4(get_bits(inst, 24, 17) as u32)?;
+        let src0 = get_bits(inst, 8, 0) as u16;
         Ok((
             InstFormat::VOPC(VOPC {
-                src0: get_bits(inst, 8, 0) as u16,
+                src0,
                 vsrc1: get_bits(inst, 16, 9) as u8,
                 op,
             }),
-            size,
+            if src0 == 255 { max(8, size) } else { size },
+        ))
+    } else if (get_bits(inst, 31, 26) as u32) == VOPD_ENCODE {
+        let opx = decode_opx_opcode_rdna4(get_bits(inst, 25, 22) as u32)?;
+        let opy = decode_opy_opcode_rdna4(get_bits(inst, 21, 17) as u32)?;
+        let size = 8;
+        let src0x = get_bits(inst, 8, 0) as u16;
+        let vsrc1x = get_bits(inst, 16, 9) as u8;
+        let src0y = get_bits(inst, 40, 32) as u16;
+        let vsrc1y = get_bits(inst, 48, 41) as u8;
+        let vdstx = get_bits(inst, 63, 56) as u8;
+        let vdsty = get_bits(inst, 55, 49) as u8;
+        Ok((
+            InstFormat::VOPD(VOPD {
+                opx,
+                opy,
+                src0x,
+                src0y,
+                vsrc1x,
+                vsrc1y,
+                vdstx,
+                vdsty,
+            }),
+            if src0x == 255 || src0y == 255 {
+                size + 4
+            } else {
+                size
+            },
         ))
     } else if (get_bits(inst, 31, 25) as u32) == VOP1_ENCODE {
         let src0 = get_bits(inst, 8, 0) as u16;
@@ -1102,7 +1391,11 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
                     omod,
                     neg,
                 }),
-                size,
+                if src0 == 255 || src1 == 255 || src2 == 255 {
+                    size + 4
+                } else {
+                    size
+                },
             ))
         } else {
             Ok((
@@ -1118,7 +1411,11 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
                     omod,
                     neg,
                 }),
-                size,
+                if src0 == 255 || src1 == 255 || src2 == 255 {
+                    size + 4
+                } else {
+                    size
+                },
             ))
         }
     } else if (get_bits(inst, 31, 26) as u32) == SMEM_ENCODE {

@@ -852,6 +852,30 @@ pub enum I {
     V_CVT_SR_FP8_F32,
     V_CVT_SR_BF8_F32,
 
+    V_FMAMK_F32,
+    V_FMAAK_F32,
+    V_FMAMK_F16,
+    V_FMAAK_F16,
+    V_PK_FMAC_F16,
+
+    V_DUAL_FMAC_F32,
+    V_DUAL_FMAAK_F32,
+    V_DUAL_FMAMK_F32,
+    V_DUAL_MUL_F32,
+    V_DUAL_ADD_F32,
+    V_DUAL_SUB_F32,
+    V_DUAL_SUBREV_F32,
+    V_DUAL_MUL_DX9_ZERO_F32,
+    V_DUAL_MOV_B32,
+    V_DUAL_CNDMASK_B32,
+    V_DUAL_MAX_NUM_F32,
+    V_DUAL_MIN_NUM_F32,
+    V_DUAL_DOT2ACC_F32_F16,
+    V_DUAL_DOT2ACC_F32_BF16,
+    V_DUAL_ADD_NC_U32,
+    V_DUAL_LSHLREV_B32,
+    V_DUAL_AND_B32,
+
     S_LOAD_DWORD,
     S_LOAD_DWORDX2,
     S_LOAD_DWORDX4,
@@ -1150,6 +1174,18 @@ pub struct VOPC {
 }
 
 #[derive(Debug, Clone)]
+pub struct VOPD {
+    pub opx: I,
+    pub opy: I,
+    pub src0x: u16,
+    pub src0y: u16,
+    pub vsrc1x: u8,
+    pub vsrc1y: u8,
+    pub vdstx: u8,
+    pub vdsty: u8,
+}
+
+#[derive(Debug, Clone)]
 pub struct VOP3A {
     pub vdst: u8,
     pub abs: u8,
@@ -1179,6 +1215,7 @@ pub const VOPC_ENCODE: u32 = 0b0111110;
 pub const VOP1_ENCODE: u32 = 0b0111111;
 pub const VOP2_ENCODE: u32 = 0b0;
 pub const VOP3AB_ENCODE: u32 = 0b110100;
+pub const VOPD_ENCODE: u32 = 0b110010;
 
 #[derive(Debug, Clone)]
 pub struct SOP2 {
