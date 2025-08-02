@@ -22,25 +22,15 @@ pub fn set_u64(buffer: &mut [u8], offset: usize, value: u64) {
 }
 
 pub fn get_u32(buffer: &[u8], offset: usize) -> u32 {
-    let b0 = buffer[offset] as u32;
-    let b1 = buffer[offset + 1] as u32;
-    let b2 = buffer[offset + 2] as u32;
-    let b3 = buffer[offset + 3] as u32;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(&buffer[offset..offset + 4]);
+    u32::from_le_bytes(arr)
 }
 
 pub fn get_u64(buffer: &[u8], offset: usize) -> u64 {
-    let b0 = buffer[offset] as u64;
-    let b1 = buffer[offset + 1] as u64;
-    let b2 = buffer[offset + 2] as u64;
-    let b3 = buffer[offset + 3] as u64;
-    let b4 = buffer[offset + 4] as u64;
-    let b5 = buffer[offset + 5] as u64;
-    let b6 = buffer[offset + 6] as u64;
-    let b7 = buffer[offset + 7] as u64;
-
-    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(&buffer[offset..offset + 8]);
+    u64::from_le_bytes(arr)
 }
 
 pub fn get_str(buffer: &[u8], offset: usize, size: usize) -> String {
