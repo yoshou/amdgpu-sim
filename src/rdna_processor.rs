@@ -299,12 +299,6 @@ fn u32_to_f32_abs_neg(value: u32, abs: u8, neg: u8, idx: usize) -> f32 {
 }
 
 #[inline(always)]
-fn u64_to_f64_abs_neg(value: u64, abs: u8, neg: u8, idx: usize) -> f64 {
-    let result = f64::from_bits(value);
-    abs_neg(result, abs, neg, idx)
-}
-
-#[inline(always)]
 fn f64_to_u64(value: f64) -> u64 {
     f64::to_bits(value)
 }
@@ -604,6 +598,33 @@ impl SIMD32 {
             247 => 0xc0800000, // -4.0
             248 => 0x3e22f983, // 1/(2*PI)
             255 => self.fetch_literal_constant(),
+            _ => panic!(),
+        }
+    }
+
+    fn read_sop_src_e64(&self, addr: usize) -> u32 {
+        match addr {
+            0..=105 => self.read_sgpr(addr),
+            106 => self.read_sgpr(addr), // VCC_LO
+            107 => self.read_sgpr(addr), // VCC_HI
+            108..=123 => self.read_sgpr(addr),
+            124 => 0,                    // NULL
+            125 => self.read_sgpr(addr), // M0
+            126 => self.read_sgpr(addr), // EXEC_LO
+            127 => self.read_sgpr(addr), // EXEC_HI
+            128 => 0,
+            129..=192 => (addr - 128) as u32,
+            193..=208 => (-((addr - 192) as i32)) as u32,
+            240 => 0x3f000000, // 0.5
+            241 => 0xbf000000, // -0.5
+            242 => 0x3f800000, // 1.0
+            243 => 0xbf800000, // -1.0
+            244 => 0x40000000, // 2.0
+            245 => 0xc0000000, // -2.0
+            246 => 0x40800000, // 4.0
+            247 => 0xc0800000, // -4.0
+            248 => 0x3e22f983, // 1/(2*PI)
+            255 => self.fetch_literal_constant_e64(),
             _ => panic!(),
         }
     }
@@ -1335,10 +1356,10 @@ impl SIMD32 {
                 self.v_add3_u32(d, s0, s1, s2);
             }
             I::V_CVT_F64_U32 => {
-                self.v_cvt_f64_u32_e64(d, s0);
+                self.v_cvt_f64_u32_e64(d, s0, abs, neg, clamp, omod);
             }
             I::V_CVT_I32_F64 => {
-                self.v_cvt_i32_f64_e64(d, s0);
+                self.v_cvt_i32_f64_e64(d, s0, abs, neg, clamp, omod);
             }
             I::V_ADD_F64 => {
                 self.v_add_f64_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -1440,7 +1461,7 @@ impl SIMD32 {
                 self.v_cmp_lt_u64_e64(d, s0, s1);
             }
             I::V_TRIG_PREOP_F64 => {
-                self.v_trig_preop_f64(d, s0, s1);
+                self.v_trig_preop_f64(d, s0, s1, abs, neg, clamp, omod);
             }
             _ => unimplemented!(),
         }
@@ -1448,15 +1469,15 @@ impl SIMD32 {
     }
 
     fn v_readlane_b32(&mut self, d: usize, s0: usize, s1: usize) {
-        let s1_value = self.read_sop_src(s1) as usize;
-        let s0_value = self.read_vop_src(s1_value, s0);
+        let s1_value = (self.read_sop_src_e64(s1) as usize) & 0x1F;
+        let s0_value = self.read_vop_src_e64(s1_value, s0);
         let d_value = s0_value;
         self.write_sgpr(d, d_value);
     }
 
     fn v_writelane_b32(&mut self, d: usize, s0: usize, s1: usize) {
-        let s0_value = self.read_sop_src(s0);
-        let s1_value = self.read_sop_src(s1) as usize;
+        let s1_value = (self.read_sop_src_e64(s1) as usize) & 0x1F;
+        let s0_value = self.read_sop_src_e64(s0);
         let d_value = s0_value;
         self.write_vgpr(s1_value, d, d_value);
     }
@@ -1466,8 +1487,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value & s1_value;
             self.write_vgpr(elem, d, d_value);
         }
@@ -1478,9 +1499,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
-            let s2_value = self.read_vop_src(elem, s2);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
+            let s2_value = self.read_vop_src_e64(elem, s2);
             let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
             self.write_vgpr(elem, d, d_value);
         }
@@ -1492,8 +1513,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -1522,8 +1543,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value ^ s1_value;
             self.write_vgpr(elem, d, d_value);
         }
@@ -1534,9 +1555,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
-            let s2_value = self.read_vop_src(elem, s2);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
+            let s2_value = self.read_vop_src_e64(elem, s2);
             let d_value = (s0_value ^ s1_value) ^ s2_value;
             self.write_vgpr(elem, d, d_value);
         }
@@ -1547,8 +1568,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value.wrapping_add(s1_value);
             self.write_vgpr(elem, d, d_value);
         }
@@ -1567,24 +1588,40 @@ impl SIMD32 {
         }
     }
 
-    fn v_cvt_f64_u32_e64(&mut self, d: usize, s0: usize) {
+    fn v_cvt_f64_u32_e64(
+        &mut self,
+        d: usize,
+        s0: usize,
+        _abs: u8,
+        _neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
+            let s0_value = self.read_vop_src_e64(elem, s0);
             let d_value = s0_value as f64;
 
-            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+            self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
 
-    fn v_cvt_i32_f64_e64(&mut self, d: usize, s0: usize) {
+    fn v_cvt_i32_f64_e64(
+        &mut self,
+        d: usize,
+        s0: usize,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src_pair_e64_f64(elem, s0);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
             let d_value = s0_value as i32;
 
             self.write_vgpr(elem, d, d_value as u32);
@@ -1625,8 +1662,8 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-                let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+                let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+                let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
                 let d_value = s0_value + s1_value;
                 self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
             }
@@ -1647,8 +1684,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value * s1_value;
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
@@ -1659,7 +1696,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
             let d_value = 1.0 / s0_value;
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
@@ -1670,7 +1707,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
             let mut d_value = (s0_value + 0.5).floor();
             if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
                 d_value -= 1.0;
@@ -1739,9 +1776,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
-            let s2_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s2), abs, neg, 2);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s2), abs, neg, 2);
             let d_value = if self.get_vcc_bit(elem) {
                 64f64.exp2() * fma(s0_value, s1_value, s2_value)
             } else {
@@ -1788,8 +1825,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value.min(s1_value);
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
@@ -1809,8 +1846,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s0), abs, neg, 0);
-            let s1_value = u64_to_f64_abs_neg(self.read_vop_src_pair(elem, s1), abs, neg, 1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value.max(s1_value);
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
@@ -2071,8 +2108,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s1_value << (s0_value & 0x1F);
             self.write_vgpr(elem, d, d_value);
         }
@@ -2083,8 +2120,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s1_value >> (s0_value & 0x1F);
             self.write_vgpr(elem, d, d_value);
         }
@@ -2095,8 +2132,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src_pair(elem, s0);
-            let s1_value = self.read_vop_src_pair(elem, s1);
+            let s0_value = self.read_vop_src_pair_e64(elem, s0);
+            let s1_value = self.read_vop_src_pair_e64(elem, s1);
             let d_value = s1_value << (s0_value & 0x3F);
             self.write_vgpr_pair(elem, d, d_value);
         }
@@ -2107,8 +2144,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src_pair(elem, s0);
-            let s1_value = self.read_vop_src_pair(elem, s1);
+            let s0_value = self.read_vop_src_pair_e64(elem, s0);
+            let s1_value = self.read_vop_src_pair_e64(elem, s1);
             let d_value = s1_value >> (s0_value & 0x3F);
             self.write_vgpr_pair(elem, d, d_value);
         }
@@ -2119,8 +2156,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value | s1_value;
             self.write_vgpr(elem, d, d_value);
         }
@@ -2152,7 +2189,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64(self.read_vop_src_pair(elem, s0));
+            let s0_value = self.read_vop_src_pair_e64_f64(elem, s0);
             let d_value = 1.0 / s0_value.sqrt();
 
             self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
@@ -2170,7 +2207,7 @@ impl SIMD32 {
         _omod: u8,
     ) {
         let s0_values = (0..32)
-            .map(|elem| u64_to_f64_abs_neg(self.read_vop_src_pair_e64(elem, s0), abs, neg, 0))
+            .map(|elem| abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0))
             .collect::<Vec<f64>>();
         let s1_values = (0..32)
             .map(|elem| self.read_vop_src_e64(elem, s1))
@@ -2199,9 +2236,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
-            let s2_value = self.read_vop_src(elem, s2);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
+            let s2_value = self.read_vop_src_e64(elem, s2);
             let d_value = (s0_value ^ s1_value).wrapping_add(s2_value);
             self.write_vgpr(elem, d, d_value);
         }
@@ -2212,9 +2249,9 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
-            let s2_value = self.read_vop_src(elem, s2);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
+            let s2_value = self.read_vop_src_e64(elem, s2);
             let d_value = (s0_value << (s1_value & 0x1F)).wrapping_add(s2_value);
             self.write_vgpr(elem, d, d_value);
         }
@@ -2226,8 +2263,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -2245,8 +2282,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -2264,8 +2301,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -2283,8 +2320,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0) as i32;
-            let s1_value = self.read_vop_src(elem, s1) as i32;
+            let s0_value = self.read_vop_src_e64(elem, s0) as i32;
+            let s1_value = self.read_vop_src_e64(elem, s1) as i32;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -2302,8 +2339,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src_pair(elem, s0);
-            let s1_value = self.read_vop_src_pair(elem, s1);
+            let s0_value = self.read_vop_src_pair_e64(elem, s0);
+            let s1_value = self.read_vop_src_pair_e64(elem, s1);
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -2315,7 +2352,16 @@ impl SIMD32 {
         }
     }
 
-    fn v_trig_preop_f64(&mut self, d: usize, s0: usize, s1: usize) {
+    fn v_trig_preop_f64(
+        &mut self,
+        d: usize,
+        s0: usize,
+        s1: usize,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
         const TWO_OVER_PI_FRACTION: [u64; 20] = [
             0xBA10AC06608DF8F6,
             0x25D4D7F6BF623F1A,
@@ -2343,8 +2389,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = u64_to_f64(self.read_vop_src_pair(elem, s0));
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = abs_neg(self.read_vop_src_pair_e64_f64(elem, s0), abs, neg, 0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
 
             let mut shift = (s1_value & 0x1F) as i32 * 53;
             if get_exp_f64(s0_value) > 1077 {
@@ -2359,7 +2405,7 @@ impl SIMD32 {
             }
 
             let d_value = libm::ldexp(result as f64, scale);
-            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+            self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
 
@@ -2396,8 +2442,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let (d0_value, d1_value) = s0_value.overflowing_add(s1_value);
             self.write_vgpr(elem, d0, d0_value);
             vcc |= (d1_value as u32) << elem;
@@ -2416,8 +2462,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vop_src(elem, s0);
-            let s1_value = self.read_vop_src(elem, s1);
+            let s0_value = self.read_vop_src_e64(elem, s0);
+            let s1_value = self.read_vop_src_e64(elem, s1);
             let (d0_value, d1_value) =
                 add_u32(s0_value, s1_value, self.get_sgpr_bit(s2, elem) as u32);
             self.write_vgpr(elem, d0, d0_value);
