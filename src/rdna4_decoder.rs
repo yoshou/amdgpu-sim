@@ -1242,18 +1242,38 @@ fn has_scalar_destination(op: &I) -> bool {
     }
 }
 
-pub struct InstructionStream<'a> {
+pub struct InstStream<'a> {
     pub insts: &'a [u8],
 }
 
-pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize), ()> {
+fn decode_source_operand(operand: u16, literal_constant: &[u8]) -> SourceOperand {
+    match operand {
+        0..=127 => SourceOperand::ScalarRegister(operand as u8),
+        128..=192 => SourceOperand::IntegerConstant((operand - 128) as u64),
+        193..=208 => SourceOperand::IntegerConstant((-((operand - 192) as i64)) as u64),
+        240 => SourceOperand::FloatConstant(0.5),  // 0.5
+        241 => SourceOperand::FloatConstant(-0.5), // -0.5
+        242 => SourceOperand::FloatConstant(1.0),  // 1.0
+        243 => SourceOperand::FloatConstant(-1.0), // -1.0
+        244 => SourceOperand::FloatConstant(2.0),  // 2.0
+        245 => SourceOperand::FloatConstant(-2.0), // -2.0
+        246 => SourceOperand::FloatConstant(4.0),  // 4.0
+        247 => SourceOperand::FloatConstant(-4.0), // -4.0
+        248 => SourceOperand::FloatConstant(0.15915494309), // 1/(2*PI)
+        255 => SourceOperand::LiteralConstant(buffer::get_u32(literal_constant, 0)),
+        256..511 => SourceOperand::VectorRegister((operand - 256) as u8),
+        _ => panic!(),
+    }
+}
+
+pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> {
     let inst = buffer::get_u64(inst_stream.insts, 0);
     if (get_bits(inst, 31, 23) as u32) == SOP1_ENCODE {
         let ssrc0 = get_bits(inst, 7, 0) as u8;
         let (op, size) = decode_sop1_opcode_rdna4(get_bits(inst, 15, 8) as u32)?;
         Ok((
             InstFormat::SOP1(SOP1 {
-                ssrc0,
+                ssrc0: decode_source_operand(ssrc0 as u16, &inst_stream.insts[4..]),
                 op,
                 sdst: get_bits(inst, 22, 16) as u8,
             }),
@@ -1264,7 +1284,11 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
         let ssrc1 = get_bits(inst, 15, 8) as u8;
         let (op, size) = decode_sopc_opcode_rdna4(get_bits(inst, 22, 16) as u32)?;
         Ok((
-            InstFormat::SOPC(SOPC { ssrc0, ssrc1, op }),
+            InstFormat::SOPC(SOPC {
+                ssrc0: decode_source_operand(ssrc0 as u16, &inst_stream.insts[4..]),
+                ssrc1: decode_source_operand(ssrc1 as u16, &inst_stream.insts[4..]),
+                op,
+            }),
             if ssrc0 == 255 || ssrc1 == 255 {
                 max(8, size)
             } else {
@@ -1296,8 +1320,8 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
         let (op, size) = decode_sop2_opcode_rdna4(get_bits(inst, 29, 23) as u32)?;
         Ok((
             InstFormat::SOP2(SOP2 {
-                ssrc0,
-                ssrc1,
+                ssrc0: decode_source_operand(ssrc0 as u16, &inst_stream.insts[4..]),
+                ssrc1: decode_source_operand(ssrc1 as u16, &inst_stream.insts[4..]),
                 sdst: get_bits(inst, 22, 16) as u8,
                 op,
             }),
@@ -1312,7 +1336,7 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
         let src0 = get_bits(inst, 8, 0) as u16;
         Ok((
             InstFormat::VOPC(VOPC {
-                src0,
+                src0: decode_source_operand(src0, &inst_stream.insts[4..]),
                 vsrc1: get_bits(inst, 16, 9) as u8,
                 op,
             }),
@@ -1332,8 +1356,8 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
             InstFormat::VOPD(VOPD {
                 opx,
                 opy,
-                src0x,
-                src0y,
+                src0x: decode_source_operand(src0x, &inst_stream.insts[8..]),
+                src0y: decode_source_operand(src0y, &inst_stream.insts[8..]),
                 vsrc1x,
                 vsrc1y,
                 vdstx,
@@ -1350,7 +1374,7 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
         let (op, size) = decode_vop1_opcode_rdna4(get_bits(inst, 15, 9) as u32)?;
         Ok((
             InstFormat::VOP1(VOP1 {
-                src0,
+                src0: decode_source_operand(src0, &inst_stream.insts[4..]),
                 op,
                 vdst: get_bits(inst, 24, 17) as u8,
             }),
@@ -1361,7 +1385,7 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
         let (op, size) = decode_vop2_opcode_rdna4(get_bits(inst, 30, 25) as u32)?;
         Ok((
             InstFormat::VOP2(VOP2 {
-                src0,
+                src0: decode_source_operand(src0, &inst_stream.insts[4..]),
                 vsrc1: get_bits(inst, 16, 9) as u8,
                 vdst: get_bits(inst, 24, 17) as u8,
                 op,
@@ -1385,9 +1409,9 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
                     sdst: get_bits(inst, 14, 8) as u8,
                     cm,
                     op,
-                    src0,
-                    src1,
-                    src2,
+                    src0: decode_source_operand(src0, &inst_stream.insts[8..]),
+                    src1: decode_source_operand(src1, &inst_stream.insts[8..]),
+                    src2: decode_source_operand(src2, &inst_stream.insts[8..]),
                     omod,
                     neg,
                 }),
@@ -1405,9 +1429,9 @@ pub fn decode_rdna4(inst_stream: InstructionStream) -> Result<(InstFormat, usize
                     opsel: get_bits(inst, 14, 11) as u8,
                     cm,
                     op,
-                    src0,
-                    src1,
-                    src2,
+                    src0: decode_source_operand(src0, &inst_stream.insts[8..]),
+                    src1: decode_source_operand(src1, &inst_stream.insts[8..]),
+                    src2: decode_source_operand(src2, &inst_stream.insts[8..]),
                     omod,
                     neg,
                 }),
