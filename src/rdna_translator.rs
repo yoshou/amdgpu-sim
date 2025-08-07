@@ -1,7 +1,8 @@
 use core::panic;
 use std::os::raw::c_void;
 
-use crate::{instructions::I, rdna_instructions::*};
+use crate::instructions::*;
+use crate::rdna_instructions::*;
 use llvm_sys as llvm;
 
 pub fn is_terminator(inst: &InstFormat) -> bool {
