@@ -11,6 +11,7 @@ num = "*"
 indicatif = "0.15.0"
 libm = "*"
 num-traits = "0.2.12"
+llvm-sys = "150.2.0"
 
 [dev-dependencies]
 rand = "*"
@@ -20,3 +21,7 @@ serde = { version = "1.0.188", features = ["derive"] }
 rmp-serde = "1.1.2"
 png = "*"
 getopts = "0.2"
+
+[features]
+default = ["llvm-sys/prefer-dynamic"]
+

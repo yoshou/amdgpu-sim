@@ -3,6 +3,7 @@ use crate::instructions::*;
 use crate::processor::*;
 use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
+use crate::rdna_translator::*;
 
 struct F64x8 {
     value0: std::arch::x86_64::__m256d,
@@ -219,7 +220,10 @@ unsafe fn omod_clamp_f64x8(value: F64x8, omod: u8, clamp: bool) -> F64x8 {
             value1: _mm256_max_pd(zero, _mm256_min_pd(value1, one)),
         }
     } else {
-        F64x8 { value0: value0, value1: value1 }
+        F64x8 {
+            value0: value0,
+            value1: value1,
+        }
     }
 }
 
@@ -302,6 +306,8 @@ struct SIMD32 {
     pub sgprs: RegisterFileImpl<u32>,
     pub vgprs: RegisterFileImpl<u32>,
     num_vgprs: usize,
+    insts_blocks: HashMap<u64, InstBlock>,
+    translator: RDNATranslator,
 }
 
 #[inline(always)]
@@ -588,9 +594,54 @@ impl SIMD32 {
         let inst_stream = InstStream {
             insts: &self.insts[self.ctx.pc..],
         };
-        if let Ok((inst, size)) = decode_rdna4(inst_stream) {
+        if let Some(block) = self.insts_blocks.get(&self.get_pc()) {
+            let sgprs = self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
+            let vgprs = (self
+                .vgprs
+                .regs
+                .as_mut_ptr()
+                .wrapping_add(self.num_vgprs * self.ctx.id * 32))
+                as *mut u32;
+            let scc: *mut bool = (&mut self.ctx.scc) as *mut bool;
+
+            block.execute(sgprs, vgprs, scc);
+            self.ctx.pc = block.next_pc as usize;
+            return Signals::None;
+        } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
             self.next_pc = self.get_pc() as usize + size;
-            let result = self.execute_inst(inst);
+
+            let result = if is_terminator(&inst) {
+                let block = self.translator.build();
+
+                self.insts_blocks
+                    .insert(self.translator.get_address().unwrap(), block);
+
+                let block = self
+                    .insts_blocks
+                    .get_mut(&self.translator.get_address().unwrap())
+                    .unwrap();
+
+                let sgprs =
+                    self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
+                let vgprs = (self
+                    .vgprs
+                    .regs
+                    .as_mut_ptr()
+                    .wrapping_add(self.num_vgprs * self.ctx.id * 32))
+                    as *mut u32;
+                let scc: *mut bool = (&mut self.ctx.scc) as *mut bool;
+
+                block.execute(sgprs, vgprs, scc);
+
+                self.translator.clear();
+
+                block.next_pc = self.ctx.pc;
+                self.execute_inst(inst)
+            } else {
+                self.translator.add_inst(self.ctx.pc as u64, inst.clone());
+                Signals::None
+            };
+
             self.set_pc(self.next_pc as u64);
             result
         } else {
@@ -3671,6 +3722,8 @@ struct ComputeUnit {
     simds: Vec<Arc<Mutex<SIMD32>>>,
 }
 
+use std::collections::HashMap;
+
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_vgprs: usize) -> Self {
         let mut simds = vec![];
@@ -3688,6 +3741,8 @@ impl ComputeUnit {
                 sgprs: RegisterFileImpl::new(1, 128 * num_wave_slot, 0),
                 vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
                 num_vgprs: num_vgprs,
+                insts_blocks: HashMap::new(),
+                translator: RDNATranslator::new(),
             })));
         }
 
@@ -3710,6 +3765,8 @@ pub struct RDNAProcessor<'a> {
     aql: HsaKernelDispatchPacket<'a>,
     private_seg_buffer: Vec<u8>,
 }
+
+unsafe impl<'a> Send for SIMD32 {}
 
 impl<'a> RDNAProcessor<'a> {
     pub fn new(
