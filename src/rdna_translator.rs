@@ -429,41 +429,6 @@ impl IREmitter {
         llvm::core::LLVMBuildLoad2(builder, ty_i32, value_ptr, empty_name.as_ptr())
     }
 
-    unsafe fn emit_store_vgpr_u32(
-        &self,
-        reg: u32,
-        elem: llvm::prelude::LLVMValueRef,
-        value: llvm::prelude::LLVMValueRef,
-    ) {
-        let context = self.context;
-        let builder = self.builder;
-        let vgprs_ptr = self.vgprs_ptr;
-
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let empty_name = std::ffi::CString::new("").unwrap();
-
-        let index = llvm::core::LLVMBuildAdd(
-            builder,
-            llvm::core::LLVMConstInt(
-                llvm::core::LLVMInt64TypeInContext(context),
-                reg as u64 * 32,
-                0,
-            ),
-            elem,
-            empty_name.as_ptr(),
-        );
-        let mut indices = vec![index];
-        let value_ptr = llvm::core::LLVMBuildGEP2(
-            builder,
-            ty_i32,
-            vgprs_ptr,
-            indices.as_mut_ptr(),
-            indices.len() as u32,
-            empty_name.as_ptr(),
-        );
-        llvm::core::LLVMBuildStore(builder, value, value_ptr);
-    }
-
     unsafe fn emit_load_vgpr_u64(
         &self,
         reg: u32,
@@ -501,6 +466,54 @@ impl IREmitter {
         )
     }
 
+    unsafe fn emit_load_vgpr_f64(
+        &self,
+        reg: u32,
+        elem: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let value = self.emit_load_vgpr_u64(reg, elem);
+        let context = self.context;
+        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        llvm::core::LLVMBuildBitCast(self.builder, value, ty_f64, empty_name.as_ptr())
+    }
+
+    unsafe fn emit_store_vgpr_u32(
+        &self,
+        reg: u32,
+        elem: llvm::prelude::LLVMValueRef,
+        value: llvm::prelude::LLVMValueRef,
+    ) {
+        let context = self.context;
+        let builder = self.builder;
+        let vgprs_ptr = self.vgprs_ptr;
+
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let index = llvm::core::LLVMBuildAdd(
+            builder,
+            llvm::core::LLVMConstInt(
+                llvm::core::LLVMInt64TypeInContext(context),
+                reg as u64 * 32,
+                0,
+            ),
+            elem,
+            empty_name.as_ptr(),
+        );
+        let mut indices = vec![index];
+        let value_ptr = llvm::core::LLVMBuildGEP2(
+            builder,
+            ty_i32,
+            vgprs_ptr,
+            indices.as_mut_ptr(),
+            indices.len() as u32,
+            empty_name.as_ptr(),
+        );
+        llvm::core::LLVMBuildStore(builder, value, value_ptr);
+    }
+
     unsafe fn emit_store_vgpr_u64(
         &self,
         reg: u32,
@@ -523,19 +536,6 @@ impl IREmitter {
         let value_hi = llvm::core::LLVMBuildTrunc(builder, value_hi, ty_i32, empty_name.as_ptr());
         self.emit_store_vgpr_u32(reg, elem, value_lo);
         self.emit_store_vgpr_u32(reg + 1, elem, value_hi);
-    }
-
-    unsafe fn emit_load_vgpr_f64(
-        &self,
-        reg: u32,
-        elem: llvm::prelude::LLVMValueRef,
-    ) -> llvm::prelude::LLVMValueRef {
-        let value = self.emit_load_vgpr_u64(reg, elem);
-        let context = self.context;
-        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-        let empty_name = std::ffi::CString::new("").unwrap();
-
-        llvm::core::LLVMBuildBitCast(self.builder, value, ty_f64, empty_name.as_ptr())
     }
 
     unsafe fn emit_store_vgpr_f64(
@@ -561,62 +561,35 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        let mut indices = vec![llvm::core::LLVMConstInt(
-            llvm::core::LLVMInt64TypeInContext(context),
-            reg as u64,
-            0,
-        )];
-        let value_ptr = llvm::core::LLVMBuildGEP2(
-            builder,
-            ty_i32,
-            sgprs_ptr,
-            indices.as_mut_ptr(),
-            indices.len() as u32,
-            empty_name.as_ptr(),
-        );
-        llvm::core::LLVMBuildLoad2(builder, ty_i32, value_ptr, empty_name.as_ptr())
+        if reg == 124 {
+            llvm::core::LLVMConstInt(ty_i32, 0, 0)
+        } else {
+            let mut indices = vec![llvm::core::LLVMConstInt(
+                llvm::core::LLVMInt64TypeInContext(context),
+                reg as u64,
+                0,
+            )];
+            let value_ptr = llvm::core::LLVMBuildGEP2(
+                builder,
+                ty_i32,
+                sgprs_ptr,
+                indices.as_mut_ptr(),
+                indices.len() as u32,
+                empty_name.as_ptr(),
+            );
+            llvm::core::LLVMBuildLoad2(builder, ty_i32, value_ptr, empty_name.as_ptr())
+        }
     }
 
     unsafe fn emit_load_sgpr_u64(&self, reg: u32) -> llvm::prelude::LLVMValueRef {
         let context = self.context;
         let builder = self.builder;
-        let sgprs_ptr = self.sgprs_ptr;
-
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        
         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        let mut indices = vec![llvm::core::LLVMConstInt(
-            llvm::core::LLVMInt64TypeInContext(context),
-            (reg + 1) as u64,
-            1,
-        )];
-        let value_hi_ptr = llvm::core::LLVMBuildGEP2(
-            builder,
-            ty_i32,
-            sgprs_ptr,
-            indices.as_mut_ptr(),
-            indices.len() as u32,
-            empty_name.as_ptr(),
-        );
-        let value_hi =
-            llvm::core::LLVMBuildLoad2(builder, ty_i32, value_hi_ptr, empty_name.as_ptr());
-
-        let mut indices = vec![llvm::core::LLVMConstInt(
-            llvm::core::LLVMInt64TypeInContext(context),
-            reg as u64,
-            0,
-        )];
-        let value_lo_ptr = llvm::core::LLVMBuildGEP2(
-            builder,
-            ty_i32,
-            sgprs_ptr,
-            indices.as_mut_ptr(),
-            indices.len() as u32,
-            empty_name.as_ptr(),
-        );
-        let value_lo =
-            llvm::core::LLVMBuildLoad2(builder, ty_i32, value_lo_ptr, empty_name.as_ptr());
+        let value_hi = self.emit_load_sgpr_u32(reg + 1);
+        let value_lo = self.emit_load_sgpr_u32(reg);
 
         let value_hi = llvm::core::LLVMBuildZExt(builder, value_hi, ty_i64, empty_name.as_ptr());
         let value_lo = llvm::core::LLVMBuildZExt(builder, value_lo, ty_i64, empty_name.as_ptr());
@@ -713,7 +686,8 @@ impl IREmitter {
             SourceOperand::FloatConstant(value) => {
                 llvm::core::LLVMConstInt(ty_i64, f64::to_bits(*value), 0)
             }
-            _ => panic!("Unsupported source operand type"),
+            SourceOperand::ScalarRegister(value) => self.emit_load_sgpr_u64(*value as u32),
+            _ => panic!("Unsupported source operand type: {:?}", operand),
         }
     }
 
@@ -752,8 +726,12 @@ impl IREmitter {
             SourceOperand::IntegerConstant(value) => {
                 llvm::core::LLVMConstInt(ty_i64, *value as u64, 0)
             }
+            SourceOperand::FloatConstant(value) => {
+                llvm::core::LLVMConstInt(ty_i64, f64::to_bits(*value), 0)
+            }
+            SourceOperand::ScalarRegister(value) => self.emit_load_sgpr_u64(*value as u32),
             SourceOperand::VectorRegister(value) => self.emit_load_vgpr_u64(*value as u32, elem),
-            _ => panic!("Unsupported source operand type"),
+            _ => panic!("Unsupported source operand type: {:?}", operand),
         }
     }
 
