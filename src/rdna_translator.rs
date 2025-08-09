@@ -103,6 +103,34 @@ struct IREmitter {
 }
 
 impl IREmitter {
+    unsafe fn emit_exec_bit(
+        &self,
+        index: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let builder = self.builder;
+
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let exec_value = self.emit_load_sgpr_u32(126);
+
+        let index_mask = llvm::core::LLVMBuildShl(
+            builder,
+            llvm::core::LLVMConstInt(ty_i32, 1, 0),
+            index,
+            empty_name.as_ptr(),
+        );
+        let masked = llvm::core::LLVMBuildAnd(builder, exec_value, index_mask, empty_name.as_ptr());
+        llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntNE,
+            masked,
+            llvm::core::LLVMConstInt(ty_i32, 0, 0),
+            empty_name.as_ptr(),
+        )
+    }
+
     unsafe fn emit_vop_execmask(
         &self,
         bb: llvm::prelude::LLVMBasicBlockRef,
