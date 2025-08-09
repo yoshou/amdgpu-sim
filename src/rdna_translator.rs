@@ -115,25 +115,10 @@ impl IREmitter {
         let context = self.context;
         let function = self.function;
         let builder = self.builder;
-        let sgprs_ptr = self.sgprs_ptr;
 
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
-
-        let mut indices = vec![llvm::core::LLVMConstInt(
-            llvm::core::LLVMInt64TypeInContext(context),
-            126,
-            0,
-        )];
-        let exec_ptr = llvm::core::LLVMBuildGEP2(
-            builder,
-            ty_i32,
-            sgprs_ptr,
-            indices.as_mut_ptr(),
-            indices.len() as u32,
-            empty_name.as_ptr(),
-        );
 
         let bb_loop_entry =
             llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
@@ -142,23 +127,8 @@ impl IREmitter {
         llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_entry);
 
         let index = llvm::core::LLVMBuildPhi(builder, ty_i64, empty_name.as_ptr());
-        let exec_value = llvm::core::LLVMBuildLoad2(builder, ty_i32, exec_ptr, empty_name.as_ptr());
-
         let index_i32 = llvm::core::LLVMBuildTrunc(builder, index, ty_i32, empty_name.as_ptr());
-        let shifted = llvm::core::LLVMBuildShl(
-            builder,
-            llvm::core::LLVMConstInt(ty_i32, 1, 0),
-            index_i32,
-            empty_name.as_ptr(),
-        );
-        let anded = llvm::core::LLVMBuildAnd(builder, exec_value, shifted, empty_name.as_ptr());
-        let cmp = llvm::core::LLVMBuildICmp(
-            builder,
-            llvm::LLVMIntPredicate::LLVMIntEQ,
-            anded,
-            llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            empty_name.as_ptr(),
-        );
+        let exec = self.emit_exec_bit(index_i32);
 
         let bb_loop_skip_body =
             llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
@@ -172,7 +142,7 @@ impl IREmitter {
         let bb_loop_exit =
             llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
 
-        llvm::core::LLVMBuildCondBr(builder, cmp, bb_loop_skip_body, bb_loop_body);
+        llvm::core::LLVMBuildCondBr(builder, exec, bb_loop_body, bb_loop_skip_body);
 
         llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_skip_body);
 
@@ -249,25 +219,10 @@ impl IREmitter {
         let context = self.context;
         let function = self.function;
         let builder = self.builder;
-        let sgprs_ptr = self.sgprs_ptr;
 
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
-
-        let mut indices = vec![llvm::core::LLVMConstInt(
-            llvm::core::LLVMInt64TypeInContext(context),
-            126,
-            0,
-        )];
-        let exec_ptr = llvm::core::LLVMBuildGEP2(
-            builder,
-            ty_i32,
-            sgprs_ptr,
-            indices.as_mut_ptr(),
-            indices.len() as u32,
-            empty_name.as_ptr(),
-        );
 
         let bb_loop_entry =
             llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
@@ -276,26 +231,9 @@ impl IREmitter {
         llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_entry);
 
         let index = llvm::core::LLVMBuildPhi(builder, ty_i64, empty_name.as_ptr());
-
         let vcc = llvm::core::LLVMBuildPhi(builder, ty_i32, empty_name.as_ptr());
-
-        let exec_value = llvm::core::LLVMBuildLoad2(builder, ty_i32, exec_ptr, empty_name.as_ptr());
-
         let index_i32 = llvm::core::LLVMBuildTrunc(builder, index, ty_i32, empty_name.as_ptr());
-        let shifted = llvm::core::LLVMBuildShl(
-            builder,
-            llvm::core::LLVMConstInt(ty_i32, 1, 0),
-            index_i32,
-            empty_name.as_ptr(),
-        );
-        let anded = llvm::core::LLVMBuildAnd(builder, exec_value, shifted, empty_name.as_ptr());
-        let cmp = llvm::core::LLVMBuildICmp(
-            builder,
-            llvm::LLVMIntPredicate::LLVMIntEQ,
-            anded,
-            llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            empty_name.as_ptr(),
-        );
+        let exec = self.emit_exec_bit(index_i32);
 
         let bb_loop_skip_body =
             llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
@@ -309,7 +247,7 @@ impl IREmitter {
         let bb_loop_exit =
             llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
 
-        llvm::core::LLVMBuildCondBr(builder, cmp, bb_loop_skip_body, bb_loop_body);
+        llvm::core::LLVMBuildCondBr(builder, exec, bb_loop_body, bb_loop_skip_body);
 
         llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_skip_body);
 
