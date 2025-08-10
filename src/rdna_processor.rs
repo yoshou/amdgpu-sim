@@ -594,48 +594,39 @@ impl SIMD32 {
         let inst_stream = InstStream {
             insts: &self.insts[self.ctx.pc..],
         };
-        if let Some(block) = self.insts_blocks.get(&self.get_pc()) {
-            let sgprs = self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
-            let vgprs = (self
-                .vgprs
-                .regs
-                .as_mut_ptr()
-                .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                as *mut u32;
-            let scc: *mut bool = (&mut self.ctx.scc) as *mut bool;
-
-            block.execute(sgprs, vgprs, scc);
-            self.ctx.pc = block.next_pc as usize;
-            return Signals::None;
-        } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
+        if let Ok((inst, size)) = decode_rdna4(inst_stream) {
             self.next_pc = self.get_pc() as usize + size;
 
             let result = if is_terminator(&inst) {
-                let block = self.translator.build();
+                if self.translator.insts.len() > 0 {
+                    if !self.insts_blocks.contains_key(&self.translator.get_address().unwrap()) {
+                        let block = self.translator.build();
 
-                self.insts_blocks
-                    .insert(self.translator.get_address().unwrap(), block);
+                        self.insts_blocks
+                            .insert(self.translator.get_address().unwrap(), block);
+                    }
 
-                let block = self
-                    .insts_blocks
-                    .get_mut(&self.translator.get_address().unwrap())
-                    .unwrap();
+                    let block = self
+                        .insts_blocks
+                        .get_mut(&self.translator.get_address().unwrap())
+                        .unwrap();
 
-                let sgprs =
-                    self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
-                let vgprs = (self
-                    .vgprs
-                    .regs
-                    .as_mut_ptr()
-                    .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                    as *mut u32;
-                let scc: *mut bool = (&mut self.ctx.scc) as *mut bool;
+                    let sgprs_ptr =
+                        self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
+                    let vgprs_ptr = (self
+                        .vgprs
+                        .regs
+                        .as_mut_ptr()
+                        .wrapping_add(self.num_vgprs * self.ctx.id * 32))
+                        as *mut u32;
+                    let scc_ptr = (&mut self.ctx.scc) as *mut bool;
 
-                block.execute(sgprs, vgprs, scc);
+                    block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
 
-                self.translator.clear();
+                    block.next_pc = self.ctx.pc;
 
-                block.next_pc = self.ctx.pc;
+                    self.translator.clear();
+                }
                 self.execute_inst(inst)
             } else {
                 self.translator.add_inst(self.ctx.pc as u64, inst.clone());
