@@ -31,15 +31,6 @@ pub struct InstBlock {
 
 impl Drop for InstBlock {
     fn drop(&mut self) {
-        unsafe {
-            if !self.module.is_null() {
-                llvm::core::LLVMDisposeModule(self.module);
-            }
-            if !self.engine.is_null() {
-                llvm::execution_engine::LLVMDisposeExecutionEngine(self.engine);
-            }
-            llvm::core::LLVMContextDispose(self.context);
-        }
     }
 }
 
