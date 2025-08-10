@@ -27,11 +27,8 @@ pub struct InstBlock {
     module: llvm::prelude::LLVMModuleRef,
     engine: llvm::execution_engine::LLVMExecutionEngineRef,
     func: llvm_sys::prelude::LLVMValueRef,
-    pub next_pc: usize,
-}
-
-impl Drop for InstBlock {
-    fn drop(&mut self) {}
+    pub terminator_pc: u64,
+    pub terminator_next_pc: usize,
 }
 
 impl InstBlock {
@@ -41,16 +38,8 @@ impl InstBlock {
             module: std::ptr::null_mut(),
             engine: std::ptr::null_mut(),
             func: std::ptr::null_mut(),
-            next_pc: 0,
-        }
-    }
-
-    pub fn dispose(&mut self) {
-        unsafe {
-            llvm::core::LLVMContextDispose(self.context);
-            if !self.module.is_null() {
-                llvm::core::LLVMDisposeModule(self.module);
-            }
+            terminator_pc: 0,
+            terminator_next_pc: 0,
         }
     }
 
@@ -717,7 +706,6 @@ impl IREmitter {
             }
             SourceOperand::ScalarRegister(value) => self.emit_load_sgpr_u64(*value as u32),
             SourceOperand::VectorRegister(value) => self.emit_load_vgpr_u64(*value as u32, elem),
-            _ => panic!("Unsupported source operand type: {:?}", operand),
         }
     }
 
@@ -828,7 +816,7 @@ impl IREmitter {
         let builder = self.builder;
         let empty_name = std::ffi::CString::new("").unwrap();
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-        
+
         let value = if (clamp >> idx) & 1 != 0 {
             assert!(llvm::core::LLVMTypeOf(value) == ty_f64);
             let zero = llvm::core::LLVMConstReal(ty_f64, 0.0);
@@ -855,7 +843,7 @@ impl IREmitter {
                 2,
                 empty_name.as_ptr(),
             );
-            
+
             let mut param_tys = vec![ty_f64];
             let intrinsic_name = b"llvm.maxnum.f64\0";
             let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
@@ -1646,10 +1634,8 @@ impl RDNATranslator {
                                 let s0_value =
                                     emitter.emit_vector_source_operand_f64(&inst.src0, elem);
                                 let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                
-                                let mut param_tys = vec![
-                                    ty_f64,
-                                ];
+
+                                let mut param_tys = vec![ty_f64];
                                 let intrinsic_name = b"llvm.maxnum.f64\0";
                                 let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
                                     intrinsic_name.as_ptr() as *const _,
@@ -1661,10 +1647,7 @@ impl RDNATranslator {
                                     param_tys.as_mut_ptr(),
                                     param_tys.len() as usize,
                                 );
-                                let mut param_tys = vec![
-                                    ty_f64,
-                                    ty_f64,
-                                ];
+                                let mut param_tys = vec![ty_f64, ty_f64];
                                 let d_value = llvm::core::LLVMBuildCall2(
                                     builder,
                                     llvm::core::LLVMFunctionType(
@@ -2598,21 +2581,13 @@ impl RDNATranslator {
                                 let shift = llvm::core::LLVMBuildMul(
                                     builder,
                                     s1_value,
-                                    llvm::core::LLVMConstInt(
-                                        ty_i32,
-                                        53,
-                                        0,
-                                    ),
+                                    llvm::core::LLVMConstInt(ty_i32, 53, 0),
                                     empty_name.as_ptr(),
                                 );
 
                                 let bitpos = llvm::core::LLVMBuildSub(
                                     builder,
-                                    llvm::core::LLVMConstInt(
-                                        ty_i32,
-                                        1201 - 53,
-                                        0,
-                                    ),
+                                    llvm::core::LLVMConstInt(ty_i32, 1201 - 53, 0),
                                     shift,
                                     empty_name.as_ptr(),
                                 );
@@ -2727,7 +2702,7 @@ impl RDNATranslator {
                                     emitter.emit_abs_neg(inst.abs, inst.neg, s0_value, 0);
                                 let s1_value =
                                     emitter.emit_abs_neg(inst.abs, inst.neg, s1_value, 1);
-                                    
+
                                 let mut param_tys = vec![ty_f64];
                                 let intrinsic_name = b"llvm.maxnum.f64\0";
                                 let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
@@ -2754,12 +2729,8 @@ impl RDNATranslator {
                                     2,
                                     empty_name.as_ptr(),
                                 );
-                                let d_value = emitter.emit_omod_clamp(
-                                    inst.omod,
-                                    inst.cm,
-                                    d_value,
-                                    0,
-                                );
+                                let d_value =
+                                    emitter.emit_omod_clamp(inst.omod, inst.cm, d_value, 0);
 
                                 emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
@@ -4084,16 +4055,10 @@ impl RDNATranslator {
                                         empty_name.as_ptr(),
                                     );
 
-                                    let data = emitter.emit_load_vgpr_u32(
-                                        inst.vsrc as u32 + j as u32,
-                                        elem,
-                                    );
+                                    let data = emitter
+                                        .emit_load_vgpr_u32(inst.vsrc as u32 + j as u32, elem);
 
-                                    llvm::core::LLVMBuildStore(
-                                        builder,
-                                        data,
-                                        ptr,
-                                    );
+                                    llvm::core::LLVMBuildStore(builder, data, ptr);
                                 }
 
                                 llvm::core::LLVMBuildBr(builder, bb_cont);
@@ -4183,16 +4148,10 @@ impl RDNATranslator {
                                         empty_name.as_ptr(),
                                     );
 
-                                    let data = emitter.emit_load_vgpr_u32(
-                                        inst.vsrc as u32 + j as u32,
-                                        elem,
-                                    );
+                                    let data = emitter
+                                        .emit_load_vgpr_u32(inst.vsrc as u32 + j as u32, elem);
 
-                                    llvm::core::LLVMBuildStore(
-                                        builder,
-                                        data,
-                                        ptr,
-                                    );
+                                    llvm::core::LLVMBuildStore(builder, data, ptr);
                                 }
 
                                 llvm::core::LLVMBuildBr(builder, bb_cont);

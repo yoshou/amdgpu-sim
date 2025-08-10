@@ -594,13 +594,44 @@ impl SIMD32 {
         let inst_stream = InstStream {
             insts: &self.insts[self.ctx.pc..],
         };
-        if let Ok((inst, size)) = decode_rdna4(inst_stream) {
+        let pc = self.ctx.pc as u64;
+        let block = self.insts_blocks.get(&pc);
+        if block.is_some() && self.translator.insts.len() == 0 {
+            let block = block.unwrap();
+
+            let sgprs_ptr =
+                self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
+            let vgprs_ptr = (self
+                .vgprs
+                .regs
+                .as_mut_ptr()
+                .wrapping_add(self.num_vgprs * self.ctx.id * 32))
+                as *mut u32;
+            let scc_ptr = (&mut self.ctx.scc) as *mut bool;
+
+            block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
+
+            self.next_pc = block.terminator_next_pc;
+            self.set_pc(block.terminator_pc);
+            
+            let inst_stream = InstStream {
+                insts: &self.insts[self.ctx.pc..],
+            };
+            let (inst, _) = decode_rdna4(inst_stream).unwrap();
+            assert!(is_terminator(&inst), "Expected a terminator instruction, got: {:?}", inst);
+            let result = self.execute_inst(inst);
+            self.set_pc(self.next_pc as u64);
+            result
+        } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
             self.next_pc = self.get_pc() as usize + size;
 
             let result = if is_terminator(&inst) {
                 if self.translator.insts.len() > 0 {
                     if !self.insts_blocks.contains_key(&self.translator.get_address().unwrap()) {
-                        let block = self.translator.build();
+                        let mut block = self.translator.build();
+
+                        block.terminator_next_pc = self.next_pc;
+                        block.terminator_pc = self.get_pc();
 
                         self.insts_blocks
                             .insert(self.translator.get_address().unwrap(), block);
@@ -623,8 +654,6 @@ impl SIMD32 {
 
                     block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
 
-                    block.next_pc = self.ctx.pc;
-
                     self.translator.clear();
                 }
                 self.execute_inst(inst)
@@ -632,8 +661,8 @@ impl SIMD32 {
                 self.translator.add_inst(self.ctx.pc as u64, inst.clone());
                 Signals::None
             };
-
             self.set_pc(self.next_pc as u64);
+
             result
         } else {
             let inst = get_u64(&self.insts, self.ctx.pc);
