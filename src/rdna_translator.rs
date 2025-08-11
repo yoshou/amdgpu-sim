@@ -1,4 +1,5 @@
 use core::panic;
+use std::collections::HashSet;
 use std::os::raw::c_void;
 
 use crate::instructions::*;
@@ -37,6 +38,7 @@ pub struct InstBlock {
     pub terminator_pc: u64,
     pub terminator_next_pc: usize,
     pub terminator: InstFormat,
+    reg_usage: RegisterUsage,
 }
 
 impl InstBlock {
@@ -51,6 +53,7 @@ impl InstBlock {
                 op: I::S_ENDPGM,
                 simm16: 0,
             }),
+            reg_usage: RegisterUsage::new(),
         }
     }
 
@@ -84,6 +87,10 @@ struct IREmitter {
     sgprs_ptr: llvm::prelude::LLVMValueRef,
     vgprs_ptr: llvm::prelude::LLVMValueRef,
     scc_ptr: llvm::prelude::LLVMValueRef,
+}
+
+struct LLVMValueU32x8 {
+    v0: llvm::prelude::LLVMValueRef,
 }
 
 struct LLVMValueF64x8 {
@@ -1726,6 +1733,127 @@ impl IREmitter {
     }
 }
 
+struct RegisterUsage {
+    use_sgprs: HashSet<u32>,
+    use_vgprs: HashSet<u32>,
+    def_sgprs: HashSet<u32>,
+    def_vgprs: HashSet<u32>,
+    incomming_sgprs: HashSet<u32>,
+    incomming_vgprs: HashSet<u32>,
+}
+
+impl RegisterUsage {
+    fn new() -> Self {
+        RegisterUsage {
+            use_sgprs: HashSet::new(),
+            use_vgprs: HashSet::new(),
+            def_sgprs: HashSet::new(),
+            def_vgprs: HashSet::new(),
+            incomming_sgprs: HashSet::new(),
+            incomming_vgprs: HashSet::new(),
+        }
+    }
+
+    fn use_sgpr_u32(&mut self, reg: u32) {
+        if reg == 124 {
+            return;
+        }
+        if !self.def_sgprs.contains(&reg) {
+            self.incomming_sgprs.insert(reg);
+        }
+        self.use_sgprs.insert(reg);
+    }
+    fn use_sgpr_u64(&mut self, reg: u32) {
+        self.use_sgpr_u32(reg);
+        self.use_sgpr_u32(reg + 1);
+    }
+    fn use_sgpr_f64(&mut self, reg: u32) {
+        self.use_sgpr_u32(reg);
+        self.use_sgpr_u32(reg + 1);
+    }
+
+    fn use_vgpr_u32(&mut self, reg: u32) {
+        if !self.def_vgprs.contains(&reg) {
+            self.incomming_vgprs.insert(reg);
+        }
+        self.use_vgprs.insert(reg);
+    }
+
+    fn use_vgpr_u64(&mut self, reg: u32) {
+        self.use_vgpr_u32(reg);
+        self.use_vgpr_u32(reg + 1);
+    }
+
+    fn use_vgpr_f64(&mut self, reg: u32) {
+        self.use_vgpr_u32(reg);
+        self.use_vgpr_u32(reg + 1);
+    }
+
+    fn use_operand_u32(&mut self, operand: &SourceOperand) {
+        match operand {
+            SourceOperand::ScalarRegister(reg) => self.use_sgpr_u32(*reg as u32),
+            SourceOperand::VectorRegister(reg) => self.use_vgpr_u32(*reg as u32),
+            _ => {}
+        };
+    }
+
+    fn use_operand_u64(&mut self, operand: &SourceOperand) {
+        match operand {
+            SourceOperand::ScalarRegister(reg) => {
+                self.use_sgpr_u32(*reg as u32);
+                self.use_sgpr_u32((*reg + 1) as u32);
+            }
+            SourceOperand::VectorRegister(reg) => {
+                self.use_vgpr_u32(*reg as u32);
+                self.use_vgpr_u32((*reg + 1) as u32);
+            }
+            _ => {}
+        };
+    }
+
+    fn use_operand_f64(&mut self, operand: &SourceOperand) {
+        match operand {
+            SourceOperand::ScalarRegister(reg) => {
+                self.use_sgpr_u32(*reg as u32);
+                self.use_sgpr_u32((*reg + 1) as u32);
+            }
+            SourceOperand::VectorRegister(reg) => {
+                self.use_vgpr_u32(*reg as u32);
+                self.use_vgpr_u32((*reg + 1) as u32);
+            }
+            _ => {}
+        };
+    }
+
+    fn def_sgpr_u32(&mut self, reg: u32) {
+        self.def_sgprs.insert(reg);
+    }
+
+    fn def_sgpr_u64(&mut self, reg: u32) {
+        self.def_sgpr_u32(reg);
+        self.def_sgpr_u32(reg + 1);
+    }
+
+    fn def_sgpr_f64(&mut self, reg: u32) {
+        self.def_sgpr_u32(reg);
+        self.def_sgpr_u32(reg + 1);
+    }
+
+    fn def_vgpr_u32(&mut self, reg: u32) {
+        self.def_vgprs.insert(reg);
+    }
+
+    fn def_vgpr_u64(&mut self, reg: u32) {
+        self.def_vgpr_u32(reg);
+        self.def_vgpr_u32(reg + 1);
+    }
+
+    fn def_vgpr_f64(&mut self, reg: u32) {
+        self.def_vgpr_u32(reg);
+        self.def_vgpr_u32(reg + 1);
+    }
+}
+
 impl RDNATranslator {
     pub fn new() -> Self {
         RDNATranslator {
@@ -1739,6 +1867,553 @@ impl RDNATranslator {
     pub fn add_inst(&mut self, addr: u64, inst: InstFormat) {
         self.addresses.push(addr);
         self.insts.push(inst);
+    }
+
+    fn analyze(&self) -> RegisterUsage {
+        let mut reg_usage = RegisterUsage {
+            use_sgprs: HashSet::new(),
+            use_vgprs: HashSet::new(),
+            def_sgprs: HashSet::new(),
+            def_vgprs: HashSet::new(),
+            incomming_sgprs: HashSet::new(),
+            incomming_vgprs: HashSet::new(),
+        };
+
+        for inst in &self.insts {
+            match inst {
+                InstFormat::SOPP(inst) => match inst.op {
+                    I::S_CLAUSE => {}
+                    I::S_WAIT_KMCNT => {}
+                    I::S_DELAY_ALU => {}
+                    I::S_WAIT_ALU => {}
+                    I::S_WAIT_LOADCNT => {}
+                    I::S_NOP => {}
+                    I::S_SENDMSG => {}
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VOPC(inst) => match inst.op {
+                    I::V_CMP_GT_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_EQ_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_NE_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_GT_U64 => {
+                        reg_usage.use_operand_u64(&inst.src0);
+                        reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_GT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_LT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_NLT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMP_NGT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(106);
+                    }
+                    I::V_CMPX_NGT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    I::V_CMPX_NGE_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    I::V_CMPX_LT_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    I::V_CMPX_EQ_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    I::V_CMPX_LT_I32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VOP1(inst) => match inst.op {
+                    I::V_CVT_F64_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_MOV_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_RCP_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_RSQ_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_RNDNE_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_CVT_I32_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VOP2(inst) => match inst.op {
+                    I::V_ADD_NC_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_AND_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_XOR_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_LSHLREV_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_LSHRREV_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CNDMASK_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                        reg_usage.use_vgpr_u32(106);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_ADD_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_MUL_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_MAX_NUM_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VOP3(inst) => match inst.op {
+                    I::V_BFE_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.use_operand_u32(&inst.src2);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CNDMASK_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.use_operand_u32(&inst.src2);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_GT_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_EQ_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_NLT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_NGT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_LT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_GT_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_CMP_LG_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_ADD_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_MUL_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_FMA_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.use_operand_f64(&inst.src2);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_DIV_FMAS_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.use_operand_f64(&inst.src2);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_DIV_FIXUP_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.use_operand_f64(&inst.src2);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_LDEXP_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_CMP_CLASS_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.def_sgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_XAD_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.use_operand_u32(&inst.src2);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_XOR3_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.use_operand_u32(&inst.src2);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_ADD3_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.use_operand_u32(&inst.src2);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_MUL_LO_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    }
+                    I::V_TRIG_PREOP_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    I::V_MAX_NUM_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VOP3SD(inst) => match inst.op {
+                    I::V_MAD_CO_U64_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0);
+                        reg_usage.use_operand_u32(&inst.src1);
+                        reg_usage.use_operand_u64(&inst.src2);
+                        reg_usage.def_vgpr_u64(inst.vdst as u32);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::V_DIV_SCALE_F64 => {
+                        reg_usage.use_operand_f64(&inst.src0);
+                        reg_usage.use_operand_f64(&inst.src1);
+                        reg_usage.use_operand_f64(&inst.src2);
+                        reg_usage.def_vgpr_f64(inst.vdst as u32);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VOPD(inst) => {
+                    let vdstx = inst.vdstx as u32;
+                    let vdsty = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as u32;
+                    match inst.opx {
+                        I::V_DUAL_CNDMASK_B32 => {
+                            reg_usage.use_operand_u32(&inst.src0x);
+                            reg_usage.use_vgpr_u32(inst.vsrc1x as u32);
+                            reg_usage.use_sgpr_u32(106);
+                            reg_usage.def_vgpr_u32(vdstx);
+                        }
+                        I::V_DUAL_MOV_B32 => {
+                            reg_usage.use_operand_u32(&inst.src0x);
+                            reg_usage.def_vgpr_u32(vdstx);
+                        }
+                        _ => {
+                            panic!("Unsupported instruction: {:?}", inst);
+                        }
+                    }
+                    match inst.opy {
+                        I::V_DUAL_CNDMASK_B32 => {
+                            reg_usage.use_operand_u32(&inst.src0y);
+                            reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                            reg_usage.use_sgpr_u32(106);
+                            reg_usage.def_vgpr_u32(vdsty);
+                        }
+                        I::V_DUAL_MOV_B32 => {
+                            reg_usage.use_operand_u32(&inst.src0y);
+                            reg_usage.def_vgpr_u32(vdsty);
+                        }
+                        I::V_DUAL_ADD_NC_U32 => {
+                            reg_usage.use_operand_u32(&inst.src0y);
+                            reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                            reg_usage.def_vgpr_u32(vdsty);
+                        }
+                        I::V_DUAL_LSHLREV_B32 => {
+                            reg_usage.use_operand_u32(&inst.src0y);
+                            reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                            reg_usage.def_vgpr_u32(vdsty);
+                        }
+                        _ => {
+                            panic!("Unsupported instruction: {:?}", inst);
+                        }
+                    }
+                }
+                InstFormat::SMEM(inst) => match inst.op {
+                    I::S_LOAD_B32 => {
+                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                        reg_usage.def_sgpr_u32(inst.sdata as u32);
+                    }
+                    I::S_LOAD_B64 => {
+                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                        for i in 0..2 {
+                            reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                        }
+                    }
+                    I::S_LOAD_B96 => {
+                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                        for i in 0..3 {
+                            reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                        }
+                    }
+                    I::S_LOAD_B128 => {
+                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                        for i in 0..4 {
+                            reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                        }
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::SOP1(inst) => match inst.op {
+                    I::S_AND_SAVEEXEC_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_sgpr_u32(126);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    I::S_AND_NOT1_SAVEEXEC_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_sgpr_u32(126);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                        reg_usage.def_sgpr_u32(126);
+                    }
+                    I::S_MOV_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_MOV_B64 => {
+                        reg_usage.use_operand_u64(&inst.ssrc0);
+                        reg_usage.def_sgpr_u64(inst.sdst as u32);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::SOP2(inst) => match inst.op {
+                    I::S_AND_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_OR_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_XOR_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_AND_NOT1_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_OR_NOT1_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_LSHR_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_CSELECT_B32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                        reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    }
+                    I::S_ADD_NC_U64 => {
+                        reg_usage.use_operand_u64(&inst.ssrc0);
+                        reg_usage.use_operand_u64(&inst.ssrc1);
+                        reg_usage.def_sgpr_u64(inst.sdst as u32);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::SOPC(inst) => match inst.op {
+                    I::S_CMP_LG_U32 => {
+                        reg_usage.use_operand_u32(&inst.ssrc0);
+                        reg_usage.use_operand_u32(&inst.ssrc1);
+                    }
+                    I::S_CMP_LG_U64 => {
+                        reg_usage.use_operand_u64(&inst.ssrc0);
+                        reg_usage.use_operand_u64(&inst.ssrc1);
+                    }
+                    I::S_CMP_EQ_U64 => {
+                        reg_usage.use_operand_u64(&inst.ssrc0);
+                        reg_usage.use_operand_u64(&inst.ssrc1);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                InstFormat::VGLOBAL(inst) => match inst.op {
+                    I::GLOBAL_LOAD_B32 => {
+                        if inst.saddr != 124 {
+                            reg_usage.use_sgpr_u64(inst.saddr as u32);
+                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                        } else {
+                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                        }
+
+                        for i in 0..1 {
+                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                        }
+                    }
+                    I::GLOBAL_LOAD_B64 => {
+                        if inst.saddr != 124 {
+                            reg_usage.use_sgpr_u64(inst.saddr as u32);
+                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                        } else {
+                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                        }
+
+                        for i in 0..2 {
+                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                        }
+                    }
+                    I::GLOBAL_LOAD_B128 => {
+                        if inst.saddr != 124 {
+                            reg_usage.use_sgpr_u64(inst.saddr as u32);
+                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                        } else {
+                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                        }
+
+                        for i in 0..4 {
+                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                        }
+                    }
+                    I::GLOBAL_STORE_B64 => {
+                        if inst.saddr != 124 {
+                            reg_usage.use_sgpr_u64(inst.saddr as u32);
+                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                        } else {
+                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                        }
+
+                        for i in 0..2 {
+                            reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                        }
+                    }
+                    I::GLOBAL_STORE_B128 => {
+                        if inst.saddr != 124 {
+                            reg_usage.use_sgpr_u64(inst.saddr as u32);
+                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                        } else {
+                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                        }
+
+                        for i in 0..4 {
+                            reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                        }
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                },
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            }
+        }
+        reg_usage
     }
 
     pub fn build(&mut self) -> InstBlock {
@@ -1797,6 +2472,8 @@ impl RDNATranslator {
                 vgprs_ptr,
                 scc_ptr,
             };
+
+            let reg_usage = self.analyze();
 
             for inst in &self.insts {
                 match inst {
@@ -5814,6 +6491,7 @@ impl RDNATranslator {
             inst_block.context = context;
             inst_block.module = module;
             inst_block.addr = func;
+            inst_block.reg_usage = reg_usage;
         }
 
         inst_block
