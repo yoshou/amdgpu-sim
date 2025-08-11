@@ -598,6 +598,7 @@ impl SIMD32 {
         let block = self.insts_blocks.get(&pc);
         if block.is_some() && self.translator.insts.len() == 0 {
             let block = block.unwrap();
+            let inst = block.terminator.clone();
 
             let sgprs_ptr =
                 self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
@@ -613,12 +614,7 @@ impl SIMD32 {
 
             self.next_pc = block.terminator_next_pc;
             self.set_pc(block.terminator_pc);
-            
-            let inst_stream = InstStream {
-                insts: &self.insts[self.ctx.pc..],
-            };
-            let (inst, _) = decode_rdna4(inst_stream).unwrap();
-            assert!(is_terminator(&inst), "Expected a terminator instruction, got: {:?}", inst);
+
             let result = self.execute_inst(inst);
             self.set_pc(self.next_pc as u64);
             result
@@ -627,11 +623,15 @@ impl SIMD32 {
 
             let result = if is_terminator(&inst) {
                 if self.translator.insts.len() > 0 {
-                    if !self.insts_blocks.contains_key(&self.translator.get_address().unwrap()) {
+                    if !self
+                        .insts_blocks
+                        .contains_key(&self.translator.get_address().unwrap())
+                    {
                         let mut block = self.translator.build();
 
                         block.terminator_next_pc = self.next_pc;
                         block.terminator_pc = self.get_pc();
+                        block.terminator = inst.clone();
 
                         self.insts_blocks
                             .insert(self.translator.get_address().unwrap(), block);
