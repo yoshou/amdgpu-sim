@@ -2021,6 +2021,54 @@ impl IREmitter {
         abs_value
     }
 
+    unsafe fn emit_get_exp_f64(
+        &self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+        let mut param_tys = vec![ty_f64, ty_i32];
+        let intrinsic_name = b"llvm.frexp.f64\0";
+        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
+            intrinsic_name.as_ptr() as *const _,
+            intrinsic_name.len() as usize,
+        );
+        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
+            self.module,
+            intrinsic_id,
+            param_tys.as_mut_ptr(),
+            param_tys.len() as usize,
+        );
+        let mut return_tys = vec![ty_f64, ty_i32];
+        let mut param_tys = vec![ty_f64];
+        let frexp_value = llvm::core::LLVMBuildCall2(
+            builder,
+            llvm::core::LLVMFunctionType(
+                llvm::core::LLVMStructTypeInContext(
+                    context,
+                    return_tys.as_mut_ptr(),
+                    return_tys.len() as u32,
+                    0,
+                ),
+                param_tys.as_mut_ptr(),
+                1,
+                0,
+            ),
+            intrinsic,
+            [value].as_mut_ptr(),
+            1,
+            empty_name.as_ptr(),
+        );
+
+        let exp_value =
+            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 1, empty_name.as_ptr());
+        exp_value
+    }
+
     unsafe fn emit_abs_neg(
         &self,
         abs: u8,
@@ -2362,17 +2410,10 @@ impl IREmitter {
         }
 
         for vgpr in &vgprs {
-            // let vgpr_ptr = llvm::core::LLVMBuildArrayAlloca(
-            //     self.builder,
-            //     llvm::core::LLVMInt32TypeInContext(self.context),
-            //     llvm::core::LLVMConstInt(llvm::core::LLVMInt64TypeInContext(self.context), 32, 0),
-            //     std::ffi::CString::new(format!("vgpr{}", vgpr))
-            //         .unwrap()
-            //         .as_ptr(),
-            // );
-            let vgpr_ptr = llvm::core::LLVMBuildAlloca(
+            let vgpr_ptr = llvm::core::LLVMBuildArrayAlloca(
                 self.builder,
-                llvm::core::LLVMArrayType(llvm::core::LLVMInt32TypeInContext(self.context), 32),
+                llvm::core::LLVMInt32TypeInContext(self.context),
+                llvm::core::LLVMConstInt(llvm::core::LLVMInt64TypeInContext(self.context), 32, 0),
                 std::ffi::CString::new(format!("vgpr{}", vgpr))
                     .unwrap()
                     .as_ptr(),
@@ -5100,6 +5141,7 @@ impl RDNATranslator {
                         } else {
                             bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+                                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -5108,15 +5150,8 @@ impl RDNATranslator {
                                 let s1_value =
                                     emitter.emit_vector_source_operand_u32(&inst.src1, elem);
 
-                                let s1_value = llvm::core::LLVMBuildSIToFP(
-                                    builder,
-                                    s1_value,
-                                    ty_f64,
-                                    empty_name.as_ptr(),
-                                );
-
-                                let mut param_tys = vec![ty_f64];
-                                let intrinsic_name = b"llvm.exp2.f64\0";
+                                let mut param_tys = vec![ty_f64, ty_i32];
+                                let intrinsic_name = b"llvm.ldexp.f64\0";
                                 let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
                                     intrinsic_name.as_ptr() as *const _,
                                     intrinsic_name.len() as usize,
@@ -5127,24 +5162,18 @@ impl RDNATranslator {
                                     param_tys.as_mut_ptr(),
                                     param_tys.len() as usize,
                                 );
-                                let mut param_tys = vec![ty_f64];
-                                let exp2_value = llvm::core::LLVMBuildCall2(
+                                let mut param_tys = vec![ty_f64, ty_i32];
+                                let d_value = llvm::core::LLVMBuildCall2(
                                     builder,
                                     llvm::core::LLVMFunctionType(
                                         ty_f64,
                                         param_tys.as_mut_ptr(),
-                                        1,
+                                        2,
                                         0,
                                     ),
                                     intrinsic,
-                                    [s1_value].as_mut_ptr(),
-                                    1,
-                                    empty_name.as_ptr(),
-                                );
-                                let d_value = llvm::core::LLVMBuildFMul(
-                                    builder,
-                                    s0_value,
-                                    exp2_value,
+                                    [s0_value, s1_value].as_mut_ptr(),
+                                    2,
                                     empty_name.as_ptr(),
                                 );
 
@@ -5320,6 +5349,8 @@ impl RDNATranslator {
 
                             let s0_value = emitter.emit_abs_neg(inst.abs, inst.neg, s0_value, 0);
 
+                            let s0_exp_value = emitter.emit_get_exp_f64(s0_value);
+
                             let s1_value = llvm::core::LLVMBuildAnd(
                                 builder,
                                 s1_value,
@@ -5390,6 +5421,29 @@ impl RDNATranslator {
                                 empty_name.as_ptr(),
                             );
 
+                            let cmp = llvm::core::LLVMBuildICmp(
+                                builder,
+                                llvm::LLVMIntPredicate::LLVMIntSGT,
+                                s0_exp_value,
+                                llvm::core::LLVMConstInt(ty_i32, 1077, 0),
+                                empty_name.as_ptr(),
+                            );
+
+                            let sub = llvm::core::LLVMBuildSub(
+                                builder,
+                                s0_exp_value,
+                                llvm::core::LLVMConstInt(ty_i32, 1077, 0),
+                                empty_name.as_ptr(),
+                            );
+
+                            let shift = llvm::core::LLVMBuildSelect(
+                                builder,
+                                cmp,
+                                llvm::core::LLVMBuildAdd(builder, shift, sub, empty_name.as_ptr()),
+                                shift,
+                                empty_name.as_ptr(),
+                            );
+
                             let bitpos = llvm::core::LLVMBuildSub(
                                 builder,
                                 llvm::core::LLVMConstInt(ty_i32, 1201 - 53, 0),
@@ -5444,6 +5498,27 @@ impl RDNATranslator {
                                     0,
                                 ),
                                 shift,
+                                empty_name.as_ptr(),
+                            );
+
+                            let cmp = llvm::core::LLVMBuildICmp(
+                                builder,
+                                llvm::LLVMIntPredicate::LLVMIntSGT,
+                                s0_exp_value,
+                                llvm::core::LLVMConstInt(ty_i32, 1968, 0),
+                                empty_name.as_ptr(),
+                            );
+
+                            let scale = llvm::core::LLVMBuildSelect(
+                                builder,
+                                cmp,
+                                llvm::core::LLVMBuildAdd(
+                                    builder,
+                                    scale,
+                                    llvm::core::LLVMConstInt(ty_i32, 128, 0),
+                                    empty_name.as_ptr(),
+                                ),
+                                scale,
                                 empty_name.as_ptr(),
                             );
 
@@ -7051,18 +7126,44 @@ impl RDNATranslator {
                 panic!("Failed to verify main module: {}", err_.to_str().unwrap());
             }
 
-            let pass_manager = llvm::core::LLVMCreateFunctionPassManagerForModule(module);
-            llvm::transforms::util::LLVMAddPromoteMemoryToRegisterPass(pass_manager);
-            llvm::transforms::instcombine::LLVMAddInstructionCombiningPass(pass_manager);
-            llvm::transforms::scalar::LLVMAddReassociatePass(pass_manager);
-            llvm::transforms::scalar::LLVMAddGVNPass(pass_manager);
-            llvm::transforms::scalar::LLVMAddCFGSimplificationPass(pass_manager);
-            llvm::transforms::scalar::LLVMAddDeadStoreEliminationPass(pass_manager);
-            llvm::core::LLVMInitializeFunctionPassManager(pass_manager);
+            llvm::target::LLVM_InitializeNativeTarget();
+            llvm::target::LLVM_InitializeAllTargetMCs();
+            llvm::target::LLVM_InitializeAllAsmParsers();
+            llvm::target::LLVM_InitializeAllAsmPrinters();
 
-            llvm::core::LLVMRunFunctionPassManager(pass_manager, function);
+            let triple = llvm::core::LLVMGetTarget(module);
+            let mut target = std::ptr::null_mut();
+            let mut err = std::ptr::null_mut();
+            let result =
+                llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut err);
+            if result != 0 {
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!(
+                    "Failed to get target from triple: {}",
+                    err_.to_str().unwrap()
+                );
+            }
+            let cpu_name = llvm::target_machine::LLVMGetHostCPUName();
+            let cpu_feature = llvm::target_machine::LLVMGetHostCPUFeatures();
+            let tm = llvm::target_machine::LLVMCreateTargetMachine(
+                target,
+                triple,
+                cpu_name,
+                cpu_feature,
+                llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+                llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
+                llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+            );
 
-            llvm::core::LLVMDisposePassManager(pass_manager);
+            let pass_builder_options =
+                llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
+            llvm::transforms::pass_builder::LLVMRunPassesOnFunction(
+                function,
+                b"early-cse,instcombine<no-verify-fixpoint>,aggressive-instcombine,mem2reg,gvn,dse,instsimplify,load-store-vectorizer,loop-fusion,loop-load-elim,reassociate,function-simplification<O3>,loop-vectorize,simplifycfg,loop-unroll<O3>\0".as_ptr() as *const _,
+                tm,
+                pass_builder_options,
+            );
 
             let mut instruction_count = 0;
 
@@ -7076,11 +7177,6 @@ impl RDNATranslator {
 
                 bb = llvm::core::LLVMGetNextBasicBlock(bb);
             }
-
-            llvm::target::LLVM_InitializeNativeTarget();
-            llvm::target::LLVM_InitializeAllTargetMCs();
-            llvm::target::LLVM_InitializeAllAsmParsers();
-            llvm::target::LLVM_InitializeAllAsmPrinters();
 
             let jit_builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
 
@@ -7118,7 +7214,7 @@ impl RDNATranslator {
                     triple,
                     cpu_name,
                     cpu_feature,
-                    llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
+                    llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
                     llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
                     llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
                 );

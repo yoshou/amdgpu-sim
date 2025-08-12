@@ -11,7 +11,7 @@ num = "*"
 indicatif = "0.15.0"
 libm = "*"
 num-traits = "0.2.12"
-llvm-sys = "150.2.0"
+llvm-sys = "201.0.1"
 libc = "0.2"
 
 [dev-dependencies]
