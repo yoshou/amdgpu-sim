@@ -3963,7 +3963,7 @@ impl<'a> RDNAProcessor<'a> {
         let bar = ProgressBar::new(num_workgroups as u64);
 
         bar.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) \n {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) \n {msg}")
             .progress_chars("#>-"));
 
         let num_wgps = self.wgps.len();
