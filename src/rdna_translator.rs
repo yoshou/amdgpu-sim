@@ -8,7 +8,7 @@ use crate::rdna_instructions::*;
 use llvm_sys as llvm;
 
 const USE_STACK_CACHE: bool = false;
-const USE_SIMD: bool = false;
+const USE_SIMD: bool = true;
 
 pub fn is_terminator(inst: &InstFormat) -> bool {
     match inst {
@@ -43,6 +43,9 @@ pub struct InstBlock {
     pub terminator_next_pc: usize,
     pub terminator: InstFormat,
     reg_usage: RegisterUsage,
+    pub call_count: u64,
+    pub elapsed_time: u64,
+    pub num_instructions: usize,
 }
 
 impl InstBlock {
@@ -58,20 +61,33 @@ impl InstBlock {
                 simm16: 0,
             }),
             reg_usage: RegisterUsage::new(),
+            call_count: 0,
+            elapsed_time: 0,
+            num_instructions: 0,
         }
     }
 
-    pub fn execute(&self, sgprs_ptr: *mut u32, vgprs_ptr: *mut u32, scc_ptr: *mut bool) {
+    pub fn execute(&mut self, sgprs_ptr: *mut u32, vgprs_ptr: *mut u32, scc_ptr: *mut bool) {
         unsafe {
             let func = std::mem::transmute::<_, extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
                 self.addr,
             );
+
+            use std::time::Instant;
+            let start = Instant::now();
 
             func(
                 sgprs_ptr as *mut c_void,
                 vgprs_ptr as *mut c_void,
                 scc_ptr as *mut c_void,
             );
+
+            let end = Instant::now();
+            let duration = end.duration_since(start);
+            let elapsed_ns = duration.as_nanos() as u64;
+
+            self.call_count += 1;
+            self.elapsed_time += elapsed_ns;
         }
     }
 }
@@ -162,6 +178,129 @@ impl IREmitter {
     }
 
     unsafe fn emit_vop_execmask(
+        &self,
+        bb: llvm::prelude::LLVMBasicBlockRef,
+        predicate: impl Fn(
+            &IREmitter,
+            llvm::prelude::LLVMBasicBlockRef,
+            llvm::prelude::LLVMValueRef,
+            llvm::prelude::LLVMValueRef,
+        ) -> llvm::prelude::LLVMBasicBlockRef,
+    ) -> llvm::prelude::LLVMBasicBlockRef {
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let context = self.context;
+        let function = self.function;
+        let builder = self.builder;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+        let ty_i32x8 = llvm::core::LLVMVectorType(ty_i32, 8);
+
+        let exec_value = self.emit_load_sgpr_u32(126);
+
+        let zero_vec = llvm::core::LLVMConstVector(
+            [
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+            ]
+            .as_mut_ptr(),
+            8,
+        );
+
+        let bit_mask = llvm::core::LLVMConstVector(
+            [
+                llvm::core::LLVMConstInt(ty_i32, 1, 0),
+                llvm::core::LLVMConstInt(ty_i32, 2, 0),
+                llvm::core::LLVMConstInt(ty_i32, 4, 0),
+                llvm::core::LLVMConstInt(ty_i32, 8, 0),
+                llvm::core::LLVMConstInt(ty_i32, 16, 0),
+                llvm::core::LLVMConstInt(ty_i32, 32, 0),
+                llvm::core::LLVMConstInt(ty_i32, 64, 0),
+                llvm::core::LLVMConstInt(ty_i32, 128, 0),
+            ]
+            .as_mut_ptr(),
+            8,
+        );
+
+        let bb_loop_entry =
+            llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
+        llvm::core::LLVMBuildBr(builder, bb_loop_entry);
+
+        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_entry);
+
+        let index = llvm::core::LLVMBuildPhi(builder, ty_i64, empty_name.as_ptr());
+        let index_i32 = llvm::core::LLVMBuildTrunc(builder, index, ty_i32, empty_name.as_ptr());
+
+        let exec_value =
+            llvm::core::LLVMBuildLShr(builder, exec_value, index_i32, empty_name.as_ptr());
+
+        let exec_vec = llvm::core::LLVMBuildInsertElement(
+            builder,
+            llvm::core::LLVMGetPoison(ty_i32x8),
+            exec_value,
+            llvm::core::LLVMConstInt(ty_i32, 0, 0),
+            empty_name.as_ptr(),
+        );
+
+        let exec_vec = llvm::core::LLVMBuildShuffleVector(
+            builder,
+            exec_vec,
+            llvm::core::LLVMGetPoison(ty_i32x8),
+            zero_vec,
+            empty_name.as_ptr(),
+        );
+
+        let exec_mask = llvm::core::LLVMBuildAnd(builder, exec_vec, bit_mask, empty_name.as_ptr());
+
+        let mask = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            exec_mask,
+            bit_mask,
+            empty_name.as_ptr(),
+        );
+
+        let bb_loop_exit =
+            llvm::core::LLVMAppendBasicBlockInContext(context, function, empty_name.as_ptr());
+
+        let bb_loop_entry = predicate(self, bb_loop_entry, index, mask);
+
+        let next_index = llvm::core::LLVMBuildAdd(
+            builder,
+            index,
+            llvm::core::LLVMConstInt(ty_i64, 8, 0),
+            empty_name.as_ptr(),
+        );
+
+        let cmp = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            next_index,
+            llvm::core::LLVMConstInt(ty_i64, 32, 0),
+            empty_name.as_ptr(),
+        );
+        llvm::core::LLVMBuildCondBr(builder, cmp, bb_loop_exit, bb_loop_entry);
+
+        let mut incoming_value = vec![llvm::core::LLVMConstInt(ty_i64, 0, 0), next_index];
+        let mut incoming_blocks = vec![bb, bb_loop_entry];
+        llvm::core::LLVMAddIncoming(
+            index,
+            incoming_value.as_mut_ptr(),
+            incoming_blocks.as_mut_ptr(),
+            incoming_value.len() as u32,
+        );
+
+        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_exit);
+
+        bb_loop_exit
+    }
+
+    unsafe fn emit_vop(
         &self,
         bb: llvm::prelude::LLVMBasicBlockRef,
         predicate: impl Fn(
@@ -261,7 +400,7 @@ impl IREmitter {
         bb_loop_exit
     }
 
-    unsafe fn emit_vop_execmask_update_sgpr(
+    unsafe fn emit_vop_update_sgpr(
         &self,
         bb: llvm::prelude::LLVMBasicBlockRef,
         sgpr_reg: u32,
@@ -2487,6 +2626,38 @@ impl RDNATranslator {
         self.insts.push(inst);
     }
 
+    fn get_pc(&self) -> u64 {
+        *self.addresses.last().unwrap() as u64
+    }
+
+    fn get_next_pcs(&self) -> Vec<u64> {
+        let inst = self.insts.last().unwrap();
+        let mut next_pscs = Vec::new();
+        let next_pc = ((self.get_pc() as i64) + 4) as usize;
+        match inst {
+            InstFormat::SOPP(inst) => match inst.op {
+                I::S_CBRANCH_EXECZ
+                | I::S_CBRANCH_EXECNZ
+                | I::S_CBRANCH_VCCZ
+                | I::S_CBRANCH_VCCNZ
+                | I::S_CBRANCH_SCC0
+                | I::S_CBRANCH_SCC1 => {
+                    next_pscs.push(next_pc as u64);
+                    let next_pc =
+                        ((self.get_pc() as i64) + ((inst.simm16 as i64) * 4) + 4) as usize;
+                    next_pscs.push(next_pc as u64);
+                }
+                I::S_BRANCH => {
+                    let next_pc = ((self.get_pc() as i64) + ((inst.simm16 as i64) * 4)) as usize;
+                    next_pscs.push(next_pc as u64);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        next_pscs
+    }
+
     fn analyze(&self) -> RegisterUsage {
         let mut reg_usage = RegisterUsage {
             use_sgprs: HashSet::new(),
@@ -2506,7 +2677,7 @@ impl RDNATranslator {
         reg_usage.def_sgprs.insert(106);
         reg_usage.def_sgprs.insert(126);
 
-        for inst in &self.insts {
+        for inst in &self.insts[..self.insts.len() - 1] {
             match inst {
                 InstFormat::SOPP(inst) => match inst.op {
                     I::S_CLAUSE => {}
@@ -3108,7 +3279,20 @@ impl RDNATranslator {
                 emitter.emit_alloc_registers(&reg_usage);
             }
 
-            for inst in &self.insts {
+            let block_pc = self.get_address().unwrap();
+            let current_pc = self.get_pc();
+            let next_pcs = self.get_next_pcs();
+
+            if next_pcs.len() == 2 && (next_pcs[1] >= block_pc) && (next_pcs[1] < current_pc) {
+                println!(
+                    "Warning: Block {} has a backward branch to {}",
+                    block_pc, next_pcs[1]
+                );
+            }
+
+            let terminator = self.insts.last().unwrap().clone();
+
+            for inst in &self.insts[..self.insts.len() - 1] {
                 match inst {
                     InstFormat::SOPP(inst) => match inst.op {
                         I::S_CLAUSE => {}
@@ -3124,323 +3308,258 @@ impl RDNATranslator {
                     },
                     InstFormat::VOPC(inst) => match inst.op {
                         I::V_CMP_GT_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntUGT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntUGT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_EQ_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntEQ,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntEQ,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_NE_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntNE,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntNE,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_GT_U64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntUGT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntUGT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_GT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildFCmp(
-                                        builder,
-                                        llvm::LLVMRealPredicate::LLVMRealUGT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildFCmp(
+                                    builder,
+                                    llvm::LLVMRealPredicate::LLVMRealUGT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_LT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildFCmp(
-                                        builder,
-                                        llvm::LLVMRealPredicate::LLVMRealULT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildFCmp(
+                                    builder,
+                                    llvm::LLVMRealPredicate::LLVMRealULT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_NLT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildFCmp(
-                                        builder,
-                                        llvm::LLVMRealPredicate::LLVMRealULT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
-                                    let cmp_value = llvm::core::LLVMBuildNot(
-                                        builder,
-                                        cmp_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildFCmp(
+                                    builder,
+                                    llvm::LLVMRealPredicate::LLVMRealULT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
+                                let cmp_value = llvm::core::LLVMBuildNot(
+                                    builder,
+                                    cmp_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMP_NGT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                106,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildFCmp(
-                                        builder,
-                                        llvm::LLVMRealPredicate::LLVMRealUGT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
-                                    let cmp_value = llvm::core::LLVMBuildNot(
-                                        builder,
-                                        cmp_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildFCmp(
+                                    builder,
+                                    llvm::LLVMRealPredicate::LLVMRealUGT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
+                                let cmp_value = llvm::core::LLVMBuildNot(
+                                    builder,
+                                    cmp_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMPX_NGT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                126,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildFCmp(
-                                        builder,
-                                        llvm::LLVMRealPredicate::LLVMRealUGT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
-                                    let cmp_value = llvm::core::LLVMBuildNot(
-                                        builder,
-                                        cmp_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildFCmp(
+                                    builder,
+                                    llvm::LLVMRealPredicate::LLVMRealUGT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
+                                let cmp_value = llvm::core::LLVMBuildNot(
+                                    builder,
+                                    cmp_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMPX_NGE_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                126,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildFCmp(
-                                        builder,
-                                        llvm::LLVMRealPredicate::LLVMRealUGE,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
-                                    let cmp_value = llvm::core::LLVMBuildNot(
-                                        builder,
-                                        cmp_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildFCmp(
+                                    builder,
+                                    llvm::LLVMRealPredicate::LLVMRealUGE,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
+                                let cmp_value = llvm::core::LLVMBuildNot(
+                                    builder,
+                                    cmp_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMPX_LT_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                126,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntULT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntULT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMPX_EQ_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                126,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntEQ,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntEQ,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         I::V_CMPX_LT_I32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
-                                bb,
-                                126,
-                                |emitter, bb, elem| {
-                                    let empty_name = std::ffi::CString::new("").unwrap();
+                            bb = emitter.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                                    let s0_value =
-                                        emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                                    let s1_value =
-                                        emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                                    let cmp_value = llvm::core::LLVMBuildICmp(
-                                        builder,
-                                        llvm::LLVMIntPredicate::LLVMIntSLT,
-                                        s0_value,
-                                        s1_value,
-                                        empty_name.as_ptr(),
-                                    );
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                                let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                                let cmp_value = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntSLT,
+                                    s0_value,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
 
-                                    (bb, cmp_value)
-                                },
-                            );
+                                (bb, cmp_value)
+                            });
                         }
                         _ => {
                             panic!("Unsupported instruction: {:?}", inst);
@@ -3448,7 +3567,7 @@ impl RDNATranslator {
                     },
                     InstFormat::VOP1(inst) => match inst.op {
                         I::V_CVT_F64_U32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3473,7 +3592,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_MOV_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let s0_value =
                                     emitter.emit_vector_source_operand_u32(&inst.src0, elem);
 
@@ -3485,7 +3604,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_RCP_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3507,7 +3626,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_RSQ_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
@@ -3553,7 +3672,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_RNDNE_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
@@ -3593,7 +3712,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_CVT_I32_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3617,7 +3736,7 @@ impl RDNATranslator {
                     },
                     InstFormat::VOP2(inst) => match inst.op {
                         I::V_ADD_NC_U32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3635,7 +3754,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_AND_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3653,7 +3772,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_XOR_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3671,7 +3790,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_LSHLREV_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3699,7 +3818,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_LSHRREV_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3727,7 +3846,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_CNDMASK_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -3856,7 +3975,7 @@ impl RDNATranslator {
                                     );
                                 }
                             } else {
-                                bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                                bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                     let empty_name = std::ffi::CString::new("").unwrap();
 
                                     let s0_value =
@@ -3974,7 +4093,7 @@ impl RDNATranslator {
                                     );
                                 }
                             } else {
-                                bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                                bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                     let empty_name = std::ffi::CString::new("").unwrap();
 
                                     let s0_value =
@@ -3994,7 +4113,7 @@ impl RDNATranslator {
                             }
                         }
                         I::V_MAX_NUM_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
@@ -4039,7 +4158,7 @@ impl RDNATranslator {
                     },
                     InstFormat::VOP3(inst) => match inst.op {
                         I::V_BFE_U32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
@@ -4096,7 +4215,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_CNDMASK_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -4157,7 +4276,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_CMP_GT_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4181,7 +4300,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_CMP_EQ_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4205,7 +4324,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_CMP_NLT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4239,7 +4358,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_CMP_NGT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4273,7 +4392,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_CMP_LT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4302,7 +4421,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_CMP_GT_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4331,7 +4450,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_CMP_LG_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -4463,7 +4582,7 @@ impl RDNATranslator {
                                     );
                                 }
                             } else {
-                                bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                                bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                     let empty_name = std::ffi::CString::new("").unwrap();
 
                                     let s0_value =
@@ -4594,7 +4713,7 @@ impl RDNATranslator {
                                     );
                                 }
                             } else {
-                                bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                                bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                     let empty_name = std::ffi::CString::new("").unwrap();
 
                                     let s0_value =
@@ -4730,8 +4849,36 @@ impl RDNATranslator {
                                         mask,
                                     );
                                 }
+                                // bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem, mask| {
+                                //     let s0_value = emitter
+                                //         .emit_vector_source_operand_f64x8(&inst.src0, elem, mask);
+
+                                //     let s1_value = emitter
+                                //         .emit_vector_source_operand_f64x8(&inst.src1, elem, mask);
+
+                                //     let s2_value = emitter
+                                //         .emit_vector_source_operand_f64x8(&inst.src2, elem, mask);
+
+                                //     let s0_value =
+                                //         emitter.emit_abs_neg_f64x8(s0_value, inst.abs, inst.neg, 0);
+                                //     let s1_value =
+                                //         emitter.emit_abs_neg_f64x8(s1_value, inst.abs, inst.neg, 1);
+                                //     let s2_value =
+                                //         emitter.emit_abs_neg_f64x8(s2_value, inst.abs, inst.neg, 2);
+
+                                //     let d_value =
+                                //         emitter.emit_fma_f64x8(s0_value, s1_value, s2_value);
+
+                                //     emitter.emit_store_vgpr_f64x8(
+                                //         inst.vdst as u32,
+                                //         elem,
+                                //         d_value,
+                                //         mask,
+                                //     );
+                                //     bb
+                                // });
                             } else {
-                                bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                                bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                     let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
                                     let empty_name = std::ffi::CString::new("").unwrap();
 
@@ -4788,7 +4935,7 @@ impl RDNATranslator {
                             }
                         }
                         I::V_DIV_FMAS_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
@@ -4890,7 +5037,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_DIV_FIXUP_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
@@ -5067,7 +5214,7 @@ impl RDNATranslator {
                                     );
                                 }
                             } else {
-                                bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                                bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                     let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
                                     let empty_name = std::ffi::CString::new("").unwrap();
 
@@ -5124,7 +5271,7 @@ impl RDNATranslator {
                             }
                         }
                         I::V_CMP_CLASS_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.vdst as u32,
                                 |emitter, bb, elem| {
@@ -5170,7 +5317,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_XAD_U32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -5202,7 +5349,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_XOR3_B32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -5234,7 +5381,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_ADD3_U32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -5266,7 +5413,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_MUL_LO_U32 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
                                 let s0_value =
@@ -5288,7 +5435,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_TRIG_PREOP_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
                                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
@@ -5477,7 +5624,7 @@ impl RDNATranslator {
                             });
                         }
                         I::V_MAX_NUM_F64 => {
-                            bb = emitter.emit_vop_execmask(bb, |emitter, bb, elem| {
+                            bb = emitter.emit_vop(bb, |emitter, bb, elem| {
                                 let empty_name = std::ffi::CString::new("").unwrap();
                                 let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
@@ -5532,7 +5679,7 @@ impl RDNATranslator {
                     },
                     InstFormat::VOP3SD(inst) => match inst.op {
                         I::V_MAD_CO_U64_U32 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.sdst as u32,
                                 |emitter, bb, elem| {
@@ -5622,7 +5769,7 @@ impl RDNATranslator {
                             );
                         }
                         I::V_DIV_SCALE_F64 => {
-                            bb = emitter.emit_vop_execmask_update_sgpr(
+                            bb = emitter.emit_vop_update_sgpr(
                                 bb,
                                 inst.sdst as u32,
                                 |emitter, bb, elem| {
@@ -6992,6 +7139,19 @@ impl RDNATranslator {
 
             llvm::core::LLVMDisposePassManager(pass_manager);
 
+            let mut instruction_count = 0;
+
+            let mut bb = llvm::core::LLVMGetFirstBasicBlock(function);
+            while bb != std::ptr::null_mut() {
+                let mut inst = llvm::core::LLVMGetFirstInstruction(bb);
+                while inst != std::ptr::null_mut() {
+                    instruction_count += 1;
+                    inst = llvm::core::LLVMGetNextInstruction(inst);
+                }
+
+                bb = llvm::core::LLVMGetNextBasicBlock(bb);
+            }
+
             llvm::target::LLVM_InitializeNativeTarget();
             llvm::target::LLVM_InitializeAllTargetMCs();
             llvm::target::LLVM_InitializeAllAsmParsers();
@@ -7129,6 +7289,8 @@ impl RDNATranslator {
             inst_block.module = module;
             inst_block.addr = func;
             inst_block.reg_usage = reg_usage;
+            inst_block.terminator = terminator;
+            inst_block.num_instructions = instruction_count;
         }
 
         inst_block

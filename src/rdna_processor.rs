@@ -595,10 +595,12 @@ impl SIMD32 {
             insts: &self.insts[self.ctx.pc..],
         };
         let pc = self.ctx.pc as u64;
-        let block = self.insts_blocks.get(&pc);
+        let block = self.insts_blocks.get_mut(&pc);
         if block.is_some() && self.translator.insts.len() == 0 {
             let block = block.unwrap();
-            let inst = block.terminator.clone();
+            let terminator = block.terminator.clone();
+            let terminator_pc = block.terminator_pc;
+            let terminator_next_pc = block.terminator_next_pc;
 
             let sgprs_ptr =
                 self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
@@ -612,15 +614,16 @@ impl SIMD32 {
 
             block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
 
-            self.next_pc = block.terminator_next_pc;
-            self.set_pc(block.terminator_pc);
+            self.next_pc = terminator_next_pc;
+            self.set_pc(terminator_pc);
 
-            let result = self.execute_inst(inst);
+            let result = self.execute_inst(terminator);
             self.set_pc(self.next_pc as u64);
             result
         } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
             self.next_pc = self.get_pc() as usize + size;
 
+            self.translator.add_inst(self.ctx.pc as u64, inst.clone());
             let result = if is_terminator(&inst) {
                 if self.translator.insts.len() > 0 {
                     if !self
@@ -631,7 +634,6 @@ impl SIMD32 {
 
                         block.terminator_next_pc = self.next_pc;
                         block.terminator_pc = self.get_pc();
-                        block.terminator = inst.clone();
 
                         self.insts_blocks
                             .insert(self.translator.get_address().unwrap(), block);
@@ -658,7 +660,6 @@ impl SIMD32 {
                 }
                 self.execute_inst(inst)
             } else {
-                self.translator.add_inst(self.ctx.pc as u64, inst.clone());
                 Signals::None
             };
             self.set_pc(self.next_pc as u64);
@@ -4019,6 +4020,36 @@ impl<'a> RDNAProcessor<'a> {
             for t in thread_handles {
                 t.join().unwrap();
             }
+        }
+
+        let mut sum_block_call_count = HashMap::new();
+        let mut sum_block_elapsed_time = HashMap::new();
+        let mut sum_instruction_count = HashMap::new();
+        for wgp in &self.wgps {
+            for cu in &wgp.cunits {
+                for simd in &cu.simds {
+                    let v = simd.lock().unwrap();
+                    for (addr, block) in v.insts_blocks.iter() {
+                        *sum_block_call_count.entry(*addr).or_insert(0) += block.call_count;
+                        *sum_block_elapsed_time.entry(*addr).or_insert(0) += block.elapsed_time;
+                        *sum_instruction_count.entry(*addr).or_insert(0) = block.num_instructions;
+                    }
+                }
+            }
+        }
+
+        let mut sorted_blocks: Vec<_> = sum_block_elapsed_time.iter().collect();
+        sorted_blocks.sort_by(|a, b| b.1.cmp(a.1));
+        println!("Block execution summary:");
+        for (addr, elapsed_time) in sorted_blocks {
+            let call_count = sum_block_call_count.get(addr).unwrap_or(&0);
+            println!(
+                "Block at 0x{:08X} executed {} times, total elapsed time: {} ms, instruction count: {}",
+                addr,
+                call_count,
+                (*elapsed_time as f64 / 1_000_000.0),
+                sum_instruction_count.get(addr).unwrap_or(&0)
+            );
         }
 
         bar.finish();
