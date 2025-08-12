@@ -306,7 +306,6 @@ struct SIMD32 {
     pub sgprs: RegisterFileImpl<u32>,
     pub vgprs: RegisterFileImpl<u32>,
     num_vgprs: usize,
-    insts_blocks: HashMap<u64, InstBlock>,
     translator: RDNATranslator,
 }
 
@@ -603,7 +602,7 @@ impl SIMD32 {
             insts: &self.insts[self.ctx.pc..],
         };
         let pc = self.ctx.pc as u64;
-        let block = self.insts_blocks.get_mut(&pc);
+        let block = self.translator.insts_blocks.get_mut(&pc);
         if block.is_some() && self.translator.insts.len() == 0 {
             let block = block.unwrap();
             let terminator = block.terminator.clone();
@@ -634,23 +633,11 @@ impl SIMD32 {
             self.translator.add_inst(self.ctx.pc as u64, inst.clone());
             let result = if is_terminator(&inst) {
                 if self.translator.insts.len() > 0 {
-                    if !self
-                        .insts_blocks
-                        .contains_key(&self.translator.get_address().unwrap())
-                    {
-                        let mut block = self.translator.build();
+                    let pc = self.get_pc();
+                    let block = self.translator.get_or_build();
 
-                        block.terminator_next_pc = self.next_pc;
-                        block.terminator_pc = self.get_pc();
-
-                        self.insts_blocks
-                            .insert(self.translator.get_address().unwrap(), block);
-                    }
-
-                    let block = self
-                        .insts_blocks
-                        .get_mut(&self.translator.get_address().unwrap())
-                        .unwrap();
+                    block.terminator_next_pc = self.next_pc;
+                    block.terminator_pc = pc;
 
                     let sgprs_ptr =
                         self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
@@ -663,8 +650,6 @@ impl SIMD32 {
                     let scc_ptr = (&mut self.ctx.scc) as *mut bool;
 
                     block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
-
-                    self.translator.clear();
                 }
                 self.execute_inst(inst)
             } else {
@@ -3770,7 +3755,6 @@ impl ComputeUnit {
                 sgprs: RegisterFileImpl::new(1, 128 * num_wave_slot, 0),
                 vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
                 num_vgprs: num_vgprs,
-                insts_blocks: HashMap::new(),
                 translator: RDNATranslator::new(),
             })));
         }
@@ -4037,7 +4021,7 @@ impl<'a> RDNAProcessor<'a> {
             for cu in &wgp.cunits {
                 for simd in &cu.simds {
                     let v = simd.lock().unwrap();
-                    for (addr, block) in v.insts_blocks.iter() {
+                    for (addr, block) in v.translator.insts_blocks.iter() {
                         *sum_block_call_count.entry(*addr).or_insert(0) += block.call_count;
                         *sum_block_elapsed_time.entry(*addr).or_insert(0) += block.elapsed_time;
                         *sum_instruction_count.entry(*addr).or_insert(0) = block.num_instructions;

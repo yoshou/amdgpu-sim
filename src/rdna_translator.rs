@@ -96,7 +96,7 @@ pub struct RDNATranslator {
     pub addresses: Vec<u64>,
     pub insts: Vec<InstFormat>,
     context: llvm::prelude::LLVMContextRef,
-    pub counter: usize,
+    pub insts_blocks: HashMap<u64, InstBlock>,
 }
 
 struct IREmitter {
@@ -2617,7 +2617,7 @@ impl RDNATranslator {
             addresses: Vec::new(),
             insts: Vec::new(),
             context: unsafe { llvm::core::LLVMContextCreate() },
-            counter: 0,
+            insts_blocks: HashMap::new(),
         }
     }
 
@@ -3214,7 +3214,14 @@ impl RDNATranslator {
         reg_usage
     }
 
-    pub fn build(&mut self) -> InstBlock {
+    pub fn get_or_build(&mut self) -> &mut InstBlock {
+        if self.insts_blocks.contains_key(&self.get_address().unwrap()) {
+            return self
+                .insts_blocks
+                .get_mut(&self.get_address().unwrap())
+                .unwrap();
+        }
+
         let mut inst_block = InstBlock::new();
 
         unsafe {
@@ -7293,7 +7300,13 @@ impl RDNATranslator {
             inst_block.num_instructions = instruction_count;
         }
 
-        inst_block
+        let block_addr = self.get_address().unwrap();
+
+        self.clear();
+
+        self.insts_blocks.insert(block_addr, inst_block);
+
+        self.insts_blocks.get_mut(&block_addr).unwrap()
     }
 
     pub fn get_address(&self) -> Option<u64> {
