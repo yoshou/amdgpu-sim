@@ -396,9 +396,17 @@ fn div_fixup_f64(s0: f64, s1: f64, s2: f64) -> f64 {
             0.0
         }
     } else if (get_exp_f64(s2) - get_exp_f64(s1)) < -1075 {
-        panic!();
+        if sign_out {
+            -0.0
+        } else {
+            0.0
+        }
     } else if get_exp_f64(s1) == 2047 {
-        panic!();
+        if sign_out {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        }
     } else {
         if sign_out {
             -s0.abs()
