@@ -178,7 +178,7 @@ impl IREmitter {
         )
     }
 
-    unsafe fn emit_vop_execmask(
+    unsafe fn _emit_vop_execmask(
         &self,
         bb: llvm::prelude::LLVMBasicBlockRef,
         predicate: impl Fn(
@@ -2140,6 +2140,22 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
+        let value = if (omod >> idx) & 1 != 0 {
+            assert!(llvm::core::LLVMTypeOf(value) == ty_f64);
+            let two = llvm::core::LLVMConstReal(ty_f64, 2.0);
+            let four = llvm::core::LLVMConstReal(ty_f64, 4.0);
+            let half = llvm::core::LLVMConstReal(ty_f64, 0.5);
+
+            match idx {
+                0 => llvm::core::LLVMBuildFMul(builder, value, two, empty_name.as_ptr()),
+                1 => llvm::core::LLVMBuildFMul(builder, value, four, empty_name.as_ptr()),
+                2 => llvm::core::LLVMBuildFMul(builder, value, half, empty_name.as_ptr()),
+                _ => value,
+            }
+        } else {
+            value
+        };
+
         let value = if (clamp >> idx) & 1 != 0 {
             assert!(llvm::core::LLVMTypeOf(value) == ty_f64);
             let zero = llvm::core::LLVMConstReal(ty_f64, 0.0);
@@ -2521,7 +2537,7 @@ impl RegisterUsage {
         self.use_sgpr_u32(reg);
         self.use_sgpr_u32(reg + 1);
     }
-    fn use_sgpr_f64(&mut self, reg: u32) {
+    fn _use_sgpr_f64(&mut self, reg: u32) {
         self.use_sgpr_u32(reg);
         self.use_sgpr_u32(reg + 1);
     }
@@ -2591,7 +2607,7 @@ impl RegisterUsage {
         self.def_sgpr_u32(reg + 1);
     }
 
-    fn def_sgpr_f64(&mut self, reg: u32) {
+    fn _def_sgpr_f64(&mut self, reg: u32) {
         self.def_sgpr_u32(reg);
         self.def_sgpr_u32(reg + 1);
     }
@@ -6968,7 +6984,7 @@ impl RDNATranslator {
                 std::ffi::CString::new(format!("block{}", self.get_address().unwrap())).unwrap();
             let function = llvm::core::LLVMAddFunction(module, func_name.as_ptr(), ty_function);
 
-            let mut bb = llvm::core::LLVMAppendBasicBlockInContext(
+            let bb = llvm::core::LLVMAppendBasicBlockInContext(
                 context,
                 function,
                 b"entry\0".as_ptr() as *const _,
@@ -7012,7 +7028,7 @@ impl RDNATranslator {
 
             let terminator = self.insts.last().unwrap().clone();
 
-            bb = self.emit_intrsuctions(&mut emitter, bb);
+            self.emit_intrsuctions(&mut emitter, bb);
 
             if USE_STACK_CACHE {
                 emitter.emit_spill_registers(&reg_usage);
