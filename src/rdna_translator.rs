@@ -7245,31 +7245,8 @@ impl RDNATranslator {
             let lljit_gl_prefix = llvm::orc2::lljit::LLVMOrcLLJITGetGlobalPrefix(jit);
 
             let mut dg = std::ptr::null_mut();
-            let filename = std::ffi::CString::new("/usr/lib/x86_64-linux-gnu/libm.so.6").unwrap();
-            let err = llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
+            let err = llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
                 &mut dg,
-                filename.as_ptr(),
-                lljit_gl_prefix,
-                None,
-                std::ptr::null_mut(),
-            );
-            if !err.is_null() {
-                let err = llvm::error::LLVMGetErrorMessage(err);
-                let err = std::ffi::CString::from_raw(err);
-                let err_ = err.clone();
-                panic!(
-                    "Failed to create dynamic library search generator: {}",
-                    err_.to_str().unwrap()
-                );
-            }
-
-            llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, dg);
-
-            let mut dg = std::ptr::null_mut();
-            let filename = std::ffi::CString::new("/usr/lib/x86_64-linux-gnu/libc.so.6").unwrap();
-            let err = llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
-                &mut dg,
-                filename.as_ptr(),
                 lljit_gl_prefix,
                 None,
                 std::ptr::null_mut(),
