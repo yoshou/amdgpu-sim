@@ -4017,14 +4017,18 @@ impl<'a> RDNAProcessor<'a> {
         let mut sum_block_call_count = HashMap::new();
         let mut sum_block_elapsed_time = HashMap::new();
         let mut sum_instruction_count = HashMap::new();
+        let mut instruction_usage = HashMap::new();
         for wgp in &self.wgps {
             for cu in &wgp.cunits {
                 for simd in &cu.simds {
                     let v = simd.lock().unwrap();
-                    for (addr, block) in v.translator.insts_blocks.iter() {
+                    for (addr, block) in &v.translator.insts_blocks {
                         *sum_block_call_count.entry(*addr).or_insert(0) += block.call_count;
                         *sum_block_elapsed_time.entry(*addr).or_insert(0) += block.elapsed_time;
-                        *sum_instruction_count.entry(*addr).or_insert(0) = block.num_instructions;
+                        *sum_instruction_count.entry(*addr).or_insert(0) += block.num_instructions;
+                        for (inst, count) in block.instruction_usage.clone() {
+                            *instruction_usage.entry(inst).or_insert(0) += count.clone();
+                        }
                     }
                 }
             }
@@ -4042,6 +4046,13 @@ impl<'a> RDNAProcessor<'a> {
                 (*elapsed_time as f64 / 1_000_000.0),
                 sum_instruction_count.get(addr).unwrap_or(&0)
             );
+        }
+
+        println!("\nInstruction usage summary:");
+        let mut sorted_instructions: Vec<_> = instruction_usage.iter().collect();
+        sorted_instructions.sort_by(|a, b| b.1.cmp(a.1));
+        for (inst, count) in sorted_instructions {
+            println!("Instruction {:?} executed {} times", inst, count);
         }
 
         bar.finish();
