@@ -4027,7 +4027,8 @@ impl<'a> RDNAProcessor<'a> {
                         *sum_block_elapsed_time.entry(*addr).or_insert(0) += block.elapsed_time;
                         *sum_instruction_count.entry(*addr).or_insert(0) += block.num_instructions;
                         for (inst, count) in block.instruction_usage.clone() {
-                            *instruction_usage.entry(inst).or_insert(0) += count.clone();
+                            *instruction_usage.entry(inst).or_insert(0) +=
+                                count.clone() * block.call_count as u32;
                         }
                     }
                 }
