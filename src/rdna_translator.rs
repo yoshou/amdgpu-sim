@@ -202,17 +202,7 @@ impl IREmitter {
         let exec_value = self.emit_load_sgpr_u32(126);
 
         let zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 8].as_mut_ptr(),
             8,
         );
 
@@ -1832,17 +1822,7 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
 
         let zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 8].as_mut_ptr(),
             8,
         );
         let poison = llvm::core::LLVMGetPoison(ty_i32x8);
@@ -1903,13 +1883,7 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(self.context);
 
         let zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 4].as_mut_ptr(),
             4,
         );
         let poison = llvm::core::LLVMGetPoison(llvm::core::LLVMVectorType(ty_f64, 4));
@@ -1918,8 +1892,7 @@ impl IREmitter {
             SourceOperand::LiteralConstant(value) => {
                 let value =
                     llvm::core::LLVMConstReal(ty_f64, f64::from_bits((*value as u64) << 32));
-                let value =
-                    llvm::core::LLVMConstVector([value, value, value, value].as_mut_ptr(), 4);
+                let value = llvm::core::LLVMConstVector([value; 4].as_mut_ptr(), 4);
                 LLVMValueF64x8 {
                     v0: value,
                     v1: value,
@@ -1928,8 +1901,7 @@ impl IREmitter {
             SourceOperand::IntegerConstant(value) => {
                 let value =
                     llvm::core::LLVMConstReal(ty_f64, f64::from_bits((*value as u64) << 32));
-                let value =
-                    llvm::core::LLVMConstVector([value, value, value, value].as_mut_ptr(), 4);
+                let value = llvm::core::LLVMConstVector([value; 4].as_mut_ptr(), 4);
                 LLVMValueF64x8 {
                     v0: value,
                     v1: value,
@@ -1937,8 +1909,7 @@ impl IREmitter {
             }
             SourceOperand::FloatConstant(value) => {
                 let value = llvm::core::LLVMConstReal(ty_f64, *value);
-                let value =
-                    llvm::core::LLVMConstVector([value, value, value, value].as_mut_ptr(), 4);
+                let value = llvm::core::LLVMConstVector([value; 4].as_mut_ptr(), 4);
                 LLVMValueF64x8 {
                     v0: value,
                     v1: value,
@@ -1987,17 +1958,7 @@ impl IREmitter {
         let ty_i32x8 = llvm::core::LLVMVectorType(ty_i32, 8);
 
         let zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 8].as_mut_ptr(),
             8,
         );
         let poison = llvm::core::LLVMGetPoison(ty_i32x8);
@@ -2005,26 +1966,17 @@ impl IREmitter {
         match operand {
             SourceOperand::LiteralConstant(value) => {
                 let value = llvm::core::LLVMConstInt(ty_i32, *value as u64, 0);
-                let value = llvm::core::LLVMConstVector(
-                    [value, value, value, value, value, value, value, value].as_mut_ptr(),
-                    8,
-                );
+                let value = llvm::core::LLVMConstVector([value; 8].as_mut_ptr(), 8);
                 LLVMValueU32x8 { v0: value }
             }
             SourceOperand::IntegerConstant(value) => {
                 let value = llvm::core::LLVMConstInt(ty_i32, *value as u64, 0);
-                let value = llvm::core::LLVMConstVector(
-                    [value, value, value, value, value, value, value, value].as_mut_ptr(),
-                    8,
-                );
+                let value = llvm::core::LLVMConstVector([value; 8].as_mut_ptr(), 8);
                 LLVMValueU32x8 { v0: value }
             }
             SourceOperand::FloatConstant(value) => {
                 let value = llvm::core::LLVMConstInt(ty_i32, f32::to_bits(*value as f32) as u64, 0);
-                let value = llvm::core::LLVMConstVector(
-                    [value, value, value, value, value, value, value, value].as_mut_ptr(),
-                    8,
-                );
+                let value = llvm::core::LLVMConstVector([value; 8].as_mut_ptr(), 8);
                 LLVMValueU32x8 { v0: value }
             }
             SourceOperand::ScalarRegister(value) => {
@@ -2180,13 +2132,7 @@ impl IREmitter {
         let ty_i64x4 = llvm::core::LLVMVectorType(ty_i64, 4);
 
         let negative_zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i64, 0x8000000000000000, 0),
-                llvm::core::LLVMConstInt(ty_i64, 0x8000000000000000, 0),
-                llvm::core::LLVMConstInt(ty_i64, 0x8000000000000000, 0),
-                llvm::core::LLVMConstInt(ty_i64, 0x8000000000000000, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i64, 0x8000000000000000, 0); 4].as_mut_ptr(),
             4,
         );
 
@@ -2403,17 +2349,7 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
 
         let zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 8].as_mut_ptr(),
             8,
         );
 
@@ -2553,17 +2489,7 @@ impl IREmitter {
         let ty_i64x4 = llvm::core::LLVMVectorType(ty_i64, 4);
 
         let zero_vec = llvm::core::LLVMConstVector(
-            [
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-                llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            ]
-            .as_mut_ptr(),
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 8].as_mut_ptr(),
             8,
         );
 
@@ -2874,10 +2800,12 @@ impl RegisterUsage {
         }
         self.use_sgprs.insert(reg);
     }
+
     fn use_sgpr_u64(&mut self, reg: u32) {
         self.use_sgpr_u32(reg);
         self.use_sgpr_u32(reg + 1);
     }
+
     fn _use_sgpr_f64(&mut self, reg: u32) {
         self.use_sgpr_u32(reg);
         self.use_sgpr_u32(reg + 1);
