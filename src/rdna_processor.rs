@@ -240,14 +240,16 @@ pub trait RegisterFile<T: Copy> {
 
 pub struct RegisterFileImpl<T: Copy> {
     num_elems: usize,
-    pub regs: Vec<T>,
+    pub regs: aligned_vec::AVec<T>,
 }
 
 impl<T: Copy> RegisterFile<T> for RegisterFileImpl<T> {
     fn new(num_elems: usize, count: usize, default: T) -> Self {
+        let mut regs = aligned_vec::AVec::new(32);
+        regs.resize(num_elems * count, default);
         RegisterFileImpl {
             num_elems: num_elems,
-            regs: vec![default; num_elems * count],
+            regs: regs,
         }
     }
 
