@@ -1121,6 +1121,61 @@ impl IREmitter {
         llvm::core::LLVMBuildStore(builder, value, value_ptr);
     }
 
+    unsafe fn emit_store_stack_vgpr_u32x8(
+        &mut self,
+        reg: u32,
+        elem: llvm::prelude::LLVMValueRef,
+        value: llvm::prelude::LLVMValueRef,
+        mask: llvm::prelude::LLVMValueRef,
+    ) {
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let context = self.context;
+        let builder = self.builder;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(self.context);
+        let ty_i32x8 = llvm::core::LLVMVectorType(ty_i32, 8);
+        let ty_i1 = llvm::core::LLVMInt1TypeInContext(self.context);
+        let ty_i1x8 = llvm::core::LLVMVectorType(ty_i1, 8);
+        let ty_ptr = llvm::core::LLVMPointerTypeInContext(context, 0);
+        let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
+
+        let mut indices = vec![elem];
+        let value_ptr = llvm::core::LLVMBuildGEP2(
+            builder,
+            ty_i32,
+            *self.vgpr_ptr_map.get(&reg).unwrap(),
+            indices.as_mut_ptr(),
+            indices.len() as u32,
+            empty_name.as_ptr(),
+        );
+
+        let mut param_tys = vec![ty_i32x8, ty_ptr];
+        let intrinsic_name = b"llvm.masked.store.v8i32\0";
+        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
+            intrinsic_name.as_ptr() as *const _,
+            intrinsic_name.len() as usize,
+        );
+        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
+            self.module,
+            intrinsic_id,
+            param_tys.as_mut_ptr(),
+            param_tys.len() as usize,
+        );
+        let mut param_tys = vec![ty_i32x8, ty_ptr, ty_i32, ty_i1x8];
+        llvm::core::LLVMBuildCall2(
+            builder,
+            llvm::core::LLVMFunctionType(
+                llvm::core::LLVMVoidTypeInContext(context),
+                param_tys.as_mut_ptr(),
+                param_tys.len() as u32,
+                0,
+            ),
+            intrinsic,
+            [value, value_ptr, alignment, mask].as_mut_ptr(),
+            4,
+            empty_name.as_ptr(),
+        );
+    }
+
     unsafe fn emit_store_vgpr_u32(
         &mut self,
         reg: u32,
@@ -1180,7 +1235,7 @@ impl IREmitter {
         let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
         if USE_VGPR_STACK_CACHE {
-            return self.emit_store_stack_vgpr_u32(reg, elem, value);
+            return self.emit_store_stack_vgpr_u32x8(reg, elem, value, mask);
         }
 
         let index = llvm::core::LLVMBuildAdd(
