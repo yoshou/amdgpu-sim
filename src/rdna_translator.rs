@@ -2440,6 +2440,80 @@ impl IREmitter {
 
         let value0 = llvm::core::LLVMBuildShuffleVector(
             self.builder,
+            value.v0,
+            zero_vec,
+            index0_vec,
+            empty_name.as_ptr(),
+        );
+        let value1 = llvm::core::LLVMBuildShuffleVector(
+            self.builder,
+            value.v0,
+            zero_vec,
+            index1_vec,
+            empty_name.as_ptr(),
+        );
+
+        let value0 =
+            llvm::core::LLVMBuildBitCast(self.builder, value0, ty_i64x4, empty_name.as_ptr());
+        let value1 =
+            llvm::core::LLVMBuildBitCast(self.builder, value1, ty_i64x4, empty_name.as_ptr());
+
+        let value0 = llvm::core::LLVMBuildUIToFP(builder, value0, ty_f64x4, empty_name.as_ptr());
+        let value1 = llvm::core::LLVMBuildUIToFP(builder, value1, ty_f64x4, empty_name.as_ptr());
+
+        LLVMValueF64x8 {
+            v0: value0,
+            v1: value1,
+        }
+    }
+
+    unsafe fn emit_i32x8_to_f64x8(&mut self, value: LLVMValueU32x8) -> LLVMValueF64x8 {
+        let context = self.context;
+        let builder = self.builder;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+        let ty_i64x4 = llvm::core::LLVMVectorType(ty_i64, 4);
+        let ty_f64x4 = llvm::core::LLVMVectorType(ty_f64, 4);
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let zero_vec = llvm::core::LLVMConstVector(
+            [llvm::core::LLVMConstInt(ty_i32, 0, 0); 8].as_mut_ptr(),
+            8,
+        );
+
+        let index0_vec = llvm::core::LLVMConstVector(
+            [
+                llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                llvm::core::LLVMConstInt(ty_i32, 8, 0),
+                llvm::core::LLVMConstInt(ty_i32, 1, 0),
+                llvm::core::LLVMConstInt(ty_i32, 9, 0),
+                llvm::core::LLVMConstInt(ty_i32, 4, 0),
+                llvm::core::LLVMConstInt(ty_i32, 12, 0),
+                llvm::core::LLVMConstInt(ty_i32, 5, 0),
+                llvm::core::LLVMConstInt(ty_i32, 13, 0),
+            ]
+            .as_mut_ptr(),
+            8,
+        );
+
+        let index1_vec = llvm::core::LLVMConstVector(
+            [
+                llvm::core::LLVMConstInt(ty_i32, 2, 0),
+                llvm::core::LLVMConstInt(ty_i32, 10, 0),
+                llvm::core::LLVMConstInt(ty_i32, 3, 0),
+                llvm::core::LLVMConstInt(ty_i32, 11, 0),
+                llvm::core::LLVMConstInt(ty_i32, 6, 0),
+                llvm::core::LLVMConstInt(ty_i32, 14, 0),
+                llvm::core::LLVMConstInt(ty_i32, 7, 0),
+                llvm::core::LLVMConstInt(ty_i32, 15, 0),
+            ]
+            .as_mut_ptr(),
+            8,
+        );
+
+        let value0 = llvm::core::LLVMBuildShuffleVector(
+            self.builder,
             zero_vec,
             value.v0,
             index0_vec,
@@ -3083,28 +3157,50 @@ impl IREmitter {
             },
             InstFormat::VOP1(inst) => match inst.op {
                 I::V_CVT_F64_U32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let d_value = llvm::core::LLVMBuildUIToFP(
-                            builder,
-                            s0_value,
-                            llvm::core::LLVMDoubleTypeInContext(context),
-                            empty_name.as_ptr(),
-                        );
-                        let d_value = llvm::core::LLVMBuildBitCast(
-                            builder,
-                            d_value,
-                            llvm::core::LLVMInt64TypeInContext(context),
-                            empty_name.as_ptr(),
-                        );
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        emitter.emit_store_vgpr_u64(inst.vdst as u32, elem, d_value);
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
 
-                        bb
-                    });
+                            let d_value = emitter.emit_u32x8_to_f64x8(s0_value);
+
+                            emitter.emit_store_vgpr_f64x8(inst.vdst as u32, i, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let d_value = llvm::core::LLVMBuildUIToFP(
+                                builder,
+                                s0_value,
+                                llvm::core::LLVMDoubleTypeInContext(context),
+                                empty_name.as_ptr(),
+                            );
+                            let d_value = llvm::core::LLVMBuildBitCast(
+                                builder,
+                                d_value,
+                                llvm::core::LLVMInt64TypeInContext(context),
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u64(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_MOV_B32 => {
                     if USE_SIMD {
@@ -3293,43 +3389,112 @@ impl IREmitter {
                     }
                 }
                 I::V_RNDNE_F64 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
+
                         let empty_name = std::ffi::CString::new("").unwrap();
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+                        let ty_f64x4 = llvm::core::LLVMVectorType(ty_f64, 4);
 
-                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.roundeven.f64\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let mut param_tys = vec![ty_f64];
-                        let d_value = llvm::core::LLVMBuildCall2(
-                            builder,
-                            llvm::core::LLVMFunctionType(
-                                ty_f64,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as u32,
+                        for i in (0..32).step_by(8) {
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
                                 0,
-                            ),
-                            intrinsic,
-                            [s0_value].as_mut_ptr(),
-                            1,
-                            empty_name.as_ptr(),
-                        );
+                            );
 
-                        emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        bb
-                    });
+                            let s0_value =
+                                emitter.emit_vector_source_operand_f64x8(&inst.src0, elem, mask);
+
+                            let mut param_tys = vec![ty_f64x4];
+                            let intrinsic_name = b"llvm.roundeven.v4f64\0";
+                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
+                                intrinsic_name.as_ptr() as *const _,
+                                intrinsic_name.len() as usize,
+                            );
+                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
+                                emitter.module,
+                                intrinsic_id,
+                                param_tys.as_mut_ptr(),
+                                param_tys.len() as usize,
+                            );
+                            let mut param_tys = vec![ty_f64x4];
+                            let d_value0 = llvm::core::LLVMBuildCall2(
+                                builder,
+                                llvm::core::LLVMFunctionType(
+                                    ty_f64x4,
+                                    param_tys.as_mut_ptr(),
+                                    param_tys.len() as u32,
+                                    0,
+                                ),
+                                intrinsic,
+                                [s0_value.v0].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+                            let d_value1 = llvm::core::LLVMBuildCall2(
+                                builder,
+                                llvm::core::LLVMFunctionType(
+                                    ty_f64x4,
+                                    param_tys.as_mut_ptr(),
+                                    param_tys.len() as u32,
+                                    0,
+                                ),
+                                intrinsic,
+                                [s0_value.v1].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = LLVMValueF64x8 {
+                                v0: d_value0,
+                                v1: d_value1,
+                            };
+
+                            emitter.emit_store_vgpr_f64x8(inst.vdst as u32, i, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+                            let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+
+                            let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+
+                            let mut param_tys = vec![ty_f64];
+                            let intrinsic_name = b"llvm.roundeven.f64\0";
+                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
+                                intrinsic_name.as_ptr() as *const _,
+                                intrinsic_name.len() as usize,
+                            );
+                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
+                                emitter.module,
+                                intrinsic_id,
+                                param_tys.as_mut_ptr(),
+                                param_tys.len() as usize,
+                            );
+                            let mut param_tys = vec![ty_f64];
+                            let d_value = llvm::core::LLVMBuildCall2(
+                                builder,
+                                llvm::core::LLVMFunctionType(
+                                    ty_f64,
+                                    param_tys.as_mut_ptr(),
+                                    param_tys.len() as u32,
+                                    0,
+                                ),
+                                intrinsic,
+                                [s0_value].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_CVT_I32_F64 => {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
@@ -3355,38 +3520,102 @@ impl IREmitter {
             },
             InstFormat::VOP2(inst) => match inst.op {
                 I::V_ADD_NC_U32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                        let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                        let d_value = llvm::core::LLVMBuildAdd(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
 
-                        bb
-                    });
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
+
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
+
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
+
+                            let s1_value =
+                                emitter.emit_load_vgpr_u32x8(inst.vsrc1 as u32, elem, mask);
+
+                            let d_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                s0_value.v0,
+                                s1_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                            let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                            let d_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_AND_B32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                        let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                        let d_value = llvm::core::LLVMBuildAnd(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
 
-                        bb
-                    });
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
+
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
+
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
+
+                            let s1_value =
+                                emitter.emit_load_vgpr_u32x8(inst.vsrc1 as u32, elem, mask);
+
+                            let d_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s0_value.v0,
+                                s1_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                            let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                            let d_value = llvm::core::LLVMBuildXor(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_XOR_B32 => {
                     if USE_SIMD {
@@ -3511,31 +3740,77 @@ impl IREmitter {
                     }
                 }
                 I::V_LSHRREV_B32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                        let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
-                        let s0_value = llvm::core::LLVMBuildAnd(
-                            builder,
-                            s0_value,
-                            llvm::core::LLVMConstInt(
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let elem = llvm::core::LLVMConstInt(
                                 llvm::core::LLVMInt32TypeInContext(context),
-                                31,
+                                i as u64,
                                 0,
-                            ),
-                            empty_name.as_ptr(),
-                        );
-                        let d_value = llvm::core::LLVMBuildLShr(
-                            builder,
-                            s1_value,
-                            s0_value,
-                            empty_name.as_ptr(),
-                        );
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            );
 
-                        bb
-                    });
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
+
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
+
+                            let s1_value =
+                                emitter.emit_load_vgpr_u32x8(inst.vsrc1 as u32, elem, mask);
+
+                            let s0_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s0_value.v0,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(
+                                        llvm::core::LLVMInt32TypeInContext(context),
+                                        31,
+                                        0,
+                                    ); 8]
+                                        .as_mut_ptr(),
+                                    8,
+                                ),
+                                empty_name.as_ptr(),
+                            );
+                            let d_value = llvm::core::LLVMBuildLShr(
+                                builder,
+                                s1_value.v0,
+                                s0_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                            let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+                            let s0_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s0_value,
+                                llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt32TypeInContext(context),
+                                    31,
+                                    0,
+                                ),
+                                empty_name.as_ptr(),
+                            );
+                            let d_value = llvm::core::LLVMBuildLShr(
+                                builder,
+                                s1_value,
+                                s0_value,
+                                empty_name.as_ptr(),
+                            );
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_CNDMASK_B32 => {
                     if USE_SIMD {
@@ -4374,7 +4649,7 @@ impl IREmitter {
 
                             let s0_value =
                                 emitter.emit_abs_neg_f64x8(s0_value, inst.abs, inst.neg, 0);
-                            let s1_value = emitter.emit_u32x8_to_f64x8(s1_value);
+                            let s1_value = emitter.emit_i32x8_to_f64x8(s1_value);
 
                             let s1_value = emitter.emit_exp2_f64x8(s1_value);
                             let d_value = emitter.emit_mul_f64x8(s0_value, s1_value);
@@ -4518,33 +4793,75 @@ impl IREmitter {
                     });
                 }
                 I::V_ADD3_U32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
+
                         let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
 
-                        let add_value = llvm::core::LLVMBuildAdd(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s1_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src1, elem, mask);
 
-                        let d_value = llvm::core::LLVMBuildAdd(
-                            builder,
-                            add_value,
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s2_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src2, elem, mask);
 
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            let add_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                s0_value.v0,
+                                s1_value.v0,
+                                empty_name.as_ptr(),
+                            );
 
-                        bb
-                    });
+                            let d_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                add_value,
+                                s2_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+
+                            let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+
+                            let add_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                add_value,
+                                s2_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_MUL_LO_U32 => {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
@@ -4921,34 +5238,108 @@ impl IREmitter {
                     });
                 }
                 I::V_DIV_SCALE_F64 => {
-                    bb = self.emit_vop_update_sgpr(bb, inst.sdst as u32, |emitter, bb, elem| {
-                        let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
+
                         let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let s1_value = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        let s2_value = emitter.emit_vector_source_operand_f64(&inst.src2, elem);
+                            let s0_value =
+                                emitter.emit_vector_source_operand_f64x8(&inst.src0, elem, mask);
 
-                        let muled = llvm::core::LLVMBuildFMul(
-                            builder,
-                            s0_value,
-                            s2_value,
-                            empty_name.as_ptr(),
+                            let s1_value =
+                                emitter.emit_vector_source_operand_f64x8(&inst.src1, elem, mask);
+
+                            let s2_value =
+                                emitter.emit_vector_source_operand_f64x8(&inst.src2, elem, mask);
+
+                            let s0_value = emitter.emit_abs_neg_f64x8(s0_value, 0, inst.neg, 0);
+
+                            let s1_value = emitter.emit_abs_neg_f64x8(s1_value, 0, inst.neg, 1);
+
+                            let s2_value = emitter.emit_abs_neg_f64x8(s2_value, 0, inst.neg, 2);
+
+                            let muled0 = llvm::core::LLVMBuildFMul(
+                                builder,
+                                s0_value.v0,
+                                s2_value.v0,
+                                empty_name.as_ptr(),
+                            );
+                            let muled1 = llvm::core::LLVMBuildFMul(
+                                builder,
+                                s0_value.v1,
+                                s2_value.v1,
+                                empty_name.as_ptr(),
+                            );
+                            let d_value0 = llvm::core::LLVMBuildFDiv(
+                                builder,
+                                muled0,
+                                s1_value.v0,
+                                empty_name.as_ptr(),
+                            );
+                            let d_value1 = llvm::core::LLVMBuildFDiv(
+                                builder,
+                                muled1,
+                                s1_value.v1,
+                                empty_name.as_ptr(),
+                            );
+                            let d_value = LLVMValueF64x8 {
+                                v0: d_value0,
+                                v1: d_value1,
+                            };
+
+                            emitter.emit_store_vgpr_f64x8(inst.vdst as u32, i, d_value, mask);
+                        }
+
+                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                        emitter.emit_store_sgpr_u32(
+                            inst.sdst as u32,
+                            llvm::core::LLVMConstInt(ty_i32, 0, 0),
                         );
-                        let d0_value = llvm::core::LLVMBuildFDiv(
-                            builder,
-                            muled,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
-                        let d1_value = llvm::core::LLVMConstInt(ty_i1, 0, 0);
+                    } else {
+                        bb =
+                            self.emit_vop_update_sgpr(bb, inst.sdst as u32, |emitter, bb, elem| {
+                                let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+                                let empty_name = std::ffi::CString::new("").unwrap();
 
-                        emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d0_value);
+                                let s0_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        (bb, d1_value)
-                    });
+                                let s1_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src1, elem);
+
+                                let s2_value =
+                                    emitter.emit_vector_source_operand_f64(&inst.src2, elem);
+
+                                let muled = llvm::core::LLVMBuildFMul(
+                                    builder,
+                                    s0_value,
+                                    s2_value,
+                                    empty_name.as_ptr(),
+                                );
+                                let d0_value = llvm::core::LLVMBuildFDiv(
+                                    builder,
+                                    muled,
+                                    s1_value,
+                                    empty_name.as_ptr(),
+                                );
+                                let d1_value = llvm::core::LLVMConstInt(ty_i1, 0, 0);
+
+                                emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d0_value);
+
+                                (bb, d1_value)
+                            });
+                    }
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
