@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::os::raw::c_void;
 
 use crate::instructions::*;
+use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
 use llvm_sys as llvm;
 use llvm_sys::prelude::LLVMBasicBlockRef;
@@ -3062,6 +3063,25 @@ impl IREmitter {
                         (bb, cmp_value)
                     });
                 }
+                I::V_CMP_LE_F64 => {
+                    bb = self.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                        let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
+                        let cmp_value = llvm::core::LLVMBuildFCmp(
+                            builder,
+                            llvm::LLVMRealPredicate::LLVMRealULE,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
+                        let cmp_value =
+                            llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
+
+                        (bb, cmp_value)
+                    });
+                }
                 I::V_CMPX_NGT_F64 => {
                     bb = self.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
@@ -3496,6 +3516,134 @@ impl IREmitter {
                         });
                     }
                 }
+                I::V_FRACT_F64 => {
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                        let empty_name = std::ffi::CString::new("").unwrap();
+                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+                        let ty_f64x4 = llvm::core::LLVMVectorType(ty_f64, 4);
+
+                        for i in (0..32).step_by(8) {
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
+
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
+
+                            let s0_value =
+                                emitter.emit_vector_source_operand_f64x8(&inst.src0, elem, mask);
+
+                            let mut param_tys = vec![ty_f64x4];
+                            let intrinsic_name = b"llvm.floor.v4f64\0";
+                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
+                                intrinsic_name.as_ptr() as *const _,
+                                intrinsic_name.len() as usize,
+                            );
+                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
+                                emitter.module,
+                                intrinsic_id,
+                                param_tys.as_mut_ptr(),
+                                param_tys.len() as usize,
+                            );
+                            let mut param_tys = vec![ty_f64x4];
+                            let d_value0 = llvm::core::LLVMBuildCall2(
+                                builder,
+                                llvm::core::LLVMFunctionType(
+                                    ty_f64x4,
+                                    param_tys.as_mut_ptr(),
+                                    param_tys.len() as u32,
+                                    0,
+                                ),
+                                intrinsic,
+                                [s0_value.v0].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+                            let d_value1 = llvm::core::LLVMBuildCall2(
+                                builder,
+                                llvm::core::LLVMFunctionType(
+                                    ty_f64x4,
+                                    param_tys.as_mut_ptr(),
+                                    param_tys.len() as u32,
+                                    0,
+                                ),
+                                intrinsic,
+                                [s0_value.v1].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value0 = llvm::core::LLVMBuildFSub(
+                                builder,
+                                s0_value.v0,
+                                d_value0,
+                                empty_name.as_ptr(),
+                            );
+                            let d_value1 = llvm::core::LLVMBuildFSub(
+                                builder,
+                                s0_value.v1,
+                                d_value1,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = LLVMValueF64x8 {
+                                v0: d_value0,
+                                v1: d_value1,
+                            };
+
+                            emitter.emit_store_vgpr_f64x8(inst.vdst as u32, i, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+                            let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+
+                            let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+
+                            let mut param_tys = vec![ty_f64];
+                            let intrinsic_name = b"llvm.floor.f64\0";
+                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
+                                intrinsic_name.as_ptr() as *const _,
+                                intrinsic_name.len() as usize,
+                            );
+                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
+                                emitter.module,
+                                intrinsic_id,
+                                param_tys.as_mut_ptr(),
+                                param_tys.len() as usize,
+                            );
+                            let mut param_tys = vec![ty_f64];
+                            let d_value = llvm::core::LLVMBuildCall2(
+                                builder,
+                                llvm::core::LLVMFunctionType(
+                                    ty_f64,
+                                    param_tys.as_mut_ptr(),
+                                    param_tys.len() as u32,
+                                    0,
+                                ),
+                                intrinsic,
+                                [s0_value].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = llvm::core::LLVMBuildFSub(
+                                builder,
+                                s0_value,
+                                d_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
+                }
                 I::V_CVT_I32_F64 => {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
@@ -3510,6 +3658,24 @@ impl IREmitter {
                         );
 
                         emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                        bb
+                    });
+                }
+                I::V_CVT_F64_I32 => {
+                    bb = self.emit_vop(bb, |emitter, bb, elem| {
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                        let d_value = llvm::core::LLVMBuildSIToFP(
+                            builder,
+                            s0_value,
+                            llvm::core::LLVMDoubleTypeInContext(context),
+                            empty_name.as_ptr(),
+                        );
+
+                        emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
                     });
@@ -4006,113 +4172,254 @@ impl IREmitter {
             },
             InstFormat::VOP3(inst) => match inst.op {
                 I::V_BFE_U32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        let s1_value = llvm::core::LLVMBuildAnd(
-                            builder,
-                            s1_value,
-                            llvm::core::LLVMConstInt(ty_i32, 31, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let shifted = llvm::core::LLVMBuildLShr(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
 
-                        let s2_value = llvm::core::LLVMBuildAnd(
-                            builder,
-                            s2_value,
-                            llvm::core::LLVMConstInt(ty_i32, 31, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let mask = llvm::core::LLVMBuildShl(
-                            builder,
-                            llvm::core::LLVMConstInt(ty_i32, 1, 0),
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
-                        let mask = llvm::core::LLVMBuildSub(
-                            builder,
-                            mask,
-                            llvm::core::LLVMConstInt(ty_i32, 1, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let d_value =
-                            llvm::core::LLVMBuildAnd(builder, shifted, mask, empty_name.as_ptr());
+                            let s1_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src1, elem, mask);
 
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            let s2_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src2, elem, mask);
 
-                        bb
-                    });
+                            let s1_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s1_value.v0,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(
+                                        llvm::core::LLVMInt32TypeInContext(context),
+                                        31,
+                                        0,
+                                    ); 8]
+                                        .as_mut_ptr(),
+                                    8,
+                                ),
+                                empty_name.as_ptr(),
+                            );
+
+                            let shifted = llvm::core::LLVMBuildLShr(
+                                builder,
+                                s0_value.v0,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            let s2_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s2_value.v0,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(
+                                        llvm::core::LLVMInt32TypeInContext(context),
+                                        31,
+                                        0,
+                                    ); 8]
+                                        .as_mut_ptr(),
+                                    8,
+                                ),
+                                empty_name.as_ptr(),
+                            );
+
+                            let mask_value = llvm::core::LLVMBuildShl(
+                                builder,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(
+                                        llvm::core::LLVMInt32TypeInContext(context),
+                                        1,
+                                        0,
+                                    ); 8]
+                                        .as_mut_ptr(),
+                                    8,
+                                ),
+                                s2_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            let mask_value = llvm::core::LLVMBuildSub(
+                                builder,
+                                mask_value,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(
+                                        llvm::core::LLVMInt32TypeInContext(context),
+                                        1,
+                                        0,
+                                    ); 8]
+                                        .as_mut_ptr(),
+                                    8,
+                                ),
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                shifted,
+                                mask_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+
+                            let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+
+                            let s1_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s1_value,
+                                llvm::core::LLVMConstInt(ty_i32, 31, 0),
+                                empty_name.as_ptr(),
+                            );
+                            let shifted = llvm::core::LLVMBuildLShr(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            let s2_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                s2_value,
+                                llvm::core::LLVMConstInt(ty_i32, 31, 0),
+                                empty_name.as_ptr(),
+                            );
+                            let mask = llvm::core::LLVMBuildShl(
+                                builder,
+                                llvm::core::LLVMConstInt(ty_i32, 1, 0),
+                                s2_value,
+                                empty_name.as_ptr(),
+                            );
+                            let mask = llvm::core::LLVMBuildSub(
+                                builder,
+                                mask,
+                                llvm::core::LLVMConstInt(ty_i32, 1, 0),
+                                empty_name.as_ptr(),
+                            );
+                            let d_value = llvm::core::LLVMBuildAnd(
+                                builder,
+                                shifted,
+                                mask,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_CNDMASK_B32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let vcc_value = emitter.emit_scalar_source_operand_u32(&inst.src2);
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
-
-                        let s2_value = emitter.emit_scalar_source_operand_u32(&inst.src2);
-
-                        let elem_i32 = llvm::core::LLVMBuildTrunc(
-                            emitter.builder,
-                            elem,
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            empty_name.as_ptr(),
-                        );
-                        let elem_shifted = llvm::core::LLVMBuildShl(
-                            emitter.builder,
-                            llvm::core::LLVMConstInt(
+                            let elem = llvm::core::LLVMConstInt(
                                 llvm::core::LLVMInt32TypeInContext(context),
-                                1,
+                                i as u64,
                                 0,
-                            ),
-                            elem_i32,
-                            empty_name.as_ptr(),
-                        );
+                            );
 
-                        let elem_masked = llvm::core::LLVMBuildAnd(
-                            emitter.builder,
-                            s2_value,
-                            elem_shifted,
-                            empty_name.as_ptr(),
-                        );
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
+                            let cond = emitter.emit_bits_to_mask(vcc_value, i);
 
-                        let cond = llvm::core::LLVMBuildICmp(
-                            emitter.builder,
-                            llvm::LLVMIntPredicate::LLVMIntEQ,
-                            elem_masked,
-                            llvm::core::LLVMConstInt(
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
+
+                            let s1_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src1, elem, mask);
+
+                            let d_value = llvm::core::LLVMBuildSelect(
+                                builder,
+                                cond,
+                                s1_value.v0,
+                                s0_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+
+                            let s2_value = emitter.emit_scalar_source_operand_u32(&inst.src2);
+
+                            let elem_i32 = llvm::core::LLVMBuildTrunc(
+                                emitter.builder,
+                                elem,
                                 llvm::core::LLVMInt32TypeInContext(context),
-                                0,
-                                0,
-                            ),
-                            empty_name.as_ptr(),
-                        );
+                                empty_name.as_ptr(),
+                            );
+                            let elem_shifted = llvm::core::LLVMBuildShl(
+                                emitter.builder,
+                                llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt32TypeInContext(context),
+                                    1,
+                                    0,
+                                ),
+                                elem_i32,
+                                empty_name.as_ptr(),
+                            );
 
-                        let d_value = llvm::core::LLVMBuildSelect(
-                            emitter.builder,
-                            cond,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                            let elem_masked = llvm::core::LLVMBuildAnd(
+                                emitter.builder,
+                                s2_value,
+                                elem_shifted,
+                                empty_name.as_ptr(),
+                            );
 
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            let cond = llvm::core::LLVMBuildICmp(
+                                emitter.builder,
+                                llvm::LLVMIntPredicate::LLVMIntEQ,
+                                elem_masked,
+                                llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt32TypeInContext(context),
+                                    0,
+                                    0,
+                                ),
+                                empty_name.as_ptr(),
+                            );
 
-                        bb
-                    });
+                            let d_value = llvm::core::LLVMBuildSelect(
+                                emitter.builder,
+                                cond,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_CMP_GT_U32 => {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
@@ -4239,6 +4546,48 @@ impl IREmitter {
                     });
                 }
                 I::V_CMP_LG_F64 => {
+                    bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                        let s1_value = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
+
+                        let s0_value = emitter.emit_abs_neg(inst.abs, inst.neg, s0_value, 0);
+                        let s1_value = emitter.emit_abs_neg(inst.abs, inst.neg, s1_value, 1);
+
+                        let cmp_value = llvm::core::LLVMBuildFCmp(
+                            builder,
+                            llvm::LLVMRealPredicate::LLVMRealONE,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
+
+                        (bb, cmp_value)
+                    });
+                }
+                I::V_CMP_LE_F64 => {
+                    bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                        let s1_value = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
+
+                        let s0_value = emitter.emit_abs_neg(inst.abs, inst.neg, s0_value, 0);
+                        let s1_value = emitter.emit_abs_neg(inst.abs, inst.neg, s1_value, 1);
+
+                        let cmp_value = llvm::core::LLVMBuildFCmp(
+                            builder,
+                            llvm::LLVMRealPredicate::LLVMRealOLE,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
+
+                        (bb, cmp_value)
+                    });
+                }
+                I::V_CMP_NEQ_F64 => {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
 
@@ -4735,62 +5084,142 @@ impl IREmitter {
                     });
                 }
                 I::V_XAD_U32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        let xor_value = llvm::core::LLVMBuildXor(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
 
-                        let d_value = llvm::core::LLVMBuildAdd(
-                            builder,
-                            xor_value,
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s1_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src1, elem, mask);
 
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            let s2_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src2, elem, mask);
 
-                        bb
-                    });
+                            let d_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                llvm::core::LLVMBuildXor(
+                                    builder,
+                                    s0_value.v0,
+                                    s1_value.v0,
+                                    empty_name.as_ptr(),
+                                ),
+                                s2_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+
+                            let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+
+                            let xor_value = llvm::core::LLVMBuildXor(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = llvm::core::LLVMBuildAdd(
+                                builder,
+                                xor_value,
+                                s2_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_XOR3_B32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        let xor_value = llvm::core::LLVMBuildXor(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
 
-                        let d_value = llvm::core::LLVMBuildXor(
-                            builder,
-                            xor_value,
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s1_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src1, elem, mask);
 
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            let s2_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src2, elem, mask);
 
-                        bb
-                    });
+                            let d_value = llvm::core::LLVMBuildXor(
+                                builder,
+                                llvm::core::LLVMBuildXor(
+                                    builder,
+                                    s0_value.v0,
+                                    s1_value.v0,
+                                    empty_name.as_ptr(),
+                                ),
+                                s2_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+
+                            let s2_value = emitter.emit_vector_source_operand_u32(&inst.src2, elem);
+
+                            let xor_value = llvm::core::LLVMBuildXor(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            let d_value = llvm::core::LLVMBuildXor(
+                                builder,
+                                xor_value,
+                                s2_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_ADD3_U32 => {
                     if USE_SIMD {
@@ -4864,24 +5293,56 @@ impl IREmitter {
                     }
                 }
                 I::V_MUL_LO_U32 => {
-                    bb = self.emit_vop(bb, |emitter, bb, elem| {
+                    if USE_SIMD {
+                        let emitter = self;
+                        let exec_value = emitter.emit_load_sgpr_u32(126);
+
                         let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        for i in (0..32).step_by(8) {
+                            let elem = llvm::core::LLVMConstInt(
+                                llvm::core::LLVMInt32TypeInContext(context),
+                                i as u64,
+                                0,
+                            );
 
-                        let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                            let mask = emitter.emit_bits_to_mask(exec_value, i);
 
-                        let d_value = llvm::core::LLVMBuildMul(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                            let s0_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src0, elem, mask);
 
-                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+                            let s1_value =
+                                emitter.emit_vector_source_operand_u32x8(&inst.src1, elem, mask);
 
-                        bb
-                    });
+                            let d_value = llvm::core::LLVMBuildMul(
+                                builder,
+                                s0_value.v0,
+                                s1_value.v0,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32x8(inst.vdst as u32, elem, d_value, mask);
+                        }
+                    } else {
+                        bb = self.emit_vop(bb, |emitter, bb, elem| {
+                            let empty_name = std::ffi::CString::new("").unwrap();
+
+                            let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                            let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+
+                            let d_value = llvm::core::LLVMBuildMul(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
+
+                            bb
+                        });
+                    }
                 }
                 I::V_TRIG_PREOP_F64 => {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
@@ -5341,6 +5802,7 @@ impl IREmitter {
                             });
                     }
                 }
+                I::V_ADD_CO_CI_U32 => {}
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }
@@ -6823,7 +7285,8 @@ impl RDNATranslator {
                     next_pscs.push(next_pc as u64);
                 }
                 I::S_BRANCH => {
-                    let next_pc = ((self.get_pc() as i64) + ((inst.simm16 as i64) * 4)) as usize;
+                    let next_pc =
+                        ((self.get_pc() as i64) + ((inst.simm16 as i64) * 4) + 4) as usize;
                     next_pscs.push(next_pc as u64);
                 }
                 _ => {}
@@ -6831,6 +7294,541 @@ impl RDNATranslator {
             _ => {}
         }
         next_pscs
+    }
+
+    fn analyze_instructions(&self, inst: &InstFormat, reg_usage: &mut RegisterUsage) {
+        match inst {
+            InstFormat::SOPP(inst) => match inst.op {
+                I::S_CLAUSE => {}
+                I::S_WAIT_KMCNT => {}
+                I::S_DELAY_ALU => {}
+                I::S_WAIT_ALU => {}
+                I::S_WAIT_LOADCNT => {}
+                I::S_NOP => {}
+                I::S_SENDMSG => {}
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VOPC(inst) => match inst.op {
+                I::V_CMP_GT_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_EQ_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NE_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_GT_U64 => {
+                    reg_usage.use_operand_u64(&inst.src0);
+                    reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_GT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_LT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NLT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NGT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMPX_NGT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::V_CMPX_NGE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::V_CMPX_LT_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::V_CMPX_EQ_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::V_CMPX_LT_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VOP1(inst) => match inst.op {
+                I::V_CVT_F64_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_MOV_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_RCP_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_RSQ_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_RNDNE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_CVT_I32_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VOP2(inst) => match inst.op {
+                I::V_ADD_NC_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_AND_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_XOR_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_LSHLREV_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_LSHRREV_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_CNDMASK_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.use_vgpr_u32(106);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_ADD_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_MUL_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_MAX_NUM_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VOP3(inst) => match inst.op {
+                I::V_BFE_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_CNDMASK_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_GT_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_EQ_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NLT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NGT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_LT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_GT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_LG_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_ADD_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_MUL_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_FMA_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.use_operand_f64(&inst.src2);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_DIV_FMAS_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.use_operand_f64(&inst.src2);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_DIV_FIXUP_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.use_operand_f64(&inst.src2);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_LDEXP_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_CMP_CLASS_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_XAD_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_XOR3_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_ADD3_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MUL_LO_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_TRIG_PREOP_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                I::V_MAX_NUM_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VOP3SD(inst) => match inst.op {
+                I::V_MAD_CO_U64_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u64(&inst.src2);
+                    reg_usage.def_vgpr_u64(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::V_DIV_SCALE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.use_operand_f64(&inst.src2);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VOPD(inst) => {
+                let vdstx = inst.vdstx as u32;
+                let vdsty = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as u32;
+                match inst.opx {
+                    I::V_DUAL_CNDMASK_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0x);
+                        reg_usage.use_vgpr_u32(inst.vsrc1x as u32);
+                        reg_usage.use_sgpr_u32(106);
+                        reg_usage.def_vgpr_u32(vdstx);
+                    }
+                    I::V_DUAL_MOV_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0x);
+                        reg_usage.def_vgpr_u32(vdstx);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                }
+                match inst.opy {
+                    I::V_DUAL_CNDMASK_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0y);
+                        reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                        reg_usage.use_sgpr_u32(106);
+                        reg_usage.def_vgpr_u32(vdsty);
+                    }
+                    I::V_DUAL_MOV_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0y);
+                        reg_usage.def_vgpr_u32(vdsty);
+                    }
+                    I::V_DUAL_ADD_NC_U32 => {
+                        reg_usage.use_operand_u32(&inst.src0y);
+                        reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_u32(vdsty);
+                    }
+                    I::V_DUAL_LSHLREV_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0y);
+                        reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_u32(vdsty);
+                    }
+                    _ => {
+                        panic!("Unsupported instruction: {:?}", inst);
+                    }
+                }
+            }
+            InstFormat::SMEM(inst) => match inst.op {
+                I::S_LOAD_B32 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    reg_usage.def_sgpr_u32(inst.sdata as u32);
+                }
+                I::S_LOAD_B64 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    for i in 0..2 {
+                        reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                    }
+                }
+                I::S_LOAD_B96 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    for i in 0..3 {
+                        reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                    }
+                }
+                I::S_LOAD_B128 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    for i in 0..4 {
+                        reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                    }
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::SOP1(inst) => match inst.op {
+                I::S_AND_SAVEEXEC_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_sgpr_u32(126);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::S_AND_NOT1_SAVEEXEC_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_sgpr_u32(126);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::S_MOV_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_MOV_B64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.def_sgpr_u64(inst.sdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::SOP2(inst) => match inst.op {
+                I::S_AND_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_OR_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_XOR_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_AND_NOT1_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_OR_NOT1_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_LSHR_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_CSELECT_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_ADD_NC_U64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.use_operand_u64(&inst.ssrc1);
+                    reg_usage.def_sgpr_u64(inst.sdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::SOPC(inst) => match inst.op {
+                I::S_CMP_LG_U32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_LG_U64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.use_operand_u64(&inst.ssrc1);
+                }
+                I::S_CMP_EQ_U64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.use_operand_u64(&inst.ssrc1);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VGLOBAL(inst) => match inst.op {
+                I::GLOBAL_LOAD_B32 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..1 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
+                I::GLOBAL_LOAD_B64 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..2 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
+                I::GLOBAL_LOAD_B128 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..4 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
+                I::GLOBAL_STORE_B64 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..2 {
+                        reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                    }
+                }
+                I::GLOBAL_STORE_B128 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..4 {
+                        reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                    }
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            _ => {
+                panic!("Unsupported instruction: {:?}", inst);
+            }
+        }
     }
 
     fn analyze(&self) -> RegisterUsage {
@@ -6846,540 +7844,444 @@ impl RDNATranslator {
         reg_usage.def_sgprs.insert(126);
 
         for inst in &self.insts[..self.insts.len() - 1] {
-            match inst {
-                InstFormat::SOPP(inst) => match inst.op {
-                    I::S_CLAUSE => {}
-                    I::S_WAIT_KMCNT => {}
-                    I::S_DELAY_ALU => {}
-                    I::S_WAIT_ALU => {}
-                    I::S_WAIT_LOADCNT => {}
-                    I::S_NOP => {}
-                    I::S_SENDMSG => {}
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VOPC(inst) => match inst.op {
-                    I::V_CMP_GT_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_EQ_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_NE_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_GT_U64 => {
-                        reg_usage.use_operand_u64(&inst.src0);
-                        reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_GT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_LT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_NLT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMP_NGT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(106);
-                    }
-                    I::V_CMPX_NGT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    I::V_CMPX_NGE_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    I::V_CMPX_LT_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    I::V_CMPX_EQ_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    I::V_CMPX_LT_I32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VOP1(inst) => match inst.op {
-                    I::V_CVT_F64_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_MOV_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_RCP_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_RSQ_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_RNDNE_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_CVT_I32_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VOP2(inst) => match inst.op {
-                    I::V_ADD_NC_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_AND_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_XOR_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_LSHLREV_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_LSHRREV_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CNDMASK_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
-                        reg_usage.use_vgpr_u32(106);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_ADD_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_MUL_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_MAX_NUM_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VOP3(inst) => match inst.op {
-                    I::V_BFE_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.use_operand_u32(&inst.src2);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CNDMASK_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.use_operand_u32(&inst.src2);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_GT_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_EQ_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_NLT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_NGT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_LT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_GT_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_CMP_LG_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_ADD_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_MUL_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_FMA_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.use_operand_f64(&inst.src2);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_DIV_FMAS_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.use_operand_f64(&inst.src2);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_DIV_FIXUP_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.use_operand_f64(&inst.src2);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_LDEXP_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_CMP_CLASS_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.def_sgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_XAD_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.use_operand_u32(&inst.src2);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_XOR3_B32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.use_operand_u32(&inst.src2);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_ADD3_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.use_operand_u32(&inst.src2);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_MUL_LO_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.def_vgpr_u32(inst.vdst as u32);
-                    }
-                    I::V_TRIG_PREOP_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    I::V_MAX_NUM_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VOP3SD(inst) => match inst.op {
-                    I::V_MAD_CO_U64_U32 => {
-                        reg_usage.use_operand_u32(&inst.src0);
-                        reg_usage.use_operand_u32(&inst.src1);
-                        reg_usage.use_operand_u64(&inst.src2);
-                        reg_usage.def_vgpr_u64(inst.vdst as u32);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::V_DIV_SCALE_F64 => {
-                        reg_usage.use_operand_f64(&inst.src0);
-                        reg_usage.use_operand_f64(&inst.src1);
-                        reg_usage.use_operand_f64(&inst.src2);
-                        reg_usage.def_vgpr_f64(inst.vdst as u32);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VOPD(inst) => {
-                    let vdstx = inst.vdstx as u32;
-                    let vdsty = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as u32;
-                    match inst.opx {
-                        I::V_DUAL_CNDMASK_B32 => {
-                            reg_usage.use_operand_u32(&inst.src0x);
-                            reg_usage.use_vgpr_u32(inst.vsrc1x as u32);
-                            reg_usage.use_sgpr_u32(106);
-                            reg_usage.def_vgpr_u32(vdstx);
-                        }
-                        I::V_DUAL_MOV_B32 => {
-                            reg_usage.use_operand_u32(&inst.src0x);
-                            reg_usage.def_vgpr_u32(vdstx);
-                        }
-                        _ => {
-                            panic!("Unsupported instruction: {:?}", inst);
-                        }
-                    }
-                    match inst.opy {
-                        I::V_DUAL_CNDMASK_B32 => {
-                            reg_usage.use_operand_u32(&inst.src0y);
-                            reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
-                            reg_usage.use_sgpr_u32(106);
-                            reg_usage.def_vgpr_u32(vdsty);
-                        }
-                        I::V_DUAL_MOV_B32 => {
-                            reg_usage.use_operand_u32(&inst.src0y);
-                            reg_usage.def_vgpr_u32(vdsty);
-                        }
-                        I::V_DUAL_ADD_NC_U32 => {
-                            reg_usage.use_operand_u32(&inst.src0y);
-                            reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
-                            reg_usage.def_vgpr_u32(vdsty);
-                        }
-                        I::V_DUAL_LSHLREV_B32 => {
-                            reg_usage.use_operand_u32(&inst.src0y);
-                            reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
-                            reg_usage.def_vgpr_u32(vdsty);
-                        }
-                        _ => {
-                            panic!("Unsupported instruction: {:?}", inst);
-                        }
-                    }
-                }
-                InstFormat::SMEM(inst) => match inst.op {
-                    I::S_LOAD_B32 => {
-                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
-                        reg_usage.def_sgpr_u32(inst.sdata as u32);
-                    }
-                    I::S_LOAD_B64 => {
-                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
-                        for i in 0..2 {
-                            reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
-                        }
-                    }
-                    I::S_LOAD_B96 => {
-                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
-                        for i in 0..3 {
-                            reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
-                        }
-                    }
-                    I::S_LOAD_B128 => {
-                        reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
-                        for i in 0..4 {
-                            reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
-                        }
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::SOP1(inst) => match inst.op {
-                    I::S_AND_SAVEEXEC_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_sgpr_u32(126);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    I::S_AND_NOT1_SAVEEXEC_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_sgpr_u32(126);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                        reg_usage.def_sgpr_u32(126);
-                    }
-                    I::S_MOV_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_MOV_B64 => {
-                        reg_usage.use_operand_u64(&inst.ssrc0);
-                        reg_usage.def_sgpr_u64(inst.sdst as u32);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::SOP2(inst) => match inst.op {
-                    I::S_AND_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_OR_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_XOR_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_AND_NOT1_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_OR_NOT1_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_LSHR_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_CSELECT_B32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                        reg_usage.def_sgpr_u32(inst.sdst as u32);
-                    }
-                    I::S_ADD_NC_U64 => {
-                        reg_usage.use_operand_u64(&inst.ssrc0);
-                        reg_usage.use_operand_u64(&inst.ssrc1);
-                        reg_usage.def_sgpr_u64(inst.sdst as u32);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::SOPC(inst) => match inst.op {
-                    I::S_CMP_LG_U32 => {
-                        reg_usage.use_operand_u32(&inst.ssrc0);
-                        reg_usage.use_operand_u32(&inst.ssrc1);
-                    }
-                    I::S_CMP_LG_U64 => {
-                        reg_usage.use_operand_u64(&inst.ssrc0);
-                        reg_usage.use_operand_u64(&inst.ssrc1);
-                    }
-                    I::S_CMP_EQ_U64 => {
-                        reg_usage.use_operand_u64(&inst.ssrc0);
-                        reg_usage.use_operand_u64(&inst.ssrc1);
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                InstFormat::VGLOBAL(inst) => match inst.op {
-                    I::GLOBAL_LOAD_B32 => {
-                        if inst.saddr != 124 {
-                            reg_usage.use_sgpr_u64(inst.saddr as u32);
-                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
-                        } else {
-                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                        }
-
-                        for i in 0..1 {
-                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
-                        }
-                    }
-                    I::GLOBAL_LOAD_B64 => {
-                        if inst.saddr != 124 {
-                            reg_usage.use_sgpr_u64(inst.saddr as u32);
-                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
-                        } else {
-                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                        }
-
-                        for i in 0..2 {
-                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
-                        }
-                    }
-                    I::GLOBAL_LOAD_B128 => {
-                        if inst.saddr != 124 {
-                            reg_usage.use_sgpr_u64(inst.saddr as u32);
-                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
-                        } else {
-                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                        }
-
-                        for i in 0..4 {
-                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
-                        }
-                    }
-                    I::GLOBAL_STORE_B64 => {
-                        if inst.saddr != 124 {
-                            reg_usage.use_sgpr_u64(inst.saddr as u32);
-                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
-                        } else {
-                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                        }
-
-                        for i in 0..2 {
-                            reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
-                        }
-                    }
-                    I::GLOBAL_STORE_B128 => {
-                        if inst.saddr != 124 {
-                            reg_usage.use_sgpr_u64(inst.saddr as u32);
-                            reg_usage.use_vgpr_u32(inst.vaddr as u32);
-                        } else {
-                            reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                        }
-
-                        for i in 0..4 {
-                            reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
-                        }
-                    }
-                    _ => {
-                        panic!("Unsupported instruction: {:?}", inst);
-                    }
-                },
-                _ => {
-                    panic!("Unsupported instruction: {:?}", inst);
-                }
-            }
+            self.analyze_instructions(inst, &mut reg_usage);
         }
         reg_usage
+    }
+
+    pub fn build_from_program(&mut self, program: &RDNAProgram) -> &mut InstBlock {
+        let mut inst_block = InstBlock::new();
+
+        unsafe {
+            llvm::target::LLVM_InitializeNativeTarget();
+            llvm::target::LLVM_InitializeAllTargetMCs();
+            llvm::target::LLVM_InitializeAllAsmParsers();
+            llvm::target::LLVM_InitializeAllAsmPrinters();
+
+            let context = self.context;
+            let module = llvm::core::LLVMModuleCreateWithNameInContext(
+                format!("kernel").as_ptr() as *const _,
+                context,
+            );
+
+            llvm::core::LLVMSetTarget(
+                module,
+                std::ffi::CString::new("x86_64-pc-linux-gnu")
+                    .unwrap()
+                    .as_ptr(),
+            );
+
+            let ty_void = llvm::core::LLVMVoidTypeInContext(context);
+            let mut param_ty = vec![
+                llvm::core::LLVMPointerType(llvm::core::LLVMInt32TypeInContext(context), 0),
+                llvm::core::LLVMPointerType(llvm::core::LLVMInt32TypeInContext(context), 0),
+                llvm::core::LLVMPointerType(llvm::core::LLVMInt8TypeInContext(context), 0),
+            ];
+            let ty_function = llvm::core::LLVMFunctionType(
+                ty_void,
+                param_ty.as_mut_ptr(),
+                param_ty.len() as u32,
+                0,
+            );
+
+            let func_name = std::ffi::CString::new("kernel").unwrap();
+            let function = llvm::core::LLVMAddFunction(module, func_name.as_ptr(), ty_function);
+
+            let entry_bb = llvm::core::LLVMAppendBasicBlockInContext(
+                context,
+                function,
+                b"entry\0".as_ptr() as *const _,
+            );
+
+            let builder = llvm::core::LLVMCreateBuilderInContext(context);
+            llvm::core::LLVMPositionBuilderAtEnd(builder, entry_bb);
+
+            let sgprs_ptr = llvm::core::LLVMGetParam(function, 0);
+            let vgprs_ptr = llvm::core::LLVMGetParam(function, 1);
+            let scc_ptr = llvm::core::LLVMGetParam(function, 2);
+
+            let mut emitter = IREmitter {
+                context,
+                module,
+                function,
+                builder,
+                sgprs_ptr,
+                vgprs_ptr,
+                scc_ptr,
+                sgpr_ptr_map: HashMap::new(),
+                vgpr_ptr_map: HashMap::new(),
+            };
+
+            let mut reg_usage = RegisterUsage::new();
+            for reg in 0..128 {
+                reg_usage.incomming_sgprs.insert(reg);
+                reg_usage.use_sgprs.insert(reg);
+            }
+
+            emitter.emit_alloc_registers(&reg_usage);
+
+            let mut basic_blocks = HashMap::new();
+
+            let mut addrs = program.insts_blocks.keys().collect::<Vec<_>>();
+            addrs.sort_by_key(|addr| *addr);
+
+            for addr in addrs {
+                let basic_block = llvm::core::LLVMAppendBasicBlockInContext(
+                    context,
+                    function,
+                    format!("block_{}\0", addr).as_ptr() as *const _,
+                );
+                basic_blocks.insert(addr, basic_block);
+            }
+
+            for (addr, block) in &program.insts_blocks {
+                let mut basic_block = *basic_blocks.get(addr).unwrap();
+
+                llvm::core::LLVMPositionBuilderAtEnd(builder, basic_block);
+
+                if is_terminator(block.insts.last().unwrap()) {
+                    for inst in &block.insts[..block.insts.len() - 1] {
+                        basic_block = emitter.emit_instruction(basic_block, inst);
+                    }
+                    let last_inst = block.insts.last().unwrap();
+                    if let InstFormat::SOPP(inst) = last_inst {
+                        match inst.op {
+                            I::S_CBRANCH_EXECZ => {
+                                let empty_name = std::ffi::CString::new("").unwrap();
+                                let exec_value = emitter.emit_load_sgpr_u32(126);
+                                let zero = llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt32TypeInContext(context),
+                                    0,
+                                    0,
+                                );
+                                let cond = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntEQ,
+                                    exec_value,
+                                    zero,
+                                    empty_name.as_ptr() as *const _,
+                                );
+                                llvm::core::LLVMBuildCondBr(
+                                    builder,
+                                    cond,
+                                    *basic_blocks.get(&block.next_pcs[1]).unwrap(),
+                                    *basic_blocks.get(&block.next_pcs[0]).unwrap(),
+                                );
+                            }
+                            I::S_CBRANCH_VCCNZ => {
+                                let empty_name = std::ffi::CString::new("").unwrap();
+                                let vcc_value = emitter.emit_load_sgpr_u32(106);
+                                let zero = llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt32TypeInContext(context),
+                                    0,
+                                    0,
+                                );
+                                let cond = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntNE,
+                                    vcc_value,
+                                    zero,
+                                    empty_name.as_ptr() as *const _,
+                                );
+                                llvm::core::LLVMBuildCondBr(
+                                    builder,
+                                    cond,
+                                    *basic_blocks.get(&block.next_pcs[1]).unwrap(),
+                                    *basic_blocks.get(&block.next_pcs[0]).unwrap(),
+                                );
+                            }
+                            I::S_CBRANCH_SCC0 => {
+                                let empty_name = std::ffi::CString::new("").unwrap();
+
+                                let scc_value = llvm::core::LLVMBuildLoad2(
+                                    builder,
+                                    llvm::core::LLVMInt8TypeInContext(context),
+                                    emitter.scc_ptr,
+                                    empty_name.as_ptr() as *const _,
+                                );
+
+                                let zero = llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt8TypeInContext(context),
+                                    0,
+                                    0,
+                                );
+                                let cond = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntEQ,
+                                    scc_value,
+                                    zero,
+                                    empty_name.as_ptr() as *const _,
+                                );
+                                llvm::core::LLVMBuildCondBr(
+                                    builder,
+                                    cond,
+                                    *basic_blocks.get(&block.next_pcs[1]).unwrap(),
+                                    *basic_blocks.get(&block.next_pcs[0]).unwrap(),
+                                );
+                            }
+                            I::S_CBRANCH_SCC1 => {
+                                let empty_name = std::ffi::CString::new("").unwrap();
+
+                                let scc_value = llvm::core::LLVMBuildLoad2(
+                                    builder,
+                                    llvm::core::LLVMInt8TypeInContext(context),
+                                    emitter.scc_ptr,
+                                    empty_name.as_ptr() as *const _,
+                                );
+
+                                let zero = llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt8TypeInContext(context),
+                                    0,
+                                    0,
+                                );
+                                let cond = llvm::core::LLVMBuildICmp(
+                                    builder,
+                                    llvm::LLVMIntPredicate::LLVMIntNE,
+                                    scc_value,
+                                    zero,
+                                    empty_name.as_ptr() as *const _,
+                                );
+                                llvm::core::LLVMBuildCondBr(
+                                    builder,
+                                    cond,
+                                    *basic_blocks.get(&block.next_pcs[1]).unwrap(),
+                                    *basic_blocks.get(&block.next_pcs[0]).unwrap(),
+                                );
+                            }
+                            I::S_BRANCH => {
+                                llvm::core::LLVMBuildBr(
+                                    builder,
+                                    *basic_blocks.get(&block.next_pcs[0]).unwrap(),
+                                );
+                            }
+                            I::S_ENDPGM => {
+                                llvm::core::LLVMBuildRetVoid(builder);
+                            }
+                            _ => panic!("Unsupported terminator instruction: {:?}", inst),
+                        }
+                    } else {
+                        panic!(
+                            "Last instruction in block {} is not a terminator: {:?}",
+                            addr, last_inst
+                        );
+                    }
+                } else {
+                    for inst in &block.insts {
+                        basic_block = emitter.emit_instruction(basic_block, inst);
+                    }
+
+                    if block.next_pcs.len() == 1 {
+                        llvm::core::LLVMBuildBr(
+                            builder,
+                            *basic_blocks.get(&block.next_pcs[0]).unwrap(),
+                        );
+                    } else {
+                        panic!("Block {} has multiple next PCs: {:?}", addr, block.next_pcs);
+                    }
+                }
+            }
+
+            llvm::core::LLVMPositionBuilderAtEnd(builder, entry_bb);
+
+            llvm::core::LLVMBuildBr(builder, *basic_blocks.get(&program.entry_pc).unwrap());
+
+            llvm::core::LLVMDisposeBuilder(builder);
+
+            let mut err = std::ptr::null_mut();
+            let is_err = llvm::analysis::LLVMVerifyModule(
+                module,
+                llvm::analysis::LLVMVerifierFailureAction::LLVMPrintMessageAction,
+                &mut err,
+            );
+            if is_err != 0 {
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                llvm::core::LLVMDisposeMessage(err.into_raw());
+                panic!("Failed to verify main module: {}", err_.to_str().unwrap());
+            }
+
+            let triple = llvm::core::LLVMGetTarget(module);
+            let mut target = std::ptr::null_mut();
+            let mut err = std::ptr::null_mut();
+            let result =
+                llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut err);
+            if result != 0 {
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!(
+                    "Failed to get target from triple: {}",
+                    err_.to_str().unwrap()
+                );
+            }
+            let cpu_name = llvm::target_machine::LLVMGetHostCPUName();
+            let cpu_feature = llvm::target_machine::LLVMGetHostCPUFeatures();
+            let tm = llvm::target_machine::LLVMCreateTargetMachine(
+                target,
+                triple,
+                cpu_name,
+                cpu_feature,
+                llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+                llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
+                llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+            );
+
+            let pass_builder_options =
+                llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
+            let err = llvm::transforms::pass_builder::LLVMRunPassesOnFunction(
+                function,
+                b"early-cse,instcombine<no-verify-fixpoint>,aggressive-instcombine,mem2reg,gvn,dse,instsimplify,load-store-vectorizer,loop-fusion,loop-load-elim,reassociate,function-simplification<O3>,loop-vectorize,simplifycfg,loop-unroll<O3>\0".as_ptr() as *const _,
+                tm,
+                pass_builder_options,
+            );
+
+            if !err.is_null() {
+                let err = llvm::error::LLVMGetErrorMessage(err);
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!(
+                    "Failed to run passes on function: {}",
+                    err_.to_str().unwrap()
+                );
+            }
+
+            let mut instruction_count = 0;
+
+            let mut bb = llvm::core::LLVMGetFirstBasicBlock(function);
+            while bb != std::ptr::null_mut() {
+                let mut inst = llvm::core::LLVMGetFirstInstruction(bb);
+                while inst != std::ptr::null_mut() {
+                    instruction_count += 1;
+                    inst = llvm::core::LLVMGetNextInstruction(inst);
+                }
+
+                bb = llvm::core::LLVMGetNextBasicBlock(bb);
+            }
+
+            let jit_builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
+
+            let jtmb = if false {
+                let mut jtmb = std::ptr::null_mut();
+                let err = llvm::orc2::LLVMOrcJITTargetMachineBuilderDetectHost(&mut jtmb);
+                if !err.is_null() {
+                    let err = llvm::error::LLVMGetErrorMessage(err);
+                    let err = std::ffi::CString::from_raw(err);
+                    let err_ = err.clone();
+                    panic!(
+                        "Failed to detect host JIT target machine: {}",
+                        err_.to_str().unwrap()
+                    );
+                }
+                jtmb
+            } else {
+                let triple = llvm::core::LLVMGetTarget(module);
+                let mut target = std::ptr::null_mut();
+                let mut err = std::ptr::null_mut();
+                let result =
+                    llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut err);
+                if result != 0 {
+                    let err = std::ffi::CString::from_raw(err);
+                    let err_ = err.clone();
+                    panic!(
+                        "Failed to get target from triple: {}",
+                        err_.to_str().unwrap()
+                    );
+                }
+                let cpu_name = llvm::target_machine::LLVMGetHostCPUName();
+                let cpu_feature = llvm::target_machine::LLVMGetHostCPUFeatures();
+                let tm = llvm::target_machine::LLVMCreateTargetMachine(
+                    target,
+                    triple,
+                    cpu_name,
+                    cpu_feature,
+                    llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+                    llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
+                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+                );
+                let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
+                jtmb
+            };
+
+            llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(jit_builder, jtmb);
+
+            llvm::orc2::lljit::LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator(
+                jit_builder,
+                llvm_obj_linking_layer_create,
+                std::ptr::null_mut(),
+            );
+
+            let mut jit = std::ptr::null_mut();
+
+            let err = llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, jit_builder);
+            if !err.is_null() {
+                let err = llvm::error::LLVMGetErrorMessage(err);
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!("Failed to create LLJIT: {}", err_.to_str().unwrap());
+            }
+
+            let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
+
+            let lljit_gl_prefix = llvm::orc2::lljit::LLVMOrcLLJITGetGlobalPrefix(jit);
+
+            let mut dg = std::ptr::null_mut();
+            let err = llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+                &mut dg,
+                lljit_gl_prefix,
+                None,
+                std::ptr::null_mut(),
+            );
+            if !err.is_null() {
+                let err = llvm::error::LLVMGetErrorMessage(err);
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!(
+                    "Failed to create dynamic library search generator: {}",
+                    err_.to_str().unwrap()
+                );
+            }
+
+            llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, dg);
+
+            let tsctx = llvm::orc2::LLVMOrcCreateNewThreadSafeContext();
+            let tsm = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(module, tsctx);
+
+            let err = llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(jit, dylib, tsm);
+            if !err.is_null() {
+                let err = llvm::error::LLVMGetErrorMessage(err);
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!("Failed to add LLVM IR module: {}", err_.to_str().unwrap());
+            }
+
+            let mut func = 0u64;
+            let err = llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut func, func_name.as_ptr());
+            if !err.is_null() {
+                let err = llvm::error::LLVMGetErrorMessage(err);
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!("Failed to lookup function: {}", err_.to_str().unwrap());
+            }
+
+            let terminator = InstFormat::SOPP(SOPP {
+                op: I::S_ENDPGM,
+                simm16: 0,
+            });
+
+            inst_block.context = context;
+            inst_block.module = module;
+            inst_block.addr = func;
+            inst_block.reg_usage = reg_usage;
+            inst_block.terminator = terminator;
+            inst_block.num_instructions = instruction_count;
+        }
+
+        let block_addr = program.entry_pc as u64;
+
+        self.clear();
+
+        self.insts_blocks.insert(block_addr, inst_block);
+
+        self.insts_blocks.get_mut(&block_addr).unwrap()
     }
 
     pub fn get_or_build(&mut self) -> &mut InstBlock {
@@ -7749,5 +8651,155 @@ impl RDNATranslator {
     pub fn clear(&mut self) {
         self.addresses.clear();
         self.insts.clear();
+    }
+}
+
+pub struct RDNAProgram {
+    entry_pc: usize,
+    insts_blocks: HashMap<usize, BasicBlock>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Range {
+    start: usize,
+    end: usize, // Exclusive end
+}
+
+struct BasicBlock {
+    insts: Vec<InstFormat>,
+    next_pcs: Vec<usize>,
+}
+
+impl RDNAProgram {
+    fn get_next_pcs(pc: usize, inst: &InstFormat) -> Vec<usize> {
+        let mut next_pscs = Vec::new();
+        match inst {
+            InstFormat::SOPP(inst) => match inst.op {
+                I::S_CBRANCH_EXECZ
+                | I::S_CBRANCH_EXECNZ
+                | I::S_CBRANCH_VCCZ
+                | I::S_CBRANCH_VCCNZ
+                | I::S_CBRANCH_SCC0
+                | I::S_CBRANCH_SCC1 => {
+                    next_pscs.push(pc);
+                    let next_pc = ((pc as i64) + ((inst.simm16 as i16 as i64) * 4)) as usize;
+                    next_pscs.push(next_pc);
+                }
+                I::S_BRANCH => {
+                    let next_pc = ((pc as i64) + ((inst.simm16 as i16 as i64) * 4)) as usize;
+                    next_pscs.push(next_pc);
+                }
+                I::S_ENDPGM => {}
+                _ => {
+                    next_pscs.push(pc);
+                }
+            },
+            _ => {
+                next_pscs.push(pc);
+            }
+        }
+        next_pscs
+    }
+
+    fn search_instruction_ranges(
+        pc: usize,
+        inst_stream: &InstStream,
+        visited: &mut HashSet<Range>,
+    ) {
+        let mut pc = pc;
+        let start_pc = pc;
+        let mut insts = Vec::new();
+        let mut doing = true;
+        while doing {
+            let current_inst_stream = InstStream {
+                insts: &inst_stream.insts[pc..],
+            };
+            let (inst, size) = decode_rdna4(current_inst_stream).unwrap();
+            insts.push(inst.clone());
+            pc += size;
+            if is_terminator(&inst)
+                || visited
+                    .iter()
+                    .find(|range| pc >= range.start && pc < range.end)
+                    .is_some()
+            {
+                doing = false;
+            }
+        }
+
+        let next_pcs = Self::get_next_pcs(pc, &insts.last().unwrap());
+
+        visited.insert(Range {
+            start: start_pc,
+            end: pc,
+        });
+
+        for next_pc in next_pcs {
+            if let Some(range) = visited
+                .iter()
+                .find(|range| next_pc >= range.start && next_pc < range.end)
+                .cloned()
+            {
+                if range.start < next_pc {
+                    visited.insert(Range {
+                        start: range.start,
+                        end: next_pc,
+                    });
+                    visited.insert(Range {
+                        start: next_pc,
+                        end: range.end,
+                    });
+                    visited.remove(&range);
+                } else {
+                }
+            } else {
+                Self::search_instruction_ranges(next_pc as usize, inst_stream, visited);
+            }
+        }
+    }
+
+    fn create_basic_block_from_range(range: &Range, inst_stream: &InstStream) -> BasicBlock {
+        let mut insts = Vec::new();
+        let mut pc = range.start;
+        while pc < range.end {
+            let current_inst_stream = InstStream {
+                insts: &inst_stream.insts[pc..],
+            };
+            let (inst, size) = decode_rdna4(current_inst_stream).unwrap();
+            insts.push(inst.clone());
+            pc += size;
+        }
+        let next_pcs = Self::get_next_pcs(range.end, &insts.last().unwrap());
+        BasicBlock { insts, next_pcs }
+    }
+
+    pub fn new(pc: usize, inst_stream: &[u8]) -> Self {
+        let inst_stream = InstStream { insts: inst_stream };
+        let mut visited = HashSet::new();
+        Self::search_instruction_ranges(pc, &inst_stream, &mut visited);
+
+        let mut ranges = visited.into_iter().collect::<Vec<_>>();
+        ranges.sort_by_key(|r| r.start);
+
+        for i in 0..ranges.len() - 1 {
+            if ranges[i].end != ranges[i + 1].start {
+                panic!(
+                    "Ranges are not contiguous: {:?} and {:?}",
+                    ranges[i],
+                    ranges[i + 1]
+                );
+            }
+        }
+
+        let mut basic_blocks = HashMap::new();
+        for range in ranges {
+            let block = Self::create_basic_block_from_range(&range, &inst_stream);
+            basic_blocks.insert(range.start, block);
+        }
+
+        RDNAProgram {
+            entry_pc: pc,
+            insts_blocks: basic_blocks,
+        }
     }
 }
