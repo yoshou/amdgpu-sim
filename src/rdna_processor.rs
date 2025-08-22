@@ -5,6 +5,8 @@ use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
 use crate::rdna_translator::*;
 
+static USE_ENTIRE_KERNEL_TRANSLATION: bool = false;
+
 struct F64x8 {
     value0: std::arch::x86_64::__m256d,
     value1: std::arch::x86_64::__m256d,
@@ -282,11 +284,13 @@ impl<T: Copy> RegisterFile<T> for RegisterFileImpl<T> {
     }
 }
 
+#[derive(FromPrimitive)]
+#[repr(i32)]
 pub enum Signals {
-    None,
-    EndOfProgram,
-    Switch,
-    Unknown,
+    None = 0,
+    EndOfProgram = 1,
+    Switch = 2,
+    Unknown = 3,
 }
 
 pub trait Processor {
@@ -296,14 +300,13 @@ pub trait Processor {
 #[derive(Copy, Clone, Debug)]
 struct Context {
     id: usize,
-    pc: usize,
+    pc: u64,
     scc: bool,
     scratch_base: u64,
 }
 
 struct SIMD32 {
     ctx: Context,
-    next_pc: usize,
     insts: Vec<u8>,
     pub sgprs: RegisterFileImpl<u32>,
     pub vgprs: RegisterFileImpl<u32>,
@@ -571,7 +574,7 @@ impl SIMD32 {
         for wavefront in 0..num_wavefronts {
             ctxs.push_back(Context {
                 id: wavefront,
-                pc: entry_addr,
+                pc: entry_addr as u64,
                 scc: false,
                 scratch_base: setup_data[wavefront].scratch_base,
             })
@@ -581,6 +584,13 @@ impl SIMD32 {
             Signals::None => true,
             _ => false,
         };
+
+        if USE_ENTIRE_KERNEL_TRANSLATION {
+            if self.translator.insts_blocks.is_empty() {
+                let program = RDNAProgram::new(self.ctx.pc as usize, &self.insts);
+                self.translator.build_from_program(&program);
+            }
+        }
 
         while !ctxs.is_empty() {
             if let Some(ctx) = ctxs.pop_front() {
@@ -601,15 +611,12 @@ impl SIMD32 {
 
     fn step(&mut self) -> Signals {
         let inst_stream = InstStream {
-            insts: &self.insts[self.ctx.pc..],
+            insts: &self.insts[self.ctx.pc as usize..],
         };
         let pc = self.ctx.pc as u64;
         let block = self.translator.insts_blocks.get_mut(&pc);
         if block.is_some() && self.translator.insts.len() == 0 {
             let block = block.unwrap();
-            let terminator = block.terminator.clone();
-            let terminator_pc = block.terminator_pc;
-            let terminator_next_pc = block.terminator_next_pc;
 
             let sgprs_ptr =
                 self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
@@ -621,25 +628,12 @@ impl SIMD32 {
                 as *mut u32;
             let scc_ptr = (&mut self.ctx.scc) as *mut bool;
 
-            block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
-
-            self.next_pc = terminator_next_pc;
-            self.set_pc(terminator_pc);
-
-            let result = self.execute_inst(terminator);
-            self.set_pc(self.next_pc as u64);
-            result
+            block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
         } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
-            self.next_pc = self.get_pc() as usize + size;
-
             self.translator.add_inst(self.ctx.pc as u64, inst.clone());
             let result = if is_terminator(&inst) {
                 if self.translator.insts.len() > 0 {
-                    let pc = self.get_pc();
                     let block = self.translator.get_or_build();
-
-                    block.terminator_next_pc = self.next_pc;
-                    block.terminator_pc = pc;
 
                     let sgprs_ptr =
                         self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
@@ -651,17 +645,19 @@ impl SIMD32 {
                         as *mut u32;
                     let scc_ptr = (&mut self.ctx.scc) as *mut bool;
 
-                    block.execute(sgprs_ptr, vgprs_ptr, scc_ptr);
+                    block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
+                } else {
+                    self.ctx.pc += size as u64;
+                    Signals::None
                 }
-                self.execute_inst(inst)
             } else {
+                self.ctx.pc += size as u64;
                 Signals::None
             };
-            self.set_pc(self.next_pc as u64);
 
             result
         } else {
-            let inst = get_u64(&self.insts, self.ctx.pc);
+            let inst = get_u64(&self.insts, self.ctx.pc as usize);
             println!(
                 "Unknown instruction 0x{:08X} at PC: 0x{:08X}",
                 inst & 0xFFFFFFFF,
@@ -669,15 +665,6 @@ impl SIMD32 {
             );
             Signals::Unknown
         }
-    }
-
-    fn get_pc(&self) -> u64 {
-        (&self.insts[self.ctx.pc] as *const u8) as u64
-    }
-
-    fn set_pc(&mut self, value: u64) {
-        let base_ptr = (&self.insts[0] as *const u8) as u64;
-        self.ctx.pc = (value - base_ptr) as usize;
     }
 
     fn is_execz(&self) -> bool {
@@ -3658,36 +3645,36 @@ impl SIMD32 {
             I::S_SENDMSG => {}
             I::S_CBRANCH_EXECZ => {
                 if self.is_execz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
                 }
             }
             I::S_CBRANCH_EXECNZ => {
                 if self.is_execnz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
                 }
             }
             I::S_CBRANCH_VCCZ => {
                 if self.is_vccz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
                 }
             }
             I::S_CBRANCH_VCCNZ => {
                 if self.is_vccnz() {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
                 }
             }
             I::S_CBRANCH_SCC0 => {
                 if !self.ctx.scc {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
                 }
             }
             I::S_CBRANCH_SCC1 => {
                 if self.ctx.scc {
-                    self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
                 }
             }
             I::S_BRANCH => {
-                self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
+                self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
             }
             _ => unimplemented!(),
         }
@@ -3748,11 +3735,10 @@ impl ComputeUnit {
             simds.push(Arc::new(Mutex::new(SIMD32 {
                 ctx: Context {
                     id: 0,
-                    pc: pc,
+                    pc: pc as u64,
                     scc: false,
                     scratch_base: 0,
                 },
-                next_pc: 0,
                 insts: insts.clone(),
                 sgprs: RegisterFileImpl::new(1, 128 * num_wave_slot, 0),
                 vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
@@ -4050,6 +4036,16 @@ impl<'a> RDNAProcessor<'a> {
                 sum_instruction_count.get(addr).unwrap_or(&0)
             );
         }
+
+        let mut total_elapsed_time = 0;
+        for (_, elapsed_time) in &sum_block_elapsed_time {
+            total_elapsed_time += elapsed_time;
+        }
+
+        println!(
+            "\nTotal elapsed time: {} ms",
+            (total_elapsed_time as f64 / 1_000_000.0)
+        );
 
         println!("\nInstruction usage summary:");
         let mut sorted_instructions: Vec<_> = instruction_usage.iter().collect();

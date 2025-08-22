@@ -10,7 +10,8 @@ edition = "2018"
 num = "*"
 indicatif = "0.15.0"
 libm = "*"
-num-traits = "0.2.12"
+num-traits = "0.2"
+num-derive = "0.4"
 llvm-sys = "201.0.1"
 libc = "0.2"
 aligned-vec = "0.6.4"
@@ -27,3 +28,8 @@ getopts = "0.2"
 [features]
 default = ["llvm-sys/prefer-dynamic"]
 
+[profile.release]
+debug = "line-tables-only"
+
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
