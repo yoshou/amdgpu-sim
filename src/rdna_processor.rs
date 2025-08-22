@@ -5,6 +5,7 @@ use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
 use crate::rdna_translator::*;
 
+static USE_INTERPRETER: bool = false;
 static USE_ENTIRE_KERNEL_TRANSLATION: bool = false;
 
 struct F64x8 {
@@ -613,57 +614,73 @@ impl SIMD32 {
         let inst_stream = InstStream {
             insts: &self.insts[self.ctx.pc as usize..],
         };
-        let pc = self.ctx.pc as u64;
-        let block = self.translator.insts_blocks.get_mut(&pc);
-        if block.is_some() && self.translator.insts.len() == 0 {
-            let block = block.unwrap();
 
-            let sgprs_ptr =
-                self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
-            let vgprs_ptr = (self
-                .vgprs
-                .regs
-                .as_mut_ptr()
-                .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                as *mut u32;
-            let scc_ptr = (&mut self.ctx.scc) as *mut bool;
+        if USE_INTERPRETER {
+            if let Ok((inst, size)) = decode_rdna4(inst_stream) {
+                self.ctx.pc += size as u64;
+                self.execute_inst(inst)
+            } else {
+                let inst = get_u64(&self.insts, self.ctx.pc as usize);
+                println!(
+                    "Unknown instruction 0x{:08X} at PC: 0x{:08X}",
+                    inst & 0xFFFFFFFF,
+                    self.ctx.pc
+                );
+                Signals::Unknown
+            }
+        } else {
+            let pc = self.ctx.pc as u64;
+            let block = self.translator.insts_blocks.get_mut(&pc);
+            if block.is_some() && self.translator.insts.len() == 0 {
+                let block = block.unwrap();
 
-            block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
-        } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
-            self.translator.add_inst(self.ctx.pc as u64, inst.clone());
-            let result = if is_terminator(&inst) {
-                if self.translator.insts.len() > 0 {
-                    let block = self.translator.get_or_build();
+                let sgprs_ptr =
+                    self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
+                let vgprs_ptr = (self
+                    .vgprs
+                    .regs
+                    .as_mut_ptr()
+                    .wrapping_add(self.num_vgprs * self.ctx.id * 32))
+                    as *mut u32;
+                let scc_ptr = (&mut self.ctx.scc) as *mut bool;
 
-                    let sgprs_ptr =
-                        self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id) as *mut u32;
-                    let vgprs_ptr = (self
-                        .vgprs
-                        .regs
-                        .as_mut_ptr()
-                        .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                        as *mut u32;
-                    let scc_ptr = (&mut self.ctx.scc) as *mut bool;
+                block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
+            } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
+                self.translator.add_inst(self.ctx.pc as u64, inst.clone());
+                let result = if is_terminator(&inst) {
+                    if self.translator.insts.len() > 0 {
+                        let block = self.translator.get_or_build();
 
-                    block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
+                        let sgprs_ptr = self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id)
+                            as *mut u32;
+                        let vgprs_ptr = (self
+                            .vgprs
+                            .regs
+                            .as_mut_ptr()
+                            .wrapping_add(self.num_vgprs * self.ctx.id * 32))
+                            as *mut u32;
+                        let scc_ptr = (&mut self.ctx.scc) as *mut bool;
+
+                        block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
+                    } else {
+                        self.ctx.pc += size as u64;
+                        Signals::None
+                    }
                 } else {
                     self.ctx.pc += size as u64;
                     Signals::None
-                }
-            } else {
-                self.ctx.pc += size as u64;
-                Signals::None
-            };
+                };
 
-            result
-        } else {
-            let inst = get_u64(&self.insts, self.ctx.pc as usize);
-            println!(
-                "Unknown instruction 0x{:08X} at PC: 0x{:08X}",
-                inst & 0xFFFFFFFF,
-                self.ctx.pc
-            );
-            Signals::Unknown
+                result
+            } else {
+                let inst = get_u64(&self.insts, self.ctx.pc as usize);
+                println!(
+                    "Unknown instruction 0x{:08X} at PC: 0x{:08X}",
+                    inst & 0xFFFFFFFF,
+                    self.ctx.pc
+                );
+                Signals::Unknown
+            }
         }
     }
 
@@ -3645,36 +3662,36 @@ impl SIMD32 {
             I::S_SENDMSG => {}
             I::S_CBRANCH_EXECZ => {
                 if self.is_execz() {
-                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
                 }
             }
             I::S_CBRANCH_EXECNZ => {
                 if self.is_execnz() {
-                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
                 }
             }
             I::S_CBRANCH_VCCZ => {
                 if self.is_vccz() {
-                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
                 }
             }
             I::S_CBRANCH_VCCNZ => {
                 if self.is_vccnz() {
-                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
                 }
             }
             I::S_CBRANCH_SCC0 => {
                 if !self.ctx.scc {
-                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
                 }
             }
             I::S_CBRANCH_SCC1 => {
                 if self.ctx.scc {
-                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                    self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
                 }
             }
             I::S_BRANCH => {
-                self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4) + 4) as u64;
+                self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
             }
             _ => unimplemented!(),
         }
