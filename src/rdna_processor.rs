@@ -7,6 +7,7 @@ use crate::rdna_translator::*;
 
 static USE_INTERPRETER: bool = false;
 static USE_ENTIRE_KERNEL_TRANSLATION: bool = false;
+static USE_SIMD: bool = true;
 
 struct F64x8 {
     value0: std::arch::x86_64::__m256d,
@@ -1346,7 +1347,7 @@ impl SIMD32 {
     }
 
     fn v_mul_f64_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
-        if true {
+        if USE_SIMD {
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 use std::arch::x86_64::*;
@@ -1767,7 +1768,7 @@ impl SIMD32 {
         clamp: bool,
         omod: u8,
     ) {
-        if true {
+        if USE_SIMD {
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 use std::arch::x86_64::*;
@@ -1895,7 +1896,7 @@ impl SIMD32 {
         clamp: bool,
         omod: u8,
     ) {
-        if true {
+        if USE_SIMD {
             unsafe {
                 #[cfg(target_arch = "x86_64")]
                 use std::arch::x86_64::*;
