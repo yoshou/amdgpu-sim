@@ -9475,7 +9475,7 @@ impl RDNATranslator {
 
             let pass_builder_options =
                 llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
-            llvm::transforms::pass_builder::LLVMRunPassesOnFunction(
+            let err = llvm::transforms::pass_builder::LLVMRunPassesOnFunction(
                 function,
                 b"early-cse,instcombine<no-verify-fixpoint>,aggressive-instcombine,mem2reg,gvn,dse,instsimplify,load-store-vectorizer,loop-fusion,loop-load-elim,reassociate,function-simplification<O3>,loop-vectorize,simplifycfg,loop-unroll<O3>\0".as_ptr() as *const _,
                 tm,
