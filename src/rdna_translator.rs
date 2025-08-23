@@ -9482,6 +9482,16 @@ impl RDNATranslator {
                 pass_builder_options,
             );
 
+            if !err.is_null() {
+                let err = llvm::error::LLVMGetErrorMessage(err);
+                let err = std::ffi::CString::from_raw(err);
+                let err_ = err.clone();
+                panic!(
+                    "Failed to run passes on function: {}",
+                    err_.to_str().unwrap()
+                );
+            }
+
             let mut instruction_count = 0;
 
             let mut bb = llvm::core::LLVMGetFirstBasicBlock(function);
