@@ -13075,8 +13075,6 @@ impl RDNATranslator {
                 use_vgpr_stack_cache: false,
             };
 
-            let reg_usage = self.analyze();
-
             {
                 let mut instruction_usage = HashMap::new();
 
@@ -13157,20 +13155,11 @@ impl RDNATranslator {
                 inst_block.instruction_usage = instruction_usage;
             }
 
+            let reg_usage = self.analyze();
+
             emitter.emit_alloc_registers(&reg_usage);
 
             emitter.emit_restore_registers(&reg_usage);
-
-            let block_pc = self.get_address().unwrap();
-            let current_pc = self.get_pc();
-            let next_pcs = self.get_next_pcs();
-
-            if next_pcs.len() == 2 && (next_pcs[1] >= block_pc) && (next_pcs[1] < current_pc) {
-                println!(
-                    "Warning: Block {} has a backward branch to {}",
-                    block_pc, next_pcs[1]
-                );
-            }
 
             for inst in &self.insts[..self.insts.len() - 1] {
                 bb = emitter.emit_instruction(bb, inst);
