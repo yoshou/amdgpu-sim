@@ -1,17 +1,15 @@
-use core::panic;
-use itertools::izip;
-use itertools::Itertools;
-use std::collections::HashMap;
-use std::collections::HashSet;
-use std::os::raw::c_void;
-
 use crate::instructions::*;
 use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
 use crate::rdna_processor::Signals;
+
+use itertools::izip;
+use itertools::Itertools;
 use llvm_sys as llvm;
-use llvm_sys::prelude::LLVMBasicBlockRef;
 use num::FromPrimitive;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::os::raw::c_void;
 
 const USE_VGPR_STACK_CACHE: bool = true;
 const USE_SGPR_STACK_CACHE: bool = true;
@@ -2701,10 +2699,10 @@ impl IREmitter {
 
     unsafe fn emit_terminator(
         &mut self,
-        bb: LLVMBasicBlockRef,
+        bb: llvm::prelude::LLVMBasicBlockRef,
         inst: &InstFormat,
         pc: u64,
-    ) -> LLVMBasicBlockRef {
+    ) -> llvm::prelude::LLVMBasicBlockRef {
         let context = self.context;
         let builder = self.builder;
         let scc_ptr = self.scc_ptr;
@@ -2877,9 +2875,9 @@ impl IREmitter {
 
     unsafe fn emit_instruction(
         &mut self,
-        bb: LLVMBasicBlockRef,
+        bb: llvm::prelude::LLVMBasicBlockRef,
         inst: &InstFormat,
-    ) -> LLVMBasicBlockRef {
+    ) -> llvm::prelude::LLVMBasicBlockRef {
         let context = self.context;
         let builder = self.builder;
         let scc_ptr = self.scc_ptr;
