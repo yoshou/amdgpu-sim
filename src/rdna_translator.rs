@@ -10732,85 +10732,54 @@ impl IREmitter {
                         let ty_p0x8 = llvm::core::LLVMVectorType(ty_p0, 8);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32x8 = llvm::core::LLVMVectorType(ty_i32, 8);
-                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                        let ty_i64x8 = llvm::core::LLVMVectorType(ty_i64, 8);
                         let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
                         let ty_i1x8 = llvm::core::LLVMVectorType(ty_i1, 8);
                         let ty_p0x4 = llvm::core::LLVMVectorType(ty_p0, 4);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                         let ty_i64x4 = llvm::core::LLVMVectorType(ty_i64, 4);
                         let ty_i1x4 = llvm::core::LLVMVectorType(ty_i1, 4);
+                        let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
 
                         let exec_value = emitter.emit_load_sgpr_u32(126);
 
                         const NUM_WORDS: usize = 4;
 
-                        let saddr_value = if inst.saddr != 124 {
-                            let saddr_value = emitter.emit_load_sgpr_u64(inst.saddr as u32);
-
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i64, 0, 0); 8].as_mut_ptr(),
-                                8,
-                            );
-                            let poison = llvm::core::LLVMGetPoison(ty_i64x8);
-
-                            let saddr_value = llvm::core::LLVMBuildInsertElement(
-                                builder,
-                                poison,
-                                saddr_value,
-                                llvm::core::LLVMConstInt(ty_i64, 0, 0),
-                                empty_name.as_ptr(),
-                            );
-                            let saddr_value = llvm::core::LLVMBuildShuffleVector(
-                                builder,
-                                saddr_value,
-                                poison,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-                            saddr_value
-                        } else {
-                            std::ptr::null_mut()
-                        };
-
                         for i in (0..32).step_by(8) {
                             let mask = emitter.emit_bits_to_mask_x8(exec_value, i as u32);
                             if inst.saddr != 124 {
-                                let vaddr_value =
-                                    emitter.emit_load_vgpr_u32x8(inst.vaddr as u32, i, mask);
-                                let vaddr_value = llvm::core::LLVMBuildZExt(
-                                    builder,
-                                    vaddr_value,
-                                    ty_i64x8,
-                                    empty_name.as_ptr(),
-                                );
-                                let vaddr_value = llvm::core::LLVMBuildAdd(
+                                let saddr_value = emitter.emit_load_sgpr_u64(inst.saddr as u32);
+
+                                let saddr_value = llvm::core::LLVMBuildIntToPtr(
                                     builder,
                                     saddr_value,
-                                    vaddr_value,
+                                    ty_p0,
                                     empty_name.as_ptr(),
                                 );
 
-                                let ioffset = llvm::core::LLVMConstVector(
-                                    [llvm::core::LLVMConstInt(
-                                        ty_i64,
-                                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
-                                        0,
-                                    ); 8]
-                                        .as_mut_ptr(),
-                                    8,
-                                );
-                                let addr = llvm::core::LLVMBuildAdd(
+                                let vaddr_value =
+                                    emitter.emit_load_vgpr_u32x8(inst.vaddr as u32, i, mask);
+
+                                let vaddr_value = llvm::core::LLVMBuildGEP2(
                                     builder,
-                                    vaddr_value,
-                                    ioffset,
+                                    ty_i8,
+                                    saddr_value,
+                                    [vaddr_value].as_mut_ptr(),
+                                    1,
                                     empty_name.as_ptr(),
                                 );
 
-                                let ptr = llvm::core::LLVMBuildIntToPtr(
+                                let ioffset = llvm::core::LLVMConstInt(
+                                    ty_i64,
+                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    0,
+                                );
+
+                                let ptr = llvm::core::LLVMBuildGEP2(
                                     builder,
-                                    addr,
-                                    ty_p0x8,
+                                    ty_i8,
+                                    vaddr_value,
+                                    [ioffset].as_mut_ptr(),
+                                    1,
                                     empty_name.as_ptr(),
                                 );
 
