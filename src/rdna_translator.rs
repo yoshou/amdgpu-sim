@@ -121,6 +121,7 @@ struct IREmitter {
     ret_value: llvm::prelude::LLVMValueRef,
     sgpr_ptr_map: HashMap<u32, llvm::prelude::LLVMValueRef>,
     vgpr_ptr_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 4]>,
+    vgpr_reg_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 4]>,
     use_vgpr_stack_cache: bool,
 }
 
@@ -667,7 +668,7 @@ impl IREmitter {
                 8,
             );
         }
-        self.vgpr_ptr_map.get(&reg).unwrap()[(elem / 8) as usize]
+        self.vgpr_reg_map.get(&reg).unwrap()[(elem / 8) as usize]
     }
 
     unsafe fn emit_load_vgpr_u32x8(
@@ -764,12 +765,12 @@ impl IREmitter {
             return;
         }
 
-        let reg_value = self.vgpr_ptr_map.get(&reg).unwrap()[(elem / 8) as usize];
+        let reg_value = self.vgpr_reg_map.get(&reg).unwrap()[(elem / 8) as usize];
 
         let reg_value =
             llvm::core::LLVMBuildSelect(builder, mask, value, reg_value, empty_name.as_ptr());
 
-        self.vgpr_ptr_map.get_mut(&reg).unwrap()[(elem / 8) as usize] = reg_value;
+        self.vgpr_reg_map.get_mut(&reg).unwrap()[(elem / 8) as usize] = reg_value;
     }
 
     unsafe fn emit_store_vgpr_u32(
@@ -1994,6 +1995,35 @@ impl IREmitter {
                 );
                 self.sgpr_ptr_map.insert(*sgpr, sgpr_ptr);
             }
+        }
+
+        if self.use_vgpr_stack_cache {
+            let vgprs: Vec<u32> = reg_usage
+                .use_vgprs
+                .union(&reg_usage.def_vgprs)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            for vgpr in &vgprs {
+                let mut vgpr_ptr = [std::ptr::null_mut(); 4];
+
+                for i in 0..4 {
+                    vgpr_ptr[i] = llvm::core::LLVMBuildAlloca(
+                        self.builder,
+                        llvm::core::LLVMVectorType(
+                            llvm::core::LLVMInt32TypeInContext(self.context),
+                            8,
+                        ),
+                        std::ffi::CString::new(format!("vgpr{}.{}", vgpr, i))
+                            .unwrap()
+                            .as_ptr(),
+                    );
+                }
+                self.vgpr_ptr_map.insert(*vgpr, vgpr_ptr);
+            }
+        }
+
+        if USE_SGPR_STACK_CACHE {
             for sgpr in &reg_usage.incomming_sgprs {
                 let sgpr_ptr = *self.sgpr_ptr_map.get(sgpr).unwrap();
                 let context = self.context;
@@ -2027,6 +2057,43 @@ impl IREmitter {
         }
 
         if self.use_vgpr_stack_cache {
+            for vgpr in &reg_usage.incomming_vgprs {
+                let context = self.context;
+                let builder = self.builder;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                for i in (0..32).step_by(8) {
+                    let mut indices: Vec<*mut llvm_sys::LLVMValue> =
+                        vec![llvm::core::LLVMConstInt(
+                            llvm::core::LLVMInt64TypeInContext(context),
+                            *vgpr as u64 * 32 + i as u64,
+                            0,
+                        )];
+                    let value_ptr = llvm::core::LLVMBuildGEP2(
+                        builder,
+                        ty_i32,
+                        self.vgprs_ptr,
+                        indices.as_mut_ptr(),
+                        indices.len() as u32,
+                        empty_name.as_ptr(),
+                    );
+
+                    llvm::core::LLVMBuildMemCpy(
+                        builder,
+                        self.vgpr_ptr_map.get(vgpr).unwrap()[(i / 8) as usize],
+                        4,
+                        value_ptr,
+                        4,
+                        llvm::core::LLVMConstInt(ty_i32, 32, 0),
+                    );
+                }
+            }
+        }
+    }
+
+    unsafe fn emit_restore_registers(&mut self, reg_usage: &RegisterUsage) {
+        if self.use_vgpr_stack_cache {
             let vgprs: Vec<u32> = reg_usage
                 .use_vgprs
                 .union(&reg_usage.def_vgprs)
@@ -2034,7 +2101,7 @@ impl IREmitter {
                 .collect::<Vec<_>>();
 
             for vgpr in &vgprs {
-                self.vgpr_ptr_map.insert(*vgpr, [std::ptr::null_mut(); 4]);
+                self.vgpr_reg_map.insert(*vgpr, [std::ptr::null_mut(); 4]);
             }
             for vgpr in &reg_usage.incomming_vgprs {
                 let context = self.context;
@@ -2044,26 +2111,14 @@ impl IREmitter {
                 let ty_i32x8 = llvm::core::LLVMVectorType(ty_i32, 8);
 
                 for i in (0..32).step_by(8) {
-                    let mut indices = vec![llvm::core::LLVMConstInt(
-                        llvm::core::LLVMInt64TypeInContext(context),
-                        *vgpr as u64 * 32 + i,
-                        0,
-                    )];
-                    let value_ptr = llvm::core::LLVMBuildGEP2(
-                        builder,
-                        ty_i32,
-                        self.vgprs_ptr,
-                        indices.as_mut_ptr(),
-                        indices.len() as u32,
-                        empty_name.as_ptr(),
-                    );
+                    let value_ptr = self.vgpr_ptr_map.get_mut(vgpr).unwrap()[(i / 8) as usize];
                     let value = llvm::core::LLVMBuildLoad2(
                         builder,
                         ty_i32x8,
                         value_ptr,
                         empty_name.as_ptr(),
                     );
-                    self.vgpr_ptr_map.get_mut(vgpr).unwrap()[(i / 8) as usize] = value;
+                    self.vgpr_reg_map.get_mut(vgpr).unwrap()[(i / 8) as usize] = value;
                 }
             }
         }
@@ -2105,23 +2160,11 @@ impl IREmitter {
 
         if self.use_vgpr_stack_cache {
             for vgpr in &reg_usage.def_vgprs {
-                let vgpr_ptr = self.vgpr_ptr_map.get(vgpr).unwrap();
                 for i in (0..32).step_by(8) {
-                    let mut indices = vec![llvm::core::LLVMConstInt(
-                        llvm::core::LLVMInt64TypeInContext(context),
-                        *vgpr as u64 * 32 + i,
-                        0,
-                    )];
-                    let value_ptr = llvm::core::LLVMBuildGEP2(
-                        builder,
-                        ty_i32,
-                        self.vgprs_ptr,
-                        indices.as_mut_ptr(),
-                        indices.len() as u32,
-                        empty_name.as_ptr(),
-                    );
+                    let value_ptr = self.vgpr_ptr_map.get(vgpr).unwrap()[(i / 8) as usize];
+                    let value = self.vgpr_reg_map.get(vgpr).unwrap()[(i / 8) as usize];
 
-                    llvm::core::LLVMBuildStore(builder, vgpr_ptr[(i / 8) as usize], value_ptr);
+                    llvm::core::LLVMBuildStore(builder, value, value_ptr);
                 }
             }
         }
@@ -10199,6 +10242,22 @@ impl RDNATranslator {
                 I::S_WAIT_LOADCNT => {}
                 I::S_NOP => {}
                 I::S_SENDMSG => {}
+                I::S_CBRANCH_EXECZ => {
+                    reg_usage.use_sgpr_u32(126);
+                }
+                I::S_CBRANCH_EXECNZ => {
+                    reg_usage.use_sgpr_u32(126);
+                }
+                I::S_CBRANCH_VCCZ => {
+                    reg_usage.use_sgpr_u32(106);
+                }
+                I::S_CBRANCH_VCCNZ => {
+                    reg_usage.use_sgpr_u32(106);
+                }
+                I::S_CBRANCH_SCC0 => {}
+                I::S_CBRANCH_SCC1 => {}
+                I::S_BRANCH => {}
+                I::S_ENDPGM => {}
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }
@@ -10230,6 +10289,11 @@ impl RDNATranslator {
                     reg_usage.def_sgpr_u32(106);
                 }
                 I::V_CMP_LT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_LE_F64 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
                     reg_usage.def_sgpr_u32(106);
@@ -10294,9 +10358,17 @@ impl RDNATranslator {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.def_vgpr_f64(inst.vdst as u32);
                 }
+                I::V_FRACT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
                 I::V_CVT_I32_F64 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_CVT_F64_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
@@ -10391,12 +10463,22 @@ impl RDNATranslator {
                     reg_usage.use_operand_f64(&inst.src1);
                     reg_usage.def_sgpr_u32(inst.vdst as u32);
                 }
+                I::V_CMP_LE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
                 I::V_CMP_GT_F64 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.use_operand_f64(&inst.src1);
                     reg_usage.def_sgpr_u32(inst.vdst as u32);
                 }
                 I::V_CMP_LG_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NEQ_F64 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.use_operand_f64(&inst.src1);
                     reg_usage.def_sgpr_u32(inst.vdst as u32);
@@ -10485,6 +10567,13 @@ impl RDNATranslator {
                     reg_usage.def_sgpr_u32(inst.sdst as u32);
                 }
                 I::V_DIV_SCALE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.use_operand_f64(&inst.src2);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::V_ADD_CO_CI_U32 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.use_operand_f64(&inst.src1);
                     reg_usage.use_operand_f64(&inst.src2);
@@ -10813,13 +10902,43 @@ impl RDNATranslator {
                 ret_value,
                 sgpr_ptr_map: HashMap::new(),
                 vgpr_ptr_map: HashMap::new(),
+                vgpr_reg_map: HashMap::new(),
                 use_vgpr_stack_cache: USE_VGPR_STACK_CACHE,
             };
 
             let mut reg_usage = RegisterUsage::new();
-            for reg in 0..128 {
-                reg_usage.incomming_sgprs.insert(reg);
-                reg_usage.use_sgprs.insert(reg);
+
+            for (_, block) in &program.insts_blocks {
+                for inst in &block.insts {
+                    self.analyze_instructions(inst, &mut reg_usage);
+                }
+            }
+
+            reg_usage.incomming_sgprs.insert(106);
+            reg_usage.incomming_sgprs.insert(126);
+
+            reg_usage.use_sgprs.insert(106);
+            reg_usage.use_sgprs.insert(126);
+
+            reg_usage.def_sgprs.insert(106);
+            reg_usage.def_sgprs.insert(126);
+
+            for reg in 0..16 {
+                if reg_usage.use_sgprs.contains(&reg) {
+                    reg_usage.incomming_sgprs.insert(reg);
+                }
+            }
+
+            for reg in 106..128 {
+                if reg_usage.use_sgprs.contains(&reg) {
+                    reg_usage.incomming_sgprs.insert(reg);
+                }
+            }
+
+            for reg in 0..16 {
+                if reg_usage.use_vgprs.contains(&reg) || reg_usage.def_vgprs.contains(&reg) {
+                    reg_usage.incomming_vgprs.insert(reg);
+                }
             }
 
             emitter.emit_alloc_registers(&reg_usage);
@@ -10843,10 +10962,29 @@ impl RDNATranslator {
 
                 llvm::core::LLVMPositionBuilderAtEnd(builder, basic_block);
 
+                let mut reg_usage = RegisterUsage::new();
+                reg_usage.incomming_sgprs.insert(106);
+                reg_usage.incomming_sgprs.insert(126);
+
+                reg_usage.use_sgprs.insert(106);
+                reg_usage.use_sgprs.insert(126);
+
+                reg_usage.def_sgprs.insert(106);
+                reg_usage.def_sgprs.insert(126);
+
+                for inst in &block.insts {
+                    self.analyze_instructions(inst, &mut reg_usage);
+                }
+
+                emitter.emit_restore_registers(&reg_usage);
+
                 if is_terminator(block.insts.last().unwrap()) {
                     for inst in &block.insts[..block.insts.len() - 1] {
                         basic_block = emitter.emit_instruction(basic_block, inst);
                     }
+
+                    emitter.emit_spill_registers(&reg_usage);
+
                     let last_inst = block.insts.last().unwrap();
                     if let InstFormat::SOPP(inst) = last_inst {
                         match inst.op {
@@ -10978,6 +11116,8 @@ impl RDNATranslator {
                     for inst in &block.insts {
                         basic_block = emitter.emit_instruction(basic_block, inst);
                     }
+
+                    emitter.emit_spill_registers(&reg_usage);
 
                     if block.next_pcs.len() == 1 {
                         llvm::core::LLVMBuildBr(
@@ -11267,7 +11407,8 @@ impl RDNATranslator {
                 ret_value,
                 sgpr_ptr_map: HashMap::new(),
                 vgpr_ptr_map: HashMap::new(),
-                use_vgpr_stack_cache: USE_VGPR_STACK_CACHE,
+                vgpr_reg_map: HashMap::new(),
+                use_vgpr_stack_cache: false,
             };
 
             let reg_usage = self.analyze();
@@ -11353,6 +11494,8 @@ impl RDNATranslator {
             }
 
             emitter.emit_alloc_registers(&reg_usage);
+
+            emitter.emit_restore_registers(&reg_usage);
 
             let block_pc = self.get_address().unwrap();
             let current_pc = self.get_pc();

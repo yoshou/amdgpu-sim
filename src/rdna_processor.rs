@@ -6,7 +6,7 @@ use crate::rdna_instructions::*;
 use crate::rdna_translator::*;
 
 static USE_INTERPRETER: bool = false;
-static USE_ENTIRE_KERNEL_TRANSLATION: bool = false;
+static USE_ENTIRE_KERNEL_TRANSLATION: bool = true;
 static USE_SIMD: bool = true;
 
 struct F64x8 {
