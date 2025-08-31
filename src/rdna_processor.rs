@@ -3967,7 +3967,7 @@ impl<'a> RDNAProcessor<'a> {
         let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
 
         use indicatif::{ProgressBar, ProgressStyle};
-        let bar = Arc::new(ProgressBar::new(num_workgroups as u64 * 4));
+        let bar = ProgressBar::new(num_workgroups as u64 * 4);
 
         bar.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) \n {msg}")
@@ -4005,7 +4005,7 @@ impl<'a> RDNAProcessor<'a> {
                         let simd: Arc<Mutex<SIMD32>> =
                             Arc::clone(&self.wgps[wgp_idx].cunits[cu_idx].simds[simd_idx]);
 
-                        let bar = Arc::clone(&bar);
+                        let bar = bar.clone();
                         pool.execute(move || {
                             if let Ok(mut v) = simd.lock() {
                                 v.dispatch(entry_address, setup_data);
