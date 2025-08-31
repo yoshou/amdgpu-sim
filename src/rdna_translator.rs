@@ -2653,7 +2653,7 @@ impl IREmitter {
         }
     }
 
-    unsafe fn emit_spill_registers(&mut self, reg_usage: &RegisterUsage) {
+    unsafe fn emit_save_registers(&mut self, reg_usage: &RegisterUsage) {
         let context = self.context;
         let builder = self.builder;
         let empty_name = std::ffi::CString::new("").unwrap();
@@ -11863,39 +11863,6 @@ impl RDNATranslator {
         self.insts.push(inst);
     }
 
-    fn get_pc(&self) -> u64 {
-        *self.addresses.last().unwrap() as u64
-    }
-
-    fn get_next_pcs(&self) -> Vec<u64> {
-        let inst = self.insts.last().unwrap();
-        let mut next_pscs = Vec::new();
-        let next_pc = ((self.get_pc() as i64) + 4) as usize;
-        match inst {
-            InstFormat::SOPP(inst) => match inst.op {
-                I::S_CBRANCH_EXECZ
-                | I::S_CBRANCH_EXECNZ
-                | I::S_CBRANCH_VCCZ
-                | I::S_CBRANCH_VCCNZ
-                | I::S_CBRANCH_SCC0
-                | I::S_CBRANCH_SCC1 => {
-                    next_pscs.push(next_pc as u64);
-                    let next_pc =
-                        ((self.get_pc() as i64) + ((inst.simm16 as i64) * 4) + 4) as usize;
-                    next_pscs.push(next_pc as u64);
-                }
-                I::S_BRANCH => {
-                    let next_pc =
-                        ((self.get_pc() as i64) + ((inst.simm16 as i64) * 4) + 4) as usize;
-                    next_pscs.push(next_pc as u64);
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        next_pscs
-    }
-
     fn analyze_instructions(&self, inst: &InstFormat, reg_usage: &mut RegisterUsage) {
         match inst {
             InstFormat::SOPP(inst) => match inst.op {
@@ -12647,7 +12614,7 @@ impl RDNATranslator {
                         basic_block = emitter.emit_instruction(basic_block, inst);
                     }
 
-                    emitter.emit_spill_registers(&reg_usage);
+                    emitter.emit_save_registers(&reg_usage);
 
                     let last_inst = block.insts.last().unwrap();
                     if let InstFormat::SOPP(inst) = last_inst {
@@ -12781,7 +12748,7 @@ impl RDNATranslator {
                         basic_block = emitter.emit_instruction(basic_block, inst);
                     }
 
-                    emitter.emit_spill_registers(&reg_usage);
+                    emitter.emit_save_registers(&reg_usage);
 
                     if block.next_pcs.len() == 1 {
                         llvm::core::LLVMBuildBr(
@@ -13171,7 +13138,7 @@ impl RDNATranslator {
                 *self.addresses.last().unwrap(),
             );
 
-            emitter.emit_spill_registers(&reg_usage);
+            emitter.emit_save_registers(&reg_usage);
 
             llvm::core::LLVMBuildRet(builder, emitter.ret_value);
 
