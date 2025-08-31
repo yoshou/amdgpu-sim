@@ -12769,7 +12769,7 @@ impl RDNATranslator {
                 cpu_feature,
                 llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
                 llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-                llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+                llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
             );
 
             let pass_builder_options =
@@ -12842,7 +12842,7 @@ impl RDNATranslator {
                     cpu_feature,
                     llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
                     llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
                 );
                 let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
                 jtmb
@@ -13146,7 +13146,7 @@ impl RDNATranslator {
                 cpu_feature,
                 llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
                 llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-                llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+                llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
             );
 
             let pass_builder_options =
@@ -13219,7 +13219,7 @@ impl RDNATranslator {
                     cpu_feature,
                     llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
                     llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelLarge,
+                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
                 );
                 let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
                 jtmb
