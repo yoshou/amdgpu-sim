@@ -12820,30 +12820,6 @@ impl RDNATranslator {
                 }
                 jtmb
             } else {
-                let triple = llvm::core::LLVMGetTarget(module);
-                let mut target = std::ptr::null_mut();
-                let mut err = std::ptr::null_mut();
-                let result =
-                    llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut err);
-                if result != 0 {
-                    let err = std::ffi::CString::from_raw(err);
-                    let err_ = err.clone();
-                    panic!(
-                        "Failed to get target from triple: {}",
-                        err_.to_str().unwrap()
-                    );
-                }
-                let cpu_name = llvm::target_machine::LLVMGetHostCPUName();
-                let cpu_feature = llvm::target_machine::LLVMGetHostCPUFeatures();
-                let tm = llvm::target_machine::LLVMCreateTargetMachine(
-                    target,
-                    triple,
-                    cpu_name,
-                    cpu_feature,
-                    llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-                    llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
-                );
                 let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
                 jtmb
             };
@@ -13197,30 +13173,6 @@ impl RDNATranslator {
                 }
                 jtmb
             } else {
-                let triple = llvm::core::LLVMGetTarget(module);
-                let mut target = std::ptr::null_mut();
-                let mut err = std::ptr::null_mut();
-                let result =
-                    llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut err);
-                if result != 0 {
-                    let err = std::ffi::CString::from_raw(err);
-                    let err_ = err.clone();
-                    panic!(
-                        "Failed to get target from triple: {}",
-                        err_.to_str().unwrap()
-                    );
-                }
-                let cpu_name = llvm::target_machine::LLVMGetHostCPUName();
-                let cpu_feature = llvm::target_machine::LLVMGetHostCPUFeatures();
-                let tm = llvm::target_machine::LLVMCreateTargetMachine(
-                    target,
-                    triple,
-                    cpu_name,
-                    cpu_feature,
-                    llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-                    llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-                    llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
-                );
                 let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
                 jtmb
             };
