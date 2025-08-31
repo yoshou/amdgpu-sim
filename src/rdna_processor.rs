@@ -3774,6 +3774,7 @@ struct WorkgroupProcessor {
 }
 
 use std::sync::{Arc, Mutex};
+use threadpool::ThreadPool;
 
 pub struct RDNAProcessor<'a> {
     wgps: Vec<WorkgroupProcessor>,
@@ -3966,7 +3967,7 @@ impl<'a> RDNAProcessor<'a> {
         let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
 
         use indicatif::{ProgressBar, ProgressStyle};
-        let bar = ProgressBar::new(num_workgroups as u64);
+        let bar = Arc::new(ProgressBar::new(num_workgroups as u64 * 4));
 
         bar.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) \n {msg}")
@@ -3974,8 +3975,9 @@ impl<'a> RDNAProcessor<'a> {
 
         let num_wgps = self.wgps.len();
 
+        let pool = ThreadPool::new(16);
+
         for workgroup_id_base in (0..num_workgroups).step_by(num_wgps) {
-            let mut thread_handles = vec![];
             for wgp_idx in 0..num_wgps {
                 let workgroup_id = workgroup_id_base + wgp_idx as u32;
                 let workgroup_id_x = workgroup_id % num_workgroup_x;
@@ -4003,22 +4005,19 @@ impl<'a> RDNAProcessor<'a> {
                         let simd: Arc<Mutex<SIMD32>> =
                             Arc::clone(&self.wgps[wgp_idx].cunits[cu_idx].simds[simd_idx]);
 
-                        let handle = std::thread::spawn(move || {
+                        let bar = Arc::clone(&bar);
+                        pool.execute(move || {
                             if let Ok(mut v) = simd.lock() {
                                 v.dispatch(entry_address, setup_data);
                             }
+                            bar.inc(1);
                         });
-                        thread_handles.push(handle);
                     }
                 }
-
-                bar.inc(1);
-            }
-
-            for t in thread_handles {
-                t.join().unwrap();
             }
         }
+
+        pool.join();
 
         let mut sum_block_call_count = HashMap::new();
         let mut sum_block_elapsed_time = HashMap::new();
