@@ -13829,13 +13829,6 @@ impl RDNATranslator {
                 context,
             );
 
-            llvm::core::LLVMSetTarget(
-                module,
-                std::ffi::CString::new("x86_64-pc-linux-gnu")
-                    .unwrap()
-                    .as_ptr(),
-            );
-
             let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
             let mut param_ty = vec![
                 llvm::core::LLVMPointerType(llvm::core::LLVMInt32TypeInContext(context), 0),
@@ -14138,7 +14131,7 @@ impl RDNATranslator {
                 panic!("Failed to verify main module: {}", err_.to_str().unwrap());
             }
 
-            let triple = llvm::core::LLVMGetTarget(module);
+            let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
             let mut target = std::ptr::null_mut();
             let mut err = std::ptr::null_mut();
             let result =
@@ -14312,13 +14305,6 @@ impl RDNATranslator {
             let module = llvm::core::LLVMModuleCreateWithNameInContext(
                 format!("block{}", self.get_address().unwrap()).as_ptr() as *const _,
                 context,
-            );
-
-            llvm::core::LLVMSetTarget(
-                module,
-                std::ffi::CString::new("x86_64-pc-linux-gnu")
-                    .unwrap()
-                    .as_ptr(),
             );
 
             let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
@@ -14495,7 +14481,7 @@ impl RDNATranslator {
                 panic!("Failed to verify main module: {}", err_.to_str().unwrap());
             }
 
-            let triple = llvm::core::LLVMGetTarget(module);
+            let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
             let mut target = std::ptr::null_mut();
             let mut err = std::ptr::null_mut();
             let result =
