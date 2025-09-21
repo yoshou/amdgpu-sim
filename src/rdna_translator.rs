@@ -676,10 +676,11 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(self.context);
         let ty_f64x8 = llvm::core::LLVMVectorType(ty_f64, 8);
 
-        let value = self.vgpr_reg_f64_map.get(&reg).unwrap()[(elem / 8) as usize];
-
-        if value != std::ptr::null_mut() {
-            return value;
+        if self.use_vgpr_stack_cache {
+            let value = self.vgpr_reg_f64_map.get(&reg).unwrap()[(elem / 8) as usize];
+            if value != std::ptr::null_mut() {
+                return value;
+            }
         }
 
         let value = self.emit_load_vgpr_u64x8(reg, elem, mask);
@@ -1124,7 +1125,9 @@ impl IREmitter {
             llvm::core::LLVMBuildBitCast(self.builder, value, ty_i64x8, empty_name.as_ptr());
         self.emit_store_vgpr_u64x8(reg, elem, value_u64x8, mask);
 
-        self.vgpr_reg_f64_map.get_mut(&reg).unwrap()[(elem / 8) as usize] = value;
+        if self.use_vgpr_stack_cache {
+            self.vgpr_reg_f64_map.get_mut(&reg).unwrap()[(elem / 8) as usize] = value;
+        }
     }
 
     unsafe fn emit_store_vgpr_u64x8_avx2(
