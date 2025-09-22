@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::os::raw::c_void;
 
-const USE_VGPR_STACK_CACHE: bool = true;
-const USE_SGPR_STACK_CACHE: bool = true;
+const USE_VGPR_CACHE: bool = true;
+const USE_SGPR_CACHE: bool = true;
 const USE_SIMD: bool = true;
 const USE_MASKED_GATHER: bool = true;
 const SIMD_WIDTH: usize = 16;
@@ -126,7 +126,8 @@ struct IREmitter {
     vgpr_reg_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 32 / SIMD_WIDTH]>,
     vgpr_incomming_reg_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 32 / SIMD_WIDTH]>,
     vgpr_reg_f64_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 32 / SIMD_WIDTH]>,
-    use_vgpr_stack_cache: bool,
+    use_vgpr_cache: bool,
+    use_scc_cache: bool,
 }
 
 impl IREmitter {
@@ -419,7 +420,11 @@ impl IREmitter {
     unsafe fn emit_load_scc_u8(&mut self) -> llvm::prelude::LLVMValueRef {
         let context = self.context;
         let builder = self.builder;
-        let scc_ptr = self.local_scc_ptr;
+        let scc_ptr = if self.use_scc_cache {
+            self.local_scc_ptr
+        } else {
+            self.scc_ptr
+        };
 
         let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
@@ -429,7 +434,11 @@ impl IREmitter {
 
     unsafe fn emit_store_scc_u8(&mut self, value: llvm::prelude::LLVMValueRef) {
         let builder = self.builder;
-        let scc_ptr = self.local_scc_ptr;
+        let scc_ptr = if self.use_scc_cache {
+            self.local_scc_ptr
+        } else {
+            self.scc_ptr
+        };
 
         llvm::core::LLVMBuildStore(builder, value, scc_ptr);
     }
@@ -446,7 +455,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             panic!("Not implemented");
         }
 
@@ -564,7 +573,7 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(self.context);
         let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             let value = self.vgpr_reg_f64_map.get(&reg).unwrap()[elem as usize / N];
             if value != std::ptr::null_mut() {
                 return value;
@@ -608,7 +617,7 @@ impl IREmitter {
         let ptr_ty = llvm::core::LLVMPointerTypeInContext(context, 0);
         let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             return self.emit_load_stack_vgpr_u32xn::<N>(reg, elem);
         }
 
@@ -700,7 +709,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             panic!("Not implemented");
         }
 
@@ -745,7 +754,7 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
         let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             return self.emit_store_stack_vgpr_u32xn::<N>(reg, elem, value, mask);
         }
 
@@ -898,7 +907,7 @@ impl IREmitter {
             llvm::core::LLVMBuildBitCast(self.builder, value, ty_i64xn, empty_name.as_ptr());
         self.emit_store_vgpr_u64xn::<N>(reg, elem, value_u64xn, mask);
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             self.vgpr_reg_f64_map.get_mut(&reg).unwrap()[elem as usize / N] = value;
         }
     }
@@ -926,7 +935,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        if USE_SGPR_STACK_CACHE {
+        if USE_SGPR_CACHE {
             return self.emit_load_stack_sgpr_u32(reg);
         }
 
@@ -990,7 +999,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        if USE_SGPR_STACK_CACHE {
+        if USE_SGPR_CACHE {
             return self.emit_store_stack_sgpr_u32(reg, value);
         }
 
@@ -1949,7 +1958,7 @@ impl IREmitter {
     }
 
     unsafe fn emit_alloc_registers(&mut self, reg_usage: &RegisterUsage) {
-        if USE_SGPR_STACK_CACHE {
+        if USE_SGPR_CACHE {
             let sgprs: Vec<u32> = reg_usage
                 .use_sgprs
                 .union(&reg_usage.def_sgprs)
@@ -1968,7 +1977,7 @@ impl IREmitter {
             }
         }
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             let vgprs: Vec<u32> = reg_usage
                 .use_vgprs
                 .union(&reg_usage.def_vgprs)
@@ -1994,7 +2003,7 @@ impl IREmitter {
             }
         }
 
-        if USE_SGPR_STACK_CACHE {
+        if USE_SGPR_CACHE {
             for sgpr in &reg_usage.incomming_sgprs {
                 let sgpr_ptr = *self.sgpr_ptr_map.get(sgpr).unwrap();
                 let context = self.context;
@@ -2027,7 +2036,7 @@ impl IREmitter {
             }
         }
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             for vgpr in &reg_usage.incomming_vgprs {
                 let context = self.context;
                 let builder = self.builder;
@@ -2089,7 +2098,7 @@ impl IREmitter {
         bb: llvm::prelude::LLVMBasicBlockRef,
         reg_usage: &RegisterUsage,
     ) -> llvm::prelude::LLVMBasicBlockRef {
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             let vgprs: Vec<u32> = reg_usage
                 .use_vgprs
                 .union(&reg_usage.def_vgprs)
@@ -2145,7 +2154,7 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        if USE_SGPR_STACK_CACHE {
+        if USE_SGPR_CACHE {
             for sgpr in &reg_usage.def_sgprs {
                 let sgpr_ptr = *self.sgpr_ptr_map.get(sgpr).unwrap();
                 let mut indices = vec![llvm::core::LLVMConstInt(
@@ -2173,7 +2182,7 @@ impl IREmitter {
             }
         }
 
-        if self.use_vgpr_stack_cache {
+        if self.use_vgpr_cache {
             for vgpr in &reg_usage.def_vgprs {
                 const N: usize = SIMD_WIDTH;
 
@@ -11608,7 +11617,8 @@ impl RDNATranslator {
                 vgpr_reg_map: HashMap::new(),
                 vgpr_incomming_reg_map: HashMap::new(),
                 vgpr_reg_f64_map: HashMap::new(),
-                use_vgpr_stack_cache: USE_VGPR_STACK_CACHE,
+                use_vgpr_cache: USE_VGPR_CACHE,
+                use_scc_cache: true,
             };
 
             let mut reg_usage = RegisterUsage::new();
@@ -12078,7 +12088,8 @@ impl RDNATranslator {
                 vgpr_reg_map: HashMap::new(),
                 vgpr_incomming_reg_map: HashMap::new(),
                 vgpr_reg_f64_map: HashMap::new(),
-                use_vgpr_stack_cache: false,
+                use_vgpr_cache: false,
+                use_scc_cache: false,
             };
 
             {
