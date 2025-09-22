@@ -614,7 +614,7 @@ impl IREmitter {
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
         let ty_i1 = llvm::core::LLVMInt1TypeInContext(self.context);
         let ty_i1xn = llvm::core::LLVMVectorType(ty_i1, N as u32);
-        let ptr_ty = llvm::core::LLVMPointerTypeInContext(context, 0);
+        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
         let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
         if self.use_vgpr_cache {
@@ -624,7 +624,7 @@ impl IREmitter {
         let elem =
             llvm::core::LLVMConstInt(llvm::core::LLVMInt64TypeInContext(context), elem as u64, 0);
 
-        let mut param_tys = vec![ty_i32xn, ptr_ty];
+        let mut param_tys = vec![ty_i32xn, ty_p0];
         let intrinsic_name = format!("llvm.masked.load.v{}i32\0", N);
         let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
             intrinsic_name.as_ptr() as *const _,
@@ -657,7 +657,7 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
 
-        let mut param_tys = vec![ptr_ty, ty_i32, ty_i1xn, ty_i32xn];
+        let mut param_tys = vec![ty_p0, ty_i32, ty_i1xn, ty_i32xn];
         let value = llvm::core::LLVMBuildCall2(
             builder,
             llvm::core::LLVMFunctionType(
@@ -750,7 +750,7 @@ impl IREmitter {
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
         let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
         let ty_i1xn = llvm::core::LLVMVectorType(ty_i1, N as u32);
-        let ty_ptr = llvm::core::LLVMPointerTypeInContext(context, 0);
+        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
         let empty_name = std::ffi::CString::new("").unwrap();
         let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
@@ -781,7 +781,7 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
 
-        let mut param_tys = vec![ty_i32xn, ty_ptr];
+        let mut param_tys = vec![ty_i32xn, ty_p0];
         let intrinsic_name = format!("llvm.masked.store.v{}i32\0", N);
         let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
             intrinsic_name.as_ptr() as *const _,
@@ -793,7 +793,7 @@ impl IREmitter {
             param_tys.as_mut_ptr(),
             param_tys.len() as usize,
         );
-        let mut param_tys = vec![ty_i32xn, ty_ptr, ty_i32, ty_i1xn];
+        let mut param_tys = vec![ty_i32xn, ty_p0, ty_i32, ty_i1xn];
         llvm::core::LLVMBuildCall2(
             builder,
             llvm::core::LLVMFunctionType(
@@ -8223,6 +8223,7 @@ impl IREmitter {
                     let emitter = self;
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
                     let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
@@ -8235,7 +8236,7 @@ impl IREmitter {
                         let ptr = llvm::core::LLVMBuildIntToPtr(
                             builder,
                             addr,
-                            llvm::core::LLVMPointerType(ty_i32, 0),
+                            ty_p0,
                             empty_name.as_ptr(),
                         );
 
@@ -8249,6 +8250,7 @@ impl IREmitter {
                     let emitter = self;
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
                     let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
@@ -8261,7 +8263,7 @@ impl IREmitter {
                         let ptr = llvm::core::LLVMBuildIntToPtr(
                             builder,
                             addr,
-                            llvm::core::LLVMPointerType(ty_i32, 0),
+                            ty_p0,
                             empty_name.as_ptr(),
                         );
                         let data =
@@ -8274,6 +8276,7 @@ impl IREmitter {
                     let emitter = self;
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
                     let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
@@ -8286,7 +8289,7 @@ impl IREmitter {
                         let ptr = llvm::core::LLVMBuildIntToPtr(
                             builder,
                             addr,
-                            llvm::core::LLVMPointerType(ty_i32, 0),
+                            ty_p0,
                             empty_name.as_ptr(),
                         );
                         let data =
@@ -8299,6 +8302,7 @@ impl IREmitter {
                     let emitter = self;
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
                     let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
@@ -8311,7 +8315,7 @@ impl IREmitter {
                         let ptr = llvm::core::LLVMBuildIntToPtr(
                             builder,
                             addr,
-                            llvm::core::LLVMPointerType(ty_i32, 0),
+                            ty_p0,
                             empty_name.as_ptr(),
                         );
                         let data =
@@ -8722,10 +8726,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
-                        let ty_p0 = llvm::core::LLVMPointerType(
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            0,
-                        );
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
@@ -8870,6 +8871,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
@@ -8985,10 +8987,7 @@ impl IREmitter {
                                     let ptr = llvm::core::LLVMBuildIntToPtr(
                                         builder,
                                         addr,
-                                        llvm::core::LLVMPointerType(
-                                            llvm::core::LLVMInt32TypeInContext(context),
-                                            0,
-                                        ),
+                                        ty_p0,
                                         empty_name.as_ptr(),
                                     );
                                     let data = llvm::core::LLVMBuildLoad2(
@@ -9049,6 +9048,7 @@ impl IREmitter {
                     } else {
                         let emitter = self;
                         let empty_name = std::ffi::CString::new("").unwrap();
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
 
                         for i in 0..32 {
                             let elem = llvm::core::LLVMConstInt(
@@ -9108,10 +9108,7 @@ impl IREmitter {
                                 let ptr = llvm::core::LLVMBuildIntToPtr(
                                     builder,
                                     addr,
-                                    llvm::core::LLVMPointerType(
-                                        llvm::core::LLVMInt32TypeInContext(context),
-                                        0,
-                                    ),
+                                    ty_p0,
                                     empty_name.as_ptr(),
                                 );
                                 let data = llvm::core::LLVMBuildLoad2(
@@ -9141,10 +9138,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
-                        let ty_p0 = llvm::core::LLVMPointerType(
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            0,
-                        );
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
@@ -9369,6 +9363,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
@@ -9484,10 +9479,7 @@ impl IREmitter {
                                     let ptr = llvm::core::LLVMBuildIntToPtr(
                                         builder,
                                         addr,
-                                        llvm::core::LLVMPointerType(
-                                            llvm::core::LLVMInt32TypeInContext(context),
-                                            0,
-                                        ),
+                                        ty_p0,
                                         empty_name.as_ptr(),
                                     );
                                     let data = llvm::core::LLVMBuildLoad2(
@@ -9552,6 +9544,7 @@ impl IREmitter {
                     } else {
                         let emitter = self;
                         let empty_name = std::ffi::CString::new("").unwrap();
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
 
                         let mut offsets = Vec::new();
                         for i in 0..32 {
@@ -9624,10 +9617,7 @@ impl IREmitter {
                                 let ptr = llvm::core::LLVMBuildIntToPtr(
                                     builder,
                                     addr,
-                                    llvm::core::LLVMPointerType(
-                                        llvm::core::LLVMInt32TypeInContext(context),
-                                        0,
-                                    ),
+                                    ty_p0,
                                     empty_name.as_ptr(),
                                 );
                                 let data = llvm::core::LLVMBuildLoad2(
@@ -9657,10 +9647,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
-                        let ty_p0 = llvm::core::LLVMPointerType(
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            0,
-                        );
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
@@ -9884,6 +9871,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
@@ -10007,10 +9995,7 @@ impl IREmitter {
                                     let ptr = llvm::core::LLVMBuildIntToPtr(
                                         builder,
                                         addr,
-                                        llvm::core::LLVMPointerType(
-                                            llvm::core::LLVMInt32TypeInContext(context),
-                                            0,
-                                        ),
+                                        ty_p0,
                                         empty_name.as_ptr(),
                                     );
                                     let data = llvm::core::LLVMBuildLoad2(
@@ -10075,6 +10060,8 @@ impl IREmitter {
                     } else {
                         let emitter = self;
                         let empty_name = std::ffi::CString::new("").unwrap();
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+
                         let mut offsets = Vec::new();
                         for i in 0..32 {
                             let elem = llvm::core::LLVMConstInt(
@@ -10146,10 +10133,7 @@ impl IREmitter {
                                 let ptr = llvm::core::LLVMBuildIntToPtr(
                                     builder,
                                     addr,
-                                    llvm::core::LLVMPointerType(
-                                        llvm::core::LLVMInt32TypeInContext(context),
-                                        0,
-                                    ),
+                                    ty_p0,
                                     empty_name.as_ptr(),
                                 );
                                 let data = llvm::core::LLVMBuildLoad2(
@@ -10179,10 +10163,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
-                        let ty_p0 = llvm::core::LLVMPointerType(
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            0,
-                        );
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
@@ -10392,6 +10373,7 @@ impl IREmitter {
                     } else {
                         let emitter = self;
                         let empty_name = std::ffi::CString::new("").unwrap();
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
 
                         let mut offsets = Vec::new();
                         for i in 0..32 {
@@ -10464,10 +10446,7 @@ impl IREmitter {
                                 let ptr = llvm::core::LLVMBuildIntToPtr(
                                     builder,
                                     addr,
-                                    llvm::core::LLVMPointerType(
-                                        llvm::core::LLVMInt32TypeInContext(context),
-                                        0,
-                                    ),
+                                    ty_p0,
                                     empty_name.as_ptr(),
                                 );
 
@@ -10490,10 +10469,7 @@ impl IREmitter {
 
                         const N: usize = SIMD_WIDTH;
 
-                        let ty_p0 = llvm::core::LLVMPointerType(
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            0,
-                        );
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                         let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
@@ -10703,6 +10679,7 @@ impl IREmitter {
                     } else {
                         let emitter = self;
                         let empty_name = std::ffi::CString::new("").unwrap();
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
 
                         let mut offsets = Vec::new();
                         for i in 0..32 {
@@ -10775,10 +10752,7 @@ impl IREmitter {
                                 let ptr = llvm::core::LLVMBuildIntToPtr(
                                     builder,
                                     addr,
-                                    llvm::core::LLVMPointerType(
-                                        llvm::core::LLVMInt32TypeInContext(context),
-                                        0,
-                                    ),
+                                    ty_p0,
                                     empty_name.as_ptr(),
                                 );
 
@@ -11564,12 +11538,8 @@ impl RDNATranslator {
             );
 
             let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-            let mut param_ty = vec![
-                llvm::core::LLVMPointerType(llvm::core::LLVMInt32TypeInContext(context), 0),
-                llvm::core::LLVMPointerType(llvm::core::LLVMInt32TypeInContext(context), 0),
-                llvm::core::LLVMPointerType(llvm::core::LLVMInt8TypeInContext(context), 0),
-                llvm::core::LLVMPointerType(llvm::core::LLVMInt8TypeInContext(context), 0),
-            ];
+            let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+            let mut param_ty = vec![ty_p0, ty_p0, ty_p0, ty_p0];
             let ty_function = llvm::core::LLVMFunctionType(
                 ty_i32,
                 param_ty.as_mut_ptr(),
@@ -12032,15 +12002,9 @@ impl RDNATranslator {
                 context,
             );
 
-            let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
             let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-            let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-            let mut param_ty = vec![
-                llvm::core::LLVMPointerType(ty_i32, 0),
-                llvm::core::LLVMPointerType(ty_i32, 0),
-                llvm::core::LLVMPointerType(ty_i8, 0),
-                llvm::core::LLVMPointerType(ty_i64, 0),
-            ];
+            let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+            let mut param_ty = vec![ty_p0, ty_p0, ty_p0, ty_p0];
             let ty_function = llvm::core::LLVMFunctionType(
                 ty_i32,
                 param_ty.as_mut_ptr(),
