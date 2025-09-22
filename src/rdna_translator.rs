@@ -120,6 +120,7 @@ struct IREmitter {
     pc_ptr: llvm::prelude::LLVMValueRef,
     ret_value: llvm::prelude::LLVMValueRef,
     exec_value: llvm::prelude::LLVMValueRef,
+    local_scc_ptr: llvm::prelude::LLVMValueRef,
     sgpr_ptr_map: HashMap<u32, llvm::prelude::LLVMValueRef>,
     vgpr_ptr_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 32 / SIMD_WIDTH]>,
     vgpr_reg_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 32 / SIMD_WIDTH]>,
@@ -413,6 +414,24 @@ impl IREmitter {
         self.emit_store_sgpr_u32(sgpr_reg, new_vcc);
 
         bb_loop_exit
+    }
+
+    unsafe fn emit_load_scc_u8(&mut self) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let builder = self.builder;
+        let scc_ptr = self.local_scc_ptr;
+
+        let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        llvm::core::LLVMBuildLoad2(builder, ty_i8, scc_ptr, empty_name.as_ptr())
+    }
+
+    unsafe fn emit_store_scc_u8(&mut self, value: llvm::prelude::LLVMValueRef) {
+        let builder = self.builder;
+        let scc_ptr = self.local_scc_ptr;
+
+        llvm::core::LLVMBuildStore(builder, value, scc_ptr);
     }
 
     unsafe fn emit_load_vgpr_u32(
@@ -2044,6 +2063,25 @@ impl IREmitter {
                 }
             }
         }
+
+        {
+            let context = self.context;
+            let builder = self.builder;
+            let empty_name = std::ffi::CString::new("").unwrap();
+            let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+
+            self.local_scc_ptr =
+                llvm::core::LLVMBuildAlloca(self.builder, ty_i8, empty_name.as_ptr());
+
+            llvm::core::LLVMBuildMemCpy(
+                builder,
+                self.local_scc_ptr,
+                1,
+                self.scc_ptr,
+                1,
+                llvm::core::LLVMConstInt(ty_i8, 1, 0),
+            );
+        }
     }
 
     unsafe fn emit_restore_registers(
@@ -2170,7 +2208,6 @@ impl IREmitter {
     ) -> llvm::prelude::LLVMBasicBlockRef {
         let context = self.context;
         let builder = self.builder;
-        let scc_ptr = self.scc_ptr;
 
         match inst {
             InstFormat::SOPP(inst) => match inst.op {
@@ -2243,8 +2280,7 @@ impl IREmitter {
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
-                    let scc_value =
-                        llvm::core::LLVMBuildLoad2(builder, ty_i8, scc_ptr, empty_name.as_ptr());
+                    let scc_value = self.emit_load_scc_u8();
 
                     let cmp_value = llvm::core::LLVMBuildICmp(
                         builder,
@@ -2278,8 +2314,7 @@ impl IREmitter {
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
-                    let scc_value =
-                        llvm::core::LLVMBuildLoad2(builder, ty_i8, scc_ptr, empty_name.as_ptr());
+                    let scc_value = self.emit_load_scc_u8();
 
                     let cmp_value = llvm::core::LLVMBuildICmp(
                         builder,
@@ -2343,7 +2378,6 @@ impl IREmitter {
     ) -> llvm::prelude::LLVMBasicBlockRef {
         let context = self.context;
         let builder = self.builder;
-        let scc_ptr = self.scc_ptr;
         let mut bb = bb;
 
         match inst {
@@ -8310,7 +8344,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_AND_NOT1_SAVEEXEC_B32 => {
                     let emitter = self;
@@ -8351,7 +8385,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_MOV_B32 => {
                     let emitter = self;
@@ -8399,7 +8433,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_OR_B32 => {
                     let emitter = self;
@@ -8426,7 +8460,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_XOR_B32 => {
                     let emitter = self;
@@ -8453,7 +8487,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_AND_NOT1_B32 => {
                     let emitter = self;
@@ -8491,7 +8525,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_OR_NOT1_B32 => {
                     let emitter = self;
@@ -8525,7 +8559,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_LSHR_B32 => {
                     let emitter = self;
@@ -8558,7 +8592,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_CSELECT_B32 => {
                     let emitter = self;
@@ -8568,12 +8602,8 @@ impl IREmitter {
                     let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
                     let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
 
-                    let scc_value = llvm::core::LLVMBuildLoad2(
-                        builder,
-                        ty_i8,
-                        emitter.scc_ptr,
-                        empty_name.as_ptr(),
-                    );
+                    let scc_value = emitter.emit_load_scc_u8();
+
                     let cmp = llvm::core::LLVMBuildICmp(
                         builder,
                         llvm::LLVMIntPredicate::LLVMIntNE,
@@ -8627,7 +8657,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_CMP_LG_U64 => {
                     let emitter = self;
@@ -8648,7 +8678,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 I::S_CMP_EQ_U64 => {
                     let emitter = self;
@@ -8669,7 +8699,7 @@ impl IREmitter {
                     let scc_value =
                         llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
-                    llvm::core::LLVMBuildStore(builder, scc_value, emitter.scc_ptr);
+                    emitter.emit_store_scc_u8(scc_value);
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
@@ -11572,6 +11602,7 @@ impl RDNATranslator {
                 pc_ptr,
                 ret_value,
                 exec_value: std::ptr::null_mut(),
+                local_scc_ptr: std::ptr::null_mut(),
                 sgpr_ptr_map: HashMap::new(),
                 vgpr_ptr_map: HashMap::new(),
                 vgpr_reg_map: HashMap::new(),
@@ -11711,12 +11742,7 @@ impl RDNATranslator {
                             I::S_CBRANCH_SCC0 => {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
-                                let scc_value = llvm::core::LLVMBuildLoad2(
-                                    builder,
-                                    llvm::core::LLVMInt8TypeInContext(context),
-                                    emitter.scc_ptr,
-                                    empty_name.as_ptr() as *const _,
-                                );
+                                let scc_value = emitter.emit_load_scc_u8();
 
                                 let zero = llvm::core::LLVMConstInt(
                                     llvm::core::LLVMInt8TypeInContext(context),
@@ -11740,12 +11766,7 @@ impl RDNATranslator {
                             I::S_CBRANCH_SCC1 => {
                                 let empty_name = std::ffi::CString::new("").unwrap();
 
-                                let scc_value = llvm::core::LLVMBuildLoad2(
-                                    builder,
-                                    llvm::core::LLVMInt8TypeInContext(context),
-                                    emitter.scc_ptr,
-                                    empty_name.as_ptr() as *const _,
-                                );
+                                let scc_value = emitter.emit_load_scc_u8();
 
                                 let zero = llvm::core::LLVMConstInt(
                                     llvm::core::LLVMInt8TypeInContext(context),
@@ -12051,6 +12072,7 @@ impl RDNATranslator {
                 pc_ptr,
                 ret_value,
                 exec_value: std::ptr::null_mut(),
+                local_scc_ptr: std::ptr::null_mut(),
                 sgpr_ptr_map: HashMap::new(),
                 vgpr_ptr_map: HashMap::new(),
                 vgpr_reg_map: HashMap::new(),
