@@ -2814,7 +2814,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -2873,7 +2873,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -2910,7 +2910,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULT,
+                                llvm::LLVMRealPredicate::LLVMRealOLT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -2969,7 +2969,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULT,
+                                llvm::LLVMRealPredicate::LLVMRealOLT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3006,7 +3006,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULT,
+                                llvm::LLVMRealPredicate::LLVMRealOLT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3067,7 +3067,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULT,
+                                llvm::LLVMRealPredicate::LLVMRealOLT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3106,7 +3106,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3167,7 +3167,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3206,7 +3206,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULE,
+                                llvm::LLVMRealPredicate::LLVMRealOLE,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3265,7 +3265,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULE,
+                                llvm::LLVMRealPredicate::LLVMRealOLE,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3302,7 +3302,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3370,7 +3370,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3409,7 +3409,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGE,
+                                llvm::LLVMRealPredicate::LLVMRealOGE,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -3477,7 +3477,7 @@ impl IREmitter {
                             let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGE,
+                                llvm::LLVMRealPredicate::LLVMRealOGE,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -5278,7 +5278,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULT,
+                                llvm::LLVMRealPredicate::LLVMRealOLT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -5349,7 +5349,7 @@ impl IREmitter {
 
                                 let cmp_value = llvm::core::LLVMBuildFCmp(
                                     builder,
-                                    llvm::LLVMRealPredicate::LLVMRealULT,
+                                    llvm::LLVMRealPredicate::LLVMRealOLT,
                                     s0_value,
                                     s1_value,
                                     empty_name.as_ptr(),
@@ -5396,7 +5396,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -5467,7 +5467,7 @@ impl IREmitter {
 
                                 let cmp_value = llvm::core::LLVMBuildFCmp(
                                     builder,
-                                    llvm::LLVMRealPredicate::LLVMRealUGT,
+                                    llvm::LLVMRealPredicate::LLVMRealOGT,
                                     s0_value,
                                     s1_value,
                                     empty_name.as_ptr(),
@@ -5514,7 +5514,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealULT,
+                                llvm::LLVMRealPredicate::LLVMRealOLT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -5582,7 +5582,7 @@ impl IREmitter {
 
                                 let cmp_value = llvm::core::LLVMBuildFCmp(
                                     builder,
-                                    llvm::LLVMRealPredicate::LLVMRealULT,
+                                    llvm::LLVMRealPredicate::LLVMRealOLT,
                                     s0_value,
                                     s1_value,
                                     empty_name.as_ptr(),
@@ -5624,7 +5624,7 @@ impl IREmitter {
 
                             let cmp_value = llvm::core::LLVMBuildFCmp(
                                 builder,
-                                llvm::LLVMRealPredicate::LLVMRealUGT,
+                                llvm::LLVMRealPredicate::LLVMRealOGT,
                                 s0_value,
                                 s1_value,
                                 empty_name.as_ptr(),
@@ -5692,7 +5692,7 @@ impl IREmitter {
 
                                 let cmp_value = llvm::core::LLVMBuildFCmp(
                                     builder,
-                                    llvm::LLVMRealPredicate::LLVMRealUGT,
+                                    llvm::LLVMRealPredicate::LLVMRealOGT,
                                     s0_value,
                                     s1_value,
                                     empty_name.as_ptr(),
