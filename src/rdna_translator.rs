@@ -11639,7 +11639,7 @@ impl RDNATranslator {
                 let basic_block = llvm::core::LLVMAppendBasicBlockInContext(
                     context,
                     function,
-                    format!("block_{}\0", addr).as_ptr() as *const _,
+                    format!("block{:x}\0", addr).as_ptr() as *const _,
                 );
                 basic_blocks.insert(addr, basic_block);
             }
