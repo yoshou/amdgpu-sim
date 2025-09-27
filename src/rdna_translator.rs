@@ -1177,41 +1177,25 @@ impl IREmitter {
     ) -> llvm::prelude::LLVMValueRef {
         let context = self.context;
         let builder = self.builder;
+        let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+        let ty_i1x32 = llvm::core::LLVMVectorType(ty_i1, 32);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
         let empty_name = std::ffi::CString::new("").unwrap();
 
-        let zero_vec = llvm::core::LLVMConstVector(
-            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-            N as u32,
-        );
-        let poison = llvm::core::LLVMGetPoison(ty_i32xn);
+        let bit_vec = llvm::core::LLVMBuildBitCast(builder, value, ty_i1x32, empty_name.as_ptr());
 
-        let bit_mask = self.emit_bit_mask_u32xn::<N>(elem);
+        let poison = llvm::core::LLVMGetPoison(ty_i1x32);
 
-        let value_vec = llvm::core::LLVMBuildInsertElement(
+        let mut indices_values = Vec::new();
+        for i in 0..N {
+            indices_values.push(llvm::core::LLVMConstInt(ty_i32, elem as u64 + i as u64, 0));
+        }
+
+        let mask = llvm::core::LLVMBuildShuffleVector(
             builder,
+            bit_vec,
             poison,
-            value,
-            llvm::core::LLVMConstInt(ty_i32, 0, 0),
-            empty_name.as_ptr(),
-        );
-
-        let value_vec = llvm::core::LLVMBuildShuffleVector(
-            builder,
-            value_vec,
-            poison,
-            zero_vec,
-            empty_name.as_ptr(),
-        );
-
-        let value_vec = llvm::core::LLVMBuildAnd(builder, value_vec, bit_mask, empty_name.as_ptr());
-
-        let mask = llvm::core::LLVMBuildICmp(
-            builder,
-            llvm::LLVMIntPredicate::LLVMIntNE,
-            value_vec,
-            zero_vec,
+            llvm::core::LLVMConstVector(indices_values.as_mut_ptr(), N as u32),
             empty_name.as_ptr(),
         );
 
@@ -2412,12 +2396,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2436,47 +2416,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -2508,12 +2472,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2532,47 +2492,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -2604,12 +2548,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2628,47 +2568,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -2700,12 +2624,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2724,47 +2644,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -2796,12 +2700,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2820,47 +2720,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -2892,12 +2776,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2916,47 +2796,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -2988,12 +2852,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3014,47 +2874,31 @@ impl IREmitter {
                             let cmp_value =
                                 llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3088,12 +2932,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3114,47 +2954,31 @@ impl IREmitter {
                             let cmp_value =
                                 llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3188,12 +3012,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3212,47 +3032,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3284,12 +3088,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3310,47 +3110,31 @@ impl IREmitter {
                             let cmp_value =
                                 llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3391,12 +3175,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3417,47 +3197,31 @@ impl IREmitter {
                             let cmp_value =
                                 llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3498,12 +3262,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3522,47 +3282,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3601,12 +3345,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3625,47 +3365,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -3704,12 +3428,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -3728,47 +3448,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5055,12 +4759,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5079,47 +4779,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5155,12 +4839,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5179,47 +4859,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5255,12 +4919,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5287,47 +4947,31 @@ impl IREmitter {
                             let cmp_value =
                                 llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5373,12 +5017,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5405,47 +5045,31 @@ impl IREmitter {
                             let cmp_value =
                                 llvm::core::LLVMBuildNot(builder, cmp_value, empty_name.as_ptr());
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5491,12 +5115,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5520,47 +5140,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5601,12 +5205,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5630,47 +5230,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5711,12 +5295,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5740,47 +5320,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5821,12 +5385,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5850,47 +5410,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
@@ -5931,12 +5475,8 @@ impl IREmitter {
                         const N: usize = SIMD_WIDTH;
 
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-                        let mut agg_value = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
+                        let mut cmp_values = Vec::new();
 
                         for i in (0..32).step_by(N) {
                             let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5960,47 +5500,31 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let zero_vec = llvm::core::LLVMConstVector(
-                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
-                                N as u32,
-                            );
-
-                            let bit_flags = emitter.emit_bit_mask_u32xn::<N>(i);
-
-                            let flag_value = llvm::core::LLVMBuildSelect(
-                                builder,
-                                cmp_value,
-                                bit_flags,
-                                zero_vec,
-                                empty_name.as_ptr(),
-                            );
-
-                            agg_value = llvm::core::LLVMBuildOr(
-                                builder,
-                                agg_value,
-                                flag_value,
-                                empty_name.as_ptr(),
-                            );
+                            cmp_values.push(cmp_value);
                         }
 
-                        let mut param_tys = vec![ty_i32xn];
-                        let intrinsic_name = format!("llvm.vector.reduce.or.v{}i32\0", N);
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
+                        let mut index_values = Vec::new();
+                        for i in 0..32 {
+                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+                        }
+
+                        let indices = llvm::core::LLVMConstVector(
+                            index_values.as_mut_ptr(),
+                            index_values.len() as u32,
                         );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
-                        let d_value = llvm::core::LLVMBuildCall2(
+
+                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
-                            llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
-                            intrinsic,
-                            [agg_value].as_mut_ptr(),
-                            1,
+                            cmp_values[0],
+                            cmp_values[1],
+                            indices,
+                            empty_name.as_ptr(),
+                        );
+
+                        let d_value = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            cmp_value,
+                            ty_i32,
                             empty_name.as_ptr(),
                         );
 
