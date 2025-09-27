@@ -1986,7 +1986,13 @@ impl IREmitter {
                 self.vgpr_ptr_map.insert(*vgpr, vgpr_ptr);
             }
         }
+    }
 
+    unsafe fn emit_restore_stack(
+        &mut self,
+        bb: llvm::prelude::LLVMBasicBlockRef,
+        reg_usage: &RegisterUsage,
+    ) -> llvm::prelude::LLVMBasicBlockRef {
         if USE_SGPR_CACHE {
             for sgpr in &reg_usage.incomming_sgprs {
                 let sgpr_ptr = *self.sgpr_ptr_map.get(sgpr).unwrap();
@@ -2075,6 +2081,8 @@ impl IREmitter {
                 llvm::core::LLVMConstInt(ty_i8, 1, 0),
             );
         }
+
+        bb
     }
 
     unsafe fn emit_restore_registers(
@@ -2128,7 +2136,7 @@ impl IREmitter {
         bb
     }
 
-    unsafe fn emit_save_registers(
+    unsafe fn emit_save_stack(
         &mut self,
         bb: llvm::prelude::LLVMBasicBlockRef,
         reg_usage: &RegisterUsage,
@@ -2165,6 +2173,16 @@ impl IREmitter {
                 );
             }
         }
+        bb
+    }
+
+    unsafe fn emit_save_registers(
+        &mut self,
+        bb: llvm::prelude::LLVMBasicBlockRef,
+        reg_usage: &RegisterUsage,
+    ) -> llvm::prelude::LLVMBasicBlockRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
 
         if self.use_vgpr_cache {
             for vgpr in &reg_usage.def_vgprs {
@@ -11153,6 +11171,7 @@ impl RDNATranslator {
             }
 
             emitter.emit_alloc_registers(&reg_usage);
+            emitter.emit_restore_stack(entry_bb, &reg_usage);
 
             let mut basic_blocks = HashMap::new();
 
@@ -11664,19 +11683,21 @@ impl RDNATranslator {
 
             emitter.emit_alloc_registers(&reg_usage);
 
+            bb = emitter.emit_restore_stack(bb, &reg_usage);
             bb = emitter.emit_restore_registers(bb, &reg_usage);
 
             for inst in &self.insts[..self.insts.len() - 1] {
                 bb = emitter.emit_instruction(bb, inst);
             }
 
-            emitter.emit_terminator(
+            bb = emitter.emit_terminator(
                 bb,
                 self.insts.last().unwrap(),
                 *self.addresses.last().unwrap(),
             );
 
-            emitter.emit_save_registers(bb, &reg_usage);
+            bb = emitter.emit_save_registers(bb, &reg_usage);
+            emitter.emit_save_stack(bb, &reg_usage);
 
             llvm::core::LLVMBuildRet(builder, emitter.ret_value);
 
