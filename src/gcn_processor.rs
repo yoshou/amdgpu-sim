@@ -3728,8 +3728,12 @@ impl<'a> GCNProcessor<'a> {
 
         let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
 
-        use indicatif::ProgressBar;
-        let bar = ProgressBar::new(num_workgroups as u64);
+        use indicatif::{ProgressBar, ProgressStyle};
+        let bar = ProgressBar::new(num_workgroups as u64 * 4);
+
+        bar.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) \n {msg}")
+            .progress_chars("#>-"));
 
         let num_cunits = self.cunits.len();
 
