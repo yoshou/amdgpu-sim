@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
@@ -173,6 +174,16 @@ fn main() -> Result<()> {
         "gfx803".to_string()
     };
 
+    let expect = if sort_increasing == 1 {
+        input.iter().copied().sorted().collect_vec()
+    } else {
+        input
+            .iter()
+            .copied()
+            .sorted_by(|a, b| b.cmp(a))
+            .collect_vec()
+    };
+
     let program_filename = format!("examples/bitonic_sort/kernel_{}.o", arch);
     let kernel_name = "_Z19bitonic_sort_kernelPjjjb.kd";
     let mut file = File::open(program_filename).unwrap();
@@ -319,12 +330,11 @@ fn main() -> Result<()> {
             }
         }
 
-        println!("---------------------------------------------");
-        for i in 0..length {
-            let value = input[i];
-            println!("{}", value);
+        if input == expect {
+            println!("Validation passed.");
+        } else {
+            println!("Validation failed.");
         }
-        println!("---------------------------------------------");
     }
 
     Ok(())
