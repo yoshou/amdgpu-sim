@@ -1914,6 +1914,30 @@ fn v_mul_hi_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     }
 }
 
+fn v_max_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s0_value.max(s1_value);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
+fn v_min_u32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1);
+        let d_value = s0_value.min(s1_value);
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
 fn v_alignbit_b32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -3352,6 +3376,12 @@ impl ComputeUnit {
             }
             I::V_MUL_HI_U32 => {
                 v_mul_hi_u32(self, d, s0, s1);
+            }
+            I::V_MAX_U32 => {
+                v_max_u32(self, d, s0, s1);
+            }
+            I::V_MIN_U32 => {
+                v_min_u32(self, d, s0, s1);
             }
             I::V_ALIGNBIT_B32 => {
                 v_alignbit_b32(self, d, s0, s1, s2);
