@@ -1941,6 +1941,53 @@ impl IREmitter {
         mul_value
     }
 
+    unsafe fn emit_concat_pair<const N: usize>(
+        &mut self,
+        values: &Vec<llvm::prelude::LLVMValueRef>,
+    ) -> Vec<llvm::prelude::LLVMValueRef> {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let context = self.context;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+        let len = values.len() as u32;
+
+        let mut index_values = Vec::new();
+        for i in 0..(2 * N) {
+            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+        }
+
+        let indices =
+            llvm::core::LLVMConstVector(index_values.as_mut_ptr(), index_values.len() as u32);
+
+        let mut result = Vec::new();
+        for i in (0..len).step_by(2) {
+            let cmp_value = llvm::core::LLVMBuildShuffleVector(
+                builder,
+                values[i as usize],
+                values[i as usize + 1],
+                indices,
+                empty_name.as_ptr(),
+            );
+            result.push(cmp_value);
+        }
+        result
+    }
+
+    unsafe fn emit_concat<const N: usize>(
+        &mut self,
+        values: &Vec<llvm::prelude::LLVMValueRef>,
+    ) -> llvm::prelude::LLVMValueRef {
+        let mut len = values.len() as u32;
+        let mut values = values.clone();
+        while len > 1 {
+            let new_values = self.emit_concat_pair::<N>(&values);
+            values = new_values;
+            len = values.len() as u32;
+        }
+        values[0]
+    }
+
     unsafe fn emit_alloc_registers(&mut self, reg_usage: &RegisterUsage) {
         if USE_SGPR_CACHE {
             let sgprs: Vec<u32> = reg_usage
@@ -2437,23 +2484,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2513,23 +2544,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2589,23 +2604,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2665,23 +2664,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2741,23 +2724,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2817,23 +2784,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2895,23 +2846,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -2975,23 +2910,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -3053,23 +2972,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -3131,23 +3034,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -3218,23 +3105,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -3303,23 +3174,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -3386,23 +3241,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -3469,23 +3308,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -4800,23 +4623,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -4880,23 +4687,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -4968,23 +4759,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -5066,23 +4841,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -5161,23 +4920,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -5251,23 +4994,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -5341,23 +5068,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -5431,23 +5142,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -5521,23 +5216,7 @@ impl IREmitter {
                             cmp_values.push(cmp_value);
                         }
 
-                        let mut index_values = Vec::new();
-                        for i in 0..32 {
-                            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-                        }
-
-                        let indices = llvm::core::LLVMConstVector(
-                            index_values.as_mut_ptr(),
-                            index_values.len() as u32,
-                        );
-
-                        let cmp_value = llvm::core::LLVMBuildShuffleVector(
-                            builder,
-                            cmp_values[0],
-                            cmp_values[1],
-                            indices,
-                            empty_name.as_ptr(),
-                        );
+                        let cmp_value = emitter.emit_concat::<N>(&cmp_values);
 
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
