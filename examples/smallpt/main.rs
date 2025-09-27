@@ -540,7 +540,7 @@ fn main() -> Result<()> {
                 grid_size_z: 1,
                 private_segment_size: private_segment_size as u32,
                 group_segment_size: 0,
-                kernel_object: Pointer::new(&data, kernel_addr),
+                kernel_object: Pointer::new(&mem, kernel_addr),
                 kernarg_address: Pointer::new(&arg_buffer, 0),
             };
 
