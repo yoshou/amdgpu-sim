@@ -281,7 +281,7 @@ fn main() -> Result<()> {
                 workgroup_size_x: threads_per_block as u16,
                 workgroup_size_y: 1,
                 workgroup_size_z: 1,
-                grid_size_x: (threads_per_block * total_blocks) as u32,
+                grid_size_x: total_blocks as u32,
                 grid_size_y: 1,
                 grid_size_z: 1,
                 private_segment_size: private_segment_size as u32,

@@ -3902,9 +3902,12 @@ impl<'a> GCNProcessor<'a> {
 
         let workgroup_size = (workgroup_size_x * workgroup_size_y * workgroup_size_z) as usize;
 
-        let num_workgroup_x = (self.aql.grid_size_x + workgroup_size_x - 1) / workgroup_size_x;
-        let num_workgroup_y = (self.aql.grid_size_y + workgroup_size_y - 1) / workgroup_size_y;
-        let num_workgroup_z = (self.aql.grid_size_z + workgroup_size_z - 1) / workgroup_size_z;
+        let num_workgroup_x =
+            (self.aql.grid_size_x * workgroup_size_x + workgroup_size_x - 1) / workgroup_size_x;
+        let num_workgroup_y =
+            (self.aql.grid_size_y * workgroup_size_y + workgroup_size_y - 1) / workgroup_size_y;
+        let num_workgroup_z =
+            (self.aql.grid_size_z * workgroup_size_z + workgroup_size_z - 1) / workgroup_size_z;
 
         let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
 

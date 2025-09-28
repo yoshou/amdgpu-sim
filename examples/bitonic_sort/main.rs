@@ -310,7 +310,7 @@ fn main() -> Result<()> {
                         workgroup_size_x: local_threads as u16,
                         workgroup_size_y: 1,
                         workgroup_size_z: 1,
-                        grid_size_x: global_threads as u32,
+                        grid_size_x: (global_threads / local_threads) as u32,
                         grid_size_y: 1,
                         grid_size_z: 1,
                         private_segment_size: private_segment_size as u32,
