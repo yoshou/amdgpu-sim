@@ -69,6 +69,7 @@ struct Context {
     scc: bool,
     exec_lo: u32,
     exec_hi: u32,
+    m0: u32,
 }
 
 struct ComputeUnit {
@@ -79,6 +80,7 @@ struct ComputeUnit {
     pub vgprs: RegisterFileImpl<u32>,
     num_sgprs: usize,
     num_vgprs: usize,
+    pub lds: Vec<u8>,
 }
 
 impl Processor for ComputeUnit {
@@ -594,6 +596,13 @@ fn s_brev_b32(cu: &mut ComputeUnit, d: usize, s0: usize) {
     cu.write_sop_dst(d, d_value);
 }
 
+fn s_ff1_i32_b32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let d_value = s0_value.trailing_zeros();
+    let d_value = if s0_value == 0 { -1i32 } else { d_value as i32 };
+    cu.write_sop_dst(d, d_value as u32);
+}
+
 fn s_and_saveexec_b64(cu: &mut ComputeUnit, d: usize, s0: usize) {
     let s0_value = cu.read_sop_src_pair(s0);
     let exec_value = u64_from_u32_u32(cu.ctx.exec_lo, cu.ctx.exec_hi);
@@ -662,6 +671,14 @@ fn s_sub_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
     let (d_value, carry) = sub_u32(s0_value, s1_value, 0);
     cu.write_sop_dst(d, d_value as u32);
     cu.ctx.scc = carry;
+}
+
+fn s_max_u32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    let d_value = max_u32(s0_value, s1_value);
+    cu.write_sop_dst(d, d_value as u32);
+    cu.ctx.scc = d_value == s0_value;
 }
 
 fn s_add_i32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
@@ -800,6 +817,18 @@ fn s_cmp_eq_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src(s0);
     let s1_value = cu.read_sop_src(s1);
     cu.ctx.scc = s0_value == s1_value;
+}
+
+fn s_cmp_lt_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    cu.ctx.scc = s0_value < s1_value;
+}
+
+fn s_cmp_ge_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    cu.ctx.scc = s0_value >= s1_value;
 }
 
 fn s_cmp_gt_i32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
@@ -1112,6 +1141,26 @@ fn v_rndne_f64_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
     }
 }
 
+fn v_readfirstlane_b32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    let exec_value = u64_from_u32_u32(cu.ctx.exec_lo, cu.ctx.exec_hi);
+    let lane = (exec_value.trailing_zeros() & 0x3F) as usize;
+    let s0_value = cu.read_vop_src(lane, s0);
+    let d_value = s0_value;
+    cu.write_sgpr(d, d_value);
+}
+
+fn v_cvt_u32_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = u32_to_f32(cu.read_vop_src(elem, s0));
+        let d_value = s0_value as u32;
+
+        cu.write_vgpr(elem, d, d_value);
+    }
+}
+
 fn v_fract_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize) {
     for elem in 0..64 {
         if !cu.get_exec(elem) {
@@ -1386,6 +1435,18 @@ fn v_max_f32_e32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
             s1_value
         };
         cu.write_vgpr(elem, d, f32_to_u32(d_value));
+    }
+}
+
+fn v_add_u16_e64(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0) as u16;
+        let s1_value = cu.read_vop_src(elem, s1) as u16;
+        let d_value = s0_value.saturating_add(s1_value);
+        cu.write_vgpr(elem, d, d_value as u32);
     }
 }
 
@@ -1885,6 +1946,18 @@ fn v_bfe_i32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize, s2: usize) {
         let s1_value = cu.read_vop_src(elem, s1);
         let s2_value = cu.read_vop_src(elem, s2);
         let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
+        cu.write_vgpr(elem, d, d_value as u32);
+    }
+}
+
+fn v_ashrrev_i32(cu: &mut ComputeUnit, d: usize, s0: usize, s1: usize) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let s0_value = cu.read_vop_src(elem, s0);
+        let s1_value = cu.read_vop_src(elem, s1) as i32;
+        let d_value = s1_value >> (s0_value & 0x1F);
         cu.write_vgpr(elem, d, d_value as u32);
     }
 }
@@ -2581,6 +2654,28 @@ fn buffer_store_dword(
         }
     }
 }
+fn ds_write_b8(cu: &mut ComputeUnit, d0: usize, addr: usize, offset: u8) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr(elem, addr) + offset as u32;
+        let addr_val = addr_val.min(cu.ctx.m0);
+        let data = cu.read_vgpr(elem, d0) as u8;
+        cu.write_lds_u8(addr_val, data);
+    }
+}
+fn ds_read_u8(cu: &mut ComputeUnit, r: usize, addr: usize, offset: u8) {
+    for elem in 0..64 {
+        if !cu.get_exec(elem) {
+            continue;
+        }
+        let addr_val = cu.read_vgpr(elem, addr) + offset as u32;
+        let addr_val = addr_val.min(cu.ctx.m0);
+        let data = cu.read_lds_u8(addr_val);
+        cu.write_vgpr(elem, r, data as u32);
+    }
+}
 impl ComputeUnit {
     pub fn new(pc: usize, insts: Vec<u8>, num_sgprs: usize, num_vgprs: usize) -> Self {
         // create instance
@@ -2591,6 +2686,7 @@ impl ComputeUnit {
                 scc: false,
                 exec_lo: 0xFFFFFFFF,
                 exec_hi: 0xFFFFFFFF,
+                m0: 0,
             },
             next_pc: 0,
             insts: insts,
@@ -2598,6 +2694,7 @@ impl ComputeUnit {
             vgprs: RegisterFileImpl::new(64, 256, 0),
             num_sgprs: num_sgprs,
             num_vgprs: num_vgprs,
+            lds: vec![0; 32 * 1024],
         }
     }
     pub fn dispatch(
@@ -2637,6 +2734,7 @@ impl ComputeUnit {
                 exec_lo: 0xFFFFFFFF,
                 exec_hi: 0xFFFFFFFF,
                 scc: false,
+                m0: 0,
             })
         }
 
@@ -2770,6 +2868,7 @@ impl ComputeUnit {
             103 => self.set_flat_scratch_hi(value),
             106 => self.set_vcc_lo(value),
             107 => self.set_vcc_hi(value),
+            124 => self.ctx.m0 = value,
             126 => self.ctx.exec_lo = value,
             127 => self.ctx.exec_hi = value,
             _ => panic!(),
@@ -2829,12 +2928,6 @@ impl ComputeUnit {
         u64_from_u32_u32(self.read_vgpr(elem, idx), self.read_vgpr(elem, idx + 1))
     }
     fn write_vgpr(&mut self, elem: usize, idx: usize, value: u32) {
-        // if idx == 0 {
-        //     println!(
-        //         "Write v[{}][{}] with {:08X} at {:012X}",
-        //         idx, elem, value, self.pc
-        //     );
-        // }
         if idx >= self.num_vgprs {
             panic!();
         }
@@ -2921,6 +3014,16 @@ impl ComputeUnit {
         let ptr = addr as *mut u32;
         unsafe { *ptr }
     }
+    fn write_lds_u8(&mut self, addr: u32, data: u8) {
+        let ptr = self.lds.as_mut_ptr().wrapping_add(addr as usize);
+        unsafe {
+            *ptr = data;
+        }
+    }
+    fn read_lds_u8(&mut self, addr: u32) -> u8 {
+        let ptr = self.lds.as_ptr().wrapping_add(addr as usize);
+        unsafe { *ptr }
+    }
     fn get_buffer_resource_constant_base(&self, idx: usize) -> usize {
         let w0 = self.read_sgpr_pair(idx) as usize;
         w0 & ((1 << 48) - 1)
@@ -3002,6 +3105,9 @@ impl ComputeUnit {
             I::S_BREV_B32 => {
                 s_brev_b32(self, d, s0);
             }
+            I::S_FF1_I32_B32 => {
+                s_ff1_i32_b32(self, d, s0);
+            }
             I::S_AND_SAVEEXEC_B64 => {
                 s_and_saveexec_b64(self, d, s0);
             }
@@ -3036,6 +3142,9 @@ impl ComputeUnit {
             }
             I::S_SUB_U32 => {
                 s_sub_u32_e32(self, d, s0, s1);
+            }
+            I::S_MAX_U32 => {
+                s_max_u32_e32(self, d, s0, s1);
             }
             I::S_ADD_I32 => {
                 s_add_i32_e32(self, d, s0, s1);
@@ -3099,6 +3208,12 @@ impl ComputeUnit {
         match inst.op {
             I::S_CMP_EQ_U32 => {
                 s_cmp_eq_u32_e32(self, s0, s1);
+            }
+            I::S_CMP_LT_U32 => {
+                s_cmp_lt_u32_e32(self, s0, s1);
+            }
+            I::S_CMP_GE_U32 => {
+                s_cmp_ge_u32_e32(self, s0, s1);
             }
             I::S_CMP_GT_I32 => {
                 s_cmp_gt_i32_e32(self, s0, s1);
@@ -3210,6 +3325,12 @@ impl ComputeUnit {
             I::V_RNDNE_F64 => {
                 v_rndne_f64_e32(self, d, s0);
             }
+            I::V_READFIRSTLANE_B32 => {
+                v_readfirstlane_b32_e32(self, d, s0);
+            }
+            I::V_CVT_U32_F32 => {
+                v_cvt_u32_f32_e32(self, d, s0);
+            }
             _ => unimplemented!(),
         }
         Signals::None
@@ -3296,6 +3417,9 @@ impl ComputeUnit {
         let clamp = inst.clamp != 0;
         let omod = inst.omod;
         match inst.op {
+            I::V_ADD_U16 => {
+                v_add_u16_e64(self, d, s0, s1);
+            }
             I::V_CMP_CLASS_F64 => {
                 v_cmp_class_f64_e64(self, d, s0, s1, abs, neg);
             }
@@ -3370,6 +3494,9 @@ impl ComputeUnit {
             }
             I::V_BFE_I32 => {
                 v_bfe_i32(self, d, s0, s1, s2);
+            }
+            I::V_ASHRREV_I32 => {
+                v_ashrrev_i32(self, d, s0, s1);
             }
             I::V_BFI_B32 => {
                 v_bfi_b32(self, d, s0, s1, s2);
@@ -3551,6 +3678,22 @@ impl ComputeUnit {
         }
         Signals::None
     }
+    fn execute_ds(&mut self, inst: DS) -> Signals {
+        let addr = inst.addr as usize;
+        let d0 = inst.data0 as usize;
+        let r = inst.vdst as usize;
+        let offset = inst.offset0 as u8;
+        match inst.op {
+            I::DS_WRITE_B8 => {
+                ds_write_b8(self, d0, addr, offset);
+            }
+            I::DS_READ_U8 => {
+                ds_read_u8(self, r, addr, offset);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
     fn get_pc(&self) -> u64 {
         (&self.insts[self.ctx.pc] as *const u8) as u64
     }
@@ -3574,6 +3717,7 @@ impl ComputeUnit {
             InstFormat::VOPC(fields) => self.execute_vopc(fields),
             InstFormat::FLAT(fields) => self.execute_flat(fields),
             InstFormat::MUBUF(fields) => self.execute_mubuf(fields),
+            InstFormat::DS(fields) => self.execute_ds(fields),
             _ => unimplemented!(),
         }
     }
@@ -3600,6 +3744,12 @@ pub struct GCNProcessor<'a> {
 
 impl<'a> GCNProcessor<'a> {
     pub fn new(aql: &HsaKernelDispatchPacket<'a>, num_cunits: usize, mem: &Vec<u8>) -> Self {
+        let workgroup_size_x = aql.workgroup_size_x as u32;
+        let workgroup_size_y = aql.workgroup_size_y as u32;
+        let workgroup_size_z = aql.workgroup_size_z as u32;
+
+        let workgroup_size = (workgroup_size_x * workgroup_size_y * workgroup_size_z) as usize;
+
         let insts = aql.kernel_object.object.to_vec();
         let kd = aql.kernel_object.offset;
         let kernel_desc = decode_kernel_desc(&insts[kd..(kd + 64)]);
@@ -3621,7 +3771,8 @@ impl<'a> GCNProcessor<'a> {
         let entry_address = kd + kernel_desc.kernel_code_entry_byte_offset;
 
         let private_segment_size = aql.private_segment_size as usize;
-        let private_seg_buffer: Vec<u8> = vec![0u8; private_segment_size * 256 * num_cunits];
+        let private_seg_buffer: Vec<u8> =
+            vec![0u8; private_segment_size * num_cunits * workgroup_size];
 
         // create instance
         GCNProcessor {
@@ -3659,8 +3810,7 @@ impl<'a> GCNProcessor<'a> {
         let mut sgprs_pos = 0;
         if kernel_desc.enable_sgpr_private_segment_buffer {
             let mut desc_w0 = 0;
-            desc_w0 |=
-                (private_seg_ptr + (thread_id as u64) * private_seg_size * 256) & ((1 << 48) - 1);
+            desc_w0 |= (private_seg_ptr + (thread_id as u64) * private_seg_size) & ((1 << 48) - 1);
             desc_w0 |= (private_seg_size & ((1 << 14) - 1)) << 48;
             for i in 0..2 {
                 sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
@@ -3759,7 +3909,7 @@ impl<'a> GCNProcessor<'a> {
         let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
 
         use indicatif::{ProgressBar, ProgressStyle};
-        let bar = ProgressBar::new(num_workgroups as u64 * 4);
+        let bar = ProgressBar::new(num_workgroups as u64);
 
         bar.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) \n {msg}")
@@ -3779,7 +3929,7 @@ impl<'a> GCNProcessor<'a> {
                 let mut setup_data = vec![];
                 for workitem_id in (0..workgroup_size).step_by(64) {
                     setup_data.push(self.dispatch(
-                        cu_idx as u32,
+                        (workitem_id + workgroup_size * cu_idx) as u32,
                         workgroup_id_x,
                         workgroup_id_y,
                         workgroup_id_z,

@@ -135,6 +135,20 @@ pub struct MUBUF {
 }
 
 pub const MUBUF_ENCODE: u32 = 0b111000;
+
+#[derive(Debug, Clone)]
+pub struct DS {
+    pub offset0: u8,
+    pub offset1: u8,
+    pub gds: u8,
+    pub op: I,
+    pub addr: u8,
+    pub data0: u8,
+    pub data1: u8,
+    pub vdst: u8,
+}
+
+pub const DS_ENCODE: u32 = 0b110110;
 #[derive(Debug, Clone)]
 pub struct SMEM {
     pub sbase: u8,
@@ -163,4 +177,5 @@ pub enum InstFormat {
     VOP3B(VOP3B),
     FLAT(FLAT),
     MUBUF(MUBUF),
+    DS(DS),
 }
