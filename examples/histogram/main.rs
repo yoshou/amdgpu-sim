@@ -148,11 +148,11 @@ fn main() -> Result<()> {
         let value = rand::random::<u8>();
         input[i] = value;
     }
-    let input_ptr = (&input[0] as *const u8) as u64;
+    let input_ptr = input.as_ptr() as u64;
     println!("input_ptr: 0x{:16X}", input_ptr);
 
     let mut block_bins = vec![0u32; bin_size * total_blocks];
-    let block_bins_ptr = (&block_bins[0] as *const u32) as u64;
+    let block_bins_ptr = block_bins.as_mut_ptr() as u64;
     println!("block_bins_ptr: 0x{:16X}", block_bins_ptr);
 
     let arch = if matches.opt_present("arch") {
