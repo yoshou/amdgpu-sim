@@ -40,6 +40,7 @@ extern "C" fn llvm_obj_linking_layer_create(
     unsafe { llvm::orc2::ee::LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager(es) }
 }
 
+#[derive(Clone)]
 pub struct InstBlock {
     context: llvm::prelude::LLVMContextRef,
     module: llvm::prelude::LLVMModuleRef,
@@ -102,6 +103,7 @@ impl InstBlock {
     }
 }
 
+#[derive(Clone)]
 pub struct RDNATranslator {
     pub addresses: Vec<u64>,
     pub insts: Vec<InstFormat>,
@@ -10002,6 +10004,7 @@ impl IREmitter {
     }
 }
 
+#[derive(Debug, Clone)]
 struct RegisterUsage {
     use_sgprs: HashSet<u32>,
     use_vgprs: HashSet<u32>,

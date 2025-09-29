@@ -590,13 +590,6 @@ impl SIMD32 {
             })
         }
 
-        if USE_ENTIRE_KERNEL_TRANSLATION {
-            if self.translator.insts_blocks.is_empty() {
-                let program = RDNAProgram::new(self.ctx.pc as usize, &self.insts);
-                self.translator.build_from_program(&program);
-            }
-        }
-
         self.slots = slots;
     }
 
@@ -4375,6 +4368,27 @@ impl<'a> RDNAProcessor<'a> {
 
         let pool = ThreadPool::new(16);
 
+        let insts = self.aql.kernel_object.object.to_vec();
+        let entry_address = self.entry_address;
+
+        let mut translator = RDNATranslator::new();
+
+        if USE_ENTIRE_KERNEL_TRANSLATION {
+            if translator.insts_blocks.is_empty() {
+                let program = RDNAProgram::new(entry_address, &insts);
+                translator.build_from_program(&program);
+            }
+        }
+
+        for wgp in &mut self.wgps {
+            for cu in &mut wgp.cunits {
+                for simd in &cu.simds {
+                    let mut v = simd.lock().unwrap();
+                    v.translator = translator.clone();
+                }
+            }
+        }
+
         for workgroup_id_base in (0..num_workgroups).step_by(num_wgps) {
             for wgp_idx in 0..num_wgps {
                 let workgroup_id = workgroup_id_base + wgp_idx as u32;
@@ -4382,8 +4396,6 @@ impl<'a> RDNAProcessor<'a> {
                 let workgroup_id_y = (workgroup_id / num_workgroup_x) % num_workgroup_y;
                 let workgroup_id_z =
                     (workgroup_id / (num_workgroup_x * num_workgroup_y)) % num_workgroup_z;
-
-                let entry_address = self.entry_address;
 
                 let mut simds = VecDeque::new();
 
