@@ -2,6 +2,7 @@ use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::gcn_processor::*;
+use amdgpu_sim::rdna_processor::*;
 use amdgpu_sim::processor::*;
 use getopts::Options;
 use object::*;
@@ -295,8 +296,16 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let mut processor = GCNProcessor::new(&aql, 16, &mem);
-            processor.execute();
+            if arch == "gfx803" {
+                let mut processor = GCNProcessor::new(&aql, 16, &mem);
+                processor.execute();
+            } else if "gfx1200" == arch {
+                let mut processor = RDNAProcessor::new(&aql, 32, 32, &mem);
+                processor.execute();
+            } else {
+                println!("Unsupported architecture: {}", arch);
+                return Ok(());
+            }
         }
     }
 

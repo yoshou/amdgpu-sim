@@ -161,6 +161,19 @@ pub struct VGLOBAL {
 pub const VGLOBAL_ENCODE: u32 = 0b11101110;
 
 #[derive(Debug, Clone)]
+pub struct DS {
+    pub offset0: u8,
+    pub offset1: u8,
+    pub op: I,
+    pub addr: u8,
+    pub data0: u8,
+    pub data1: u8,
+    pub vdst: u8,
+}
+
+pub const DS_ENCODE: u32 = 0b110110;
+
+#[derive(Debug, Clone)]
 pub struct VSCRATCH {
     pub op: I,
     pub vaddr: u8,
@@ -192,4 +205,5 @@ pub enum InstFormat {
     VFLAT(VFLAT),
     VGLOBAL(VGLOBAL),
     VSCRATCH(VSCRATCH),
+    DS(DS),
 }

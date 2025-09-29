@@ -5,6 +5,9 @@ use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
 use crate::rdna_translator::*;
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
+
 static USE_INTERPRETER: bool = false;
 static USE_ENTIRE_KERNEL_TRANSLATION: bool = true;
 static USE_SIMD: bool = true;
@@ -308,11 +311,13 @@ struct Context {
 }
 
 struct SIMD32 {
+    slots: Vec<Context>,
     ctx: Context,
     insts: Vec<u8>,
     pub sgprs: RegisterFileImpl<u32>,
     pub vgprs: RegisterFileImpl<u32>,
     num_vgprs: usize,
+    lds: Rc<RefCell<Vec<u8>>>,
     translator: RDNATranslator,
 }
 
@@ -475,6 +480,11 @@ fn fma<T: MulAdd<Output = T>>(a: T, b: T, c: T) -> T {
 }
 
 #[inline(always)]
+fn u32_to_f32(value: u32) -> f32 {
+    f32::from_bits(value)
+}
+
+#[inline(always)]
 fn u64_to_f64(value: u64) -> f64 {
     f64::from_bits(value)
 }
@@ -570,22 +580,15 @@ impl SIMD32 {
             }
         }
 
-        use std::collections::VecDeque;
-
-        let mut ctxs = VecDeque::new();
+        let mut slots = Vec::new();
         for wavefront in 0..num_wavefronts {
-            ctxs.push_back(Context {
+            slots.push(Context {
                 id: wavefront,
                 pc: entry_addr as u64,
                 scc: false,
                 scratch_base: setup_data[wavefront].scratch_base,
             })
         }
-
-        let is_signal_none = |signal: &Signals| match signal {
-            Signals::None => true,
-            _ => false,
-        };
 
         if USE_ENTIRE_KERNEL_TRANSLATION {
             if self.translator.insts_blocks.is_empty() {
@@ -594,21 +597,7 @@ impl SIMD32 {
             }
         }
 
-        while !ctxs.is_empty() {
-            if let Some(ctx) = ctxs.pop_front() {
-                self.ctx = ctx;
-            }
-            let mut signal = self.step();
-            while is_signal_none(&signal) {
-                signal = self.step();
-            }
-
-            match signal {
-                Signals::EndOfProgram => {}
-                Signals::Switch => ctxs.push_back(self.ctx),
-                _ => panic!(),
-            }
-        }
+        self.slots = slots;
     }
 
     fn step(&mut self) -> Signals {
@@ -866,6 +855,18 @@ impl SIMD32 {
         }
     }
 
+    fn read_vector_source_operand_f32(&self, elem: usize, addr: SourceOperand) -> f32 {
+        match addr {
+            SourceOperand::LiteralConstant(value) => u32_to_f32(value),
+            SourceOperand::IntegerConstant(value) => u32_to_f32((value & 0xFFFFFFFF) as u32),
+            SourceOperand::FloatConstant(value) => value as f32,
+            SourceOperand::ScalarRegister(value) => u32_to_f32(self.read_sgpr(value as usize)),
+            SourceOperand::VectorRegister(value) => {
+                u32_to_f32(self.read_vgpr(elem, value as usize))
+            }
+        }
+    }
+
     fn read_vector_source_operand_f64(&self, elem: usize, addr: SourceOperand) -> f64 {
         match addr {
             SourceOperand::LiteralConstant(value) => u64_to_f64((value as u64) << 32),
@@ -893,6 +894,7 @@ impl SIMD32 {
             InstFormat::SOPP(fields) => self.execute_sopp(fields),
             InstFormat::VSCRATCH(fields) => self.execute_vscratch(fields),
             InstFormat::VGLOBAL(fields) => self.execute_vglobal(fields),
+            InstFormat::DS(fields) => self.execute_ds(fields),
             _ => unimplemented!(),
         }
     }
@@ -908,6 +910,9 @@ impl SIMD32 {
             I::S_MOV_B64 => {
                 self.s_mov_b64(d, s0);
             }
+            I::S_CTZ_I32_B32 => {
+                self.s_ctz_i32_b64(d, s0);
+            }
             I::S_AND_SAVEEXEC_B32 => {
                 self.s_and_saveexec_b32(d, s0);
             }
@@ -916,6 +921,10 @@ impl SIMD32 {
             }
             I::S_AND_NOT1_SAVEEXEC_B32 => {
                 self.s_and_not1_saveexec_b32(d, s0);
+            }
+            I::S_BARRIER_SIGNAL => {
+                let sig = self.read_scalar_source_operand_u32(s0) as i32;
+                assert!(sig == -1);
             }
             _ => unimplemented!(),
         }
@@ -933,6 +942,15 @@ impl SIMD32 {
         let s0_value = self.read_scalar_source_operand_u64(s0);
         let d_value = s0_value;
         self.write_sop_dst_pair(d, d_value);
+    }
+
+    fn s_ctz_i32_b64(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let d_value = match s0_value.trailing_zeros() {
+            n if n >= 32 => -1,
+            n => n as i32,
+        };
+        self.write_sop_dst(d, d_value as u32);
     }
 
     fn s_and_saveexec_b32(&mut self, d: usize, s0: SourceOperand) {
@@ -977,6 +995,12 @@ impl SIMD32 {
         let s1 = inst.ssrc1;
 
         match inst.op {
+            I::S_ADD_CO_I32 => {
+                self.s_add_co_i32(d, s0, s1);
+            }
+            I::S_SUB_CO_I32 => {
+                self.s_sub_co_i32(d, s0, s1);
+            }
             I::S_ADD_NC_U64 => {
                 self.s_add_nc_u64(d, s0, s1);
             }
@@ -1004,12 +1028,37 @@ impl SIMD32 {
             I::S_MUL_I32 => {
                 self.s_mul_i32(d, s0, s1);
             }
+            I::S_MUL_HI_U32 => {
+                self.s_mul_hi_u32(d, s0, s1);
+            }
             I::S_LSHR_B32 => {
                 self.s_lshr_b32(d, s0, s1);
+            }
+            I::S_LSHL_B32 => {
+                self.s_lshl_b32(d, s0, s1);
+            }
+            I::S_MAX_U32 => {
+                self.s_max_u32(d, s0, s1);
             }
             _ => unimplemented!(),
         }
         Signals::None
+    }
+
+    fn s_add_co_i32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        let (d_value, scc_value) = s0_value.overflowing_add(s1_value);
+        self.write_sop_dst(d, d_value as u32);
+        self.ctx.scc = scc_value;
+    }
+
+    fn s_sub_co_i32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        let (d_value, scc_value) = s0_value.overflowing_sub(s1_value);
+        self.write_sop_dst(d, d_value as u32);
+        self.ctx.scc = scc_value;
     }
 
     fn s_add_nc_u64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
@@ -1076,16 +1125,40 @@ impl SIMD32 {
     fn s_mul_i32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
         let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
-        let d_value = s0_value * s1_value;
+        let d_value = s0_value.wrapping_mul(s1_value);
         self.write_sop_dst(d, d_value as u32);
     }
 
+    fn s_mul_hi_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = (((s0_value as u64) * (s1_value as u64)) >> 32) as u32;
+        self.write_sop_dst(d, d_value);
+    }
+
     fn s_lshr_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
-        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
-        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
         let d_value = s0_value >> (s1_value & 0x1F);
-        self.write_sop_dst(d, d_value as u32);
+        self.write_sop_dst(d, d_value);
         self.ctx.scc = d_value != 0;
+    }
+
+    fn s_lshl_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = s0_value << (s1_value & 0x1F);
+        self.write_sop_dst(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_max_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let scc_value = s0_value >= s1_value;
+        let d_value = if scc_value { s0_value } else { s1_value };
+        self.write_sop_dst(d, d_value);
+        self.ctx.scc = scc_value;
     }
 
     fn execute_sopc(&mut self, inst: SOPC) -> Signals {
@@ -1095,6 +1168,18 @@ impl SIMD32 {
         match inst.op {
             I::S_CMP_LG_U32 => {
                 self.s_cmp_lg_u32(s0, s1);
+            }
+            I::S_CMP_EQ_U32 => {
+                self.s_cmp_eq_u32(s0, s1);
+            }
+            I::S_CMP_LT_U32 => {
+                self.s_cmp_lt_u32(s0, s1);
+            }
+            I::S_CMP_GE_U32 => {
+                self.s_cmp_ge_u32(s0, s1);
+            }
+            I::S_CMP_LT_I32 => {
+                self.s_cmp_lt_i32(s0, s1);
             }
             I::S_CMP_LG_U64 => {
                 self.s_cmp_lg_u64(s0, s1);
@@ -1111,6 +1196,30 @@ impl SIMD32 {
         let s0_value = self.read_scalar_source_operand_u32(s0);
         let s1_value = self.read_scalar_source_operand_u32(s1);
         self.ctx.scc = s0_value != s1_value;
+    }
+
+    fn s_cmp_eq_u32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        self.ctx.scc = s0_value == s1_value;
+    }
+
+    fn s_cmp_lt_u32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        self.ctx.scc = s0_value < s1_value;
+    }
+
+    fn s_cmp_ge_u32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        self.ctx.scc = s0_value >= s1_value;
+    }
+
+    fn s_cmp_lt_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        self.ctx.scc = s0_value < s1_value;
     }
 
     fn s_cmp_lg_u64(&mut self, s0: SourceOperand, s1: SourceOperand) {
@@ -1133,8 +1242,14 @@ impl SIMD32 {
             I::V_MOV_B32 => {
                 self.v_mov_b32_e32(d, s0);
             }
+            I::V_READFIRSTLANE_B32 => {
+                self.v_readfirstlane_b32_e32(d, s0);
+            }
             I::V_CVT_F64_U32 => {
                 self.v_cvt_f64_u32_e32(d, s0);
+            }
+            I::V_RCP_IFLAG_F32 => {
+                self.v_rcp_iflag_f32_e32(d, s0);
             }
             I::V_RCP_F64 => {
                 self.v_rcp_f64_e32(d, s0);
@@ -1150,6 +1265,12 @@ impl SIMD32 {
             }
             I::V_CVT_F64_I32 => {
                 self.v_cvt_f64_i32_e32(d, s0);
+            }
+            I::V_CVT_F32_U32 => {
+                self.v_cvt_f32_u32_e32(d, s0);
+            }
+            I::V_CVT_U32_F32 => {
+                self.v_cvt_u32_f32_e32(d, s0);
             }
             I::V_RNDNE_F64 => {
                 self.v_rndne_f64_e32(d, s0);
@@ -1170,6 +1291,14 @@ impl SIMD32 {
         }
     }
 
+    fn v_readfirstlane_b32_e32(&mut self, d: usize, s0: SourceOperand) {
+        let exec_value = self.read_sgpr(126);
+        let lane = (exec_value.trailing_zeros() & 0x1F) as usize;
+        let s0_value = self.read_vector_source_operand_u32(lane, s0);
+        let d_value = s0_value;
+        self.write_sgpr(d, d_value);
+    }
+
     fn v_cvt_f64_u32_e32(&mut self, d: usize, s0: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -1179,6 +1308,18 @@ impl SIMD32 {
             let d_value = s0_value as f64;
 
             self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_rcp_iflag_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = 1.0 / s0_value;
+
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
     }
 
@@ -1229,7 +1370,6 @@ impl SIMD32 {
             self.write_vgpr(elem, d, d_value as u32);
         }
     }
-
     fn v_cvt_f64_i32_e32(&mut self, d: usize, s0: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -1239,6 +1379,30 @@ impl SIMD32 {
             let d_value = s0_value as f64;
 
             self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+        }
+    }
+
+    fn v_cvt_f32_u32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let d_value = s0_value as f32;
+
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_cvt_u32_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = s0_value as u32;
+
+            self.write_vgpr(elem, d, d_value);
         }
     }
 
@@ -1273,6 +1437,9 @@ impl SIMD32 {
             }
             I::V_ADD_NC_U32 => {
                 self.v_add_nc_u32_e32(d, s0, s1);
+            }
+            I::V_MUL_F32 => {
+                self.v_mul_f32_e32(d, s0, s1);
             }
             I::V_MUL_F64 => {
                 self.v_mul_f64_e32(d, s0, s1);
@@ -1343,6 +1510,18 @@ impl SIMD32 {
             let s1_value = self.read_vgpr(elem, s1);
             let d_value = s0_value.wrapping_add(s1_value);
             self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_mul_f32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value * s1_value;
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
     }
 
@@ -1455,6 +1634,9 @@ impl SIMD32 {
         let clamp = inst.cm != 0;
         let omod = inst.omod;
         match inst.op {
+            I::V_ADD_NC_U16 => {
+                self.v_add_nc_u16(d, s0, s1);
+            }
             I::V_READLANE_B32 => {
                 self.v_readlane_b32(d, s0, s1);
             }
@@ -1464,8 +1646,20 @@ impl SIMD32 {
             I::V_AND_B32 => {
                 self.v_and_b32_e64(d, s0, s1);
             }
+            I::V_LSHL_OR_B32 => {
+                self.v_lshl_or_b32(d, s0, s1, s2);
+            }
             I::V_BFE_U32 => {
                 self.v_bfe_u32(d, s0, s1, s2);
+            }
+            I::V_ASHRREV_I32 => {
+                self.v_ashrrev_i32_e64(d, s0, s1);
+            }
+            I::V_CMP_EQ_U16 => {
+                self.v_cmp_eq_u16_e64(d, s0, s1);
+            }
+            I::V_CMP_GT_U16 => {
+                self.v_cmp_gt_u16_e64(d, s0, s1);
             }
             I::V_CMP_LT_U32 => {
                 self.v_cmp_lt_u32_e64(d, s0, s1);
@@ -1598,6 +1792,18 @@ impl SIMD32 {
         Signals::None
     }
 
+    fn v_add_nc_u16(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
+            let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
+            let d_value = s0_value.wrapping_add(s1_value);
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
     fn v_readlane_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let s1_value = (self.read_scalar_source_operand_u32(s1) as usize) & 0x1F;
         let s0_value = self.read_vector_source_operand_u32(s1_value, s0);
@@ -1624,6 +1830,19 @@ impl SIMD32 {
         }
     }
 
+    fn v_lshl_or_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let d_value = (s0_value << (s1_value & 0x1F)) | s2_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
     fn v_bfe_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -1634,6 +1853,56 @@ impl SIMD32 {
             let s2_value = self.read_vector_source_operand_u32(elem, s2);
             let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
             self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_ashrrev_i32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1) as i32;
+            let d_value = s1_value >> (s0_value & 0x1F);
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    fn v_cmp_eq_u16_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
+            let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
+            let d_value = s0_value == s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_gt_u16_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
+            let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
+            let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
 
@@ -3483,6 +3752,12 @@ impl SIMD32 {
             I::GLOBAL_STORE_B128 => {
                 self.global_store_b128(vaddr, vsrc, saddr, ioffset);
             }
+            I::GLOBAL_LOAD_U8 => {
+                self.global_load_u8(vaddr, vdst, saddr, ioffset);
+            }
+            I::GLOBAL_LOAD_U16 => {
+                self.global_load_u16(vaddr, vdst, saddr, ioffset);
+            }
             I::GLOBAL_LOAD_B32 => {
                 self.global_load_b32(vaddr, vdst, saddr, ioffset);
             }
@@ -3492,6 +3767,8 @@ impl SIMD32 {
             I::GLOBAL_LOAD_B128 => {
                 self.global_load_b128(vaddr, vdst, saddr, ioffset);
             }
+            I::GLOBAL_WB => {}
+            I::GLOBAL_INV => {}
             _ => unimplemented!(),
         }
         Signals::None
@@ -3576,6 +3853,52 @@ impl SIMD32 {
         }
     }
 
+    fn global_load_u8(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let addr = offset[elem] + (ioffset as u64);
+
+            let ptr = addr as *mut u8;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
+    fn global_load_u16(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let addr = offset[elem] + (ioffset as u64);
+
+            let ptr = addr as *mut u16;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
     fn global_load_b32(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
         let offset = (0..32)
             .map(|elem| {
@@ -3650,6 +3973,64 @@ impl SIMD32 {
         }
     }
 
+    fn execute_ds(&mut self, inst: DS) -> Signals {
+        let addr = inst.addr as usize;
+        let data0 = inst.data0 as usize;
+        let vdst = inst.vdst as usize;
+        let offset0 = inst.offset0;
+        match inst.op {
+            I::DS_LOAD_U8 => {
+                self.ds_load_u8(addr, vdst, offset0);
+            }
+            I::DS_STORE_B8 => {
+                self.ds_store_b8(addr, data0, offset0);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn ds_load_u8(&mut self, addr: usize, vdst: usize, offset0: u8) {
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let addr = addr[elem] + (offset0 as usize);
+
+            let ptr = lds.wrapping_add(addr);
+            let data = unsafe { *ptr };
+
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
+    fn ds_store_b8(&mut self, addr: usize, data0: usize, offset0: u8) {
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let data = self.read_vgpr(elem, data0) as u8;
+            let addr = addr[elem] + (offset0 as usize);
+
+            let ptr = lds.wrapping_add(addr);
+            unsafe {
+                *ptr = data;
+            }
+        }
+    }
+
     fn execute_sopp(&mut self, inst: SOPP) -> Signals {
         let simm16 = inst.simm16 as i16;
         match inst.op {
@@ -3658,6 +4039,11 @@ impl SIMD32 {
             I::S_WAIT_ALU => {}
             I::S_WAIT_KMCNT => {}
             I::S_WAIT_LOADCNT => {}
+            I::S_WAIT_BVHCNT => {}
+            I::S_WAIT_SAMPLECNT => {}
+            I::S_WAIT_STORECNT => {}
+            I::S_WAIT_LOADCNT_DSCNT => {}
+            I::S_WAIT_DSCNT => {}
             I::S_CLAUSE => {}
             I::S_DELAY_ALU => {}
             I::S_SENDMSG => {}
@@ -3693,6 +4079,10 @@ impl SIMD32 {
             }
             I::S_BRANCH => {
                 self.ctx.pc = ((self.ctx.pc as i64) + ((simm16 as i64) * 4)) as u64;
+            }
+            I::S_BARRIER_WAIT => {
+                assert!(simm16 == -1);
+                return Signals::Switch;
             }
             _ => unimplemented!(),
         }
@@ -3746,11 +4136,12 @@ struct ComputeUnit {
 use std::collections::HashMap;
 
 impl ComputeUnit {
-    pub fn new(pc: usize, insts: Vec<u8>, num_vgprs: usize) -> Self {
+    pub fn new(pc: usize, insts: Vec<u8>, num_vgprs: usize, lds: Rc<RefCell<Vec<u8>>>) -> Self {
         let mut simds = vec![];
         for _ in 0..2 {
             let num_wave_slot = 16;
             simds.push(Arc::new(Mutex::new(SIMD32 {
+                slots: Vec::new(),
                 ctx: Context {
                     id: 0,
                     pc: pc as u64,
@@ -3761,6 +4152,7 @@ impl ComputeUnit {
                 sgprs: RegisterFileImpl::new(1, 128 * num_wave_slot, 0),
                 vgprs: RegisterFileImpl::new(32, 1536 / 4, 0),
                 num_vgprs: num_vgprs,
+                lds: lds.clone(),
                 translator: RDNATranslator::new(),
             })));
         }
@@ -3773,6 +4165,7 @@ struct WorkgroupProcessor {
     cunits: Vec<ComputeUnit>,
 }
 
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use threadpool::ThreadPool;
 
@@ -3807,11 +4200,13 @@ impl<'a> RDNAProcessor<'a> {
         let mut wgps = vec![];
         for _ in 0..num_wgps {
             let mut cunits_in_wgp = vec![];
+            let lds = Rc::new(RefCell::new(vec![0u8; 128 * 1024]));
             for _ in 0..2 {
                 let cu = ComputeUnit::new(
                     kd + kernel_desc.kernel_code_entry_byte_offset,
                     mem.clone(),
                     kernel_desc.granulated_workitem_vgpr_count,
+                    lds.clone(),
                 );
                 cunits_in_wgp.push(cu);
             }
@@ -3970,7 +4365,7 @@ impl<'a> RDNAProcessor<'a> {
         let num_workgroups = num_workgroup_x * num_workgroup_y * num_workgroup_z;
 
         use indicatif::{ProgressBar, ProgressStyle};
-        let bar = ProgressBar::new(num_workgroups as u64 * 4);
+        let bar = ProgressBar::new(num_workgroups as u64);
 
         bar.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta_precise}) \n {msg}")
@@ -3990,6 +4385,8 @@ impl<'a> RDNAProcessor<'a> {
 
                 let entry_address = self.entry_address;
 
+                let mut simds = VecDeque::new();
+
                 for cu_idx in 0..2 {
                     for simd_idx in 0..2 {
                         let mut setup_data = vec![];
@@ -4008,19 +4405,57 @@ impl<'a> RDNAProcessor<'a> {
                         let simd: Arc<Mutex<SIMD32>> =
                             Arc::clone(&self.wgps[wgp_idx].cunits[cu_idx].simds[simd_idx]);
 
-                        let bar = bar.clone();
-                        pool.execute(move || {
-                            if let Ok(mut v) = simd.lock() {
-                                v.dispatch(entry_address, setup_data);
-                            }
-                            bar.inc(1);
-                        });
+                        if let Ok(mut v) = simd.lock() {
+                            v.dispatch(entry_address, setup_data)
+                        }
+
+                        simds.push_back(simd);
                     }
                 }
-            }
-        }
 
-        pool.join();
+                let bar = bar.clone();
+                pool.execute(move || {
+                    let is_signal_none = |signal: &Signals| match signal {
+                        Signals::None => true,
+                        _ => false,
+                    };
+
+                    while !simds.is_empty() {
+                        if let Some(simd) = simds.pop_front() {
+                            if let Ok(mut v) = simd.lock() {
+                                let mut switch_ctxs = Vec::new();
+                                for ctx in v.slots.clone() {
+                                    v.ctx = ctx;
+                                    let mut signal = Signals::None;
+                                    while is_signal_none(&signal) {
+                                        signal = v.step();
+                                    }
+
+                                    match signal {
+                                        Signals::EndOfProgram => {}
+                                        Signals::Switch => switch_ctxs.push(v.ctx),
+                                        _ => panic!(),
+                                    }
+                                }
+
+                                if switch_ctxs.len() > 0 {
+                                    v.slots = switch_ctxs.clone();
+                                    simds.push_back(Arc::clone(&simd));
+                                }
+                            } else {
+                                panic!("Failed to lock simd");
+                            }
+                        } else {
+                            panic!("No simd available");
+                        }
+                    }
+
+                    bar.inc(1);
+                });
+            }
+
+            pool.join();
+        }
 
         let mut sum_block_call_count = HashMap::new();
         let mut sum_block_elapsed_time = HashMap::new();
