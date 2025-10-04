@@ -14442,6 +14442,9 @@ impl RDNATranslator {
     pub fn build_from_program(&mut self, program: &RDNAProgram) -> &mut InstBlock {
         let mut inst_block = InstBlock::new();
 
+        let mut entry_pcs = Vec::new();
+        entry_pcs.push(program.entry_pc as u64);
+
         unsafe {
             llvm::target::LLVM_InitializeNativeTarget();
             llvm::target::LLVM_InitializeAllTargetMCs();
@@ -14704,6 +14707,23 @@ impl RDNATranslator {
                                 );
                                 llvm::core::LLVMBuildRet(builder, ret_value);
                             }
+                            I::S_BARRIER_WAIT => {
+                                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+
+                                let next_pc_value =
+                                    llvm::core::LLVMConstInt(ty_i64, block.next_pcs[0] as u64, 0);
+
+                                llvm::core::LLVMBuildStore(builder, next_pc_value, emitter.pc_ptr);
+
+                                let ret_value = llvm::core::LLVMConstInt(
+                                    llvm::core::LLVMInt32TypeInContext(context),
+                                    Signals::Switch as u64,
+                                    0,
+                                );
+                                llvm::core::LLVMBuildRet(builder, ret_value);
+
+                                entry_pcs.push(block.next_pcs[0] as u64);
+                            }
                             _ => panic!("Unsupported terminator instruction: {:?}", inst),
                         }
                     } else {
@@ -14732,7 +14752,27 @@ impl RDNATranslator {
 
             llvm::core::LLVMPositionBuilderAtEnd(builder, entry_bb);
 
-            llvm::core::LLVMBuildBr(builder, *basic_blocks.get(&program.entry_pc).unwrap());
+            let empty_name = std::ffi::CString::new("").unwrap();
+            let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+
+            let pc_value =
+                llvm::core::LLVMBuildLoad2(builder, ty_i64, emitter.pc_ptr, empty_name.as_ptr());
+
+            let switch = llvm::core::LLVMBuildSwitch(
+                builder,
+                pc_value,
+                *basic_blocks.get(&program.entry_pc).unwrap(),
+                entry_pcs.len() as u32,
+            );
+
+            for entry_pc in &entry_pcs {
+                let case_value = llvm::core::LLVMConstInt(ty_i64, *entry_pc, 0);
+                llvm::core::LLVMAddCase(
+                    switch,
+                    case_value,
+                    *basic_blocks.get(&(*entry_pc as usize)).unwrap(),
+                );
+            }
 
             llvm::core::LLVMDisposeBuilder(builder);
 
@@ -14894,11 +14934,13 @@ impl RDNATranslator {
             inst_block.num_instructions = instruction_count;
         }
 
-        let block_addr = program.entry_pc as u64;
+        for entry_pc in &entry_pcs {
+            self.insts_blocks.insert(*entry_pc, inst_block.clone());
+        }
 
         self.clear();
 
-        self.insts_blocks.insert(block_addr, inst_block);
+        let block_addr = program.entry_pc as u64;
 
         self.insts_blocks.get_mut(&block_addr).unwrap()
     }
@@ -15305,6 +15347,9 @@ impl RDNAProgram {
                     next_pscs.push(next_pc);
                 }
                 I::S_ENDPGM => {}
+                I::S_BARRIER_WAIT => {
+                    next_pscs.push(pc);
+                }
                 _ => {
                     next_pscs.push(pc);
                 }
