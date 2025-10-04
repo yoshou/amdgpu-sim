@@ -14144,6 +14144,12 @@ impl RDNATranslator {
                     reg_usage.def_sgpr_u32(inst.sdst as u32);
                     reg_usage.def_sgpr_u32(126);
                 }
+                I::S_AND_SAVEEXEC_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_sgpr_u32(126);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
                 I::S_OR_SAVEEXEC_B32 => {
                     reg_usage.use_operand_u32(&inst.ssrc0);
                     reg_usage.use_sgpr_u32(126);
