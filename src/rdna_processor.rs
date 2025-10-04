@@ -626,8 +626,16 @@ impl SIMD32 {
                     .wrapping_add(self.num_vgprs * self.ctx.id * 32))
                     as *mut u32;
                 let scc_ptr = (&mut self.ctx.scc) as *mut bool;
+                let lds_ptr = self.lds.borrow_mut().as_mut_ptr();
 
-                block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
+                block.execute(
+                    sgprs_ptr,
+                    vgprs_ptr,
+                    scc_ptr,
+                    &mut self.ctx.pc,
+                    self.ctx.scratch_base,
+                    lds_ptr,
+                )
             } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
                 self.translator.add_inst(self.ctx.pc as u64, inst.clone());
                 let result = if is_terminator(&inst) {
@@ -643,8 +651,16 @@ impl SIMD32 {
                             .wrapping_add(self.num_vgprs * self.ctx.id * 32))
                             as *mut u32;
                         let scc_ptr = (&mut self.ctx.scc) as *mut bool;
+                        let lds_ptr = self.lds.borrow_mut().as_mut_ptr();
 
-                        block.execute(sgprs_ptr, vgprs_ptr, scc_ptr, &mut self.ctx.pc)
+                        block.execute(
+                            sgprs_ptr,
+                            vgprs_ptr,
+                            scc_ptr,
+                            &mut self.ctx.pc,
+                            self.ctx.scratch_base,
+                            lds_ptr,
+                        )
                     } else {
                         self.ctx.pc += size as u64;
                         Signals::None
