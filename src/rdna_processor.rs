@@ -904,7 +904,7 @@ impl SIMD32 {
                 self.s_mov_b64(d, s0);
             }
             I::S_CTZ_I32_B32 => {
-                self.s_ctz_i32_b64(d, s0);
+                self.s_ctz_i32_b32(d, s0);
             }
             I::S_AND_SAVEEXEC_B32 => {
                 self.s_and_saveexec_b32(d, s0);
@@ -937,8 +937,8 @@ impl SIMD32 {
         self.write_sop_dst_pair(d, d_value);
     }
 
-    fn s_ctz_i32_b64(&mut self, d: usize, s0: SourceOperand) {
-        let s0_value = self.read_scalar_source_operand_u64(s0);
+    fn s_ctz_i32_b32(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
         let d_value = match s0_value.trailing_zeros() {
             n if n >= 32 => -1,
             n => n as i32,
