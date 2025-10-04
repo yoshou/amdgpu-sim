@@ -4387,20 +4387,20 @@ impl<'a> RDNAProcessor<'a> {
         let insts = self.aql.kernel_object.object.to_vec();
         let entry_address = self.entry_address;
 
-        let mut translator = RDNATranslator::new();
-
         if USE_ENTIRE_KERNEL_TRANSLATION {
+            let mut translator = RDNATranslator::new();
+
             if translator.insts_blocks.is_empty() {
                 let program = RDNAProgram::new(entry_address, &insts);
                 translator.build_from_program(&program);
             }
-        }
 
-        for wgp in &mut self.wgps {
-            for cu in &mut wgp.cunits {
-                for simd in &cu.simds {
-                    let mut v = simd.lock().unwrap();
-                    v.translator = translator.clone();
+            for wgp in &mut self.wgps {
+                for cu in &mut wgp.cunits {
+                    for simd in &cu.simds {
+                        let mut v = simd.lock().unwrap();
+                        v.translator = translator.clone();
+                    }
                 }
             }
         }
