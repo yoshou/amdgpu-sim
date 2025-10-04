@@ -14581,28 +14581,28 @@ impl RDNATranslator {
 
                 llvm::core::LLVMPositionBuilderAtEnd(builder, basic_block);
 
-                let mut reg_usage = RegisterUsage::new();
-                reg_usage.incomming_sgprs.insert(106);
-                reg_usage.incomming_sgprs.insert(126);
+                let mut block_reg_usage = RegisterUsage::new();
+                block_reg_usage.incomming_sgprs.insert(106);
+                block_reg_usage.incomming_sgprs.insert(126);
 
-                reg_usage.use_sgprs.insert(106);
-                reg_usage.use_sgprs.insert(126);
+                block_reg_usage.use_sgprs.insert(106);
+                block_reg_usage.use_sgprs.insert(126);
 
-                reg_usage.def_sgprs.insert(106);
-                reg_usage.def_sgprs.insert(126);
+                block_reg_usage.def_sgprs.insert(106);
+                block_reg_usage.def_sgprs.insert(126);
 
                 for inst in &block.insts {
-                    Self::analyze_instructions(inst, &mut reg_usage);
+                    Self::analyze_instructions(inst, &mut block_reg_usage);
                 }
 
-                basic_block = emitter.emit_restore_registers(basic_block, &reg_usage);
+                basic_block = emitter.emit_restore_registers(basic_block, &block_reg_usage);
 
                 if is_terminator(block.insts.last().unwrap()) {
                     for inst in &block.insts[..block.insts.len() - 1] {
                         basic_block = emitter.emit_instruction(basic_block, inst);
                     }
 
-                    emitter.emit_save_registers(basic_block, &reg_usage);
+                    basic_block = emitter.emit_save_registers(basic_block, &block_reg_usage);
 
                     let last_inst = block.insts.last().unwrap();
                     if let InstFormat::SOPP(inst) = last_inst {
@@ -14716,6 +14716,8 @@ impl RDNATranslator {
                             I::S_BARRIER_WAIT => {
                                 let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
 
+                                emitter.emit_save_stack(basic_block, &reg_usage);
+
                                 let next_pc_value =
                                     llvm::core::LLVMConstInt(ty_i64, block.next_pcs[0] as u64, 0);
 
@@ -14743,7 +14745,7 @@ impl RDNATranslator {
                         basic_block = emitter.emit_instruction(basic_block, inst);
                     }
 
-                    emitter.emit_save_registers(basic_block, &reg_usage);
+                    emitter.emit_save_registers(basic_block, &block_reg_usage);
 
                     if block.next_pcs.len() == 1 {
                         llvm::core::LLVMBuildBr(
