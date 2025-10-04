@@ -2606,7 +2606,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
             let s1_value = self.read_vector_source_operand_u64(elem, s1);
             let d_value = s1_value << (s0_value & 0x3F);
             self.write_vgpr_pair(elem, d, d_value);
