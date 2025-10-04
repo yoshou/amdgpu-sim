@@ -2301,7 +2301,7 @@ impl IREmitter {
             }
         }
 
-        {
+        if self.use_scc_cache {
             let context = self.context;
             let builder = self.builder;
             let empty_name = std::ffi::CString::new("").unwrap();
