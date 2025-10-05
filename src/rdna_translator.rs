@@ -2179,6 +2179,37 @@ impl IREmitter {
         values[0]
     }
 
+    unsafe fn emit_split<const N: usize>(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> Vec<llvm::prelude::LLVMValueRef> {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let context = self.context;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+        let len = llvm::core::LLVMGetVectorSize(llvm::core::LLVMTypeOf(value)) as usize;
+
+        let mut values = Vec::new();
+        for i in (0..len).step_by(N) {
+            let mut index_values = Vec::new();
+            for j in 0..N {
+                index_values.push(llvm::core::LLVMConstInt(ty_i32, (i + j) as u64, 0));
+            }
+            let indices =
+                llvm::core::LLVMConstVector(index_values.as_mut_ptr(), index_values.len() as u32);
+            let value = llvm::core::LLVMBuildShuffleVector(
+                builder,
+                value,
+                llvm::core::LLVMGetUndef(llvm::core::LLVMTypeOf(value)),
+                indices,
+                empty_name.as_ptr(),
+            );
+            values.push(value);
+        }
+        values
+    }
+
     unsafe fn emit_alloc_registers(&mut self, reg_usage: &RegisterUsage) {
         if USE_SGPR_CACHE {
             let sgprs: Vec<u32> = reg_usage
@@ -2411,6 +2442,44 @@ impl IREmitter {
                 );
             }
         }
+
+        if self.use_vgpr_cache {
+            for vgpr in &reg_usage.def_vgprs {
+                let context = self.context;
+                let builder = self.builder;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                const N: usize = SIMD_WIDTH;
+
+                for i in (0..32).step_by(N) {
+                    let mut indices: Vec<*mut llvm_sys::LLVMValue> =
+                        vec![llvm::core::LLVMConstInt(
+                            llvm::core::LLVMInt64TypeInContext(context),
+                            *vgpr as u64 * 32 + i as u64,
+                            0,
+                        )];
+                    let value_ptr = llvm::core::LLVMBuildGEP2(
+                        builder,
+                        ty_i32,
+                        self.vgprs_ptr,
+                        indices.as_mut_ptr(),
+                        indices.len() as u32,
+                        empty_name.as_ptr(),
+                    );
+
+                    llvm::core::LLVMBuildMemCpy(
+                        builder,
+                        value_ptr,
+                        4,
+                        self.vgpr_ptr_map.get(vgpr).unwrap()[i / N],
+                        4,
+                        llvm::core::LLVMConstInt(ty_i32, 4 * N as u64, 0),
+                    );
+                }
+            }
+        }
+
         bb
     }
 
@@ -4201,6 +4270,8 @@ impl IREmitter {
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
+                    const N: usize = SIMD_WIDTH;
+
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     let mut param_tys = vec![ty_i32];
@@ -4240,7 +4311,29 @@ impl IREmitter {
                     let elem =
                         llvm::core::LLVMBuildZExt(builder, elem, ty_i64, empty_name.as_ptr());
 
-                    let d_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                    let d_value = if USE_SIMD {
+                        let mut values = Vec::new();
+                        for i in (0..32).step_by(N) {
+                            let value = emitter.emit_vector_source_operand_u32xn::<N>(
+                                &inst.src0,
+                                i as u32,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(ty_i1, 1, 0); N].as_mut_ptr(),
+                                    N as u32,
+                                ),
+                            );
+                            values.push(value);
+                        }
+                        let value = emitter.emit_concat::<N>(&values);
+                        llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            value,
+                            elem,
+                            empty_name.as_ptr(),
+                        )
+                    } else {
+                        emitter.emit_vector_source_operand_u32(&inst.src0, elem)
+                    };
 
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
                 }
@@ -8196,9 +8289,12 @@ impl IREmitter {
                 }
                 I::V_WRITELANE_B32 => {
                     let emitter = self;
+                    let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                     let empty_name = std::ffi::CString::new("").unwrap();
+
+                    const N: usize = SIMD_WIDTH;
 
                     let s0_value = emitter.emit_scalar_source_operand_u32(&inst.src0);
                     let s1_value = emitter.emit_scalar_source_operand_u32(&inst.src1);
@@ -8213,13 +8309,51 @@ impl IREmitter {
                     let s1_value =
                         llvm::core::LLVMBuildZExt(builder, s1_value, ty_i64, empty_name.as_ptr());
 
-                    emitter.emit_store_vgpr_u32(inst.vdst as u32, s1_value, s0_value);
+                    if USE_SIMD {
+                        let mut values = Vec::new();
+                        for i in (0..32).step_by(N) {
+                            let value = emitter.emit_load_vgpr_u32xn::<N>(
+                                inst.vdst as u32,
+                                i as u32,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(ty_i1, 1, 0); N].as_mut_ptr(),
+                                    N as u32,
+                                ),
+                            );
+                            values.push(value);
+                        }
+                        let value = emitter.emit_concat::<N>(&values);
+                        let value = llvm::core::LLVMBuildInsertElement(
+                            builder,
+                            value,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
+                        let values = emitter.emit_split::<N>(value);
+                        for i in (0..32).step_by(N) {
+                            emitter.emit_store_vgpr_u32xn::<N>(
+                                inst.vdst as u32,
+                                i as u32,
+                                values[i / N],
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(ty_i1, 1, 0); N].as_mut_ptr(),
+                                    N as u32,
+                                ),
+                            );
+                        }
+                    } else {
+                        emitter.emit_store_vgpr_u32(inst.vdst as u32, s1_value, s0_value);
+                    };
                 }
                 I::V_READLANE_B32 => {
                     let emitter = self;
+                    let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                     let empty_name = std::ffi::CString::new("").unwrap();
+
+                    const N: usize = SIMD_WIDTH;
 
                     let s1_value = emitter.emit_scalar_source_operand_u32(&inst.src1);
 
@@ -8233,7 +8367,29 @@ impl IREmitter {
                     let s1_value =
                         llvm::core::LLVMBuildZExt(builder, s1_value, ty_i64, empty_name.as_ptr());
 
-                    let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, s1_value);
+                    let s0_value = if USE_SIMD {
+                        let mut values = Vec::new();
+                        for i in (0..32).step_by(N) {
+                            let value = emitter.emit_vector_source_operand_u32xn::<N>(
+                                &inst.src0,
+                                i as u32,
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(ty_i1, 1, 0); N].as_mut_ptr(),
+                                    N as u32,
+                                ),
+                            );
+                            values.push(value);
+                        }
+                        let value = emitter.emit_concat::<N>(&values);
+                        llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        )
+                    } else {
+                        emitter.emit_vector_source_operand_u32(&inst.src0, s1_value)
+                    };
 
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, s0_value);
                 }
@@ -14826,7 +14982,7 @@ impl RDNATranslator {
                 llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
             let err = llvm::transforms::pass_builder::LLVMRunPassesOnFunction(
                 function,
-                b"lcssa,adce,early-cse,instcombine,aggressive-instcombine,mem2reg,gvn,dse,instsimplify,load-store-vectorizer,loop-fusion,loop-reduce,sink,loop-load-elim,reassociate,function-simplification<O3>,loop-vectorize,simplifycfg,loop-unroll<O3>\0".as_ptr() as *const _,
+                b"lcssa,adce,early-cse,instcombine<no-verify-fixpoint>,aggressive-instcombine,mem2reg,gvn,dse,instsimplify,load-store-vectorizer,loop-fusion,loop-reduce,sink,loop-load-elim,reassociate,function-simplification<O3>,loop-vectorize,simplifycfg,loop-unroll<O3>\0".as_ptr() as *const _,
                 tm,
                 pass_builder_options,
             );
