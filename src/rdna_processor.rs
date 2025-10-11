@@ -472,6 +472,7 @@ fn cmp_class_f64(a: f64, mask: u32) -> bool {
     result
 }
 
+use half::f16;
 use num_traits::ops::mul_add::MulAdd;
 
 #[inline(always)]
@@ -505,6 +506,19 @@ fn abs_neg<T: num::Float>(value: T, abs: u8, neg: u8, idx: usize) -> T {
     result
 }
 
+fn abs_neg_f16(value: f16, abs: u8, neg: u8, idx: usize) -> f16 {
+    let mut result = value;
+    if ((abs >> idx) & 1) != 0 {
+        if result.is_sign_negative() {
+            result = -result;
+        }
+    }
+    if ((neg >> idx) & 1) != 0 {
+        result = -result;
+    }
+    result
+}
+
 #[inline(always)]
 fn u32_to_f32_abs_neg(value: u32, abs: u8, neg: u8, idx: usize) -> f32 {
     let result = f32::from_bits(value);
@@ -516,14 +530,30 @@ fn f64_to_u64(value: f64) -> u64 {
     f64::to_bits(value)
 }
 
-fn clamp_f64(value: f64, min_value: f64, max_value: f64) -> f64 {
-    if value < min_value {
-        min_value
-    } else if value > max_value {
-        max_value
+fn clamp_f32(value: f32, clamp: bool) -> f32 {
+    if clamp {
+        value.clamp(0.0, 1.0)
     } else {
         value
     }
+}
+
+fn clamp_f64(value: f64, clamp: bool) -> f64 {
+    if clamp {
+        value.clamp(0.0, 1.0)
+    } else {
+        value
+    }
+}
+
+fn f32_to_u32_omod_clamp(value: f32, omod: u8, clamp: bool) -> u32 {
+    let value = match omod {
+        1 => value * 2.0,
+        2 => value * 4.0,
+        3 => value * 0.5,
+        _ => value,
+    };
+    f32::to_bits(clamp_f32(value, clamp))
 }
 
 fn f64_to_u64_omod_clamp(value: f64, omod: u8, clamp: bool) -> u64 {
@@ -533,12 +563,7 @@ fn f64_to_u64_omod_clamp(value: f64, omod: u8, clamp: bool) -> u64 {
         3 => value * 0.5,
         _ => value,
     };
-    let value = if clamp {
-        clamp_f64(value, 0.0, 1.0)
-    } else {
-        value
-    };
-    f64::to_bits(value)
+    f64::to_bits(clamp_f64(value, clamp))
 }
 
 impl SIMD32 {
@@ -854,6 +879,79 @@ impl SIMD32 {
         }
     }
 
+    fn read_vector_source_operand_f16(&self, elem: usize, addr: SourceOperand) -> f16 {
+        match addr {
+            SourceOperand::LiteralConstant(value) => f16::from_bits(value as u16 & 0xFFFF),
+            SourceOperand::IntegerConstant(value) => f16::from_bits(value as u16 & 0xFFFF),
+            SourceOperand::FloatConstant(value) => f16::from_f32(value as f32),
+            SourceOperand::ScalarRegister(value) => {
+                f16::from_bits((self.read_sgpr(value as usize) & 0xFFFF) as u16)
+            }
+            SourceOperand::VectorRegister(value) => {
+                f16::from_bits((self.read_vgpr(elem, value as usize) & 0xFFFF) as u16)
+            }
+        }
+    }
+
+    fn read_vector_source_operand_f16_hi(&self, elem: usize, addr: SourceOperand) -> f16 {
+        match addr {
+            SourceOperand::LiteralConstant(value) => f16::from_bits(value as u16 & 0xFFFF),
+            SourceOperand::IntegerConstant(value) => f16::from_bits(value as u16 & 0xFFFF),
+            SourceOperand::FloatConstant(value) => f16::from_f32(value as f32),
+            SourceOperand::ScalarRegister(value) => {
+                f16::from_bits(((self.read_sgpr(value as usize) >> 16) & 0xFFFF) as u16)
+            }
+            SourceOperand::VectorRegister(value) => {
+                f16::from_bits(((self.read_vgpr(elem, value as usize) >> 16) & 0xFFFF) as u16)
+            }
+        }
+    }
+
+    fn read_vector_source_operand_f16_vec<const N: usize>(
+        &self,
+        elem: usize,
+        addr: SourceOperand,
+    ) -> [f16; N] {
+        match addr {
+            SourceOperand::LiteralConstant(value) => {
+                let value = f16::from_bits(value as u16 & 0xFFFF);
+                [value; N]
+            }
+            SourceOperand::IntegerConstant(value) => {
+                let value = f16::from_bits(value as u16 & 0xFFFF);
+                [value; N]
+            }
+            SourceOperand::FloatConstant(value) => {
+                let value = f16::from_f64(value);
+                [value; N]
+            }
+            SourceOperand::ScalarRegister(value) => {
+                let mut result = [f16::ZERO; N];
+                for i in (0..N).step_by(2) {
+                    assert!(i + 1 < N);
+                    let reg_value = self.read_sgpr(value as usize + i / 2);
+                    let value_lo = f16::from_bits((reg_value & 0xFFFF) as u16);
+                    let value_hi = f16::from_bits((reg_value >> 16) as u16);
+                    result[i] = value_lo;
+                    result[i + 1] = value_hi;
+                }
+                return result;
+            }
+            SourceOperand::VectorRegister(value) => {
+                let mut result = [f16::ZERO; N];
+                for i in (0..N).step_by(2) {
+                    assert!(i + 1 < N);
+                    let reg_value = self.read_vgpr(elem, value as usize + i / 2);
+                    let value_lo = f16::from_bits((reg_value & 0xFFFF) as u16);
+                    let value_hi = f16::from_bits((reg_value >> 16) as u16);
+                    result[i] = value_lo;
+                    result[i + 1] = value_hi;
+                }
+                return result;
+            }
+        }
+    }
+
     fn read_vector_source_operand_u64(&self, elem: usize, addr: SourceOperand) -> u64 {
         match addr {
             SourceOperand::LiteralConstant(value) => value as u64,
@@ -872,6 +970,41 @@ impl SIMD32 {
             SourceOperand::ScalarRegister(value) => u32_to_f32(self.read_sgpr(value as usize)),
             SourceOperand::VectorRegister(value) => {
                 u32_to_f32(self.read_vgpr(elem, value as usize))
+            }
+        }
+    }
+
+    fn read_vector_source_operand_f32_vec<const N: usize>(
+        &self,
+        elem: usize,
+        addr: SourceOperand,
+    ) -> [f32; N] {
+        match addr {
+            SourceOperand::LiteralConstant(value) => {
+                let value = u32_to_f32(value);
+                [value; N]
+            }
+            SourceOperand::IntegerConstant(value) => {
+                let value = u32_to_f32((value & 0xFFFFFFFF) as u32);
+                [value; N]
+            }
+            SourceOperand::FloatConstant(value) => {
+                let value = value as f32;
+                [value; N]
+            }
+            SourceOperand::ScalarRegister(value) => {
+                let mut result = [0.0f32; N];
+                for i in 0..N {
+                    result[i] = u32_to_f32(self.read_sgpr(value as usize + i));
+                }
+                return result;
+            }
+            SourceOperand::VectorRegister(value) => {
+                let mut result = [0.0f32; N];
+                for i in 0..N {
+                    result[i] = u32_to_f32(self.read_vgpr(elem, value as usize + i));
+                }
+                return result;
             }
         }
     }
@@ -897,6 +1030,7 @@ impl SIMD32 {
             InstFormat::VOP2(fields) => self.execute_vop2(fields),
             InstFormat::VOP3(fields) => self.execute_vop3(fields),
             InstFormat::VOP3SD(fields) => self.execute_vop3sd(fields),
+            InstFormat::VOP3P(fields) => self.execute_vop3p(fields),
             InstFormat::VOPC(fields) => self.execute_vopc(fields),
             InstFormat::VOPD(fields) => self.execute_vopd(fields),
             InstFormat::SMEM(fields) => self.execute_smem(fields),
@@ -1046,6 +1180,9 @@ impl SIMD32 {
             I::S_LSHL_B32 => {
                 self.s_lshl_b32(d, s0, s1);
             }
+            I::S_LSHL_B64 => {
+                self.s_lshl_b64(d, s0, s1);
+            }
             I::S_MAX_U32 => {
                 self.s_max_u32(d, s0, s1);
             }
@@ -1158,6 +1295,14 @@ impl SIMD32 {
         let s1_value = self.read_scalar_source_operand_u32(s1);
         let d_value = s0_value << (s1_value & 0x1F);
         self.write_sop_dst(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_lshl_b64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = s0_value << (s1_value & 0x3F);
+        self.write_sop_dst_pair(d, d_value);
         self.ctx.scc = d_value != 0;
     }
 
@@ -1688,6 +1833,9 @@ impl SIMD32 {
             I::V_ADD3_U32 => {
                 self.v_add3_u32(d, s0, s1, s2);
             }
+            I::V_MUL_F32 => {
+                self.v_mul_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
             I::V_CVT_F64_U32 => {
                 self.v_cvt_f64_u32_e64(d, s0, abs, neg, clamp, omod);
             }
@@ -1778,6 +1926,9 @@ impl SIMD32 {
             I::V_LSHL_ADD_U32 => {
                 self.v_lshl_add_u32(d, s0, s1, s2);
             }
+            I::V_ADD_LSHL_U32 => {
+                self.v_add_lshl_u32(d, s0, s1, s2);
+            }
             I::V_CMP_NE_U32 => {
                 self.v_cmp_ne_u32_e64(d, s0, s1);
             }
@@ -1795,6 +1946,9 @@ impl SIMD32 {
             }
             I::V_TRIG_PREOP_F64 => {
                 self.v_trig_preop_f64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CVT_F32_F16 => {
+                self.v_cvt_f32_f16_e64(d, s0, abs, neg, clamp, omod);
             }
             _ => unimplemented!(),
         }
@@ -1993,6 +2147,27 @@ impl SIMD32 {
             let s2_value = self.read_vector_source_operand_u32(elem, s2);
             let (d_value, _) = add_u32(s0_value, s1_value, s2_value);
             self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_mul_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value * s1_value;
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
 
@@ -2745,6 +2920,25 @@ impl SIMD32 {
         }
     }
 
+    fn v_add_lshl_u32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let d_value = s0_value.wrapping_add(s1_value) << (s2_value & 0x1F);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
     fn v_cmp_ne_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let mut vcc = 0u32;
         for elem in 0..32 {
@@ -2897,6 +3091,25 @@ impl SIMD32 {
         }
     }
 
+    fn v_cvt_f32_f16_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg_f16(self.read_vector_source_operand_f16(elem, s0), abs, neg, 0);
+            let d_value = s0_value.to_f32();
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
     fn execute_vop3sd(&mut self, inst: VOP3SD) -> Signals {
         let d0 = inst.vdst as usize;
         let d1 = inst.sdst as usize;
@@ -3030,6 +3243,156 @@ impl SIMD32 {
                 continue;
             }
             self.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn execute_vop3p(&mut self, inst: VOP3P) -> Signals {
+        let d = inst.vdst as usize;
+        let s0 = inst.src0;
+        let s1 = inst.src1;
+        let s2 = inst.src2;
+        let opsel = inst.opsel;
+        let opsel_hi = inst.opsel_hi | (inst.opsel_hi2 << 2);
+        let neg = inst.neg;
+        let neg_hi = inst.neg_hi;
+        let clamp = inst.cm != 0;
+        match inst.op {
+            I::V_WMMA_F32_16X16X16_F16 => {
+                self.v_wmma_f32_16x16x16_f16(d, s0, s1, s2);
+            }
+            I::V_FMA_MIXLO_F16 => {
+                self.v_fma_mixlo_f16(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
+            }
+            _ => unimplemented!("{:?}", inst.op),
+        }
+        Signals::None
+    }
+
+    fn v_wmma_f32_16x16x16_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+    ) {
+        let mut matrix_a = [[0f32; 16]; 16];
+        let mut matrix_b = [[0f32; 16]; 16];
+        let mut matrix_c = [[0f32; 16]; 16];
+        let mut matrix_d = [[0f32; 16]; 16];
+
+        for elem in 0..32 {
+            let s0_value = self.read_vector_source_operand_f16_vec::<8>(elem, s0);
+            for i in 0..2 {
+                for j in 0..2 {
+                    for k in 0..2 {
+                        let col = (k + j * 2 + (elem / 16) * 4 + i * 8) as usize;
+                        let row = (elem % 16) as usize;
+                        matrix_a[row][col] = s0_value[k + j * 2 + i * 4].to_f32();
+                    }
+                }
+            }
+            let s1_value = self.read_vector_source_operand_f16_vec::<8>(elem, s1);
+            for i in 0..2 {
+                for j in 0..2 {
+                    for k in 0..2 {
+                        let row = (k + j * 2 + (elem / 16) * 4 + i * 8) as usize;
+                        let col = (elem % 16) as usize;
+                        matrix_b[row][col] = s1_value[k + j * 2 + i * 4].to_f32();
+                    }
+                }
+            }
+            let s2_value = self.read_vector_source_operand_f32_vec::<8>(elem, s2);
+            for i in 0..8 {
+                let row = ((elem / 16) * 8 + i) as usize;
+                let col = (elem % 16) as usize;
+                matrix_c[row][col] = s2_value[i];
+            }
+        }
+
+        for i in 0..16 {
+            for j in 0..16 {
+                let mut sum = matrix_c[i][j];
+                for k in 0..16 {
+                    sum += matrix_a[i][k] * matrix_b[k][j];
+                }
+                matrix_d[i][j] = sum;
+            }
+        }
+
+        for elem in 0..32 {
+            for i in 0..8 {
+                let row = ((elem / 16) * 8 + i) as usize;
+                let col = (elem % 16) as usize;
+                self.write_vgpr(elem, d + i, f32_to_u32(matrix_d[row][col]));
+            }
+        }
+    }
+
+    fn v_fma_mixlo_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = if opsel_hi & 1 == 0 {
+                abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0)
+            } else if opsel & 1 == 0 {
+                abs_neg_f16(
+                    self.read_vector_source_operand_f16_hi(elem, s0),
+                    abs,
+                    neg,
+                    0,
+                )
+                .to_f32()
+            } else {
+                abs_neg_f16(self.read_vector_source_operand_f16(elem, s0), abs, neg, 0).to_f32()
+            };
+
+            let s1_value = if opsel_hi & 2 == 0 {
+                abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1)
+            } else if opsel & 2 == 0 {
+                abs_neg_f16(
+                    self.read_vector_source_operand_f16_hi(elem, s1),
+                    abs,
+                    neg,
+                    1,
+                )
+                .to_f32()
+            } else {
+                abs_neg_f16(self.read_vector_source_operand_f16(elem, s1), abs, neg, 1).to_f32()
+            };
+
+            let s2_value = if opsel_hi & 4 == 0 {
+                abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2)
+            } else if opsel & 4 == 0 {
+                abs_neg_f16(
+                    self.read_vector_source_operand_f16_hi(elem, s2),
+                    abs,
+                    neg,
+                    2,
+                )
+                .to_f32()
+            } else {
+                abs_neg_f16(self.read_vector_source_operand_f16(elem, s2), abs, neg, 2).to_f32()
+            };
+
+            let d_value = fma(s0_value, s1_value, s2_value);
+
+            self.write_vgpr(
+                elem,
+                d,
+                f16::from_f32(clamp_f32(d_value, clamp)).to_bits() as u32,
+            );
         }
     }
 
@@ -3658,11 +4021,17 @@ impl SIMD32 {
             I::SCRATCH_STORE_B64 => {
                 self.scratch_store_b64(vaddr, vsrc, saddr, ioffset);
             }
+            I::SCRATCH_STORE_B128 => {
+                self.scratch_store_b128(vaddr, vsrc, saddr, ioffset);
+            }
             I::SCRATCH_LOAD_B32 => {
                 self.scratch_load_b32(vaddr, vdst, saddr, ioffset);
             }
             I::SCRATCH_LOAD_B64 => {
                 self.scratch_load_b64(vaddr, vdst, saddr, ioffset);
+            }
+            I::SCRATCH_LOAD_B128 => {
+                self.scratch_load_b128(vaddr, vdst, saddr, ioffset);
             }
             _ => unimplemented!(),
         }
@@ -3689,6 +4058,28 @@ impl SIMD32 {
 
     fn scratch_store_b64(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
         for i in 0..2 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let data = self.read_vgpr(elem, vsrc + i);
+                let vaddr_val = 0u64;
+                let saddr_val = self.read_sgpr(saddr) as u64;
+                let offset = ((vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) / 4 * 32
+                    + (elem as u64))
+                    * 4;
+                let addr = self.ctx.scratch_base + offset;
+
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
+    fn scratch_store_b128(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        for i in 0..4 {
             for elem in 0..32 {
                 if !self.get_exec_bit(elem) {
                     continue;
@@ -3745,6 +4136,26 @@ impl SIMD32 {
         }
     }
 
+    fn scratch_load_b128(&mut self, _vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        for i in 0..4 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let vaddr_val = 0u64;
+                let saddr_val = self.read_sgpr(saddr) as u64;
+                let offset = ((vaddr_val + saddr_val + ioffset as u64 + (i as u64 * 4)) / 4 * 32
+                    + (elem as u64))
+                    * 4;
+                let addr = self.ctx.scratch_base + offset;
+
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
     fn execute_vglobal(&mut self, inst: VGLOBAL) -> Signals {
         let saddr = inst.saddr as usize;
         let vaddr = inst.vaddr as usize;
@@ -3752,6 +4163,9 @@ impl SIMD32 {
         let vdst = inst.vdst as usize;
         let ioffset = inst.ioffset as u32;
         match inst.op {
+            I::GLOBAL_STORE_B16 => {
+                self.global_store_b16(vaddr, vsrc, saddr, ioffset);
+            }
             I::GLOBAL_STORE_B32 => {
                 self.global_store_b32(vaddr, vsrc, saddr, ioffset);
             }
@@ -3781,6 +4195,31 @@ impl SIMD32 {
             _ => unimplemented!(),
         }
         Signals::None
+    }
+
+    fn global_store_b16(&mut self, vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let data = self.read_vgpr(elem, vsrc);
+            let addr = offset[elem] + (ioffset as u64);
+
+            let ptr = addr as *mut u16;
+            unsafe {
+                *ptr = data as u16;
+            }
+        }
     }
 
     fn global_store_b32(&mut self, vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {

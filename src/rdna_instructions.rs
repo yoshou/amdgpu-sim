@@ -112,10 +112,26 @@ pub struct VOP3SD {
     pub neg: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct VOP3P {
+    pub vdst: u8,
+    pub neg_hi: u8,
+    pub opsel: u8,
+    pub opsel_hi2: u8,
+    pub cm: u8,
+    pub op: I,
+    pub src0: SourceOperand,
+    pub src1: SourceOperand,
+    pub src2: SourceOperand,
+    pub opsel_hi: u8,
+    pub neg: u8,
+}
+
 pub const VOPC_ENCODE: u32 = 0b0111110;
 pub const VOP1_ENCODE: u32 = 0b0111111;
 pub const VOP2_ENCODE: u32 = 0b0;
 pub const VOP3_ENCODE: u32 = 0b110101;
+pub const VOP3P_ENCODE: u32 = 0b11001100;
 pub const VOPD_ENCODE: u32 = 0b110010;
 
 #[derive(Debug, Clone)]
@@ -200,6 +216,7 @@ pub enum InstFormat {
     VOP2(VOP2),
     VOP3(VOP3),
     VOP3SD(VOP3SD),
+    VOP3P(VOP3P),
     VOPC(VOPC),
     VOPD(VOPD),
     VFLAT(VFLAT),

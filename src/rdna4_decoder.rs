@@ -880,6 +880,68 @@ fn decode_vop3_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
+fn decode_vop3p_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
+    match opcode {
+        0 => Ok((I::V_PK_MAD_I16, 8)),
+        1 => Ok((I::V_PK_MUL_LO_U16, 8)),
+        2 => Ok((I::V_PK_ADD_I16, 8)),
+        3 => Ok((I::V_PK_SUB_I16, 8)),
+        4 => Ok((I::V_PK_LSHLREV_B16, 8)),
+        5 => Ok((I::V_PK_LSHRREV_B16, 8)),
+        6 => Ok((I::V_PK_ASHRREV_I16, 8)),
+        7 => Ok((I::V_PK_MAX_I16, 8)),
+        8 => Ok((I::V_PK_MIN_I16, 8)),
+        9 => Ok((I::V_PK_MAD_U16, 8)),
+        10 => Ok((I::V_PK_ADD_U16, 8)),
+        11 => Ok((I::V_PK_SUB_U16, 8)),
+        12 => Ok((I::V_PK_MAX_U16, 8)),
+        13 => Ok((I::V_PK_MIN_U16, 8)),
+        14 => Ok((I::V_PK_FMA_F16, 8)),
+        15 => Ok((I::V_PK_ADD_F16, 8)),
+        16 => Ok((I::V_PK_MUL_F16, 8)),
+        19 => Ok((I::V_DOT2_F32_F16, 8)),
+        22 => Ok((I::V_DOT4_I32_IU8, 8)),
+        23 => Ok((I::V_DOT4_U32_U8, 8)),
+        24 => Ok((I::V_DOT8_I32_IU4, 8)),
+        25 => Ok((I::V_DOT8_U32_U4, 8)),
+        26 => Ok((I::V_DOT2_F32_BF16, 8)),
+        27 => Ok((I::V_PK_MIN_NUM_F16, 8)),
+        28 => Ok((I::V_PK_MAX_NUM_F16, 8)),
+        29 => Ok((I::V_PK_MINIMUM_F16, 8)),
+        30 => Ok((I::V_PK_MAXIMUM_F16, 8)),
+        32 => Ok((I::V_FMA_MIX_F32, 8)),
+        33 => Ok((I::V_FMA_MIXLO_F16, 8)),
+        34 => Ok((I::V_FMA_MIXHI_F16, 8)),
+        36 => Ok((I::V_DOT4_F32_FP8_BF8, 8)),
+        37 => Ok((I::V_DOT4_F32_BF8_FP8, 8)),
+        38 => Ok((I::V_DOT4_F32_FP8_FP8, 8)),
+        39 => Ok((I::V_DOT4_F32_BF8_BF8, 8)),
+        64 => Ok((I::V_WMMA_F32_16X16X16_F16, 8)),
+        65 => Ok((I::V_WMMA_F32_16X16X16_BF16, 8)),
+        66 => Ok((I::V_WMMA_F16_16X16X16_F16, 8)),
+        67 => Ok((I::V_WMMA_BF16_16X16X16_BF16, 8)),
+        68 => Ok((I::V_WMMA_I32_16X16X16_IU8, 8)),
+        69 => Ok((I::V_WMMA_I32_16X16X16_IU4, 8)),
+        70 => Ok((I::V_WMMA_F32_16X16X16_FP8_FP8, 8)),
+        71 => Ok((I::V_WMMA_F32_16X16X16_FP8_BF8, 8)),
+        72 => Ok((I::V_WMMA_F32_16X16X16_BF8_FP8, 8)),
+        73 => Ok((I::V_WMMA_F32_16X16X16_BF8_BF8, 8)),
+        74 => Ok((I::V_WMMA_I32_16X16X32_IU4, 8)),
+        80 => Ok((I::V_SWMMAC_F32_16X16X32_F16, 8)),
+        81 => Ok((I::V_SWMMAC_F32_16X16X32_BF16, 8)),
+        82 => Ok((I::V_SWMMAC_F16_16X16X32_F16, 8)),
+        83 => Ok((I::V_SWMMAC_BF16_16X16X32_BF16, 8)),
+        84 => Ok((I::V_SWMMAC_I32_16X16X32_IU8, 8)),
+        85 => Ok((I::V_SWMMAC_I32_16X16X32_IU4, 8)),
+        86 => Ok((I::V_SWMMAC_I32_16X16X64_IU4, 8)),
+        87 => Ok((I::V_SWMMAC_F32_16X16X32_FP8_FP8, 8)),
+        88 => Ok((I::V_SWMMAC_F32_16X16X32_FP8_BF8, 8)),
+        89 => Ok((I::V_SWMMAC_F32_16X16X32_BF8_FP8, 8)),
+        90 => Ok((I::V_SWMMAC_F32_16X16X32_BF8_BF8, 8)),
+        _ => Err(()),
+    }
+}
+
 fn decode_vopc_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         1 => Ok((I::V_CMP_LT_F16, 4)),
@@ -1571,6 +1633,35 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
                 },
             ))
         }
+    } else if (get_bits(inst, 31, 24) as u32) == VOP3P_ENCODE {
+        let vdst = get_bits(inst, 7, 0) as u8;
+        let cm = get_bits(inst, 15, 15) as u8;
+        let src0 = get_bits(inst, 40, 32) as u16;
+        let src1 = get_bits(inst, 49, 41) as u16;
+        let src2 = get_bits(inst, 58, 50) as u16;
+        let opsel_hi = get_bits(inst, 60, 59) as u8;
+        let neg = get_bits(inst, 63, 61) as u8;
+        let (op, size) = decode_vop3p_opcode_rdna4(get_bits(inst, 25, 16) as u32)?;
+        Ok((
+            InstFormat::VOP3P(VOP3P {
+                vdst,
+                neg_hi: get_bits(inst, 10, 8) as u8,
+                opsel: get_bits(inst, 13, 11) as u8,
+                opsel_hi2: get_bits(inst, 14, 14) as u8,
+                cm,
+                op,
+                src0: decode_source_operand(src0, &inst_stream.insts[8..]),
+                src1: decode_source_operand(src1, &inst_stream.insts[8..]),
+                src2: decode_source_operand(src2, &inst_stream.insts[8..]),
+                opsel_hi,
+                neg,
+            }),
+            if src0 == 255 || src1 == 255 || src2 == 255 {
+                size + 4
+            } else {
+                size
+            },
+        ))
     } else if (get_bits(inst, 31, 26) as u32) == SMEM_ENCODE {
         let (op, size) = decode_smem_opcode_rdna4(get_bits(inst, 18, 13) as u32)?;
         Ok((

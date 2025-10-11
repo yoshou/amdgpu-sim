@@ -21,6 +21,11 @@ pub fn set_u64(buffer: &mut [u8], offset: usize, value: u64) {
     buffer[offset + 7] = ((value >> 56) & 0xFF) as u8;
 }
 
+pub fn set_f32(buffer: &mut [u8], offset: usize, value: f32) {
+    let bytes = value.to_le_bytes();
+    buffer[offset..offset + 4].copy_from_slice(&bytes);
+}
+
 pub fn get_u32(buffer: &[u8], offset: usize) -> u32 {
     let mut arr = [0u8; 4];
     arr.copy_from_slice(&buffer[offset..offset + 4]);
