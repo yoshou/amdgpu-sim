@@ -10,229 +10,6 @@ use std::collections::VecDeque;
 
 static USE_INTERPRETER: bool = false;
 static USE_ENTIRE_KERNEL_TRANSLATION: bool = true;
-static USE_SIMD: bool = true;
-
-struct F64x8 {
-    value0: std::arch::x86_64::__m256d,
-    value1: std::arch::x86_64::__m256d,
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn read_vector_source_operand_f64x8(
-    elem: usize,
-    addr: SourceOperand,
-    sgprs: *const u32,
-    vgprs: *mut u32,
-) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-    match addr {
-        SourceOperand::ScalarRegister(value) => {
-            let value = _mm256_castsi256_pd(_mm256_set1_epi64x(
-                ((((*sgprs.wrapping_add((value + 1) as usize)) as u64) << 32)
-                    | ((*sgprs.wrapping_add(value as usize)) as u64)) as i64,
-            ));
-            F64x8 {
-                value0: value,
-                value1: value,
-            }
-        }
-        SourceOperand::VectorRegister(value) => {
-            let value_lo = _mm256_loadu_si256(
-                (vgprs.wrapping_add(value as usize * 32 + elem)) as *const __m256i,
-            );
-            let value_hi = _mm256_loadu_si256(
-                (vgprs.wrapping_add(value as usize * 32 + elem + 32)) as *const __m256i,
-            );
-            let value0 = _mm256_castsi256_pd(_mm256_unpacklo_epi32(value_lo, value_hi));
-            let value1 = _mm256_castsi256_pd(_mm256_unpackhi_epi32(value_lo, value_hi));
-            F64x8 {
-                value0: value0,
-                value1: value1,
-            }
-        }
-        SourceOperand::LiteralConstant(value) => {
-            let value = _mm256_castsi256_pd(_mm256_set1_epi64x((value as i64) << 32));
-            F64x8 {
-                value0: value,
-                value1: value,
-            }
-        }
-        SourceOperand::IntegerConstant(value) => {
-            let value = _mm256_castsi256_pd(_mm256_set1_epi64x(value as i64));
-            F64x8 {
-                value0: value,
-                value1: value,
-            }
-        }
-        SourceOperand::FloatConstant(value) => {
-            let value = _mm256_set1_pd(value);
-            F64x8 {
-                value0: value,
-                value1: value,
-            }
-        }
-    }
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn read_vgpr_f64x8(elem: usize, addr: usize, vgprs: *mut u32) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value_lo = _mm256_loadu_si256((vgprs.wrapping_add(addr * 32 + elem)) as *const __m256i);
-    let value_hi =
-        _mm256_loadu_si256((vgprs.wrapping_add(addr * 32 + elem + 32)) as *const __m256i);
-    let value0 = _mm256_castsi256_pd(_mm256_unpacklo_epi32(value_lo, value_hi));
-    let value1 = _mm256_castsi256_pd(_mm256_unpackhi_epi32(value_lo, value_hi));
-    F64x8 {
-        value0: value0,
-        value1: value1,
-    }
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn mask_store_vgpr_f64x8(
-    mask: std::arch::x86_64::__m256i,
-    elem: usize,
-    addr: usize,
-    value: F64x8,
-    vgprs: *mut u32,
-) {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value0 = _mm256_castpd_ps(value.value0);
-    let value1 = _mm256_castpd_ps(value.value1);
-    let value_lo = _mm256_shuffle_ps::<0x88>(value0, value1);
-    let value_hi = _mm256_shuffle_ps::<0xDD>(value0, value1);
-    let value_lo = _mm256_castps_si256(value_lo);
-    let value_hi = _mm256_castps_si256(value_hi);
-
-    _mm256_maskstore_epi32(
-        (vgprs.wrapping_add(addr * 32 + elem)) as *mut i32,
-        mask,
-        value_lo,
-    );
-    _mm256_maskstore_epi32(
-        (vgprs.wrapping_add(addr * 32 + elem + 32)) as *mut i32,
-        mask,
-        value_hi,
-    );
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn abs_neg_f64x8(value: F64x8, abs: u8, neg: u8, idx: usize) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value0 = value.value0;
-    let value1 = value.value1;
-
-    let (value0, value1) = if (abs >> idx) & 1 != 0 {
-        (
-            _mm256_andnot_pd(value0, _mm256_set1_pd(-0.0)),
-            _mm256_andnot_pd(value1, _mm256_set1_pd(-0.0)),
-        )
-    } else {
-        (value0, value1)
-    };
-    let (value0, value1) = if (neg >> idx) & 1 != 0 {
-        (
-            _mm256_xor_pd(value0, _mm256_set1_pd(-0.0)),
-            _mm256_xor_pd(value1, _mm256_set1_pd(-0.0)),
-        )
-    } else {
-        (value0, value1)
-    };
-    F64x8 {
-        value0: value0,
-        value1: value1,
-    }
-}
-
-#[target_feature(enable = "fma")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn fmadd_f64x8(s0: F64x8, s1: F64x8, s2: F64x8) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value0 = _mm256_fmadd_pd(s0.value0, s1.value0, s2.value0);
-    let value1 = _mm256_fmadd_pd(s0.value1, s1.value1, s2.value1);
-    F64x8 {
-        value0: value0,
-        value1: value1,
-    }
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn add_f64x8(s0: F64x8, s1: F64x8) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value0 = _mm256_add_pd(s0.value0, s1.value0);
-    let value1 = _mm256_add_pd(s0.value1, s1.value1);
-    F64x8 {
-        value0: value0,
-        value1: value1,
-    }
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn mul_f64x8(s0: F64x8, s1: F64x8) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value0 = _mm256_mul_pd(s0.value0, s1.value0);
-    let value1 = _mm256_mul_pd(s0.value1, s1.value1);
-    F64x8 {
-        value0: value0,
-        value1: value1,
-    }
-}
-
-#[target_feature(enable = "avx")]
-#[cfg(target_arch = "x86_64")]
-unsafe fn omod_clamp_f64x8(value: F64x8, omod: u8, clamp: bool) -> F64x8 {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let value0 = value.value0;
-    let value1 = value.value1;
-
-    let value0 = match omod {
-        1 => _mm256_mul_pd(value0, _mm256_set1_pd(2.0)),
-        2 => _mm256_mul_pd(value0, _mm256_set1_pd(4.0)),
-        3 => _mm256_mul_pd(value0, _mm256_set1_pd(0.5)),
-        _ => value0,
-    };
-    let value1 = match omod {
-        1 => _mm256_mul_pd(value1, _mm256_set1_pd(2.0)),
-        2 => _mm256_mul_pd(value1, _mm256_set1_pd(4.0)),
-        3 => _mm256_mul_pd(value1, _mm256_set1_pd(0.5)),
-        _ => value1,
-    };
-
-    if clamp {
-        let zero = _mm256_setzero_pd();
-        let one = _mm256_set1_pd(1.0);
-        F64x8 {
-            value0: _mm256_max_pd(zero, _mm256_min_pd(value0, one)),
-            value1: _mm256_max_pd(zero, _mm256_min_pd(value1, one)),
-        }
-    } else {
-        F64x8 {
-            value0: value0,
-            value1: value1,
-        }
-    }
-}
 
 pub trait RegisterFile<T: Copy> {
     fn new(num_elems: usize, count: usize, default: T) -> Self;
@@ -1680,53 +1457,14 @@ impl SIMD32 {
     }
 
     fn v_mul_f64_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
-        if USE_SIMD {
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                use std::arch::x86_64::*;
-
-                let bitpos = _mm256_set_epi32(
-                    1 << 7,
-                    1 << 6,
-                    1 << 5,
-                    1 << 4,
-                    1 << 3,
-                    1 << 2,
-                    1 << 1,
-                    1 << 0,
-                );
-
-                let sgprs = self.sgprs.regs.as_ptr().wrapping_add(128 * self.ctx.id) as *const u32;
-                let vgprs = (self
-                    .vgprs
-                    .regs
-                    .as_mut_ptr()
-                    .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                    as *mut u32;
-
-                for elem in (0..32).step_by(8) {
-                    let i = (self.get_exec() >> elem) as i32;
-                    let mask =
-                        _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(i), bitpos), bitpos);
-
-                    let s0_value = read_vector_source_operand_f64x8(elem, s0, sgprs, vgprs);
-                    let s1_value = read_vgpr_f64x8(elem, s1, vgprs);
-
-                    let d_value = mul_f64x8(s0_value, s1_value);
-
-                    mask_store_vgpr_f64x8(mask, elem, d, d_value, vgprs);
-                }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
             }
-        } else {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let s0_value = self.read_vector_source_operand_f64(elem, s0);
-                let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
-                let d_value = s0_value * s1_value;
-                self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
-            }
+            let s0_value = self.read_vector_source_operand_f64(elem, s0);
+            let s1_value = u64_to_f64(self.read_vgpr_pair(elem, s1));
+            let d_value = s0_value * s1_value;
+            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
         }
     }
 
@@ -2221,58 +1959,14 @@ impl SIMD32 {
         clamp: bool,
         omod: u8,
     ) {
-        if USE_SIMD {
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                use std::arch::x86_64::*;
-
-                let bitpos = _mm256_set_epi32(
-                    1 << 7,
-                    1 << 6,
-                    1 << 5,
-                    1 << 4,
-                    1 << 3,
-                    1 << 2,
-                    1 << 1,
-                    1 << 0,
-                );
-
-                let sgprs = self.sgprs.regs.as_ptr().wrapping_add(128 * self.ctx.id) as *const u32;
-                let vgprs = (self
-                    .vgprs
-                    .regs
-                    .as_mut_ptr()
-                    .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                    as *mut u32;
-
-                for elem in (0..32).step_by(8) {
-                    let i = (self.get_exec() >> elem) as i32;
-                    let mask =
-                        _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(i), bitpos), bitpos);
-
-                    let s0_value = read_vector_source_operand_f64x8(elem, s0, sgprs, vgprs);
-                    let s1_value = read_vector_source_operand_f64x8(elem, s1, sgprs, vgprs);
-
-                    let s0_value = abs_neg_f64x8(s0_value, abs, neg, 0);
-                    let s1_value = abs_neg_f64x8(s1_value, abs, neg, 1);
-
-                    let d_value = add_f64x8(s0_value, s1_value);
-
-                    let d_value = omod_clamp_f64x8(d_value, omod, clamp);
-
-                    mask_store_vgpr_f64x8(mask, elem, d, d_value, vgprs);
-                }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
             }
-        } else {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
-                let s1_value = abs_neg(self.read_vector_source_operand_f64(elem, s1), abs, neg, 1);
-                let d_value = s0_value + s1_value;
-                self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
-            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f64(elem, s1), abs, neg, 1);
+            let d_value = s0_value + s1_value;
+            self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
 
@@ -2349,61 +2043,15 @@ impl SIMD32 {
         clamp: bool,
         omod: u8,
     ) {
-        if USE_SIMD {
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                use std::arch::x86_64::*;
-
-                let bitpos = _mm256_set_epi32(
-                    1 << 7,
-                    1 << 6,
-                    1 << 5,
-                    1 << 4,
-                    1 << 3,
-                    1 << 2,
-                    1 << 1,
-                    1 << 0,
-                );
-
-                let sgprs = self.sgprs.regs.as_ptr().wrapping_add(128 * self.ctx.id) as *const u32;
-                let vgprs = (self
-                    .vgprs
-                    .regs
-                    .as_mut_ptr()
-                    .wrapping_add(self.num_vgprs * self.ctx.id * 32))
-                    as *mut u32;
-
-                for elem in (0..32).step_by(8) {
-                    let i = (self.get_exec() >> elem) as i32;
-                    let mask =
-                        _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(i), bitpos), bitpos);
-
-                    let s0_value = read_vector_source_operand_f64x8(elem, s0, sgprs, vgprs);
-                    let s1_value = read_vector_source_operand_f64x8(elem, s1, sgprs, vgprs);
-                    let s2_value = read_vector_source_operand_f64x8(elem, s2, sgprs, vgprs);
-
-                    let s0_value = abs_neg_f64x8(s0_value, abs, neg, 0);
-                    let s1_value = abs_neg_f64x8(s1_value, abs, neg, 1);
-                    let s2_value = abs_neg_f64x8(s2_value, abs, neg, 2);
-
-                    let d_value = fmadd_f64x8(s0_value, s1_value, s2_value);
-
-                    let d_value = omod_clamp_f64x8(d_value, omod, clamp);
-
-                    mask_store_vgpr_f64x8(mask, elem, d, d_value, vgprs);
-                }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
             }
-        } else {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
-                let s1_value = abs_neg(self.read_vector_source_operand_f64(elem, s1), abs, neg, 1);
-                let s2_value = abs_neg(self.read_vector_source_operand_f64(elem, s2), abs, neg, 2);
-                let d_value = fma(s0_value, s1_value, s2_value);
-                self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
-            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f64(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vector_source_operand_f64(elem, s2), abs, neg, 2);
+            let d_value = fma(s0_value, s1_value, s2_value);
+            self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
 
