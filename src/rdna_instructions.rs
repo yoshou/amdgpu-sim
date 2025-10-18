@@ -7,6 +7,7 @@ pub enum SourceOperand {
     IntegerConstant(u64),
     FloatConstant(f64),
     LiteralConstant(u32),
+    PrivateBase,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +70,7 @@ pub struct VOP2 {
     pub vsrc1: u8,
     pub vdst: u8,
     pub op: I,
+    pub literal_constant: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +159,7 @@ pub struct VOPD {
     pub vsrc1y: u8,
     pub vdstx: u8,
     pub vdsty: u8,
+    pub literal_constant: Option<u32>,
 }
 
 pub const VFLAT_ENCODE: u32 = 0b11101100;
@@ -175,6 +178,28 @@ pub struct VGLOBAL {
 }
 
 pub const VGLOBAL_ENCODE: u32 = 0b11101110;
+
+#[derive(Debug, Clone)]
+pub struct VIMAGE {
+    pub op: I,
+    pub dim: u8,
+    pub r128: u8,
+    pub d16: u8,
+    pub a16: u8,
+    pub dmask: u8,
+    pub vdata: u8,
+    pub rsrc: u16,
+    pub scope: u8,
+    pub th: u8,
+    pub tfe: u8,
+    pub vaddr4: u8,
+    pub vaddr0: u8,
+    pub vaddr1: u8,
+    pub vaddr2: u8,
+    pub vaddr3: u8,
+}
+
+pub const VIMAGE_ENCODE: u32 = 0b110100;
 
 #[derive(Debug, Clone)]
 pub struct DS {
@@ -222,5 +247,6 @@ pub enum InstFormat {
     VFLAT(VFLAT),
     VGLOBAL(VGLOBAL),
     VSCRATCH(VSCRATCH),
+    VIMAGE(VIMAGE),
     DS(DS),
 }

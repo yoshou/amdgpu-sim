@@ -79,12 +79,12 @@ pub trait Processor {
     fn step(&mut self) -> Signals;
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Context {
     id: usize,
     pc: u64,
     scc: bool,
-    scratch_base: u64,
+    scratch: Rc<RefCell<AVec<u8, ConstAlign<0x1_0000_0000>>>>,
 }
 
 struct SIMD32 {
@@ -106,7 +106,7 @@ fn u64_from_u32_u32(lo: u32, hi: u32) -> u64 {
 #[inline(always)]
 fn add_u32(a: u32, b: u32, c: u32) -> (u32, bool) {
     let d = (a as u64) + (b as u64) + (c as u64);
-    (d as u32, d > (u32::MAX as u64))
+    ((d & 0xFFFF_FFFF) as u32, d >= (0x1_0000_0000 as u64))
 }
 
 #[inline(always)]
@@ -118,6 +118,48 @@ fn mul_u32(a: u32, b: u32) -> u32 {
 fn get_exp_f64(val: f64) -> i16 {
     let bits: u64 = f64::to_bits(val);
     ((bits >> 52) & 0x7ff) as i16
+}
+
+fn get_exp_f32(val: f32) -> i16 {
+    let bits: u32 = f32::to_bits(val);
+    ((bits >> 23) & 0xff) as i16
+}
+
+fn div_scale_f32(s0: f32, s1: f32, s2: f32) -> (f32, bool) {
+    let mut vcc = false;
+    let mut d = s0 * s2 / s1;
+    let s1_exp = get_exp_f32(s1);
+    let s2_exp = get_exp_f32(s2);
+    if s2 == 0.0 || s1 == 0.0 {
+        d = f32::NAN;
+    } else if s2_exp - s1_exp >= 96 {
+        // N/D near MAX_FLOAT
+        vcc = true;
+        if s0 == s1 {
+            // Only scale the denominator
+            d = s0 * 64f32.exp2();
+        }
+    } else if !s1.is_normal() {
+        d = s0 * 64f32.exp2();
+    } else if (!(1.0 / s1).is_normal()) && (!(s2 / s1).is_normal()) {
+        vcc = true;
+        if s0 == s1 {
+            // Only scale the denominator
+            d = s0 * 64f32.exp2();
+        }
+    } else if !(1.0 / s1).is_normal() {
+        d = s0 * (-64f32).exp2();
+    } else if !(s2 / s1).is_normal() {
+        vcc = true;
+        if s0 == s2 {
+            // Only scale the numerator
+            d = s0 * 64f32.exp2();
+        }
+    } else if s2_exp <= 23 {
+        // Numerator is tiny
+        d = s0 * 64f32.exp2();
+    }
+    (d, vcc)
 }
 
 fn div_scale_f64(s0: f64, s1: f64, s2: f64) -> (f64, bool) {
@@ -155,6 +197,53 @@ fn div_scale_f64(s0: f64, s1: f64, s2: f64) -> (f64, bool) {
         d = s0 * 128f64.exp2();
     }
     (d, vcc)
+}
+
+fn div_fixup_f32(s0: f32, s1: f32, s2: f32) -> f32 {
+    let sign_out = s1.is_sign_negative() != s2.is_sign_negative();
+    if s2.is_nan() {
+        s2
+    } else if s1.is_nan() {
+        s1
+    } else if s1 == 0.0 && s2 == 0.0 {
+        // 0/0
+        u32_to_f32(0xffc00000)
+    } else if s1.is_infinite() && s2.is_infinite() {
+        // inf/inf
+        u32_to_f32(0xffc00000)
+    } else if s1 == 0.0 || s2.is_infinite() {
+        // x/0, or inf/y
+        if sign_out {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        }
+    } else if s1.is_infinite() || s2 == 0.0 {
+        // x/inf, 0/y
+        if sign_out {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if (get_exp_f32(s2) - get_exp_f32(s1)) < -1075 {
+        if sign_out {
+            -0.0
+        } else {
+            0.0
+        }
+    } else if get_exp_f32(s1) == 2047 {
+        if sign_out {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        }
+    } else {
+        if sign_out {
+            -s0.abs()
+        } else {
+            s0.abs()
+        }
+    }
 }
 
 fn div_fixup_f64(s0: f64, s1: f64, s2: f64) -> f64 {
@@ -204,6 +293,51 @@ fn div_fixup_f64(s0: f64, s1: f64, s2: f64) -> f64 {
     }
 }
 
+fn cmp_class_f32(a: f32, mask: u32) -> bool {
+    let mut result = false;
+    if (mask & 0x01) != 0 {
+        // value is a signaling NaN.
+        result |= a.is_nan();
+    }
+    if (mask & 0x02) != 0 {
+        // value is a quiet NaN.
+        result |= a.is_nan();
+    }
+    if (mask & 0x04) != 0 {
+        // value is negative infinity.
+        result |= a.is_infinite() && a.is_sign_negative();
+    }
+    if (mask & 0x08) != 0 {
+        // value is a negative normal value.
+        result |= a.is_normal() && a.is_sign_negative();
+    }
+    if (mask & 0x10) != 0 {
+        // value is a negative denormal value.
+        result |= !a.is_normal() && a.is_sign_negative();
+    }
+    if (mask & 0x20) != 0 {
+        // value is negative zero.
+        result |= a == 0.0 && a.is_sign_negative();
+    }
+    if (mask & 0x40) != 0 {
+        // value is positive zero.
+        result |= a == 0.0 && a.is_sign_positive();
+    }
+    if (mask & 0x80) != 0 {
+        // value is a positive denormal value.
+        result |= !a.is_normal() && a.is_sign_positive();
+    }
+    if (mask & 0x100) != 0 {
+        // value is a positive normal value.
+        result |= a.is_normal() && a.is_sign_positive();
+    }
+    if (mask & 0x200) != 0 {
+        // value is positive infinity.
+        result |= a.is_infinite() && a.is_sign_positive();
+    }
+    result
+}
+
 fn cmp_class_f64(a: f64, mask: u32) -> bool {
     let mut result = false;
     if (mask & 0x01) != 0 {
@@ -249,6 +383,8 @@ fn cmp_class_f64(a: f64, mask: u32) -> bool {
     result
 }
 
+use aligned_vec::AVec;
+use aligned_vec::ConstAlign;
 use half::f16;
 use num_traits::ops::mul_add::MulAdd;
 
@@ -343,6 +479,120 @@ fn f64_to_u64_omod_clamp(value: f64, omod: u8, clamp: bool) -> u64 {
     f64::to_bits(clamp_f64(value, clamp))
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Aabb {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+}
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct Box4Node {
+    pub child_index: [u32; 4],
+    pub aabb: [Aabb; 4],
+    pub parent_addr: u32,
+    pub update_counter: u32,
+    pub child_count: u32,
+}
+
+fn intersect(ray_origin: [f32; 3], inv_direction: [f32; 3], aabb: &Aabb, max_t: f32) -> (f32, f32) {
+    let f = [
+        (aabb.max[0] - ray_origin[0]) * inv_direction[0],
+        (aabb.max[1] - ray_origin[1]) * inv_direction[1],
+        (aabb.max[2] - ray_origin[2]) * inv_direction[2],
+    ];
+    let n = [
+        (aabb.min[0] - ray_origin[0]) * inv_direction[0],
+        (aabb.min[1] - ray_origin[1]) * inv_direction[1],
+        (aabb.min[2] - ray_origin[2]) * inv_direction[2],
+    ];
+    let tmax = [f[0].max(n[0]), f[1].max(n[1]), f[2].max(n[2])];
+    let tmin = [f[0].min(n[0]), f[1].min(n[1]), f[2].min(n[2])];
+    let t1 = tmax[0].min(tmax[1].min(tmax[2].min(max_t)));
+    let t0 = tmin[0].max(tmin[1].max(tmin[2].max(0.0)));
+    (t0, t1)
+}
+
+fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn intersect_triangle(
+    ray_origin: [f32; 3],
+    ray_direction: [f32; 3],
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+    flags: u32,
+) -> (f32, f32, f32, f32) {
+    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    let s1 = cross(ray_direction, e2);
+    let denom = dot(s1, e1);
+    if denom == 0.0 {
+        let result0 = f32::INFINITY;
+        let result1 = denom;
+        let result2 = 0.0;
+        let result3 = 0.0;
+
+        return (result0, result1, result2, result3);
+    }
+    let inv_denom = 1.0 / denom;
+    let d = [
+        ray_origin[0] - v0[0],
+        ray_origin[1] - v0[1],
+        ray_origin[2] - v0[2],
+    ];
+    let b_y = dot(d, s1) * inv_denom;
+    let s2 = cross(d, e1);
+    let b_z = dot(ray_direction, s2) * inv_denom;
+    let t = dot(e2, s2) * inv_denom;
+    let b_x = 1.0 - b_y - b_z;
+    let barycentrics = [b_x, b_y, b_z];
+    if b_y < 0.0 || b_y > 1.0 || b_z < 0.0 || (b_y + b_z) > 1.0 || t < 0.0 {
+        let result0 = f32::INFINITY;
+        let result1 = denom;
+        let result2 = barycentrics[((flags >> 0) & 3) as usize] * denom;
+        let result3 = barycentrics[((flags >> 2) & 3) as usize] * denom;
+
+        (result0, result1, result2, result3)
+    } else {
+        let result0 = dot(e2, s2);
+        let result1 = denom;
+        let result2 = barycentrics[((flags >> 0) & 3) as usize] * denom;
+        let result3 = barycentrics[((flags >> 2) & 3) as usize] * denom;
+
+        (result0, result1, result2, result3)
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct TrianglePair {
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+    v3: [f32; 3],
+}
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+struct TrianglePairNode {
+    pub tri_pair: TrianglePair,
+    pub padding: u32,
+    pub prim_index: [u32; 2],
+    pub flags: u32,
+}
+
 impl SIMD32 {
     pub fn dispatch(&mut self, entry_addr: usize, setup_data: Vec<RegisterSetupData>) {
         let num_wavefronts = setup_data.len();
@@ -383,13 +633,13 @@ impl SIMD32 {
         }
 
         let mut slots = Vec::new();
-        for wavefront in 0..num_wavefronts {
+        for (wavefront, data) in setup_data.into_iter().enumerate() {
             slots.push(Context {
                 id: wavefront,
                 pc: entry_addr as u64,
                 scc: false,
-                scratch_base: setup_data[wavefront].scratch_base,
-            })
+                scratch: data.scratch,
+            });
         }
 
         self.slots = slots;
@@ -402,8 +652,9 @@ impl SIMD32 {
 
         if USE_INTERPRETER {
             if let Ok((inst, size)) = decode_rdna4(inst_stream) {
+                let result = self.execute_inst(inst);
                 self.ctx.pc += size as u64;
-                self.execute_inst(inst)
+                result
             } else {
                 let inst = get_u64(&self.insts, self.ctx.pc as usize);
                 println!(
@@ -435,7 +686,7 @@ impl SIMD32 {
                     vgprs_ptr,
                     scc_ptr,
                     &mut self.ctx.pc,
-                    self.ctx.scratch_base,
+                    self.ctx.scratch.borrow_mut().as_mut_ptr() as u64,
                     lds_ptr,
                 )
             } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
@@ -460,7 +711,7 @@ impl SIMD32 {
                             vgprs_ptr,
                             scc_ptr,
                             &mut self.ctx.pc,
-                            self.ctx.scratch_base,
+                            self.ctx.scratch.borrow_mut().as_mut_ptr() as u64,
                             lds_ptr,
                         )
                     } else {
@@ -633,6 +884,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f32_to_u32(value as f32),
             SourceOperand::ScalarRegister(value) => self.read_sgpr(value as usize),
             SourceOperand::VectorRegister(_) => panic!(),
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -643,6 +895,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f64_to_u64(value),
             SourceOperand::ScalarRegister(value) => self.read_sgpr_pair(value as usize),
             SourceOperand::VectorRegister(_) => panic!(),
+            SourceOperand::PrivateBase => self.ctx.scratch.borrow_mut().as_ptr() as u64,
         }
     }
 
@@ -653,6 +906,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f32_to_u32(value as f32),
             SourceOperand::ScalarRegister(value) => self.read_sgpr(value as usize),
             SourceOperand::VectorRegister(value) => self.read_vgpr(elem, value as usize),
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -667,6 +921,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 f16::from_bits((self.read_vgpr(elem, value as usize) & 0xFFFF) as u16)
             }
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -681,6 +936,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 f16::from_bits(((self.read_vgpr(elem, value as usize) >> 16) & 0xFFFF) as u16)
             }
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -726,6 +982,7 @@ impl SIMD32 {
                 }
                 return result;
             }
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -736,6 +993,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f64_to_u64(value),
             SourceOperand::ScalarRegister(value) => self.read_sgpr_pair(value as usize),
             SourceOperand::VectorRegister(value) => self.read_vgpr_pair(elem, value as usize),
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -748,6 +1006,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 u32_to_f32(self.read_vgpr(elem, value as usize))
             }
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -783,6 +1042,7 @@ impl SIMD32 {
                 }
                 return result;
             }
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -795,6 +1055,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 u64_to_f64(self.read_vgpr_pair(elem, value as usize))
             }
+            SourceOperand::PrivateBase => panic!(),
         }
     }
 
@@ -803,6 +1064,7 @@ impl SIMD32 {
             InstFormat::SOP1(fields) => self.execute_sop1(fields),
             InstFormat::SOP2(fields) => self.execute_sop2(fields),
             InstFormat::SOPC(fields) => self.execute_sopc(fields),
+            InstFormat::SOPK(fields) => self.execute_sopk(fields),
             InstFormat::VOP1(fields) => self.execute_vop1(fields),
             InstFormat::VOP2(fields) => self.execute_vop2(fields),
             InstFormat::VOP3(fields) => self.execute_vop3(fields),
@@ -812,10 +1074,11 @@ impl SIMD32 {
             InstFormat::VOPD(fields) => self.execute_vopd(fields),
             InstFormat::SMEM(fields) => self.execute_smem(fields),
             InstFormat::SOPP(fields) => self.execute_sopp(fields),
+            InstFormat::VFLAT(fields) => self.execute_vflat(fields),
             InstFormat::VSCRATCH(fields) => self.execute_vscratch(fields),
             InstFormat::VGLOBAL(fields) => self.execute_vglobal(fields),
+            InstFormat::VIMAGE(fields) => self.execute_vimage(fields),
             InstFormat::DS(fields) => self.execute_ds(fields),
-            _ => unimplemented!(),
         }
     }
 
@@ -833,6 +1096,9 @@ impl SIMD32 {
             I::S_CTZ_I32_B32 => {
                 self.s_ctz_i32_b32(d, s0);
             }
+            I::S_CVT_F32_I32 => {
+                self.s_cvt_f32_i32(d, s0);
+            }
             I::S_AND_SAVEEXEC_B32 => {
                 self.s_and_saveexec_b32(d, s0);
             }
@@ -842,11 +1108,18 @@ impl SIMD32 {
             I::S_AND_NOT1_SAVEEXEC_B32 => {
                 self.s_and_not1_saveexec_b32(d, s0);
             }
+            I::S_SEXT_I32_I16 => {
+                self.s_sext_i32_i16(d, s0);
+            }
             I::S_BARRIER_SIGNAL => {
                 let sig = self.read_scalar_source_operand_u32(s0) as i32;
                 assert!(sig == -1);
             }
-            _ => unimplemented!(),
+            I::S_GETPC_B64 => {
+                let pc = self.ctx.pc + 4 + self.insts.as_ptr() as u64;
+                self.write_sop_dst_pair(d, pc);
+            }
+            _ => unimplemented!("{:?}", inst.op),
         }
 
         Signals::None
@@ -871,6 +1144,12 @@ impl SIMD32 {
             n => n as i32,
         };
         self.write_sop_dst(d, d_value as u32);
+    }
+
+    fn s_cvt_f32_i32(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let d_value = s0_value as i32 as f32;
+        self.write_sop_dst(d, f32_to_u32(d_value));
     }
 
     fn s_and_saveexec_b32(&mut self, d: usize, s0: SourceOperand) {
@@ -907,6 +1186,13 @@ impl SIMD32 {
 
         self.set_exec(exec_value);
         self.ctx.scc = exec_value != 0;
+    }
+
+    fn s_sext_i32_i16(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as u16;
+        let d_value = (s0_value as i16) as i32;
+
+        self.write_sop_dst(d, d_value as u32);
     }
 
     fn execute_sop2(&mut self, inst: SOP2) -> Signals {
@@ -962,6 +1248,12 @@ impl SIMD32 {
             }
             I::S_MAX_U32 => {
                 self.s_max_u32(d, s0, s1);
+            }
+            I::S_ADD_CO_U32 => {
+                self.s_add_co_u32(d, s0, s1);
+            }
+            I::S_ADD_CO_CI_U32 => {
+                self.s_add_co_ci_u32(d, s0, s1);
             }
             _ => unimplemented!(),
         }
@@ -1092,6 +1384,22 @@ impl SIMD32 {
         self.ctx.scc = scc_value;
     }
 
+    fn s_add_co_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let (d_value, scc_value) = s0_value.overflowing_add(s1_value);
+        self.write_sop_dst(d, d_value);
+        self.ctx.scc = scc_value;
+    }
+
+    fn s_add_co_ci_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let (d_value, scc_value) = add_u32(s0_value, s1_value, self.ctx.scc as u32);
+        self.write_sop_dst(d, d_value as u32);
+        self.ctx.scc = scc_value;
+    }
+
     fn execute_sopc(&mut self, inst: SOPC) -> Signals {
         let s0 = inst.ssrc0;
         let s1 = inst.ssrc1;
@@ -1165,6 +1473,19 @@ impl SIMD32 {
         self.ctx.scc = s0_value == s1_value;
     }
 
+    fn execute_sopk(&mut self, inst: SOPK) -> Signals {
+        let d = inst.sdst as usize;
+        let simm16 = inst.simm16 as i16;
+
+        match inst.op {
+            I::S_MOVK_I32 => {
+                self.write_sop_dst(d, simm16 as i32 as u32);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
     fn execute_vop1(&mut self, inst: VOP1) -> Signals {
         let d = inst.vdst as usize;
         let s0 = inst.src0;
@@ -1181,6 +1502,15 @@ impl SIMD32 {
             }
             I::V_RCP_IFLAG_F32 => {
                 self.v_rcp_iflag_f32_e32(d, s0);
+            }
+            I::V_RCP_F32 => {
+                self.v_rcp_f32_e32(d, s0);
+            }
+            I::V_SQRT_F32 => {
+                self.v_sqrt_f32_e32(d, s0);
+            }
+            I::V_RNDNE_F32 => {
+                self.v_rndne_f32_e32(d, s0);
             }
             I::V_RCP_F64 => {
                 self.v_rcp_f64_e32(d, s0);
@@ -1203,8 +1533,17 @@ impl SIMD32 {
             I::V_CVT_U32_F32 => {
                 self.v_cvt_u32_f32_e32(d, s0);
             }
+            I::V_CVT_I32_F32 => {
+                self.v_cvt_i32_f32_e32(d, s0);
+            }
             I::V_RNDNE_F64 => {
                 self.v_rndne_f64_e32(d, s0);
+            }
+            I::V_FREXP_MANT_F32 => {
+                self.v_frexp_mant_f32_e32(d, s0);
+            }
+            I::V_FREXP_EXP_I32_F32 => {
+                self.v_frexp_exp_i32_f32_e32(d, s0);
             }
             _ => unimplemented!(),
         }
@@ -1224,7 +1563,11 @@ impl SIMD32 {
 
     fn v_readfirstlane_b32_e32(&mut self, d: usize, s0: SourceOperand) {
         let exec_value = self.read_sgpr(126);
-        let lane = (exec_value.trailing_zeros() & 0x1F) as usize;
+        let lane = if exec_value == 0 {
+            0
+        } else {
+            exec_value.trailing_zeros() as usize
+        };
         let s0_value = self.read_vector_source_operand_u32(lane, s0);
         let d_value = s0_value;
         self.write_sgpr(d, d_value);
@@ -1249,6 +1592,45 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
             let d_value = 1.0 / s0_value;
+
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_rcp_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = 1.0 / s0_value;
+
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_sqrt_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = s0_value.sqrt();
+
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_rndne_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let mut d_value = (s0_value + 0.5).floor();
+            if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
+                d_value -= 1.0;
+            }
 
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
@@ -1337,6 +1719,18 @@ impl SIMD32 {
         }
     }
 
+    fn v_cvt_i32_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = s0_value as i32;
+
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
     fn v_rndne_f64_e32(&mut self, d: usize, s0: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -1352,6 +1746,38 @@ impl SIMD32 {
         }
     }
 
+    fn v_frexp_mant_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = if s0_value.is_nan() || s0_value.is_infinite() {
+                s0_value
+            } else {
+                libm::frexpf(s0_value).0
+            };
+
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_frexp_exp_i32_f32_e32(&mut self, d: usize, s0: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let d_value = if s0_value.is_nan() || s0_value.is_infinite() {
+                0
+            } else {
+                libm::frexpf(s0_value).1
+            };
+
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
     fn execute_vop2(&mut self, inst: VOP2) -> Signals {
         let d = inst.vdst as usize;
         let s0 = inst.src0;
@@ -1359,6 +1785,9 @@ impl SIMD32 {
         match inst.op {
             I::V_AND_B32 => {
                 self.v_and_b32_e32(d, s0, s1);
+            }
+            I::V_OR_B32 => {
+                self.v_or_b32_e32(d, s0, s1);
             }
             I::V_XOR_B32 => {
                 self.v_xor_b32_e32(d, s0, s1);
@@ -1368,6 +1797,21 @@ impl SIMD32 {
             }
             I::V_ADD_NC_U32 => {
                 self.v_add_nc_u32_e32(d, s0, s1);
+            }
+            I::V_SUB_NC_U32 => {
+                self.v_sub_nc_u32_e32(d, s0, s1);
+            }
+            I::V_SUBREV_NC_U32 => {
+                self.v_subrev_nc_u32_e32(d, s0, s1);
+            }
+            I::V_ADD_CO_CI_U32 => {
+                self.v_add_co_ci_u32_e32(d, s0, s1);
+            }
+            I::V_ADD_F32 => {
+                self.v_add_f32_e32(d, s0, s1);
+            }
+            I::V_SUB_F32 => {
+                self.v_sub_f32_e32(d, s0, s1);
             }
             I::V_MUL_F32 => {
                 self.v_mul_f32_e32(d, s0, s1);
@@ -1387,7 +1831,19 @@ impl SIMD32 {
             I::V_LSHRREV_B32 => {
                 self.v_lshrrev_b32_e32(d, s0, s1);
             }
-            _ => unimplemented!(),
+            I::V_FMAMK_F32 => {
+                self.v_fmamk_f32(d, s0, s1, inst.literal_constant.unwrap());
+            }
+            I::V_FMAAK_F32 => {
+                self.v_fmaak_f32(d, s0, s1, inst.literal_constant.unwrap());
+            }
+            I::V_FMAC_F32 => {
+                self.v_fmac_f32_e32(d, s0, s1);
+            }
+            I::V_LSHLREV_B64 => {
+                self.v_lshlrev_b64_e32(d, s0, s1);
+            }
+            _ => unimplemented!("{:?}", inst),
         }
         Signals::None
     }
@@ -1400,6 +1856,18 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_u32(elem, s0);
             let s1_value = self.read_vgpr(elem, s1);
             let d_value = s0_value & s1_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_or_b32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value | s1_value;
             self.write_vgpr(elem, d, d_value);
         }
     }
@@ -1441,6 +1909,75 @@ impl SIMD32 {
             let s1_value = self.read_vgpr(elem, s1);
             let d_value = s0_value.wrapping_add(s1_value);
             self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_sub_nc_u32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value.wrapping_sub(s1_value);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_subrev_nc_u32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s1_value.wrapping_sub(s0_value);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_add_co_ci_u32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let carry = self.get_vcc_bit(elem);
+            let (d_value, carry) = add_u32(s0_value, s1_value, carry as u32);
+            self.write_vgpr(elem, d, d_value);
+            vcc |= (carry as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_add_f32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value + s1_value;
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_sub_f32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value - s1_value;
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
     }
 
@@ -1516,6 +2053,57 @@ impl SIMD32 {
         }
     }
 
+    fn v_fmamk_f32(&mut self, d: usize, s0: SourceOperand, s1: usize, literal_constant: u32) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let literal_value = u32_to_f32(literal_constant);
+            let d_value = fma(s0_value, literal_value, s1_value);
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_fmaak_f32(&mut self, d: usize, s0: SourceOperand, s1: usize, literal_constant: u32) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let literal_value = u32_to_f32(literal_constant);
+            let d_value = fma(s0_value, s1_value, literal_value);
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_fmac_f32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = u32_to_f32(self.read_vgpr(elem, d));
+            let d_value = fma(s0_value, s1_value, d_value);
+            self.write_vgpr(elem, d, f32_to_u32(d_value));
+        }
+    }
+
+    fn v_lshlrev_b64_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr_pair(elem, s1);
+            let d_value = s1_value << (s0_value & 0x3F);
+            self.write_vgpr_pair(elem, d, d_value);
+        }
+    }
+
     fn execute_vop3(&mut self, inst: VOP3) -> Signals {
         let d = inst.vdst as usize;
         let s0 = inst.src0;
@@ -1529,6 +2117,9 @@ impl SIMD32 {
             I::V_ADD_NC_U16 => {
                 self.v_add_nc_u16(d, s0, s1);
             }
+            I::V_LSHLREV_B16 => {
+                self.v_lshlrev_b16_e64(d, s0, s1);
+            }
             I::V_READLANE_B32 => {
                 self.v_readlane_b32(d, s0, s1);
             }
@@ -1540,6 +2131,9 @@ impl SIMD32 {
             }
             I::V_LSHL_OR_B32 => {
                 self.v_lshl_or_b32(d, s0, s1, s2);
+            }
+            I::V_AND_OR_B32 => {
+                self.v_and_or_b32(d, s0, s1, s2);
             }
             I::V_BFE_U32 => {
                 self.v_bfe_u32(d, s0, s1, s2);
@@ -1573,6 +2167,33 @@ impl SIMD32 {
             }
             I::V_MUL_F32 => {
                 self.v_mul_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_FMA_F32 => {
+                self.v_fma_f32(d, s0, s1, s2, abs, neg, clamp, omod);
+            }
+            I::V_DIV_FMAS_F32 => {
+                self.v_div_fmas_f32(d, s0, s1, s2, abs, neg, clamp, omod);
+            }
+            I::V_DIV_FIXUP_F32 => {
+                self.v_div_fixup_f32(d, s0, s1, s2, abs, neg, clamp, omod);
+            }
+            I::V_CMP_GE_F32 => {
+                self.v_cmp_ge_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CMP_LT_F32 => {
+                self.v_cmp_lt_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CMP_LE_F32 => {
+                self.v_cmp_le_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CMP_GT_F32 => {
+                self.v_cmp_gt_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CMP_LG_F32 => {
+                self.v_cmp_lg_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_CMP_CLASS_F32 => {
+                self.v_cmp_class_f32_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CVT_F64_U32 => {
                 self.v_cvt_f64_u32_e64(d, s0, abs, neg, clamp, omod);
@@ -1676,11 +2297,17 @@ impl SIMD32 {
             I::V_CMP_GT_U32 => {
                 self.v_cmp_gt_u32_e64(d, s0, s1);
             }
+            I::V_CMPX_NE_U32 => {
+                self.v_cmpx_ne_u32_e64(d, s0, s1);
+            }
             I::V_CMP_GT_I32 => {
                 self.v_cmp_gt_i32_e64(d, s0, s1);
             }
             I::V_CMP_LT_U64 => {
                 self.v_cmp_lt_u64_e64(d, s0, s1);
+            }
+            I::V_CMP_EQ_U64 => {
+                self.v_cmp_eq_u64_e64(d, s0, s1);
             }
             I::V_TRIG_PREOP_F64 => {
                 self.v_trig_preop_f64(d, s0, s1, abs, neg, clamp, omod);
@@ -1688,7 +2315,10 @@ impl SIMD32 {
             I::V_CVT_F32_F16 => {
                 self.v_cvt_f32_f16_e64(d, s0, abs, neg, clamp, omod);
             }
-            _ => unimplemented!(),
+            I::V_LDEXP_F32 => {
+                self.v_ldexp_f32(d, s0, s1, abs, neg, clamp, omod);
+            }
+            _ => unimplemented!("{:?}", inst),
         }
         Signals::None
     }
@@ -1701,6 +2331,18 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
             let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
             let d_value = s0_value.wrapping_add(s1_value);
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    fn v_lshlrev_b16_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
+            let d_value = s1_value << (s0_value & 0xF);
             self.write_vgpr(elem, d, d_value as u32);
         }
     }
@@ -1740,6 +2382,19 @@ impl SIMD32 {
             let s1_value = self.read_vector_source_operand_u32(elem, s1);
             let s2_value = self.read_vector_source_operand_u32(elem, s2);
             let d_value = (s0_value << (s1_value & 0x1F)) | s2_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_and_or_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let d_value = (s0_value & s1_value) | s2_value;
             self.write_vgpr(elem, d, d_value);
         }
     }
@@ -1906,6 +2561,254 @@ impl SIMD32 {
             let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
             let d_value = s0_value * s1_value;
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_fma_f32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2);
+            let d_value = fma(s0_value, s1_value, s2_value);
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_div_fmas_f32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2);
+            let d_value = if self.get_vcc_bit(elem) {
+                32f32.exp2() * fma(s0_value, s1_value, s2_value)
+            } else {
+                fma(s0_value, s1_value, s2_value)
+            };
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_div_fixup_f32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2);
+            let d_value = div_fixup_f32(s0_value, s1_value, s2_value);
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_cmp_ge_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value >= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_lt_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_le_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value <= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_gt_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_lg_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value != s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_class_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        _clamp: bool,
+        _omod: u8,
+    ) {
+        let s0_values = (0..32)
+            .map(|elem| abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0))
+            .collect::<Vec<f32>>();
+        let s1_values = (0..32)
+            .map(|elem| self.read_vector_source_operand_u32(elem, s1))
+            .collect::<Vec<u32>>();
+
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = s0_values[elem];
+            let s1_value = s1_values[elem];
+            let d_value = cmp_class_f32(s0_value, s1_value);
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
 
@@ -2441,7 +3344,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
             let s1_value = self.read_vector_source_operand_u64(elem, s1);
             let d_value = s1_value >> (s0_value & 0x3F);
             self.write_vgpr_pair(elem, d, d_value);
@@ -2644,6 +3547,25 @@ impl SIMD32 {
         }
     }
 
+    fn v_cmpx_ne_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let d_value = s0_value != s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
     fn v_cmp_gt_i32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let mut vcc = 0u32;
         for elem in 0..32 {
@@ -2672,6 +3594,25 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_u64(elem, s0);
             let s1_value = self.read_vector_source_operand_u64(elem, s1);
             let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_eq_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u64(elem, s0);
+            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
@@ -2758,6 +3699,27 @@ impl SIMD32 {
         }
     }
 
+    fn v_ldexp_f32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1) as i32;
+            let d_value = libm::ldexpf(s0_value, s1_value);
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
     fn execute_vop3sd(&mut self, inst: VOP3SD) -> Signals {
         let d0 = inst.vdst as usize;
         let d1 = inst.sdst as usize;
@@ -2777,6 +3739,9 @@ impl SIMD32 {
             I::V_MAD_CO_U64_U32 => {
                 self.v_mad_co_u64_u32(d0, d1, s0, s1, s2);
             }
+            I::V_DIV_SCALE_F32 => {
+                self.v_div_scale_f32(d0, d1, s0, s1, s2, 0, neg, clamp, omod);
+            }
             I::V_DIV_SCALE_F64 => {
                 self.v_div_scale_f64(d0, d1, s0, s1, s2, 0, neg, clamp, omod);
             }
@@ -2793,7 +3758,7 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_u32(elem, s0);
             let s1_value = self.read_vector_source_operand_u32(elem, s1);
-            let (d0_value, d1_value) = s0_value.overflowing_add(s1_value);
+            let (d0_value, d1_value) = add_u32(s0_value, s1_value, 0);
             self.write_vgpr(elem, d0, d0_value);
             vcc |= (d1_value as u32) << elem;
         }
@@ -2858,6 +3823,39 @@ impl SIMD32 {
                 continue;
             }
             self.set_sgpr_bit(d1, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_div_scale_f32(
+        &mut self,
+        d: usize,
+        sdst: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let s2_value = abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2);
+            let (d_value, flag) = div_scale_f32(s0_value, s1_value, s2_value);
+
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+            vcc |= (flag as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(sdst, elem, ((vcc >> elem) & 1) != 0);
         }
     }
 
@@ -3063,6 +4061,9 @@ impl SIMD32 {
             I::V_CMPX_LT_U32 => {
                 self.v_cmpx_lt_u32_e32(s0, s1);
             }
+            I::V_CMPX_NE_U32 => {
+                self.v_cmpx_ne_u32_e32(s0, s1);
+            }
             I::V_CMPX_EQ_U32 => {
                 self.v_cmpx_eq_u32_e32(s0, s1);
             }
@@ -3071,6 +4072,24 @@ impl SIMD32 {
             }
             I::V_CMP_GT_U64 => {
                 self.v_cmp_gt_u64_e32(s0, s1);
+            }
+            I::V_CMP_EQ_U64 => {
+                self.v_cmp_eq_u64_e32(s0, s1);
+            }
+            I::V_CMP_GE_F32 => {
+                self.v_cmp_ge_f32_e32(s0, s1);
+            }
+            I::V_CMP_GT_F32 => {
+                self.v_cmp_gt_f32_e32(s0, s1);
+            }
+            I::V_CMP_LE_F32 => {
+                self.v_cmp_le_f32_e32(s0, s1);
+            }
+            I::V_CMP_LT_F32 => {
+                self.v_cmp_lt_f32_e32(s0, s1);
+            }
+            I::V_CMP_NGT_F32 => {
+                self.v_cmp_ngt_f32_e32(s0, s1);
             }
             I::V_CMP_GT_F64 => {
                 self.v_cmp_gt_f64_e32(s0, s1);
@@ -3198,6 +4217,25 @@ impl SIMD32 {
         }
     }
 
+    fn v_cmpx_ne_u32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value != s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
     fn v_cmpx_eq_u32_e32(&mut self, s0: SourceOperand, s1: usize) {
         let mut vcc = 0u32;
         for elem in 0..32 {
@@ -3245,6 +4283,120 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_u64(elem, s0);
             let s1_value = self.read_vgpr_pair(elem, s1);
             let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_eq_u64_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u64(elem, s0);
+            let s1_value = self.read_vgpr_pair(elem, s1);
+            let d_value = s0_value == s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_ge_f32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value >= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_gt_f32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value > s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_le_f32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value <= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_lt_f32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_ngt_f32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = !(s0_value > s1_value);
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
@@ -3413,6 +4565,7 @@ impl SIMD32 {
 
         let s0 = inst.src0x;
         let s1 = inst.vsrc1x as usize;
+        let d = inst.vdstx as usize;
         match inst.opx {
             I::V_DUAL_CNDMASK_B32 => {
                 self.v_dual_cndmask_b32(&mut dual_result0_u32, s0, s1);
@@ -3420,10 +4573,39 @@ impl SIMD32 {
             I::V_DUAL_MOV_B32 => {
                 self.v_dual_mov_b32(&mut dual_result0_u32, s0);
             }
-            _ => unimplemented!(),
+            I::V_DUAL_FMAC_F32 => {
+                self.v_dual_fmac_f32(&mut dual_result0_u32, s0, s1, d);
+            }
+            I::V_DUAL_MUL_F32 => {
+                self.v_dual_mul_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_ADD_F32 => {
+                self.v_dual_add_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_SUB_F32 => {
+                self.v_dual_sub_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_FMAMK_F32 => {
+                self.v_dual_fmamk_f32(
+                    &mut dual_result0_u32,
+                    s0,
+                    s1,
+                    inst.literal_constant.unwrap(),
+                );
+            }
+            I::V_DUAL_FMAAK_F32 => {
+                self.v_dual_fmaak_f32(
+                    &mut dual_result0_u32,
+                    s0,
+                    s1,
+                    inst.literal_constant.unwrap(),
+                );
+            }
+            _ => unimplemented!("{:?}", inst.opx),
         }
         let s0 = inst.src0y;
         let s1 = inst.vsrc1y as usize;
+        let d = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as usize;
         match inst.opy {
             I::V_DUAL_CNDMASK_B32 => {
                 self.v_dual_cndmask_b32(&mut dual_result1_u32, s0, s1);
@@ -3440,11 +4622,38 @@ impl SIMD32 {
             I::V_DUAL_AND_B32 => {
                 self.v_dual_and_b32(&mut dual_result1_u32, s0, s1);
             }
-            _ => unimplemented!(),
+            I::V_DUAL_MUL_F32 => {
+                self.v_dual_mul_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_ADD_F32 => {
+                self.v_dual_add_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_SUB_F32 => {
+                self.v_dual_sub_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_FMAC_F32 => {
+                self.v_dual_fmac_f32(&mut dual_result1_u32, s0, s1, d);
+            }
+            I::V_DUAL_FMAAK_F32 => {
+                self.v_dual_fmaak_f32(
+                    &mut dual_result1_u32,
+                    s0,
+                    s1,
+                    inst.literal_constant.unwrap(),
+                );
+            }
+            _ => unimplemented!("{:?}", inst.opy),
         }
         let d = inst.vdstx as usize;
         match inst.opx {
-            I::V_DUAL_CNDMASK_B32 | I::V_DUAL_MOV_B32 => {
+            I::V_DUAL_CNDMASK_B32
+            | I::V_DUAL_MOV_B32
+            | I::V_DUAL_FMAC_F32
+            | I::V_DUAL_MUL_F32
+            | I::V_DUAL_ADD_F32
+            | I::V_DUAL_SUB_F32
+            | I::V_DUAL_FMAMK_F32
+            | I::V_DUAL_FMAAK_F32 => {
                 for elem in 0..32 {
                     if !self.get_exec_bit(elem) {
                         continue;
@@ -3460,7 +4669,12 @@ impl SIMD32 {
             | I::V_DUAL_MOV_B32
             | I::V_DUAL_LSHLREV_B32
             | I::V_DUAL_ADD_NC_U32
-            | I::V_DUAL_AND_B32 => {
+            | I::V_DUAL_AND_B32
+            | I::V_DUAL_MUL_F32
+            | I::V_DUAL_ADD_F32
+            | I::V_DUAL_SUB_F32
+            | I::V_DUAL_FMAC_F32
+            | I::V_DUAL_FMAAK_F32 => {
                 for elem in 0..32 {
                     if !self.get_exec_bit(elem) {
                         continue;
@@ -3500,6 +4714,19 @@ impl SIMD32 {
         }
     }
 
+    fn v_dual_fmac_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize, d: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = u32_to_f32(self.read_vgpr(elem, d));
+            let d_value = fma(s0_value, s1_value, d_value);
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
     fn v_dual_lshlrev_b32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -3533,6 +4760,80 @@ impl SIMD32 {
             let s1_value = self.read_vgpr(elem, s1);
             let d_value = s0_value & s1_value;
             d_values[elem] = d_value;
+        }
+    }
+
+    fn v_dual_mul_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value * s1_value;
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    fn v_dual_add_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value + s1_value;
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    fn v_dual_sub_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value - s1_value;
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    fn v_dual_fmamk_f32(
+        &mut self,
+        d_values: &mut [u32],
+        s0: SourceOperand,
+        s1: usize,
+        literal_constant: u32,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let simm32_value = u32_to_f32(literal_constant);
+            let d_value = fma(s0_value, simm32_value, s1_value);
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    fn v_dual_fmaak_f32(
+        &mut self,
+        d_values: &mut [u32],
+        s0: SourceOperand,
+        s1: usize,
+        literal_constant: u32,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let simm32_value = u32_to_f32(literal_constant);
+            let d_value = fma(s0_value, s1_value, simm32_value);
+            d_values[elem] = f32_to_u32(d_value);
         }
     }
 
@@ -3656,6 +4957,141 @@ impl SIMD32 {
         self.write_sgpr(sdata, data as u32);
     }
 
+    fn execute_vflat(&mut self, inst: VFLAT) -> Signals {
+        let vaddr = inst.vaddr as usize;
+        let vsrc = inst.vsrc as usize;
+        let vdst = inst.vdst as usize;
+        let ioffset = inst.ioffset as u32;
+        match inst.op {
+            I::FLAT_LOAD_B32 => {
+                self.flat_load_b32(vaddr, vdst, ioffset);
+            }
+            I::FLAT_LOAD_B64 => {
+                self.flat_load_b64(vaddr, vdst, ioffset);
+            }
+            I::FLAT_LOAD_B128 => {
+                self.flat_load_b128(vaddr, vdst, ioffset);
+            }
+            I::FLAT_STORE_B32 => {
+                self.flat_store_b32(vaddr, vsrc, ioffset);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn flat_load_b32(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let ioffset = ((ioffset << 8) as i32) >> 8;
+
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+            let addr = if ((offset[elem] as u64) < scratch_base)
+                || ((offset[elem] as u64) >= scratch_limit)
+            {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr = offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let ptr = addr as *mut u32;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, data);
+        }
+    }
+
+    fn flat_load_b64(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for i in 0..2 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+                let addr = if ((offset[elem] as u64) < scratch_base)
+                    || ((offset[elem] as u64) >= scratch_limit)
+                {
+                    offset[elem] as i64 + (ioffset as i64) + (i as i64 * 4)
+                } else {
+                    let lane_addr =
+                        offset[elem] as i64 + (ioffset as i64) + i as i64 * 4 - scratch_base as i64;
+                    scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+                };
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn flat_load_b128(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for i in 0..4 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+                let addr = if ((offset[elem] as u64) < scratch_base)
+                    || ((offset[elem] as u64) >= scratch_limit)
+                {
+                    offset[elem] as i64 + (ioffset as i64) + (i as i64 * 4)
+                } else {
+                    let lane_addr =
+                        offset[elem] as i64 + (ioffset as i64) + i as i64 * 4 - scratch_base as i64;
+                    scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+                };
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn flat_store_b32(&mut self, vaddr: usize, vsrc: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let scratch_base = self.ctx.scratch.borrow_mut().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+            let addr = if ((offset[elem] as u64) < scratch_base)
+                || ((offset[elem] as u64) >= scratch_limit)
+            {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr = offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let data = self.read_vgpr(elem, vsrc);
+            let ptr = addr as *mut u32;
+            unsafe {
+                *ptr = data;
+            }
+        }
+    }
+
     fn execute_vscratch(&mut self, inst: VSCRATCH) -> Signals {
         let saddr = inst.saddr as usize;
         let vaddr = inst.vaddr as usize;
@@ -3669,6 +5105,9 @@ impl SIMD32 {
             I::SCRATCH_STORE_B64 => {
                 self.scratch_store_b64(vaddr, vsrc, saddr, ioffset);
             }
+            I::SCRATCH_STORE_B96 => {
+                self.scratch_store_b96(vaddr, vsrc, saddr, ioffset);
+            }
             I::SCRATCH_STORE_B128 => {
                 self.scratch_store_b128(vaddr, vsrc, saddr, ioffset);
             }
@@ -3677,6 +5116,9 @@ impl SIMD32 {
             }
             I::SCRATCH_LOAD_B64 => {
                 self.scratch_load_b64(vaddr, vdst, saddr, ioffset);
+            }
+            I::SCRATCH_LOAD_B96 => {
+                self.scratch_load_b96(vaddr, vdst, saddr, ioffset);
             }
             I::SCRATCH_LOAD_B128 => {
                 self.scratch_load_b128(vaddr, vdst, saddr, ioffset);
@@ -3694,8 +5136,9 @@ impl SIMD32 {
             let data = self.read_vgpr(elem, vsrc);
             let vaddr_val = 0u64;
             let saddr_val = self.read_sgpr(saddr) as u64;
-            let offset = ((vaddr_val + saddr_val + (ioffset as u64)) / 4 * 32 + (elem as u64)) * 4;
-            let addr = self.ctx.scratch_base + offset;
+            let offset = (vaddr_val + saddr_val + (ioffset as u64)) * 32 + (elem as u64) * 4;
+            let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
+            assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
             let ptr = addr as *mut u32;
             unsafe {
@@ -3713,10 +5156,32 @@ impl SIMD32 {
                 let data = self.read_vgpr(elem, vsrc + i);
                 let vaddr_val = 0u64;
                 let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = ((vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) / 4 * 32
-                    + (elem as u64))
-                    * 4;
-                let addr = self.ctx.scratch_base + offset;
+                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                    + (elem as u64) * 4;
+                let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
+                assert!(offset < self.ctx.scratch.borrow().len() as u64);
+
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
+    fn scratch_store_b96(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        for i in 0..3 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let data = self.read_vgpr(elem, vsrc + i);
+                let vaddr_val = 0u64;
+                let saddr_val = self.read_sgpr(saddr) as u64;
+                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                    + (elem as u64) * 4;
+                let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
+                assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -3735,10 +5200,10 @@ impl SIMD32 {
                 let data = self.read_vgpr(elem, vsrc + i);
                 let vaddr_val = 0u64;
                 let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = ((vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) / 4 * 32
-                    + (elem as u64))
-                    * 4;
-                let addr = self.ctx.scratch_base + offset;
+                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                    + (elem as u64) * 4;
+                let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
+                assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -3755,8 +5220,9 @@ impl SIMD32 {
             }
             let vaddr_val = 0u64;
             let saddr_val = self.read_sgpr(saddr) as u64;
-            let offset = ((vaddr_val + saddr_val + ioffset as u64) / 4 * 32 + (elem as u64)) * 4;
-            let addr = self.ctx.scratch_base + offset;
+            let offset = (vaddr_val + saddr_val + (ioffset as u64)) * 32 + (elem as u64) * 4;
+            let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
+            assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
             let ptr = addr as *mut u32;
             let data = unsafe { *ptr };
@@ -3772,10 +5238,30 @@ impl SIMD32 {
                 }
                 let vaddr_val = 0u64;
                 let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = ((vaddr_val + saddr_val + ioffset as u64 + (i as u64 * 4)) / 4 * 32
-                    + (elem as u64))
-                    * 4;
-                let addr = self.ctx.scratch_base + offset;
+                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                    + (elem as u64) * 4;
+                let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
+                assert!(offset < self.ctx.scratch.borrow().len() as u64);
+
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn scratch_load_b96(&mut self, _vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        for i in 0..3 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let vaddr_val = 0u64;
+                let saddr_val = self.read_sgpr(saddr) as u64;
+                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                    + (elem as u64) * 4;
+                let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
+                assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
                 let ptr = addr as *mut u32;
                 let data = unsafe { *ptr };
@@ -3792,10 +5278,10 @@ impl SIMD32 {
                 }
                 let vaddr_val = 0u64;
                 let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = ((vaddr_val + saddr_val + ioffset as u64 + (i as u64 * 4)) / 4 * 32
-                    + (elem as u64))
-                    * 4;
-                let addr = self.ctx.scratch_base + offset;
+                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                    + (elem as u64) * 4;
+                let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
+                assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
                 let ptr = addr as *mut u32;
                 let data = unsafe { *ptr };
@@ -4069,6 +5555,163 @@ impl SIMD32 {
         }
     }
 
+    fn execute_vimage(&mut self, inst: VIMAGE) -> Signals {
+        let vdata = inst.vdata as usize;
+        let vaddr0 = inst.vaddr0 as usize;
+        let vaddr1 = inst.vaddr1 as usize;
+        let vaddr2 = inst.vaddr2 as usize;
+        let vaddr3 = inst.vaddr3 as usize;
+        let vaddr4 = inst.vaddr4 as usize;
+        let s = inst.rsrc as usize;
+        match inst.op {
+            I::IMAGE_BVH64_INTERSECT_RAY => {
+                self.image_bvh64_intersect_ray(vdata, vaddr0, vaddr1, vaddr2, vaddr3, vaddr4, s);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn image_bvh64_intersect_ray(
+        &mut self,
+        vdata: usize,
+        vaddr0: usize,
+        vaddr1: usize,
+        vaddr2: usize,
+        vaddr3: usize,
+        vaddr4: usize,
+        s: usize,
+    ) {
+        let s0_value = self.read_sgpr(s);
+        let s1_value = self.read_sgpr(s + 1);
+        let _s2_value = self.read_sgpr(s + 2);
+        let _s3_value = self.read_sgpr(s + 3);
+        let _base_addr = (((s1_value as u64) << 32) | (s0_value as u64)) & ((1u64 << 48) - 1);
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let node_ptr = self.read_vgpr_pair(elem, vaddr0);
+            let node_type = (node_ptr & 0x7) as u8;
+            match node_type {
+                5 => {
+                    let node_ptr = (node_ptr & !0x7u64) << 3;
+                    let node = unsafe { *(node_ptr as *const Box4Node) };
+                    let ray_extent = u32_to_f32(self.read_vgpr(elem, vaddr1));
+                    let ray_origin_x = u32_to_f32(self.read_vgpr(elem, vaddr2));
+                    let ray_origin_y = u32_to_f32(self.read_vgpr(elem, vaddr2 + 1));
+                    let ray_origin_z = u32_to_f32(self.read_vgpr(elem, vaddr2 + 2));
+                    let ray_inv_dir_x = u32_to_f32(self.read_vgpr(elem, vaddr4));
+                    let ray_inv_dir_y = u32_to_f32(self.read_vgpr(elem, vaddr4 + 1));
+                    let ray_inv_dir_z = u32_to_f32(self.read_vgpr(elem, vaddr4 + 2));
+
+                    let mut s0 = intersect(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                        &node.aabb[0],
+                        ray_extent,
+                    );
+                    let mut s1 = intersect(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                        &node.aabb[1],
+                        ray_extent,
+                    );
+                    let mut s2 = intersect(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                        &node.aabb[2],
+                        ray_extent,
+                    );
+                    let mut s3 = intersect(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                        &node.aabb[3],
+                        ray_extent,
+                    );
+
+                    let mut result0 = if s0.0 <= s0.1 {
+                        node.child_index[0]
+                    } else {
+                        0xFFFF_FFFF
+                    };
+                    let mut result1 = if s1.0 <= s1.1 {
+                        node.child_index[1]
+                    } else {
+                        0xFFFF_FFFF
+                    };
+                    let mut result2 = if s2.0 <= s2.1 {
+                        node.child_index[2]
+                    } else {
+                        0xFFFF_FFFF
+                    };
+                    let mut result3 = if s3.0 <= s3.1 {
+                        node.child_index[3]
+                    } else {
+                        0xFFFF_FFFF
+                    };
+
+                    let sort = |child_index_a: &mut u32,
+                                child_index_b: &mut u32,
+                                dist_a: &mut f32,
+                                dist_b: &mut f32| {
+                        if (*child_index_b != 0xFFFF_FFFF && dist_b < dist_a)
+                            || *child_index_a == 0xFFFF_FFFF
+                        {
+                            let t0 = *dist_a;
+                            let t1 = *child_index_a;
+                            *child_index_a = *child_index_b;
+                            *dist_a = *dist_b;
+                            *child_index_b = t1;
+                            *dist_b = t0;
+                        }
+                    };
+
+                    sort(&mut result0, &mut result2, &mut s0.0, &mut s2.0);
+                    sort(&mut result1, &mut result3, &mut s1.0, &mut s3.0);
+                    sort(&mut result0, &mut result1, &mut s0.0, &mut s1.0);
+                    sort(&mut result2, &mut result3, &mut s2.0, &mut s3.0);
+                    sort(&mut result1, &mut result2, &mut s1.0, &mut s2.0);
+
+                    self.write_vgpr(elem, vdata, result0);
+                    self.write_vgpr(elem, vdata + 1, result1);
+                    self.write_vgpr(elem, vdata + 2, result2);
+                    self.write_vgpr(elem, vdata + 3, result3);
+                }
+                0 | 1 => {
+                    let node_ptr = (node_ptr & !(0x7u64)) << 3;
+                    let node = unsafe { *(node_ptr as *const TrianglePairNode) };
+                    let tri = if node_type & 1 == 0 {
+                        [node.tri_pair.v0, node.tri_pair.v1, node.tri_pair.v2]
+                    } else {
+                        [node.tri_pair.v3, node.tri_pair.v2, node.tri_pair.v1]
+                    };
+                    let ray_origin_x = u32_to_f32(self.read_vgpr(elem, vaddr2));
+                    let ray_origin_y = u32_to_f32(self.read_vgpr(elem, vaddr2 + 1));
+                    let ray_origin_z = u32_to_f32(self.read_vgpr(elem, vaddr2 + 2));
+                    let ray_dir_x = u32_to_f32(self.read_vgpr(elem, vaddr3));
+                    let ray_dir_y = u32_to_f32(self.read_vgpr(elem, vaddr3 + 1));
+                    let ray_dir_z = u32_to_f32(self.read_vgpr(elem, vaddr3 + 2));
+                    let result = intersect_triangle(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_dir_x, ray_dir_y, ray_dir_z],
+                        tri[0],
+                        tri[1],
+                        tri[2],
+                        node.flags >> ((node_type & 1) * 8),
+                    );
+                    self.write_vgpr(elem, vdata, f32_to_u32(result.0));
+                    self.write_vgpr(elem, vdata + 1, f32_to_u32(result.1));
+                    self.write_vgpr(elem, vdata + 2, f32_to_u32(result.2));
+                    self.write_vgpr(elem, vdata + 3, f32_to_u32(result.3));
+                }
+                _ => {
+                    panic!("Unsupported node type: {}", node_type);
+                }
+            }
+        }
+    }
+
     fn execute_ds(&mut self, inst: DS) -> Signals {
         let addr = inst.addr as usize;
         let data0 = inst.data0 as usize;
@@ -4191,7 +5834,7 @@ struct RegisterSetupData {
     user_sgpr_count: usize,
     sgprs: [u32; 16],
     vgprs: [[u32; 32]; 16],
-    scratch_base: u64,
+    scratch: Rc<RefCell<AVec<u8, ConstAlign<0x1_0000_0000>>>>,
 }
 
 fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
@@ -4242,7 +5885,7 @@ impl ComputeUnit {
                     id: 0,
                     pc: pc as u64,
                     scc: false,
-                    scratch_base: 0,
+                    scratch: Rc::new(RefCell::new(AVec::new(0x1_0000_0000))),
                 },
                 insts: insts.clone(),
                 sgprs: RegisterFileImpl::new(1, 128 * num_wave_slot, 0),
@@ -4272,7 +5915,6 @@ pub struct RDNAProcessor<'a> {
     aql_packet_address: u64,
     kernel_args_ptr: u64,
     aql: HsaKernelDispatchPacket<'a>,
-    private_seg_buffer: Vec<u8>,
 }
 
 unsafe impl<'a> Send for SIMD32 {}
@@ -4316,10 +5958,6 @@ impl<'a> RDNAProcessor<'a> {
         let kernel_args_ptr = aql.kernarg_address.address();
         let entry_address = kd + kernel_desc.kernel_code_entry_byte_offset;
 
-        let private_segment_size = aql.private_segment_size as usize;
-        let private_seg_buffer: Vec<u8> =
-            vec![0u8; private_segment_size * num_cunits * 2 * 32 * 16];
-
         // create instance
         RDNAProcessor {
             wgps: wgps,
@@ -4328,7 +5966,6 @@ impl<'a> RDNAProcessor<'a> {
             aql_packet_address: aql_packet_address,
             entry_address: entry_address,
             aql: *aql,
-            private_seg_buffer: private_seg_buffer,
         }
     }
 
@@ -4339,24 +5976,21 @@ impl<'a> RDNAProcessor<'a> {
         workgroup_id_z: u32,
         workitem_offset: usize,
     ) -> RegisterSetupData {
-        let private_seg_ptr = if self.private_seg_buffer.len() > 0 {
-            (&self.private_seg_buffer[0] as *const u8) as u64
-        } else {
-            0
-        };
-
         let kernel_args_ptr = self.kernel_args_ptr;
         let aql_packet_address = self.aql_packet_address;
         let kernel_desc = &self.kernel_desc;
         let private_seg_size = self.aql.private_segment_size as u64;
+
+        let mut scratch = AVec::new(0x1_0000_0000);
+        scratch.resize(private_seg_size as usize * 32, 0);
+        let scratch_base = scratch.as_ptr() as u64;
 
         // Initialize SGPRS
         let mut sgprs = [0u32; 16];
         let mut sgprs_pos = 0;
         if kernel_desc.enable_sgpr_private_segment_buffer {
             let mut desc_w0 = 0;
-            desc_w0 |=
-                (private_seg_ptr + workitem_offset as u64 * private_seg_size) & ((1 << 48) - 1);
+            desc_w0 |= scratch_base & ((1 << 48) - 1);
             desc_w0 |= (private_seg_size & ((1 << 14) - 1)) << 48;
             for i in 0..2 {
                 sgprs[sgprs_pos + i] = ((desc_w0 >> (i * 32)) & 0xFFFFFFFF) as u32;
@@ -4440,7 +6074,7 @@ impl<'a> RDNAProcessor<'a> {
             user_sgpr_count: kernel_desc.user_sgpr_count,
             sgprs: sgprs,
             vgprs: vgprs,
-            scratch_base: private_seg_ptr + workitem_offset as u64 * private_seg_size,
+            scratch: Rc::new(RefCell::new(scratch)),
         }
     }
 
@@ -4505,15 +6139,22 @@ impl<'a> RDNAProcessor<'a> {
                 for cu_idx in 0..2 {
                     for simd_idx in 0..2 {
                         let mut setup_data = vec![];
+                        
+                        if cu_idx * 64 + simd_idx * 32 >= workgroup_size {
+                            continue;
+                        }
+
                         for workitem_id in (0..workgroup_size).step_by(32 * 2 * 2) {
+                            let workitem_offset = workitem_id
+                                + cu_idx * 64
+                                + simd_idx * 32
+                                + wgp_idx * workgroup_size;
+
                             setup_data.push(self.dispatch(
                                 workgroup_id_x,
                                 workgroup_id_y,
                                 workgroup_id_z,
-                                workitem_id
-                                    + cu_idx * 64
-                                    + simd_idx * 32
-                                    + wgp_idx * workgroup_size,
+                                workitem_offset,
                             ));
                         }
 
@@ -4548,7 +6189,7 @@ impl<'a> RDNAProcessor<'a> {
 
                                     match signal {
                                         Signals::EndOfProgram => {}
-                                        Signals::Switch => switch_ctxs.push(v.ctx),
+                                        Signals::Switch => switch_ctxs.push(v.ctx.clone()),
                                         _ => panic!(),
                                     }
                                 }

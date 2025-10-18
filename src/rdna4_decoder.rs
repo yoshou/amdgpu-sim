@@ -176,6 +176,15 @@ fn decode_sop2_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
 
 fn decode_sopk_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
+        0 => Ok((I::S_MOVK_I32, 4)),
+        1 => Ok((I::S_VERSION, 4)),
+        2 => Ok((I::S_CMOVK_I32, 4)),
+        15 => Ok((I::S_ADDK_CO_I32, 4)),
+        16 => Ok((I::S_MULK_I32, 4)),
+        17 => Ok((I::S_GETREG_B32, 4)),
+        18 => Ok((I::S_SETREG_B32, 4)),
+        19 => Ok((I::S_SETREG_IMM32_B32, 4)),
+        20 => Ok((I::S_CALL_B64, 4)),
         _ => Err(()),
     }
 }
@@ -411,8 +420,8 @@ fn decode_vop2_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
         38 => Ok((I::V_SUB_NC_U32, 4)),
         39 => Ok((I::V_SUBREV_NC_U32, 4)),
         43 => Ok((I::V_FMAC_F32, 4)),
-        44 => Ok((I::V_FMAMK_F32, 4)),
-        45 => Ok((I::V_FMAAK_F32, 4)),
+        44 => Ok((I::V_FMAMK_F32, 8)),
+        45 => Ok((I::V_FMAAK_F32, 8)),
         47 => Ok((I::V_CVT_PK_RTZ_F16_F32, 4)),
         48 => Ok((I::V_MIN_NUM_F16, 4)),
         49 => Ok((I::V_MAX_NUM_F16, 4)),
@@ -1185,6 +1194,67 @@ fn decode_smem_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
+fn decode_vflat_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
+    match opcode {
+        16 => Ok((I::FLAT_LOAD_U8, 12)),
+        17 => Ok((I::FLAT_LOAD_I8, 12)),
+        18 => Ok((I::FLAT_LOAD_U16, 12)),
+        19 => Ok((I::FLAT_LOAD_I16, 12)),
+        20 => Ok((I::FLAT_LOAD_B32, 12)),
+        21 => Ok((I::FLAT_LOAD_B64, 12)),
+        22 => Ok((I::FLAT_LOAD_B96, 12)),
+        23 => Ok((I::FLAT_LOAD_B128, 12)),
+        24 => Ok((I::FLAT_STORE_B8, 12)),
+        25 => Ok((I::FLAT_STORE_B16, 12)),
+        26 => Ok((I::FLAT_STORE_B32, 12)),
+        27 => Ok((I::FLAT_STORE_B64, 12)),
+        28 => Ok((I::FLAT_STORE_B96, 12)),
+        29 => Ok((I::FLAT_STORE_B128, 12)),
+        30 => Ok((I::FLAT_LOAD_D16_U8, 12)),
+        31 => Ok((I::FLAT_LOAD_D16_I8, 12)),
+        32 => Ok((I::FLAT_LOAD_D16_B16, 12)),
+        33 => Ok((I::FLAT_LOAD_D16_HI_U8, 12)),
+        34 => Ok((I::FLAT_LOAD_D16_HI_I8, 12)),
+        35 => Ok((I::FLAT_LOAD_D16_HI_B16, 12)),
+        36 => Ok((I::FLAT_STORE_D16_HI_B8, 12)),
+        37 => Ok((I::FLAT_STORE_D16_HI_B16, 12)),
+        51 => Ok((I::FLAT_ATOMIC_SWAP_B32, 12)),
+        52 => Ok((I::FLAT_ATOMIC_CMPSWAP_B32, 12)),
+        53 => Ok((I::FLAT_ATOMIC_ADD_U32, 12)),
+        54 => Ok((I::FLAT_ATOMIC_SUB_U32, 12)),
+        55 => Ok((I::FLAT_ATOMIC_SUB_CLAMP_U32, 12)),
+        56 => Ok((I::FLAT_ATOMIC_MIN_I32, 12)),
+        57 => Ok((I::FLAT_ATOMIC_MIN_U32, 12)),
+        58 => Ok((I::FLAT_ATOMIC_MAX_I32, 12)),
+        59 => Ok((I::FLAT_ATOMIC_MAX_U32, 12)),
+        60 => Ok((I::FLAT_ATOMIC_AND_B32, 12)),
+        61 => Ok((I::FLAT_ATOMIC_OR_B32, 12)),
+        62 => Ok((I::FLAT_ATOMIC_XOR_B32, 12)),
+        63 => Ok((I::FLAT_ATOMIC_INC_U32, 12)),
+        64 => Ok((I::FLAT_ATOMIC_DEC_U32, 12)),
+        65 => Ok((I::FLAT_ATOMIC_SWAP_B64, 12)),
+        66 => Ok((I::FLAT_ATOMIC_CMPSWAP_B64, 12)),
+        67 => Ok((I::FLAT_ATOMIC_ADD_U64, 12)),
+        68 => Ok((I::FLAT_ATOMIC_SUB_U64, 12)),
+        69 => Ok((I::FLAT_ATOMIC_MIN_I64, 12)),
+        70 => Ok((I::FLAT_ATOMIC_MIN_U64, 12)),
+        71 => Ok((I::FLAT_ATOMIC_MAX_I64, 12)),
+        72 => Ok((I::FLAT_ATOMIC_MAX_U64, 12)),
+        73 => Ok((I::FLAT_ATOMIC_AND_B64, 12)),
+        74 => Ok((I::FLAT_ATOMIC_OR_B64, 12)),
+        75 => Ok((I::FLAT_ATOMIC_XOR_B64, 12)),
+        76 => Ok((I::FLAT_ATOMIC_INC_U64, 12)),
+        77 => Ok((I::FLAT_ATOMIC_DEC_U64, 12)),
+        80 => Ok((I::FLAT_ATOMIC_COND_SUB_U32, 12)),
+        81 => Ok((I::FLAT_ATOMIC_MIN_NUM_F32, 12)),
+        82 => Ok((I::FLAT_ATOMIC_MAX_NUM_F32, 12)),
+        86 => Ok((I::FLAT_ATOMIC_ADD_F32, 12)),
+        89 => Ok((I::FLAT_ATOMIC_PK_ADD_F16, 12)),
+        90 => Ok((I::FLAT_ATOMIC_PK_ADD_BF16, 12)),
+        _ => Err(()),
+    }
+}
+
 fn decode_vscratch_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         16 => Ok((I::SCRATCH_LOAD_U8, 12)),
@@ -1276,6 +1346,45 @@ fn decode_vglobal_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
         89 => Ok((I::GLOBAL_ATOMIC_PK_ADD_F16, 12)),
         90 => Ok((I::GLOBAL_ATOMIC_PK_ADD_BF16, 12)),
         115 => Ok((I::GLOBAL_ATOMIC_ORDERED_ADD_B64, 12)),
+        _ => Err(()),
+    }
+}
+
+fn decode_vimage_opcode_rdna4(opcode: u32) -> Result<(I, usize), ()> {
+    match opcode {
+        0 => Ok((I::IMAGE_LOAD, 12)),
+        1 => Ok((I::IMAGE_LOAD_MIP, 12)),
+        2 => Ok((I::IMAGE_LOAD_PCK, 12)),
+        3 => Ok((I::IMAGE_LOAD_PCK_SGN, 12)),
+        4 => Ok((I::IMAGE_LOAD_MIP_PCK, 12)),
+        5 => Ok((I::IMAGE_LOAD_MIP_PCK_SGN, 12)),
+        6 => Ok((I::IMAGE_STORE, 12)),
+        7 => Ok((I::IMAGE_STORE_MIP, 12)),
+        8 => Ok((I::IMAGE_STORE_PCK, 12)),
+        9 => Ok((I::IMAGE_STORE_MIP_PCK, 12)),
+        10 => Ok((I::IMAGE_ATOMIC_SWAP, 12)),
+        11 => Ok((I::IMAGE_ATOMIC_CMPSWAP, 12)),
+        12 => Ok((I::IMAGE_ATOMIC_ADD_UINT, 12)),
+        13 => Ok((I::IMAGE_ATOMIC_SUB_UINT, 12)),
+        14 => Ok((I::IMAGE_ATOMIC_MIN_INT, 12)),
+        15 => Ok((I::IMAGE_ATOMIC_MIN_UINT, 12)),
+        16 => Ok((I::IMAGE_ATOMIC_MAX_INT, 12)),
+        17 => Ok((I::IMAGE_ATOMIC_MAX_UINT, 12)),
+        18 => Ok((I::IMAGE_ATOMIC_AND, 12)),
+        19 => Ok((I::IMAGE_ATOMIC_OR, 12)),
+        20 => Ok((I::IMAGE_ATOMIC_XOR, 12)),
+        21 => Ok((I::IMAGE_ATOMIC_INC_UINT, 12)),
+        22 => Ok((I::IMAGE_ATOMIC_DEC_UINT, 12)),
+        23 => Ok((I::IMAGE_GET_RESINFO, 12)),
+        25 => Ok((I::IMAGE_BVH_INTERSECT_RAY, 12)),
+        26 => Ok((I::IMAGE_BVH64_INTERSECT_RAY, 12)),
+        128 => Ok((I::IMAGE_BVH_DUAL_INTERSECT_RAY, 12)),
+        129 => Ok((I::IMAGE_BVH8_INTERSECT_RAY, 12)),
+        131 => Ok((I::IMAGE_ATOMIC_ADD_FLT, 12)),
+        132 => Ok((I::IMAGE_ATOMIC_MIN_FLT, 12)),
+        133 => Ok((I::IMAGE_ATOMIC_MAX_FLT, 12)),
+        134 => Ok((I::IMAGE_ATOMIC_PK_ADD_F16, 12)),
+        135 => Ok((I::IMAGE_ATOMIC_PK_ADD_BF16, 12)),
         _ => Err(()),
     }
 }
@@ -1442,6 +1551,7 @@ fn decode_source_operand(operand: u16, literal_constant: &[u8]) -> SourceOperand
         0..=127 => SourceOperand::ScalarRegister(operand as u8),
         128..=192 => SourceOperand::IntegerConstant((operand - 128) as u64),
         193..=208 => SourceOperand::IntegerConstant((-((operand - 192) as i64)) as u64),
+        237 => SourceOperand::PrivateBase,
         240 => SourceOperand::FloatConstant(0.5),  // 0.5
         241 => SourceOperand::FloatConstant(-0.5), // -0.5
         242 => SourceOperand::FloatConstant(1.0),  // 1.0
@@ -1536,13 +1646,28 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
     } else if (get_bits(inst, 31, 26) as u32) == VOPD_ENCODE {
         let opx = decode_opx_opcode_rdna4(get_bits(inst, 25, 22) as u32)?;
         let opy = decode_opy_opcode_rdna4(get_bits(inst, 21, 17) as u32)?;
-        let size = 8;
+        let size_x = match opx {
+            I::V_DUAL_FMAAK_F32 => 12,
+            I::V_DUAL_FMAMK_F32 => 12,
+            _ => 8,
+        };
+        let size_y = match opy {
+            I::V_DUAL_FMAAK_F32 => 12,
+            I::V_DUAL_FMAMK_F32 => 12,
+            _ => 8,
+        };
+        let size = max(size_x, size_y);
         let src0x = get_bits(inst, 8, 0) as u16;
         let vsrc1x = get_bits(inst, 16, 9) as u8;
         let src0y = get_bits(inst, 40, 32) as u16;
         let vsrc1y = get_bits(inst, 48, 41) as u8;
         let vdstx = get_bits(inst, 63, 56) as u8;
         let vdsty = get_bits(inst, 55, 49) as u8;
+        let literal_constant = if size == 12 {
+            Some(buffer::get_u32(inst_stream.insts, 8))
+        } else {
+            None
+        };
         Ok((
             InstFormat::VOPD(VOPD {
                 opx,
@@ -1553,9 +1678,10 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
                 vsrc1y,
                 vdstx,
                 vdsty,
+                literal_constant,
             }),
             if src0x == 255 || src0y == 255 {
-                size + 4
+                max(12, size)
             } else {
                 size
             },
@@ -1574,12 +1700,18 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
     } else if (get_bits(inst, 31, 31) as u32) == VOP2_ENCODE {
         let src0 = get_bits(inst, 8, 0) as u16;
         let (op, size) = decode_vop2_opcode_rdna4(get_bits(inst, 30, 25) as u32)?;
+        let literal_constant = if size == 8 {
+            Some(buffer::get_u32(inst_stream.insts, 4))
+        } else {
+            None
+        };
         Ok((
             InstFormat::VOP2(VOP2 {
                 src0: decode_source_operand(src0, &inst_stream.insts[4..]),
                 vsrc1: get_bits(inst, 16, 9) as u8,
                 vdst: get_bits(inst, 24, 17) as u8,
                 op,
+                literal_constant,
             }),
             if src0 == 255 { max(8, size) } else { size },
         ))
@@ -1676,6 +1808,23 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
             }),
             size,
         ))
+    } else if (get_bits(inst, 31, 24) as u32) == VFLAT_ENCODE {
+        let inst_hi = buffer::get_u32(inst_stream.insts, 8) as u64;
+        let (op, size) = decode_vflat_opcode_rdna4(get_bits(inst, 21, 14) as u32)?;
+        Ok((
+            InstFormat::VFLAT(VFLAT {
+                op,
+                vaddr: get_bits(inst_hi, 71 - 64, 64 - 64) as u8,
+                vsrc: get_bits(inst, 62, 55) as u8,
+                vdst: get_bits(inst, 39, 32) as u8,
+                scope: get_bits(inst, 51, 50) as u8,
+                th: get_bits(inst, 54, 52) as u8,
+                ioffset: get_bits(inst_hi, 95 - 64, 72 - 64) as u32,
+                saddr: get_bits(inst, 6, 0) as u8,
+                sve: get_bits(inst, 49, 49) as u8,
+            }),
+            size,
+        ))
     } else if (get_bits(inst, 31, 24) as u32) == VSCRATCH_ENCODE {
         let inst_hi = buffer::get_u32(inst_stream.insts, 8) as u64;
         let (op, size) = decode_vscratch_opcode_rdna4(get_bits(inst, 21, 14) as u32)?;
@@ -1707,6 +1856,30 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
                 ioffset: get_bits(inst_hi, 95 - 64, 72 - 64) as u32,
                 saddr: get_bits(inst, 6, 0) as u8,
                 sve: get_bits(inst, 49, 49) as u8,
+            }),
+            size,
+        ))
+    } else if (get_bits(inst, 31, 26) as u32) == VIMAGE_ENCODE {
+        let inst_hi = buffer::get_u32(inst_stream.insts, 8) as u64;
+        let (op, size) = decode_vimage_opcode_rdna4(get_bits(inst, 21, 14) as u32)?;
+        Ok((
+            InstFormat::VIMAGE(VIMAGE {
+                op,
+                dim: get_bits(inst, 2, 0) as u8,
+                r128: get_bits(inst, 4, 4) as u8,
+                d16: get_bits(inst, 5, 5) as u8,
+                a16: get_bits(inst, 6, 6) as u8,
+                dmask: get_bits(inst, 25, 22) as u8,
+                vdata: get_bits(inst, 39, 32) as u8,
+                rsrc: get_bits(inst, 49, 41) as u16,
+                scope: get_bits(inst, 51, 50) as u8,
+                th: get_bits(inst, 54, 52) as u8,
+                tfe: get_bits(inst, 55, 55) as u8,
+                vaddr4: get_bits(inst, 63, 56) as u8,
+                vaddr0: get_bits(inst_hi, 71 - 64, 64 - 64) as u8,
+                vaddr1: get_bits(inst_hi, 79 - 64, 72 - 64) as u8,
+                vaddr2: get_bits(inst_hi, 87 - 64, 80 - 64) as u8,
+                vaddr3: get_bits(inst_hi, 95 - 64, 88 - 64) as u8,
             }),
             size,
         ))

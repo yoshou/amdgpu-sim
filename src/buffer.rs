@@ -11,14 +11,8 @@ pub fn set_u32(buffer: &mut [u8], offset: usize, value: u32) {
 }
 
 pub fn set_u64(buffer: &mut [u8], offset: usize, value: u64) {
-    buffer[offset] = (value & 0xFF) as u8;
-    buffer[offset + 1] = ((value >> 8) & 0xFF) as u8;
-    buffer[offset + 2] = ((value >> 16) & 0xFF) as u8;
-    buffer[offset + 3] = ((value >> 24) & 0xFF) as u8;
-    buffer[offset + 4] = ((value >> 32) & 0xFF) as u8;
-    buffer[offset + 5] = ((value >> 40) & 0xFF) as u8;
-    buffer[offset + 6] = ((value >> 48) & 0xFF) as u8;
-    buffer[offset + 7] = ((value >> 56) & 0xFF) as u8;
+    let bytes = value.to_le_bytes();
+    buffer[offset..offset + 8].copy_from_slice(&bytes);
 }
 
 pub fn set_f32(buffer: &mut [u8], offset: usize, value: f32) {
