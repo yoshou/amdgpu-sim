@@ -225,13 +225,13 @@ fn div_fixup_f32(s0: f32, s1: f32, s2: f32) -> f32 {
         } else {
             0.0
         }
-    } else if (get_exp_f32(s2) - get_exp_f32(s1)) < -1075 {
+    } else if (get_exp_f32(s2) - get_exp_f32(s1)) < -150 {
         if sign_out {
             -0.0
         } else {
             0.0
         }
-    } else if get_exp_f32(s1) == 2047 {
+    } else if get_exp_f32(s1) == 255 {
         if sign_out {
             f32::NEG_INFINITY
         } else {
