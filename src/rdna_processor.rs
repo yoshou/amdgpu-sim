@@ -540,39 +540,41 @@ fn intersect_triangle(
     let denom = dot(s1, e1);
     if denom == 0.0 {
         let result0 = f32::INFINITY;
-        let result1 = denom;
+        let result1 = 0.0;
         let result2 = 0.0;
         let result3 = 0.0;
 
         return (result0, result1, result2, result3);
     }
-    let inv_denom = 1.0 / denom;
     let d = [
         ray_origin[0] - v0[0],
         ray_origin[1] - v0[1],
         ray_origin[2] - v0[2],
     ];
-    let b_y = dot(d, s1) * inv_denom;
+    let b_y = dot(d, s1);
     let s2 = cross(d, e1);
-    let b_z = dot(ray_direction, s2) * inv_denom;
-    let t = dot(e2, s2) * inv_denom;
-    let b_x = 1.0 - b_y - b_z;
+    let b_z = dot(ray_direction, s2);
+    let t: f32 = dot(e2, s2);
+    let b_x = denom - b_y - b_z;
     let barycentrics = [b_x, b_y, b_z];
-    if b_y < 0.0 || b_y > 1.0 || b_z < 0.0 || (b_y + b_z) > 1.0 || t < 0.0 {
-        let result0 = f32::INFINITY;
-        let result1 = denom;
-        let result2 = barycentrics[((flags >> 0) & 3) as usize] * denom;
-        let result3 = barycentrics[((flags >> 2) & 3) as usize] * denom;
 
-        (result0, result1, result2, result3)
+    let result0 = if (denom > 0.0)
+        && (b_y < 0.0 || b_y > denom || b_z < 0.0 || (b_y + b_z) > denom || (t < 0.0))
+    {
+        f32::INFINITY
+    } else if (denom < 0.0)
+        && (b_y > 0.0 || b_y < denom || b_z > 0.0 || (b_y + b_z) < denom || (t > 0.0))
+    {
+        f32::INFINITY
     } else {
-        let result0 = dot(e2, s2);
-        let result1 = denom;
-        let result2 = barycentrics[((flags >> 0) & 3) as usize] * denom;
-        let result3 = barycentrics[((flags >> 2) & 3) as usize] * denom;
+        t
+    };
 
-        (result0, result1, result2, result3)
-    }
+    let result1 = denom;
+    let result2 = barycentrics[((flags >> 0) & 3) as usize];
+    let result3 = barycentrics[((flags >> 2) & 3) as usize];
+
+    (result0, result1, result2, result3)
 }
 
 #[repr(C)]
