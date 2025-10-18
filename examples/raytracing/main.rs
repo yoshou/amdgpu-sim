@@ -133,12 +133,12 @@ where
 
 fn load_geometry(
     filename: &str,
-) -> Result<aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>>> {
+) -> Result<aligned_vec::AVec<u8>> {
     let mut file = File::open(filename)?;
     let mut data = vec![];
     file.read_to_end(&mut data)?;
 
-    let mut aligned_data = aligned_vec::AVec::new(0x1_0000_0000);
+    let mut aligned_data = aligned_vec::AVec::new(128);
     aligned_data.extend_from_slice(&data);
 
     Ok(aligned_data)
