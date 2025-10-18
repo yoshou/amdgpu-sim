@@ -131,9 +131,7 @@ where
     (x + y - T::from(1)) / y
 }
 
-fn load_geometry(
-    filename: &str,
-) -> Result<aligned_vec::AVec<u8>> {
+fn load_geometry(filename: &str) -> Result<aligned_vec::AVec<u8>> {
     let mut file = File::open(filename)?;
     let mut data = vec![];
     file.read_to_end(&mut data)?;
@@ -208,70 +206,70 @@ fn main() -> Result<()> {
             .unwrap();
 
         let metadata = decode_note_metadata(note_section_data.data()).unwrap();
-        let (kernarg_seg_size, private_segment_size, _) =
-            if let Metadata::Yaml(metadata) = metadata {
-                let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
-                let metadata = &metadatas[0];
+        let (kernarg_seg_size, private_segment_size, _) = if let Metadata::Yaml(metadata) = metadata
+        {
+            let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
+            let metadata = &metadatas[0];
 
-                let kernarg_seg_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["KernargSegmentSize"]
-                {
-                    integer
-                } else {
-                    1
-                } as usize;
-                let private_seg_fixed_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["PrivateSegmentFixedSize"]
-                {
-                    integer
-                } else {
-                    1
-                } as usize;
-                let is_dynamic_call_stack = if let Yaml::Boolean(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["IsDynamicCallStack"]
-                {
-                    integer
-                } else {
-                    false
-                };
+            let kernarg_seg_size = if let Yaml::Integer(integer) =
+                metadata["Kernels"][0]["CodeProps"]["KernargSegmentSize"]
+            {
+                integer
+            } else {
+                1
+            } as usize;
+            let private_seg_fixed_size = if let Yaml::Integer(integer) =
+                metadata["Kernels"][0]["CodeProps"]["PrivateSegmentFixedSize"]
+            {
+                integer
+            } else {
+                1
+            } as usize;
+            let is_dynamic_call_stack = if let Yaml::Boolean(integer) =
+                metadata["Kernels"][0]["CodeProps"]["IsDynamicCallStack"]
+            {
+                integer
+            } else {
+                false
+            };
+
+            let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
+            let private_segment_size = private_seg_fixed_size + stack_size;
+            let wavefront_size = if let Yaml::Integer(integer) =
+                metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
+            {
+                integer
+            } else {
+                panic!("Wavefront size not found in metadata")
+            } as usize;
+
+            (kernarg_seg_size, private_segment_size, wavefront_size)
+        } else if let Metadata::MessagePack(metadata) = metadata {
+            let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
+            if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
+                let map: MetadataMapV5 = rmp_serde::from_slice(&metadata).unwrap();
+                let kernarg_seg_size = map.amdhsa_kernels[0].kernarg_segment_size as usize;
+                let private_seg_fixed_size =
+                    map.amdhsa_kernels[0].private_segment_fixed_size as usize;
+
+                let is_dynamic_call_stack =
+                    if let Some(value) = map.amdhsa_kernels[0].uses_dynamic_stack {
+                        value
+                    } else {
+                        false
+                    };
 
                 let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
                 let private_segment_size = private_seg_fixed_size + stack_size;
-                let wavefront_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
-                {
-                    integer
-                } else {
-                    panic!("Wavefront size not found in metadata")
-                } as usize;
+                let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
 
                 (kernarg_seg_size, private_segment_size, wavefront_size)
-            } else if let Metadata::MessagePack(metadata) = metadata {
-                let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
-                if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
-                    let map: MetadataMapV5 = rmp_serde::from_slice(&metadata).unwrap();
-                    let kernarg_seg_size = map.amdhsa_kernels[0].kernarg_segment_size as usize;
-                    let private_seg_fixed_size =
-                        map.amdhsa_kernels[0].private_segment_fixed_size as usize;
-
-                    let is_dynamic_call_stack =
-                        if let Some(value) = map.amdhsa_kernels[0].uses_dynamic_stack {
-                            value
-                        } else {
-                            false
-                        };
-
-                    let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
-                    let private_segment_size = private_seg_fixed_size + stack_size;
-                    let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
-
-                    (kernarg_seg_size, private_segment_size, wavefront_size)
-                } else {
-                    panic!()
-                }
             } else {
                 panic!()
-            };
+            }
+        } else {
+            panic!()
+        };
 
         let mut arg_buffer = vec![0u8; kernarg_seg_size];
 
