@@ -4994,7 +4994,7 @@ impl SIMD32 {
             let ioffset = ((ioffset << 8) as i32) >> 8;
 
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
-            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if ((offset[elem] as u64) < scratch_base)
                 || ((offset[elem] as u64) >= scratch_limit)
             {
@@ -5021,7 +5021,7 @@ impl SIMD32 {
                 }
                 let ioffset = ((ioffset << 8) as i32) >> 8;
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
-                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if ((offset[elem] as u64) < scratch_base)
                     || ((offset[elem] as u64) >= scratch_limit)
                 {
@@ -5050,7 +5050,7 @@ impl SIMD32 {
                 }
                 let ioffset = ((ioffset << 8) as i32) >> 8;
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
-                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if ((offset[elem] as u64) < scratch_base)
                     || ((offset[elem] as u64) >= scratch_limit)
                 {
@@ -5077,7 +5077,7 @@ impl SIMD32 {
                 continue;
             }
             let scratch_base = self.ctx.scratch.borrow_mut().as_ptr() as u64;
-            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if ((offset[elem] as u64) < scratch_base)
                 || ((offset[elem] as u64) >= scratch_limit)
             {
@@ -6141,7 +6141,7 @@ impl<'a> RDNAProcessor<'a> {
                 for cu_idx in 0..2 {
                     for simd_idx in 0..2 {
                         let mut setup_data = vec![];
-                        
+
                         if cu_idx * 64 + simd_idx * 32 >= workgroup_size {
                             continue;
                         }
