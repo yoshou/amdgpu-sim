@@ -16410,6 +16410,14 @@ impl RegisterUsage {
         self.use_vgpr_u32(reg + 1);
     }
 
+    fn use_operand_u16(&mut self, operand: &SourceOperand) {
+        match operand {
+            SourceOperand::ScalarRegister(reg) => self.use_sgpr_u32(*reg as u32),
+            SourceOperand::VectorRegister(reg) => self.use_vgpr_u32(*reg as u32),
+            _ => {}
+        };
+    }
+
     fn use_operand_u32(&mut self, operand: &SourceOperand) {
         match operand {
             SourceOperand::ScalarRegister(reg) => self.use_sgpr_u32(*reg as u32),
@@ -16493,6 +16501,10 @@ impl RegisterUsage {
         self.def_sgprs.insert(reg);
     }
 
+    fn def_sgpr_f32(&mut self, reg: u32) {
+        self.def_sgpr_u32(reg);
+    }
+
     fn def_sgpr_u64(&mut self, reg: u32) {
         self.def_sgpr_u32(reg);
         self.def_sgpr_u32(reg + 1);
@@ -16506,6 +16518,10 @@ impl RegisterUsage {
     fn def_vgpr_u32(&mut self, reg: u32) {
         self.use_vgpr_u32(reg);
         self.def_vgprs.insert(reg);
+    }
+
+    fn def_vgpr_u16(&mut self, reg: u32) {
+        self.def_vgpr_u32(reg);
     }
 
     fn def_vgpr_f32(&mut self, reg: u32) {
@@ -16596,7 +16612,22 @@ impl RDNATranslator {
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
                     reg_usage.def_sgpr_u32(106);
                 }
+                I::V_CMP_LT_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMPX_NE_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
                 I::V_CMP_GT_U64 => {
+                    reg_usage.use_operand_u64(&inst.src0);
+                    reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_EQ_U64 => {
                     reg_usage.use_operand_u64(&inst.src0);
                     reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
                     reg_usage.def_sgpr_u32(106);
@@ -16651,6 +16682,31 @@ impl RDNATranslator {
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
                     reg_usage.def_sgpr_u32(126);
                 }
+                I::V_CMP_GT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_LE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_LT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_GE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NGT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }
@@ -16661,6 +16717,10 @@ impl RDNATranslator {
                     reg_usage.def_vgpr_f64(inst.vdst as u32);
                 }
                 I::V_MOV_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_CLZ_I32_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
@@ -16700,9 +16760,33 @@ impl RDNATranslator {
                     reg_usage.use_operand_f32(&inst.src0);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
+                I::V_CVT_I32_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_RCP_IFLAG_F32 => {
                     reg_usage.use_operand_f32(&inst.src0);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_RCP_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_SQRT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_FREXP_MANT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_FREXP_EXP_I32_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_RNDNE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
@@ -16714,7 +16798,34 @@ impl RDNATranslator {
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
+                I::V_SUBREV_NC_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_ADD_CO_CI_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.use_sgpr_u32(106);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_SUB_NC_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MIN_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_AND_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_OR_B32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
@@ -16740,6 +16851,11 @@ impl RDNATranslator {
                     reg_usage.use_sgpr_u32(106);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
+                I::V_LSHLREV_B64 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u64(inst.vdst as u32);
+                }
                 I::V_ADD_F64 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
@@ -16755,7 +16871,33 @@ impl RDNATranslator {
                     reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
                     reg_usage.def_vgpr_f64(inst.vdst as u32);
                 }
+                I::V_ADD_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_SUB_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
                 I::V_MUL_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_FMAC_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.use_vgpr_f32(inst.vdst as u32);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_FMAMK_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_FMAAK_F32 => {
                     reg_usage.use_operand_f32(&inst.src0);
                     reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
                     reg_usage.def_vgpr_f32(inst.vdst as u32);
@@ -16772,6 +16914,12 @@ impl RDNATranslator {
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
                 I::V_CNDMASK_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_AND_OR_B32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
                     reg_usage.use_operand_u32(&inst.src2);
@@ -16800,6 +16948,16 @@ impl RDNATranslator {
                 I::V_CMP_NE_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMPX_NE_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_sgpr_u32(126);
+                }
+                I::V_CMP_EQ_U64 => {
+                    reg_usage.use_operand_u64(&inst.src0);
+                    reg_usage.use_operand_u64(&inst.src1);
                     reg_usage.def_sgpr_u32(inst.vdst as u32);
                 }
                 I::V_CMP_NLT_F64 => {
@@ -16923,6 +17081,12 @@ impl RDNATranslator {
                     reg_usage.use_operand_u32(&inst.src1);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
+                I::V_ALIGNBIT_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_CMP_EQ_U16 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
@@ -16955,10 +17119,21 @@ impl RDNATranslator {
                     reg_usage.use_operand_u32(&inst.src2);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
+                I::V_LSHL_ADD_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.use_operand_u32(&inst.src2);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_ASHRREV_I32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_LSHLREV_B16 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u16(&inst.src1);
+                    reg_usage.def_vgpr_u16(inst.vdst as u32);
                 }
                 I::V_ADD_NC_U16 => {
                     reg_usage.use_operand_u32(&inst.src0);
@@ -16966,6 +17141,11 @@ impl RDNATranslator {
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
                 I::V_LSHLREV_B64 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u64(&inst.src1);
+                    reg_usage.def_vgpr_u64(inst.vdst as u32);
+                }
+                I::V_LSHRREV_B64 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u64(&inst.src1);
                     reg_usage.def_vgpr_u64(inst.vdst as u32);
@@ -16979,11 +17159,71 @@ impl RDNATranslator {
                     reg_usage.use_operand_f32(&inst.src1);
                     reg_usage.def_vgpr_f32(inst.vdst as u32);
                 }
+                I::V_FMA_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.use_operand_f32(&inst.src2);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_DIV_FMAS_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.use_operand_f32(&inst.src2);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_DIV_FIXUP_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.use_operand_f32(&inst.src2);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_CMP_GE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_LT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_LE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_GT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_LG_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_CLASS_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_LDEXP_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }
             },
             InstFormat::VOP3SD(inst) => match inst.op {
+                I::V_DIV_SCALE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.use_operand_f32(&inst.src2);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
                 I::V_MAD_CO_U64_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
@@ -17046,6 +17286,27 @@ impl RDNATranslator {
                         reg_usage.use_operand_u32(&inst.src0x);
                         reg_usage.def_vgpr_u32(vdstx);
                     }
+                    I::V_DUAL_FMAC_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0x);
+                        reg_usage.use_vgpr_f32(inst.vsrc1x as u32);
+                        reg_usage.use_vgpr_f32(vdstx);
+                        reg_usage.def_vgpr_f32(vdstx);
+                    }
+                    I::V_DUAL_SUB_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0x);
+                        reg_usage.use_vgpr_f32(inst.vsrc1x as u32);
+                        reg_usage.def_vgpr_f32(vdstx);
+                    }
+                    I::V_DUAL_MUL_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0x);
+                        reg_usage.use_vgpr_f32(inst.vsrc1x as u32);
+                        reg_usage.def_vgpr_f32(vdstx);
+                    }
+                    I::V_DUAL_FMAAK_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0x);
+                        reg_usage.use_vgpr_f32(inst.vsrc1x as u32);
+                        reg_usage.def_vgpr_f32(vdstx);
+                    }
                     _ => {
                         panic!("Unsupported instruction: {:?}", inst);
                     }
@@ -17070,6 +17331,37 @@ impl RDNATranslator {
                         reg_usage.use_operand_u32(&inst.src0y);
                         reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
                         reg_usage.def_vgpr_u32(vdsty);
+                    }
+                    I::V_DUAL_AND_B32 => {
+                        reg_usage.use_operand_u32(&inst.src0y);
+                        reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_u32(vdsty);
+                    }
+                    I::V_DUAL_ADD_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0y);
+                        reg_usage.use_vgpr_f32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_f32(vdsty);
+                    }
+                    I::V_DUAL_SUB_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0y);
+                        reg_usage.use_vgpr_f32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_f32(vdsty);
+                    }
+                    I::V_DUAL_MUL_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0y);
+                        reg_usage.use_vgpr_f32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_f32(vdsty);
+                    }
+                    I::V_DUAL_FMAC_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0y);
+                        reg_usage.use_vgpr_f32(inst.vsrc1y as u32);
+                        reg_usage.use_vgpr_f32(vdsty);
+                        reg_usage.def_vgpr_f32(vdsty);
+                    }
+                    I::V_DUAL_FMAAK_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0y);
+                        reg_usage.use_vgpr_f32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_f32(vdsty);
                     }
                     _ => {
                         panic!("Unsupported instruction: {:?}", inst);
@@ -17138,6 +17430,10 @@ impl RDNATranslator {
                 I::S_CTZ_I32_B32 => {
                     reg_usage.use_operand_u32(&inst.ssrc0);
                     reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_CVT_F32_I32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.def_sgpr_f32(inst.sdst as u32);
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
@@ -17251,6 +17547,39 @@ impl RDNATranslator {
                 I::S_CMP_EQ_U64 => {
                     reg_usage.use_operand_u64(&inst.ssrc0);
                     reg_usage.use_operand_u64(&inst.ssrc1);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::SOPK(inst) => match inst.op {
+                I::S_MOVK_I32 => {
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VFLAT(inst) => match inst.op {
+                I::FLAT_LOAD_B32 => {
+                    reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::FLAT_LOAD_B64 => {
+                    reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    for i in 0..2 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
+                I::FLAT_LOAD_B128 => {
+                    reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    for i in 0..4 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
+                I::FLAT_STORE_B32 => {
+                    reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    reg_usage.use_vgpr_u32(inst.vsrc as u32);
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
@@ -17378,6 +17707,12 @@ impl RDNATranslator {
                         reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
                     }
                 }
+                I::SCRATCH_LOAD_B96 => {
+                    reg_usage.use_sgpr_u32(inst.saddr as u32);
+                    for i in 0..3 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
                 I::SCRATCH_LOAD_B128 => {
                     reg_usage.use_sgpr_u32(inst.saddr as u32);
                     for i in 0..4 {
@@ -17417,9 +17752,27 @@ impl RDNATranslator {
                     panic!("Unsupported instruction: {:?}", inst);
                 }
             },
-            _ => {
-                panic!("Unsupported instruction: {:?}", inst);
-            }
+            InstFormat::VIMAGE(inst) => match inst.op {
+                I::IMAGE_BVH64_INTERSECT_RAY => {
+                    reg_usage.use_vgpr_u64(inst.vaddr0 as u32);
+                    reg_usage.use_vgpr_f32(inst.vaddr1 as u32);
+                    for i in 0..3 {
+                        reg_usage.use_vgpr_f32(inst.vaddr2 as u32 + i);
+                    }
+                    for i in 0..3 {
+                        reg_usage.use_vgpr_f32(inst.vaddr3 as u32 + i);
+                    }
+                    for i in 0..3 {
+                        reg_usage.use_vgpr_f32(inst.vaddr4 as u32 + i);
+                    }
+                    for i in 0..4 {
+                        reg_usage.def_vgpr_u32(inst.vdata as u32 + i);
+                    }
+                }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
         }
     }
 
