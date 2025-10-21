@@ -682,20 +682,23 @@ impl SIMD32 {
                     as *mut u32;
                 let scc_ptr = (&mut self.ctx.scc) as *mut bool;
                 let lds_ptr = self.lds.borrow_mut().as_mut_ptr();
+                let scratch_ptr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64;
 
                 block.execute(
                     sgprs_ptr,
                     vgprs_ptr,
                     scc_ptr,
                     &mut self.ctx.pc,
-                    self.ctx.scratch.borrow_mut().as_mut_ptr() as u64,
+                    scratch_ptr,
                     lds_ptr,
                 )
             } else if let Ok((inst, size)) = decode_rdna4(inst_stream) {
                 self.translator.add_inst(self.ctx.pc as u64, inst.clone());
                 let result = if is_terminator(&inst) {
                     if self.translator.insts.len() > 0 {
-                        let block = self.translator.get_or_build();
+                        let block = self
+                            .translator
+                            .get_or_build(self.ctx.scratch.borrow().len() / 32);
 
                         let sgprs_ptr = self.sgprs.regs.as_mut_ptr().wrapping_add(128 * self.ctx.id)
                             as *mut u32;
@@ -707,13 +710,14 @@ impl SIMD32 {
                             as *mut u32;
                         let scc_ptr = (&mut self.ctx.scc) as *mut bool;
                         let lds_ptr = self.lds.borrow_mut().as_mut_ptr();
+                        let scratch_ptr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64;
 
                         block.execute(
                             sgprs_ptr,
                             vgprs_ptr,
                             scc_ptr,
                             &mut self.ctx.pc,
-                            self.ctx.scratch.borrow_mut().as_mut_ptr() as u64,
+                            scratch_ptr,
                             lds_ptr,
                         )
                     } else {
@@ -6115,7 +6119,7 @@ impl<'a> RDNAProcessor<'a> {
 
             if translator.insts_blocks.is_empty() {
                 let program = RDNAProgram::new(entry_address, &insts);
-                translator.build_from_program(&program);
+                translator.build_from_program(&program, self.aql.private_segment_size as usize);
             }
 
             for wgp in &mut self.wgps {
