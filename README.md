@@ -64,6 +64,18 @@ The kernel program is based on the following code.
 
 https://github.com/ROCm/rocWMMA
 
+### ray tracing
+
+Please execute the following command.
+
+```sh
+cargo run --release --example raytracing --arch gfx1200
+```
+
+The kernel program is based on the following code.
+
+https://github.com/GPUOpen-LibrariesAndSDKs/HIPRTSDK
+
 ## Implementation techniques
 
 * The kernel code is translated to an intermediate representation based on LLVM IR.
