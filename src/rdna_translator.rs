@@ -3610,7 +3610,7 @@ impl IREmitter {
         mul_value
     }
 
-    unsafe fn emit_concat_pair<const N: usize>(
+    unsafe fn emit_concat_pair(
         &mut self,
         values: &Vec<llvm::prelude::LLVMValueRef>,
     ) -> Vec<llvm::prelude::LLVMValueRef> {
@@ -3621,20 +3621,26 @@ impl IREmitter {
 
         let len = values.len() as u32;
 
-        let mut index_values = Vec::new();
-        for i in 0..(2 * N) {
-            index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
-        }
-
-        let indices =
-            llvm::core::LLVMConstVector(index_values.as_mut_ptr(), index_values.len() as u32);
-
         let mut result = Vec::new();
         for i in (0..len).step_by(2) {
+            let value1 = values[i as usize];
+            let value2 = values[i as usize + 1];
+
+            let value1_len = llvm::core::LLVMGetVectorSize(llvm::core::LLVMTypeOf(value1));
+            let value2_len = llvm::core::LLVMGetVectorSize(llvm::core::LLVMTypeOf(value2));
+
+            let mut index_values = Vec::new();
+            for i in 0..(value1_len + value2_len) {
+                index_values.push(llvm::core::LLVMConstInt(ty_i32, i as u64, 0));
+            }
+
+            let indices =
+                llvm::core::LLVMConstVector(index_values.as_mut_ptr(), index_values.len() as u32);
+
             let cmp_value = llvm::core::LLVMBuildShuffleVector(
                 builder,
-                values[i as usize],
-                values[i as usize + 1],
+                value1,
+                value2,
                 indices,
                 empty_name.as_ptr(),
             );
@@ -3650,7 +3656,7 @@ impl IREmitter {
         let mut len = values.len() as u32;
         let mut values = values.clone();
         while len > 1 {
-            let new_values = self.emit_concat_pair::<N>(&values);
+            let new_values = self.emit_concat_pair(&values);
             values = new_values;
             len = values.len() as u32;
         }
