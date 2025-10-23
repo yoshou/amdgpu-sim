@@ -22241,9 +22241,7 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
                         let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                        let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                        let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
                         let empty_name = std::ffi::CString::new("").unwrap();
 
                         let exec_value = emitter.emit_load_sgpr_u32(126);
@@ -22384,17 +22382,8 @@ impl IREmitter {
                             );
 
                             let mut param_tys = vec![
-                                ty_p0, ty_p0, ty_p0, ty_p0, ty_i64, // node_addr
-                                ty_f32, // ray_extent
-                                ty_f32, // ray_origin_x
-                                ty_f32, // ray_origin_y
-                                ty_f32, // ray_origin_z
-                                ty_f32, // ray_dir_x
-                                ty_f32, // ray_dir_y
-                                ty_f32, // ray_dir_z
-                                ty_f32, // ray_inv_dir_x
-                                ty_f32, // ray_inv_dir_y
-                                ty_f32, // ray_inv_dir_z
+                                ty_p0, ty_p0, ty_p0, ty_p0, ty_i64, ty_f32, ty_f32, ty_f32, ty_f32,
+                                ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
                             ];
                             let image_bvh64_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                                 ty_void,
@@ -22532,17 +22521,8 @@ impl IREmitter {
                                 0,
                             );
                             let mut param_tys = vec![
-                                ty_p0, ty_p0, ty_p0, ty_p0, ty_i64, // node_addr
-                                ty_f32, // ray_extent
-                                ty_f32, // ray_origin_x
-                                ty_f32, // ray_origin_y
-                                ty_f32, // ray_origin_z
-                                ty_f32, // ray_dir_x
-                                ty_f32, // ray_dir_y
-                                ty_f32, // ray_dir_z
-                                ty_f32, // ray_inv_dir_x
-                                ty_f32, // ray_inv_dir_y
-                                ty_f32, // ray_inv_dir_z
+                                ty_p0, ty_p0, ty_p0, ty_p0, ty_i64, ty_f32, ty_f32, ty_f32, ty_f32,
+                                ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
                             ];
                             let image_bvh64_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                                 ty_void,
