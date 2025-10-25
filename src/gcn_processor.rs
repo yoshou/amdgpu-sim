@@ -849,6 +849,12 @@ fn s_cmp_lg_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     cu.ctx.scc = s0_value != s1_value;
 }
 
+fn s_cmp_gt_u32_e32(cu: &mut ComputeUnit, s0: usize, s1: usize) {
+    let s0_value = cu.read_sop_src(s0);
+    let s1_value = cu.read_sop_src(s1);
+    cu.ctx.scc = s0_value > s1_value;
+}
+
 fn s_cmp_ne_u64(cu: &mut ComputeUnit, s0: usize, s1: usize) {
     let s0_value = cu.read_sop_src_pair(s0);
     let s1_value = cu.read_sop_src_pair(s1);
@@ -3223,6 +3229,9 @@ impl ComputeUnit {
             }
             I::S_CMP_LG_U32 => {
                 s_cmp_lg_u32_e32(self, s0, s1);
+            }
+            I::S_CMP_GT_U32 => {
+                s_cmp_gt_u32_e32(self, s0, s1);
             }
             I::S_CMP_NE_U64 => {
                 s_cmp_ne_u64(self, s0, s1);

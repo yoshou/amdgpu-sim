@@ -5217,6 +5217,26 @@ impl IREmitter {
 
                 emitter.emit_store_scc_u8(scc_value);
             }
+            I::S_CMP_GT_U32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntUGT,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
             I::S_CMP_LT_I32 => {
                 let emitter = self;
                 let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
@@ -20264,6 +20284,10 @@ impl RDNATranslator {
                     reg_usage.use_operand_u32(&inst.ssrc1);
                 }
                 I::S_CMP_GE_U32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_GT_U32 => {
                     reg_usage.use_operand_u32(&inst.ssrc0);
                     reg_usage.use_operand_u32(&inst.ssrc1);
                 }

@@ -846,16 +846,21 @@ pub fn decode_gcn3(inst: u64) -> Result<(InstFormat, usize), ()> {
             size,
         ))
     } else if (get_bits(inst, 31, 30) as u32) == SOP2_ENCODE {
+        let ssrc0 = get_bits(inst, 7, 0) as u8;
         let ssrc1 = get_bits(inst, 15, 8) as u8;
         let (op, size) = decode_sop2_opcode_gcn3(get_bits(inst, 29, 23) as u32)?;
         Ok((
             InstFormat::SOP2(SOP2 {
-                ssrc0: get_bits(inst, 7, 0) as u8,
+                ssrc0,
                 ssrc1,
                 sdst: get_bits(inst, 22, 16) as u8,
                 op,
             }),
-            if ssrc1 == 255 { max(8, size) } else { size },
+            if ssrc0 == 255 || ssrc1 == 255 {
+                max(8, size)
+            } else {
+                size
+            },
         ))
     } else if (get_bits(inst, 31, 26) as u32) == VOP3AB_ENCODE {
         let op = get_bits(inst, 25, 16) as u32;
