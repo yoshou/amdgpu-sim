@@ -386,6 +386,7 @@ fn cmp_class_f64(a: f64, mask: u32) -> bool {
 use aligned_vec::AVec;
 use aligned_vec::ConstAlign;
 use half::f16;
+use itertools::Itertools;
 use num_traits::ops::mul_add::MulAdd;
 
 #[inline(always)]
@@ -526,7 +527,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn intersect_triangle(
+fn intersect_triangle_frac(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     v0: [f32; 3],
@@ -575,6 +576,267 @@ fn intersect_triangle(
     let result3 = barycentrics[((flags >> 2) & 3) as usize];
 
     (result0, result1, result2, result3)
+}
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct Box8Node {
+    data: [u32; 32],
+}
+
+impl Box8Node {
+    pub fn get_box_node_base(&self) -> u32 {
+        self.data[0]
+    }
+
+    pub fn get_prim_node_base(&self) -> u32 {
+        self.data[1]
+    }
+
+    pub fn get_parent_addr(&self) -> u32 {
+        self.data[2]
+    }
+
+    pub fn get_origin(&self) -> [f32; 3] {
+        let x = f32::from_bits(self.data[3]);
+        let y = f32::from_bits(self.data[4]);
+        let z = f32::from_bits(self.data[5]);
+        [x, y, z]
+    }
+
+    pub fn get_exponent(&self) -> (u8, u8, u8) {
+        (
+            (self.data[6] & 0xFF) as u8,
+            ((self.data[6] >> 8) & 0xFF) as u8,
+            ((self.data[6] >> 16) & 0xFF) as u8,
+        )
+    }
+
+    pub fn get_child_count(&self) -> u8 {
+        ((self.data[6] >> 28) & 0x0F) as u8 + 1
+    }
+
+    pub fn get_matrix_id(&self) -> u32 {
+        (self.data[7] as u32) & 0x7F
+    }
+
+    pub fn get_child_box(&self, index: usize) -> Aabb {
+        let rcp_exponent = [
+            f32::from_bits((254 - (self.get_exponent().0 as u32) + 12) << 23),
+            f32::from_bits((254 - (self.get_exponent().1 as u32) + 12) << 23),
+            f32::from_bits((254 - (self.get_exponent().2 as u32) + 12) << 23),
+        ];
+
+        let min_x =
+            self.get_origin()[0] + (self.data[8 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[0];
+        let min_y = self.get_origin()[1]
+            + ((self.data[8 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[1];
+        let min_z = self.get_origin()[2]
+            + ((self.data[9 + index * 3]) & 0x00000FFF) as f32 / rcp_exponent[2];
+        let max_x = self.get_origin()[0]
+            + if self.get_exponent().0 != 0 {
+                ((self.data[9 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[0]
+            } else {
+                0.0
+            };
+        let max_y = self.get_origin()[1]
+            + if self.get_exponent().1 != 0 {
+                (self.data[10 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[1]
+            } else {
+                0.0
+            };
+        let max_z = self.get_origin()[2]
+            + if self.get_exponent().2 != 0 {
+                ((self.data[10 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[2]
+            } else {
+                0.0
+            };
+
+        Aabb {
+            min: [min_x, min_y, min_z],
+            max: [max_x, max_y, max_z],
+        }
+    }
+
+    pub fn get_child_type(&self, index: usize) -> u8 {
+        ((self.data[10 + index * 3] >> 24) & 0x0F) as u8
+    }
+
+    pub fn get_child_addr(&self, index: usize) -> u32 {
+        let child_type = self.get_child_type(index);
+        let mut child_addr = if child_type == 5 {
+            self.data[0] >> 4
+        } else {
+            self.data[1] >> 4
+        };
+        for j in 0..index {
+            if (self.get_child_type(j) == 5) == (child_type == 5) {
+                let node_range = (self.data[10 + j * 3] >> 28) & 0x0F;
+                child_addr += node_range;
+            }
+        }
+        child_addr
+    }
+
+    pub fn get_child_index(&self, index: usize) -> u32 {
+        (self.get_child_addr(index) << 4) | (self.get_child_type(index) as u32)
+    }
+}
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+struct TrianglePacketNode {
+    data: [u32; 32],
+}
+
+impl TrianglePacketNode {
+    pub fn read_unaligned_bits(&self, position: u32, length: u32) -> u32 {
+        let mut data = 0;
+        if length != 0 {
+            let hi_ofs = (position + length) % 32;
+            let lo_word = position / 32;
+            let hi_word = (position + length) / 32;
+            let lo_mask = if length == 32 {
+                !0u32
+            } else {
+                (1u32 << length) - 1
+            } << (position % 32);
+            let hi_mask = (1u32 << hi_ofs) - 1;
+            let lo_bits = (self.data[lo_word as usize] & lo_mask) >> (position % 32);
+
+            data = lo_bits;
+            if hi_word < 32 && hi_word != lo_word && hi_mask > 0 {
+                let hi_bits = (self.data[hi_word as usize] & hi_mask) << (length - hi_ofs);
+                data |= hi_bits;
+            }
+        }
+        data
+    }
+
+    pub fn read_vertex(&self, vertex_index: u32) -> [f32; 3] {
+        let position = 52 + 96 * vertex_index;
+
+        let x_bits = self.read_unaligned_bits(position + 0 * 32, 32);
+        let y_bits = self.read_unaligned_bits(position + 1 * 32, 32);
+        let z_bits = self.read_unaligned_bits(position + 2 * 32, 32);
+
+        [
+            f32::from_bits(x_bits),
+            f32::from_bits(y_bits),
+            f32::from_bits(z_bits),
+        ]
+    }
+
+    pub fn read_descriptor(&self, pair_index: u32, triangle_index: u32) -> [u32; 4] {
+        let position = 1024 - (pair_index + 1) * 29;
+        let descriptor = self.read_unaligned_bits(position, 29);
+        let tri_indices = if triangle_index > 0 {
+            descriptor >> 3
+        } else {
+            descriptor >> 17
+        };
+        [
+            tri_indices & 15,
+            (tri_indices >> 4) & 15,
+            (tri_indices >> 8) & 15,
+            descriptor & 1,
+        ]
+    }
+
+    pub fn fetch_triangle(&self, pair_index: u32, triangle_index: u32) -> [[f32; 3]; 3] {
+        let tri_indices = self.read_descriptor(pair_index, triangle_index);
+
+        let v0 = self.read_vertex(tri_indices[0]);
+        let v1 = self.read_vertex(tri_indices[1]);
+        let v2 = self.read_vertex(tri_indices[2]);
+
+        [v0, v1, v2]
+    }
+
+    pub fn get_triangle_pair_count(&self) -> u32 {
+        self.read_unaligned_bits(28, 3) + 1
+    }
+
+    pub fn get_index_section_midpoint(&self) -> u32 {
+        self.read_unaligned_bits(32 + 10, 10)
+    }
+
+    pub fn get_prim_index_anchor_size(&self) -> u32 {
+        self.read_unaligned_bits(32 + 0, 5)
+    }
+
+    pub fn get_prim_index_payload_size(&self) -> u32 {
+        self.read_unaligned_bits(32 + 5, 5)
+    }
+
+    pub fn read_prim_index(&self, pair_index: u32, triangle_index: u32) -> u32 {
+        let flat_tri_index = 2 * pair_index + triangle_index;
+
+        let prim_index_payload_size = self.get_prim_index_payload_size();
+        let prim_index_anchor_size = self.get_prim_index_anchor_size();
+        let prim_index_anchor_pos = self.get_index_section_midpoint();
+
+        let prim_index_anchor =
+            self.read_unaligned_bits(prim_index_anchor_pos, prim_index_anchor_size);
+        if flat_tri_index == 0 {
+            return prim_index_anchor;
+        }
+        let prim_index_payload_pos = prim_index_anchor_pos
+            + prim_index_anchor_size
+            + (flat_tri_index - 1) * prim_index_payload_size;
+
+        let prim_index = self.read_unaligned_bits(prim_index_payload_pos, prim_index_payload_size);
+        let prim_index_mask = (1 << prim_index_payload_size) - 1;
+
+        if prim_index_payload_size >= prim_index_anchor_size {
+            prim_index
+        } else {
+            prim_index | (prim_index_anchor & !prim_index_mask)
+        }
+    }
+
+    pub fn is_range_end(&self, pair_index: u32) -> bool {
+        let descriptor = self.read_descriptor(pair_index, 0);
+        descriptor[3] != 0
+    }
+}
+
+fn intersect_triangle(
+    ray_origin: [f32; 3],
+    ray_direction: [f32; 3],
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+) -> (f32, f32, f32) {
+    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    let s1 = cross(ray_direction, e2);
+    let denom = dot(s1, e1);
+    if denom == 0.0 {
+        let result0 = f32::INFINITY;
+        let result1 = 0.0;
+        let result2 = 0.0;
+
+        return (result0, result1, result2);
+    }
+    let d = [
+        ray_origin[0] - v0[0],
+        ray_origin[1] - v0[1],
+        ray_origin[2] - v0[2],
+    ];
+    let inv_denom = 1.0 / denom;
+    let b_y = dot(d, s1) * inv_denom;
+    let s2 = cross(d, e1);
+    let b_z = dot(ray_direction, s2) * inv_denom;
+    let t: f32 = dot(e2, s2) * inv_denom;
+
+    let t = if b_y < 0.0 || b_y > 1.0 || b_z < 0.0 || (b_y + b_z) > 1.0 {
+        f32::INFINITY
+    } else {
+        t
+    };
+
+    (t, b_y, b_z)
 }
 
 #[repr(C)]
@@ -1813,6 +2075,9 @@ impl SIMD32 {
             I::V_ADD_CO_CI_U32 => {
                 self.v_add_co_ci_u32_e32(d, s0, s1);
             }
+            I::V_MUL_U32_U24 => {
+                self.v_mul_u32_u24_e32(d, s0, s1);
+            }
             I::V_ADD_F32 => {
                 self.v_add_f32_e32(d, s0, s1);
             }
@@ -1960,6 +2225,20 @@ impl SIMD32 {
                 continue;
             }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_mul_u32_u24_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let s0_value = s0_value & 0xFFFFFF;
+            let s1_value = s1_value & 0xFFFFFF;
+            let d_value = s0_value.wrapping_mul(s1_value);
+            self.write_vgpr(elem, d, d_value);
         }
     }
 
@@ -2162,6 +2441,9 @@ impl SIMD32 {
             I::V_XOR_B32 => {
                 self.v_xor_b32_e64(d, s0, s1);
             }
+            I::V_OR3_B32 => {
+                self.v_or3_b32(d, s0, s1, s2);
+            }
             I::V_XOR3_B32 => {
                 self.v_xor3_b32(d, s0, s1, s2);
             }
@@ -2170,6 +2452,9 @@ impl SIMD32 {
             }
             I::V_ADD3_U32 => {
                 self.v_add3_u32(d, s0, s1, s2);
+            }
+            I::V_MAD_U32_U24 => {
+                self.v_mad_u32_u24(d, s0, s1, s2);
             }
             I::V_MUL_F32 => {
                 self.v_mul_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -2511,6 +2796,19 @@ impl SIMD32 {
         }
     }
 
+    fn v_or3_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let d_value = (s0_value | s1_value) | s2_value;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
     fn v_xor3_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -2545,6 +2843,23 @@ impl SIMD32 {
             let s1_value = self.read_vector_source_operand_u32(elem, s1);
             let s2_value = self.read_vector_source_operand_u32(elem, s2);
             let (d_value, _) = add_u32(s0_value, s1_value, s2_value);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_mad_u32_u24(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+
+            let s0_value = s0_value & 0xFFFFFF;
+            let s1_value = s1_value & 0xFFFFFF;
+            let d_value = s0_value.wrapping_mul(s1_value).wrapping_add(s2_value);
+
             self.write_vgpr(elem, d, d_value);
         }
     }
@@ -4067,6 +4382,9 @@ impl SIMD32 {
             I::V_CMPX_LT_U32 => {
                 self.v_cmpx_lt_u32_e32(s0, s1);
             }
+            I::V_CMPX_GT_U32 => {
+                self.v_cmpx_gt_u32_e32(s0, s1);
+            }
             I::V_CMPX_NE_U32 => {
                 self.v_cmpx_ne_u32_e32(s0, s1);
             }
@@ -4213,6 +4531,25 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_u32(elem, s0);
             let s1_value = self.read_vgpr(elem, s1);
             let d_value = s0_value < s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_exec_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmpx_gt_u32_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
@@ -5573,6 +5910,9 @@ impl SIMD32 {
             I::IMAGE_BVH64_INTERSECT_RAY => {
                 self.image_bvh64_intersect_ray(vdata, vaddr0, vaddr1, vaddr2, vaddr3, vaddr4, s);
             }
+            I::IMAGE_BVH8_INTERSECT_RAY => {
+                self.image_bvh8_intersect_ray(vdata, vaddr0, vaddr1, vaddr2, vaddr3, vaddr4, s);
+            }
             _ => unimplemented!(),
         }
         Signals::None
@@ -5698,7 +6038,7 @@ impl SIMD32 {
                     let ray_dir_x = u32_to_f32(self.read_vgpr(elem, vaddr3));
                     let ray_dir_y = u32_to_f32(self.read_vgpr(elem, vaddr3 + 1));
                     let ray_dir_z = u32_to_f32(self.read_vgpr(elem, vaddr3 + 2));
-                    let result = intersect_triangle(
+                    let result = intersect_triangle_frac(
                         [ray_origin_x, ray_origin_y, ray_origin_z],
                         [ray_dir_x, ray_dir_y, ray_dir_z],
                         tri[0],
@@ -5710,6 +6050,149 @@ impl SIMD32 {
                     self.write_vgpr(elem, vdata + 1, f32_to_u32(result.1));
                     self.write_vgpr(elem, vdata + 2, f32_to_u32(result.2));
                     self.write_vgpr(elem, vdata + 3, f32_to_u32(result.3));
+                }
+                _ => {
+                    panic!("Unsupported node type: {}", node_type);
+                }
+            }
+        }
+    }
+
+    fn image_bvh8_intersect_ray(
+        &mut self,
+        vdata: usize,
+        vaddr0: usize,
+        vaddr1: usize,
+        vaddr2: usize,
+        vaddr3: usize,
+        vaddr4: usize,
+        s: usize,
+    ) {
+        let s0_value = self.read_sgpr(s);
+        let s1_value = self.read_sgpr(s + 1);
+        let _s2_value = self.read_sgpr(s + 2);
+        let _s3_value = self.read_sgpr(s + 3);
+        let _base_addr = (((s1_value as u64) << 32) | (s0_value as u64)) & ((1u64 << 48) - 1);
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let node_base = self.read_vgpr_pair(elem, vaddr0);
+            let node_index = self.read_vgpr(elem, vaddr4);
+            let node_ptr = (node_base + (node_index & !0xF) as u64) << 3;
+            let node_type = (node_index & 0xF) as u8;
+            match node_type {
+                0..3 | 8..11 => {
+                    let tri_pair_index = (node_type & 3) + ((node_type & 8) >> 1);
+                    let node = unsafe { *(node_ptr as *const TrianglePacketNode) };
+                    let tri0 = node.fetch_triangle(tri_pair_index as u32, 0);
+                    let tri1 = node.fetch_triangle(tri_pair_index as u32, 1);
+
+                    let ray_origin_x = u32_to_f32(self.read_vgpr(elem, vaddr2));
+                    let ray_origin_y = u32_to_f32(self.read_vgpr(elem, vaddr2 + 1));
+                    let ray_origin_z = u32_to_f32(self.read_vgpr(elem, vaddr2 + 2));
+                    let ray_dir_x = u32_to_f32(self.read_vgpr(elem, vaddr3));
+                    let ray_dir_y = u32_to_f32(self.read_vgpr(elem, vaddr3 + 1));
+                    let ray_dir_z = u32_to_f32(self.read_vgpr(elem, vaddr3 + 2));
+
+                    let result0 = intersect_triangle(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_dir_x, ray_dir_y, ray_dir_z],
+                        tri0[0],
+                        tri0[1],
+                        tri0[2],
+                    );
+                    let result1 = intersect_triangle(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_dir_x, ray_dir_y, ray_dir_z],
+                        tri1[0],
+                        tri1[1],
+                        tri1[2],
+                    );
+
+                    let prim0 = node.read_prim_index(tri_pair_index as u32, 0);
+                    let prim1 = node.read_prim_index(tri_pair_index as u32, 1);
+
+                    self.write_vgpr(elem, vdata, f32_to_u32(result0.0));
+                    self.write_vgpr(elem, vdata + 1, f32_to_u32(result0.1));
+                    self.write_vgpr(elem, vdata + 2, f32_to_u32(result0.2));
+                    self.write_vgpr(elem, vdata + 3, prim0);
+                    self.write_vgpr(elem, vdata + 4, f32_to_u32(result1.0));
+                    self.write_vgpr(elem, vdata + 5, f32_to_u32(result1.1));
+                    self.write_vgpr(elem, vdata + 6, f32_to_u32(result1.2));
+                    self.write_vgpr(elem, vdata + 7, prim1);
+
+                    let node_end = (tri_pair_index as u32 + 1) == node.get_triangle_pair_count();
+                    let range_end = node.is_range_end(tri_pair_index as u32);
+
+                    self.write_vgpr(
+                        elem,
+                        vdata + 8,
+                        ((range_end as u32) << 1) | (node_end as u32),
+                    );
+                }
+                5 => {
+                    let node = unsafe { *(node_ptr as *const Box8Node) };
+                    let ray_extent = u32_to_f32(self.read_vgpr(elem, vaddr1));
+                    let ray_origin_x = u32_to_f32(self.read_vgpr(elem, vaddr2));
+                    let ray_origin_y = u32_to_f32(self.read_vgpr(elem, vaddr2 + 1));
+                    let ray_origin_z = u32_to_f32(self.read_vgpr(elem, vaddr2 + 2));
+                    let ray_dir_x = u32_to_f32(self.read_vgpr(elem, vaddr3));
+                    let ray_dir_y = u32_to_f32(self.read_vgpr(elem, vaddr3 + 1));
+                    let ray_dir_z = u32_to_f32(self.read_vgpr(elem, vaddr3 + 2));
+                    let ray_inv_dir_x = 1.0 / ray_dir_x;
+                    let ray_inv_dir_y = 1.0 / ray_dir_y;
+                    let ray_inv_dir_z = 1.0 / ray_dir_z;
+
+                    let child_count = node.get_child_count();
+
+                    let boxes = (0..child_count)
+                        .map(|i| node.get_child_box(i as usize))
+                        .collect::<Vec<Aabb>>();
+
+                    let s = boxes
+                        .iter()
+                        .map(|aabb| {
+                            intersect(
+                                [ray_origin_x, ray_origin_y, ray_origin_z],
+                                [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                                aabb,
+                                ray_extent,
+                            )
+                        })
+                        .collect::<Vec<(f32, f32)>>();
+
+                    let result = (0..child_count)
+                        .map(|i| {
+                            if s[i as usize].0 <= s[i as usize].1 {
+                                node.get_child_index(i as usize)
+                            } else {
+                                0xFFFF_FFFF
+                            }
+                        })
+                        .collect::<Vec<u32>>();
+
+                    let result = result
+                        .into_iter()
+                        .zip(s.into_iter())
+                        .sorted_by(|&(_idx_a, (dist_a, _)), &(_idx_b, (dist_b, _))| {
+                            if (_idx_b != 0xFFFF_FFFF && dist_b < dist_a) || _idx_a == 0xFFFF_FFFF {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        })
+                        .map(|(idx, _)| idx)
+                        .collect::<Vec<u32>>();
+
+                    for i in 0..8 {
+                        let res = if i < child_count {
+                            result[i as usize]
+                        } else {
+                            0xFFFF_FFFF
+                        };
+                        self.write_vgpr(elem, vdata + i as usize, res);
+                    }
                 }
                 _ => {
                     panic!("Unsupported node type: {}", node_type);
