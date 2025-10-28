@@ -3,6 +3,7 @@ use crate::rdna4_decoder::*;
 use crate::rdna_instructions::*;
 use crate::rdna_processor::Signals;
 
+use itertools::Itertools;
 use llvm_sys as llvm;
 use num::FromPrimitive;
 use std::collections::HashMap;
@@ -88,7 +89,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn intersect_triangle(
+fn intersect_triangle_frac(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     v0: [f32; 3],
@@ -264,7 +265,7 @@ pub extern "C" fn image_bvh64_intersect_ray(
             } else {
                 [node.tri_pair.v3, node.tri_pair.v2, node.tri_pair.v1]
             };
-            let result = intersect_triangle(
+            let result = intersect_triangle_frac(
                 [ray_origin_x, ray_origin_y, ray_origin_z],
                 [ray_dir_x, ray_dir_y, ray_dir_z],
                 tri[0],
@@ -284,6 +285,408 @@ pub extern "C" fn image_bvh64_intersect_ray(
             panic!("Unsupported node type: {}", node_type);
         }
     };
+}
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+pub struct Box8Node {
+    data: [u32; 32],
+}
+
+impl Box8Node {
+    pub fn get_box_node_base(&self) -> u32 {
+        self.data[0]
+    }
+
+    pub fn get_prim_node_base(&self) -> u32 {
+        self.data[1]
+    }
+
+    pub fn get_parent_addr(&self) -> u32 {
+        self.data[2]
+    }
+
+    pub fn get_origin(&self) -> [f32; 3] {
+        let x = f32::from_bits(self.data[3]);
+        let y = f32::from_bits(self.data[4]);
+        let z = f32::from_bits(self.data[5]);
+        [x, y, z]
+    }
+
+    pub fn get_exponent(&self) -> (u8, u8, u8) {
+        (
+            (self.data[6] & 0xFF) as u8,
+            ((self.data[6] >> 8) & 0xFF) as u8,
+            ((self.data[6] >> 16) & 0xFF) as u8,
+        )
+    }
+
+    pub fn get_child_count(&self) -> u8 {
+        ((self.data[6] >> 28) & 0x0F) as u8 + 1
+    }
+
+    pub fn get_matrix_id(&self) -> u32 {
+        (self.data[7] as u32) & 0x7F
+    }
+
+    pub fn get_child_box(&self, index: usize) -> Aabb {
+        let rcp_exponent = [
+            f32::from_bits((254 - (self.get_exponent().0 as u32) + 12) << 23),
+            f32::from_bits((254 - (self.get_exponent().1 as u32) + 12) << 23),
+            f32::from_bits((254 - (self.get_exponent().2 as u32) + 12) << 23),
+        ];
+
+        let min_x =
+            self.get_origin()[0] + (self.data[8 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[0];
+        let min_y = self.get_origin()[1]
+            + ((self.data[8 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[1];
+        let min_z = self.get_origin()[2]
+            + ((self.data[9 + index * 3]) & 0x00000FFF) as f32 / rcp_exponent[2];
+        let max_x = self.get_origin()[0]
+            + if self.get_exponent().0 != 0 {
+                ((self.data[9 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[0]
+            } else {
+                0.0
+            };
+        let max_y = self.get_origin()[1]
+            + if self.get_exponent().1 != 0 {
+                (self.data[10 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[1]
+            } else {
+                0.0
+            };
+        let max_z = self.get_origin()[2]
+            + if self.get_exponent().2 != 0 {
+                ((self.data[10 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[2]
+            } else {
+                0.0
+            };
+
+        Aabb {
+            min: [min_x, min_y, min_z],
+            max: [max_x, max_y, max_z],
+        }
+    }
+
+    pub fn get_child_type(&self, index: usize) -> u8 {
+        ((self.data[10 + index * 3] >> 24) & 0x0F) as u8
+    }
+
+    pub fn get_child_addr(&self, index: usize) -> u32 {
+        let child_type = self.get_child_type(index);
+        let mut child_addr = if child_type == 5 {
+            self.data[0] >> 4
+        } else {
+            self.data[1] >> 4
+        };
+        for j in 0..index {
+            if (self.get_child_type(j) == 5) == (child_type == 5) {
+                let node_range = (self.data[10 + j * 3] >> 28) & 0x0F;
+                child_addr += node_range;
+            }
+        }
+        child_addr
+    }
+
+    pub fn get_child_index(&self, index: usize) -> u32 {
+        (self.get_child_addr(index) << 4) | (self.get_child_type(index) as u32)
+    }
+}
+
+#[repr(C, align(64))]
+#[derive(Debug, Clone, Copy)]
+struct TrianglePacketNode {
+    data: [u32; 32],
+}
+
+impl TrianglePacketNode {
+    pub fn read_unaligned_bits(&self, position: u32, length: u32) -> u32 {
+        let mut data = 0;
+        if length != 0 {
+            let hi_ofs = (position + length) % 32;
+            let lo_word = position / 32;
+            let hi_word = (position + length) / 32;
+            let lo_mask = if length == 32 {
+                !0u32
+            } else {
+                (1u32 << length) - 1
+            } << (position % 32);
+            let hi_mask = (1u32 << hi_ofs) - 1;
+            let lo_bits = (self.data[lo_word as usize] & lo_mask) >> (position % 32);
+
+            data = lo_bits;
+            if hi_word < 32 && hi_word != lo_word && hi_mask > 0 {
+                let hi_bits = (self.data[hi_word as usize] & hi_mask) << (length - hi_ofs);
+                data |= hi_bits;
+            }
+        }
+        data
+    }
+
+    pub fn read_vertex(&self, vertex_index: u32) -> [f32; 3] {
+        let position = 52 + 96 * vertex_index;
+
+        let x_bits = self.read_unaligned_bits(position + 0 * 32, 32);
+        let y_bits = self.read_unaligned_bits(position + 1 * 32, 32);
+        let z_bits = self.read_unaligned_bits(position + 2 * 32, 32);
+
+        [
+            f32::from_bits(x_bits),
+            f32::from_bits(y_bits),
+            f32::from_bits(z_bits),
+        ]
+    }
+
+    pub fn read_descriptor(&self, pair_index: u32, triangle_index: u32) -> [u32; 4] {
+        let position = 1024 - (pair_index + 1) * 29;
+        let descriptor = self.read_unaligned_bits(position, 29);
+        let tri_indices = if triangle_index > 0 {
+            descriptor >> 3
+        } else {
+            descriptor >> 17
+        };
+        [
+            tri_indices & 15,
+            (tri_indices >> 4) & 15,
+            (tri_indices >> 8) & 15,
+            descriptor & 1,
+        ]
+    }
+
+    pub fn fetch_triangle(&self, pair_index: u32, triangle_index: u32) -> [[f32; 3]; 3] {
+        let tri_indices = self.read_descriptor(pair_index, triangle_index);
+
+        let v0 = self.read_vertex(tri_indices[0]);
+        let v1 = self.read_vertex(tri_indices[1]);
+        let v2 = self.read_vertex(tri_indices[2]);
+
+        [v0, v1, v2]
+    }
+
+    pub fn get_triangle_pair_count(&self) -> u32 {
+        self.read_unaligned_bits(28, 3) + 1
+    }
+
+    pub fn get_index_section_midpoint(&self) -> u32 {
+        self.read_unaligned_bits(32 + 10, 10)
+    }
+
+    pub fn get_prim_index_anchor_size(&self) -> u32 {
+        self.read_unaligned_bits(32 + 0, 5)
+    }
+
+    pub fn get_prim_index_payload_size(&self) -> u32 {
+        self.read_unaligned_bits(32 + 5, 5)
+    }
+
+    pub fn read_prim_index(&self, pair_index: u32, triangle_index: u32) -> u32 {
+        let flat_tri_index = 2 * pair_index + triangle_index;
+
+        let prim_index_payload_size = self.get_prim_index_payload_size();
+        let prim_index_anchor_size = self.get_prim_index_anchor_size();
+        let prim_index_anchor_pos = self.get_index_section_midpoint();
+
+        let prim_index_anchor =
+            self.read_unaligned_bits(prim_index_anchor_pos, prim_index_anchor_size);
+        if flat_tri_index == 0 {
+            return prim_index_anchor;
+        }
+        let prim_index_payload_pos = prim_index_anchor_pos
+            + prim_index_anchor_size
+            + (flat_tri_index - 1) * prim_index_payload_size;
+
+        let prim_index = self.read_unaligned_bits(prim_index_payload_pos, prim_index_payload_size);
+        let prim_index_mask = (1 << prim_index_payload_size) - 1;
+
+        if prim_index_payload_size >= prim_index_anchor_size {
+            prim_index
+        } else {
+            prim_index | (prim_index_anchor & !prim_index_mask)
+        }
+    }
+
+    pub fn is_range_end(&self, pair_index: u32) -> bool {
+        let descriptor = self.read_descriptor(pair_index, 0);
+        descriptor[3] != 0
+    }
+}
+
+fn intersect_triangle(
+    ray_origin: [f32; 3],
+    ray_direction: [f32; 3],
+    v0: [f32; 3],
+    v1: [f32; 3],
+    v2: [f32; 3],
+) -> (f32, f32, f32) {
+    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+    let s1 = cross(ray_direction, e2);
+    let denom = dot(s1, e1);
+    if denom == 0.0 {
+        let result0 = f32::INFINITY;
+        let result1 = 0.0;
+        let result2 = 0.0;
+
+        return (result0, result1, result2);
+    }
+    let d = [
+        ray_origin[0] - v0[0],
+        ray_origin[1] - v0[1],
+        ray_origin[2] - v0[2],
+    ];
+    let inv_denom = 1.0 / denom;
+    let b_y = dot(d, s1) * inv_denom;
+    let s2 = cross(d, e1);
+    let b_z = dot(ray_direction, s2) * inv_denom;
+    let t: f32 = dot(e2, s2) * inv_denom;
+
+    let t = if b_y < 0.0 || b_y > 1.0 || b_z < 0.0 || (b_y + b_z) > 1.0 {
+        f32::INFINITY
+    } else {
+        t
+    };
+
+    (t, b_y, b_z)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn image_bvh8_intersect_ray(
+    result0_ptr: *mut u32,
+    result1_ptr: *mut u32,
+    result2_ptr: *mut u32,
+    result3_ptr: *mut u32,
+    result4_ptr: *mut u32,
+    result5_ptr: *mut u32,
+    result6_ptr: *mut u32,
+    result7_ptr: *mut u32,
+    result8_ptr: *mut u32,
+    result9_ptr: *mut u32,
+    node_base: u64,
+    ray_extent: f32,
+    ray_origin_x: f32,
+    ray_origin_y: f32,
+    ray_origin_z: f32,
+    ray_dir_x: f32,
+    ray_dir_y: f32,
+    ray_dir_z: f32,
+    node_index: u32,
+) {
+    let node_ptr = (node_base + (node_index & !0xF) as u64) << 3;
+    let node_type = (node_index & 0xF) as u8;
+    match node_type {
+        0..3 | 8..11 => {
+            let tri_pair_index = (node_type & 3) + ((node_type & 8) >> 1);
+            let node = unsafe { *(node_ptr as *const TrianglePacketNode) };
+            let tri0 = node.fetch_triangle(tri_pair_index as u32, 0);
+            let tri1 = node.fetch_triangle(tri_pair_index as u32, 1);
+
+            let result0 = intersect_triangle(
+                [ray_origin_x, ray_origin_y, ray_origin_z],
+                [ray_dir_x, ray_dir_y, ray_dir_z],
+                tri0[0],
+                tri0[1],
+                tri0[2],
+            );
+            let result1 = intersect_triangle(
+                [ray_origin_x, ray_origin_y, ray_origin_z],
+                [ray_dir_x, ray_dir_y, ray_dir_z],
+                tri1[0],
+                tri1[1],
+                tri1[2],
+            );
+
+            let prim0 = node.read_prim_index(tri_pair_index as u32, 0);
+            let prim1 = node.read_prim_index(tri_pair_index as u32, 1);
+
+            let node_end = (tri_pair_index as u32 + 1) == node.get_triangle_pair_count();
+            let range_end = node.is_range_end(tri_pair_index as u32);
+
+            unsafe {
+                *result0_ptr = f32::to_bits(result0.0);
+                *result1_ptr = f32::to_bits(result0.1);
+                *result2_ptr = f32::to_bits(result0.2);
+                *result3_ptr = prim0;
+                *result4_ptr = f32::to_bits(result1.0);
+                *result5_ptr = f32::to_bits(result1.1);
+                *result6_ptr = f32::to_bits(result1.2);
+                *result7_ptr = prim1;
+                *result8_ptr = ((range_end as u32) << 1) | (node_end as u32);
+                *result9_ptr = 0;
+            }
+        }
+        5 => {
+            let node = unsafe { *(node_ptr as *const Box8Node) };
+            let ray_inv_dir_x = 1.0 / ray_dir_x;
+            let ray_inv_dir_y = 1.0 / ray_dir_y;
+            let ray_inv_dir_z = 1.0 / ray_dir_z;
+
+            let child_count = node.get_child_count();
+
+            let boxes = (0..child_count)
+                .map(|i| node.get_child_box(i as usize))
+                .collect::<Vec<Aabb>>();
+
+            let s = boxes
+                .iter()
+                .map(|aabb| {
+                    intersect(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                        aabb,
+                        ray_extent,
+                    )
+                })
+                .collect::<Vec<(f32, f32)>>();
+
+            let result = (0..child_count)
+                .map(|i| {
+                    if s[i as usize].0 <= s[i as usize].1 {
+                        node.get_child_index(i as usize)
+                    } else {
+                        0xFFFF_FFFF
+                    }
+                })
+                .collect::<Vec<u32>>();
+
+            let result = result
+                .into_iter()
+                .zip(s.into_iter())
+                .sorted_by(|&(_idx_a, (dist_a, _)), &(_idx_b, (dist_b, _))| {
+                    if (_idx_b != 0xFFFF_FFFF && dist_b < dist_a) || _idx_a == 0xFFFF_FFFF {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    }
+                })
+                .map(|(idx, _)| idx)
+                .collect::<Vec<u32>>();
+
+            let results = (0..8)
+                .map(|i| {
+                    if i < result.len() {
+                        result[i as usize]
+                    } else {
+                        0xFFFF_FFFF
+                    }
+                })
+                .collect::<Vec<u32>>();
+
+            unsafe {
+                *result0_ptr = results[0];
+                *result1_ptr = results[1];
+                *result2_ptr = results[2];
+                *result3_ptr = results[3];
+                *result4_ptr = results[4];
+                *result5_ptr = results[5];
+                *result6_ptr = results[6];
+                *result7_ptr = results[7];
+                *result8_ptr = 0;
+                *result9_ptr = 0;
+            }
+        }
+        _ => {
+            panic!("Unsupported node type: {}", node_type);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3768,7 +4171,7 @@ impl IREmitter {
             self.results_ptr = llvm::core::LLVMBuildArrayAlloca(
                 builder,
                 ty_i32xn,
-                llvm::core::LLVMConstInt(ty_i32, 4 * 4, 0),
+                llvm::core::LLVMConstInt(ty_i32, 10 * 4, 0),
                 empty_name.as_ptr(),
             );
         }
@@ -19361,6 +19764,371 @@ impl IREmitter {
                                 builder,
                                 ty_i32,
                                 result_ptrs[i],
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32(inst.vdata as u32 + i as u32, elem, result);
+                        }
+
+                        bb
+                    });
+                }
+            }
+            I::IMAGE_BVH8_INTERSECT_RAY => {
+                if USE_SIMD {
+                    let emitter = self;
+                    let context = emitter.context;
+
+                    const N: usize = SIMD_WIDTH;
+
+                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                    let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                    let empty_name = std::ffi::CString::new("").unwrap();
+
+                    let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                    for i in (0..32).step_by(N) {
+                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                        let node_base =
+                            emitter.emit_load_vgpr_u64xn::<N>(inst.vaddr0 as u32, i, mask);
+                        let ray_extent =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr1 as u32, i, mask);
+
+                        let ray_origin_x =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr2 as u32, i, mask);
+                        let ray_origin_y =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr2 as u32 + 1, i, mask);
+                        let ray_origin_z =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr2 as u32 + 2, i, mask);
+                        let ray_dir_x =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr3 as u32, i, mask);
+                        let ray_dir_y =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr3 as u32 + 1, i, mask);
+                        let ray_dir_z =
+                            emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr3 as u32 + 2, i, mask);
+                        let node_index =
+                            emitter.emit_load_vgpr_u32xn::<N>(inst.vaddr4 as u32, i, mask);
+
+                        let values = [
+                            ray_extent,
+                            ray_origin_x,
+                            ray_origin_y,
+                            ray_origin_z,
+                            ray_dir_x,
+                            ray_dir_y,
+                            ray_dir_z,
+                            node_index,
+                        ];
+
+                        llvm::core::LLVMBuildStore(
+                            builder,
+                            node_base,
+                            llvm::core::LLVMBuildGEP2(
+                                builder,
+                                ty_i64,
+                                emitter.node_addr_ptr,
+                                [llvm::core::LLVMConstInt(ty_i64, i as u64, 0)].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            ),
+                        );
+
+                        for (j, value) in values.iter().enumerate() {
+                            llvm::core::LLVMBuildStore(
+                                builder,
+                                *value,
+                                llvm::core::LLVMBuildGEP2(
+                                    builder,
+                                    ty_f32,
+                                    emitter.values_ptr,
+                                    [llvm::core::LLVMConstInt(
+                                        ty_i64,
+                                        (i as u64) + j as u64 * 32,
+                                        0,
+                                    )]
+                                    .as_mut_ptr(),
+                                    1,
+                                    empty_name.as_ptr(),
+                                ),
+                            );
+                        }
+                    }
+
+                    bb = emitter.emit_vop(bb, |emitter, bb, elem| {
+                        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                        let ty_void = llvm::core::LLVMVoidTypeInContext(context);
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let node_base = llvm::core::LLVMBuildLoad2(
+                            builder,
+                            ty_i64,
+                            llvm::core::LLVMBuildGEP2(
+                                builder,
+                                ty_i64,
+                                emitter.node_addr_ptr,
+                                [elem].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            ),
+                            empty_name.as_ptr(),
+                        );
+
+                        let values = (0..10)
+                            .map(|j| {
+                                llvm::core::LLVMBuildLoad2(
+                                    builder,
+                                    ty_f32,
+                                    llvm::core::LLVMBuildGEP2(
+                                        builder,
+                                        ty_f32,
+                                        emitter.values_ptr,
+                                        [llvm::core::LLVMBuildAdd(
+                                            builder,
+                                            elem,
+                                            llvm::core::LLVMConstInt(ty_i64, j as u64 * 32, 0),
+                                            empty_name.as_ptr(),
+                                        )]
+                                        .as_mut_ptr(),
+                                        1,
+                                        empty_name.as_ptr(),
+                                    ),
+                                    empty_name.as_ptr(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        let ray_extent = values[0];
+                        let ray_origin_x = values[1];
+                        let ray_origin_y = values[2];
+                        let ray_origin_z = values[3];
+                        let ray_dir_x = values[4];
+                        let ray_dir_y = values[5];
+                        let ray_dir_z = values[6];
+                        let node_index = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            values[7],
+                            ty_i32,
+                            empty_name.as_ptr(),
+                        );
+
+                        let image_bvh8_intersect_ray_func = llvm::core::LLVMGetNamedFunction(
+                            emitter.module,
+                            "image_bvh8_intersect_ray\0".as_ptr() as *const _,
+                        );
+
+                        let mut param_tys = vec![
+                            ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0,
+                            ty_i64, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_i32,
+                        ];
+                        let image_bvh8_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
+                            ty_void,
+                            param_tys.as_mut_ptr(),
+                            param_tys.len() as u32,
+                            0,
+                        );
+                        let image_bvh8_intersect_ray_func =
+                            if image_bvh8_intersect_ray_func.is_null() {
+                                llvm::core::LLVMAddFunction(
+                                    emitter.module,
+                                    "image_bvh8_intersect_ray\0".as_ptr() as *const _,
+                                    image_bvh8_intersect_ray_func_ty,
+                                )
+                            } else {
+                                image_bvh8_intersect_ray_func
+                            };
+
+                        let results_ptr = (0..10)
+                            .map(|j| {
+                                llvm::core::LLVMBuildGEP2(
+                                    builder,
+                                    ty_i32,
+                                    emitter.results_ptr,
+                                    [llvm::core::LLVMBuildAdd(
+                                        builder,
+                                        elem,
+                                        llvm::core::LLVMConstInt(ty_i64, j as u64 * 32, 0),
+                                        empty_name.as_ptr(),
+                                    )]
+                                    .as_mut_ptr(),
+                                    1,
+                                    empty_name.as_ptr(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        llvm::core::LLVMBuildCall2(
+                            builder,
+                            image_bvh8_intersect_ray_func_ty,
+                            image_bvh8_intersect_ray_func,
+                            [
+                                results_ptr[0],
+                                results_ptr[1],
+                                results_ptr[2],
+                                results_ptr[3],
+                                results_ptr[4],
+                                results_ptr[5],
+                                results_ptr[6],
+                                results_ptr[7],
+                                results_ptr[8],
+                                results_ptr[9],
+                                node_base,
+                                ray_extent,
+                                ray_origin_x,
+                                ray_origin_y,
+                                ray_origin_z,
+                                ray_dir_x,
+                                ray_dir_y,
+                                ray_dir_z,
+                                node_index,
+                            ]
+                            .as_mut_ptr(),
+                            param_tys.len() as u32,
+                            empty_name.as_ptr(),
+                        );
+
+                        bb
+                    });
+
+                    for i in (0..32).step_by(N) {
+                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+                        for j in 0..10 {
+                            let result = llvm::core::LLVMBuildLoad2(
+                                builder,
+                                ty_i32xn,
+                                llvm::core::LLVMBuildGEP2(
+                                    builder,
+                                    ty_i32,
+                                    emitter.results_ptr,
+                                    [llvm::core::LLVMConstInt(
+                                        ty_i64,
+                                        (i as u64) + j as u64 * 32,
+                                        0,
+                                    )]
+                                    .as_mut_ptr(),
+                                    1,
+                                    empty_name.as_ptr(),
+                                ),
+                                empty_name.as_ptr(),
+                            );
+
+                            emitter.emit_store_vgpr_u32xn::<N>(
+                                inst.vdata as u32 + j as u32,
+                                i,
+                                result,
+                                mask,
+                            );
+                        }
+                    }
+                } else {
+                    bb = self.emit_vop(bb, |emitter, bb, elem| {
+                        let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                        let ty_void = llvm::core::LLVMVoidTypeInContext(context);
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let node_base = emitter.emit_load_vgpr_u64(inst.vaddr0 as u32, elem);
+                        let ray_extent = emitter.emit_load_vgpr_f32(inst.vaddr1 as u32, elem);
+                        let ray_origin_x = emitter.emit_load_vgpr_f32(inst.vaddr2 as u32, elem);
+                        let ray_origin_y = emitter.emit_load_vgpr_f32(inst.vaddr2 as u32 + 1, elem);
+                        let ray_origin_z = emitter.emit_load_vgpr_f32(inst.vaddr2 as u32 + 2, elem);
+                        let ray_dir_x = emitter.emit_load_vgpr_f32(inst.vaddr3 as u32, elem);
+                        let ray_dir_y = emitter.emit_load_vgpr_f32(inst.vaddr3 as u32 + 1, elem);
+                        let ray_dir_z = emitter.emit_load_vgpr_f32(inst.vaddr3 as u32 + 2, elem);
+                        let node_index = emitter.emit_load_vgpr_u32(inst.vaddr4 as u32, elem);
+
+                        let image_bvh8_intersect_ray_func = llvm::core::LLVMGetNamedFunction(
+                            emitter.module,
+                            "image_bvh8_intersect_ray\0".as_ptr() as *const _,
+                        );
+
+                        let return_ty = llvm::core::LLVMArrayType2(ty_i32, 10);
+                        let mut param_tys = vec![
+                            ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0,
+                            ty_i64, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_i32,
+                        ];
+                        let image_bvh8_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
+                            ty_void,
+                            param_tys.as_mut_ptr(),
+                            param_tys.len() as u32,
+                            0,
+                        );
+                        let image_bvh8_intersect_ray_func =
+                            if image_bvh8_intersect_ray_func.is_null() {
+                                llvm::core::LLVMAddFunction(
+                                    emitter.module,
+                                    "image_bvh8_intersect_ray\0".as_ptr() as *const _,
+                                    image_bvh8_intersect_ray_func_ty,
+                                )
+                            } else {
+                                image_bvh8_intersect_ray_func
+                            };
+
+                        let result =
+                            llvm::core::LLVMBuildAlloca(builder, return_ty, empty_name.as_ptr());
+
+                        let results_ptr = (0..10)
+                            .map(|i| {
+                                llvm::core::LLVMBuildGEP2(
+                                    builder,
+                                    ty_i32,
+                                    result,
+                                    [llvm::core::LLVMConstInt(ty_i64, i as u64, 0)].as_mut_ptr(),
+                                    1,
+                                    empty_name.as_ptr(),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+
+                        llvm::core::LLVMBuildCall2(
+                            builder,
+                            image_bvh8_intersect_ray_func_ty,
+                            image_bvh8_intersect_ray_func,
+                            [
+                                results_ptr[0],
+                                results_ptr[1],
+                                results_ptr[2],
+                                results_ptr[3],
+                                results_ptr[4],
+                                results_ptr[5],
+                                results_ptr[6],
+                                results_ptr[7],
+                                results_ptr[8],
+                                results_ptr[9],
+                                node_base,
+                                ray_extent,
+                                ray_origin_x,
+                                ray_origin_y,
+                                ray_origin_z,
+                                ray_dir_x,
+                                ray_dir_y,
+                                ray_dir_z,
+                                node_index,
+                            ]
+                            .as_mut_ptr(),
+                            param_tys.len() as u32,
+                            empty_name.as_ptr(),
+                        );
+
+                        for i in 0..10 {
+                            let result = llvm::core::LLVMBuildLoad2(
+                                builder,
+                                ty_i32,
+                                llvm::core::LLVMBuildGEP2(
+                                    builder,
+                                    ty_i32,
+                                    result,
+                                    [llvm::core::LLVMConstInt(ty_i64, i as u64, 0)].as_mut_ptr(),
+                                    1,
+                                    empty_name.as_ptr(),
+                                ),
                                 empty_name.as_ptr(),
                             );
 
