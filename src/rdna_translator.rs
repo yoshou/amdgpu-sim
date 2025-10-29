@@ -400,26 +400,16 @@ struct TrianglePacketNode {
 
 impl TrianglePacketNode {
     pub fn read_unaligned_bits(&self, position: u32, length: u32) -> u32 {
-        let mut data = 0;
+        let mut data = 0u64;
         if length != 0 {
-            let hi_ofs = (position + length) % 32;
-            let lo_word = position / 32;
-            let hi_word = (position + length) / 32;
-            let lo_mask = if length == 32 {
-                !0u32
-            } else {
-                (1u32 << length) - 1
-            } << (position % 32);
-            let hi_mask = (1u32 << hi_ofs) - 1;
-            let lo_bits = (self.data[lo_word as usize] & lo_mask) >> (position % 32);
-
-            data = lo_bits;
-            if hi_word < 32 && hi_word != lo_word && hi_mask > 0 {
-                let hi_bits = (self.data[hi_word as usize] & hi_mask) << (length - hi_ofs);
-                data |= hi_bits;
+            data = self.data[(position / 32) as usize] as u64;
+            if (position + length - 1) / 32 != position / 32 {
+                data |= (self.data[((position + length - 1) / 32) as usize] as u64) << 32;
             }
+            data >>= position % 32;
+            data &= (1 << length) - 1;
         }
-        data
+        data as u32
     }
 
     pub fn read_vertex(&self, vertex_index: u32) -> [f32; 3] {
