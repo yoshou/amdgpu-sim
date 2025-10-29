@@ -604,12 +604,11 @@ impl Box8Node {
         [x, y, z]
     }
 
-    pub fn get_exponent(&self) -> (u8, u8, u8) {
-        (
-            (self.data[6] & 0xFF) as u8,
-            ((self.data[6] >> 8) & 0xFF) as u8,
-            ((self.data[6] >> 16) & 0xFF) as u8,
-        )
+    pub fn get_exponent(&self) -> [u8; 3] {
+        let x = (self.data[6] & 0xFF) as u8;
+        let y = ((self.data[6] >> 8) & 0xFF) as u8;
+        let z = ((self.data[6] >> 16) & 0xFF) as u8;
+        [x, y, z]
     }
 
     pub fn get_child_count(&self) -> u8 {
@@ -621,32 +620,33 @@ impl Box8Node {
     }
 
     pub fn get_child_box(&self, index: usize) -> Aabb {
+        let exponent = self.get_exponent();
+        let origin = self.get_origin();
+
         let rcp_exponent = [
-            f32::from_bits((254 - (self.get_exponent().0 as u32) + 12) << 23),
-            f32::from_bits((254 - (self.get_exponent().1 as u32) + 12) << 23),
-            f32::from_bits((254 - (self.get_exponent().2 as u32) + 12) << 23),
+            f32::from_bits((254 - (exponent[0] as u32) + 12) << 23),
+            f32::from_bits((254 - (exponent[1] as u32) + 12) << 23),
+            f32::from_bits((254 - (exponent[2] as u32) + 12) << 23),
         ];
 
-        let min_x =
-            self.get_origin()[0] + (self.data[8 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[0];
-        let min_y = self.get_origin()[1]
-            + ((self.data[8 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[1];
-        let min_z = self.get_origin()[2]
-            + ((self.data[9 + index * 3]) & 0x00000FFF) as f32 / rcp_exponent[2];
-        let max_x = self.get_origin()[0]
-            + if self.get_exponent().0 != 0 {
+        let min_x = origin[0] + (self.data[8 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[0];
+        let min_y =
+            origin[1] + ((self.data[8 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[1];
+        let min_z = origin[2] + ((self.data[9 + index * 3]) & 0x00000FFF) as f32 / rcp_exponent[2];
+        let max_x = origin[0]
+            + if exponent[0] != 0 {
                 ((self.data[9 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[0]
             } else {
                 0.0
             };
-        let max_y = self.get_origin()[1]
-            + if self.get_exponent().1 != 0 {
+        let max_y = origin[1]
+            + if exponent[1] != 0 {
                 (self.data[10 + index * 3] & 0x00000FFF) as f32 / rcp_exponent[1]
             } else {
                 0.0
             };
-        let max_z = self.get_origin()[2]
-            + if self.get_exponent().2 != 0 {
+        let max_z = origin[2]
+            + if exponent[2] != 0 {
                 ((self.data[10 + index * 3] >> 12) & 0x00000FFF) as f32 / rcp_exponent[2]
             } else {
                 0.0
@@ -793,6 +793,10 @@ impl TrianglePacketNode {
         } else {
             prim_index | (prim_index_anchor & !prim_index_mask)
         }
+    }
+
+    pub fn get_prim_index(&self, pair_index: u32, triangle_index: u32) -> u32 {
+        self.read_prim_index(pair_index, triangle_index)
     }
 
     pub fn is_range_end(&self, pair_index: u32) -> bool {
@@ -6110,8 +6114,11 @@ impl SIMD32 {
                         tri1[2],
                     );
 
-                    let prim0 = node.read_prim_index(tri_pair_index as u32, 0);
-                    let prim1 = node.read_prim_index(tri_pair_index as u32, 1);
+                    let prim0 = node.get_prim_index(tri_pair_index as u32, 0);
+                    let prim1 = node.get_prim_index(tri_pair_index as u32, 1);
+
+                    let node_end = (tri_pair_index as u32 + 1) == node.get_triangle_pair_count();
+                    let range_end = node.is_range_end(tri_pair_index as u32);
 
                     self.write_vgpr(elem, vdata, f32_to_u32(result0.0));
                     self.write_vgpr(elem, vdata + 1, f32_to_u32(result0.1));
@@ -6121,10 +6128,6 @@ impl SIMD32 {
                     self.write_vgpr(elem, vdata + 5, f32_to_u32(result1.1));
                     self.write_vgpr(elem, vdata + 6, f32_to_u32(result1.2));
                     self.write_vgpr(elem, vdata + 7, prim1);
-
-                    let node_end = (tri_pair_index as u32 + 1) == node.get_triangle_pair_count();
-                    let range_end = node.is_range_end(tri_pair_index as u32);
-
                     self.write_vgpr(
                         elem,
                         vdata + 8,
@@ -6162,9 +6165,9 @@ impl SIMD32 {
                         })
                         .collect::<Vec<(f32, f32)>>();
 
-                    let result = (0..child_count)
+                    let results = (0..8)
                         .map(|i| {
-                            if s[i as usize].0 <= s[i as usize].1 {
+                            if i < 8 && s[i as usize].0 <= s[i as usize].1 {
                                 node.get_child_index(i as usize)
                             } else {
                                 0xFFFF_FFFF
@@ -6172,7 +6175,7 @@ impl SIMD32 {
                         })
                         .collect::<Vec<u32>>();
 
-                    let result = result
+                    let results = results
                         .into_iter()
                         .zip(s.into_iter())
                         .sorted_by(|&(_idx_a, (dist_a, _)), &(_idx_b, (dist_b, _))| {
@@ -6186,12 +6189,7 @@ impl SIMD32 {
                         .collect::<Vec<u32>>();
 
                     for i in 0..8 {
-                        let res = if i < child_count {
-                            result[i as usize]
-                        } else {
-                            0xFFFF_FFFF
-                        };
-                        self.write_vgpr(elem, vdata + i as usize, res);
+                        self.write_vgpr(elem, vdata + i as usize, results[i as usize]);
                     }
                 }
                 _ => {
