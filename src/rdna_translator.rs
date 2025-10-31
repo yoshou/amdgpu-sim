@@ -783,6 +783,21 @@ struct IREmitter {
 }
 
 impl IREmitter {
+    unsafe fn get_intrinsic_declaration(
+        &mut self,
+        name: &str,
+        param_types: &[llvm::prelude::LLVMTypeRef],
+    ) -> llvm::prelude::LLVMValueRef {
+        let mut param_types = param_types.to_vec();
+        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(name.as_ptr() as *const _, name.len());
+        llvm::core::LLVMGetIntrinsicDeclaration(
+            self.module,
+            intrinsic_id,
+            param_types.as_mut_ptr(),
+            param_types.len() as usize,
+        )
+    }
+
     unsafe fn emit_exec_bit(
         &mut self,
         index: llvm::prelude::LLVMValueRef,
@@ -1467,18 +1482,7 @@ impl IREmitter {
         let elem =
             llvm::core::LLVMConstInt(llvm::core::LLVMInt64TypeInContext(context), elem as u64, 0);
 
-        let mut param_tys = vec![ty_i32xn, ty_p0];
-        let intrinsic_name = "llvm.masked.load.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.masked.load.", &[ty_i32xn, ty_p0]);
 
         let index = llvm::core::LLVMBuildAdd(
             builder,
@@ -1664,18 +1668,7 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
 
-        let mut param_tys = vec![ty_i32xn, ty_p0];
-        let intrinsic_name = "llvm.masked.store.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.masked.store.", &[ty_i32xn, ty_p0]);
         let mut param_tys = vec![ty_i32xn, ty_p0, ty_i32, ty_i1xn];
         llvm::core::LLVMBuildCall2(
             builder,
@@ -3026,18 +3019,7 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
-        let mut param_tys = vec![ty_f32];
-        let intrinsic_name = b"llvm.fabs.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty_f32]);
         let mut param_tys = vec![ty_f32];
         let abs_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3060,18 +3042,7 @@ impl IREmitter {
         let empty_name = std::ffi::CString::new("").unwrap();
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
-        let mut param_tys = vec![ty_f64];
-        let intrinsic_name = b"llvm.fabs.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty_f64]);
         let mut param_tys = vec![ty_f64];
         let abs_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3095,18 +3066,7 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
 
-        let mut param_tys = vec![ty_f32xn];
-        let intrinsic_name = "llvm.fabs.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty_f32xn]);
         let mut param_tys = vec![ty_f32xn];
         let abs_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3130,18 +3090,7 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let mut param_tys = vec![ty_f32, ty_i32];
-        let intrinsic_name = b"llvm.frexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32, ty_i32]);
         let mut return_tys = vec![ty_f32, ty_i32];
         let mut param_tys = vec![ty_f32];
         let frexp_value = llvm::core::LLVMBuildCall2(
@@ -3178,18 +3127,7 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let mut param_tys = vec![ty_f32, ty_i32];
-        let intrinsic_name = b"llvm.frexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32, ty_i32]);
         let mut return_tys = vec![ty_f32, ty_i32];
         let mut param_tys = vec![ty_f32];
         let frexp_value = llvm::core::LLVMBuildCall2(
@@ -3226,18 +3164,7 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let mut param_tys = vec![ty_f64, ty_i32];
-        let intrinsic_name = b"llvm.frexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f64, ty_i32]);
         let mut return_tys = vec![ty_f64, ty_i32];
         let mut param_tys = vec![ty_f64];
         let frexp_value = llvm::core::LLVMBuildCall2(
@@ -3276,18 +3203,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let mut param_tys = vec![ty_f64xn, ty_i32xn];
-        let intrinsic_name = "llvm.frexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f64xn, ty_i32xn]);
         let mut return_tys = vec![ty_f64xn, ty_i32xn];
         let mut param_tys = vec![ty_f64xn];
         let frexp_value = llvm::core::LLVMBuildCall2(
@@ -3326,18 +3242,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let mut param_tys = vec![ty_f32xn, ty_i32xn];
-        let intrinsic_name = "llvm.frexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32xn, ty_i32xn]);
         let mut return_tys = vec![ty_f32xn, ty_i32xn];
         let mut param_tys = vec![ty_f32xn];
         let frexp_value = llvm::core::LLVMBuildCall2(
@@ -3376,18 +3281,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let mut param_tys = vec![ty_f32xn, ty_i32xn];
-        let intrinsic_name = "llvm.frexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32xn, ty_i32xn]);
         let mut return_tys = vec![ty_f32xn, ty_i32xn];
         let mut param_tys = vec![ty_f32xn];
         let frexp_value = llvm::core::LLVMBuildCall2(
@@ -3575,18 +3469,7 @@ impl IREmitter {
             let zero = llvm::core::LLVMConstReal(ty_f64, 0.0);
             let one = llvm::core::LLVMConstReal(ty_f64, 1.0);
 
-            let mut param_tys = vec![ty_f64];
-            let intrinsic_name = b"llvm.minnum.\0";
-            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                intrinsic_name.as_ptr() as *const _,
-                intrinsic_name.len() as usize,
-            );
-            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                self.module,
-                intrinsic_id,
-                param_tys.as_mut_ptr(),
-                param_tys.len() as usize,
-            );
+            let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_f64]);
             let mut param_tys = vec![ty_f64, ty_f64];
             let min_value = llvm::core::LLVMBuildCall2(
                 builder,
@@ -3597,18 +3480,7 @@ impl IREmitter {
                 empty_name.as_ptr(),
             );
 
-            let mut param_tys = vec![ty_f64];
-            let intrinsic_name = b"llvm.maxnum.\0";
-            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                intrinsic_name.as_ptr() as *const _,
-                intrinsic_name.len() as usize,
-            );
-            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                self.module,
-                intrinsic_id,
-                param_tys.as_mut_ptr(),
-                param_tys.len() as usize,
-            );
+            let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64]);
             let mut param_tys = vec![ty_f64, ty_f64];
             let max_value = llvm::core::LLVMBuildCall2(
                 builder,
@@ -3675,18 +3547,7 @@ impl IREmitter {
                 N as u32,
             );
 
-            let mut param_tys = vec![ty_f64xn];
-            let intrinsic_name = "llvm.minnum.\0";
-            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                intrinsic_name.as_ptr() as *const _,
-                intrinsic_name.len() as usize,
-            );
-            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                self.module,
-                intrinsic_id,
-                param_tys.as_mut_ptr(),
-                param_tys.len() as usize,
-            );
+            let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_f64xn]);
             let mut param_tys = vec![ty_f64xn, ty_f64xn];
             let min_value = llvm::core::LLVMBuildCall2(
                 builder,
@@ -3697,18 +3558,7 @@ impl IREmitter {
                 empty_name.as_ptr(),
             );
 
-            let mut param_tys = vec![ty_f64xn];
-            let intrinsic_name = "llvm.maxnum.\0";
-            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                intrinsic_name.as_ptr() as *const _,
-                intrinsic_name.len() as usize,
-            );
-            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                self.module,
-                intrinsic_id,
-                param_tys.as_mut_ptr(),
-                param_tys.len() as usize,
-            );
+            let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64xn]);
             let mut param_tys = vec![ty_f64xn, ty_f64xn];
             let max_value = llvm::core::LLVMBuildCall2(
                 builder,
@@ -3739,18 +3589,7 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
 
-        let mut param_tys = vec![ty_f32xn];
-        let intrinsic_name = "llvm.fma.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.fma.", &[ty_f32xn]);
         let mut param_tys = vec![ty_f32xn, ty_f32xn, ty_f32xn];
         let fma_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3775,18 +3614,7 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
         let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
 
-        let mut param_tys = vec![ty_f64xn];
-        let intrinsic_name = "llvm.fma.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.fma.", &[ty_f64xn]);
         let mut param_tys = vec![ty_f64xn, ty_f64xn, ty_f64xn];
         let fma_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3855,18 +3683,7 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
 
-        let mut param_tys = vec![ty_f32xn];
-        let intrinsic_name = "llvm.exp2.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.exp2.", &[ty_f32xn]);
         let mut param_tys = vec![ty_f32xn];
         let exp2_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3889,18 +3706,7 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
         let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
 
-        let mut param_tys = vec![ty_f64xn];
-        let intrinsic_name = "llvm.exp2.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.exp2.", &[ty_f64xn]);
         let mut param_tys = vec![ty_f64xn];
         let exp2_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3926,18 +3732,7 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let mut param_tys = vec![ty_f64xn, ty_i32xn];
-        let intrinsic_name = "llvm.ldexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.ldexp.", &[ty_f64xn, ty_i32xn]);
         let mut param_tys = vec![ty_f64xn, ty_i32xn];
         let ldexp_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -3961,18 +3756,7 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let mut param_tys = vec![ty_f32, ty_i32];
-        let intrinsic_name = "llvm.ldexp.\0";
-        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-            intrinsic_name.as_ptr() as *const _,
-            intrinsic_name.len() as usize,
-        );
-        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-            self.module,
-            intrinsic_id,
-            param_tys.as_mut_ptr(),
-            param_tys.len() as usize,
-        );
+        let intrinsic = self.get_intrinsic_declaration("llvm.ldexp.", &[ty_f32, ty_i32]);
         let mut param_tys = vec![ty_f32, ty_i32];
         let ldexp_value = llvm::core::LLVMBuildCall2(
             builder,
@@ -4954,18 +4738,7 @@ impl IREmitter {
 
                 let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
 
-                let mut param_tys = vec![ty_i32];
-                let intrinsic_name = "llvm.cttz.\0";
-                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                    intrinsic_name.as_ptr() as *const _,
-                    intrinsic_name.len() as usize,
-                );
-                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                    emitter.module,
-                    intrinsic_id,
-                    param_tys.as_mut_ptr(),
-                    param_tys.len() as usize,
-                );
+                let intrinsic = emitter.get_intrinsic_declaration("llvm.cttz.", &[ty_i32]);
                 let mut param_tys = vec![ty_i32, ty_i1];
                 let d_value = llvm::core::LLVMBuildCall2(
                     builder,
@@ -5283,19 +5056,8 @@ impl IREmitter {
                 let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
                 let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
 
-                let mut param_tys = vec![ty_i32];
-
-                let intrinsic_name = "llvm.sadd.with.overflow.\0";
-                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                    intrinsic_name.as_ptr() as *const _,
-                    intrinsic_name.len() as usize,
-                );
-                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                    emitter.module,
-                    intrinsic_id,
-                    param_tys.as_mut_ptr(),
-                    param_tys.len() as usize,
-                );
+                let intrinsic =
+                    emitter.get_intrinsic_declaration("llvm.sadd.with.overflow.", &[ty_i32]);
 
                 let mut return_tys = vec![ty_i32, ty_i1];
                 let mut param_tys = vec![ty_i32, ty_i32];
@@ -5347,19 +5109,8 @@ impl IREmitter {
                 let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
                 let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
 
-                let mut param_tys = vec![ty_i32];
-
-                let intrinsic_name = "llvm.ssub.with.overflow.\0";
-                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                    intrinsic_name.as_ptr() as *const _,
-                    intrinsic_name.len() as usize,
-                );
-                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                    emitter.module,
-                    intrinsic_id,
-                    param_tys.as_mut_ptr(),
-                    param_tys.len() as usize,
-                );
+                let intrinsic =
+                    emitter.get_intrinsic_declaration("llvm.ssub.with.overflow.", &[ty_i32]);
 
                 let mut return_tys = vec![ty_i32, ty_i1];
                 let mut param_tys = vec![ty_i32, ty_i32];
@@ -6434,18 +6185,8 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
 
-                        let mut param_tys = vec![ty_f32xn];
-                        let intrinsic_name = "llvm.sqrt.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32xn]);
                         let mut param_tys = vec![ty_f32xn];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6470,18 +6211,7 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
 
-                        let mut param_tys = vec![ty_f32];
-                        let intrinsic_name = b"llvm.sqrt.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32]);
                         let mut param_tys = vec![ty_f32];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6520,18 +6250,8 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
 
-                        let mut param_tys = vec![ty_f32xn];
-                        let intrinsic_name = "llvm.roundeven.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.roundeven.", &[ty_f32xn]);
                         let mut param_tys = vec![ty_f32xn];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6556,18 +6276,8 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
 
-                        let mut param_tys = vec![ty_f32];
-                        let intrinsic_name = b"llvm.roundeven.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.roundeven.", &[ty_f32]);
                         let mut param_tys = vec![ty_f32];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6656,18 +6366,8 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
-                        let mut param_tys = vec![ty_f64xn];
-                        let intrinsic_name = "llvm.sqrt.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f64xn]);
                         let mut param_tys = vec![ty_f64xn];
                         let sqrt_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6701,18 +6401,7 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.sqrt.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64];
                         let intrinsic_call = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6757,18 +6446,8 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
-                        let mut param_tys = vec![ty_f64xn];
-                        let intrinsic_name = "llvm.roundeven.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.roundeven.", &[ty_f64xn]);
                         let mut param_tys = vec![ty_f64xn];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6793,18 +6472,8 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.roundeven.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.roundeven.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6843,18 +6512,8 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
-                        let mut param_tys = vec![ty_f64xn];
-                        let intrinsic_name = "llvm.floor.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.floor.", &[ty_f64xn]);
                         let mut param_tys = vec![ty_f64xn];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -6886,18 +6545,7 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.floor.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.floor.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -7315,18 +6963,7 @@ impl IREmitter {
 
                 let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                let mut param_tys = vec![ty_i32];
-                let intrinsic_name = "llvm.cttz.\0";
-                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                    intrinsic_name.as_ptr() as *const _,
-                    intrinsic_name.len() as usize,
-                );
-                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                    emitter.module,
-                    intrinsic_id,
-                    param_tys.as_mut_ptr(),
-                    param_tys.len() as usize,
-                );
+                let intrinsic = emitter.get_intrinsic_declaration("llvm.cttz.", &[ty_i32]);
                 let mut param_tys = vec![ty_i32, ty_i1];
                 let elem = llvm::core::LLVMBuildCall2(
                     builder,
@@ -7390,21 +7027,8 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src0, i, mask);
 
-                        let mut param_tys = vec![llvm::core::LLVMVectorType(
-                            llvm::core::LLVMInt32TypeInContext(context),
-                            N as u32,
-                        )];
-                        let intrinsic_name = "llvm.ctlz.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.ctlz.", &[ty_i32xn]);
                         let mut param_tys = vec![ty_i32xn, ty_i1];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -7449,18 +7073,8 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                        let mut param_tys = vec![ty_i32];
-                        let intrinsic_name = b"llvm.ctlz.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.ctlz.", &[ty_i32]);
                         let mut param_tys = vec![ty_i32, ty_i1];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -8523,19 +8137,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_load_vgpr_f32(inst.vsrc1 as u32, elem);
                         let d_value = emitter.emit_load_vgpr_f32(inst.vdst as u32, elem);
 
-                        let mut param_tys = vec![ty_f32];
-
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
 
                         let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
 
@@ -8596,19 +8198,7 @@ impl IREmitter {
                             f32::from_bits(inst.literal_constant.unwrap()) as f64,
                         );
 
-                        let mut param_tys = vec![ty_f32];
-
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
 
                         let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
 
@@ -8669,19 +8259,7 @@ impl IREmitter {
                             f32::from_bits(inst.literal_constant.unwrap()) as f64,
                         );
 
-                        let mut param_tys = vec![ty_f32];
-
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
 
                         let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
 
@@ -8796,18 +8374,8 @@ impl IREmitter {
                         let s1_value =
                             emitter.emit_load_vgpr_f64xn::<N>(inst.vsrc1 as u32, i, mask);
 
-                        let mut param_tys = vec![ty_f64xn];
-                        let intrinsic_name = "llvm.maxnum.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64xn]);
                         let mut param_tys = vec![ty_f64xn, ty_f64xn];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -8833,18 +8401,8 @@ impl IREmitter {
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
                         let s1_value = emitter.emit_load_vgpr_f64(inst.vsrc1 as u32, elem);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.maxnum.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64, ty_f64];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -10358,18 +9916,9 @@ impl IREmitter {
                         );
 
                         for cls in 0..10 {
-                            let mut param_tys = vec![ty_f32xn];
-                            let intrinsic_name = "llvm.is.fpclass.\0";
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
-                            );
+                            let intrinsic =
+                                emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f32xn]);
+
                             let mut param_tys = vec![ty_f32xn, ty_i32];
                             let class_value = llvm::core::LLVMBuildCall2(
                                 builder,
@@ -10430,18 +9979,10 @@ impl IREmitter {
                         );
                     }
 
+                    let intrinsic =
+                        emitter.get_intrinsic_declaration("llvm.vector.reduce.or.", &[ty_i32xn]);
+
                     let mut param_tys = vec![ty_i32xn];
-                    let intrinsic_name = "llvm.vector.reduce.or.\0";
-                    let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                        intrinsic_name.as_ptr() as *const _,
-                        intrinsic_name.len() as usize,
-                    );
-                    let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                        emitter.module,
-                        intrinsic_id,
-                        param_tys.as_mut_ptr(),
-                        param_tys.len() as usize,
-                    );
                     let d_value = llvm::core::LLVMBuildCall2(
                         builder,
                         llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
@@ -10463,18 +10004,8 @@ impl IREmitter {
 
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
 
-                        let mut param_tys = vec![ty_f32];
-                        let intrinsic_name = b"llvm.is.fpclass.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f32]);
                         let mut param_tys = vec![ty_f32, ty_i32];
                         let class_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -10687,18 +10218,8 @@ impl IREmitter {
                         );
 
                         for cls in 0..10 {
-                            let mut param_tys = vec![ty_f64xn];
-                            let intrinsic_name = "llvm.is.fpclass.\0";
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
-                            );
+                            let intrinsic =
+                                emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f64xn]);
                             let mut param_tys = vec![ty_f64xn, ty_i32];
                             let class_value = llvm::core::LLVMBuildCall2(
                                 builder,
@@ -10759,18 +10280,10 @@ impl IREmitter {
                         );
                     }
 
+                    let intrinsic =
+                        emitter.get_intrinsic_declaration("llvm.vector.reduce.or.", &[ty_i32xn]);
+
                     let mut param_tys = vec![ty_i32xn];
-                    let intrinsic_name = "llvm.vector.reduce.or.\0";
-                    let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                        intrinsic_name.as_ptr() as *const _,
-                        intrinsic_name.len() as usize,
-                    );
-                    let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                        emitter.module,
-                        intrinsic_id,
-                        param_tys.as_mut_ptr(),
-                        param_tys.len() as usize,
-                    );
                     let d_value = llvm::core::LLVMBuildCall2(
                         builder,
                         llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
@@ -10791,18 +10304,8 @@ impl IREmitter {
 
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.is.fpclass.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64, ty_i32];
                         let class_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -10965,19 +10468,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s1_value, 1);
                         let s2_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s2_value, 2);
 
-                        let mut param_tys = vec![ty_f64];
-
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f64]);
 
                         let mut param_tys = vec![ty_f64, ty_f64, ty_f64];
 
@@ -11101,18 +10592,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64, ty_f64, ty_f64];
                         let fma_result = llvm::core::LLVMBuildCall2(
                             builder,
@@ -11190,18 +10670,8 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let mut param_tys = vec![ty_f64xn];
-                        let intrinsic_name = "llvm.fabs.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.fabs.", &[ty_f64xn]);
                         let mut param_tys = vec![ty_f64xn];
                         let abs_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -11256,18 +10726,7 @@ impl IREmitter {
 
                         let s2_value = emitter.emit_vector_source_operand_u64(&inst.src2, elem);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.fabs.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fabs.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64];
                         let abs_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -11344,18 +10803,8 @@ impl IREmitter {
 
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
 
-                        let mut param_tys = vec![ty_f64, ty_i32];
-                        let intrinsic_name = b"llvm.ldexp.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.ldexp.", &[ty_f64, ty_i32]);
                         let mut param_tys = vec![ty_f64, ty_i32];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -12024,18 +11473,8 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let mut param_tys = vec![ty_f64];
-                            let intrinsic_name = b"llvm.exp2.\0";
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
-                            );
+                            let intrinsic =
+                                emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f64]);
                             let mut param_tys = vec![ty_f64];
                             let exp2_scale = llvm::core::LLVMBuildCall2(
                                 builder,
@@ -12326,18 +11765,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.exp2.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64];
                         let exp2_scale = llvm::core::LLVMBuildCall2(
                             builder,
@@ -12392,18 +11820,8 @@ impl IREmitter {
                         let s1_value =
                             emitter.emit_abs_neg_f64xn::<N>(s1_value, inst.abs, inst.neg, 1);
 
-                        let mut param_tys = vec![ty_f64xn];
-                        let intrinsic_name = "llvm.maxnum.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64xn]);
                         let mut param_tys = vec![ty_f64xn, ty_f64xn];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -12430,18 +11848,8 @@ impl IREmitter {
                         let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_value, 0);
                         let s1_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s1_value, 1);
 
-                        let mut param_tys = vec![ty_f64];
-                        let intrinsic_name = b"llvm.maxnum.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64]);
                         let mut param_tys = vec![ty_f64, ty_f64];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -12703,19 +12111,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s1_value, 1);
                         let s2_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s2_value, 2);
 
-                        let mut param_tys = vec![ty_f32];
-
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
 
                         let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
 
@@ -12830,18 +12226,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let mut param_tys = vec![ty_f32];
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
                         let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
                         let fma_result = llvm::core::LLVMBuildCall2(
                             builder,
@@ -12915,18 +12300,8 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let mut param_tys = vec![ty_f32xn];
-                        let intrinsic_name = "llvm.fabs.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.fabs.", &[ty_f32xn]);
                         let mut param_tys = vec![ty_f32xn];
                         let abs_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -13011,18 +12386,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let mut param_tys = vec![ty_f32];
-                        let intrinsic_name = b"llvm.fabs.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fabs.", &[ty_f32]);
                         let mut param_tys = vec![ty_f32];
                         let abs_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -13120,18 +12484,8 @@ impl IREmitter {
 
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
 
-                        let mut param_tys = vec![ty_f32, ty_i32];
-                        let intrinsic_name = b"llvm.ldexp.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.ldexp.", &[ty_f32, ty_i32]);
                         let mut param_tys = vec![ty_f32, ty_i32];
                         let d_value = llvm::core::LLVMBuildCall2(
                             builder,
@@ -13477,19 +12831,9 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
-                        let mut param_tys = vec![ty_i64xn];
 
-                        let intrinsic_name = "llvm.uadd.with.overflow.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter
+                            .get_intrinsic_declaration("llvm.uadd.with.overflow.", &[ty_i64xn]);
 
                         let mut return_tys = vec![ty_i64xn, ty_i1xn];
                         let mut param_tys = vec![ty_i64xn, ty_i64xn];
@@ -13550,18 +12894,10 @@ impl IREmitter {
                         );
                     }
 
+                    let intrinsic =
+                        emitter.get_intrinsic_declaration("llvm.vector.reduce.or.", &[ty_i32xn]);
+
                     let mut param_tys = vec![ty_i32xn];
-                    let intrinsic_name = "llvm.vector.reduce.or.\0";
-                    let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                        intrinsic_name.as_ptr() as *const _,
-                        intrinsic_name.len() as usize,
-                    );
-                    let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                        emitter.module,
-                        intrinsic_id,
-                        param_tys.as_mut_ptr(),
-                        param_tys.len() as usize,
-                    );
                     let d_value = llvm::core::LLVMBuildCall2(
                         builder,
                         llvm::core::LLVMFunctionType(ty_i32, param_tys.as_mut_ptr(), 1, 0),
@@ -13601,19 +12937,9 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
-                        let mut param_tys = vec![ty_i64];
 
-                        let intrinsic_name = b"llvm.uadd.with.overflow.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter
+                            .get_intrinsic_declaration("llvm.uadd.with.overflow.", &[ty_i64]);
 
                         let mut return_tys =
                             vec![ty_i64, llvm::core::LLVMInt1TypeInContext(context)];
@@ -14381,19 +13707,8 @@ impl IREmitter {
                                         empty_name.as_ptr(),
                                     );
 
-                                    let mut param_tys = vec![ty_f32];
-
-                                    let intrinsic_name = b"llvm.fma.\0";
-                                    let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                        intrinsic_name.as_ptr() as *const _,
-                                        intrinsic_name.len() as usize,
-                                    );
-                                    let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                        emitter.module,
-                                        intrinsic_id,
-                                        param_tys.as_mut_ptr(),
-                                        param_tys.len() as usize,
-                                    );
+                                    let intrinsic =
+                                        emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
 
                                     let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
 
@@ -15020,19 +14335,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_abs_neg_f32(inst.neg_hi, inst.neg, s1_value, 1);
                         let s2_value = emitter.emit_abs_neg_f32(inst.neg_hi, inst.neg, s2_value, 2);
 
-                        let mut param_tys = vec![ty_f32];
-
-                        let intrinsic_name = b"llvm.fma.\0";
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
 
                         let mut param_tys = vec![ty_f32, ty_f32, ty_f32];
 
@@ -15726,18 +15029,9 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let intrinsic_name = "llvm.masked.gather.\0";
-                            let mut param_tys = vec![ty_i32xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.gather.",
+                                &[ty_i32xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i32xn];
@@ -16063,18 +15357,9 @@ impl IREmitter {
                             let value =
                                 emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc as u32, i as u32, mask);
 
-                            let intrinsic_name = "llvm.masked.scatter.\0";
-                            let mut param_tys = vec![ty_i32xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.scatter.",
+                                &[ty_i32xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_i32xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -16321,18 +15606,9 @@ impl IREmitter {
                         );
 
                         {
-                            let intrinsic_name = "llvm.masked.gather.\0";
-                            let mut param_tys = vec![ty_i8xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.gather.",
+                                &[ty_i8xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i8xn];
@@ -16545,18 +15821,9 @@ impl IREmitter {
                         );
 
                         {
-                            let intrinsic_name = "llvm.masked.gather.\0";
-                            let mut param_tys = vec![ty_i16xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.gather.",
+                                &[ty_i16xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i16xn];
@@ -16778,18 +16045,9 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let intrinsic_name = "llvm.masked.gather.\0";
-                            let mut param_tys = vec![ty_i32xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.gather.",
+                                &[ty_i32xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i32xn];
@@ -17002,18 +16260,9 @@ impl IREmitter {
                                     empty_name.as_ptr(),
                                 );
 
-                                let intrinsic_name = "llvm.masked.gather.\0";
-                                let mut param_tys = vec![ty_i32xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.gather.",
+                                    &[ty_i32xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i32xn];
@@ -17081,18 +16330,9 @@ impl IREmitter {
                                     empty_name.as_ptr(),
                                 );
 
-                                let intrinsic_name = "llvm.masked.gather.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.gather.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i64xn];
@@ -17317,18 +16557,9 @@ impl IREmitter {
                                     empty_name.as_ptr(),
                                 );
 
-                                let intrinsic_name = "llvm.masked.gather.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.gather.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i64xn];
@@ -17396,18 +16627,9 @@ impl IREmitter {
                                     empty_name.as_ptr(),
                                 );
 
-                                let intrinsic_name = "llvm.masked.gather.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.gather.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i64xn];
@@ -17633,18 +16855,9 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let intrinsic_name = "llvm.masked.scatter.\0";
-                        let mut param_tys = vec![ty_i16xn, ty_p0xn];
-
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
+                        let intrinsic = emitter.get_intrinsic_declaration(
+                            "llvm.masked.scatter.",
+                            &[ty_i16xn, ty_p0xn],
                         );
 
                         let mut param_tys = vec![ty_i16xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -17856,18 +17069,9 @@ impl IREmitter {
                                 mask,
                             );
 
-                            let intrinsic_name = "llvm.masked.scatter.\0";
-                            let mut param_tys = vec![ty_i32xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.scatter.",
+                                &[ty_i32xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_i32xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -18080,18 +17284,9 @@ impl IREmitter {
                                     mask,
                                 );
 
-                                let intrinsic_name = "llvm.masked.scatter.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.scatter.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_i64xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -18153,18 +17348,9 @@ impl IREmitter {
                                     mask,
                                 );
 
-                                let intrinsic_name = "llvm.masked.scatter.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.scatter.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_i64xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -18381,18 +17567,9 @@ impl IREmitter {
                                     mask,
                                 );
 
-                                let intrinsic_name = "llvm.masked.scatter.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.scatter.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_i64xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -18454,18 +17631,9 @@ impl IREmitter {
                                     mask,
                                 );
 
-                                let intrinsic_name = "llvm.masked.scatter.\0";
-                                let mut param_tys = vec![ty_i64xn, ty_p0xn];
-
-                                let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                    intrinsic_name.as_ptr() as *const _,
-                                    intrinsic_name.len() as usize,
-                                );
-                                let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                    emitter.module,
-                                    intrinsic_id,
-                                    param_tys.as_mut_ptr(),
-                                    param_tys.len() as usize,
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.scatter.",
+                                    &[ty_i64xn, ty_p0xn],
                                 );
 
                                 let mut param_tys = vec![ty_i64xn, ty_p0xn, ty_i32, ty_i1xn];
@@ -18678,18 +17846,11 @@ impl IREmitter {
                                 mask,
                             );
 
-                            let mut param_tys = vec![ty_i32xn, ty_p0];
-                            let intrinsic_name = "llvm.masked.store.\0";
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.store.",
+                                &[ty_i32xn, ty_p0],
                             );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
-                            );
+
                             let mut param_tys = vec![ty_i32xn, ty_p0, ty_i32, ty_i1xn];
                             llvm::core::LLVMBuildCall2(
                                 builder,
@@ -18880,18 +18041,8 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let mut param_tys = vec![ty_i32xn, ty_p0];
-                            let intrinsic_name = "llvm.masked.load.\0";
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
-                            );
+                            let intrinsic = emitter
+                                .get_intrinsic_declaration("llvm.masked.load.", &[ty_i32xn, ty_p0]);
 
                             let mut param_tys = vec![ty_p0, ty_i32, ty_i1xn, ty_i32xn];
                             let value = llvm::core::LLVMBuildCall2(
@@ -19106,19 +18257,8 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let intrinsic_name = "llvm.masked.scatter.\0";
-                        let mut param_tys = vec![ty_i8xn, ty_p0xn];
-
-                        let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                            intrinsic_name.as_ptr() as *const _,
-                            intrinsic_name.len() as usize,
-                        );
-                        let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                            emitter.module,
-                            intrinsic_id,
-                            param_tys.as_mut_ptr(),
-                            param_tys.len() as usize,
-                        );
+                        let intrinsic = emitter
+                            .get_intrinsic_declaration("llvm.masked.scatter.", &[ty_i8xn, ty_p0xn]);
 
                         let mut param_tys = vec![ty_i8xn, ty_p0xn, ty_i32, ty_i1xn];
                         llvm::core::LLVMBuildCall2(
@@ -19252,18 +18392,9 @@ impl IREmitter {
                         );
 
                         {
-                            let intrinsic_name = "llvm.masked.gather.\0";
-                            let mut param_tys = vec![ty_i8xn, ty_p0xn];
-
-                            let intrinsic_id = llvm::core::LLVMLookupIntrinsicID(
-                                intrinsic_name.as_ptr() as *const _,
-                                intrinsic_name.len() as usize,
-                            );
-                            let intrinsic = llvm::core::LLVMGetIntrinsicDeclaration(
-                                emitter.module,
-                                intrinsic_id,
-                                param_tys.as_mut_ptr(),
-                                param_tys.len() as usize,
+                            let intrinsic = emitter.get_intrinsic_declaration(
+                                "llvm.masked.gather.",
+                                &[ty_i8xn, ty_p0xn],
                             );
 
                             let mut param_tys = vec![ty_p0xn, ty_i32, ty_i1xn, ty_i8xn];
