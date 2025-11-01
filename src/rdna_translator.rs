@@ -34,14 +34,6 @@ pub fn is_terminator(inst: &InstFormat) -> bool {
     }
 }
 
-extern "C" fn llvm_obj_linking_layer_create(
-    _: *mut c_void,
-    es: llvm::orc2::LLVMOrcExecutionSessionRef,
-    _: *const ::libc::c_char,
-) -> llvm::orc2::LLVMOrcObjectLayerRef {
-    unsafe { llvm::orc2::ee::LLVMOrcCreateRTDyldObjectLinkingLayerWithSectionMemoryManager(es) }
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Aabb {
@@ -20347,12 +20339,6 @@ impl RDNATranslator {
 
             llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(jit_builder, jtmb);
 
-            llvm::orc2::lljit::LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator(
-                jit_builder,
-                llvm_obj_linking_layer_create,
-                std::ptr::null_mut(),
-            );
-
             let mut jit = std::ptr::null_mut();
 
             let err = llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, jit_builder);
@@ -20726,12 +20712,6 @@ impl RDNATranslator {
             };
 
             llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(jit_builder, jtmb);
-
-            llvm::orc2::lljit::LLVMOrcLLJITBuilderSetObjectLinkingLayerCreator(
-                jit_builder,
-                llvm_obj_linking_layer_create,
-                std::ptr::null_mut(),
-            );
 
             let mut jit = std::ptr::null_mut();
 
