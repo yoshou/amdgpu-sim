@@ -1490,6 +1490,9 @@ impl SIMD32 {
             I::S_CSELECT_B32 => {
                 self.s_cselect_b32(d, s0, s1);
             }
+            I::S_BFM_B32 => {
+                self.s_bfm_b32(d, s0, s1);
+            }
             I::S_MUL_U64 => {
                 self.s_mul_u64(d, s0, s1);
             }
@@ -1589,6 +1592,13 @@ impl SIMD32 {
         let s0_value = self.read_scalar_source_operand_u32(s0);
         let s1_value = self.read_scalar_source_operand_u32(s1);
         let d_value = if self.ctx.scc { s0_value } else { s1_value };
+        self.write_sop_dst(d, d_value);
+    }
+
+    fn s_bfm_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = ((1 << (s0_value & 0x1F)) - 1) << (s1_value & 0x1F);
         self.write_sop_dst(d, d_value);
     }
 
@@ -2417,6 +2427,12 @@ impl SIMD32 {
             I::V_BFE_U32 => {
                 self.v_bfe_u32(d, s0, s1, s2);
             }
+            I::V_MAX_U32 => {
+                self.v_max_u32_e64(d, s0, s1);
+            }
+            I::V_MIN_U32 => {
+                self.v_min_u32_e64(d, s0, s1);
+            }
             I::V_ASHRREV_I32 => {
                 self.v_ashrrev_i32_e64(d, s0, s1);
             }
@@ -2693,6 +2709,30 @@ impl SIMD32 {
             let s1_value = self.read_vector_source_operand_u32(elem, s1);
             let s2_value = self.read_vector_source_operand_u32(elem, s2);
             let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << (s2_value & 0x1F)) - 1);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_max_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let d_value = s0_value.max(s1_value);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_min_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let d_value = s0_value.min(s1_value);
             self.write_vgpr(elem, d, d_value);
         }
     }
