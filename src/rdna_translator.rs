@@ -747,6 +747,59 @@ pub struct RDNATranslator {
     pub insts_blocks: HashMap<u64, InstBlock>,
 }
 
+struct RayIntersectionEmitter {
+    pub node_addr_ptr: llvm::prelude::LLVMValueRef,
+    pub values_ptr: llvm::prelude::LLVMValueRef,
+    pub results_ptr: llvm::prelude::LLVMValueRef,
+}
+
+impl RayIntersectionEmitter {
+    fn new() -> Self {
+        RayIntersectionEmitter {
+            node_addr_ptr: std::ptr::null_mut(),
+            values_ptr: std::ptr::null_mut(),
+            results_ptr: std::ptr::null_mut(),
+        }
+    }
+
+    fn emit_alloc(
+        &mut self,
+        context: llvm::prelude::LLVMContextRef,
+        builder: llvm::prelude::LLVMBuilderRef,
+    ) {
+        unsafe {
+            let empty_name = std::ffi::CString::new("").unwrap();
+            let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+            let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+            let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+
+            const N: usize = SIMD_WIDTH;
+            let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+            let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+            let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
+
+            self.node_addr_ptr = llvm::core::LLVMBuildArrayAlloca(
+                builder,
+                ty_i64xn,
+                llvm::core::LLVMConstInt(ty_i32, 4, 0),
+                empty_name.as_ptr(),
+            );
+            self.values_ptr = llvm::core::LLVMBuildArrayAlloca(
+                builder,
+                ty_f32xn,
+                llvm::core::LLVMConstInt(ty_i32, 10 * 32 / N as u64, 0),
+                empty_name.as_ptr(),
+            );
+            self.results_ptr = llvm::core::LLVMBuildArrayAlloca(
+                builder,
+                ty_i32xn,
+                llvm::core::LLVMConstInt(ty_i32, 10 * 4, 0),
+                empty_name.as_ptr(),
+            );
+        }
+    }
+}
+
 struct MatrixEmitter {
     pub matrix_a_ptr: llvm::prelude::LLVMValueRef,
     pub matrix_b_ptr: llvm::prelude::LLVMValueRef,
@@ -764,12 +817,14 @@ impl MatrixEmitter {
         }
     }
 
-    fn emit_alloc<const N: usize>(
+    fn emit_alloc(
         &mut self,
         context: llvm::prelude::LLVMContextRef,
         builder: llvm::prelude::LLVMBuilderRef,
     ) {
         unsafe {
+            const N: usize = SIMD_WIDTH;
+
             let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
             let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
             let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
@@ -830,9 +885,7 @@ struct IREmitter {
     vgpr_reg_f64_map: HashMap<u32, [llvm::prelude::LLVMValueRef; 32 / SIMD_WIDTH]>,
     use_vgpr_cache: bool,
     use_scc_cache: bool,
-    node_addr_ptr: llvm::prelude::LLVMValueRef,
-    values_ptr: llvm::prelude::LLVMValueRef,
-    results_ptr: llvm::prelude::LLVMValueRef,
+    ray: RayIntersectionEmitter,
     matrix: MatrixEmitter,
 }
 
@@ -3753,41 +3806,9 @@ impl IREmitter {
             }
         }
 
-        {
-            let builder = self.builder;
-            let context = self.context;
-            let empty_name = std::ffi::CString::new("").unwrap();
-            let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-            let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-            let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+        self.ray.emit_alloc(self.context, self.builder);
 
-            const N: usize = SIMD_WIDTH;
-            let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-            let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-            let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
-
-            self.node_addr_ptr = llvm::core::LLVMBuildArrayAlloca(
-                builder,
-                ty_i64xn,
-                llvm::core::LLVMConstInt(ty_i32, 4, 0),
-                empty_name.as_ptr(),
-            );
-            self.values_ptr = llvm::core::LLVMBuildArrayAlloca(
-                builder,
-                ty_f32xn,
-                llvm::core::LLVMConstInt(ty_i32, 10 * 32 / N as u64, 0),
-                empty_name.as_ptr(),
-            );
-            self.results_ptr = llvm::core::LLVMBuildArrayAlloca(
-                builder,
-                ty_i32xn,
-                llvm::core::LLVMConstInt(ty_i32, 10 * 4, 0),
-                empty_name.as_ptr(),
-            );
-        }
-
-        self.matrix
-            .emit_alloc::<SIMD_WIDTH>(self.context, self.builder);
+        self.matrix.emit_alloc(self.context, self.builder);
 
         if self.use_scc_cache {
             let context = self.context;
@@ -17681,7 +17702,7 @@ impl IREmitter {
                             llvm::core::LLVMBuildGEP2(
                                 builder,
                                 ty_i64,
-                                emitter.node_addr_ptr,
+                                emitter.ray.node_addr_ptr,
                                 [llvm::core::LLVMConstInt(ty_i64, i as u64, 0)].as_mut_ptr(),
                                 1,
                                 empty_name.as_ptr(),
@@ -17695,7 +17716,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_f32,
-                                    emitter.values_ptr,
+                                    emitter.ray.values_ptr,
                                     [llvm::core::LLVMConstInt(
                                         ty_i64,
                                         (i as u64) + j as u64 * 32,
@@ -17722,7 +17743,7 @@ impl IREmitter {
                             llvm::core::LLVMBuildGEP2(
                                 builder,
                                 ty_i64,
-                                emitter.node_addr_ptr,
+                                emitter.ray.node_addr_ptr,
                                 [elem].as_mut_ptr(),
                                 1,
                                 empty_name.as_ptr(),
@@ -17738,7 +17759,7 @@ impl IREmitter {
                                     llvm::core::LLVMBuildGEP2(
                                         builder,
                                         ty_f32,
-                                        emitter.values_ptr,
+                                        emitter.ray.values_ptr,
                                         [llvm::core::LLVMBuildAdd(
                                             builder,
                                             elem,
@@ -17796,7 +17817,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_i32,
-                                    emitter.results_ptr,
+                                    emitter.ray.results_ptr,
                                     [llvm::core::LLVMBuildAdd(
                                         builder,
                                         elem,
@@ -17848,7 +17869,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_i32,
-                                    emitter.results_ptr,
+                                    emitter.ray.results_ptr,
                                     [llvm::core::LLVMConstInt(
                                         ty_i64,
                                         (i as u64) + j as u64 * 32,
@@ -17924,7 +17945,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_i32,
-                                    emitter.results_ptr,
+                                    emitter.ray.results_ptr,
                                     [llvm::core::LLVMBuildAdd(
                                         builder,
                                         elem,
@@ -18035,7 +18056,7 @@ impl IREmitter {
                             llvm::core::LLVMBuildGEP2(
                                 builder,
                                 ty_i64,
-                                emitter.node_addr_ptr,
+                                emitter.ray.node_addr_ptr,
                                 [llvm::core::LLVMConstInt(ty_i64, i as u64, 0)].as_mut_ptr(),
                                 1,
                                 empty_name.as_ptr(),
@@ -18049,7 +18070,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_f32,
-                                    emitter.values_ptr,
+                                    emitter.ray.values_ptr,
                                     [llvm::core::LLVMConstInt(
                                         ty_i64,
                                         (i as u64) + j as u64 * 32,
@@ -18076,7 +18097,7 @@ impl IREmitter {
                             llvm::core::LLVMBuildGEP2(
                                 builder,
                                 ty_i64,
-                                emitter.node_addr_ptr,
+                                emitter.ray.node_addr_ptr,
                                 [elem].as_mut_ptr(),
                                 1,
                                 empty_name.as_ptr(),
@@ -18092,7 +18113,7 @@ impl IREmitter {
                                     llvm::core::LLVMBuildGEP2(
                                         builder,
                                         ty_f32,
-                                        emitter.values_ptr,
+                                        emitter.ray.values_ptr,
                                         [llvm::core::LLVMBuildAdd(
                                             builder,
                                             elem,
@@ -18153,7 +18174,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_i32,
-                                    emitter.results_ptr,
+                                    emitter.ray.results_ptr,
                                     [llvm::core::LLVMBuildAdd(
                                         builder,
                                         elem,
@@ -18209,7 +18230,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_i32,
-                                    emitter.results_ptr,
+                                    emitter.ray.results_ptr,
                                     [llvm::core::LLVMConstInt(
                                         ty_i64,
                                         (i as u64) + j as u64 * 32,
@@ -18280,7 +18301,7 @@ impl IREmitter {
                                 llvm::core::LLVMBuildGEP2(
                                     builder,
                                     ty_i32,
-                                    emitter.results_ptr,
+                                    emitter.ray.results_ptr,
                                     [llvm::core::LLVMBuildAdd(
                                         builder,
                                         elem,
@@ -19971,9 +19992,7 @@ impl RDNATranslator {
                 vgpr_reg_f64_map: HashMap::new(),
                 use_vgpr_cache: USE_VGPR_CACHE,
                 use_scc_cache: true,
-                node_addr_ptr: std::ptr::null_mut(),
-                values_ptr: std::ptr::null_mut(),
-                results_ptr: std::ptr::null_mut(),
+                ray: RayIntersectionEmitter::new(),
                 matrix: MatrixEmitter::new(),
             };
 
@@ -20535,9 +20554,7 @@ impl RDNATranslator {
                 vgpr_reg_f64_map: HashMap::new(),
                 use_vgpr_cache: false,
                 use_scc_cache: false,
-                node_addr_ptr: std::ptr::null_mut(),
-                values_ptr: std::ptr::null_mut(),
-                results_ptr: std::ptr::null_mut(),
+                ray: RayIntersectionEmitter::new(),
                 matrix: MatrixEmitter::new(),
             };
 
