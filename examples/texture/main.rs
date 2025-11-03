@@ -132,6 +132,14 @@ where
     (x + y - T::from(1)) / y
 }
 
+const SEL_0: u32 = 0;
+const SEL_X: u32 = 4;
+const FMT_8_UNORM: u32 = 1;
+const IMAGE_CHANNEL_ORDER_A: u32 = 0;
+const IMAGE_CHANNEL_TYPE_SNORM_INT8: u32 = 0;
+const IMG_2D_ARRAY: u32 = 13;
+const TEX_WRAP: u32 = 0;
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
@@ -170,12 +178,24 @@ fn main() -> Result<()> {
     let tex_obj_ptr = tex_obj.as_ptr() as u64;
     println!("tex_obj_ptr: 0x{:16X}", tex_obj_ptr);
 
-    set_bits_u32(&mut tex_obj, 0, 32, (data_ptr >> 8) as u32);
-    set_bits_u32(&mut tex_obj, 32, 8, (data_ptr >> 40) as u32);
-    set_bits_u32(&mut tex_obj, 62, 16, size_x as u32 - 1);
-    set_bits_u32(&mut tex_obj, 78, 16, size_y as u32 - 1);
+    set_bits_u32(&mut tex_obj[0..8], 0, 32, (data_ptr >> 8) as u32);
+    set_bits_u32(&mut tex_obj[0..8], 32, 8, (data_ptr >> 40) as u32);
+    set_bits_u32(&mut tex_obj[0..8], 49, 8, FMT_8_UNORM);
+    set_bits_u32(&mut tex_obj[0..8], 62, 16, size_x as u32 - 1);
+    set_bits_u32(&mut tex_obj[0..8], 78, 16, size_y as u32 - 1);
+    set_bits_u32(&mut tex_obj[0..8], 96, 3, SEL_0);
+    set_bits_u32(&mut tex_obj[0..8], 99, 3, SEL_0);
+    set_bits_u32(&mut tex_obj[0..8], 102, 3, SEL_0);
+    set_bits_u32(&mut tex_obj[0..8], 105, 3, SEL_X);
+    set_bits_u32(&mut tex_obj[0..8], 124, 4, IMG_2D_ARRAY);
 
+    tex_obj[8] = IMAGE_CHANNEL_TYPE_SNORM_INT8;
+    tex_obj[9] = IMAGE_CHANNEL_ORDER_A;
     tex_obj[10] = size_x as u32;
+
+    set_bits_u32(&mut tex_obj[12..16], 0, 3, TEX_WRAP);
+    set_bits_u32(&mut tex_obj[12..16], 3, 3, TEX_WRAP);
+    set_bits_u32(&mut tex_obj[12..16], 6, 3, TEX_WRAP);
 
     let arch = if matches.opt_present("arch") {
         matches.opt_str("arch").unwrap()
