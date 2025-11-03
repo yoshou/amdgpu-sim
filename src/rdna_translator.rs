@@ -18368,6 +18368,14 @@ impl IREmitter {
         bb
     }
 
+    unsafe fn emit_vsample(
+        &mut self,
+        _bb: llvm::prelude::LLVMBasicBlockRef,
+        _inst: &VSAMPLE,
+    ) -> llvm::prelude::LLVMBasicBlockRef {
+        unimplemented!()
+    }
+
     unsafe fn emit_instruction(
         &mut self,
         bb: llvm::prelude::LLVMBasicBlockRef,
@@ -18392,6 +18400,7 @@ impl IREmitter {
             InstFormat::DS(inst) => self.emit_ds(bb, inst),
             InstFormat::SOPK(inst) => self.emit_sopk(bb, inst),
             InstFormat::VIMAGE(inst) => self.emit_vimage(bb, inst),
+            InstFormat::VSAMPLE(inst) => self.emit_vsample(bb, inst),
         }
     }
 }
@@ -19891,6 +19900,11 @@ impl RDNATranslator {
                         reg_usage.def_vgpr_u32(inst.vdata as u32 + i);
                     }
                 }
+                _ => {
+                    panic!("Unsupported instruction: {:?}", inst);
+                }
+            },
+            InstFormat::VSAMPLE(inst) => match inst.op {
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }

@@ -50,6 +50,47 @@ pub fn get_bits(buffer: &[u8], offset: usize, bit: usize, size: usize) -> u8 {
     ((get_u32(buffer, offset + (bit >> 3)) >> (bit & 0x7)) & ((1 << size) - 1)) as u8
 }
 
+pub fn get_bits_u32(buffer: &[u32], bit_offset: usize, bit_size: usize) -> u32 {
+    assert!(bit_size > 0 && bit_size <= 32);
+    assert!(bit_offset + bit_size <= buffer.len() * 32);
+
+    let word_offset = bit_offset / 32;
+    let bit_offset = bit_offset % 32;
+
+    if bit_offset + bit_size <= 32 {
+        let val = buffer[word_offset];
+        (val >> bit_offset) & (((1u64 << bit_size) - 1) as u32)
+    } else {
+        let lo_val = buffer[word_offset];
+        let hi_val = buffer[word_offset + 1];
+        let lo_bits = 32 - bit_offset;
+        let hi_bits = bit_size - lo_bits;
+        ((lo_val >> bit_offset) & ((1u32 << lo_bits) - 1))
+            | ((hi_val & ((1u32 << hi_bits) - 1)) << lo_bits)
+    }
+}
+
+pub fn set_bits_u32(buffer: &mut [u32], bit_offset: usize, bit_size: usize, value: u32) {
+    assert!(bit_size > 0 && bit_size <= 32);
+    assert!(bit_offset + bit_size <= buffer.len() * 32);
+
+    let word_offset = bit_offset / 32;
+    let bit_offset = bit_offset % 32;
+
+    if bit_offset + bit_size <= 32 {
+        let mask = (((1u64 << bit_size) - 1) as u32) << bit_offset;
+        buffer[word_offset] = (buffer[word_offset] & !mask) | ((value << bit_offset) & mask);
+    } else {
+        let lo_bits = 32 - bit_offset;
+        let hi_bits = bit_size - lo_bits;
+        let lo_mask = ((1u32 << lo_bits) - 1) << bit_offset;
+        let hi_mask = (1u32 << hi_bits) - 1;
+        buffer[word_offset] = (buffer[word_offset] & !lo_mask) | ((value << bit_offset) & lo_mask);
+        buffer[word_offset + 1] =
+            (buffer[word_offset + 1] & !hi_mask) | ((value >> lo_bits) & hi_mask);
+    }
+}
+
 pub fn get_bits_u64(buffer: &[u64], bit_offset: usize, bit_size: usize) -> u64 {
     assert!(bit_size > 0 && bit_size <= 64);
     assert!(bit_offset + bit_size <= buffer.len() * 64);

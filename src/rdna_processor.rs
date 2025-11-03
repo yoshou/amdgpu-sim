@@ -1340,6 +1340,7 @@ impl SIMD32 {
             InstFormat::VSCRATCH(fields) => self.execute_vscratch(fields),
             InstFormat::VGLOBAL(fields) => self.execute_vglobal(fields),
             InstFormat::VIMAGE(fields) => self.execute_vimage(fields),
+            InstFormat::VSAMPLE(fields) => self.execute_vsample(fields),
             InstFormat::DS(fields) => self.execute_ds(fields),
         }
     }
@@ -1361,6 +1362,9 @@ impl SIMD32 {
             I::S_CVT_F32_I32 => {
                 self.s_cvt_f32_i32(d, s0);
             }
+            I::S_CVT_F32_U32 => {
+                self.s_cvt_f32_u32(d, s0);
+            }
             I::S_AND_SAVEEXEC_B32 => {
                 self.s_and_saveexec_b32(d, s0);
             }
@@ -1381,7 +1385,7 @@ impl SIMD32 {
                 let pc = self.ctx.pc + 4 + self.insts.as_ptr() as u64;
                 self.write_sop_dst_pair(d, pc);
             }
-            _ => unimplemented!("{:?}", inst.op),
+            _ => unimplemented!(),
         }
 
         Signals::None
@@ -1411,6 +1415,12 @@ impl SIMD32 {
     fn s_cvt_f32_i32(&mut self, d: usize, s0: SourceOperand) {
         let s0_value = self.read_scalar_source_operand_u32(s0);
         let d_value = s0_value as i32 as f32;
+        self.write_sop_dst(d, f32_to_u32(d_value));
+    }
+
+    fn s_cvt_f32_u32(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let d_value = s0_value as f32;
         self.write_sop_dst(d, f32_to_u32(d_value));
     }
 
@@ -1519,6 +1529,9 @@ impl SIMD32 {
             }
             I::S_ADD_CO_CI_U32 => {
                 self.s_add_co_ci_u32(d, s0, s1);
+            }
+            I::S_BFE_U32 => {
+                self.s_bfe_u32(d, s0, s1);
             }
             _ => unimplemented!(),
         }
@@ -1670,6 +1683,14 @@ impl SIMD32 {
         let (d_value, scc_value) = add_u32(s0_value, s1_value, self.ctx.scc as u32);
         self.write_sop_dst(d, d_value as u32);
         self.ctx.scc = scc_value;
+    }
+
+    fn s_bfe_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << ((s1_value >> 16) & 0x7F)) - 1);
+        self.write_sop_dst(d, d_value as u32);
+        self.ctx.scc = d_value != 0;
     }
 
     fn execute_sopc(&mut self, inst: SOPC) -> Signals {
@@ -2118,7 +2139,7 @@ impl SIMD32 {
             I::V_LSHLREV_B64 => {
                 self.v_lshlrev_b64_e32(d, s0, s1);
             }
-            _ => unimplemented!("{:?}", inst),
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -2448,6 +2469,9 @@ impl SIMD32 {
             I::V_MUL_LO_U32 => {
                 self.v_mul_lo_u32(d, s0, s1);
             }
+            I::V_MUL_HI_U32 => {
+                self.v_mul_hi_u32(d, s0, s1);
+            }
             I::V_XOR_B32 => {
                 self.v_xor_b32_e64(d, s0, s1);
             }
@@ -2460,11 +2484,17 @@ impl SIMD32 {
             I::V_ADD_NC_U32 => {
                 self.v_add_nc_u32_e64(d, s0, s1);
             }
+            I::V_SUB_NC_U32 => {
+                self.v_sub_nc_u32_e64(d, s0, s1);
+            }
             I::V_ADD3_U32 => {
                 self.v_add3_u32(d, s0, s1, s2);
             }
             I::V_MAD_U32_U24 => {
                 self.v_mad_u32_u24(d, s0, s1, s2);
+            }
+            I::V_ADD_F32 => {
+                self.v_add_f32_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_MUL_F32 => {
                 self.v_mul_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -2496,6 +2526,9 @@ impl SIMD32 {
             I::V_CMP_CLASS_F32 => {
                 self.v_cmp_class_f32_e64(d, s0, s1, abs, neg, clamp, omod);
             }
+            I::V_CVT_F32_U32 => {
+                self.v_cvt_f32_u32_e64(d, s0, abs, neg, clamp, omod);
+            }
             I::V_CVT_F64_U32 => {
                 self.v_cvt_f64_u32_e64(d, s0, abs, neg, clamp, omod);
             }
@@ -2507,6 +2540,9 @@ impl SIMD32 {
             }
             I::V_MUL_F64 => {
                 self.v_mul_f64_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_RCP_F32 => {
+                self.v_rcp_f32_e64(d, s0, abs, neg, clamp, omod);
             }
             I::V_RCP_F64 => {
                 self.v_rcp_f64_e64(d, s0, abs, neg, clamp, omod);
@@ -2598,6 +2634,9 @@ impl SIMD32 {
             I::V_CMP_GT_U32 => {
                 self.v_cmp_gt_u32_e64(d, s0, s1);
             }
+            I::V_CMP_GE_U32 => {
+                self.v_cmp_ge_u32_e64(d, s0, s1);
+            }
             I::V_CMPX_NE_U32 => {
                 self.v_cmpx_ne_u32_e64(d, s0, s1);
             }
@@ -2619,7 +2658,16 @@ impl SIMD32 {
             I::V_LDEXP_F32 => {
                 self.v_ldexp_f32(d, s0, s1, abs, neg, clamp, omod);
             }
-            _ => unimplemented!("{:?}", inst),
+            I::V_FMAC_F32 => {
+                self.v_fmac_f32_e64(d, s0, s1, abs, neg, clamp, omod);
+            }
+            I::V_FLOOR_F32 => {
+                self.v_floor_f32_e64(d, s0, abs, neg, clamp, omod);
+            }
+            I::V_S_RCP_F32 => {
+                self.v_s_rcp_f32(d, s0, abs, neg, clamp, omod);
+            }
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -2818,6 +2866,18 @@ impl SIMD32 {
         }
     }
 
+    fn v_mul_hi_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let d_value = ((s0_value as u64 * s1_value as u64) >> 32) as u32;
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
     fn v_xor_b32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -2868,6 +2928,18 @@ impl SIMD32 {
         }
     }
 
+    fn v_sub_nc_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let d_value = s0_value.wrapping_sub(s1_value);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
     fn v_add3_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, s2: SourceOperand) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -2895,6 +2967,27 @@ impl SIMD32 {
             let d_value = s0_value.wrapping_mul(s1_value).wrapping_add(s2_value);
 
             self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_add_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = s0_value + s1_value;
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
 
@@ -3167,6 +3260,26 @@ impl SIMD32 {
         }
     }
 
+    fn v_cvt_f32_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        _abs: u8,
+        _neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let d_value = s0_value as f32;
+
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
     fn v_cvt_f64_u32_e64(
         &mut self,
         d: usize,
@@ -3246,6 +3359,25 @@ impl SIMD32 {
             let s1_value = abs_neg(self.read_vector_source_operand_f64(elem, s1), abs, neg, 1);
             let d_value = s0_value * s1_value;
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_rcp_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let d_value = 1.0 / s0_value;
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
 
@@ -3902,6 +4034,25 @@ impl SIMD32 {
         }
     }
 
+    fn v_cmp_ge_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let d_value = s0_value >= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
     fn v_cmpx_ne_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
         let mut vcc = 0u32;
         for elem in 0..32 {
@@ -4073,6 +4224,69 @@ impl SIMD32 {
             let d_value = libm::ldexpf(s0_value, s1_value);
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
+    }
+
+    fn v_fmac_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
+            let d_value = u32_to_f32(self.read_vgpr(elem, d));
+            let d_value = fma(s0_value, s1_value, d_value);
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_floor_f32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
+            let mut d_value = s0_value.trunc();
+            if (s0_value < 0.0) && (s0_value != d_value) {
+                d_value += -1.0;
+            }
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+        }
+    }
+
+    fn v_s_rcp_f32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
+    ) {
+        let s0_value = abs_neg(
+            u32_to_f32(self.read_scalar_source_operand_u32(s0)),
+            abs,
+            neg,
+            0,
+        );
+        let d_value = 1.0 / s0_value;
+        self.write_sgpr(d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 
     fn execute_vop3sd(&mut self, inst: VOP3SD) -> Signals {
@@ -4264,7 +4478,7 @@ impl SIMD32 {
             I::V_FMA_MIXLO_F16 => {
                 self.v_fma_mixlo_f16(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
             }
-            _ => unimplemented!("{:?}", inst.op),
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -4473,9 +4687,7 @@ impl SIMD32 {
             I::V_CMPX_NLT_F64 => {
                 self.v_cmpx_nlt_f64_e32(s0, s1);
             }
-            _ => {
-                unimplemented!()
-            }
+            _ => unimplemented!(),
         }
         Signals::None
     }
@@ -4978,7 +5190,7 @@ impl SIMD32 {
                     inst.literal_constant.unwrap(),
                 );
             }
-            _ => unimplemented!("{:?}", inst.opx),
+            _ => unimplemented!(),
         }
         let s0 = inst.src0y;
         let s1 = inst.vsrc1y as usize;
@@ -5019,7 +5231,7 @@ impl SIMD32 {
                     inst.literal_constant.unwrap(),
                 );
             }
-            _ => unimplemented!("{:?}", inst.opy),
+            _ => unimplemented!(),
         }
         let d = inst.vdstx as usize;
         match inst.opx {
@@ -5701,6 +5913,9 @@ impl SIMD32 {
             I::GLOBAL_LOAD_B128 => {
                 self.global_load_b128(vaddr, vdst, saddr, ioffset);
             }
+            I::GLOBAL_ATOMIC_ADD_U32 => {
+                self.global_atomic_add_u32(vaddr, vdst, vsrc, saddr, ioffset);
+            }
             I::GLOBAL_WB => {}
             I::GLOBAL_INV => {}
             _ => unimplemented!(),
@@ -5929,6 +6144,40 @@ impl SIMD32 {
                 let data = unsafe { *ptr };
                 self.write_vgpr(elem, vdst + i, data);
             }
+        }
+    }
+
+    fn global_atomic_add_u32(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: u32,
+    ) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let addr = offset[elem] + (ioffset as u64);
+            let data = self.read_vgpr(elem, vsrc);
+
+            let ptr = addr as *mut u32;
+            let data = unsafe {
+                use std::sync::atomic::{AtomicU32, Ordering};
+                AtomicU32::from_ptr(ptr).fetch_add(data, Ordering::SeqCst)
+            };
+            self.write_vgpr(elem, vdst, data);
         }
     }
 
@@ -6226,6 +6475,65 @@ impl SIMD32 {
                     panic!("Unsupported node type: {}", node_type);
                 }
             }
+        }
+    }
+
+    fn execute_vsample(&mut self, inst: VSAMPLE) -> Signals {
+        let vdata = inst.vdata as usize;
+        let vaddr0 = inst.vaddr0 as usize;
+        let vaddr1 = inst.vaddr1 as usize;
+        let rsrc = inst.rsrc as usize;
+        let samp = inst.samp as usize;
+        match inst.op {
+            I::IMAGE_SAMPLE_LZ => {
+                self.image_sample_lz(vdata, vaddr0, vaddr1, rsrc, samp);
+            }
+            _ => unimplemented!(),
+        }
+        Signals::None
+    }
+
+    fn image_sample_lz(
+        &mut self,
+        vdata: usize,
+        vaddr0: usize,
+        vaddr1: usize,
+        rsrc: usize,
+        samp: usize,
+    ) {
+        let _samp_value = (0..4)
+            .map(|i| self.read_sgpr(samp + i))
+            .collect::<Vec<u32>>();
+        let rsrc_value = (0..8)
+            .map(|i| self.read_sgpr(rsrc + i))
+            .collect::<Vec<u32>>();
+
+        let w = get_bits_u32(&rsrc_value, 62, 16) + 1;
+        let h = get_bits_u32(&rsrc_value, 78, 16) + 1;
+
+        let base_addr =
+            (((rsrc_value[1] as u64) << 40) | ((rsrc_value[0] as u64) << 8)) & ((1u64 << 48) - 1);
+        let pixels = base_addr as *const u8;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+
+            let u = u32_to_f32(self.read_vgpr(elem, vaddr0));
+            let v = u32_to_f32(self.read_vgpr(elem, vaddr1));
+
+            let x = ((u - 0.5) * (w as f32) + 0.5).floor() as i32;
+            let y = ((v - 0.5) * (h as f32) + 0.5).floor() as i32;
+
+            let data = if x < 0 || x >= (w as i32) || y < 0 || y >= (h as i32) {
+                0u8
+            } else {
+                let offset = y as u64 * w as u64 + x as u64;
+                let ptr = unsafe { pixels.add(offset as usize) };
+                unsafe { std::ptr::read_unaligned(ptr as *const u8) }
+            };
+
+            self.write_vgpr(elem, vdata, data as u32);
         }
     }
 

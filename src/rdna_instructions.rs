@@ -202,6 +202,30 @@ pub struct VIMAGE {
 pub const VIMAGE_ENCODE: u32 = 0b110100;
 
 #[derive(Debug, Clone)]
+pub struct VSAMPLE {
+    pub op: I,
+    pub dim: u8,
+    pub tfe: u8,
+    pub r128: u8,
+    pub d16: u8,
+    pub a16: u8,
+    pub unrm: u8,
+    pub dmask: u8,
+    pub vdata: u8,
+    pub lwe: u8,
+    pub rsrc: u16,
+    pub scope: u8,
+    pub th: u8,
+    pub samp: u16,
+    pub vaddr0: u8,
+    pub vaddr1: u8,
+    pub vaddr2: u8,
+    pub vaddr3: u8,
+}
+
+pub const VSAMPLE_ENCODE: u32 = 0b111001;
+
+#[derive(Debug, Clone)]
 pub struct DS {
     pub offset0: u8,
     pub offset1: u8,
@@ -248,5 +272,6 @@ pub enum InstFormat {
     VGLOBAL(VGLOBAL),
     VSCRATCH(VSCRATCH),
     VIMAGE(VIMAGE),
+    VSAMPLE(VSAMPLE),
     DS(DS),
 }
