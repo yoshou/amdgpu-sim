@@ -151,6 +151,27 @@ impl IREmitter {
                     emitter.emit_store_sgpr_u32(inst.sdata as u32 + i, data);
                 }
             }
+            I::S_LOAD_B256 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
+
+                for i in 0..8 {
+                    let offset = llvm::core::LLVMConstInt(ty_i64, (inst.ioffset + i * 4) as u64, 0);
+                    let addr =
+                        llvm::core::LLVMBuildAdd(builder, sbase, offset, empty_name.as_ptr());
+                    let ptr =
+                        llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
+                    let data =
+                        llvm::core::LLVMBuildLoad2(builder, ty_i32, ptr, empty_name.as_ptr());
+
+                    emitter.emit_store_sgpr_u32(inst.sdata as u32 + i, data);
+                }
+            }
             _ => {
                 panic!("Unsupported instruction: {:?}", inst);
             }
@@ -316,6 +337,18 @@ impl IREmitter {
 
                 let d_value =
                     llvm::core::LLVMBuildSIToFP(builder, s0_value, ty_f32, empty_name.as_ptr());
+
+                emitter.emit_store_sgpr_f32(inst.sdst as u32, d_value);
+            }
+            I::S_CVT_F32_U32 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+
+                let d_value =
+                    llvm::core::LLVMBuildUIToFP(builder, s0_value, ty_f32, empty_name.as_ptr());
 
                 emitter.emit_store_sgpr_f32(inst.sdst as u32, d_value);
             }
@@ -497,6 +530,62 @@ impl IREmitter {
                 );
                 let d_value =
                     llvm::core::LLVMBuildLShr(builder, s0_value, s1_value, empty_name.as_ptr());
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntNE,
+                    d_value,
+                    llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_BFE_U32 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                // offset = s1[4:0], width = s1[22:16]
+                let offset = llvm::core::LLVMBuildAnd(
+                    builder,
+                    s1_value,
+                    llvm::core::LLVMConstInt(ty_i32, 0x1F, 0),
+                    empty_name.as_ptr(),
+                );
+                let width = llvm::core::LLVMBuildAnd(
+                    builder,
+                    llvm::core::LLVMBuildLShr(
+                        builder,
+                        s1_value,
+                        llvm::core::LLVMConstInt(ty_i32, 16, 0),
+                        empty_name.as_ptr(),
+                    ),
+                    llvm::core::LLVMConstInt(ty_i32, 0x7F, 0),
+                    empty_name.as_ptr(),
+                );
+
+                let shifted =
+                    llvm::core::LLVMBuildLShr(builder, s0_value, offset, empty_name.as_ptr());
+
+                // mask = (1 << width) - 1
+                let one = llvm::core::LLVMConstInt(ty_i32, 1, 0);
+                let mask = llvm::core::LLVMBuildSub(
+                    builder,
+                    llvm::core::LLVMBuildShl(builder, one, width, empty_name.as_ptr()),
+                    one,
+                    empty_name.as_ptr(),
+                );
+
+                let d_value = llvm::core::LLVMBuildAnd(builder, shifted, mask, empty_name.as_ptr());
 
                 emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
 

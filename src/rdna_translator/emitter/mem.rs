@@ -649,6 +649,162 @@ impl IREmitter {
         match inst.op {
             I::GLOBAL_WB => {}
             I::GLOBAL_INV => {}
+            I::GLOBAL_ATOMIC_ADD_U32 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+
+                const N: usize = SIMD_WIDTH;
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
+
+                let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                // Splat the uniform scalar base address across the lanes.
+                let saddr_vec = if inst.saddr != 124 {
+                    let saddr_value = emitter.emit_load_sgpr_u64(inst.saddr as u32);
+                    let zero_vec = llvm::core::LLVMConstVector(
+                        [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
+                        N as u32,
+                    );
+                    let poison = llvm::core::LLVMGetPoison(ty_i64xn);
+                    let saddr_value = llvm::core::LLVMBuildInsertElement(
+                        builder,
+                        poison,
+                        saddr_value,
+                        llvm::core::LLVMConstInt(ty_i64, 0, 0),
+                        empty_name.as_ptr(),
+                    );
+                    llvm::core::LLVMBuildShuffleVector(
+                        builder,
+                        saddr_value,
+                        poison,
+                        zero_vec,
+                        empty_name.as_ptr(),
+                    )
+                } else {
+                    std::ptr::null_mut()
+                };
+
+                let ioffset_vec = llvm::core::LLVMConstVector(
+                    [llvm::core::LLVMConstInt(
+                        ty_i64,
+                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                        0,
+                    ); N]
+                        .as_mut_ptr(),
+                    N as u32,
+                );
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let addr_vec = if inst.saddr != 124 {
+                        let vaddr_value =
+                            emitter.emit_load_vgpr_u32xn::<N>(inst.vaddr as u32, i, mask);
+                        let vaddr_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            vaddr_value,
+                            ty_i64xn,
+                            empty_name.as_ptr(),
+                        );
+                        llvm::core::LLVMBuildAdd(
+                            builder,
+                            saddr_vec,
+                            vaddr_value,
+                            empty_name.as_ptr(),
+                        )
+                    } else {
+                        emitter.emit_load_vgpr_u64xn::<N>(inst.vaddr as u32, i, mask)
+                    };
+                    let addr_vec = llvm::core::LLVMBuildAdd(
+                        builder,
+                        addr_vec,
+                        ioffset_vec,
+                        empty_name.as_ptr(),
+                    );
+
+                    let data_vec = emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc as u32, i, mask);
+
+                    let mut result_vec = llvm::core::LLVMGetPoison(ty_i32xn);
+                    for lane in 0..N {
+                        let lane_idx = llvm::core::LLVMConstInt(ty_i32, lane as u64, 0);
+                        let active = llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            mask,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+                        let addr = llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            addr_vec,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+                        let data = llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            data_vec,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+
+                        let bb_pre = llvm::core::LLVMGetInsertBlock(builder);
+                        let bb_exec = llvm::core::LLVMAppendBasicBlockInContext(
+                            context,
+                            emitter.function,
+                            empty_name.as_ptr(),
+                        );
+                        let bb_cont = llvm::core::LLVMAppendBasicBlockInContext(
+                            context,
+                            emitter.function,
+                            empty_name.as_ptr(),
+                        );
+
+                        llvm::core::LLVMBuildCondBr(builder, active, bb_exec, bb_cont);
+
+                        // Only active lanes perform the atomic (it has side effects).
+                        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_exec);
+                        let ptr = llvm::core::LLVMBuildIntToPtr(
+                            builder,
+                            addr,
+                            ty_p0,
+                            empty_name.as_ptr(),
+                        );
+                        let old = llvm::core::LLVMBuildAtomicRMW(
+                            builder,
+                            llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd,
+                            ptr,
+                            data,
+                            llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                            0,
+                        );
+                        let result_exec = llvm::core::LLVMBuildInsertElement(
+                            builder,
+                            result_vec,
+                            old,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+                        llvm::core::LLVMBuildBr(builder, bb_cont);
+
+                        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_cont);
+                        let phi = llvm::core::LLVMBuildPhi(builder, ty_i32xn, empty_name.as_ptr());
+                        llvm::core::LLVMAddIncoming(
+                            phi,
+                            [result_exec, result_vec].as_mut_ptr(),
+                            [bb_exec, bb_pre].as_mut_ptr(),
+                            2,
+                        );
+                        result_vec = phi;
+                    }
+
+                    emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, result_vec, mask);
+                }
+
+                bb = llvm::core::LLVMGetInsertBlock(builder);
+            }
             I::GLOBAL_LOAD_U8 => {
                 if USE_SIMD {
                     let emitter = self;
@@ -4123,9 +4279,118 @@ impl IREmitter {
 
     pub(crate) unsafe fn emit_vsample(
         &mut self,
-        _bb: llvm::prelude::LLVMBasicBlockRef,
-        _inst: &VSAMPLE,
+        bb: llvm::prelude::LLVMBasicBlockRef,
+        inst: &VSAMPLE,
     ) -> llvm::prelude::LLVMBasicBlockRef {
-        unimplemented!()
+        let context = self.context;
+        let builder = self.builder;
+
+        match inst.op {
+            I::IMAGE_SAMPLE_LZ => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+
+                const N: usize = SIMD_WIDTH;
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                // The 8-dword image resource descriptor is uniform across lanes.
+                let rsrc_values = (0..8)
+                    .map(|i| emitter.emit_load_sgpr_u32(inst.rsrc as u32 + i))
+                    .collect::<Vec<_>>();
+
+                // Declare (or find) the runtime helper `image_sample_lz`, resolved
+                // by the JIT through the process symbol table.
+                let mut param_tys = vec![
+                    ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_f32, ty_f32,
+                ];
+                let func_ty = llvm::core::LLVMFunctionType(
+                    ty_i32,
+                    param_tys.as_mut_ptr(),
+                    param_tys.len() as u32,
+                    0,
+                );
+                let func = llvm::core::LLVMGetNamedFunction(
+                    emitter.module,
+                    "image_sample_lz\0".as_ptr() as *const _,
+                );
+                let func = if func.is_null() {
+                    llvm::core::LLVMAddFunction(
+                        emitter.module,
+                        "image_sample_lz\0".as_ptr() as *const _,
+                        func_ty,
+                    )
+                } else {
+                    func
+                };
+
+                let vaddr0 = inst.vaddr0 as u32;
+                let vaddr1 = inst.vaddr1 as u32;
+                let vdata = inst.vdata as u32;
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let u_vec = emitter.emit_load_vgpr_f32xn::<N>(vaddr0, i, mask);
+                    let v_vec = emitter.emit_load_vgpr_f32xn::<N>(vaddr1, i, mask);
+
+                    // The fetch is side-effect free, so sampling every lane and
+                    // discarding inactive ones via the masked store is safe.
+                    let mut result_vec = llvm::core::LLVMGetPoison(ty_i32xn);
+                    for lane in 0..N {
+                        let lane_idx = llvm::core::LLVMConstInt(ty_i32, lane as u64, 0);
+                        let u = llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            u_vec,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+                        let v = llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            v_vec,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+
+                        let mut args = vec![
+                            rsrc_values[0],
+                            rsrc_values[1],
+                            rsrc_values[2],
+                            rsrc_values[3],
+                            rsrc_values[4],
+                            rsrc_values[5],
+                            rsrc_values[6],
+                            rsrc_values[7],
+                            u,
+                            v,
+                        ];
+                        let result = llvm::core::LLVMBuildCall2(
+                            builder,
+                            func_ty,
+                            func,
+                            args.as_mut_ptr(),
+                            args.len() as u32,
+                            empty_name.as_ptr(),
+                        );
+
+                        result_vec = llvm::core::LLVMBuildInsertElement(
+                            builder,
+                            result_vec,
+                            result,
+                            lane_idx,
+                            empty_name.as_ptr(),
+                        );
+                    }
+
+                    emitter.emit_store_vgpr_u32xn::<N>(vdata, i, result_vec, mask);
+                }
+            }
+            _ => unimplemented!(),
+        }
+
+        bb
     }
 }

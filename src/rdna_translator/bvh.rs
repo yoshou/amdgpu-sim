@@ -1,4 +1,45 @@
+use crate::buffer::get_bits_u32;
 use itertools::Itertools;
+
+/// Runtime helper for IMAGE_SAMPLE_LZ. Mirrors the interpreter's
+/// `image_sample_lz` (see rdna_processor.rs): nearest-texel fetch of an
+/// 8-bit single-channel 2D image at LOD 0, returning the raw texel byte as
+/// a u32. Called per lane from generated IR; resolved by the JIT via the
+/// process symbol table like the `image_bvh*_intersect_ray` helpers.
+#[unsafe(no_mangle)]
+pub extern "C" fn image_sample_lz(
+    r0: u32,
+    r1: u32,
+    r2: u32,
+    r3: u32,
+    r4: u32,
+    r5: u32,
+    r6: u32,
+    r7: u32,
+    u: f32,
+    v: f32,
+) -> u32 {
+    let rsrc_value = [r0, r1, r2, r3, r4, r5, r6, r7];
+
+    let w = get_bits_u32(&rsrc_value, 62, 16) + 1;
+    let h = get_bits_u32(&rsrc_value, 78, 16) + 1;
+
+    let base_addr =
+        (((rsrc_value[1] as u64) << 40) | ((rsrc_value[0] as u64) << 8)) & ((1u64 << 48) - 1);
+    let pixels = base_addr as *const u8;
+
+    let x = ((u - 0.5) * (w as f32) + 0.5).floor() as i32;
+    let y = ((v - 0.5) * (h as f32) + 0.5).floor() as i32;
+
+    if x < 0 || x >= (w as i32) || y < 0 || y >= (h as i32) {
+        0u32
+    } else {
+        let offset = y as u64 * w as u64 + x as u64;
+        let ptr = unsafe { pixels.add(offset as usize) };
+        let data = unsafe { std::ptr::read_unaligned(ptr) };
+        data as u32
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
