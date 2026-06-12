@@ -3254,6 +3254,109 @@ impl IREmitter {
         let mut bb = bb;
 
         match inst.op {
+            I::DS_BPERMUTE_B32 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                const N: usize = SIMD_WIDTH;
+
+                let true_mask = llvm::core::LLVMConstVector(
+                    [llvm::core::LLVMConstInt(ty_i1, 1, 0); N].as_mut_ptr(),
+                    N as u32,
+                );
+
+                let source_active = (0..32)
+                    .map(|i| {
+                        let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
+                        emitter.emit_exec_bit(elem)
+                    })
+                    .collect::<Vec<_>>();
+
+                let source_values = [
+                    emitter.emit_load_vgpr_u32xn::<N>(inst.data0 as u32, 0, true_mask),
+                    emitter.emit_load_vgpr_u32xn::<N>(inst.data0 as u32, N as u32, true_mask),
+                ];
+                let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                for base in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, base);
+                    let addr_values =
+                        emitter.emit_load_vgpr_u32xn::<N>(inst.addr as u32, base as u32, true_mask);
+                    let mut result = llvm::core::LLVMConstVector(
+                        [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                        N as u32,
+                    );
+
+                    for dst_lane in 0..N {
+                        let index = llvm::core::LLVMConstInt(ty_i32, dst_lane as u64, 0);
+                        let addr = llvm::core::LLVMBuildExtractElement(
+                            builder,
+                            addr_values,
+                            index,
+                            empty_name.as_ptr(),
+                        );
+                        let addr = llvm::core::LLVMBuildAdd(
+                            builder,
+                            addr,
+                            llvm::core::LLVMConstInt(ty_i32, inst.offset0 as u64, 0),
+                            empty_name.as_ptr(),
+                        );
+                        let lane = llvm::core::LLVMBuildLShr(
+                            builder,
+                            addr,
+                            llvm::core::LLVMConstInt(ty_i32, 2, 0),
+                            empty_name.as_ptr(),
+                        );
+                        let lane = llvm::core::LLVMBuildAnd(
+                            builder,
+                            lane,
+                            llvm::core::LLVMConstInt(ty_i32, 31, 0),
+                            empty_name.as_ptr(),
+                        );
+
+                        let mut value = llvm::core::LLVMConstInt(ty_i32, 0, 0);
+                        for src_lane in 0..32 {
+                            let is_lane = llvm::core::LLVMBuildICmp(
+                                builder,
+                                llvm::LLVMIntPredicate::LLVMIntEQ,
+                                lane,
+                                llvm::core::LLVMConstInt(ty_i32, src_lane as u64, 0),
+                                empty_name.as_ptr(),
+                            );
+                            let is_lane_active = llvm::core::LLVMBuildAnd(
+                                builder,
+                                is_lane,
+                                source_active[src_lane],
+                                empty_name.as_ptr(),
+                            );
+                            let source = llvm::core::LLVMBuildExtractElement(
+                                builder,
+                                source_values[src_lane / N],
+                                llvm::core::LLVMConstInt(ty_i32, (src_lane % N) as u64, 0),
+                                empty_name.as_ptr(),
+                            );
+                            value = llvm::core::LLVMBuildSelect(
+                                builder,
+                                is_lane_active,
+                                source,
+                                value,
+                                empty_name.as_ptr(),
+                            );
+                        }
+
+                        result = llvm::core::LLVMBuildInsertElement(
+                            builder,
+                            result,
+                            value,
+                            index,
+                            empty_name.as_ptr(),
+                        );
+                    }
+
+                    emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, base as u32, result, mask);
+                }
+            }
             I::DS_STORE_B8 => {
                 if USE_SIMD {
                     let emitter = self;

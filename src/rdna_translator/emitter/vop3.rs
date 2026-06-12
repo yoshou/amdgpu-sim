@@ -1013,7 +1013,12 @@ impl IREmitter {
                     });
                 }
             }
-            I::V_CMPX_NE_U32 => {
+            I::V_CMPX_NE_U32 | I::V_CMPX_GT_U32 => {
+                let pred = match inst.op {
+                    I::V_CMPX_NE_U32 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_GT_U32 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    _ => unreachable!(),
+                };
                 if USE_SIMD {
                     let emitter = self;
                     let empty_name = std::ffi::CString::new("").unwrap();
@@ -1036,7 +1041,7 @@ impl IREmitter {
 
                         let cmp_value = llvm::core::LLVMBuildICmp(
                             builder,
-                            llvm::LLVMIntPredicate::LLVMIntNE,
+                            pred,
                             s0_value,
                             s1_value,
                             empty_name.as_ptr(),
@@ -1067,7 +1072,7 @@ impl IREmitter {
 
                         let cmp_value = llvm::core::LLVMBuildICmp(
                             builder,
-                            llvm::LLVMIntPredicate::LLVMIntNE,
+                            pred,
                             s0_value,
                             s1_value,
                             empty_name.as_ptr(),

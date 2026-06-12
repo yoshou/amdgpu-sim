@@ -6549,9 +6549,32 @@ impl SIMD32 {
             I::DS_STORE_B8 => {
                 self.ds_store_b8(addr, data0, offset0);
             }
+            I::DS_BPERMUTE_B32 => {
+                self.ds_bpermute_b32(addr, data0, vdst, offset0);
+            }
             _ => unimplemented!(),
         }
         Signals::None
+    }
+
+    fn ds_bpermute_b32(&mut self, addr: usize, data0: usize, vdst: usize, offset0: u8) {
+        let values = (0..32)
+            .map(|elem| self.read_vgpr(elem, data0))
+            .collect::<Vec<u32>>();
+        let active = (0..32)
+            .map(|elem| self.get_exec_bit(elem))
+            .collect::<Vec<bool>>();
+
+        for elem in 0..32 {
+            if !active[elem] {
+                continue;
+            }
+
+            let lane = ((self.read_vgpr(elem, addr).wrapping_add(offset0 as u32) >> 2) & 31)
+                as usize;
+            let value = if active[lane] { values[lane] } else { 0 };
+            self.write_vgpr(elem, vdst, value);
+        }
     }
 
     fn ds_load_u8(&mut self, addr: usize, vdst: usize, offset0: u8) {
