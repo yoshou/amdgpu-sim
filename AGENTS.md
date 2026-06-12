@@ -1,4 +1,4 @@
-# Copilot instructions for `amdgpu-sim`
+# Codex instructions for `amdgpu-sim`
 
 ## Build, test, and run commands
 
@@ -37,6 +37,6 @@
   - `smallpt`, `bitonic_sort`, `histogram`, and `texture` default to `gfx803`
   - `raytracing` defaults to `gfx1200`
   - `simple_hgemm` should be run with `--arch gfx1200`; its source still has a `gfx942` default even though this repository ships `examples/simple_hgemm/kernel_gfx1200.o` and the dispatcher supports `gfx1200`
-- `smallpt` has repository-specific CLI details already captured in `.github/skills/run-smallpt/SKILL.md`: it accepts `--arch` and `--nb_samples`, and it writes `image.png` at the repository root.
+- `smallpt` has repository-specific CLI details already captured in `.codex/skills/run-smallpt/SKILL.md`: it accepts `--arch` and `--nb_samples`, and it writes `image.png` at the repository root.
 - Register files are stored as flattened `(elem, register)` arrays in both processor implementations. The RDNA path uses `aligned_vec::AVec` for aligned storage, which is part of the performance-sensitive design rather than an incidental implementation detail.
 - The RDNA processor is JIT-oriented by default (`USE_INTERPRETER = false` in `src/rdna_processor.rs`), so RDNA changes often span decoding, processor execution, and LLVM translation together. GCN changes stay within the decoder/interpreter path.
