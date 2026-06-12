@@ -290,6 +290,15 @@ impl IREmitter {
 
         self.vgpr_reg_f64_map.get_mut(&reg).unwrap()[elem as usize / N] = std::ptr::null_mut();
 
+        // The f64 cache is keyed by the low register of the pair, so a write
+        // to this register also invalidates the pair cached at reg - 1, whose
+        // high half it clobbers.
+        if reg > 0 {
+            if let Some(values) = self.vgpr_reg_f64_map.get_mut(&(reg - 1)) {
+                values[elem as usize / N] = std::ptr::null_mut();
+            }
+        }
+
         self.vgpr_reg_map.get_mut(&reg).unwrap()[elem as usize / N] = value;
     }
 
