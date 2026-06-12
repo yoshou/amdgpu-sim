@@ -2220,10 +2220,8 @@ impl IREmitter {
 
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_value, inst.abs, inst.neg, 0);
-                        let s1_value = emitter.emit_i32_to_f64xn::<N>(s1_value);
 
-                        let s1_value = emitter.emit_exp2_f64xn::<N>(s1_value);
-                        let d_value = emitter.emit_fmul(s0_value, s1_value);
+                        let d_value = emitter.emit_ldexp_f64xn::<N>(s0_value, s1_value);
 
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }

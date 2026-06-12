@@ -566,6 +566,64 @@ impl IREmitter {
         ldexp_value
     }
 
+    // x86 has no vector lowering for llvm.ldexp/llvm.exp2, so those scalarize
+    // into per-lane scalbn libcalls. Compute x * 2^n inline instead, as three
+    // clamped power-of-two multiplies so overflow, underflow and denormals
+    // still round correctly over the full i32 exponent range.
+    pub(crate) unsafe fn emit_ldexp_f64xn<const N: usize>(
+        &mut self,
+        value0: llvm::prelude::LLVMValueRef,
+        value1: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+        let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+        let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
+
+        let splat_i32 = |v: i64| {
+            llvm::core::LLVMConstVector(
+                [llvm::core::LLVMConstInt(ty_i32, v as u64, 1); N].as_mut_ptr(),
+                N as u32,
+            )
+        };
+        let splat_i64 = |v: u64| {
+            llvm::core::LLVMConstVector(
+                [llvm::core::LLVMConstInt(ty_i64, v, 0); N].as_mut_ptr(),
+                N as u32,
+            )
+        };
+
+        let smin = self.get_intrinsic_declaration("llvm.smin.", &[ty_i32xn]);
+        let smax = self.get_intrinsic_declaration("llvm.smax.", &[ty_i32xn]);
+
+        let mut result = value0;
+        let mut remaining = value1;
+
+        for _ in 0..3 {
+            let step = smin.emit_call(ty_i32xn, &[remaining, splat_i32(1023)]);
+            let step = smax.emit_call(ty_i32xn, &[step, splat_i32(-1022)]);
+            remaining =
+                llvm::core::LLVMBuildSub(builder, remaining, step, empty_name.as_ptr());
+
+            let step = llvm::core::LLVMBuildSExt(builder, step, ty_i64xn, empty_name.as_ptr());
+            let biased =
+                llvm::core::LLVMBuildAdd(builder, step, splat_i64(1023), empty_name.as_ptr());
+            let bits =
+                llvm::core::LLVMBuildShl(builder, biased, splat_i64(52), empty_name.as_ptr());
+            let scale =
+                llvm::core::LLVMBuildBitCast(builder, bits, ty_f64xn, empty_name.as_ptr());
+
+            result = llvm::core::LLVMBuildFMul(builder, result, scale, empty_name.as_ptr());
+        }
+
+        result
+    }
+
     pub(crate) unsafe fn emit_ldexp_f32(
         &mut self,
         value0: llvm::prelude::LLVMValueRef,
