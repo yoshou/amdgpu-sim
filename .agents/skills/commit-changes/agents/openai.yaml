@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit changes"
+  short_description: "Stage and commit focused repo changes."
+  default_prompt: "Commit the current changes following this repository's commit style."
