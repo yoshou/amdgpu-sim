@@ -1,0 +1,4 @@
+interface:
+  display_name: "Profile RDNA JIT"
+  short_description: "Map JIT native perf samples to RDNA blocks"
+  default_prompt: "Use $profile-rdna-jit to profile an RDNA LLVM JIT workload and identify RDNA block bottlenecks."
