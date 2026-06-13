@@ -385,6 +385,10 @@ impl RDNATranslator {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.def_vgpr_f64(inst.vdst as u32);
                 }
+                I::V_SQRT_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f64(inst.vdst as u32);
+                }
                 I::V_RNDNE_F64 => {
                     reg_usage.use_operand_f64(&inst.src0);
                     reg_usage.def_vgpr_f64(inst.vdst as u32);

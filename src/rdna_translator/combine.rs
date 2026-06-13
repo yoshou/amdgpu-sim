@@ -711,10 +711,307 @@ fn match_div_f64(
     Some(matched)
 }
 
+fn as_rsq_f64(inst: &InstFormat) -> Option<(u32, u32)> {
+    match inst {
+        InstFormat::VOP1(i) if matches!(i.op, I::V_RSQ_F64) => {
+            Some((i.vdst as u32, vgpr_pair(&i.src0)?))
+        }
+        InstFormat::VOP3(i)
+            if matches!(i.op, I::V_RSQ_F64) && i.neg == 0 && i.abs == 0 && i.omod == 0 =>
+        {
+            Some((i.vdst as u32, vgpr_pair(&i.src0)?))
+        }
+        _ => None,
+    }
+}
+
+// (vdst pair, src0, src1) for an unmodified f64 multiply (VOP2 or VOP3).
+fn as_mul_f64(inst: &InstFormat) -> Option<(u32, SourceOperand, SourceOperand)> {
+    match inst {
+        InstFormat::VOP3(i)
+            if matches!(i.op, I::V_MUL_F64)
+                && i.neg == 0
+                && i.abs == 0
+                && i.omod == 0
+                && i.cm == 0
+                && i.opsel == 0 =>
+        {
+            Some((i.vdst as u32, i.src0, i.src1))
+        }
+        InstFormat::VOP2(i) if matches!(i.op, I::V_MUL_F64) => {
+            Some((i.vdst as u32, i.src0, SourceOperand::VectorRegister(i.vsrc1)))
+        }
+        _ => None,
+    }
+}
+
+// (vdst pair, src0, src1, src2, neg) for an unmodified f64 FMA.
+fn as_fma_f64(
+    inst: &InstFormat,
+) -> Option<(u32, SourceOperand, SourceOperand, SourceOperand, u8)> {
+    if let InstFormat::VOP3(i) = inst {
+        if matches!(i.op, I::V_FMA_F64) && i.abs == 0 && i.omod == 0 && i.cm == 0 && i.opsel == 0 {
+            return Some((i.vdst as u32, i.src0, i.src1, i.src2, i.neg));
+        }
+    }
+    None
+}
+
+// First index after `start` whose instruction satisfies `pred`. The chain is a
+// strict data dependency, so the matching instruction is uniquely pinned by its
+// register operands; interleaved scheduling fillers are skipped.
+fn find_forward(
+    insts: &[InstFormat],
+    start: usize,
+    end: usize,
+    pred: impl Fn(&InstFormat) -> bool,
+) -> Option<usize> {
+    (start + 1..end).find(|&j| pred(&insts[j]))
+}
+
+fn is_mul_xy(inst: &InstFormat, x: u32, y: u32) -> Option<u32> {
+    let (dst, s0, s1) = as_mul_f64(inst)?;
+    let (a, b) = (vgpr_pair(&s0), vgpr_pair(&s1));
+    if (a == Some(x) && b == Some(y)) || (a == Some(y) && b == Some(x)) {
+        Some(dst)
+    } else {
+        None
+    }
+}
+
+fn is_mul_half(inst: &InstFormat, r: u32) -> Option<u32> {
+    let (dst, s0, s1) = as_mul_f64(inst)?;
+    let half = |o: &SourceOperand| matches!(o, SourceOperand::FloatConstant(v) if v.to_bits() == 0.5f64.to_bits());
+    if (half(&s0) && vgpr_pair(&s1) == Some(r)) || (half(&s1) && vgpr_pair(&s0) == Some(r)) {
+        Some(dst)
+    } else {
+        None
+    }
+}
+
+// Matches the rsq + Newton-Raphson f64 sqrt expansion seeded at the
+// V_RSQ_F64 `anchor`:
+//
+//   r  = rsq(X)             [anchor, dst rD]
+//   A  = X * rD
+//   rD = 0.5 * rD
+//   B  = fma(-rD, A, 0.5)
+//   A  = fma(A, B, A)
+//   rD = fma(rD, B, rD)
+//   B  = fma(-A, A, X)
+//   A  = fma(B, rD, A)
+//   B  = fma(-A, A, X)
+//   rD = fma(B, rD, A)      [final, = sqrt(X)]
+//
+// rD ends holding sqrt(X) so the whole chain collapses to V_SQRT_F64(rD, X):
+// returns the final FMA index (to rewrite) and the other chain indices (to
+// remove). X is never written by the chain, so it is still live to seed the
+// sqrt; this is checked, as is that nothing outside the chain observes the
+// temporaries.
+struct SqrtMatch {
+    final_idx: usize,
+    removed: Vec<usize>,
+    rd: u32,
+    x: u32,
+}
+
+fn match_sqrt_f64(insts: &[InstFormat], effects: &[InstEffects], anchor: usize) -> Option<SqrtMatch> {
+    let (rd, x) = as_rsq_f64(&insts[anchor])?;
+    let n = insts.len();
+
+    // step1: A = X * rD
+    let i1 = find_forward(insts, anchor, n, |i| is_mul_xy(i, x, rd).is_some())?;
+    let a = is_mul_xy(&insts[i1], x, rd)?;
+
+    // step2: rD = 0.5 * rD
+    let i2 = find_forward(insts, i1, n, |i| is_mul_half(i, rd) == Some(rd))?;
+
+    // step3: B = fma(-rD, A, 0.5)
+    let i3 = find_forward(insts, i2, n, |i| {
+        as_fma_f64(i).map_or(false, |(_, s0, s1, s2, neg)| {
+            neg == 1
+                && vgpr_pair(&s0) == Some(rd)
+                && vgpr_pair(&s1) == Some(a)
+                && matches!(s2, SourceOperand::FloatConstant(v) if v.to_bits() == 0.5f64.to_bits())
+        })
+    })?;
+    let b = as_fma_f64(&insts[i3])?.0;
+
+    // step4: A = fma(A, B, A)
+    let i4 = find_forward(insts, i3, n, |i| {
+        as_fma_f64(i).map_or(false, |(d, s0, s1, s2, neg)| {
+            d == a
+                && neg == 0
+                && vgpr_pair(&s0) == Some(a)
+                && vgpr_pair(&s1) == Some(b)
+                && vgpr_pair(&s2) == Some(a)
+        })
+    })?;
+
+    // step5: rD = fma(rD, B, rD)
+    let i5 = find_forward(insts, i4, n, |i| {
+        as_fma_f64(i).map_or(false, |(d, s0, s1, s2, neg)| {
+            d == rd
+                && neg == 0
+                && vgpr_pair(&s0) == Some(rd)
+                && vgpr_pair(&s1) == Some(b)
+                && vgpr_pair(&s2) == Some(rd)
+        })
+    })?;
+
+    // step6: B = fma(-A, A, X)
+    let i6 = find_forward(insts, i5, n, |i| {
+        as_fma_f64(i).map_or(false, |(d, s0, s1, s2, neg)| {
+            d == b
+                && neg == 1
+                && vgpr_pair(&s0) == Some(a)
+                && vgpr_pair(&s1) == Some(a)
+                && vgpr_pair(&s2) == Some(x)
+        })
+    })?;
+
+    // step7: A = fma(B, rD, A)
+    let i7 = find_forward(insts, i6, n, |i| {
+        as_fma_f64(i).map_or(false, |(d, s0, s1, s2, neg)| {
+            d == a
+                && neg == 0
+                && vgpr_pair(&s0) == Some(b)
+                && vgpr_pair(&s1) == Some(rd)
+                && vgpr_pair(&s2) == Some(a)
+        })
+    })?;
+
+    // step8: B = fma(-A, A, X)
+    let i8 = find_forward(insts, i7, n, |i| {
+        as_fma_f64(i).map_or(false, |(d, s0, s1, s2, neg)| {
+            d == b
+                && neg == 1
+                && vgpr_pair(&s0) == Some(a)
+                && vgpr_pair(&s1) == Some(a)
+                && vgpr_pair(&s2) == Some(x)
+        })
+    })?;
+
+    // step9: rD = fma(B, rD, A)  -> final sqrt(X)
+    let i9 = find_forward(insts, i8, n, |i| {
+        as_fma_f64(i).map_or(false, |(d, s0, s1, s2, neg)| {
+            d == rd
+                && neg == 0
+                && vgpr_pair(&s0) == Some(b)
+                && vgpr_pair(&s1) == Some(rd)
+                && vgpr_pair(&s2) == Some(a)
+        })
+    })?;
+
+    let removed = vec![anchor, i1, i2, i3, i4, i5, i6, i7, i8];
+
+    // X must remain unwritten through the final FMA so the rewritten sqrt
+    // reads the same input the chain consumed.
+    for j in (anchor + 1)..i9 {
+        if removed.contains(&j) {
+            continue;
+        }
+        let e = &effects[j];
+        if !e.known {
+            return None;
+        }
+        if e.kills.contains(&(VGPR_BASE + x)) || e.kills.contains(&(VGPR_BASE + x + 1)) {
+            return None;
+        }
+    }
+
+    // The chain's temporaries (A, B and the intermediate rD writes) must not be
+    // observed outside the matched set before being overwritten. The final FMA
+    // is rewritten to read only X, so reads by it no longer count.
+    let matched: Vec<usize> = removed.iter().copied().chain(std::iter::once(i9)).collect();
+    for &i in &removed {
+        for &reg in &effects[i].kills {
+            let mut killed = false;
+            for j in (i + 1)..n {
+                if matched.contains(&j) {
+                    if j == i9 {
+                        // After rewrite the final FMA neither reads nor writes
+                        // the temporaries (only X -> rD), except rD which it
+                        // still defines.
+                        if reg == VGPR_BASE + rd || reg == VGPR_BASE + rd + 1 {
+                            killed = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if effects[j].kills.contains(&reg) {
+                        killed = true;
+                        break;
+                    }
+                    continue;
+                }
+                let ej = &effects[j];
+                if !ej.known {
+                    return None;
+                }
+                if ej.reads.contains(&reg) {
+                    return None;
+                }
+                if ej.kills.contains(&reg) {
+                    killed = true;
+                    break;
+                }
+            }
+            // Stricter than the div matcher: a temporary surviving to the block
+            // end may be read by a successor block (e.g. the chain's sqrt/rsqrt
+            // estimates), so only remove a definition that is provably
+            // overwritten within this block.
+            if !killed {
+                return None;
+            }
+        }
+    }
+
+    Some(SqrtMatch {
+        final_idx: i9,
+        removed,
+        rd,
+        x,
+    })
+}
+
 // Removes instructions whose results are provably dead within the block.
 // Returns the number of removed instructions.
 pub(crate) fn combine_block(insts: &mut Vec<InstFormat>) -> usize {
     let mut removed_total = 0;
+
+    // Phase 0: collapse rsq + Newton-Raphson f64 sqrt expansions to a single
+    // V_SQRT_F64. Rewrites the final FMA in place and deletes the rest.
+    {
+        let effects: Vec<InstEffects> = insts.iter().map(effects_of).collect();
+        let mut remove = vec![false; insts.len()];
+        let mut rewrites: Vec<(usize, InstFormat)> = Vec::new();
+
+        for anchor in 0..insts.len() {
+            if let Some(m) = match_sqrt_f64(insts, &effects, anchor) {
+                if m.removed.iter().all(|&i| !remove[i]) && !remove[m.final_idx] {
+                    for &i in &m.removed {
+                        remove[i] = true;
+                    }
+                    rewrites.push((
+                        m.final_idx,
+                        InstFormat::VOP1(VOP1 {
+                            src0: SourceOperand::VectorRegister(m.x as u8),
+                            op: I::V_SQRT_F64,
+                            vdst: m.rd as u8,
+                        }),
+                    ));
+                }
+            }
+        }
+
+        for (idx, inst) in rewrites {
+            insts[idx] = inst;
+        }
+        removed_total += remove.iter().filter(|&&r| r).count();
+        let mut keep = remove.iter().map(|&r| !r);
+        insts.retain(|_| keep.next().unwrap());
+    }
 
     // Phase 1: pattern-matched rewrites. V_DIV_FIXUP_F64 already computes the
     // quotient by itself, so a matched expansion chain is deleted wholesale.

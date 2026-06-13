@@ -826,6 +826,46 @@ impl IREmitter {
                     });
                 }
             }
+            // Not a native RDNA single-instruction; synthesized by the
+            // instruction combine pass to collapse the rsq+Newton-Raphson
+            // sqrt expansion into one correctly-rounded sqrt.
+            I::V_SQRT_F64 => {
+                if USE_SIMD {
+                    let emitter = self;
+                    let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                    const N: usize = SIMD_WIDTH;
+
+                    for i in (0..32).step_by(N) {
+                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+                        let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
+
+                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                        let s0_value =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+
+                        let intrinsic =
+                            emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f64xn]);
+                        let d_value = intrinsic.emit_call(ty_f64xn, &[s0_value]);
+
+                        emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
+                    }
+                } else {
+                    bb = self.emit_vop(bb, |emitter, bb, elem| {
+                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+
+                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f64]);
+                        let d_value = intrinsic.emit_call(ty_f64, &[s0_value]);
+
+                        emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
+
+                        bb
+                    });
+                }
+            }
             I::V_RSQ_F64 => {
                 if USE_SIMD {
                     let emitter = self;
