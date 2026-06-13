@@ -11,13 +11,16 @@ use std::ffi::c_ulonglong;
 use std::os::raw::c_void;
 
 mod bvh;
+mod combine;
 mod emitter;
 mod register_usage;
 
 pub use bvh::*;
+pub(crate) use combine::*;
 pub(crate) use emitter::*;
 pub(crate) use register_usage::*;
 
+pub(crate) const USE_INSTRUCTION_COMBINE: bool = true;
 pub(crate) const USE_VGPR_CACHE: bool = true;
 pub(crate) const USE_SGPR_CACHE: bool = true;
 pub(crate) const USE_SIMD: bool = true;
@@ -1254,6 +1257,16 @@ impl RDNAProgram {
         for range in ranges {
             let block = Self::create_basic_block_from_range(&range, &inst_stream);
             basic_blocks.insert(range.start, block);
+        }
+
+        if USE_INSTRUCTION_COMBINE {
+            let mut removed = 0;
+            for block in basic_blocks.values_mut() {
+                removed += combine_block(&mut block.insts);
+            }
+            if removed > 0 {
+                println!("Instruction combine removed {} instructions", removed);
+            }
         }
 
         RDNAProgram {

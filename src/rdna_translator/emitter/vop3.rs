@@ -2083,6 +2083,10 @@ impl IREmitter {
                 }
             }
             I::V_DIV_FIXUP_F64 => {
+                // S1 and S2 are the original denominator and numerator, so the
+                // IEEE quotient can be computed here directly. This makes the
+                // upstream div_scale/rcp/div_fmas refinement chain dead code,
+                // which the instruction combine pass removes.
                 if USE_SIMD {
                     let emitter = self;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
@@ -2091,15 +2095,8 @@ impl IREmitter {
 
                     for i in (0..32).step_by(N) {
                         let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-                        let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
-                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                        let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
-
-                        let s0_value =
-                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
                         let s1_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src1, i, mask);
@@ -2107,54 +2104,15 @@ impl IREmitter {
                         let s2_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src2, i, mask);
 
-                        let s0_value =
-                            emitter.emit_abs_neg_f64xn::<N>(s0_value, inst.abs, inst.neg, 0);
                         let s1_value =
                             emitter.emit_abs_neg_f64xn::<N>(s1_value, inst.abs, inst.neg, 1);
                         let s2_value =
                             emitter.emit_abs_neg_f64xn::<N>(s2_value, inst.abs, inst.neg, 2);
 
-                        let s1_value = llvm::core::LLVMBuildBitCast(
-                            builder,
-                            s1_value,
-                            ty_i64xn,
-                            empty_name.as_ptr(),
-                        );
-
-                        let s2_value = llvm::core::LLVMBuildBitCast(
+                        let d_value = llvm::core::LLVMBuildFDiv(
                             builder,
                             s2_value,
-                            ty_i64xn,
-                            empty_name.as_ptr(),
-                        );
-
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.fabs.", &[ty_f64xn]);
-                        let abs_value = intrinsic.emit_call(ty_f64xn, &[s0_value]);
-                        let neg_value =
-                            llvm::core::LLVMBuildFNeg(builder, abs_value, empty_name.as_ptr());
-                        let sign_out = llvm::core::LLVMBuildXor(
-                            builder,
                             s1_value,
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
-                        let zero_vec = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
-                        let sign_out = llvm::core::LLVMBuildICmp(
-                            builder,
-                            llvm::LLVMIntPredicate::LLVMIntSLT,
-                            sign_out,
-                            zero_vec,
-                            empty_name.as_ptr(),
-                        );
-                        let d_value = llvm::core::LLVMBuildSelect(
-                            builder,
-                            sign_out,
-                            neg_value,
-                            abs_value,
                             empty_name.as_ptr(),
                         );
 
@@ -2162,40 +2120,22 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                         let empty_name = std::ffi::CString::new("").unwrap();
 
-                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
+                        let s1_value = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
 
-                        let s1_value = emitter.emit_vector_source_operand_u64(&inst.src1, elem);
+                        let s2_value = emitter.emit_vector_source_operand_f64(&inst.src2, elem);
 
-                        let s2_value = emitter.emit_vector_source_operand_u64(&inst.src2, elem);
+                        let s1_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s1_value, 1);
+                        let s2_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s2_value, 2);
 
-                        let intrinsic = emitter.get_intrinsic_declaration("llvm.fabs.", &[ty_f64]);
-                        let abs_value = intrinsic.emit_call(ty_f64, &[s0_value]);
-                        let neg_value =
-                            llvm::core::LLVMBuildFNeg(builder, abs_value, empty_name.as_ptr());
-                        let sign_out = llvm::core::LLVMBuildXor(
+                        let d_value = llvm::core::LLVMBuildFDiv(
                             builder,
-                            s1_value,
                             s2_value,
+                            s1_value,
                             empty_name.as_ptr(),
                         );
-                        let sign_out = llvm::core::LLVMBuildICmp(
-                            builder,
-                            llvm::LLVMIntPredicate::LLVMIntSLT,
-                            sign_out,
-                            llvm::core::LLVMConstInt(ty_i64, 0, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let d_value = llvm::core::LLVMBuildSelect(
-                            builder,
-                            sign_out,
-                            neg_value,
-                            abs_value,
-                            empty_name.as_ptr(),
-                        );
+
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb

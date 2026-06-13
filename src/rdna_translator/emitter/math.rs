@@ -509,7 +509,7 @@ impl IREmitter {
         value
     }
 
-    pub(crate) unsafe fn emit_i32_to_f64xn<const N: usize>(
+    pub(crate) unsafe fn _emit_i32_to_f64xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
@@ -537,7 +537,7 @@ impl IREmitter {
         exp2_value
     }
 
-    pub(crate) unsafe fn emit_exp2_f64xn<const N: usize>(
+    pub(crate) unsafe fn _emit_exp2_f64xn<const N: usize>(
         &mut self,
         value0: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
