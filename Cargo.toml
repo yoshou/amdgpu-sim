@@ -36,6 +36,3 @@ default = ["llvm-sys/prefer-dynamic"]
 
 [profile.release]
 debug = "line-tables-only"
-
-[build]
-rustflags = ["-C", "force-frame-pointers=yes"]

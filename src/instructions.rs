@@ -30,7 +30,7 @@ pub enum OP8 {
 }
 
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum I {
     S_MOV_B32,
     S_MOV_B64,

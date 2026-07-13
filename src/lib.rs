@@ -8,6 +8,7 @@ pub mod processor;
 pub mod rdna4_decoder;
 pub mod rdna_instructions;
 pub mod rdna_processor;
+pub mod rdna_spmd;
 pub mod rdna_translator;
 
 extern crate num;

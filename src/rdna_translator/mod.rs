@@ -1117,12 +1117,34 @@ struct Range {
     end: usize, // Exclusive end
 }
 
-struct BasicBlock {
+pub struct BasicBlock {
     insts: Vec<InstFormat>,
     next_pcs: Vec<usize>,
 }
 
+impl BasicBlock {
+    /// Instructions in program order.
+    pub fn insts(&self) -> &[InstFormat] {
+        &self.insts
+    }
+
+    /// Successor PCs, with fall-through before the branch target.
+    pub fn next_pcs(&self) -> &[usize] {
+        &self.next_pcs
+    }
+}
+
 impl RDNAProgram {
+    /// Program entry PC.
+    pub fn entry_pc(&self) -> usize {
+        self.entry_pc
+    }
+
+    /// Decoded basic blocks keyed by start PC.
+    pub fn blocks(&self) -> &HashMap<usize, BasicBlock> {
+        &self.insts_blocks
+    }
+
     fn get_next_pcs(pc: usize, inst: &InstFormat) -> Vec<usize> {
         let mut next_pscs = Vec::new();
         match inst {

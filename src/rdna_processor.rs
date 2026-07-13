@@ -1921,7 +1921,10 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
             let mut d_value = (s0_value + 0.5).floor();
-            if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
+            // Round-ties-to-even with FLOOR-based fract (ISA §V_RNDNE): Rust
+            // f32::fract() truncates, giving a negative fraction for negative x
+            // and never firing the tie adjust.
+            if s0_value.floor() % 2.0 == 0.0 && (s0_value - s0_value.floor()) == 0.5 {
                 d_value -= 1.0;
             }
 
@@ -1959,7 +1962,9 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
-            let d_value = s0_value.fract();
+            // FLOOR-based fractional part (ISA §V_FRACT): fract(-1.2) = 0.8.
+            // Rust f64::fract() truncates, giving the wrong sign for negatives.
+            let d_value = s0_value - s0_value.floor();
 
             self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
         }
@@ -2031,7 +2036,8 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
             let mut d_value = (s0_value + 0.5).floor();
-            if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
+            // Round-ties-to-even with FLOOR-based fract (see V_RNDNE_F32).
+            if s0_value.floor() % 2.0 == 0.0 && (s0_value - s0_value.floor()) == 0.5 {
                 d_value -= 1.0;
             }
 
@@ -2653,7 +2659,7 @@ impl SIMD32 {
                 self.v_trig_preop_f64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CVT_F32_F16 => {
-                self.v_cvt_f32_f16_e64(d, s0, abs, neg, clamp, omod);
+                self.v_cvt_f32_f16_e64(d, s0, abs, neg, clamp, omod, inst.opsel);
             }
             I::V_LDEXP_F32 => {
                 self.v_ldexp_f32(d, s0, s1, abs, neg, clamp, omod);
@@ -3214,7 +3220,8 @@ impl SIMD32 {
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
             let s1_value = abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1);
-            let d_value = s0_value != s1_value;
+            // LG = ORDERED not-equal (false if either is NaN); ISA §V_CMP_LG.
+            let d_value = s0_value < s1_value || s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
@@ -3666,7 +3673,8 @@ impl SIMD32 {
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
             let s1_value = abs_neg(self.read_vector_source_operand_f64(elem, s1), abs, neg, 1);
-            let d_value = s0_value != s1_value;
+            // LG = ORDERED not-equal (false if either is NaN); ISA §V_CMP_LG.
+            let d_value = s0_value < s1_value || s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
@@ -3875,19 +3883,21 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
-        _clamp: bool,
-        _omod: u8,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        omod: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_f64(elem, s0);
+            // Apply VOP3 input abs/neg and output clamp/omod modifiers, like the
+            // sibling v_rcp_f64_e64 (they were previously ignored).
+            let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
             let d_value = 1.0 / s0_value.sqrt();
 
-            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+            self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
 
@@ -4194,12 +4204,19 @@ impl SIMD32 {
         neg: u8,
         clamp: bool,
         omod: u8,
+        opsel: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = abs_neg_f16(self.read_vector_source_operand_f16(elem, s0), abs, neg, 0);
+            // RDNA4 ISA: OPSEL[0] selects src0's f16 half (1=high, 0=low).
+            let raw = if opsel & 1 != 0 {
+                self.read_vector_source_operand_f16_hi(elem, s0)
+            } else {
+                self.read_vector_source_operand_f16(elem, s0)
+            };
+            let s0_value = abs_neg_f16(raw, abs, neg, 0);
             let d_value = s0_value.to_f32();
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
@@ -4559,55 +4576,41 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
+            // RDNA4 ISA §V_FMA_MIXLO_F16: {OPSEL_HI[i], OPSEL[i]} selects each src —
+            // OPSEL_HI=0 → f32; OPSEL_HI=1 & OPSEL=1 → hi f16; OPSEL_HI=1 & OPSEL=0
+            // → lo f16. NEG_HI acts as the abs modifier (passed as `abs`).
             let s0_value = if opsel_hi & 1 == 0 {
                 abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0)
-            } else if opsel & 1 == 0 {
-                abs_neg_f16(
-                    self.read_vector_source_operand_f16_hi(elem, s0),
-                    abs,
-                    neg,
-                    0,
-                )
-                .to_f32()
+            } else if opsel & 1 != 0 {
+                abs_neg_f16(self.read_vector_source_operand_f16_hi(elem, s0), abs, neg, 0).to_f32()
             } else {
                 abs_neg_f16(self.read_vector_source_operand_f16(elem, s0), abs, neg, 0).to_f32()
             };
 
             let s1_value = if opsel_hi & 2 == 0 {
                 abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1)
-            } else if opsel & 2 == 0 {
-                abs_neg_f16(
-                    self.read_vector_source_operand_f16_hi(elem, s1),
-                    abs,
-                    neg,
-                    1,
-                )
-                .to_f32()
+            } else if opsel & 2 != 0 {
+                abs_neg_f16(self.read_vector_source_operand_f16_hi(elem, s1), abs, neg, 1).to_f32()
             } else {
                 abs_neg_f16(self.read_vector_source_operand_f16(elem, s1), abs, neg, 1).to_f32()
             };
 
             let s2_value = if opsel_hi & 4 == 0 {
                 abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2)
-            } else if opsel & 4 == 0 {
-                abs_neg_f16(
-                    self.read_vector_source_operand_f16_hi(elem, s2),
-                    abs,
-                    neg,
-                    2,
-                )
-                .to_f32()
+            } else if opsel & 4 != 0 {
+                abs_neg_f16(self.read_vector_source_operand_f16_hi(elem, s2), abs, neg, 2).to_f32()
             } else {
                 abs_neg_f16(self.read_vector_source_operand_f16(elem, s2), abs, neg, 2).to_f32()
             };
 
             let d_value = fma(s0_value, s1_value, s2_value);
 
-            self.write_vgpr(
-                elem,
-                d,
-                f16::from_f32(clamp_f32(d_value, clamp)).to_bits() as u32,
-            );
+            // `D0[15:0].f16 = f32_to_f16(fma)`: write the low 16 bits and preserve
+            // the destination's high 16 bits; no clamp (not in the ISA pseudocode).
+            let _ = clamp;
+            let old = self.read_vgpr(elem, d);
+            let lo = f16::from_f32(d_value).to_bits() as u32;
+            self.write_vgpr(elem, d, (old & 0xffff_0000) | lo);
         }
     }
 
@@ -5724,8 +5727,9 @@ impl SIMD32 {
             }
             let data = self.read_vgpr(elem, vsrc);
             let vaddr_val = 0u64;
-            let saddr_val = self.read_sgpr(saddr) as u64;
-            let offset = (vaddr_val + saddr_val + (ioffset as u64)) * 32 + (elem as u64) * 4;
+            // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+            let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64)) * 32 + (elem as u64) * 4;
             let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
             assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
@@ -5744,8 +5748,9 @@ impl SIMD32 {
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
                 let vaddr_val = 0u64;
-                let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
                     + (elem as u64) * 4;
                 let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
                 assert!(offset < self.ctx.scratch.borrow().len() as u64);
@@ -5766,8 +5771,9 @@ impl SIMD32 {
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
                 let vaddr_val = 0u64;
-                let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
                     + (elem as u64) * 4;
                 let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
                 assert!(offset < self.ctx.scratch.borrow().len() as u64);
@@ -5788,8 +5794,9 @@ impl SIMD32 {
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
                 let vaddr_val = 0u64;
-                let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
                     + (elem as u64) * 4;
                 let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
                 assert!(offset < self.ctx.scratch.borrow().len() as u64);
@@ -5808,8 +5815,9 @@ impl SIMD32 {
                 continue;
             }
             let vaddr_val = 0u64;
-            let saddr_val = self.read_sgpr(saddr) as u64;
-            let offset = (vaddr_val + saddr_val + (ioffset as u64)) * 32 + (elem as u64) * 4;
+            // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+            let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64)) * 32 + (elem as u64) * 4;
             let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
             assert!(offset < self.ctx.scratch.borrow().len() as u64);
 
@@ -5826,8 +5834,9 @@ impl SIMD32 {
                     continue;
                 }
                 let vaddr_val = 0u64;
-                let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
                     + (elem as u64) * 4;
                 let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
                 assert!(offset < self.ctx.scratch.borrow().len() as u64);
@@ -5846,8 +5855,9 @@ impl SIMD32 {
                     continue;
                 }
                 let vaddr_val = 0u64;
-                let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
                     + (elem as u64) * 4;
                 let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
                 assert!(offset < self.ctx.scratch.borrow().len() as u64);
@@ -5866,8 +5876,9 @@ impl SIMD32 {
                     continue;
                 }
                 let vaddr_val = 0u64;
-                let saddr_val = self.read_sgpr(saddr) as u64;
-                let offset = (vaddr_val + saddr_val + (ioffset as u64) + (i as u64 * 4)) * 32
+                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
+            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
+                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
                     + (elem as u64) * 4;
                 let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
                 assert!(offset < self.ctx.scratch.borrow().len() as u64);
@@ -5939,7 +5950,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem] + (ioffset as u64);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u16;
             unsafe {
@@ -5964,7 +5975,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem] + (ioffset as u64);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u32;
             unsafe {
@@ -5990,7 +6001,7 @@ impl SIMD32 {
                     continue;
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
-                let addr = offset[elem] + (ioffset as u64) + (i as u64 * 4);
+                let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -6017,7 +6028,7 @@ impl SIMD32 {
                     continue;
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
-                let addr = offset[elem] + (ioffset as u64) + (i as u64 * 4);
+                let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -6042,7 +6053,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (ioffset as u64);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u8;
             let data = unsafe { *ptr };
@@ -6065,7 +6076,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (ioffset as u64);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u16;
             let data = unsafe { *ptr };
@@ -6088,7 +6099,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (ioffset as u64);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u32;
             let data = unsafe { *ptr };
@@ -6112,7 +6123,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let addr = offset[elem] + (ioffset as u64) + (i as u64 * 4);
+                let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 let data = unsafe { *ptr };
@@ -6169,7 +6180,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (ioffset as u64);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
             let data = self.read_vgpr(elem, vsrc);
 
             let ptr = addr as *mut u32;

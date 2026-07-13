@@ -3734,8 +3734,12 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_value =
-                            emitter.emit_vector_source_operand_f16xn::<N>(&inst.src0, i, mask);
+                        // RDNA4 ISA: OPSEL[0] selects src0's f16 half (1=high, 0=low).
+                        let s0_value = if inst.opsel & 1 != 0 {
+                            emitter.emit_vector_source_operand_hi_f16xn::<N>(&inst.src0, i, mask)
+                        } else {
+                            emitter.emit_vector_source_operand_f16xn::<N>(&inst.src0, i, mask)
+                        };
 
                         let d_value = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -3751,7 +3755,11 @@ impl IREmitter {
                         let empty_name = std::ffi::CString::new("").unwrap();
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
-                        let s0_value = emitter.emit_vector_source_operand_f16(&inst.src0, elem);
+                        let s0_value = if inst.opsel & 1 != 0 {
+                            emitter.emit_vector_source_operand_hi_f16(&inst.src0, elem)
+                        } else {
+                            emitter.emit_vector_source_operand_f16(&inst.src0, elem)
+                        };
 
                         let d_value = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -5917,9 +5925,11 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
+                        // {OPSEL_HI[i], OPSEL[i]}: HI=0 → f32; HI=1 & SEL=1 → hi f16;
+                        // HI=1 & SEL=0 → lo f16 (RDNA4 ISA §V_FMA_MIXLO_F16).
                         let s0_value = if opsel_hi & 1 == 0 {
                             emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask)
-                        } else if inst.opsel & 1 == 0 {
+                        } else if inst.opsel & 1 != 0 {
                             let value = emitter
                                 .emit_vector_source_operand_hi_f16xn::<N>(&inst.src0, i, mask);
 
@@ -5942,7 +5952,7 @@ impl IREmitter {
 
                         let s1_value = if opsel_hi & 2 == 0 {
                             emitter.emit_vector_source_operand_f32xn::<N>(&inst.src1, i, mask)
-                        } else if inst.opsel & 2 == 0 {
+                        } else if inst.opsel & 2 != 0 {
                             let value = emitter
                                 .emit_vector_source_operand_hi_f16xn::<N>(&inst.src1, i, mask);
 
@@ -5965,7 +5975,7 @@ impl IREmitter {
 
                         let s2_value = if opsel_hi & 4 == 0 {
                             emitter.emit_vector_source_operand_f32xn::<N>(&inst.src2, i, mask)
-                        } else if inst.opsel & 4 == 0 {
+                        } else if inst.opsel & 4 != 0 {
                             let value = emitter
                                 .emit_vector_source_operand_hi_f16xn::<N>(&inst.src2, i, mask);
 
@@ -6015,6 +6025,14 @@ impl IREmitter {
                             ty_i32xn,
                             empty_name.as_ptr(),
                         );
+                        // MIXLO writes vdst[15:0]; preserve the existing high 16 bits.
+                        let old = emitter.emit_load_vgpr_u32xn::<N>(inst.vdst as u32, i, mask);
+                        let himask = llvm::core::LLVMConstVector(
+                            [llvm::core::LLVMConstInt(ty_i32, 0xffff_0000, 0); N].as_mut_ptr(),
+                            N as u32,
+                        );
+                        let hi = llvm::core::LLVMBuildAnd(builder, old, himask, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildOr(builder, hi, d_value, empty_name.as_ptr());
                         emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -6027,9 +6045,11 @@ impl IREmitter {
 
                         let opsel_hi = (inst.opsel_hi2 << 2) | inst.opsel_hi;
 
+                        // {OPSEL_HI[i], OPSEL[i]}: HI=0 → f32; HI=1 & SEL=1 → hi f16;
+                        // HI=1 & SEL=0 → lo f16 (RDNA4 ISA §V_FMA_MIXLO_F16).
                         let s0_value = if opsel_hi & 1 == 0 {
                             emitter.emit_vector_source_operand_f32(&inst.src0, elem)
-                        } else if inst.opsel & 1 == 0 {
+                        } else if inst.opsel & 1 != 0 {
                             let value = emitter.emit_vector_source_operand_hi_f16(&inst.src0, elem);
 
                             llvm::core::LLVMBuildFPExt(builder, value, ty_f32, empty_name.as_ptr())
@@ -6040,7 +6060,7 @@ impl IREmitter {
 
                         let s1_value = if opsel_hi & 2 == 0 {
                             emitter.emit_vector_source_operand_f32(&inst.src1, elem)
-                        } else if inst.opsel & 2 == 0 {
+                        } else if inst.opsel & 2 != 0 {
                             let value = emitter.emit_vector_source_operand_hi_f16(&inst.src1, elem);
 
                             llvm::core::LLVMBuildFPExt(builder, value, ty_f32, empty_name.as_ptr())
@@ -6051,7 +6071,7 @@ impl IREmitter {
 
                         let s2_value = if opsel_hi & 4 == 0 {
                             emitter.emit_vector_source_operand_f32(&inst.src2, elem)
-                        } else if inst.opsel & 4 == 0 {
+                        } else if inst.opsel & 4 != 0 {
                             let value = emitter.emit_vector_source_operand_hi_f16(&inst.src2, elem);
 
                             llvm::core::LLVMBuildFPExt(builder, value, ty_f32, empty_name.as_ptr())
@@ -6087,6 +6107,16 @@ impl IREmitter {
                             ty_i32,
                             empty_name.as_ptr(),
                         );
+
+                        // MIXLO writes vdst[15:0]; preserve the existing high 16 bits.
+                        let old = emitter.emit_load_vgpr_u32(inst.vdst as u32, elem);
+                        let hi = llvm::core::LLVMBuildAnd(
+                            builder,
+                            old,
+                            llvm::core::LLVMConstInt(ty_i32, 0xffff_0000, 0),
+                            empty_name.as_ptr(),
+                        );
+                        let d_value = llvm::core::LLVMBuildOr(builder, hi, d_value, empty_name.as_ptr());
 
                         emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
 

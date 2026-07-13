@@ -383,7 +383,7 @@ fn effects_of(inst: &InstFormat) -> InstEffects {
         }
         InstFormat::VOPD(inst) => {
             let half =
-                |op: &I, src0: &SourceOperand, vsrc1: u8, vdst: u8| -> Option<(Vec<u32>, Vec<u32>)> {
+                |op: &I, src0: &SourceOperand, vsrc1: u8, vdst: u32| -> Option<(Vec<u32>, Vec<u32>)> {
                     let mut reads = Vec::new();
                     let mut kills = Vec::new();
                     match op {
@@ -414,9 +414,13 @@ fn effects_of(inst: &InstFormat) -> InstEffects {
                     Some((reads, kills))
                 };
 
+            // VOPD Y-op's real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1) — opposite
+            // parity of X — not vdsty directly. Using vdsty here made the DCE treat
+            // the wrong register as killed and drop live producers of the real one.
+            let dy = ((inst.vdsty as u32) << 1) | (((inst.vdstx as u32) & 1) ^ 1);
             match (
-                half(&inst.opx, &inst.src0x, inst.vsrc1x, inst.vdstx),
-                half(&inst.opy, &inst.src0y, inst.vsrc1y, inst.vdsty),
+                half(&inst.opx, &inst.src0x, inst.vsrc1x, inst.vdstx as u32),
+                half(&inst.opy, &inst.src0y, inst.vsrc1y, dy),
             ) {
                 (Some((rx, kx)), Some((ry, ky))) => {
                     let mut reads = rx;
