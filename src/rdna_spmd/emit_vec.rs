@@ -1873,7 +1873,8 @@ impl Cg {
             }
             op if f64_pred(op).is_some() => {
                 let (pred, invert) = f64_pred(op).unwrap();
-                let a = self.vsrc_f64(&i.src0); let b = self.vsrc_f64(&i.src1);
+                let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0);
+                let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1);
                 let mut c = llvm::core::LLVMBuildFCmp(self.b, pred, a, b, self.n());
                 if invert { c = llvm::core::LLVMBuildNot(self.b, c, self.n()); }
                 self.st_cmp(i.vdst as u32, c);

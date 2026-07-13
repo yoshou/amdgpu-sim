@@ -1500,8 +1500,8 @@ impl Cg {
             // ----- f64 compares encoded as VOP3 (dest = vdst sgpr mask) -----
             op if f64_pred(op).is_some() => {
                 let (pred, invert) = f64_pred(op).unwrap();
-                let a = self.src_f64(&i.src0);
-                let b = self.src_f64(&i.src1);
+                let a = self.absneg_f64(self.src_f64(&i.src0), i.abs, i.neg, 0);
+                let b = self.absneg_f64(self.src_f64(&i.src1), i.abs, i.neg, 1);
                 let mut c = llvm::core::LLVMBuildFCmp(self.b, pred, a, b, self.n());
                 if invert {
                     c = self.b_not(c);
