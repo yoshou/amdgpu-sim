@@ -9,10 +9,28 @@ This simulator executes the HSA code object for AMD GPU on CPU.
 
 ## Execution engines
 
-| Architecture | Interpreter | LLVM JIT |
-|--------------|-------------|-----------|
-| gfx1200      | Supported   | Supported |
-| gfx803       | Supported   | Not supported |
+| Architecture | Interpreter | LLVM JIT | SPMD JIT |
+|--------------|-------------|----------|----------|
+| gfx1200      | Supported   | Supported | Supported |
+| gfx803       | Supported   | Not supported | Not supported |
+
+### RDNA SPMD backend
+
+The gfx1200 SPMD backend converts wavefront execution into independent CPU
+work-items. The examples use cooperative or segmented dispatch when barriers or
+cross-lane operations require synchronization.
+
+Available examples are `bitonic_sort_spmd`, `histogram_spmd`,
+`raytracing_spmd`, `simple_hgemm_spmd`, `smallpt_spmd`, `texture_spmd`, and
+`warp_shuffle_spmd`.
+
+```sh
+cargo run --release --example smallpt_spmd -- --arch gfx1200
+```
+
+Use `--num_threads N` to select the CPU thread count. Examples that support
+packed work-item execution also accept `--vec_width W`; `0` selects the
+single-work-item path.
 
 ## Examples
 
@@ -57,7 +75,7 @@ https://github.com/ROCm/rocm-examples
 Please execute the following command.
 
 ```sh
-cargo run --release --example simple_hgemm --arch gfx1200
+cargo run --release --example simple_hgemm -- --arch gfx1200
 ```
 
 The kernel program is based on the following code.
@@ -69,7 +87,7 @@ https://github.com/ROCm/rocWMMA
 Please execute the following command.
 
 ```sh
-cargo run --release --example raytracing --arch gfx1200
+cargo run --release --example raytracing -- --arch gfx1200
 ```
 
 The kernel program is based on the following code.

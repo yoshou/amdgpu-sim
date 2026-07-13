@@ -596,9 +596,8 @@ fn main() -> Result<()> {
                     None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
                 };
 
-                // --vec_width=W selects the width-W work-item-packing SPMD path
-                // (docs/performance/PERFORMANCE_FINDINGS.md §11); 0 uses the scalar path. Default is
-                // the host-aware default_width() (W=16 on AVX-512, else 0).
+                // --vec_width=W packs W work-items in each SIMD vector. Zero uses
+                // the single-work-item path; omission selects a host-aware default.
                 let vec_w = match matches.opt_str("vec_width") {
                     Some(s) => s.parse::<u32>().unwrap(),
                     None => default_width(),
