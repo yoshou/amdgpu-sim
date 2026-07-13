@@ -496,6 +496,13 @@ impl Cg {
         }
         v
     }
+    unsafe fn clamp_f64(&self, mut v: LLVMValueRef, clamp: u8) -> LLVMValueRef {
+        if clamp & 1 != 0 {
+            v = self.call("llvm.minnum.f64", self.f64t, &[self.f64t, self.f64t], &[v, self.cf64(1.0)]);
+            v = self.call("llvm.maxnum.f64", self.f64t, &[self.f64t, self.f64t], &[v, self.cf64(0.0)]);
+        }
+        v
+    }
     unsafe fn absneg_f32(&self, v: LLVMValueRef, abs: u8, neg: u8, idx: u32) -> LLVMValueRef {
         let mut v = v;
         if (abs >> idx) & 1 != 0 {
@@ -1425,6 +1432,7 @@ impl Cg {
                 let a = self.absneg_f64(self.src_f64(&i.src0), i.abs, i.neg, 0);
                 let b = self.absneg_f64(self.src_f64(&i.src1), i.abs, i.neg, 1);
                 let r = self.call("llvm.maxnum.f64", self.f64t, &[self.f64t, self.f64t], &[a, b]);
+                let r = self.clamp_f64(r, i.cm);
                 self.st_vgpr_f64(i.vdst as u32, r);
             }
             I::V_LDEXP_F64 => {

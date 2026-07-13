@@ -803,6 +803,13 @@ impl Cg {
         }
         v
     }
+    unsafe fn vclamp_f64(&self, mut v: LLVMValueRef, clamp: u8) -> LLVMValueRef {
+        if clamp & 1 != 0 {
+            v = self.call(&self.vfn("minnum"), self.vf64, &[self.vf64, self.vf64], &[v, self.vcf64(1.0)]);
+            v = self.call(&self.vfn("maxnum"), self.vf64, &[self.vf64, self.vf64], &[v, self.vcf64(0.0)]);
+        }
+        v
+    }
 
     // ---- f32 vector helpers ----------------------------------------------
     fn vfn32(&self, name: &str) -> String { format!("llvm.{}.v{}f32", name, self.w) }
@@ -1841,7 +1848,7 @@ impl Cg {
             I::V_ADD_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.vfadd(a, b); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_MUL_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.vfmul(a, b); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_FMA_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2); let r = self.vfmuladd(a, b, c); self.st_vgpr_f64(i.vdst as u32, r); }
-            I::V_MAX_NUM_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.call(&self.vfn("maxnum"), self.vf64, &[self.vf64, self.vf64], &[a, b]); self.st_vgpr_f64(i.vdst as u32, r); }
+            I::V_MAX_NUM_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.call(&self.vfn("maxnum"), self.vf64, &[self.vf64, self.vf64], &[a, b]); let r = self.vclamp_f64(r, i.cm); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_LDEXP_F64 => {
                 let a = self.vsrc_f64(&i.src0);
                 let e = self.vsrc_u32(&i.src1);

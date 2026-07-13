@@ -309,17 +309,19 @@ impl IREmitter {
         let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
         let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
 
-        let negative_zero_vec = llvm::core::LLVMConstVector(
+        let sign_mask_vec = llvm::core::LLVMConstVector(
             [llvm::core::LLVMConstInt(ty_i64, 0x8000000000000000, 0); N].as_mut_ptr(),
             N as u32,
         );
 
         let value = if (abs >> idx) & 1 != 0 {
             let value = llvm::core::LLVMBuildBitCast(builder, value, ty_i64xn, empty_name.as_ptr());
-            let value =
-                llvm::core::LLVMBuildAnd(builder, value, negative_zero_vec, empty_name.as_ptr());
-            let value =
-                llvm::core::LLVMBuildXor(builder, value, negative_zero_vec, empty_name.as_ptr());
+            let value = llvm::core::LLVMBuildAnd(
+                builder,
+                value,
+                llvm::core::LLVMBuildNot(builder, sign_mask_vec, empty_name.as_ptr()),
+                empty_name.as_ptr(),
+            );
             let value = llvm::core::LLVMBuildBitCast(builder, value, ty_f64xn, empty_name.as_ptr());
             value
         } else {
@@ -329,7 +331,7 @@ impl IREmitter {
         let value = if (neg >> idx) & 1 != 0 {
             let value = llvm::core::LLVMBuildBitCast(builder, value, ty_i64xn, empty_name.as_ptr());
             let value =
-                llvm::core::LLVMBuildXor(builder, value, negative_zero_vec, empty_name.as_ptr());
+                llvm::core::LLVMBuildXor(builder, value, sign_mask_vec, empty_name.as_ptr());
             let value = llvm::core::LLVMBuildBitCast(builder, value, ty_f64xn, empty_name.as_ptr());
             value
         } else {
