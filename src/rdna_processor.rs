@@ -1710,6 +1710,9 @@ impl SIMD32 {
             I::S_CMP_GE_U32 => {
                 self.s_cmp_ge_u32(s0, s1);
             }
+            I::S_CMP_GT_U32 => {
+                self.s_cmp_gt_u32(s0, s1);
+            }
             I::S_CMP_LT_I32 => {
                 self.s_cmp_lt_i32(s0, s1);
             }
@@ -1746,6 +1749,12 @@ impl SIMD32 {
         let s0_value = self.read_scalar_source_operand_u32(s0);
         let s1_value = self.read_scalar_source_operand_u32(s1);
         self.ctx.scc = s0_value >= s1_value;
+    }
+
+    fn s_cmp_gt_u32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        self.ctx.scc = s0_value > s1_value;
     }
 
     fn s_cmp_lt_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
