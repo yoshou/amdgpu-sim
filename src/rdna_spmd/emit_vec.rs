@@ -32,7 +32,7 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
+use crate::rdna_instructions::{InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
 use super::ir::{Cond, ScalarProgram, Terminator};
 
@@ -260,11 +260,59 @@ impl VecKernel {
     }
 }
 
+/// A resumable width-W packet used by the wave-owned cross-lane scheduler.
+/// One call advances W adjacent lanes of one GPU wave to the next lifted
+/// cross-lane boundary (or `s_endpgm`) and writes the packet state back.
+pub struct CoopVecKernel {
+    addr: u64,
+    pub num_vgprs: usize,
+    pub width: u32,
+    pub entry_pc: usize,
+}
+
+unsafe impl Send for CoopVecKernel {}
+unsafe impl Sync for CoopVecKernel {}
+
+impl CoopVecKernel {
+    /// `sgprs` points to 129 packet-local scalar slots (SCC at 128), `vgprs`
+    /// uses register-major SoA layout (`num_vgprs * W`), and `spill` persists
+    /// the uniform readlane/writelane spill idiom across yields. `lane_base` is
+    /// the packet's first lane within its owning 32-lane wave and is used only
+    /// to select the corresponding private scratch segments.
+    pub unsafe fn run(
+        &self,
+        sgprs: *mut u32,
+        vgprs: *mut u32,
+        scratch_base: u64,
+        scratch_stride: u64,
+        spill: *mut u32,
+        resume_pc: u64,
+        lane_base: u64,
+    ) -> u64 {
+        let f = std::mem::transmute::<
+            u64,
+            extern "C" fn(*mut u32, *mut u32, u64, u64, *mut u32, u64, u64) -> u64,
+        >(self.addr);
+        f(
+            sgprs,
+            vgprs,
+            scratch_base,
+            scratch_stride,
+            spill,
+            resume_pc,
+            lane_base,
+        )
+    }
+}
+
 struct Cg {
     ctx: llvm::prelude::LLVMContextRef,
     module: llvm::prelude::LLVMModuleRef,
+    func: LLVMValueRef,
     b: LLVMBuilderRef,
     w: u32,
+    coop: bool,
+    writeback_vgprs: usize,
     // per-lane scratch base vector <W×i64> (broadcast(base) + lane*stride)
     scratch_vec: LLVMValueRef,
     // uniform scratch base (i64 scalar) — lane 0's segment. Used for scalar
@@ -838,6 +886,26 @@ impl Cg {
             _ => llvm::core::LLVMBuildBitCast(self.b, self.vsrc_u32(op), self.vf32, self.n()),
         }
     }
+    unsafe fn vsrc_f16_f32(&self, op: &SourceOperand, high: bool) -> LLVMValueRef {
+        let mut bits = self.vsrc_u32(op);
+        if high {
+            bits = llvm::core::LLVMBuildLShr(self.b, bits, self.vci32(16), self.n());
+        }
+        let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
+        let vi16 = llvm::core::LLVMVectorType(i16t, self.w);
+        let vf16 = llvm::core::LLVMVectorType(llvm::core::LLVMHalfTypeInContext(self.ctx), self.w);
+        let bits = llvm::core::LLVMBuildTrunc(self.b, bits, vi16, self.n());
+        let half = llvm::core::LLVMBuildBitCast(self.b, bits, vf16, self.n());
+        llvm::core::LLVMBuildFPExt(self.b, half, self.vf32, self.n())
+    }
+    unsafe fn vf32_to_f16_bits(&self, value: LLVMValueRef) -> LLVMValueRef {
+        let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
+        let vi16 = llvm::core::LLVMVectorType(i16t, self.w);
+        let vf16 = llvm::core::LLVMVectorType(llvm::core::LLVMHalfTypeInContext(self.ctx), self.w);
+        let half = llvm::core::LLVMBuildFPTrunc(self.b, value, vf16, self.n());
+        let bits = llvm::core::LLVMBuildBitCast(self.b, half, vi16, self.n());
+        llvm::core::LLVMBuildZExt(self.b, bits, self.vi32, self.n())
+    }
     unsafe fn vabsneg_f32(&self, v: LLVMValueRef, abs: u8, neg: u8, idx: u32) -> LLVMValueRef {
         let mut v = v;
         if (abs >> idx) & 1 != 0 {
@@ -1118,14 +1186,44 @@ impl Cg {
 
 pub fn compile_program(program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
     let num_vgprs = num_vgprs.max(256);
-    let addr = unsafe { compile_inner(program, num_vgprs, width) };
+    let addr = unsafe { compile_inner(program, num_vgprs, width, false, &BTreeMap::new()) };
     VecKernel { addr, num_vgprs, width }
+}
+
+/// Compile a resumable width-W packet whose host-side barriers do not mutate
+/// VGPRs. Cross-lane programs must use `coop_xlane::compile_xlane_vec` so the
+/// divergence/frame analyses receive writelane and WMMA boundary effects.
+pub fn compile_cooperative(
+    program: &ScalarProgram,
+    num_vgprs: usize,
+    width: u32,
+) -> CoopVecKernel {
+    compile_cooperative_with_boundary_writes(program, num_vgprs, width, &BTreeMap::new())
+}
+
+pub(super) fn compile_cooperative_with_boundary_writes(
+    program: &ScalarProgram,
+    num_vgprs: usize,
+    width: u32,
+    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+) -> CoopVecKernel {
+    assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
+    let num_vgprs = num_vgprs.max(256);
+    let addr = unsafe { compile_inner(program, num_vgprs, width, true, boundary_writes) };
+    CoopVecKernel {
+        addr,
+        num_vgprs,
+        width,
+        entry_pc: program.entry_pc,
+    }
 }
 
 unsafe fn compile_inner(
     program: &ScalarProgram,
     num_vgprs: usize,
     width: u32,
+    coop: bool,
+    boundary_writes: &BTreeMap<usize, Vec<u32>>,
 ) -> u64 {
     let w = width;
 
@@ -1151,14 +1249,29 @@ unsafe fn compile_inner(
     let vf32 = llvm::core::LLVMVectorType(f32t, w);
     let vf64 = llvm::core::LLVMVectorType(f64t, w);
 
-    let mut params = [ptr, ptr, i64t, i64t];
-    let fty = llvm::core::LLVMFunctionType(void, params.as_mut_ptr(), 4, 0);
-    let func = llvm::core::LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, fty);
+    // Normal: `void kernel(sgprs, vgprs, scratch_base, scratch_stride)`.
+    // Cooperative packet:
+    // `i64 kernel(sgprs[129], vgprs, wave_scratch_base, scratch_stride,
+    //             spill, resume_pc, packet_lane_base)`.
+    let func = if coop {
+        let mut params = [ptr, ptr, i64t, i64t, ptr, i64t, i64t];
+        let fty = llvm::core::LLVMFunctionType(i64t, params.as_mut_ptr(), 7, 0);
+        llvm::core::LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, fty)
+    } else {
+        let mut params = [ptr, ptr, i64t, i64t];
+        let fty = llvm::core::LLVMFunctionType(void, params.as_mut_ptr(), 4, 0);
+        llvm::core::LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, fty)
+    };
 
     let sgprs_p = llvm::core::LLVMGetParam(func, 0);
     let vgprs_p = llvm::core::LLVMGetParam(func, 1);
     let scratch_base = llvm::core::LLVMGetParam(func, 2);
     let scratch_stride = llvm::core::LLVMGetParam(func, 3);
+    let packet_lane_base = if coop {
+        llvm::core::LLVMGetParam(func, 6)
+    } else {
+        llvm::core::LLVMConstInt(i64t, 0, 0)
+    };
 
     let entry = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, b"entry\0".as_ptr() as *const _);
     llvm::core::LLVMPositionBuilderAtEnd(b, entry);
@@ -1176,15 +1289,19 @@ unsafe fn compile_inner(
     for _ in 0..num_vgprs + 1 { vgpr_f64.push(llvm::core::LLVMBuildAlloca(b, vf64, b"\0".as_ptr() as *const _)); }
     let scc = llvm::core::LLVMBuildAlloca(b, i1, b"\0".as_ptr() as *const _);
     let bvh_scratch = llvm::core::LLVMBuildArrayAlloca(b, i32t, llvm::core::LLVMConstInt(i32t, 10, 0), b"\0".as_ptr() as *const _);
-    let spill_base = llvm::core::LLVMBuildArrayAlloca(
-        b,
-        i32t,
-        llvm::core::LLVMConstInt(i32t, super::emit::COOP_SPILL_SLOTS as u64, 0),
-        b"\0".as_ptr() as *const _,
-    );
+    let spill_base = if coop {
+        llvm::core::LLVMGetParam(func, 4)
+    } else {
+        llvm::core::LLVMBuildArrayAlloca(
+            b,
+            i32t,
+            llvm::core::LLVMConstInt(i32t, super::emit::COOP_SPILL_SLOTS as u64, 0),
+            b"\0".as_ptr() as *const _,
+        )
+    };
 
     let mut cg = Cg {
-        ctx, module, b, w,
+        ctx, module, func, b, w, coop, writeback_vgprs: num_vgprs,
         scratch_vec: scratch_base, // placeholder, set below
         scratch_base_scalar: scratch_base,
         scratch_stride,
@@ -1208,13 +1325,14 @@ unsafe fn compile_inner(
 
     // Select at most one leaf loop whose EXEC save/restore pairs are entirely
     // local to that loop. All other blocks keep lane masks packed in SGPRs.
-    let structured_mask_region = super::analyze_structured(program).loops.into_iter().find(|region| {
-        region.children.is_empty()
-            && !region.mask_stack.local_scopes.is_empty()
-            && region.mask_stack.boundary_live_saved.is_empty()
-            && region.mask_stack.unrestored_saved.is_empty()
-            && region.control.branch_conditions.iter().all(|cond| matches!(cond, Cond::ExecZ | Cond::ExecNz | Cond::Scc0 | Cond::Scc1))
-    });
+    let structured_mask_region = (!coop).then(|| super::analyze_structured(program))
+        .and_then(|plan| plan.loops.into_iter().find(|region| {
+            region.children.is_empty()
+                && !region.mask_stack.local_scopes.is_empty()
+                && region.mask_stack.boundary_live_saved.is_empty()
+                && region.mask_stack.unrestored_saved.is_empty()
+                && region.control.branch_conditions.iter().all(|cond| matches!(cond, Cond::ExecZ | Cond::ExecNz | Cond::Scc0 | Cond::Scc1))
+        }));
     if let Some(region) = structured_mask_region.as_ref() {
         let mask_regs = region.mask_stack.mask_sgprs.clone();
         let masks = mask_regs.iter().copied().map(|reg| {
@@ -1231,10 +1349,13 @@ unsafe fn compile_inner(
         });
     }
 
-    // scratch_vec = splat(base) + lane_idx * splat(stride)
+    // scratch_vec = splat(base) + (packet_lane_base + lane_idx) * stride.
+    // The normal whole-kernel vector path uses packet_lane_base=0.
     let base_v = cg.splat(scratch_base, vi64);
     let stride_v = cg.splat(scratch_stride, vi64);
-    let off = llvm::core::LLVMBuildMul(b, lane_idx_i64, stride_v, cg.n());
+    let lane_base_v = cg.splat(packet_lane_base, vi64);
+    let scratch_lane = cg.v_add(lane_base_v, lane_idx_i64);
+    let off = llvm::core::LLVMBuildMul(b, scratch_lane, stride_v, cg.n());
     cg.scratch_vec = cg.v_add(base_v, off);
 
     // Initialize SGPRs (scalar, from uniform sgprs_p) and VGPRs (<W×i32> SoA).
@@ -1262,10 +1383,24 @@ unsafe fn compile_inner(
             llvm::core::LLVMBuildStore(b, d, cg.vgpr_f64[p as usize]);
         }
     }
-    // Whole-program entry starts with all packed lanes active.
-    let init_exec = if w >= 32 { 0xFFFF_FFFFu32 } else { (1u32 << w) - 1 };
-    cg.st_sgpr32(EXEC, cg.ci32(init_exec));
-    llvm::core::LLVMBuildStore(b, llvm::core::LLVMConstInt(i1, 0, 0), scc);
+    if coop {
+        // SCC is persisted in the packet-local extension slot sgprs[128].
+        let gep = llvm::core::LLVMBuildGEP2(
+            b,
+            i32t,
+            sgprs_p,
+            [cg.ci32(128)].as_mut_ptr(),
+            1,
+            cg.n(),
+        );
+        let persisted_scc = llvm::core::LLVMBuildLoad2(b, i32t, gep, cg.n());
+        cg.st_scc_nz(persisted_scc);
+    } else {
+        // Whole-program entry starts with all packed lanes active.
+        let init_exec = if w >= 32 { 0xFFFF_FFFFu32 } else { (1u32 << w) - 1 };
+        cg.st_sgpr32(EXEC, cg.ci32(init_exec));
+        llvm::core::LLVMBuildStore(b, llvm::core::LLVMConstInt(i1, 0, 0), scc);
+    }
 
     cg.predicate.set(true);
 
@@ -1285,7 +1420,30 @@ unsafe fn compile_inner(
             loop_masks.exit_bbs.insert((from, to), llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
         }
     }
-    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
+    if coop {
+        let resume = llvm::core::LLVMGetParam(func, 5);
+        let mut targets: Vec<usize> = program
+            .blocks
+            .values()
+            .filter_map(|block| match block.term {
+                Terminator::Barrier { resume } => Some(resume),
+                _ => None,
+            })
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let switch = llvm::core::LLVMBuildSwitch(
+            b,
+            resume,
+            bbs[&program.entry_pc],
+            targets.len() as u32,
+        );
+        for pc in targets {
+            llvm::core::LLVMAddCase(switch, cg.ci64(pc as u64), bbs[&pc]);
+        }
+    } else {
+        llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
+    }
 
     let base_pred = true;
     // Mask elision: a VGPR write skips EXEC predication when none of its
@@ -1296,11 +1454,28 @@ unsafe fn compile_inner(
     let elide = super::vec_live::analyze_with_exit_live(program, &[]);
     let f64_fresh_in = super::freshness::analyze(program);
     cg.fresh_in = f64_fresh_in.clone();
-    let div_in = super::vec_live::divergent_entry(program);
-    let frame_in = super::vec_live::frame_entry(program);
+    let div_in = if coop {
+        let mut seed = [0u128; 2];
+        seed[0] |= 1;
+        super::vec_live::divergent_entry_with_seed_and_boundary_writes(
+            program,
+            seed,
+            boundary_writes,
+        )
+    } else {
+        super::vec_live::divergent_entry(program)
+    };
+    let frame_in = if coop {
+        super::vec_live::frame_entry_with_boundary_writes(program, boundary_writes)
+    } else {
+        super::vec_live::frame_entry(program)
+    };
     // Enable the reconvergence-liveness rule computed above (see vec_live):
     // arithmetic temps unmasked, reconvergence-visible state updates masked.
-    let do_elide = true;
+    // The cooperative ABI materializes the register file at every coroutine
+    // boundary. Keep all VALU writes EXEC-predicated there; the whole-program
+    // path can still use the reconvergence-liveness elision.
+    let do_elide = !coop;
     // Divergent-pointer load clustering (record load + transpose): needs whole
     // 8-lane transpose blocks.
     let do_cluster = w % 8 == 0;
@@ -1383,10 +1558,57 @@ unsafe fn compile_inner(
 }
 
 impl Cg {
+    /// Persist packet state at a cross-lane yield or final return. Values are
+    /// loaded through the canonical accessors so lazily materialized f64 cells
+    /// are written back correctly without first forcing their shadow slots.
+    unsafe fn emit_coop_writeback(&self) {
+        let sgprs_p = llvm::core::LLVMGetParam(self.func, 0);
+        let vgprs_p = llvm::core::LLVMGetParam(self.func, 1);
+        for i in 0..128u32 {
+            let gep = llvm::core::LLVMBuildGEP2(
+                self.b,
+                self.i32t,
+                sgprs_p,
+                [self.ci32(i)].as_mut_ptr(),
+                1,
+                self.n(),
+            );
+            llvm::core::LLVMBuildStore(self.b, self.ld_sgpr32(i), gep);
+        }
+        let scc_gep = llvm::core::LLVMBuildGEP2(
+            self.b,
+            self.i32t,
+            sgprs_p,
+            [self.ci32(128)].as_mut_ptr(),
+            1,
+            self.n(),
+        );
+        let scc = llvm::core::LLVMBuildZExt(self.b, self.ld_scc(), self.i32t, self.n());
+        llvm::core::LLVMBuildStore(self.b, scc, scc_gep);
+
+        for i in 0..self.writeback_vgprs as u32 {
+            let gep = llvm::core::LLVMBuildGEP2(
+                self.b,
+                self.i32t,
+                vgprs_p,
+                [self.ci32(i * self.w)].as_mut_ptr(),
+                1,
+                self.n(),
+            );
+            let store = llvm::core::LLVMBuildStore(self.b, self.ld_vgpr32(i), gep);
+            llvm::core::LLVMSetAlignment(store, 4);
+        }
+    }
+
     unsafe fn emit_term(&self, term: &Terminator, bbs: &BTreeMap<usize, LLVMBasicBlockRef>) {
         match term {
             Terminator::Return => {
-                llvm::core::LLVMBuildRetVoid(self.b);
+                if self.coop {
+                    self.emit_coop_writeback();
+                    llvm::core::LLVMBuildRet(self.b, self.ci64(super::emit::COOP_DONE));
+                } else {
+                    llvm::core::LLVMBuildRetVoid(self.b);
+                }
             }
             Terminator::Jump(t) => {
                 self.sync_stale_for(&[*t]);
@@ -1402,11 +1624,12 @@ impl Cg {
                     self.structured_mask_target(self.current_pc.get(), *fallthrough, bbs),
                 );
             }
-            Terminator::Barrier { .. } => {
-                // A vector call runs only one packet of work-items and therefore
-                // cannot synchronize an entire workgroup. The cooperative
-                // scalar path handles workgroup barriers.
-                panic!("the packed-work-item backend does not support workgroup barriers");
+            Terminator::Barrier { resume } => {
+                if !self.coop {
+                    panic!("the packed-work-item backend does not support workgroup barriers");
+                }
+                self.emit_coop_writeback();
+                llvm::core::LLVMBuildRet(self.b, self.ci64(*resume as u64));
             }
         }
     }
@@ -1540,6 +1763,7 @@ impl Cg {
             InstFormat::VOP1(i) => self.emit_vop1(i),
             InstFormat::VOP2(i) => self.emit_vop2(i),
             InstFormat::VOP3(i) => self.emit_vop3(i),
+            InstFormat::VOP3P(i) => self.emit_vop3p(i),
             InstFormat::VOP3SD(i) => self.emit_vop3sd(i),
             InstFormat::VOPC(i) => self.emit_vopc(i),
             InstFormat::VOPD(i) => self.emit_vopd(i),
@@ -1848,6 +2072,21 @@ impl Cg {
             I::V_ADD_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.vfadd(a, b); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_MUL_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.vfmul(a, b); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_FMA_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2); let r = self.vfmuladd(a, b, c); self.st_vgpr_f64(i.vdst as u32, r); }
+            I::V_CVT_F32_F16 => {
+                // OPSEL[0] chooses the high/low half of each packed source lane.
+                let mut bits = self.vsrc_u32(&i.src0);
+                if i.opsel & 1 != 0 {
+                    bits = llvm::core::LLVMBuildLShr(self.b, bits, self.vci32(16), self.n());
+                }
+                let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
+                let vi16 = llvm::core::LLVMVectorType(i16t, self.w);
+                let vf16 = llvm::core::LLVMVectorType(llvm::core::LLVMHalfTypeInContext(self.ctx), self.w);
+                let bits = llvm::core::LLVMBuildTrunc(self.b, bits, vi16, self.n());
+                let half = llvm::core::LLVMBuildBitCast(self.b, bits, vf16, self.n());
+                let wide = llvm::core::LLVMBuildFPExt(self.b, half, self.vf32, self.n());
+                let r = self.vabsneg_f32(wide, i.abs, i.neg, 0);
+                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
+            }
             I::V_MAX_NUM_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.call(&self.vfn("maxnum"), self.vf64, &[self.vf64, self.vf64], &[a, b]); let r = self.vclamp_f64(r, i.cm); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_LDEXP_F64 => {
                 let a = self.vsrc_f64(&i.src0);
@@ -1927,6 +2166,27 @@ impl Cg {
                 self.st_sgpr32(i.vdst as u32, v);
             }
             _ => panic!("vec: unsupported VOP3 {:?}", i.op),
+        }
+    }
+
+    unsafe fn emit_vop3p(&self, i: &VOP3P) {
+        match i.op {
+            I::V_FMA_MIXLO_F16 => {
+                let opsel_hi = i.opsel_hi | (i.opsel_hi2 << 2);
+                let src = |op: &SourceOperand, idx: u32| -> LLVMValueRef {
+                    let value = if (opsel_hi >> idx) & 1 == 0 {
+                        self.vsrc_f32(op)
+                    } else {
+                        self.vsrc_f16_f32(op, (i.opsel >> idx) & 1 != 0)
+                    };
+                    self.vabsneg_f32(value, i.neg_hi, i.neg, idx)
+                };
+                let value = self.vfma32(src(&i.src0, 0), src(&i.src1, 1), src(&i.src2, 2));
+                let lo = self.vf32_to_f16_bits(value);
+                let hi = self.v_and(self.ld_vgpr32(i.vdst as u32), self.vci32(0xffff_0000));
+                self.st_vgpr32(i.vdst as u32, self.v_or(hi, lo));
+            }
+            _ => panic!("vec: unsupported VOP3P {:?}", i.op),
         }
     }
 
@@ -2218,6 +2478,13 @@ impl Cg {
                 let hi = LLVMBuildLShr(self.b, LLVMBuildMul(self.b, a, b, self.n()), self.ci64(32), self.n());
                 self.st_sgpr32(i.sdst as u32, LLVMBuildTrunc(self.b, hi, self.i32t, self.n()));
             }
+            I::S_LSHL_B64 => {
+                let a = self.ssrc_u64(&i.ssrc0);
+                let amt = LLVMBuildAnd(self.b, self.ssrc_u64(&i.ssrc1), self.ci64(63), self.n());
+                let r = LLVMBuildShl(self.b, a, amt, self.n());
+                self.st_sgpr64(i.sdst as u32, r);
+                self.st_scc(LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, r, self.ci64(0), self.n()));
+            }
             I::S_BFE_U32 => {
                 let data = self.ssrc_u32(&i.ssrc0); let control = self.ssrc_u32(&i.ssrc1);
                 let offset = LLVMBuildAnd(self.b, control, self.ci32(0x1f), self.n());
@@ -2316,6 +2583,9 @@ impl Cg {
 
     // ---- VGLOBAL (per-lane gather/scatter) ------------------------------
     unsafe fn emit_vglobal(&self, i: &VGLOBAL) {
+        if matches!(i.op, I::GLOBAL_WB | I::GLOBAL_INV) {
+            return;
+        }
         let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
         // base address per lane (<W×i64>)
         let base = if i.saddr != 124 {
@@ -2326,6 +2596,47 @@ impl Cg {
             self.ld_vgpr64(i.vaddr as u32)
         };
         let addr = self.v_add(base, self.splat(self.ci64(sext_ioffset), self.vi64));
+
+        // Sub-dword global memory uses the same typed masked gather/scatter
+        // intrinsics as FLAT memory, then extends/truncates at the VGPR boundary.
+        if matches!(
+            i.op,
+            I::GLOBAL_LOAD_U8 | I::GLOBAL_LOAD_I8 | I::GLOBAL_LOAD_U16 | I::GLOBAL_LOAD_I16
+        ) {
+            let (elem, mnem, signed) = match i.op {
+                I::GLOBAL_LOAD_U8 => (llvm::core::LLVMInt8TypeInContext(self.ctx), "i8", false),
+                I::GLOBAL_LOAD_I8 => (llvm::core::LLVMInt8TypeInContext(self.ctx), "i8", true),
+                I::GLOBAL_LOAD_U16 => (llvm::core::LLVMInt16TypeInContext(self.ctx), "i16", false),
+                _ => (llvm::core::LLVMInt16TypeInContext(self.ctx), "i16", true),
+            };
+            let ptrs = self.ptr_at_vec(addr, 0);
+            let value = self.masked_gather_ty(ptrs, self.exec_vec(), elem, mnem);
+            let value = if signed {
+                llvm::core::LLVMBuildSExt(self.b, value, self.vi32, self.n())
+            } else {
+                llvm::core::LLVMBuildZExt(self.b, value, self.vi32, self.n())
+            };
+            self.st_vgpr32(i.vdst as u32, value);
+            return;
+        }
+
+        if matches!(i.op, I::GLOBAL_STORE_B8 | I::GLOBAL_STORE_B16) {
+            let (elem, mnem) = if matches!(i.op, I::GLOBAL_STORE_B8) {
+                (llvm::core::LLVMInt8TypeInContext(self.ctx), "i8")
+            } else {
+                (llvm::core::LLVMInt16TypeInContext(self.ctx), "i16")
+            };
+            let velem = llvm::core::LLVMVectorType(elem, self.w);
+            let value = llvm::core::LLVMBuildTrunc(
+                self.b,
+                self.ld_vgpr32(i.vsrc as u32),
+                velem,
+                self.n(),
+            );
+            let ptrs = self.ptr_at_vec(addr, 0);
+            self.masked_scatter_ty(value, ptrs, self.exec_vec(), elem, mnem);
+            return;
+        }
 
         if matches!(i.op, I::GLOBAL_ATOMIC_ADD_U32) {
             // Per-lane atomicrmw: each active lane adds its data to its own global

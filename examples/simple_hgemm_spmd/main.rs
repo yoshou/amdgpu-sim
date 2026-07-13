@@ -3,7 +3,8 @@ use yaml_rust::yaml::*;
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_spmd::{
-    build_scalar_program, compile_cooperative, dispatch_xlane, split_at_xlane, GridDims,
+    build_scalar_program, compile_cooperative, compile_xlane_vec, dispatch_xlane,
+    dispatch_xlane_vec, split_at_xlane, GridDims,
 };
 use amdgpu_sim::rdna_translator::RDNAProgram;
 use getopts::Options;
@@ -139,8 +140,18 @@ fn main() -> Result<()> {
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.optopt("", "arch", "Architecture", "ARCH");
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (unused: cross-lane path)", "W");
+    opts.optopt(
+        "",
+        "vec_width",
+        "SPMD packet width W (0,1,2,4,8,16; cross-lane ops rendezvous per wave)",
+        "W",
+    );
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
+    opts.optflag(
+        "",
+        "verify_widths",
+        "Run W=0,1,2,4,8,16 on the same inputs and require bitwise-identical output",
+    );
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
@@ -326,11 +337,23 @@ fn main() -> Result<()> {
             let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
 
             // Front end: decode CFG -> Scalar IR -> lift cross-lane ops (WMMA,
-            // read/writelane) to coroutine yields -> per-lane resumable kernel.
+            // read/writelane) to coroutine yields. W=0 uses the original scalar
+            // lanes; W>0 advances width-W packets between the same wave-level
+            // rendezvous points.
             let program = RDNAProgram::new(entry_address, &mem);
             let scalar = build_scalar_program(&program);
             let (split, xlane) = split_at_xlane(&scalar);
-            let kernel = compile_cooperative(&split, num_vgprs);
+            let vec_width = matches
+                .opt_str("vec_width")
+                .map(|s| s.parse::<u32>().unwrap())
+                .unwrap_or(0);
+            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16));
+            let verify_widths = matches.opt_present("verify_widths");
+            let widths: Vec<u32> = if verify_widths {
+                vec![0, 1, 2, 4, 8, 16]
+            } else {
+                vec![vec_width]
+            };
 
             set_u32(&mut arg_buffer, 0, m as u32);
             set_u32(&mut arg_buffer, 4, n as u32);
@@ -392,19 +415,71 @@ fn main() -> Result<()> {
             };
 
             use std::time::Instant;
-            let start = Instant::now();
-            dispatch_xlane(
-                &kernel,
-                &xlane,
-                &kernel_desc,
-                kernarg_ptr,
-                aql_packet_addr,
-                dims,
-                private_segment_size as u32,
-                num_threads,
-            );
-            let end = start.elapsed();
-            println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
+            let mut baseline_bits: Option<Vec<u16>> = None;
+            for width in widths {
+                matrix_d.fill(f16::NAN);
+                println!("vec_width={}", width);
+                if width == 0 {
+                    let kernel = compile_cooperative(&split, num_vgprs);
+                    let start = Instant::now();
+                    dispatch_xlane(
+                        &kernel,
+                        &xlane,
+                        &kernel_desc,
+                        kernarg_ptr,
+                        aql_packet_addr,
+                        dims,
+                        private_segment_size as u32,
+                        num_threads,
+                    );
+                    println!(
+                        "Elapsed time: {:.3} [ms]",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                } else {
+                    let kernel = compile_xlane_vec(&split, &xlane, num_vgprs, width);
+                    let start = Instant::now();
+                    dispatch_xlane_vec(
+                        &kernel,
+                        &xlane,
+                        &kernel_desc,
+                        kernarg_ptr,
+                        aql_packet_addr,
+                        dims,
+                        private_segment_size as u32,
+                        num_threads,
+                    );
+                    println!(
+                        "Elapsed time: {:.3} [ms]",
+                        start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+
+                if verify_widths {
+                    let actual_bits: Vec<u16> = matrix_d.iter().map(|value| value.to_bits()).collect();
+                    if width == 0 {
+                        baseline_bits = Some(actual_bits);
+                    } else {
+                        let baseline = baseline_bits.as_ref().unwrap();
+                        let mut mismatches = baseline
+                            .iter()
+                            .zip(&actual_bits)
+                            .enumerate()
+                            .filter(|(_, (expected, actual))| expected != actual);
+                        if let Some((index, (expected, actual))) = mismatches.next() {
+                            let mismatch_count = 1 + mismatches.count();
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                format!(
+                                    "vec_width={} differs from vec_width=0 at {} elements; first index {}: {:#06x} != {:#06x}",
+                                    width, mismatch_count, index, actual, expected
+                                ),
+                            ));
+                        }
+                        println!("Bitwise match with vec_width=0: passed.");
+                    }
+                }
+            }
         }
 
         let mut expect_matrix_d = vec![f16::ZERO; m * n];
@@ -423,6 +498,7 @@ fn main() -> Result<()> {
         }
 
         let mut max_relative_error = 0.0f64;
+        let mut mismatch_examples = Vec::new();
 
         for i in 0..(m * n) {
             let val1 = matrix_d[i].to_f64();
@@ -434,6 +510,9 @@ fn main() -> Result<()> {
             let relative_error = num / denom;
 
             max_relative_error = max_relative_error.max(relative_error);
+            if relative_error >= 10.0 * f16::EPSILON.to_f64() && mismatch_examples.len() < 8 {
+                mismatch_examples.push((i, val1, val2, relative_error));
+            }
         }
         let tolerance = 10.0;
         let eps = f16::EPSILON.to_f64();
@@ -444,6 +523,21 @@ fn main() -> Result<()> {
             println!("Validation passed.");
         } else {
             println!("Validation failed.");
+            for (index, actual, expected, error) in mismatch_examples {
+                println!(
+                    "  mismatch[{}] (row {}, col {}): actual={}, expected={}, relative_error={}",
+                    index,
+                    index / n,
+                    index % n,
+                    actual,
+                    expected,
+                    error
+                );
+            }
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("matrix validation failed: max relative error {}", max_relative_error),
+            ));
         }
     }
 

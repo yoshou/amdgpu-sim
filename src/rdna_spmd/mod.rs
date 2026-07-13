@@ -60,10 +60,17 @@ mod structured;
 mod vec_live;
 
 pub use cooperative::dispatch_cooperative;
-pub use coop_xlane::{dispatch_xlane, split_at_xlane, XlaneOp};
+pub use coop_xlane::{
+    compile_xlane_vec, dispatch_xlane, dispatch_xlane_vec, split_at_xlane, XlaneOp,
+};
 pub use dispatch::{dispatch_parallel, dispatch_parallel_vec, GridDims};
 pub use emit::{compile_cooperative, compile_program, CoopKernel, ScalarKernel};
-pub use emit_vec::{compile_program as compile_program_vec, VecKernel};
+pub use emit_vec::{
+    compile_cooperative as compile_cooperative_vec,
+    compile_program as compile_program_vec,
+    CoopVecKernel,
+    VecKernel,
+};
 pub use ir::{build_scalar_program, split_at_barriers, Cond, ScalarBlock, ScalarProgram, Terminator};
 pub use segmented::{dispatch_segmented, SegmentedProgram};
 pub use structured::analyze_structured;

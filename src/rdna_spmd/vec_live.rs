@@ -75,7 +75,7 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
             r.push(i.vaddr as u32);
             r.push(i.vaddr as u32 + 1);
             let store_words = match i.op {
-                I::GLOBAL_STORE_B32 => 1,
+                I::GLOBAL_STORE_B8 | I::GLOBAL_STORE_B16 | I::GLOBAL_STORE_B32 => 1,
                 I::GLOBAL_STORE_B64 => 2,
                 I::GLOBAL_STORE_B96 => 3,
                 I::GLOBAL_STORE_B128 => 4,
@@ -84,6 +84,41 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
             for k in 0..store_words {
                 r.push(i.vsrc as u32 + k);
             }
+        }
+        InstFormat::VFLAT(i) => {
+            r.push(i.vaddr as u32);
+            r.push(i.vaddr as u32 + 1);
+            let store_words = match i.op {
+                I::FLAT_STORE_B8 | I::FLAT_STORE_B16 | I::FLAT_STORE_B32 => 1,
+                I::FLAT_STORE_B64 => 2,
+                I::FLAT_STORE_B96 => 3,
+                I::FLAT_STORE_B128 => 4,
+                _ => 0,
+            };
+            for k in 0..store_words { r.push(i.vsrc as u32 + k); }
+        }
+        InstFormat::VSCRATCH(i) => {
+            if i.sve != 0 { r.push(i.vaddr as u32); }
+            let store_words = match i.op {
+                I::SCRATCH_STORE_B32 => 1,
+                I::SCRATCH_STORE_B64 => 2,
+                I::SCRATCH_STORE_B96 => 3,
+                I::SCRATCH_STORE_B128 => 4,
+                _ => 0,
+            };
+            for k in 0..store_words { r.push(i.vsrc as u32 + k); }
+        }
+        InstFormat::VIMAGE(i) => {
+            for reg in [i.vaddr0, i.vaddr1, i.vaddr2, i.vaddr3, i.vaddr4] {
+                r.push(reg as u32);
+                r.push(reg as u32 + 1);
+            }
+        }
+        InstFormat::VSAMPLE(i) => {
+            r.push(i.vaddr0 as u32);
+            r.push(i.vaddr0 as u32 + 1);
+            r.push(i.vaddr1 as u32);
+            r.push(i.vaddr1 as u32 + 1);
         }
         _ => {} // SALU/SMEM/SOPC read SGPRs only
     }
@@ -123,6 +158,33 @@ pub fn div_reads(inst: &InstFormat) -> Vec<u32> {
                 I::GLOBAL_STORE_B96 => 3, I::GLOBAL_STORE_B128 => 4, _ => 0,
             };
             for k in 0..store_words { r.push(i.vsrc as u32 + k); }
+        }
+        InstFormat::VFLAT(i) => {
+            r.push(i.vaddr as u32);
+            if i.saddr == 124 { r.push(i.vaddr as u32 + 1); }
+        }
+        InstFormat::VSCRATCH(i) => {
+            if i.sve != 0 { r.push(i.vaddr as u32); }
+        }
+        InstFormat::VIMAGE(i) => {
+            r.extend([
+                i.vaddr0 as u32,
+                i.vaddr0 as u32 + 1,
+                i.vaddr1 as u32,
+                i.vaddr2 as u32,
+                i.vaddr2 as u32 + 1,
+                i.vaddr2 as u32 + 2,
+                i.vaddr3 as u32,
+                i.vaddr3 as u32 + 1,
+                i.vaddr3 as u32 + 2,
+                i.vaddr4 as u32,
+                i.vaddr4 as u32 + 1,
+                i.vaddr4 as u32 + 2,
+            ]);
+        }
+        InstFormat::VSAMPLE(i) => {
+            r.push(i.vaddr0 as u32);
+            r.push(i.vaddr1 as u32);
         }
         _ => {}
     }
@@ -177,6 +239,17 @@ pub fn frame_def(inst: &InstFormat) -> Option<(u32, u32)> {
 }
 
 pub fn frame_entry(prog: &ScalarProgram) -> BTreeMap<usize, std::collections::HashMap<u32, u32>> {
+    frame_entry_with_boundary_writes(prog, &BTreeMap::new())
+}
+
+/// Affine-frame must-analysis with host-applied coroutine-boundary VGPR writes.
+/// A lifted cross-lane operation executes after the yielding block and before
+/// its resume block, so any frame fact overlapping one of its destinations is
+/// invalid on the resume edge.
+pub fn frame_entry_with_boundary_writes(
+    prog: &ScalarProgram,
+    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+) -> BTreeMap<usize, std::collections::HashMap<u32, u32>> {
     use std::collections::HashMap;
     // All (reg -> stride) frame defs anywhere = the TOP element. A *must*-analysis
     // (meet = intersection) must initialise non-entry blocks to TOP, else the
@@ -196,6 +269,14 @@ pub fn frame_entry(prog: &ScalarProgram) -> BTreeMap<usize, std::collections::Ha
         for (&pc, block) in &prog.blocks {
             let mut m = entry[&pc].clone();
             for inst in &block.body { frame_transfer(inst, &mut m); }
+            if let Terminator::Barrier { resume } = block.term {
+                if let Some(writes) = boundary_writes.get(&resume) {
+                    for &w in writes {
+                        m.remove(&w);
+                        if w > 0 { m.remove(&(w - 1)); }
+                    }
+                }
+            }
             for t in succs(block) {
                 let e = incoming.entry(t).or_insert(None);
                 *e = Some(match e.take() {
@@ -226,6 +307,13 @@ pub fn uses_private(inst: &InstFormat) -> bool {
         VOP3(i) => has(&i.src0) || has(&i.src1) || has(&i.src2),
         VOP3SD(i) => has(&i.src0) || has(&i.src1) || has(&i.src2),
         VOPC(i) => has(&i.src0),
+        // VSCRATCH addresses a distinct private segment for every packed lane,
+        // even when its explicit SGPR/VGPR byte offsets are uniform.
+        VSCRATCH(_) => true,
+        // FLAT may be redirected into the per-lane private aperture at runtime.
+        // Conservatively classify its load results as divergent.
+        VFLAT(_) => true,
+        VIMAGE(_) | VSAMPLE(_) => true,
         _ => false,
     }
 }
@@ -259,6 +347,18 @@ pub fn divergent_entry_with_seed(
     prog: &ScalarProgram,
     seed: [u128; 2],
 ) -> BTreeMap<usize, [u128; 2]> {
+    divergent_entry_with_seed_and_boundary_writes(prog, seed, &BTreeMap::new())
+}
+
+/// Divergence analysis with VGPR writes performed by lifted host-side
+/// cross-lane operations on each Barrier→resume edge. Such writes are marked
+/// divergent conservatively: writelane changes only one physical lane, while
+/// WMMA redistributes distinct matrix-fragment elements across all lanes.
+pub fn divergent_entry_with_seed_and_boundary_writes(
+    prog: &ScalarProgram,
+    seed: [u128; 2],
+    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+) -> BTreeMap<usize, [u128; 2]> {
     let mut entry: BTreeMap<usize, [u128; 2]> = prog.blocks.keys().map(|&pc| (pc, [0u128; 2])).collect();
     entry.insert(prog.entry_pc, seed);
     loop {
@@ -267,6 +367,13 @@ pub fn divergent_entry_with_seed(
         for (&_pc, block) in &prog.blocks {
             let mut d = entry[&_pc];
             for inst in &block.body { div_transfer(inst, &mut d); }
+            if let Terminator::Barrier { resume } = block.term {
+                if let Some(writes) = boundary_writes.get(&resume) {
+                    for &w in writes {
+                        d[(w >> 7) as usize] |= 1u128 << (w & 127);
+                    }
+                }
+            }
             for t in succs(block) {
                 let e = incoming.entry(t).or_insert([0u128; 2]);
                 e[0] |= d[0]; e[1] |= d[1];
@@ -387,4 +494,75 @@ pub fn analyze_with_exit_live(
         out.insert(pc, flags);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdna_instructions::{VOP3SD, VSCRATCH};
+
+    fn bit(set: [u128; 2], reg: u32) -> bool {
+        (set[(reg >> 7) as usize] >> (reg & 127)) & 1 != 0
+    }
+
+    #[test]
+    fn scratch_load_result_is_intrinsically_divergent() {
+        let inst = InstFormat::VSCRATCH(VSCRATCH {
+            op: I::SCRATCH_LOAD_B32,
+            vaddr: 0,
+            vsrc: 0,
+            vdst: 7,
+            scope: 0,
+            th: 0,
+            ioffset: 0,
+            saddr: 124,
+            sve: 0,
+        });
+        let mut divergent = [0u128; 2];
+        div_transfer(&inst, &mut divergent);
+        assert!(bit(divergent, 7));
+    }
+
+    #[test]
+    fn cross_lane_boundary_write_is_divergent_on_resume() {
+        let program = ScalarProgram {
+            entry_pc: 1,
+            blocks: BTreeMap::from([
+                (1, ScalarBlock { pc: 1, body: vec![], term: Terminator::Barrier { resume: 2 } }),
+                (2, ScalarBlock { pc: 2, body: vec![], term: Terminator::Return }),
+            ]),
+        };
+        let writes = BTreeMap::from([(2, vec![23])]);
+        let entry = divergent_entry_with_seed_and_boundary_writes(
+            &program,
+            [0u128; 2],
+            &writes,
+        );
+        assert!(bit(entry[&2], 23));
+    }
+
+    #[test]
+    fn cross_lane_boundary_write_kills_affine_frame_fact() {
+        let frame_def = InstFormat::VOP3SD(VOP3SD {
+            vdst: 10,
+            sdst: 106,
+            cm: 0,
+            op: I::V_MAD_CO_U64_U32,
+            src0: SourceOperand::VectorRegister(0),
+            src1: SourceOperand::IntegerConstant(16),
+            src2: SourceOperand::ScalarRegister(0),
+            omod: 0,
+            neg: 0,
+        });
+        let program = ScalarProgram {
+            entry_pc: 1,
+            blocks: BTreeMap::from([
+                (1, ScalarBlock { pc: 1, body: vec![frame_def], term: Terminator::Barrier { resume: 2 } }),
+                (2, ScalarBlock { pc: 2, body: vec![], term: Terminator::Return }),
+            ]),
+        };
+        let writes = BTreeMap::from([(2, vec![10])]);
+        let entry = frame_entry_with_boundary_writes(&program, &writes);
+        assert!(!entry[&2].contains_key(&10));
+    }
 }

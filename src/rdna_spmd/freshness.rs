@@ -102,6 +102,28 @@ pub fn f64_defs(inst: &InstFormat) -> Vec<u32> {
 /// All VGPR registers this instruction writes (at 32-bit granularity). Used to
 /// clear fresh bits; over-approximation is sound.
 pub fn vgpr_writes(inst: &InstFormat) -> Vec<u32> {
+    let memory_load_words = |op: I| match op {
+        I::GLOBAL_LOAD_U8
+        | I::GLOBAL_LOAD_I8
+        | I::GLOBAL_LOAD_U16
+        | I::GLOBAL_LOAD_I16
+        | I::GLOBAL_LOAD_B32
+        | I::GLOBAL_ATOMIC_ADD_U32
+        | I::FLAT_LOAD_U8
+        | I::FLAT_LOAD_I8
+        | I::FLAT_LOAD_U16
+        | I::FLAT_LOAD_I16
+        | I::FLAT_LOAD_B32
+        | I::SCRATCH_LOAD_U8
+        | I::SCRATCH_LOAD_I8
+        | I::SCRATCH_LOAD_U16
+        | I::SCRATCH_LOAD_I16
+        | I::SCRATCH_LOAD_B32 => 1,
+        I::GLOBAL_LOAD_B64 | I::FLAT_LOAD_B64 | I::SCRATCH_LOAD_B64 => 2,
+        I::GLOBAL_LOAD_B96 | I::FLAT_LOAD_B96 | I::SCRATCH_LOAD_B96 => 3,
+        I::GLOBAL_LOAD_B128 | I::FLAT_LOAD_B128 | I::SCRATCH_LOAD_B128 => 4,
+        _ => 0,
+    };
     match inst {
         InstFormat::VOP1(i) => {
             let w = is_f64_producer(i.op) || matches!(i.op, I::V_CVT_F64_I32 | I::V_CVT_F64_U32);
@@ -133,14 +155,22 @@ pub fn vgpr_writes(inst: &InstFormat) -> Vec<u32> {
             vec![dx, dy]
         }
         InstFormat::VGLOBAL(i) => {
-            let words = match i.op {
-                I::GLOBAL_LOAD_B32 => 1,
-                I::GLOBAL_LOAD_B64 => 2,
-                I::GLOBAL_LOAD_B96 => 3,
-                I::GLOBAL_LOAD_B128 => 4,
-                _ => 0, // stores write no VGPR
-            };
+            let words = memory_load_words(i.op);
             (0..words).map(|k| i.vdst as u32 + k).collect()
+        }
+        InstFormat::VFLAT(i) => {
+            let words = memory_load_words(i.op);
+            (0..words).map(|k| i.vdst as u32 + k).collect()
+        }
+        InstFormat::VSCRATCH(i) => {
+            let words = memory_load_words(i.op);
+            (0..words).map(|k| i.vdst as u32 + k).collect()
+        }
+        InstFormat::VIMAGE(i) if matches!(i.op, I::IMAGE_BVH64_INTERSECT_RAY) => {
+            (0..4).map(|k| i.vdata as u32 + k).collect()
+        }
+        InstFormat::VSAMPLE(i) if matches!(i.op, I::IMAGE_SAMPLE_LZ) => {
+            vec![i.vdata as u32]
         }
         InstFormat::VOP3P(i) => match i.op {
             // Cross-lane WMMA writes its 8-VGPR f32 accumulator (it is lifted to a
