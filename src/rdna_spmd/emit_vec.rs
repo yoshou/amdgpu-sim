@@ -127,6 +127,38 @@ pub(super) fn normal_sqrt_ldexp_sites(program: &ScalarProgram) -> Vec<(usize, us
 }
 
 #[cfg(test)]
+mod cooperative_vgpr_tests {
+    use super::*;
+    use super::super::ir::ScalarBlock;
+
+    #[test]
+    fn sizes_packet_state_from_ir_and_boundary_registers() {
+        let program = ScalarProgram {
+            entry_pc: 1,
+            blocks: BTreeMap::from([(
+                1,
+                ScalarBlock {
+                    pc: 1,
+                    body: vec![InstFormat::VOP1(VOP1 {
+                        src0: SourceOperand::VectorRegister(26),
+                        op: I::V_MOV_B32,
+                        vdst: 25,
+                    })],
+                    term: Terminator::Return,
+                },
+            )]),
+        };
+
+        assert_eq!(cooperative_vgpr_count(&program, 16, &BTreeMap::new()), 28);
+        assert_eq!(
+            cooperative_vgpr_count(&program, 16, &BTreeMap::from([(2, vec![31])])),
+            32
+        );
+        assert_eq!(cooperative_vgpr_count(&program, 64, &BTreeMap::new()), 64);
+    }
+}
+
+#[cfg(test)]
 mod normal_sqrt_tests {
     use super::*;
 
@@ -1201,6 +1233,30 @@ pub fn compile_cooperative(
     compile_cooperative_with_boundary_writes(program, num_vgprs, width, &BTreeMap::new())
 }
 
+fn cooperative_vgpr_count(
+    program: &ScalarProgram,
+    declared_vgprs: usize,
+    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+) -> usize {
+    // Some gfx1200 callers still decode the descriptor with the older 4-VGPR
+    // granularity, so retain every register the IR or a lifted boundary can
+    // observe. Unlike the former 256-register floor, this avoids copying 8 KiB
+    // of dead packet state on every coroutine yield in small kernels.
+    let required_vgprs = program
+        .blocks
+        .values()
+        .flat_map(|block| block.body.iter())
+        .flat_map(|inst| {
+            let mut regs = super::vec_live::vgpr_reads(inst);
+            regs.extend(super::freshness::vgpr_writes(inst));
+            regs
+        })
+        .chain(boundary_writes.values().flatten().copied())
+        .max()
+        .map_or(1, |reg| reg as usize + 1);
+    declared_vgprs.max(required_vgprs)
+}
+
 pub(super) fn compile_cooperative_with_boundary_writes(
     program: &ScalarProgram,
     num_vgprs: usize,
@@ -1208,7 +1264,7 @@ pub(super) fn compile_cooperative_with_boundary_writes(
     boundary_writes: &BTreeMap<usize, Vec<u32>>,
 ) -> CoopVecKernel {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
-    let num_vgprs = num_vgprs.max(256);
+    let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary_writes);
     let addr = unsafe { compile_inner(program, num_vgprs, width, true, boundary_writes) };
     CoopVecKernel {
         addr,
