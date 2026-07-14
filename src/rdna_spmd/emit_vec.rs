@@ -407,8 +407,12 @@ struct Cg {
     vi64: LLVMTypeRef,  // <W×i64>
     vf32: LLVMTypeRef,  // <W×f32>
     vf64: LLVMTypeRef,  // <W×f64>
-    // Reusable [10 x i32] entry scratch for per-lane ray-trace helper results.
+    // Reusable scratch for redirecting inactive atomic operations.
     bvh_scratch: LLVMValueRef,
+    // Packet passed to the ray-trace helper.  Keeping all W lanes in one call
+    // avoids spilling and restoring the whole JIT register state once per lane.
+    bvh_packet: LLVMValueRef,
+    bvh_packet_ty: LLVMTypeRef,
     // Dedicated lane-spill buffer (`[COOP_SPILL_SLOTS x i32]` alloca) plus a slot
     // index per (spill VGPR, constant lane). Models the uniform writelane/readlane
     // spill idiom: because the spilled value is wavefront-uniform (a scalar SGPR),
@@ -908,6 +912,202 @@ impl Cg {
     unsafe fn vcf32_bits(&self, bits: u32) -> LLVMValueRef {
         self.splat(llvm::core::LLVMConstBitCast(self.ci32(bits), self.f32t), self.vf32)
     }
+    unsafe fn vfrexp_f32(&self, x: LLVMValueRef) -> (LLVMValueRef, LLVMValueRef) {
+        use llvm::LLVMIntPredicate::*;
+        let n = self.n();
+        let bits = self.vf32_bits(x);
+        let sign = self.v_and(bits, self.vci32(0x8000_0000));
+        let frac = self.v_and(bits, self.vci32(0x007f_ffff));
+        let exp = self.v_and(
+            llvm::core::LLVMBuildLShr(self.b, bits, self.vci32(23), n),
+            self.vci32(0xff),
+        );
+        let exp_nonzero = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, exp, self.vci32(0), n);
+        let exp_finite = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, exp, self.vci32(0xff), n);
+        let normal = llvm::core::LLVMBuildAnd(self.b, exp_nonzero, exp_finite, n);
+        let frac_nonzero = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, frac, self.vci32(0), n);
+        let subnormal = llvm::core::LLVMBuildAnd(
+            self.b,
+            llvm::core::LLVMBuildNot(self.b, exp_nonzero, n),
+            frac_nonzero,
+            n,
+        );
+
+        let normal_mant = self.v_or(self.v_or(sign, frac), self.vci32(0x3f00_0000));
+        let lz = self.call(
+            &format!("llvm.ctlz.v{}i32", self.w),
+            self.vi32,
+            &[self.vi32, self.i1],
+            &[frac, llvm::core::LLVMConstInt(self.i1, 0, 0)],
+        );
+        let shift = llvm::core::LLVMBuildSub(self.b, lz, self.vci32(8), n);
+        let sub_frac = self.v_and(
+            llvm::core::LLVMBuildShl(self.b, frac, shift, n),
+            self.vci32(0x007f_ffff),
+        );
+        let sub_mant = self.v_or(self.v_or(sign, sub_frac), self.vci32(0x3f00_0000));
+        let mant_bits = llvm::core::LLVMBuildSelect(
+            self.b,
+            normal,
+            normal_mant,
+            llvm::core::LLVMBuildSelect(self.b, subnormal, sub_mant, bits, n),
+            n,
+        );
+
+        let normal_exp = llvm::core::LLVMBuildSub(self.b, exp, self.vci32(126), n);
+        let sub_exp = llvm::core::LLVMBuildSub(
+            self.b,
+            self.splat(self.ci32((-117i32) as u32), self.vi32),
+            lz,
+            n,
+        );
+        let out_exp = llvm::core::LLVMBuildSelect(
+            self.b,
+            normal,
+            normal_exp,
+            llvm::core::LLVMBuildSelect(self.b, subnormal, sub_exp, self.vci32(0), n),
+            n,
+        );
+        (self.vf32_of(mant_bits), out_exp)
+    }
+
+    unsafe fn vdiv_fixup_f32(
+        &self,
+        approx: LLVMValueRef,
+        numerator: LLVMValueRef,
+        denominator: LLVMValueRef,
+    ) -> LLVMValueRef {
+        use llvm::LLVMIntPredicate::*;
+        let n = self.n();
+        let a = self.vf32_bits(approx);
+        let b = self.vf32_bits(numerator);
+        let c = self.vf32_bits(denominator);
+        let abs_b = self.v_and(b, self.vci32(0x7fff_ffff));
+        let abs_c = self.v_and(c, self.vci32(0x7fff_ffff));
+        let sign = self.v_and(self.v_xor(b, c), self.vci32(0x8000_0000));
+        let exp_b = self.v_and(llvm::core::LLVMBuildLShr(self.b, b, self.vci32(23), n), self.vci32(0xff));
+        let exp_c = self.v_and(llvm::core::LLVMBuildLShr(self.b, c, self.vci32(23), n), self.vci32(0xff));
+        let frac_b = self.v_and(b, self.vci32(0x007f_ffff));
+        let frac_c = self.v_and(c, self.vci32(0x007f_ffff));
+        let b_exp_ff = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, exp_b, self.vci32(0xff), n);
+        let c_exp_ff = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, exp_c, self.vci32(0xff), n);
+        let b_frac_nz = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, frac_b, self.vci32(0), n);
+        let c_frac_nz = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, frac_c, self.vci32(0), n);
+        let b_nan = llvm::core::LLVMBuildAnd(self.b, b_exp_ff, b_frac_nz, n);
+        let c_nan = llvm::core::LLVMBuildAnd(self.b, c_exp_ff, c_frac_nz, n);
+        let b_inf = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_b, self.vci32(0x7f80_0000), n);
+        let c_inf = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_c, self.vci32(0x7f80_0000), n);
+        let b_zero = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_b, self.vci32(0), n);
+        let c_zero = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_c, self.vci32(0), n);
+        let exp_delta = llvm::core::LLVMBuildSub(self.b, exp_c, exp_b, n);
+        let underflow = llvm::core::LLVMBuildICmp(
+            self.b,
+            LLVMIntSLT,
+            exp_delta,
+            self.splat(self.ci32((-150i32) as u32), self.vi32),
+            n,
+        );
+
+        let signed_zero = sign;
+        let signed_inf = self.v_or(sign, self.vci32(0x7f80_0000));
+        let signed_approx = self.v_or(self.v_and(a, self.vci32(0x7fff_ffff)), sign);
+        let mut out = signed_approx;
+        out = llvm::core::LLVMBuildSelect(self.b, b_exp_ff, signed_inf, out, n);
+        out = llvm::core::LLVMBuildSelect(self.b, underflow, signed_zero, out, n);
+        out = llvm::core::LLVMBuildSelect(
+            self.b,
+            llvm::core::LLVMBuildOr(self.b, b_inf, c_zero, n),
+            signed_zero,
+            out,
+            n,
+        );
+        out = llvm::core::LLVMBuildSelect(
+            self.b,
+            llvm::core::LLVMBuildOr(self.b, b_zero, c_inf, n),
+            signed_inf,
+            out,
+            n,
+        );
+        let both_inf = llvm::core::LLVMBuildAnd(self.b, b_inf, c_inf, n);
+        out = llvm::core::LLVMBuildSelect(self.b, both_inf, self.vci32(0xffc0_0000), out, n);
+        let both_zero = llvm::core::LLVMBuildAnd(self.b, b_zero, c_zero, n);
+        out = llvm::core::LLVMBuildSelect(self.b, both_zero, self.vci32(0xffc0_0000), out, n);
+        out = llvm::core::LLVMBuildSelect(self.b, b_nan, b, out, n);
+        out = llvm::core::LLVMBuildSelect(self.b, c_nan, c, out, n);
+        self.vf32_of(out)
+    }
+
+    unsafe fn vdiv_scale_f32(
+        &self,
+        s0: LLVMValueRef,
+        s1: LLVMValueRef,
+        s2: LLVMValueRef,
+    ) -> (LLVMValueRef, LLVMValueRef) {
+        use llvm::LLVMIntPredicate::*;
+        use llvm::LLVMRealPredicate::LLVMRealOEQ;
+        let n = self.n();
+        let b1 = self.vf32_bits(s1);
+        let b2 = self.vf32_bits(s2);
+        let abs1 = self.v_and(b1, self.vci32(0x7fff_ffff));
+        let abs2 = self.v_and(b2, self.vci32(0x7fff_ffff));
+        let e1 = self.v_and(llvm::core::LLVMBuildLShr(self.b, b1, self.vci32(23), n), self.vci32(0xff));
+        let e2 = self.v_and(llvm::core::LLVMBuildLShr(self.b, b2, self.vci32(23), n), self.vci32(0xff));
+        let zero1 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs1, self.vci32(0), n);
+        let zero2 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs2, self.vci32(0), n);
+        let either_zero = llvm::core::LLVMBuildOr(self.b, zero1, zero2, n);
+        let exp_delta = llvm::core::LLVMBuildSub(self.b, e2, e1, n);
+        let huge_delta = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGE, exp_delta, self.vci32(96), n);
+        let e1_nonzero = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e1, self.vci32(0), n);
+        let e1_finite = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e1, self.vci32(0xff), n);
+        let s1_normal = llvm::core::LLVMBuildAnd(self.b, e1_nonzero, e1_finite, n);
+
+        let initial = self.vfdiv(self.vfmul(s0, s2), s1);
+        let inv = self.vfdiv(self.vcf32(1.0), s1);
+        let ratio = self.vfdiv(s2, s1);
+        let inv_bits = self.vf32_bits(inv);
+        let ratio_bits = self.vf32_bits(ratio);
+        let inv_exp = self.v_and(llvm::core::LLVMBuildLShr(self.b, inv_bits, self.vci32(23), n), self.vci32(0xff));
+        let ratio_exp = self.v_and(llvm::core::LLVMBuildLShr(self.b, ratio_bits, self.vci32(23), n), self.vci32(0xff));
+        let inv_normal = llvm::core::LLVMBuildAnd(
+            self.b,
+            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, inv_exp, self.vci32(0), n),
+            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, inv_exp, self.vci32(0xff), n),
+            n,
+        );
+        let ratio_normal = llvm::core::LLVMBuildAnd(
+            self.b,
+            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, ratio_exp, self.vci32(0), n),
+            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, ratio_exp, self.vci32(0xff), n),
+            n,
+        );
+        let inv_abnormal = llvm::core::LLVMBuildNot(self.b, inv_normal, n);
+        let ratio_abnormal = llvm::core::LLVMBuildNot(self.b, ratio_normal, n);
+        let both_abnormal = llvm::core::LLVMBuildAnd(self.b, inv_abnormal, ratio_abnormal, n);
+        let eq01 = llvm::core::LLVMBuildFCmp(self.b, LLVMRealOEQ, s0, s1, n);
+        let eq02 = llvm::core::LLVMBuildFCmp(self.b, LLVMRealOEQ, s0, s2, n);
+        let up = self.vfmul(s0, self.vcf32_bits(0x5f80_0000));
+        let down = self.vfmul(s0, self.vcf32_bits(0x1f80_0000));
+        let branch_huge = llvm::core::LLVMBuildSelect(self.b, eq01, up, initial, n);
+        let branch_both = llvm::core::LLVMBuildSelect(self.b, eq01, up, initial, n);
+        let branch_ratio = llvm::core::LLVMBuildSelect(self.b, eq02, up, initial, n);
+        let low_exp = llvm::core::LLVMBuildICmp(self.b, LLVMIntSLE, e2, self.vci32(23), n);
+
+        let mut out = llvm::core::LLVMBuildSelect(self.b, low_exp, up, initial, n);
+        let mut flag = llvm::core::LLVMConstNull(self.vi1);
+        out = llvm::core::LLVMBuildSelect(self.b, ratio_abnormal, branch_ratio, out, n);
+        flag = llvm::core::LLVMBuildSelect(self.b, ratio_abnormal, llvm::core::LLVMConstAllOnes(self.vi1), flag, n);
+        out = llvm::core::LLVMBuildSelect(self.b, inv_abnormal, down, out, n);
+        flag = llvm::core::LLVMBuildSelect(self.b, inv_abnormal, llvm::core::LLVMConstNull(self.vi1), flag, n);
+        out = llvm::core::LLVMBuildSelect(self.b, both_abnormal, branch_both, out, n);
+        flag = llvm::core::LLVMBuildSelect(self.b, both_abnormal, llvm::core::LLVMConstAllOnes(self.vi1), flag, n);
+        out = llvm::core::LLVMBuildSelect(self.b, llvm::core::LLVMBuildNot(self.b, s1_normal, n), up, out, n);
+        flag = llvm::core::LLVMBuildSelect(self.b, llvm::core::LLVMBuildNot(self.b, s1_normal, n), llvm::core::LLVMConstNull(self.vi1), flag, n);
+        out = llvm::core::LLVMBuildSelect(self.b, huge_delta, branch_huge, out, n);
+        flag = llvm::core::LLVMBuildSelect(self.b, huge_delta, llvm::core::LLVMConstAllOnes(self.vi1), flag, n);
+        out = llvm::core::LLVMBuildSelect(self.b, either_zero, self.vcf32_bits(f32::NAN.to_bits()), out, n);
+        flag = llvm::core::LLVMBuildSelect(self.b, either_zero, llvm::core::LLVMConstNull(self.vi1), flag, n);
+        (out, flag)
+    }
     /// Lane-mask register presented as <W×i32> 0/1 per lane.
     unsafe fn mask_to_u32(&self, reg: u32) -> LLVMValueRef {
         llvm::core::LLVMBuildZExt(self.b, self.mask_to_vec(self.ld_sgpr32(reg)), self.vi32, self.n())
@@ -1345,6 +1545,20 @@ unsafe fn compile_inner(
     for _ in 0..num_vgprs + 1 { vgpr_f64.push(llvm::core::LLVMBuildAlloca(b, vf64, b"\0".as_ptr() as *const _)); }
     let scc = llvm::core::LLVMBuildAlloca(b, i1, b"\0".as_ptr() as *const _);
     let bvh_scratch = llvm::core::LLVMBuildArrayAlloca(b, i32t, llvm::core::LLVMConstInt(i32t, 10, 0), b"\0".as_ptr() as *const _);
+    let packet_i64 = llvm::core::LLVMArrayType2(i64t, 16);
+    let packet_f32 = llvm::core::LLVMArrayType2(f32t, 16);
+    let packet_i32 = llvm::core::LLVMArrayType2(i32t, 16);
+    let mut packet_fields = [packet_i64; 15];
+    packet_fields[1..11].fill(packet_f32);
+    packet_fields[11..15].fill(packet_i32);
+    let bvh_packet_ty = llvm::core::LLVMStructTypeInContext(
+        ctx,
+        packet_fields.as_mut_ptr(),
+        packet_fields.len() as u32,
+        0,
+    );
+    let bvh_packet = llvm::core::LLVMBuildAlloca(b, bvh_packet_ty, b"\0".as_ptr() as *const _);
+    llvm::core::LLVMSetAlignment(bvh_packet, 64);
     let spill_base = if coop {
         llvm::core::LLVMGetParam(func, 4)
     } else {
@@ -1370,7 +1584,7 @@ unsafe fn compile_inner(
         frame_cur: std::cell::RefCell::new(std::collections::HashMap::new()),
         i1, i32t, i64t, f32t, f64t, iw, ptr,
         vi1, vi32, vi64, vf32, vf64,
-        bvh_scratch,
+        bvh_scratch, bvh_packet, bvh_packet_ty,
         spill_base,
         spill: std::cell::RefCell::new(BTreeMap::new()),
         predicate: std::cell::Cell::new(false),
@@ -1863,8 +2077,8 @@ impl Cg {
                 let is0 = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntEQ, x, self.vci32(0), self.n());
                 self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildSelect(self.b, is0, self.vci32(0xFFFF_FFFF), lz, self.n()));
             }
-            I::V_FREXP_MANT_F32 => { let v = self.per_lane("scalar_frexp_mant_f32", self.f32t, &[self.vsrc_f32(&i.src0)], &[self.f32t], self.vf32); self.st_vgpr32(i.vdst as u32, self.vf32_bits(v)); }
-            I::V_FREXP_EXP_I32_F32 => { let v = self.per_lane("scalar_frexp_exp_f32", self.i32t, &[self.vsrc_f32(&i.src0)], &[self.f32t], self.vi32); self.st_vgpr32(i.vdst as u32, v); }
+            I::V_FREXP_MANT_F32 => { let (v, _) = self.vfrexp_f32(self.vsrc_f32(&i.src0)); self.st_vgpr32(i.vdst as u32, self.vf32_bits(v)); }
+            I::V_FREXP_EXP_I32_F32 => { let (_, v) = self.vfrexp_f32(self.vsrc_f32(&i.src0)); self.st_vgpr32(i.vdst as u32, v); }
             I::V_CVT_U32_F32 => { let v = self.call(&format!("llvm.fptoui.sat.v{}i32.v{}f32", self.w, self.w), self.vi32, &[self.vf32], &[self.vsrc_f32(&i.src0)]); self.st_vgpr32(i.vdst as u32, v); }
             I::V_CVT_I32_F32 => { let v = self.call(&format!("llvm.fptosi.sat.v{}i32.v{}f32", self.w, self.w), self.vi32, &[self.vf32], &[self.vsrc_f32(&i.src0)]); self.st_vgpr32(i.vdst as u32, v); }
             I::V_CVT_F32_I32 => { let f = llvm::core::LLVMBuildSIToFP(self.b, self.vsrc_u32(&i.src0), self.vf32, self.n()); self.st_vgpr32(i.vdst as u32, self.vf32_bits(f)); }
@@ -2083,7 +2297,7 @@ impl Cg {
                 let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
                 let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
                 let c = self.vabsneg_f32(self.vsrc_f32(&i.src2), i.abs, i.neg, 2);
-                let r = self.per_lane("scalar_div_fixup_f32", self.f32t, &[a, b, c], &[self.f32t, self.f32t, self.f32t], self.vf32);
+                let r = self.vdiv_fixup_f32(a, b, c);
                 self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
             }
             I::V_DIV_FMAS_F32 => {
@@ -2321,15 +2535,11 @@ impl Cg {
                 self.st_sdst_mask(i.sdst, zero);
             }
             I::V_DIV_SCALE_F32 => {
-                // Per-lane scalar_div_scale_f32 returns u64: value bits | flag<<32.
                 let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), 0, i.neg, 0);
                 let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), 0, i.neg, 1);
                 let c = self.vabsneg_f32(self.vsrc_f32(&i.src2), 0, i.neg, 2);
-                let packed = self.per_lane("scalar_div_scale_f32", self.i64t, &[a, b, c], &[self.f32t, self.f32t, self.f32t], self.vi64);
-                let val = llvm::core::LLVMBuildTrunc(self.b, packed, self.vi32, self.n());
-                self.st_vgpr32(i.vdst as u32, val);
-                let flag = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, packed, self.splat(self.ci64(32), self.vi64), self.n()), self.vi32, self.n());
-                let flag = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, flag, self.vci32(0), self.n());
+                let (value, flag) = self.vdiv_scale_f32(a, b, c);
+                self.st_vgpr32(i.vdst as u32, self.vf32_bits(value));
                 self.st_sdst_mask(i.sdst, flag);
             }
             _ => panic!("vec: unsupported VOP3SD {:?}", i.op),
@@ -3167,57 +3377,53 @@ impl Cg {
         }
     }
 
-    // ---- VIMAGE (hardware ray-tracing BVH intersect) — per-lane call to the
-    // native `image_bvh64_intersect_ray` helper. Inactive lanes may hold a
-    // garbage node address, which the traversal would dereference, so their
-    // address is replaced by an active lane's (umax over EXEC-masked addresses,
-    // the same substitution the divergent-pointer load cluster uses); their
-    // results are discarded by the EXEC-predicated destination writes.
+    // ---- VIMAGE (hardware ray-tracing BVH intersect) --------------------
     unsafe fn emit_vimage(&self, i: &VIMAGE) {
         match i.op {
             I::IMAGE_BVH64_INTERSECT_RAY => {
-                let exec = self.exec_vec();
-                let node = self.ld_vgpr64(i.vaddr0 as u32);
-                let zero = llvm::core::LLVMConstNull(self.vi64);
-                let masked = llvm::core::LLVMBuildSelect(self.b, exec, node, zero, self.n());
-                let any = self.call(
-                    &format!("llvm.vector.reduce.umax.v{}i64", self.w),
-                    self.i64t, &[self.vi64], &[masked],
-                );
-                let safe = llvm::core::LLVMBuildSelect(self.b, exec, node, self.splat(any, self.vi64), self.n());
-
-                let bits_to_f32_lane = |r: u32, k: u32| -> LLVMValueRef {
-                    let v = self.ld_vgpr32(r);
-                    let e = llvm::core::LLVMBuildExtractElement(self.b, v, self.ci32(k), self.n());
-                    llvm::core::LLVMBuildBitCast(self.b, e, self.f32t, self.n())
+                let field_ptr = |field: u32| -> LLVMValueRef {
+                    llvm::core::LLVMBuildStructGEP2(
+                        self.b,
+                        self.bvh_packet_ty,
+                        self.bvh_packet,
+                        field,
+                        self.n(),
+                    )
                 };
-                let scratch_ptr = |k: u32| -> LLVMValueRef {
-                    llvm::core::LLVMBuildGEP2(self.b, self.i32t, self.bvh_scratch, [self.ci32(k)].as_mut_ptr(), 1, self.n())
-                };
-                let params = [
-                    self.ptr, self.ptr, self.ptr, self.ptr, self.i64t,
-                    self.f32t, self.f32t, self.f32t, self.f32t,
-                    self.f32t, self.f32t, self.f32t, self.f32t, self.f32t, self.f32t,
+                let inputs = [
+                    self.ld_vgpr64(i.vaddr0 as u32),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32 + 1)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32 + 2)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32 + 1)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32 + 2)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32 + 1)),
+                    self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32 + 2)),
                 ];
-                let mut outs: [LLVMValueRef; 4] = [llvm::core::LLVMGetPoison(self.vi32); 4];
-                for lane in 0..self.w {
-                    let node_l = llvm::core::LLVMBuildExtractElement(self.b, safe, self.ci32(lane), self.n());
-                    let args = [
-                        scratch_ptr(0), scratch_ptr(1), scratch_ptr(2), scratch_ptr(3),
-                        node_l,
-                        bits_to_f32_lane(i.vaddr1 as u32, lane),
-                        bits_to_f32_lane(i.vaddr2 as u32, lane), bits_to_f32_lane(i.vaddr2 as u32 + 1, lane), bits_to_f32_lane(i.vaddr2 as u32 + 2, lane),
-                        bits_to_f32_lane(i.vaddr3 as u32, lane), bits_to_f32_lane(i.vaddr3 as u32 + 1, lane), bits_to_f32_lane(i.vaddr3 as u32 + 2, lane),
-                        bits_to_f32_lane(i.vaddr4 as u32, lane), bits_to_f32_lane(i.vaddr4 as u32 + 1, lane), bits_to_f32_lane(i.vaddr4 as u32 + 2, lane),
-                    ];
-                    self.call("image_bvh64_intersect_ray", llvm::core::LLVMVoidTypeInContext(self.ctx), &params, &args);
-                    for k in 0..4u32 {
-                        let v = llvm::core::LLVMBuildLoad2(self.b, self.i32t, scratch_ptr(k), self.n());
-                        outs[k as usize] = llvm::core::LLVMBuildInsertElement(self.b, outs[k as usize], v, self.ci32(lane), self.n());
-                    }
+                for (field, value) in inputs.iter().copied().enumerate() {
+                    let store = llvm::core::LLVMBuildStore(self.b, value, field_ptr(field as u32));
+                    llvm::core::LLVMSetAlignment(store, if field == 0 { 8 } else { 4 });
                 }
+
+                self.call(
+                    "image_bvh64_intersect_ray_packet",
+                    llvm::core::LLVMVoidTypeInContext(self.ctx),
+                    &[self.ptr, self.i32t, self.i32t],
+                    &[self.bvh_packet, self.ci32(self.w), self.ld_sgpr32(EXEC)],
+                );
+
                 for k in 0..4u32 {
-                    self.st_vgpr32(i.vdata as u32 + k, outs[k as usize]);
+                    let load = llvm::core::LLVMBuildLoad2(
+                        self.b,
+                        self.vi32,
+                        field_ptr(11 + k),
+                        self.n(),
+                    );
+                    llvm::core::LLVMSetAlignment(load, 4);
+                    self.st_vgpr32(i.vdata as u32 + k, load);
                 }
             }
             _ => panic!("vec: unsupported VIMAGE {:?}", i.op),

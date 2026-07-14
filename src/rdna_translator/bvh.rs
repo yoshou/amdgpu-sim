@@ -286,6 +286,63 @@ pub extern "C" fn image_bvh64_intersect_ray(
     };
 }
 
+pub const BVH_RAY_PACKET_LANES: usize = 16;
+
+#[repr(C, align(64))]
+pub struct BvhRayPacket {
+    pub node_addr: [u64; BVH_RAY_PACKET_LANES],
+    pub ray_extent: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_origin_x: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_origin_y: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_origin_z: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_dir_x: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_dir_y: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_dir_z: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_inv_dir_x: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_inv_dir_y: [f32; BVH_RAY_PACKET_LANES],
+    pub ray_inv_dir_z: [f32; BVH_RAY_PACKET_LANES],
+    pub result0: [u32; BVH_RAY_PACKET_LANES],
+    pub result1: [u32; BVH_RAY_PACKET_LANES],
+    pub result2: [u32; BVH_RAY_PACKET_LANES],
+    pub result3: [u32; BVH_RAY_PACKET_LANES],
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn image_bvh64_intersect_ray_packet(
+    packet: *mut BvhRayPacket,
+    lane_count: u32,
+    active_mask: u32,
+) {
+    assert!(lane_count as usize <= BVH_RAY_PACKET_LANES);
+    let packet = unsafe { &mut *packet };
+    for lane in 0..lane_count as usize {
+        if active_mask & (1u32 << lane) == 0 {
+            packet.result0[lane] = 0;
+            packet.result1[lane] = 0;
+            packet.result2[lane] = 0;
+            packet.result3[lane] = 0;
+            continue;
+        }
+        image_bvh64_intersect_ray(
+            &mut packet.result0[lane],
+            &mut packet.result1[lane],
+            &mut packet.result2[lane],
+            &mut packet.result3[lane],
+            packet.node_addr[lane],
+            packet.ray_extent[lane],
+            packet.ray_origin_x[lane],
+            packet.ray_origin_y[lane],
+            packet.ray_origin_z[lane],
+            packet.ray_dir_x[lane],
+            packet.ray_dir_y[lane],
+            packet.ray_dir_z[lane],
+            packet.ray_inv_dir_x[lane],
+            packet.ray_inv_dir_y[lane],
+            packet.ray_inv_dir_z[lane],
+        );
+    }
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct Box8Node {
