@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::thread;
 
-use half::f16;
+use half::{f16, slice::HalfFloatSliceExt};
 
 use crate::instructions::I;
 use crate::processor::KernelDescriptor;
@@ -290,6 +290,61 @@ fn set_packet_vgpr(
     vgprs[packet][reg * width + packet_lane] = value;
 }
 
+trait PacketLayout: Copy {
+    fn get(self, vgprs: &[Vec<u32>], lane: usize, reg: usize) -> u32;
+    fn set(self, vgprs: &mut [Vec<u32>], lane: usize, reg: usize, value: u32);
+}
+
+#[derive(Clone, Copy)]
+struct FixedPacketLayout<const WIDTH: usize>;
+
+impl<const WIDTH: usize> PacketLayout for FixedPacketLayout<WIDTH> {
+    #[inline(always)]
+    fn get(self, vgprs: &[Vec<u32>], lane: usize, reg: usize) -> u32 {
+        vgprs[lane / WIDTH][reg * WIDTH + lane % WIDTH]
+    }
+
+    #[inline(always)]
+    fn set(self, vgprs: &mut [Vec<u32>], lane: usize, reg: usize, value: u32) {
+        vgprs[lane / WIDTH][reg * WIDTH + lane % WIDTH] = value;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DynamicPacketLayout(usize);
+
+impl PacketLayout for DynamicPacketLayout {
+    #[inline(always)]
+    fn get(self, vgprs: &[Vec<u32>], lane: usize, reg: usize) -> u32 {
+        packet_vgpr(vgprs, self.0, lane, reg)
+    }
+
+    #[inline(always)]
+    fn set(self, vgprs: &mut [Vec<u32>], lane: usize, reg: usize, value: u32) {
+        set_packet_vgpr(vgprs, self.0, lane, reg, value);
+    }
+}
+
+#[inline(always)]
+fn unpack_f16_fragments(
+    mut read_a: impl FnMut(usize) -> u32,
+    mut read_b: impl FnMut(usize) -> u32,
+) -> [f32; 16] {
+    let mut halves = [f16::from_bits(0); 16];
+    for word_index in 0..4 {
+        let word_a = read_a(word_index);
+        let word_b = read_b(word_index);
+        halves[word_index * 2] = f16::from_bits(word_a as u16);
+        halves[word_index * 2 + 1] = f16::from_bits((word_a >> 16) as u16);
+        halves[8 + word_index * 2] = f16::from_bits(word_b as u16);
+        halves[8 + word_index * 2 + 1] = f16::from_bits((word_b >> 16) as u16);
+    }
+
+    let mut values = [0.0; 16];
+    halves.convert_to_f32_slice(&mut values);
+    values
+}
+
 fn eval_vector_packets(
     sgprs: &[[u32; COOP_SGPR_BUF]],
     vgprs: &[Vec<u32>],
@@ -315,40 +370,42 @@ fn wmma_apply_packets(
     width: usize,
     vgprs: &mut [Vec<u32>],
 ) {
+    match width {
+        1 => wmma_apply_packets_layout(FixedPacketLayout::<1>, vdst, a, b, c, vgprs),
+        2 => wmma_apply_packets_layout(FixedPacketLayout::<2>, vdst, a, b, c, vgprs),
+        4 => wmma_apply_packets_layout(FixedPacketLayout::<4>, vdst, a, b, c, vgprs),
+        8 => wmma_apply_packets_layout(FixedPacketLayout::<8>, vdst, a, b, c, vgprs),
+        16 => wmma_apply_packets_layout(DynamicPacketLayout(width), vdst, a, b, c, vgprs),
+        _ => unreachable!("unsupported packet width {}", width),
+    }
+}
+
+fn wmma_apply_packets_layout(
+    layout: impl PacketLayout,
+    vdst: usize,
+    a: usize,
+    b: usize,
+    c: usize,
+    vgprs: &mut [Vec<u32>],
+) {
     let mut mat_a = [0f32; 256];
     let mut mat_b = [0f32; 256];
     let mut mat_c = [0f32; 256];
 
     for lane in 0..WAVE {
-        for i in 0..2 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    let elem = k + j * 2 + i * 4;
-                    let half_word = |base: usize| {
-                        let word = packet_vgpr(vgprs, width, lane, base + elem / 2);
-                        let bits = if elem % 2 == 0 {
-                            (word & 0xffff) as u16
-                        } else {
-                            (word >> 16) as u16
-                        };
-                        f16::from_bits(bits).to_f32()
-                    };
-
-                    let col_a = (k + j * 2 + i * 8) + (lane / 16) * 4;
-                    let row_a = lane % 16;
-                    mat_a[row_a * 16 + col_a] = half_word(a);
-
-                    let row_b = (k + j * 2 + i * 8) + (lane / 16) * 4;
-                    let col_b = lane % 16;
-                    mat_b[row_b * 16 + col_b] = half_word(b);
-                }
-            }
+        let fragments = unpack_f16_fragments(
+            |word| layout.get(vgprs, lane, a + word),
+            |word| layout.get(vgprs, lane, b + word),
+        );
+        for elem in 0..8 {
+            let matrix_index = elem + (elem / 4) * 4 + (lane / 16) * 4;
+            mat_a[(lane % 16) * 16 + matrix_index] = fragments[elem];
+            mat_b[matrix_index * 16 + lane % 16] = fragments[8 + elem];
         }
         for m in 0..8 {
             let row = m + (lane / 16) * 8;
             let col = lane % 16;
-            mat_c[row * 16 + col] =
-                f32::from_bits(packet_vgpr(vgprs, width, lane, c + m));
+            mat_c[row * 16 + col] = f32::from_bits(layout.get(vgprs, lane, c + m));
         }
     }
 
@@ -367,13 +424,7 @@ fn wmma_apply_packets(
         for m in 0..8 {
             let row = m + (lane / 16) * 8;
             let col = lane % 16;
-            set_packet_vgpr(
-                vgprs,
-                width,
-                lane,
-                vdst + m,
-                mat_d[row * 16 + col].to_bits(),
-            );
+            layout.set(vgprs, lane, vdst + m, mat_d[row * 16 + col].to_bits());
         }
     }
 }
