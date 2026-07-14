@@ -1476,9 +1476,10 @@ unsafe fn compile_inner(
     // boundary. Keep all VALU writes EXEC-predicated there; the whole-program
     // path can still use the reconvergence-liveness elision.
     let do_elide = !coop;
-    // Divergent-pointer load clustering (record load + transpose): needs whole
-    // 8-lane transpose blocks.
-    let do_cluster = w % 8 == 0;
+    // All supported widths are powers of two. Divergent-pointer load clustering
+    // uses power-of-two transpose tiles up to 8 lanes, then concatenates tiles
+    // for wider packets.
+    let do_cluster = w.is_power_of_two();
 
     for (&pc, block) in &program.blocks {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
@@ -2813,7 +2814,7 @@ impl Cg {
             && !self.frame_cur.borrow().contains_key(&c.vaddr)
     }
     /// Emit a divergent-pointer load cluster (see `vg_cluster`) as W per-lane
-    /// contiguous <span×f64> loads + a shuffle transpose, replacing span×(W/8)
+    /// contiguous <span×f64> loads + a shuffle transpose, replacing the member
     /// masked gathers. Inactive lanes may hold garbage pointers: they are
     /// substituted with an active lane's pointer (umax over active lanes) —
     /// sound because the block only runs with EXEC≠0 (the same invariant the
@@ -2842,7 +2843,7 @@ impl Cg {
                 ld
             })
             .collect();
-        let cols = self.transpose_rows(&rows, span);
+        let cols = self.transpose_rows(&rows, span, preferred_f64_transpose_tile(self.w));
         for (m, g) in members.iter().enumerate() {
             self.predicate.set(preds[m]);
             let pairs = if matches!(g.op, I::GLOBAL_LOAD_B64) { 1u32 } else { 2 };
@@ -2853,58 +2854,83 @@ impl Cg {
         }
     }
     /// Transpose W lane-major rows (<span×f64> each) into span column vectors
-    /// (<W×f64> each): 3-stage 8×8 butterfly per 8-lane block (24 two-input
-    /// v8f64 shuffles, each a single vpermt2pd/vunpck/vshuff64x2), a 7-shuffle
-    /// pairwise tree per tail field, then a free per-block concat.
-    unsafe fn transpose_rows(&self, rows: &[LLVMValueRef], span: u32) -> Vec<LLVMValueRef> {
+    /// (<W×f64> each). Each power-of-two tile uses log2(tile) butterfly stages;
+    /// wider packets concatenate independently transposed tiles.
+    unsafe fn transpose_rows(
+        &self,
+        rows: &[LLVMValueRef],
+        span: u32,
+        tile: u32,
+    ) -> Vec<LLVMValueRef> {
+        debug_assert!(tile.is_power_of_two() && tile <= 8 && self.w % tile == 0);
         let rowty = llvm::core::LLVMTypeOf(rows[0]);
         let shuf = |x: LLVMValueRef, y: LLVMValueRef, m: &[u32]| -> LLVMValueRef {
             let mut mv: Vec<LLVMValueRef> = m.iter().map(|&i| self.ci32(i)).collect();
             let mask = llvm::core::LLVMConstVector(mv.as_mut_ptr(), mv.len() as u32);
             llvm::core::LLVMBuildShuffleVector(self.b, x, y, mask, self.n())
         };
-        let nblk = (self.w / 8) as usize;
+        let nblk = (self.w / tile) as usize;
         let mut cols: Vec<Vec<LLVMValueRef>> = vec![Vec::with_capacity(nblk); span as usize];
         for blk in 0..nblk {
-            let r = &rows[blk * 8..blk * 8 + 8];
+            let begin = blk * tile as usize;
+            let r = &rows[begin..begin + tile as usize];
             let mut base = 0u32;
-            while base + 8 <= span {
-                let idx: Vec<u32> = (base..base + 8).collect();
-                let sub: Vec<LLVMValueRef> =
-                    (0..8).map(|l| shuf(r[l], llvm::core::LLVMGetPoison(rowty), &idx)).collect();
-                // stage k swaps bit k of (row index, element index); after all
-                // three, c[a][e] = sub[e][a] — verified algebraically.
-                let mut a = [std::ptr::null_mut(); 8];
-                for i in 0..4 {
-                    a[2 * i] = shuf(sub[2 * i], sub[2 * i + 1], &[0, 8, 2, 10, 4, 12, 6, 14]);
-                    a[2 * i + 1] = shuf(sub[2 * i], sub[2 * i + 1], &[1, 9, 3, 11, 5, 13, 7, 15]);
+            while base + tile <= span {
+                let idx: Vec<u32> = (base..base + tile).collect();
+                let poison = llvm::core::LLVMGetPoison(rowty);
+                let mut cur: Vec<LLVMValueRef> =
+                    r.iter().map(|&row| shuf(row, poison, &idx)).collect();
+                let mut step = 1u32;
+                while step < tile {
+                    let (lo_mask, hi_mask) = transpose_pair_masks(tile, step);
+                    let mut next = vec![std::ptr::null_mut(); tile as usize];
+                    for i in 0..tile {
+                        if i & step != 0 {
+                            continue;
+                        }
+                        let j = i | step;
+                        next[i as usize] = shuf(
+                            cur[i as usize],
+                            cur[j as usize],
+                            &lo_mask,
+                        );
+                        next[j as usize] = shuf(
+                            cur[i as usize],
+                            cur[j as usize],
+                            &hi_mask,
+                        );
+                    }
+                    cur = next;
+                    step <<= 1;
                 }
-                let mut c2 = [std::ptr::null_mut(); 8];
-                for &(i, j) in &[(0usize, 2usize), (1, 3), (4, 6), (5, 7)] {
-                    c2[i] = shuf(a[i], a[j], &[0, 1, 8, 9, 4, 5, 12, 13]);
-                    c2[j] = shuf(a[i], a[j], &[2, 3, 10, 11, 6, 7, 14, 15]);
+                for cix in 0..tile {
+                    cols[(base + cix) as usize].push(cur[cix as usize]);
                 }
-                let mut c3 = [std::ptr::null_mut(); 8];
-                for i in 0..4 {
-                    c3[i] = shuf(c2[i], c2[i + 4], &[0, 1, 2, 3, 8, 9, 10, 11]);
-                    c3[i + 4] = shuf(c2[i], c2[i + 4], &[4, 5, 6, 7, 12, 13, 14, 15]);
-                }
-                for cix in 0..8u32 {
-                    cols[(base + cix) as usize].push(c3[cix as usize]);
-                }
-                base += 8;
+                base += tile;
             }
             for f in base..span {
-                let l1: Vec<LLVMValueRef> =
-                    (0..4).map(|i| shuf(r[2 * i], r[2 * i + 1], &[f, span + f])).collect();
-                let l2: Vec<LLVMValueRef> =
-                    (0..2).map(|i| shuf(l1[2 * i], l1[2 * i + 1], &[0, 1, 2, 3])).collect();
-                cols[f as usize].push(shuf(l2[0], l2[1], &[0, 1, 2, 3, 4, 5, 6, 7]));
+                let mut parts: Vec<LLVMValueRef> = if tile == 1 {
+                    vec![shuf(r[0], llvm::core::LLVMGetPoison(rowty), &[f])]
+                } else {
+                    r.chunks(2)
+                        .map(|pair| shuf(pair[0], pair[1], &[f, span + f]))
+                        .collect()
+                };
+                let mut n = 2u32;
+                while parts.len() > 1 {
+                    let cat: Vec<u32> = (0..2 * n).collect();
+                    parts = parts
+                        .chunks(2)
+                        .map(|pair| shuf(pair[0], pair[1], &cat))
+                        .collect();
+                    n *= 2;
+                }
+                cols[f as usize].push(parts[0]);
             }
         }
         cols.into_iter()
             .map(|mut parts| {
-                let mut n = 8u32;
+                let mut n = tile;
                 while parts.len() > 1 {
                     let cat: Vec<u32> = (0..2 * n).collect();
                     parts = parts.chunks(2).map(|p| shuf(p[0], p[1], &cat)).collect();
@@ -3174,16 +3200,100 @@ impl Cg {
 // pairwise 8-aligned byte span, is one per-lane record read (smallpt: the
 // 9-f64 sphere record at 0x8..0x50). `vg_cluster` recognizes the run so it can
 // be emitted as W contiguous per-lane vector loads + a shuffle transpose
-// instead of span × W/8 masked gathers — the gathers and their per-gather
-// mask refills (kmovq) were ~8% of W=16 kernel cycles. Consecutive-only keeps
-// this trivially sound: no instruction intervenes, so EXEC, memory and the
-// address VGPRs cannot change inside the run (scheduling no-ops are already
-// filtered out of `body` by ir::is_noop).
+// instead of one masked gather per f64 column. Consecutive-only keeps this
+// trivially sound: no instruction intervenes, so EXEC, memory and the address
+// VGPRs cannot change inside the run (scheduling no-ops are already filtered
+// out of `body` by ir::is_noop).
 struct VgCluster {
     len: usize, // number of member instructions (≥ 3)
     vaddr: u32, // shared per-lane pointer pair
     lo: i64,    // lowest sign-extended ioffset (span start, bytes)
     span: u32,  // span length in f64 fields
+}
+
+/// Match a transpose tile to the host's native f64 SIMD width. The LLVM JIT is
+/// also configured for the host CPU, so this keeps each column vector native:
+/// SSE2/NEON=2 lanes, AVX2=4, AVX-512=8. Wider SPMD packets concatenate tiles.
+fn preferred_f64_transpose_tile(width: u32) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let native = if std::arch::is_x86_feature_detected!("avx512f") {
+        8
+    } else if std::arch::is_x86_feature_detected!("avx2") {
+        4
+    } else {
+        2
+    };
+    #[cfg(target_arch = "aarch64")]
+    let native = 2;
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let native = 1;
+    width.min(native)
+}
+
+/// Shuffle masks for one butterfly stage of a square power-of-two transpose.
+/// `step` selects the row/column index bit exchanged at this stage.
+fn transpose_pair_masks(tile: u32, step: u32) -> (Vec<u32>, Vec<u32>) {
+    debug_assert!(tile.is_power_of_two());
+    debug_assert!(step.is_power_of_two() && step < tile);
+    let mask = |high: bool| {
+        (0..tile)
+            .map(|position| {
+                let from_second = position & step != 0;
+                let element = (position & !step) | if high { step } else { 0 };
+                element + if from_second { tile } else { 0 }
+            })
+            .collect()
+    };
+    (mask(false), mask(true))
+}
+
+#[cfg(test)]
+mod transpose_mask_tests {
+    use super::{preferred_f64_transpose_tile, transpose_pair_masks};
+
+    #[test]
+    fn preferred_tile_partitions_every_supported_packet_width() {
+        for width in [1u32, 2, 4, 8, 16] {
+            let tile = preferred_f64_transpose_tile(width);
+            assert!(tile.is_power_of_two());
+            assert!(tile <= width);
+            assert_eq!(width % tile, 0);
+        }
+    }
+
+    #[test]
+    fn power_of_two_butterfly_masks_transpose_square_tiles() {
+        for tile in [1usize, 2, 4, 8, 16] {
+            let mut rows: Vec<Vec<usize>> = (0..tile)
+                .map(|row| (0..tile).map(|col| row * tile + col).collect())
+                .collect();
+            let mut step = 1usize;
+            while step < tile {
+                let (lo, hi) = transpose_pair_masks(tile as u32, step as u32);
+                let mut next = vec![vec![]; tile];
+                for row in 0..tile {
+                    if row & step != 0 {
+                        continue;
+                    }
+                    let other = row | step;
+                    let joined: Vec<usize> = rows[row]
+                        .iter()
+                        .chain(&rows[other])
+                        .copied()
+                        .collect();
+                    next[row] = lo.iter().map(|&index| joined[index as usize]).collect();
+                    next[other] = hi.iter().map(|&index| joined[index as usize]).collect();
+                }
+                rows = next;
+                step <<= 1;
+            }
+            for col in 0..tile {
+                for lane in 0..tile {
+                    assert_eq!(rows[col][lane], lane * tile + col, "tile={tile}");
+                }
+            }
+        }
+    }
 }
 
 fn vg_sext_ioff(io: u32) -> i64 {
