@@ -58,6 +58,96 @@ pub struct Box4Node {
     pub child_count: u32,
 }
 
+/// Ordered min/max: `minps`/`maxps` semantics, one instruction. Equal to
+/// `f32::min`/`f32::max` (IEEE minNum/maxNum) whenever neither operand is NaN;
+/// see [`intersect4`] for why that precondition is testable in bulk.
+#[inline(always)]
+fn rmin(a: f32, b: f32) -> f32 {
+    if a < b {
+        a
+    } else {
+        b
+    }
+}
+
+#[inline(always)]
+fn rmax(a: f32, b: f32) -> f32 {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Slab test for all four children of a [`Box4Node`] at once, SoA over the
+/// children. Bit-identical to four [`intersect`] calls; returns `(t0, t1)` per
+/// child.
+///
+/// `f32::min`/`f32::max` are IEEE minNum/maxNum, which x86 implements as a
+/// min/max plus a three-instruction NaN blend — twelve of them per node here.
+/// A slab value is NaN only when an axis multiplies `0 * inf` (a ray parallel
+/// to a slab whose origin lies exactly on one of the box planes), so testing
+/// all 24 of them for NaN once (six vector compares) lets the common case use
+/// the raw ordered min/max, with the minNum form kept for the rare case.
+#[inline]
+fn intersect4(
+    ray_origin: [f32; 3],
+    inv_direction: [f32; 3],
+    aabb: &[Aabb; 4],
+    max_t: f32,
+) -> ([f32; 4], [f32; 4]) {
+    let mut f = [[0f32; 4]; 3];
+    let mut n = [[0f32; 4]; 3];
+    for axis in 0..3 {
+        for child in 0..4 {
+            f[axis][child] = (aabb[child].max[axis] - ray_origin[axis]) * inv_direction[axis];
+            n[axis][child] = (aabb[child].min[axis] - ray_origin[axis]) * inv_direction[axis];
+        }
+    }
+
+    let mut has_nan = false;
+    for axis in 0..3 {
+        for child in 0..4 {
+            has_nan |= f[axis][child].is_nan() | n[axis][child].is_nan();
+        }
+    }
+
+    let mut t0 = [0f32; 4];
+    let mut t1 = [0f32; 4];
+    if has_nan {
+        for c in 0..4 {
+            let hi = [
+                f[0][c].max(n[0][c]),
+                f[1][c].max(n[1][c]),
+                f[2][c].max(n[2][c]),
+            ];
+            let lo = [
+                f[0][c].min(n[0][c]),
+                f[1][c].min(n[1][c]),
+                f[2][c].min(n[2][c]),
+            ];
+            t1[c] = hi[0].min(hi[1].min(hi[2].min(max_t)));
+            t0[c] = lo[0].max(lo[1].max(lo[2].max(0.0)));
+        }
+    } else {
+        for c in 0..4 {
+            let hi = [
+                rmax(f[0][c], n[0][c]),
+                rmax(f[1][c], n[1][c]),
+                rmax(f[2][c], n[2][c]),
+            ];
+            let lo = [
+                rmin(f[0][c], n[0][c]),
+                rmin(f[1][c], n[1][c]),
+                rmin(f[2][c], n[2][c]),
+            ];
+            t1[c] = rmin(hi[0], rmin(hi[1], rmin(hi[2], max_t)));
+            t0[c] = rmax(lo[0], rmax(lo[1], rmax(lo[2], 0.0)));
+        }
+    }
+    (t0, t1)
+}
+
 fn intersect(ray_origin: [f32; 3], inv_direction: [f32; 3], aabb: &Aabb, max_t: f32) -> (f32, f32) {
     let f = [
         (aabb.max[0] - ray_origin[0]) * inv_direction[0],
@@ -181,73 +271,48 @@ pub extern "C" fn image_bvh64_intersect_ray(
             let node_ptr = (node_addr & !0x7u64) << 3;
             let node = unsafe { *(node_ptr as *const Box4Node) };
 
-            let mut s0 = intersect(
+            let (mut t0, t1) = intersect4(
                 [ray_origin_x, ray_origin_y, ray_origin_z],
                 [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                &node.aabb[0],
-                ray_extent,
-            );
-            let mut s1 = intersect(
-                [ray_origin_x, ray_origin_y, ray_origin_z],
-                [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                &node.aabb[1],
-                ray_extent,
-            );
-            let mut s2 = intersect(
-                [ray_origin_x, ray_origin_y, ray_origin_z],
-                [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                &node.aabb[2],
-                ray_extent,
-            );
-            let mut s3 = intersect(
-                [ray_origin_x, ray_origin_y, ray_origin_z],
-                [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                &node.aabb[3],
+                &node.aabb,
                 ray_extent,
             );
 
-            let mut result0 = if s0.0 <= s0.1 {
+            let result0 = if t0[0] <= t1[0] {
                 node.child_index[0]
             } else {
                 0xFFFF_FFFF
             };
-            let mut result1 = if s1.0 <= s1.1 {
+            let result1 = if t0[1] <= t1[1] {
                 node.child_index[1]
             } else {
                 0xFFFF_FFFF
             };
-            let mut result2 = if s2.0 <= s2.1 {
+            let result2 = if t0[2] <= t1[2] {
                 node.child_index[2]
             } else {
                 0xFFFF_FFFF
             };
-            let mut result3 = if s3.0 <= s3.1 {
+            let result3 = if t0[3] <= t1[3] {
                 node.child_index[3]
             } else {
                 0xFFFF_FFFF
             };
 
-            let sort = |child_index_a: &mut u32,
-                        child_index_b: &mut u32,
-                        dist_a: &mut f32,
-                        dist_b: &mut f32| {
-                if (*child_index_b != 0xFFFF_FFFF && dist_b < dist_a)
-                    || *child_index_a == 0xFFFF_FFFF
-                {
-                    let t0 = *dist_a;
-                    let t1 = *child_index_a;
-                    *child_index_a = *child_index_b;
-                    *dist_a = *dist_b;
-                    *child_index_b = t1;
-                    *dist_b = t0;
+            let mut child = [result0, result1, result2, result3];
+            let sort = |child: &mut [u32; 4], dist: &mut [f32; 4], a: usize, b: usize| {
+                if (child[b] != 0xFFFF_FFFF && dist[b] < dist[a]) || child[a] == 0xFFFF_FFFF {
+                    child.swap(a, b);
+                    dist.swap(a, b);
                 }
             };
 
-            sort(&mut result0, &mut result2, &mut s0.0, &mut s2.0);
-            sort(&mut result1, &mut result3, &mut s1.0, &mut s3.0);
-            sort(&mut result0, &mut result1, &mut s0.0, &mut s1.0);
-            sort(&mut result2, &mut result3, &mut s2.0, &mut s3.0);
-            sort(&mut result1, &mut result2, &mut s1.0, &mut s2.0);
+            sort(&mut child, &mut t0, 0, 2);
+            sort(&mut child, &mut t0, 1, 3);
+            sort(&mut child, &mut t0, 0, 1);
+            sort(&mut child, &mut t0, 2, 3);
+            sort(&mut child, &mut t0, 1, 2);
+            let [result0, result1, result2, result3] = child;
 
             unsafe {
                 *result0_ptr = result0;
