@@ -956,6 +956,18 @@ impl Cg {
     unsafe fn vf32_of(&self, v: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildBitCast(self.b, v, self.vf32, self.n())
     }
+    /// Ordered min/max on `<W x f32>`: `a < b ? a : b`, which LLVM folds to a
+    /// single `minps`/`maxps`-class op. Equal to IEEE minNum/maxNum whenever
+    /// neither operand is NaN; callers establish that precondition in bulk.
+    unsafe fn vminnum_raw(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
+        let c = llvm::core::LLVMBuildFCmp(self.b, llvm::LLVMRealPredicate::LLVMRealOLT, a, b, self.n());
+        llvm::core::LLVMBuildSelect(self.b, c, a, b, self.n())
+    }
+    unsafe fn vmaxnum_raw(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
+        let c = llvm::core::LLVMBuildFCmp(self.b, llvm::LLVMRealPredicate::LLVMRealOGT, a, b, self.n());
+        llvm::core::LLVMBuildSelect(self.b, c, a, b, self.n())
+    }
+
     unsafe fn vfsub(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildFSub(self.b, a, b, self.n())
     }
@@ -3556,49 +3568,390 @@ impl Cg {
     unsafe fn emit_vimage(&self, i: &VIMAGE) {
         match i.op {
             I::IMAGE_BVH64_INTERSECT_RAY => {
-                let field_ptr = |field: u32| -> LLVMValueRef {
+                use llvm::LLVMIntPredicate::*;
+                use llvm::LLVMRealPredicate::*;
+                let n = self.n();
+                let func = llvm::core::LLVMGetBasicBlockParent(
+                    llvm::core::LLVMGetInsertBlock(self.b),
+                );
+                let bb = |name: &str| {
+                    llvm::core::LLVMAppendBasicBlockInContext(
+                        self.ctx,
+                        func,
+                        cstr(name).as_ptr(),
+                    )
+                };
+                let uni_bb = bb("bvh.uniform");
+                let fast = bb("bvh.box");
+                let tri_bb = bb("bvh.tri");
+                let slow = bb("bvh.general");
+                let join = bb("bvh.join");
+
+                let addr = self.ld_vgpr64(i.vaddr0 as u32);
+                let extent = self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32));
+                let origin: Vec<LLVMValueRef> = (0..3)
+                    .map(|k| self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32 + k)))
+                    .collect();
+                let inv: Vec<LLVMValueRef> = (0..3)
+                    .map(|k| self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32 + k)))
+                    .collect();
+
+                // Representative node address over the active lanes, the same
+                // umax idiom `emit_vglobal_cluster` uses (the block only runs
+                // with EXEC != 0, so at least one lane contributes).
+                let exec = self.exec_vec();
+                let masked = llvm::core::LLVMBuildSelect(
+                    self.b,
+                    exec,
+                    addr,
+                    llvm::core::LLVMConstNull(self.vi64),
+                    n,
+                );
+                let rep = self.call(
+                    &format!("llvm.vector.reduce.umax.v{}i64", self.w),
+                    self.i64t,
+                    &[self.vi64],
+                    &[masked],
+                );
+                let same = llvm::core::LLVMBuildICmp(
+                    self.b,
+                    LLVMIntEQ,
+                    addr,
+                    self.splat(rep, self.vi64),
+                    n,
+                );
+                let same_or_off = llvm::core::LLVMBuildOr(
+                    self.b,
+                    same,
+                    llvm::core::LLVMBuildNot(self.b, exec, n),
+                    n,
+                );
+                let uniform = self.call(
+                    &format!("llvm.vector.reduce.and.v{}i1", self.w),
+                    self.i1,
+                    &[self.vi1],
+                    &[same_or_off],
+                );
+                let ntype = llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(7), n);
+                let is_box = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, ntype, self.ci64(5), n);
+                let is_tri = llvm::core::LLVMBuildICmp(self.b, LLVMIntULT, ntype, self.ci64(2), n);
+                let known = llvm::core::LLVMBuildOr(self.b, is_box, is_tri, n);
+                // With EXEC == 0 the reduction above has no active lane to pick,
+                // so `rep` would be 0 and the type test would accept it as a
+                // triangle node at address 0. Blocks are not supposed to run
+                // with EXEC == 0, but the fast path must not dereference a null
+                // node if one ever does.
+                let any_active = llvm::core::LLVMBuildICmp(
+                    self.b,
+                    LLVMIntNE,
+                    self.ld_sgpr32(EXEC),
+                    self.ci32(0),
+                    n,
+                );
+                let take = llvm::core::LLVMBuildAnd(
+                    self.b,
+                    llvm::core::LLVMBuildAnd(self.b, uniform, known, n),
+                    any_active,
+                    n,
+                );
+                llvm::core::LLVMBuildCondBr(self.b, take, uni_bb, slow);
+                llvm::core::LLVMPositionBuilderAtEnd(self.b, uni_bb);
+                llvm::core::LLVMBuildCondBr(self.b, is_box, fast, tri_bb);
+
+                // ---- every active lane at the same box node ----------------
+                llvm::core::LLVMPositionBuilderAtEnd(self.b, fast);
+                let node_ptr = llvm::core::LLVMBuildShl(
+                    self.b,
+                    llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(!0x7u64), n),
+                    self.ci64(3),
+                    n,
+                );
+                // Box4Node: child_index[4], then aabb[4] of { min[3], max[3] }.
+                let field = |off: u64, ty: LLVMTypeRef| -> LLVMValueRef {
+                    let a = llvm::core::LLVMBuildAdd(self.b, node_ptr, self.ci64(off), n);
+                    let p = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, n);
+                    let ld = llvm::core::LLVMBuildLoad2(self.b, ty, p, n);
+                    llvm::core::LLVMSetAlignment(ld, 4);
+                    ld
+                };
+                let vzero = llvm::core::LLVMConstNull(self.vf32);
+                let mut child = [llvm::core::LLVMConstNull(self.vi32); 4];
+                let mut dist = [vzero; 4];
+                let mut nan_acc: Option<LLVMValueRef> = None;
+                for c in 0..4u64 {
+                    let mut hi3 = [vzero; 3];
+                    let mut lo3 = [vzero; 3];
+                    for axis in 0..3u64 {
+                        let base = 16 + c * 24 + axis * 4;
+                        let bhi = self.splat(field(base + 12, self.f32t), self.vf32);
+                        let blo = self.splat(field(base, self.f32t), self.vf32);
+                        let f = self.vfmul(self.vfsub(bhi, origin[axis as usize]), inv[axis as usize]);
+                        let g = self.vfmul(self.vfsub(blo, origin[axis as usize]), inv[axis as usize]);
+                        for v in [f, g] {
+                            let u = llvm::core::LLVMBuildFCmp(self.b, LLVMRealUNO, v, v, n);
+                            nan_acc = Some(match nan_acc {
+                                None => u,
+                                Some(p) => llvm::core::LLVMBuildOr(self.b, p, u, n),
+                            });
+                        }
+                        hi3[axis as usize] = self.vmaxnum_raw(f, g);
+                        lo3[axis as usize] = self.vminnum_raw(f, g);
+                    }
+                    let t1 = self.vminnum_raw(
+                        hi3[0],
+                        self.vminnum_raw(hi3[1], self.vminnum_raw(hi3[2], extent)),
+                    );
+                    let t0 = self.vmaxnum_raw(
+                        lo3[0],
+                        self.vmaxnum_raw(lo3[1], self.vmaxnum_raw(lo3[2], vzero)),
+                    );
+                    let hit = llvm::core::LLVMBuildFCmp(self.b, LLVMRealOLE, t0, t1, n);
+                    let ci = self.splat(field(c * 4, self.i32t), self.vi32);
+                    child[c as usize] = llvm::core::LLVMBuildSelect(
+                        self.b,
+                        hit,
+                        ci,
+                        self.vci32(0xFFFF_FFFF),
+                        n,
+                    );
+                    dist[c as usize] = t0;
+                }
+                let ones = self.vci32(0xFFFF_FFFF);
+                let swap_pair = |a: usize, b: usize,
+                                     child: &mut [LLVMValueRef; 4],
+                                     dist: &mut [LLVMValueRef; 4]| {
+                    let b_valid =
+                        llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, child[b], ones, n);
+                    let closer =
+                        llvm::core::LLVMBuildFCmp(self.b, LLVMRealOLT, dist[b], dist[a], n);
+                    let a_empty =
+                        llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, child[a], ones, n);
+                    let sw = llvm::core::LLVMBuildOr(
+                        self.b,
+                        llvm::core::LLVMBuildAnd(self.b, b_valid, closer, n),
+                        a_empty,
+                        n,
+                    );
+                    let ca = llvm::core::LLVMBuildSelect(self.b, sw, child[b], child[a], n);
+                    let cb = llvm::core::LLVMBuildSelect(self.b, sw, child[a], child[b], n);
+                    let da = llvm::core::LLVMBuildSelect(self.b, sw, dist[b], dist[a], n);
+                    let db = llvm::core::LLVMBuildSelect(self.b, sw, dist[a], dist[b], n);
+                    child[a] = ca;
+                    child[b] = cb;
+                    dist[a] = da;
+                    dist[b] = db;
+                };
+                swap_pair(0, 2, &mut child, &mut dist);
+                swap_pair(1, 3, &mut child, &mut dist);
+                swap_pair(0, 1, &mut child, &mut dist);
+                swap_pair(2, 3, &mut child, &mut dist);
+                swap_pair(1, 2, &mut child, &mut dist);
+
+                // A NaN slab value makes the ordered min/max above differ from
+                // minNum; that lane set is rare enough to redo in the helper.
+                let any_nan = self.call(
+                    &format!("llvm.vector.reduce.or.v{}i1", self.w),
+                    self.i1,
+                    &[self.vi1],
+                    &[nan_acc.unwrap()],
+                );
+                llvm::core::LLVMBuildCondBr(self.b, any_nan, slow, join);
+                let fast_end = llvm::core::LLVMGetInsertBlock(self.b);
+
+                // ---- every active lane at the same triangle-pair node ------
+                llvm::core::LLVMPositionBuilderAtEnd(self.b, tri_bb);
+                let tnode = llvm::core::LLVMBuildShl(
+                    self.b,
+                    llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(!0x7u64), n),
+                    self.ci64(3),
+                    n,
+                );
+                let tfield = |off: u64, ty: LLVMTypeRef| -> LLVMValueRef {
+                    let a = llvm::core::LLVMBuildAdd(self.b, tnode, self.ci64(off), n);
+                    let p = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, n);
+                    let ld = llvm::core::LLVMBuildLoad2(self.b, ty, p, n);
+                    llvm::core::LLVMSetAlignment(ld, 4);
+                    ld
+                };
+                // TrianglePairNode: v0,v1,v2,v3 (3 f32 each), pad, prim_index[2], flags.
+                let odd = llvm::core::LLVMBuildICmp(
+                    self.b,
+                    LLVMIntNE,
+                    llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(1), n),
+                    self.ci64(0),
+                    n,
+                );
+                let vtx = |slot: u64, axis: u64| tfield(slot * 12 + axis * 4, self.f32t);
+                // tri = odd ? [v3, v2, v1] : [v0, v1, v2]
+                let pick = |a: u64, b: u64, axis: u64| {
+                    llvm::core::LLVMBuildSelect(self.b, odd, vtx(a, axis), vtx(b, axis), n)
+                };
+                let t0v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(3, 0, k), self.vf32)).collect();
+                let t1v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(2, 1, k), self.vf32)).collect();
+                let t2v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(1, 2, k), self.vf32)).collect();
+                let flags_raw = tfield(60, self.i32t);
+                let flags = llvm::core::LLVMBuildLShr(
+                    self.b,
+                    flags_raw,
+                    llvm::core::LLVMBuildSelect(self.b, odd, self.ci32(8), self.ci32(0), n),
+                    n,
+                );
+
+                let dir: Vec<LLVMValueRef> = (0..3)
+                    .map(|k| self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32 + k)))
+                    .collect();
+                let sub3 = |a: &[LLVMValueRef], b: &[LLVMValueRef]| -> Vec<LLVMValueRef> {
+                    (0..3).map(|k| self.vfsub(a[k], b[k])).collect()
+                };
+                // Same association as `intersect_triangle_frac`: cross uses
+                // a1*b2 - a2*b1, dot is (x + y) + z. No contraction.
+                let cross = |a: &[LLVMValueRef], b: &[LLVMValueRef]| -> Vec<LLVMValueRef> {
+                    vec![
+                        self.vfsub(self.vfmul(a[1], b[2]), self.vfmul(a[2], b[1])),
+                        self.vfsub(self.vfmul(a[2], b[0]), self.vfmul(a[0], b[2])),
+                        self.vfsub(self.vfmul(a[0], b[1]), self.vfmul(a[1], b[0])),
+                    ]
+                };
+                let dot = |a: &[LLVMValueRef], b: &[LLVMValueRef]| -> LLVMValueRef {
+                    self.vfadd(
+                        self.vfadd(self.vfmul(a[0], b[0]), self.vfmul(a[1], b[1])),
+                        self.vfmul(a[2], b[2]),
+                    )
+                };
+
+                let e1 = sub3(&t1v, &t0v);
+                let e2 = sub3(&t2v, &t0v);
+                let s1 = cross(&dir, &e2);
+                let denom = dot(&s1, &e1);
+                let dv = sub3(&origin, &t0v);
+                let b_y = dot(&dv, &s1);
+                let s2 = cross(&dv, &e1);
+                let b_z = dot(&dir, &s2);
+                let t_hit = dot(&e2, &s2);
+                let b_x = self.vfsub(self.vfsub(denom, b_y), b_z);
+
+                let zero = llvm::core::LLVMConstNull(self.vf32);
+                let inf = self.vcf32(f32::INFINITY);
+                let fc = |p, a, b| llvm::core::LLVMBuildFCmp(self.b, p, a, b, n);
+                let or = |a, b| llvm::core::LLVMBuildOr(self.b, a, b, n);
+                let and = |a, b| llvm::core::LLVMBuildAnd(self.b, a, b, n);
+                let byz = self.vfadd(b_y, b_z);
+                let reject_pos = and(
+                    fc(LLVMRealOGT, denom, zero),
+                    or(
+                        or(
+                            or(fc(LLVMRealOLT, b_y, zero), fc(LLVMRealOGT, b_y, denom)),
+                            or(fc(LLVMRealOLT, b_z, zero), fc(LLVMRealOGT, byz, denom)),
+                        ),
+                        fc(LLVMRealOLT, t_hit, zero),
+                    ),
+                );
+                let reject_neg = and(
+                    fc(LLVMRealOLT, denom, zero),
+                    or(
+                        or(
+                            or(fc(LLVMRealOGT, b_y, zero), fc(LLVMRealOLT, b_y, denom)),
+                            or(fc(LLVMRealOGT, b_z, zero), fc(LLVMRealOLT, byz, denom)),
+                        ),
+                        fc(LLVMRealOGT, t_hit, zero),
+                    ),
+                );
+                let miss = or(reject_pos, reject_neg);
+                let degenerate = fc(LLVMRealOEQ, denom, zero);
+                let sel = |c, a, b| llvm::core::LLVMBuildSelect(self.b, c, a, b, n);
+                // `flags` picks a barycentric per output; it is uniform, so the
+                // index is a scalar and the selects are scalar-controlled.
+                let bary = |shift: u32| -> LLVMValueRef {
+                    let idx = llvm::core::LLVMBuildAnd(
+                        self.b,
+                        llvm::core::LLVMBuildLShr(self.b, flags, self.ci32(shift), n),
+                        self.ci32(3),
+                        n,
+                    );
+                    let is0 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, idx, self.ci32(0), n);
+                    let is1 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, idx, self.ci32(1), n);
+                    sel(is0, b_x, sel(is1, b_y, b_z))
+                };
+                let tri_res = [
+                    sel(degenerate, inf, sel(miss, inf, t_hit)),
+                    sel(degenerate, zero, denom),
+                    sel(degenerate, zero, bary(0)),
+                    sel(degenerate, zero, bary(2)),
+                ];
+                let tri_bits: Vec<LLVMValueRef> =
+                    tri_res.iter().map(|&v| self.vf32_bits(v)).collect();
+                llvm::core::LLVMBuildBr(self.b, join);
+                let tri_end = llvm::core::LLVMGetInsertBlock(self.b);
+
+
+                // ---- divergent nodes, triangle nodes, or NaN --------------
+                llvm::core::LLVMPositionBuilderAtEnd(self.b, slow);
+                let field_ptr = |f: u32| -> LLVMValueRef {
                     llvm::core::LLVMBuildStructGEP2(
                         self.b,
                         self.bvh_packet_ty,
                         self.bvh_packet,
-                        field,
-                        self.n(),
+                        f,
+                        n,
                     )
                 };
                 let inputs = [
-                    self.ld_vgpr64(i.vaddr0 as u32),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32)),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32)),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32 + 1)),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr2 as u32 + 2)),
+                    addr,
+                    extent,
+                    origin[0],
+                    origin[1],
+                    origin[2],
                     self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32)),
                     self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32 + 1)),
                     self.vf32_of(self.ld_vgpr32(i.vaddr3 as u32 + 2)),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32)),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32 + 1)),
-                    self.vf32_of(self.ld_vgpr32(i.vaddr4 as u32 + 2)),
+                    inv[0],
+                    inv[1],
+                    inv[2],
                 ];
-                for (field, value) in inputs.iter().copied().enumerate() {
-                    let store = llvm::core::LLVMBuildStore(self.b, value, field_ptr(field as u32));
-                    llvm::core::LLVMSetAlignment(store, if field == 0 { 8 } else { 4 });
+                for (f, value) in inputs.iter().copied().enumerate() {
+                    let store = llvm::core::LLVMBuildStore(self.b, value, field_ptr(f as u32));
+                    llvm::core::LLVMSetAlignment(store, if f == 0 { 8 } else { 4 });
                 }
-
                 self.call(
                     "image_bvh64_intersect_ray_packet",
                     llvm::core::LLVMVoidTypeInContext(self.ctx),
                     &[self.ptr, self.i32t, self.i32t],
                     &[self.bvh_packet, self.ci32(self.w), self.ld_sgpr32(EXEC)],
                 );
+                let slow_res: Vec<LLVMValueRef> = (0..4)
+                    .map(|k| {
+                        let ld = llvm::core::LLVMBuildLoad2(
+                            self.b,
+                            self.vi32,
+                            field_ptr(11 + k),
+                            n,
+                        );
+                        llvm::core::LLVMSetAlignment(ld, 4);
+                        ld
+                    })
+                    .collect();
+                llvm::core::LLVMBuildBr(self.b, join);
+                let slow_end = llvm::core::LLVMGetInsertBlock(self.b);
 
-                for k in 0..4u32 {
-                    let load = llvm::core::LLVMBuildLoad2(
-                        self.b,
-                        self.vi32,
-                        field_ptr(11 + k),
-                        self.n(),
-                    );
-                    llvm::core::LLVMSetAlignment(load, 4);
-                    self.st_vgpr32(i.vdata as u32 + k, load);
+                llvm::core::LLVMPositionBuilderAtEnd(self.b, join);
+                // All phis must sit at the top of the block, so build them
+                // before any of the register writes.
+                let phis: Vec<LLVMValueRef> = (0..4)
+                    .map(|k| {
+                        let phi = llvm::core::LLVMBuildPhi(self.b, self.vi32, n);
+                        let mut vals = [child[k], tri_bits[k], slow_res[k]];
+                        let mut blocks = [fast_end, tri_end, slow_end];
+                        llvm::core::LLVMAddIncoming(
+                            phi,
+                            vals.as_mut_ptr(),
+                            blocks.as_mut_ptr(),
+                            3,
+                        );
+                        phi
+                    })
+                    .collect();
+                for (k, phi) in phis.into_iter().enumerate() {
+                    self.st_vgpr32(i.vdata as u32 + k as u32, phi);
                 }
             }
             _ => panic!("vec: unsupported VIMAGE {:?}", i.op),
