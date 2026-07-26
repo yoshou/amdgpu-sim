@@ -397,6 +397,7 @@ struct Cg {
     writeback_vgprs: usize,
     // per-lane scratch base vector <W×i64> (broadcast(base) + lane*stride)
     scratch_vec: LLVMValueRef,
+    store_sink: std::cell::Cell<LLVMValueRef>,
     // uniform scratch base (i64 scalar) — lane 0's segment. Used for scalar
     // SRC_PRIVATE_BASE reads (`s_mov_b64 s[..], src_private_base`): the aperture
     // high word is uniform across lanes, and the kernel adds the per-lane low
@@ -1690,6 +1691,7 @@ unsafe fn compile_inner(
     let mut cg = Cg {
         ctx, module, func, b, w, coop, writeback_vgprs: num_vgprs,
         scratch_vec: scratch_base, // placeholder, set below
+        store_sink: std::cell::Cell::new(std::ptr::null_mut()),
         scratch_base_scalar: scratch_base,
         scratch_stride,
         sgpr, vgpr, vgpr_f64, scc,
@@ -1744,6 +1746,7 @@ unsafe fn compile_inner(
     let scratch_lane = cg.v_add(lane_base_v, lane_idx_i64);
     let off = llvm::core::LLVMBuildMul(b, scratch_lane, stride_v, cg.n());
     cg.scratch_vec = cg.v_add(base_v, off);
+    cg.store_sink.set(llvm::core::LLVMBuildAlloca(b, i64t, cstr("store_sink").as_ptr()));
 
     // Initialize SGPRs (scalar, from uniform sgprs_p) and VGPRs (<W×i32> SoA).
     for i in 0..128u32 {
@@ -3413,6 +3416,36 @@ impl Cg {
         let v = llvm::core::LLVMBuildLoad2(self.b, self.f64t, p0, self.n());
         self.splat(v, self.vf64)
     }
+    /// Load `<W x i32>` through lane-affine pointers (see `emit_vscratch`).
+    unsafe fn affine_load(&self, ptrs: LLVMValueRef) -> LLVMValueRef {
+        let n = self.n();
+        let mut v = llvm::core::LLVMGetPoison(self.vi32);
+        for l in 0..self.w {
+            let p = llvm::core::LLVMBuildExtractElement(self.b, ptrs, self.ci32(l), n);
+            let ld = llvm::core::LLVMBuildLoad2(self.b, self.i32t, p, n);
+            llvm::core::LLVMSetAlignment(ld, 4);
+            v = llvm::core::LLVMBuildInsertElement(self.b, v, ld, self.ci32(l), n);
+        }
+        v
+    }
+
+    /// Store `<W x i32>` through lane-affine pointers. A store must not be
+    /// observable from an inactive lane, so instead of predicating each one the
+    /// inactive lanes are redirected to a sink whose value is never read.
+    unsafe fn affine_store(&self, val: LLVMValueRef, ptrs: LLVMValueRef, exec: LLVMValueRef) {
+        let n = self.n();
+        let sink = llvm::core::LLVMBuildPtrToInt(self.b, self.store_sink.get(), self.i64t, n);
+        let addr_i = llvm::core::LLVMBuildPtrToInt(self.b, ptrs, self.vi64, n);
+        let safe = llvm::core::LLVMBuildSelect(self.b, exec, addr_i, self.splat(sink, self.vi64), n);
+        for l in 0..self.w {
+            let a = llvm::core::LLVMBuildExtractElement(self.b, safe, self.ci32(l), n);
+            let p = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, n);
+            let d = llvm::core::LLVMBuildExtractElement(self.b, val, self.ci32(l), n);
+            let st = llvm::core::LLVMBuildStore(self.b, d, p);
+            llvm::core::LLVMSetAlignment(st, 4);
+        }
+    }
+
     unsafe fn masked_gather(&self, ptrs: LLVMValueRef, mask: LLVMValueRef) -> LLVMValueRef {
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
         let passthru = llvm::core::LLVMConstNull(self.vi32);
@@ -3552,13 +3585,45 @@ impl Cg {
             _ => panic!("vec: unsupported VSCRATCH {:?}", i.op),
         };
         let exec = self.exec_vec();
+        // Each lane's private segment sits at `base + lane * stride`, so with no
+        // per-lane VGPR offset (`sve == 0`) the addresses are affine in the lane
+        // index. A masked gather/scatter is microcoded into per-lane accesses
+        // anyway, so issue those directly instead. Inactive lanes read their own
+        // (always allocated) slot; their value is dropped by the predicated
+        // destination write. Stores redirect inactive lanes to a sink.
+        if i.sve == 0 && words >= 2 && !is_store {
+            let tile = if self.w % 4 == 0 { 4 } else if self.w % 2 == 0 { 2 } else { 1 };
+            let rowty = llvm::core::LLVMVectorType(self.i32t, words);
+            let rows: Vec<LLVMValueRef> = (0..self.w)
+                .map(|l| {
+                    let a = llvm::core::LLVMBuildExtractElement(self.b, addr, self.ci32(l), self.n());
+                    let p = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, self.n());
+                    let ld = llvm::core::LLVMBuildLoad2(self.b, rowty, p, self.n());
+                    llvm::core::LLVMSetAlignment(ld, 4);
+                    ld
+                })
+                .collect();
+            let cols = self.transpose_rows(&rows, words, tile);
+            for k in 0..words {
+                self.st_vgpr32(i.vdst as u32 + k, cols[k as usize]);
+            }
+            return;
+        }
         for k in 0..words {
             let ptrs = self.ptr_at_vec(addr, (k as u64) * 4);
             if is_store {
                 let d = self.ld_vgpr32(i.vsrc as u32 + k);
-                self.masked_scatter(d, ptrs, exec);
+                if i.sve == 0 {
+                    self.affine_store(d, ptrs, exec);
+                } else {
+                    self.masked_scatter(d, ptrs, exec);
+                }
             } else {
-                let d = self.masked_gather(ptrs, exec);
+                let d = if i.sve == 0 {
+                    self.affine_load(ptrs)
+                } else {
+                    self.masked_gather(ptrs, exec)
+                };
                 self.st_vgpr32(i.vdst as u32 + k, d);
             }
         }
