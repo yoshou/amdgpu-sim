@@ -445,11 +445,24 @@ impl RDNATranslator {
                     reg_usage.use_operand_f32(&inst.src0);
                     reg_usage.def_vgpr_f32(inst.vdst as u32);
                 }
+                I::V_FLOOR_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_CVT_F32_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }
             },
             InstFormat::VOP2(inst) => match inst.op {
+                I::V_ASHRREV_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_ADD_NC_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
