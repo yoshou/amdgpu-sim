@@ -652,6 +652,591 @@ impl IREmitter {
         llvm::core::LLVMBuildSelect(builder, overflows, saturated, d_value, empty_name.as_ptr())
     }
 
+    /// Integer type with the same shape as the f32 value type `ty`.
+    unsafe fn int_type_like(
+        &mut self,
+        ty: llvm::prelude::LLVMTypeRef,
+    ) -> llvm::prelude::LLVMTypeRef {
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(self.context);
+
+        if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+            llvm::core::LLVMVectorType(ty_i32, llvm::core::LLVMGetVectorSize(ty))
+        } else {
+            ty_i32
+        }
+    }
+
+    /// f64 type with the same shape as the value type `ty`.
+    unsafe fn double_type_like(
+        &mut self,
+        ty: llvm::prelude::LLVMTypeRef,
+    ) -> llvm::prelude::LLVMTypeRef {
+        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(self.context);
+
+        if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+            llvm::core::LLVMVectorType(ty_f64, llvm::core::LLVMGetVectorSize(ty))
+        } else {
+            ty_f64
+        }
+    }
+
+    /// Biased exponent field of an f32 value, as an integer of matching shape.
+    unsafe fn emit_exponent_f32(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty = llvm::core::LLVMTypeOf(value);
+        let ty_int = self.int_type_like(ty);
+
+        let bits = llvm::core::LLVMBuildBitCast(builder, value, ty_int, empty_name.as_ptr());
+        let shift = self.const_i32_like(ty_int, 23);
+        let shifted = llvm::core::LLVMBuildLShr(builder, bits, shift, empty_name.as_ptr());
+        let mask = self.const_i32_like(ty_int, 0xff);
+
+        llvm::core::LLVMBuildAnd(builder, shifted, mask, empty_name.as_ptr())
+    }
+
+    /// `V_DIV_FIXUP_F32`: apply the division corner cases of the RDNA ISA to a
+    /// quotient produced by the reciprocal/Newton-Raphson macro. Operands follow
+    /// the ISA order (S0 quotient, S1 denominator, S2 numerator) and may be
+    /// scalar or vector f32 values.
+    pub(crate) unsafe fn emit_div_fixup_f32(
+        &mut self,
+        quotient: llvm::prelude::LLVMValueRef,
+        denominator: llvm::prelude::LLVMValueRef,
+        numerator: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty = llvm::core::LLVMTypeOf(quotient);
+        let ty_int = self.int_type_like(ty);
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty]);
+        let abs_quotient = intrinsic.emit_call(ty, &[quotient]);
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty]);
+        let abs_denominator = intrinsic.emit_call(ty, &[denominator]);
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty]);
+        let abs_numerator = intrinsic.emit_call(ty, &[numerator]);
+
+        let denominator_bits =
+            llvm::core::LLVMBuildBitCast(builder, denominator, ty_int, empty_name.as_ptr());
+        let numerator_bits =
+            llvm::core::LLVMBuildBitCast(builder, numerator, ty_int, empty_name.as_ptr());
+
+        // sign_out = sign(S1) ^ sign(S2)
+        let sign_bits = llvm::core::LLVMBuildXor(
+            builder,
+            denominator_bits,
+            numerator_bits,
+            empty_name.as_ptr(),
+        );
+        let zero_int = self.const_i32_like(ty_int, 0);
+        let sign_out = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntSLT,
+            sign_bits,
+            zero_int,
+            empty_name.as_ptr(),
+        );
+
+        let zero = self.const_fp_like(ty, 0.0);
+        let infinity = self.const_fp_like(ty, f64::INFINITY);
+
+        let denominator_is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            denominator,
+            denominator,
+            empty_name.as_ptr(),
+        );
+        let numerator_is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            numerator,
+            numerator,
+            empty_name.as_ptr(),
+        );
+        let denominator_is_zero = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            denominator,
+            zero,
+            empty_name.as_ptr(),
+        );
+        let numerator_is_zero = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            numerator,
+            zero,
+            empty_name.as_ptr(),
+        );
+        let denominator_is_inf = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            abs_denominator,
+            infinity,
+            empty_name.as_ptr(),
+        );
+        let numerator_is_inf = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            abs_numerator,
+            infinity,
+            empty_name.as_ptr(),
+        );
+
+        // A NaN input is propagated quiet.
+        let quiet_bit = self.const_i32_like(ty_int, 0x0040_0000);
+        let quiet_denominator = llvm::core::LLVMBuildBitCast(
+            builder,
+            llvm::core::LLVMBuildOr(builder, denominator_bits, quiet_bit, empty_name.as_ptr()),
+            ty,
+            empty_name.as_ptr(),
+        );
+        let quiet_numerator = llvm::core::LLVMBuildBitCast(
+            builder,
+            llvm::core::LLVMBuildOr(builder, numerator_bits, quiet_bit, empty_name.as_ptr()),
+            ty,
+            empty_name.as_ptr(),
+        );
+
+        // 0/0 and inf/inf produce the canonical negative quiet NaN.
+        let canonical_nan = llvm::core::LLVMBuildBitCast(
+            builder,
+            self.const_i32_like(ty_int, 0xffc00000u32 as i32),
+            ty,
+            empty_name.as_ptr(),
+        );
+
+        let negative_infinity = self.const_fp_like(ty, f64::NEG_INFINITY);
+        let signed_inf = llvm::core::LLVMBuildSelect(
+            builder,
+            sign_out,
+            negative_infinity,
+            infinity,
+            empty_name.as_ptr(),
+        );
+        let negative_zero = self.const_fp_like(ty, -0.0);
+        let signed_zero = llvm::core::LLVMBuildSelect(
+            builder,
+            sign_out,
+            negative_zero,
+            zero,
+            empty_name.as_ptr(),
+        );
+
+        // Underflow rounds to a signed zero and overflow to a signed infinity
+        // under the default round-to-nearest-even mode.
+        let denominator_exponent = self.emit_exponent_f32(denominator);
+        let numerator_exponent = self.emit_exponent_f32(numerator);
+        let exponent_delta = llvm::core::LLVMBuildSub(
+            builder,
+            numerator_exponent,
+            denominator_exponent,
+            empty_name.as_ptr(),
+        );
+        let underflow_bound = self.const_i32_like(ty_int, -150);
+        let underflows = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntSLT,
+            exponent_delta,
+            underflow_bound,
+            empty_name.as_ptr(),
+        );
+        let overflow_bound = self.const_i32_like(ty_int, 255);
+        let overflows = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            denominator_exponent,
+            overflow_bound,
+            empty_name.as_ptr(),
+        );
+
+        let negated = llvm::core::LLVMBuildFNeg(builder, abs_quotient, empty_name.as_ptr());
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            sign_out,
+            negated,
+            abs_quotient,
+            empty_name.as_ptr(),
+        );
+
+        // The selects are applied in reverse so that earlier ISA cases win.
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            overflows,
+            signed_inf,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            underflows,
+            signed_zero,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        // x/inf, 0/y
+        let to_zero = llvm::core::LLVMBuildOr(
+            builder,
+            denominator_is_inf,
+            numerator_is_zero,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            to_zero,
+            signed_zero,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        // x/0, inf/y
+        let to_inf = llvm::core::LLVMBuildOr(
+            builder,
+            denominator_is_zero,
+            numerator_is_inf,
+            empty_name.as_ptr(),
+        );
+        let d_value =
+            llvm::core::LLVMBuildSelect(builder, to_inf, signed_inf, d_value, empty_name.as_ptr());
+        // inf/inf
+        let inf_over_inf = llvm::core::LLVMBuildAnd(
+            builder,
+            denominator_is_inf,
+            numerator_is_inf,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            inf_over_inf,
+            canonical_nan,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        // 0/0
+        let zero_over_zero = llvm::core::LLVMBuildAnd(
+            builder,
+            denominator_is_zero,
+            numerator_is_zero,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            zero_over_zero,
+            canonical_nan,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            denominator_is_nan,
+            quiet_denominator,
+            d_value,
+            empty_name.as_ptr(),
+        );
+
+        llvm::core::LLVMBuildSelect(
+            builder,
+            numerator_is_nan,
+            quiet_numerator,
+            d_value,
+            empty_name.as_ptr(),
+        )
+    }
+
+    /// `V_DIV_FMAS_F32`: fused multiply-add that post-scales the quotient when
+    /// `V_DIV_SCALE_F32` reported that an operand was scaled.
+    ///
+    /// The ISA document states a fixed `2**32` factor, but gfx1201 hardware
+    /// applies `2**+-64` and picks the direction from the magnitude of the
+    /// addend: the quotient estimate is at least 2.0 only when the denominator
+    /// was scaled up, and below 2.0 when the numerator was. The scale is part of
+    /// the same rounding step as the multiply-add, so it is computed in f64 and
+    /// rounded once; rounding the f32 result first and scaling afterwards is a
+    /// double rounding and lands 1 ULP off once the result is subnormal.
+    pub(crate) unsafe fn emit_div_fmas_f32(
+        &mut self,
+        value0: llvm::prelude::LLVMValueRef,
+        value1: llvm::prelude::LLVMValueRef,
+        value2: llvm::prelude::LLVMValueRef,
+        condition: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty = llvm::core::LLVMTypeOf(value2);
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.fma.", &[ty]);
+        let fma_value = intrinsic.emit_call(ty, &[value0, value1, value2]);
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty]);
+        let abs_value2 = intrinsic.emit_call(ty, &[value2]);
+        let threshold = self.const_fp_like(ty, 2.0);
+        let scales_up = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOGE,
+            abs_value2,
+            threshold,
+            empty_name.as_ptr(),
+        );
+
+        let ty_wide = self.double_type_like(ty);
+        let value0_wide = llvm::core::LLVMBuildFPExt(builder, value0, ty_wide, empty_name.as_ptr());
+        let value1_wide = llvm::core::LLVMBuildFPExt(builder, value1, ty_wide, empty_name.as_ptr());
+        let value2_wide = llvm::core::LLVMBuildFPExt(builder, value2, ty_wide, empty_name.as_ptr());
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.fma.", &[ty_wide]);
+        let fma_wide = intrinsic.emit_call(ty_wide, &[value0_wide, value1_wide, value2_wide]);
+
+        let scale_up = self.const_fp_like(ty_wide, 18446744073709551616.0);
+        let scale_down = self.const_fp_like(ty_wide, 5.421010862427522e-20);
+        let factor = llvm::core::LLVMBuildSelect(
+            builder,
+            scales_up,
+            scale_up,
+            scale_down,
+            empty_name.as_ptr(),
+        );
+
+        let scaled_wide = llvm::core::LLVMBuildFMul(builder, fma_wide, factor, empty_name.as_ptr());
+        let scaled_value =
+            llvm::core::LLVMBuildFPTrunc(builder, scaled_wide, ty, empty_name.as_ptr());
+
+        llvm::core::LLVMBuildSelect(
+            builder,
+            condition,
+            scaled_value,
+            fma_value,
+            empty_name.as_ptr(),
+        )
+    }
+
+    /// `V_DIV_SCALE_F32`: scale an operand of the division macro so that no
+    /// subnormal terms appear during the Newton-Raphson correction. Operands
+    /// follow the ISA order (S0 value to scale, S1 denominator, S2 numerator).
+    /// Returns the scaled value and the VCC mask that tells `V_DIV_FMAS_F32`
+    /// whether the quotient needs post-scaling.
+    ///
+    /// The branch conditions were measured on gfx1201 hardware over a sweep of
+    /// the whole exponent range; they differ from the ISA pseudo code in that
+    /// the quotient-underflow case triggers on the exponent difference,
+    /// symmetric with the overflow case, and that the reciprocal-is-subnormal
+    /// test is an f32 test, not f64.
+    pub(crate) unsafe fn emit_div_scale_f32(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+        denominator: llvm::prelude::LLVMValueRef,
+        numerator: llvm::prelude::LLVMValueRef,
+    ) -> (llvm::prelude::LLVMValueRef, llvm::prelude::LLVMValueRef) {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty = llvm::core::LLVMTypeOf(value);
+        let ty_int = self.int_type_like(ty);
+        let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+        let ty_bool = if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+            llvm::core::LLVMVectorType(ty_i1, llvm::core::LLVMGetVectorSize(ty))
+        } else {
+            ty_i1
+        };
+        let true_value = llvm::core::LLVMConstAllOnes(ty_bool);
+        let false_value = llvm::core::LLVMConstNull(ty_bool);
+
+        let zero = self.const_fp_like(ty, 0.0);
+
+        let denominator_is_zero = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            denominator,
+            zero,
+            empty_name.as_ptr(),
+        );
+        let numerator_is_zero = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            numerator,
+            zero,
+            empty_name.as_ptr(),
+        );
+        let returns_nan = llvm::core::LLVMBuildOr(
+            builder,
+            denominator_is_zero,
+            numerator_is_zero,
+            empty_name.as_ptr(),
+        );
+
+        let denominator_exponent = self.emit_exponent_f32(denominator);
+        let numerator_exponent = self.emit_exponent_f32(numerator);
+        let exponent_delta = llvm::core::LLVMBuildSub(
+            builder,
+            numerator_exponent,
+            denominator_exponent,
+            empty_name.as_ptr(),
+        );
+
+        // The quotient leaves the representable range in either direction.
+        let overflow_bound = self.const_i32_like(ty_int, 96);
+        let quotient_overflows = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntSGE,
+            exponent_delta,
+            overflow_bound,
+            empty_name.as_ptr(),
+        );
+        let underflow_bound = self.const_i32_like(ty_int, -96);
+        let quotient_underflows = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntSLE,
+            exponent_delta,
+            underflow_bound,
+            empty_name.as_ptr(),
+        );
+        // 1.0 / S1 is subnormal, so the reciprocal loses precision.
+        let reciprocal_bound = self.const_i32_like(ty_int, 253);
+        let reciprocal_is_denorm = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntSGE,
+            denominator_exponent,
+            reciprocal_bound,
+            empty_name.as_ptr(),
+        );
+        // S1 is subnormal, or the numerator is so small that the residual terms
+        // of the correction would be subnormal.
+        let zero_exponent = self.const_i32_like(ty_int, 0);
+        let denominator_is_denorm = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            denominator_exponent,
+            zero_exponent,
+            empty_name.as_ptr(),
+        );
+        let tiny_bound = self.const_i32_like(ty_int, 23);
+        let numerator_is_tiny = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntSLE,
+            numerator_exponent,
+            tiny_bound,
+            empty_name.as_ptr(),
+        );
+        let operands_are_tiny = llvm::core::LLVMBuildOr(
+            builder,
+            denominator_is_denorm,
+            numerator_is_tiny,
+            empty_name.as_ptr(),
+        );
+
+        // 2**64 and 2**-64 are exact in f32, so a multiply matches ldexp bit for
+        // bit while staying a packed operation.
+        let scale_up = self.const_fp_like(ty, 18446744073709551616.0);
+        let scaled_up = llvm::core::LLVMBuildFMul(builder, value, scale_up, empty_name.as_ptr());
+        let scale_down = self.const_fp_like(ty, 5.421010862427522e-20);
+        let scaled_down =
+            llvm::core::LLVMBuildFMul(builder, value, scale_down, empty_name.as_ptr());
+
+        let nan = self.const_fp_like(ty, f64::NAN);
+        let scales_denominator = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            value,
+            denominator,
+            empty_name.as_ptr(),
+        );
+        let scales_numerator = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            value,
+            numerator,
+            empty_name.as_ptr(),
+        );
+
+        // Only the operand this invocation was handed is modified; the other one
+        // passes through unchanged.
+        let denominator_up = llvm::core::LLVMBuildSelect(
+            builder,
+            scales_denominator,
+            scaled_up,
+            value,
+            empty_name.as_ptr(),
+        );
+        let denominator_down = llvm::core::LLVMBuildSelect(
+            builder,
+            scales_denominator,
+            scaled_down,
+            value,
+            empty_name.as_ptr(),
+        );
+        let numerator_up = llvm::core::LLVMBuildSelect(
+            builder,
+            scales_numerator,
+            scaled_up,
+            value,
+            empty_name.as_ptr(),
+        );
+
+        // Within range the quotient is left alone, but both operands are shifted
+        // together when they sit at the edge of the exponent range.
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            operands_are_tiny,
+            scaled_up,
+            value,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            reciprocal_is_denorm,
+            scaled_down,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        // Quotient underflow: scale the numerator up, unless the reciprocal is
+        // already subnormal, in which case the denominator is scaled down.
+        let underflow_value = llvm::core::LLVMBuildSelect(
+            builder,
+            reciprocal_is_denorm,
+            denominator_down,
+            numerator_up,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            quotient_underflows,
+            underflow_value,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            quotient_overflows,
+            denominator_up,
+            d_value,
+            empty_name.as_ptr(),
+        );
+        let d_value =
+            llvm::core::LLVMBuildSelect(builder, returns_nan, nan, d_value, empty_name.as_ptr());
+
+        let needs_post_scale = llvm::core::LLVMBuildOr(
+            builder,
+            quotient_overflows,
+            quotient_underflows,
+            empty_name.as_ptr(),
+        );
+        let vcc_value = llvm::core::LLVMBuildSelect(
+            builder,
+            needs_post_scale,
+            true_value,
+            false_value,
+            empty_name.as_ptr(),
+        );
+
+        (d_value, vcc_value)
+    }
+
     pub(crate) unsafe fn emit_u32_to_f64xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
