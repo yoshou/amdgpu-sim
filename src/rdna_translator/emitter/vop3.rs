@@ -1858,6 +1858,14 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fadd(s0_value, s1_value);
 
+                        // A negated second operand makes this a subtract, and the
+                        // sign of a NaN it propagates has to follow.
+                        let d_value = if inst.neg & 2 != 0 {
+                            emitter.emit_sub_nan_sign(d_value, s0_value, s1_value)
+                        } else {
+                            d_value
+                        };
+
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1877,6 +1885,11 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
+                        let d_value = if inst.neg & 2 != 0 {
+                            emitter.emit_sub_nan_sign(d_value, s0_value, s1_value)
+                        } else {
+                            d_value
+                        };
 
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
@@ -6675,6 +6688,7 @@ impl IREmitter {
 
                     let d_value =
                         llvm::core::LLVMBuildFSub(builder, s0_value, s1_value, empty_name.as_ptr());
+                    let d_value = emitter.emit_sub_nan_sign(d_value, s0_value, s1_value);
 
                     opx_results.push(llvm::core::LLVMBuildBitCast(
                         builder,
@@ -6970,6 +6984,7 @@ impl IREmitter {
 
                     let d_value =
                         llvm::core::LLVMBuildFSub(builder, s0_value, s1_value, empty_name.as_ptr());
+                    let d_value = emitter.emit_sub_nan_sign(d_value, s0_value, s1_value);
 
                     opy_results.push(llvm::core::LLVMBuildBitCast(
                         builder,

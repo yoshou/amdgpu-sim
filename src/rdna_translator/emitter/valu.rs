@@ -3688,6 +3688,7 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
+                        let d_value = emitter.emit_sub_nan_sign(d_value, s0_value, s1_value);
 
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
@@ -3703,6 +3704,7 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
+                        let d_value = emitter.emit_sub_nan_sign(d_value, s0_value, s1_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb

@@ -652,18 +652,101 @@ impl IREmitter {
         llvm::core::LLVMBuildSelect(builder, overflows, saturated, d_value, empty_name.as_ptr())
     }
 
-    /// Integer type with the same shape as the f32 value type `ty`.
+    /// Integer type with the same shape and width as the float type `ty`.
     unsafe fn int_type_like(
         &mut self,
         ty: llvm::prelude::LLVMTypeRef,
     ) -> llvm::prelude::LLVMTypeRef {
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(self.context);
+        let ty_int = if self.is_double_like(ty) {
+            llvm::core::LLVMInt64TypeInContext(self.context)
+        } else {
+            llvm::core::LLVMInt32TypeInContext(self.context)
+        };
 
         if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
-            llvm::core::LLVMVectorType(ty_i32, llvm::core::LLVMGetVectorSize(ty))
+            llvm::core::LLVMVectorType(ty_int, llvm::core::LLVMGetVectorSize(ty))
         } else {
-            ty_i32
+            ty_int
         }
+    }
+
+    /// Splat an integer constant to the shape and width of the integer type `ty`.
+    unsafe fn const_int_like(
+        &mut self,
+        ty: llvm::prelude::LLVMTypeRef,
+        value: i64,
+    ) -> llvm::prelude::LLVMValueRef {
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let ty_elem = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let constant = llvm::core::LLVMConstInt(ty_elem, value as u64, 1);
+
+        if is_vector {
+            let lanes = llvm::core::LLVMGetVectorSize(ty);
+            llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+        } else {
+            constant
+        }
+    }
+
+    /// RDNA computes a subtract as S0 + (-S1), so a NaN coming from the second
+    /// operand is propagated with its sign bit flipped. LLVM folds the negation
+    /// into the subtract and x86 then returns that NaN unchanged, so the sign is
+    /// restored here. A NaN in the first operand, and a NaN created by the
+    /// operation itself, already agree.
+    pub(crate) unsafe fn emit_sub_nan_sign(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+        minuend: llvm::prelude::LLVMValueRef,
+        subtrahend: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty = llvm::core::LLVMTypeOf(value);
+        let ty_int = self.int_type_like(ty);
+
+        let minuend_is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            minuend,
+            minuend,
+            empty_name.as_ptr(),
+        );
+        let subtrahend_is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            subtrahend,
+            subtrahend,
+            empty_name.as_ptr(),
+        );
+        let flips = llvm::core::LLVMBuildAnd(
+            builder,
+            subtrahend_is_nan,
+            llvm::core::LLVMBuildNot(builder, minuend_is_nan, empty_name.as_ptr()),
+            empty_name.as_ptr(),
+        );
+
+        let sign_bit = if self.is_double_like(ty) {
+            i64::MIN
+        } else {
+            i32::MIN as i64
+        };
+        let sign = llvm::core::LLVMBuildSelect(
+            builder,
+            flips,
+            self.const_int_like(ty_int, sign_bit),
+            self.const_int_like(ty_int, 0),
+            empty_name.as_ptr(),
+        );
+
+        let bits = llvm::core::LLVMBuildBitCast(builder, value, ty_int, empty_name.as_ptr());
+        let bits = llvm::core::LLVMBuildXor(builder, bits, sign, empty_name.as_ptr());
+
+        llvm::core::LLVMBuildBitCast(builder, bits, ty, empty_name.as_ptr())
     }
 
     /// f64 type with the same shape as the value type `ty`.
