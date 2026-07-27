@@ -492,6 +492,166 @@ impl IREmitter {
         add_value
     }
 
+    /// Splat a floating point constant to the shape and element type of `ty`.
+    unsafe fn const_fp_like(
+        &mut self,
+        ty: llvm::prelude::LLVMTypeRef,
+        value: f64,
+    ) -> llvm::prelude::LLVMValueRef {
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let ty_elem = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let constant = llvm::core::LLVMConstReal(ty_elem, value);
+
+        if is_vector {
+            let lanes = llvm::core::LLVMGetVectorSize(ty);
+            llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+        } else {
+            constant
+        }
+    }
+
+    /// Splat an i32 constant to the shape of `ty` (scalar or vector of i32).
+    unsafe fn const_i32_like(
+        &mut self,
+        ty: llvm::prelude::LLVMTypeRef,
+        value: i32,
+    ) -> llvm::prelude::LLVMValueRef {
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(self.context);
+        let constant = llvm::core::LLVMConstInt(ty_i32, value as u64, 1);
+
+        if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+            let lanes = llvm::core::LLVMGetVectorSize(ty);
+            llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+        } else {
+            constant
+        }
+    }
+
+    /// True when `ty` is an f64, or a vector of f64.
+    unsafe fn is_double_like(&mut self, ty: llvm::prelude::LLVMTypeRef) -> bool {
+        let ty_elem = if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+
+        llvm::core::LLVMGetTypeKind(ty_elem) == llvm::LLVMTypeKind::LLVMDoubleTypeKind
+    }
+
+    /// Float to signed integer conversion with RDNA saturation semantics:
+    /// out-of-range inputs (including infinity) saturate and NaN converts to 0.
+    ///
+    /// The operand is clamped into the destination range before the conversion
+    /// because plain `fptosi` is poison outside it. `llvm.fptosi.sat` has the
+    /// semantics we want but scalarizes into one conversion per lane, so the
+    /// clamp is open coded to keep the sequence packed.
+    pub(crate) unsafe fn emit_fp_to_si_sat(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+        ty_dst: llvm::prelude::LLVMTypeRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty_src = llvm::core::LLVMTypeOf(value);
+        let is_double = self.is_double_like(ty_src);
+
+        // An f64 holds every i32 exactly, so clamping alone saturates. An f32
+        // cannot represent i32::MAX, so it is clamped to the largest float below
+        // 2^31 and the saturated case is restored afterwards.
+        let upper = if is_double {
+            2147483647.0
+        } else {
+            2147483520.0
+        };
+
+        let bound = self.const_fp_like(ty_src, upper);
+        let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_src]);
+        let clamped = intrinsic.emit_call(ty_src, &[value, bound]);
+
+        let bound = self.const_fp_like(ty_src, -2147483648.0);
+        let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_src]);
+        let clamped = intrinsic.emit_call(ty_src, &[clamped, bound]);
+
+        let is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            value,
+            value,
+            empty_name.as_ptr(),
+        );
+        let zero = self.const_fp_like(ty_src, 0.0);
+        let clamped =
+            llvm::core::LLVMBuildSelect(builder, is_nan, zero, clamped, empty_name.as_ptr());
+
+        let d_value = llvm::core::LLVMBuildFPToSI(builder, clamped, ty_dst, empty_name.as_ptr());
+
+        if is_double {
+            return d_value;
+        }
+
+        let bound = self.const_fp_like(ty_src, 2147483648.0);
+        let overflows = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOGE,
+            value,
+            bound,
+            empty_name.as_ptr(),
+        );
+        let saturated = self.const_i32_like(ty_dst, i32::MAX);
+
+        llvm::core::LLVMBuildSelect(builder, overflows, saturated, d_value, empty_name.as_ptr())
+    }
+
+    /// Float to unsigned integer conversion with RDNA saturation semantics.
+    pub(crate) unsafe fn emit_fp_to_ui_sat(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+        ty_dst: llvm::prelude::LLVMTypeRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty_src = llvm::core::LLVMTypeOf(value);
+        let is_double = self.is_double_like(ty_src);
+
+        // maxnum returns the operand that is not NaN, which also maps NaN to 0.
+        let zero = self.const_fp_like(ty_src, 0.0);
+        let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_src]);
+        let clamped = intrinsic.emit_call(ty_src, &[value, zero]);
+
+        let upper = if is_double {
+            4294967295.0
+        } else {
+            4294967040.0
+        };
+        let bound = self.const_fp_like(ty_src, upper);
+        let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_src]);
+        let clamped = intrinsic.emit_call(ty_src, &[clamped, bound]);
+
+        let d_value = llvm::core::LLVMBuildFPToUI(builder, clamped, ty_dst, empty_name.as_ptr());
+
+        if is_double {
+            return d_value;
+        }
+
+        let bound = self.const_fp_like(ty_src, 4294967296.0);
+        let overflows = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOGE,
+            value,
+            bound,
+            empty_name.as_ptr(),
+        );
+        let saturated = self.const_i32_like(ty_dst, -1);
+
+        llvm::core::LLVMBuildSelect(builder, overflows, saturated, d_value, empty_name.as_ptr())
+    }
+
     pub(crate) unsafe fn emit_u32_to_f64xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
