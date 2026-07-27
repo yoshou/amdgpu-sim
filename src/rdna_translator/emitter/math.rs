@@ -97,7 +97,7 @@ impl IREmitter {
         exp_value
     }
 
-    pub(crate) unsafe fn emit_exp_f64(
+    pub(crate) unsafe fn _emit_exp_f64(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
@@ -697,6 +697,38 @@ impl IREmitter {
         let mask = self.const_i32_like(ty_int, 0xff);
 
         llvm::core::LLVMBuildAnd(builder, shifted, mask, empty_name.as_ptr())
+    }
+
+    /// Biased exponent field of an f64 value, as an i32. This is what the ISA
+    /// pseudo code calls `exponent()`; `llvm.frexp` returns a different
+    /// normalization and must not be used where the ISA compares against the raw
+    /// field.
+    pub(crate) unsafe fn emit_exponent_f64(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+
+        let bits = llvm::core::LLVMBuildBitCast(builder, value, ty_i64, empty_name.as_ptr());
+        let shifted = llvm::core::LLVMBuildLShr(
+            builder,
+            bits,
+            llvm::core::LLVMConstInt(ty_i64, 52, 0),
+            empty_name.as_ptr(),
+        );
+        let exponent = llvm::core::LLVMBuildAnd(
+            builder,
+            shifted,
+            llvm::core::LLVMConstInt(ty_i64, 0x7ff, 0),
+            empty_name.as_ptr(),
+        );
+
+        llvm::core::LLVMBuildTrunc(builder, exponent, ty_i32, empty_name.as_ptr())
     }
 
     /// `V_DIV_FIXUP_F32`: apply the division corner cases of the RDNA ISA to a
@@ -1376,9 +1408,8 @@ impl IREmitter {
         value0: llvm::prelude::LLVMValueRef,
         value1: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let ty_f32 = llvm::core::LLVMTypeOf(value0);
+        let ty_i32 = llvm::core::LLVMTypeOf(value1);
 
         let intrinsic = self.get_intrinsic_declaration("llvm.ldexp.", &[ty_f32, ty_i32]);
         let ldexp_value = intrinsic.emit_call(ty_f32, &[value0, value1]);

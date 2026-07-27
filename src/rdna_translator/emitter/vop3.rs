@@ -3110,7 +3110,7 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let s0_exp_value = emitter.emit_exp_f64(s0_value);
+                            let s0_exp_value = emitter.emit_exponent_f64(s0_value);
 
                             let s1_value = llvm::core::LLVMBuildAnd(
                                 builder,
@@ -3204,7 +3204,7 @@ impl IREmitter {
 
                             let cmp = llvm::core::LLVMBuildICmp(
                                 builder,
-                                llvm::LLVMIntPredicate::LLVMIntSGT,
+                                llvm::LLVMIntPredicate::LLVMIntSGE,
                                 s0_exp_value,
                                 llvm::core::LLVMConstInt(ty_i32, 1968, 0),
                                 empty_name.as_ptr(),
@@ -3223,24 +3223,7 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let intrinsic =
-                                emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f64]);
-                            let exp2_scale = intrinsic.emit_call(
-                                ty_f64,
-                                &[llvm::core::LLVMBuildSIToFP(
-                                    builder,
-                                    scale,
-                                    ty_f64,
-                                    empty_name.as_ptr(),
-                                )],
-                            );
-
-                            let result = llvm::core::LLVMBuildFMul(
-                                builder,
-                                result,
-                                exp2_scale,
-                                empty_name.as_ptr(),
-                            );
+                            let result = emitter.emit_ldexp_f32(result, scale);
 
                             llvm::core::LLVMBuildInsertElement(
                                 builder,
@@ -3319,7 +3302,7 @@ impl IREmitter {
 
                         llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_exit);
 
-                        emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
+                        emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, next_d_value, mask);
 
                         bb = bb_loop_exit
                     }
@@ -3337,7 +3320,7 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_value, 0);
 
-                        let s0_exp_value = emitter.emit_exp_f64(s0_value);
+                        let s0_exp_value = emitter.emit_exponent_f64(s0_value);
 
                         let s1_value = llvm::core::LLVMBuildAnd(
                             builder,
@@ -3479,7 +3462,7 @@ impl IREmitter {
 
                         let cmp = llvm::core::LLVMBuildICmp(
                             builder,
-                            llvm::LLVMIntPredicate::LLVMIntSGT,
+                            llvm::LLVMIntPredicate::LLVMIntSGE,
                             s0_exp_value,
                             llvm::core::LLVMConstInt(ty_i32, 1968, 0),
                             empty_name.as_ptr(),
@@ -3498,23 +3481,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let intrinsic = emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f64]);
-                        let exp2_scale = intrinsic.emit_call(
-                            ty_f64,
-                            &[llvm::core::LLVMBuildSIToFP(
-                                builder,
-                                scale,
-                                ty_f64,
-                                empty_name.as_ptr(),
-                            )],
-                        );
-
-                        let d_value = llvm::core::LLVMBuildFMul(
-                            builder,
-                            result,
-                            exp2_scale,
-                            empty_name.as_ptr(),
-                        );
+                        let d_value = emitter.emit_ldexp_f32(result, scale);
 
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
