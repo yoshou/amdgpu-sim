@@ -4470,7 +4470,7 @@ impl IREmitter {
                     emitter.emit_store_vgpr_u32xn::<N>(vdata, i, result_vec, mask);
                 }
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
 
         bb

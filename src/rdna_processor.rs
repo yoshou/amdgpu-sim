@@ -1385,7 +1385,7 @@ impl SIMD32 {
                 let pc = self.ctx.pc + 4 + self.insts.as_ptr() as u64;
                 self.write_sop_dst_pair(d, pc);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
 
         Signals::None
@@ -1533,7 +1533,7 @@ impl SIMD32 {
             I::S_BFE_U32 => {
                 self.s_bfe_u32(d, s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -1722,7 +1722,7 @@ impl SIMD32 {
             I::S_CMP_EQ_U64 => {
                 self.s_cmp_eq_u64(s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -1783,7 +1783,7 @@ impl SIMD32 {
             I::S_MOVK_I32 => {
                 self.write_sop_dst(d, simm16 as i32 as u32);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -1847,7 +1847,7 @@ impl SIMD32 {
             I::V_FREXP_EXP_I32_F32 => {
                 self.v_frexp_exp_i32_f32_e32(d, s0);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -2154,7 +2154,7 @@ impl SIMD32 {
             I::V_LSHLREV_B64 => {
                 self.v_lshlrev_b64_e32(d, s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -2682,7 +2682,7 @@ impl SIMD32 {
             I::V_S_RCP_F32 => {
                 self.v_s_rcp_f32(d, s0, abs, neg, clamp, omod);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -4340,7 +4340,7 @@ impl SIMD32 {
             I::V_DIV_SCALE_F64 => {
                 self.v_div_scale_f64(d0, d1, s0, s1, s2, 0, neg, clamp, omod);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -4504,7 +4504,7 @@ impl SIMD32 {
             I::V_FMA_MIXLO_F16 => {
                 self.v_fma_mixlo_f16(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -4699,7 +4699,7 @@ impl SIMD32 {
             I::V_CMPX_NLT_F64 => {
                 self.v_cmpx_nlt_f64_e32(s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -5202,7 +5202,7 @@ impl SIMD32 {
                     inst.literal_constant.unwrap(),
                 );
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         let s0 = inst.src0y;
         let s1 = inst.vsrc1y as usize;
@@ -5243,7 +5243,7 @@ impl SIMD32 {
                     inst.literal_constant.unwrap(),
                 );
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         let d = inst.vdstx as usize;
         match inst.opx {
@@ -5262,7 +5262,7 @@ impl SIMD32 {
                     self.write_vgpr(elem, d, dual_result0_u32[elem]);
                 }
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         let d = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as usize;
         match inst.opy {
@@ -5283,7 +5283,7 @@ impl SIMD32 {
                     self.write_vgpr(elem, d, dual_result1_u32[elem]);
                 }
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -5473,7 +5473,7 @@ impl SIMD32 {
             I::S_LOAD_U16 => {
                 self.s_load_u16(sdata, sbase, ioffset);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -5576,7 +5576,7 @@ impl SIMD32 {
             I::FLAT_STORE_B32 => {
                 self.flat_store_b32(vaddr, vsrc, ioffset);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -5724,7 +5724,7 @@ impl SIMD32 {
             I::SCRATCH_LOAD_B128 => {
                 self.scratch_load_b128(vaddr, vdst, saddr, ioffset);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -5938,7 +5938,7 @@ impl SIMD32 {
             }
             I::GLOBAL_WB => {}
             I::GLOBAL_INV => {}
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -6216,7 +6216,7 @@ impl SIMD32 {
             I::IMAGE_BVH8_INTERSECT_RAY => {
                 self.image_bvh8_intersect_ray(vdata, vaddr0, vaddr1, vaddr2, vaddr3, vaddr4, s);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -6508,7 +6508,7 @@ impl SIMD32 {
             I::IMAGE_SAMPLE_LZ => {
                 self.image_sample_lz(vdata, vaddr0, vaddr1, rsrc, samp);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -6572,7 +6572,7 @@ impl SIMD32 {
             I::DS_BPERMUTE_B32 => {
                 self.ds_bpermute_b32(addr, data0, vdst, offset0);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -6691,7 +6691,7 @@ impl SIMD32 {
                 assert!(simm16 == -1);
                 return Signals::Switch;
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }

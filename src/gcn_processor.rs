@@ -3078,7 +3078,7 @@ impl ComputeUnit {
                     self.next_pc = ((self.get_pc() as i64) + ((simm16 as i64) * 4) + 4) as usize;
                 }
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3093,7 +3093,7 @@ impl ComputeUnit {
                 let imm32 = self.fetch_literal_constant();
                 s_setreg_imm32_b32(self, simm16, imm32);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3132,7 +3132,7 @@ impl ComputeUnit {
             I::S_SETPC_B64 => {
                 s_setpc_b64(self, s0);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
 
         Signals::None
@@ -3203,7 +3203,7 @@ impl ComputeUnit {
             I::S_CSELECT_B64 => {
                 s_cselect_b64(self, d, s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3239,7 +3239,7 @@ impl ComputeUnit {
             I::S_CMP_EQ_U64 => {
                 s_cmp_eq_u64(self, s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3257,7 +3257,7 @@ impl ComputeUnit {
             I::S_LOAD_DWORDX4 => {
                 s_load_dwordx4(self, sdata, sbase, soffset);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3340,7 +3340,7 @@ impl ComputeUnit {
             I::V_CVT_U32_F32 => {
                 v_cvt_u32_f32_e32(self, d, s0);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3411,7 +3411,7 @@ impl ComputeUnit {
             I::V_MAX_F32 => {
                 v_max_f32_e32(self, d, s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3573,7 +3573,7 @@ impl ComputeUnit {
             I::V_CVT_I32_F64 => {
                 v_cvt_i32_f64_e64(self, d, s0);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3599,7 +3599,7 @@ impl ComputeUnit {
             I::V_DIV_SCALE_F64 => {
                 v_div_scale_f64(self, d, sd, s0, s1, s2);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3623,7 +3623,7 @@ impl ComputeUnit {
             I::V_CMP_CLASS_F64 => {
                 v_cmp_class_f64(self, s0, s1);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3664,7 +3664,7 @@ impl ComputeUnit {
             I::FLAT_STORE_DWORDX4 => {
                 flat_store_dwordx4(self, s, addr);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3683,7 +3683,7 @@ impl ComputeUnit {
             I::BUFFER_STORE_DWORD => {
                 buffer_store_dword(self, s, vaddr, srsrc, soffset, offset, offen);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3699,7 +3699,7 @@ impl ComputeUnit {
             I::DS_READ_U8 => {
                 ds_read_u8(self, r, addr, offset);
             }
-            _ => unimplemented!(),
+            op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
@@ -3727,7 +3727,7 @@ impl ComputeUnit {
             InstFormat::FLAT(fields) => self.execute_flat(fields),
             InstFormat::MUBUF(fields) => self.execute_mubuf(fields),
             InstFormat::DS(fields) => self.execute_ds(fields),
-            _ => unimplemented!(),
+            inst => unimplemented!("{:?}", inst),
         }
     }
 
