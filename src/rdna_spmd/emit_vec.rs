@@ -520,6 +520,44 @@ impl Cg {
         llvm::core::LLVMBuildCall2(self.b, fty, f, args.as_ptr() as *mut _, args.len() as u32, self.n())
     }
 
+    /// Emit a call to a masked gather/scatter intrinsic. Their alignment is an
+    /// `align` attribute on the pointer argument rather than an operand, so
+    /// `args` holds only the value operands and `ptr_pos` says which is the
+    /// pointer. `overloads` selects the intrinsic's overloaded types.
+    unsafe fn masked_call(
+        &self,
+        prefix: &str,
+        overloads: &[LLVMTypeRef],
+        args: &[LLVMValueRef],
+        ptr_pos: u32,
+        align: u64,
+    ) -> LLVMValueRef {
+        let id = llvm::core::LLVMLookupIntrinsicID(prefix.as_ptr() as *const _, prefix.len());
+        let mut overloads = overloads.to_vec();
+        let f = llvm::core::LLVMGetIntrinsicDeclaration(
+            self.module,
+            id,
+            overloads.as_mut_ptr(),
+            overloads.len(),
+        );
+        let fty = llvm::core::LLVMGlobalGetValueType(f);
+        let mut args = args.to_vec();
+        let call = llvm::core::LLVMBuildCall2(
+            self.b,
+            fty,
+            f,
+            args.as_mut_ptr(),
+            args.len() as u32,
+            self.n(),
+        );
+        let name = b"align";
+        let kind =
+            llvm::core::LLVMGetEnumAttributeKindForName(name.as_ptr() as *const _, name.len());
+        let attr = llvm::core::LLVMCreateEnumAttribute(self.ctx, kind, align);
+        llvm::core::LLVMAddCallSiteAttribute(call, ptr_pos + 1, attr);
+        call
+    }
+
     // ---- constants -------------------------------------------------------
     unsafe fn ci32(&self, v: u32) -> LLVMValueRef { llvm::core::LLVMConstInt(self.i32t, v as u64, 0) }
     unsafe fn ci64(&self, v: u64) -> LLVMValueRef { llvm::core::LLVMConstInt(self.i64t, v, 0) }
@@ -1450,17 +1488,16 @@ impl Cg {
         let bit = llvm::core::LLVMBuildAnd(self.b, bit_offset, self.vci32(63), n);
         let tbl = self.trig_table();
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
-        let gather = format!("llvm.masked.gather.v{}i64.v{}p0", self.w, self.w);
         let zero64 = llvm::core::LLVMConstNull(self.vi64);
         let mut idx = [word];
         let ptrs_lo = llvm::core::LLVMBuildGEP2(self.b, self.i64t, tbl, idx.as_mut_ptr(), 1, n);
-        let lo = self.call(&gather, self.vi64, &[vptr, self.i32t, self.vi1, self.vi64],
-                           &[ptrs_lo, self.ci32(8), valid, zero64]);
+        let lo = self.masked_call("llvm.masked.gather.", &[self.vi64, vptr],
+                                  &[ptrs_lo, valid, zero64], 0, 8);
         let word1 = llvm::core::LLVMBuildAdd(self.b, word, self.vci32(1), n);
         let mut idx = [word1];
         let ptrs_hi = llvm::core::LLVMBuildGEP2(self.b, self.i64t, tbl, idx.as_mut_ptr(), 1, n);
-        let hi = self.call(&gather, self.vi64, &[vptr, self.i32t, self.vi1, self.vi64],
-                           &[ptrs_hi, self.ci32(8), valid, zero64]);
+        let hi = self.masked_call("llvm.masked.gather.", &[self.vi64, vptr],
+                                  &[ptrs_hi, valid, zero64], 0, 8);
         let bit64 = llvm::core::LLVMBuildZExt(self.b, bit, self.vi64, n);
         let ext = self.call(&format!("llvm.fshr.v{}i64", self.w), self.vi64,
                             &[self.vi64, self.vi64, self.vi64], &[hi, lo, bit64]);
@@ -3060,14 +3097,14 @@ impl Cg {
             i.op,
             I::GLOBAL_LOAD_U8 | I::GLOBAL_LOAD_I8 | I::GLOBAL_LOAD_U16 | I::GLOBAL_LOAD_I16
         ) {
-            let (elem, mnem, signed) = match i.op {
-                I::GLOBAL_LOAD_U8 => (llvm::core::LLVMInt8TypeInContext(self.ctx), "i8", false),
-                I::GLOBAL_LOAD_I8 => (llvm::core::LLVMInt8TypeInContext(self.ctx), "i8", true),
-                I::GLOBAL_LOAD_U16 => (llvm::core::LLVMInt16TypeInContext(self.ctx), "i16", false),
-                _ => (llvm::core::LLVMInt16TypeInContext(self.ctx), "i16", true),
+            let (elem, signed) = match i.op {
+                I::GLOBAL_LOAD_U8 => (llvm::core::LLVMInt8TypeInContext(self.ctx), false),
+                I::GLOBAL_LOAD_I8 => (llvm::core::LLVMInt8TypeInContext(self.ctx), true),
+                I::GLOBAL_LOAD_U16 => (llvm::core::LLVMInt16TypeInContext(self.ctx), false),
+                _ => (llvm::core::LLVMInt16TypeInContext(self.ctx), true),
             };
             let ptrs = self.ptr_at_vec(addr, 0);
-            let value = self.masked_gather_ty(ptrs, self.exec_vec(), elem, mnem);
+            let value = self.masked_gather_ty(ptrs, self.exec_vec(), elem);
             let value = if signed {
                 llvm::core::LLVMBuildSExt(self.b, value, self.vi32, self.n())
             } else {
@@ -3078,10 +3115,10 @@ impl Cg {
         }
 
         if matches!(i.op, I::GLOBAL_STORE_B8 | I::GLOBAL_STORE_B16) {
-            let (elem, mnem) = if matches!(i.op, I::GLOBAL_STORE_B8) {
-                (llvm::core::LLVMInt8TypeInContext(self.ctx), "i8")
+            let elem = if matches!(i.op, I::GLOBAL_STORE_B8) {
+                llvm::core::LLVMInt8TypeInContext(self.ctx)
             } else {
-                (llvm::core::LLVMInt16TypeInContext(self.ctx), "i16")
+                llvm::core::LLVMInt16TypeInContext(self.ctx)
             };
             let velem = llvm::core::LLVMVectorType(elem, self.w);
             let value = llvm::core::LLVMBuildTrunc(
@@ -3091,7 +3128,7 @@ impl Cg {
                 self.n(),
             );
             let ptrs = self.ptr_at_vec(addr, 0);
-            self.masked_scatter_ty(value, ptrs, self.exec_vec(), elem, mnem);
+            self.masked_scatter_ty(value, ptrs, self.exec_vec(), elem);
             return;
         }
 
@@ -3399,9 +3436,7 @@ impl Cg {
     unsafe fn masked_gather_f64(&self, ptrs: LLVMValueRef, mask: LLVMValueRef) -> LLVMValueRef {
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
         let passthru = llvm::core::LLVMConstNull(self.vf64);
-        let align = self.ci32(4);
-        let name = format!("llvm.masked.gather.v{}f64.v{}p0", self.w, self.w);
-        self.call(&name, self.vf64, &[vptr, self.i32t, self.vi1, self.vf64], &[ptrs, align, mask, passthru])
+        self.masked_call("llvm.masked.gather.", &[self.vf64, vptr], &[ptrs, mask, passthru], 0, 4)
     }
     // Uniform-address load: lane-0's (shared) address loaded scalar + broadcast.
     // Used only where the address VGPR is proven uniform across the packed lanes
@@ -3449,32 +3484,24 @@ impl Cg {
     unsafe fn masked_gather(&self, ptrs: LLVMValueRef, mask: LLVMValueRef) -> LLVMValueRef {
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
         let passthru = llvm::core::LLVMConstNull(self.vi32);
-        let align = self.ci32(4);
-        let name = format!("llvm.masked.gather.v{}i32.v{}p0", self.w, self.w);
-        self.call(&name, self.vi32, &[vptr, self.i32t, self.vi1, self.vi32], &[ptrs, align, mask, passthru])
+        self.masked_call("llvm.masked.gather.", &[self.vi32, vptr], &[ptrs, mask, passthru], 0, 4)
     }
     unsafe fn masked_scatter(&self, val: LLVMValueRef, ptrs: LLVMValueRef, mask: LLVMValueRef) {
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
-        let align = self.ci32(4);
-        let name = format!("llvm.masked.scatter.v{}i32.v{}p0", self.w, self.w);
-        self.call(&name, llvm::core::LLVMVoidTypeInContext(self.ctx), &[self.vi32, vptr, self.i32t, self.vi1], &[val, ptrs, align, mask]);
+        self.masked_call("llvm.masked.scatter.", &[self.vi32, vptr], &[val, ptrs, mask], 1, 4);
     }
     /// Typed masked gather: `<W×elem>` load through per-lane pointers, inactive
     /// lanes read 0. Used for VFLAT sub-word loads.
-    unsafe fn masked_gather_ty(&self, ptrs: LLVMValueRef, mask: LLVMValueRef, elem: LLVMTypeRef, mnem: &str) -> LLVMValueRef {
+    unsafe fn masked_gather_ty(&self, ptrs: LLVMValueRef, mask: LLVMValueRef, elem: LLVMTypeRef) -> LLVMValueRef {
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
         let velem = llvm::core::LLVMVectorType(elem, self.w);
         let passthru = llvm::core::LLVMConstNull(velem);
-        let align = self.ci32(1);
-        let name = format!("llvm.masked.gather.v{}{}.v{}p0", self.w, mnem, self.w);
-        self.call(&name, velem, &[vptr, self.i32t, self.vi1, velem], &[ptrs, align, mask, passthru])
+        self.masked_call("llvm.masked.gather.", &[velem, vptr], &[ptrs, mask, passthru], 0, 1)
     }
-    unsafe fn masked_scatter_ty(&self, val: LLVMValueRef, ptrs: LLVMValueRef, mask: LLVMValueRef, elem: LLVMTypeRef, mnem: &str) {
+    unsafe fn masked_scatter_ty(&self, val: LLVMValueRef, ptrs: LLVMValueRef, mask: LLVMValueRef, elem: LLVMTypeRef) {
         let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
         let velem = llvm::core::LLVMVectorType(elem, self.w);
-        let align = self.ci32(1);
-        let name = format!("llvm.masked.scatter.v{}{}.v{}p0", self.w, mnem, self.w);
-        self.call(&name, llvm::core::LLVMVoidTypeInContext(self.ctx), &[velem, vptr, self.i32t, self.vi1], &[val, ptrs, align, mask]);
+        self.masked_call("llvm.masked.scatter.", &[velem, vptr], &[val, ptrs, mask], 1, 1);
     }
 
     // ---- VFLAT (per-lane flat gather/scatter) — flat addressing matches the
@@ -3519,24 +3546,24 @@ impl Cg {
         let i8t = llvm::core::LLVMInt8TypeInContext(self.ctx);
         match i.op {
             I::FLAT_LOAD_U8 | I::FLAT_LOAD_I8 | I::FLAT_LOAD_U16 | I::FLAT_LOAD_I16 => {
-                let (elem, mnem, signed) = match i.op {
-                    I::FLAT_LOAD_U8 => (i8t, "i8", false),
-                    I::FLAT_LOAD_I8 => (i8t, "i8", true),
-                    I::FLAT_LOAD_U16 => (i16t, "i16", false),
-                    _ => (i16t, "i16", true),
+                let (elem, signed) = match i.op {
+                    I::FLAT_LOAD_U8 => (i8t, false),
+                    I::FLAT_LOAD_I8 => (i8t, true),
+                    I::FLAT_LOAD_U16 => (i16t, false),
+                    _ => (i16t, true),
                 };
                 let ptrs = self.ptr_at_vec(addr, 0);
-                let v = self.masked_gather_ty(ptrs, exec, elem, mnem);
+                let v = self.masked_gather_ty(ptrs, exec, elem);
                 let z = if signed { llvm::core::LLVMBuildSExt(self.b, v, self.vi32, self.n()) }
                         else { llvm::core::LLVMBuildZExt(self.b, v, self.vi32, self.n()) };
                 self.st_vgpr32(i.vdst as u32, z);
                 return;
             }
             I::FLAT_STORE_B8 | I::FLAT_STORE_B16 => {
-                let (elem, mnem) = if matches!(i.op, I::FLAT_STORE_B8) { (i8t, "i8") } else { (i16t, "i16") };
+                let elem = if matches!(i.op, I::FLAT_STORE_B8) { i8t } else { i16t };
                 let t = llvm::core::LLVMBuildTrunc(self.b, self.ld_vgpr32(i.vsrc as u32), llvm::core::LLVMVectorType(elem, self.w), self.n());
                 let ptrs = self.ptr_at_vec(addr, 0);
-                self.masked_scatter_ty(t, ptrs, exec, elem, mnem);
+                self.masked_scatter_ty(t, ptrs, exec, elem);
                 return;
             }
             _ => {}

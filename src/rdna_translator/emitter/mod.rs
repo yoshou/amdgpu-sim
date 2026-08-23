@@ -158,6 +158,7 @@ pub(crate) struct IREmitter {
 pub(crate) struct IntrinsicDeclaration {
     pub(crate) builder: llvm::prelude::LLVMBuilderRef,
     pub(crate) declaration: llvm::prelude::LLVMValueRef,
+    pub(crate) context: llvm::prelude::LLVMContextRef,
 }
 
 impl IntrinsicDeclaration {
@@ -186,6 +187,26 @@ impl IntrinsicDeclaration {
             empty_name.as_ptr(),
         )
     }
+
+    /// Emit a call to a masked load/store/gather/scatter intrinsic. Their
+    /// alignment is an `align` attribute on the pointer argument rather than an
+    /// operand, so `args` holds only the value operands and `ptr_index` says
+    /// which of them is the pointer.
+    pub(crate) unsafe fn emit_masked_call(
+        &self,
+        return_type: llvm::prelude::LLVMTypeRef,
+        args: &[llvm::prelude::LLVMValueRef],
+        ptr_index: u32,
+        align: u64,
+    ) -> llvm::prelude::LLVMValueRef {
+        let call = self.emit_call(return_type, args);
+        let name = b"align";
+        let kind =
+            llvm::core::LLVMGetEnumAttributeKindForName(name.as_ptr() as *const _, name.len());
+        let attr = llvm::core::LLVMCreateEnumAttribute(self.context, kind, align);
+        llvm::core::LLVMAddCallSiteAttribute(call, ptr_index + 1, attr);
+        call
+    }
 }
 
 impl IREmitter {
@@ -205,6 +226,7 @@ impl IREmitter {
         IntrinsicDeclaration {
             builder: self.builder,
             declaration: intrinsic,
+            context: self.context,
         }
     }
 

@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/devcontainers/rust:2-1-trixie
 
-ARG LLVM_VERSION=20
+ARG LLVM_VERSION=22
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -21,5 +21,5 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-ENV LLVM_SYS_201_PREFIX=/usr/lib/llvm-20
-ENV PATH=/usr/lib/llvm-20/bin:${PATH}
+ENV LLVM_SYS_221_PREFIX=/usr/lib/llvm-22
+ENV PATH=/usr/lib/llvm-22/bin:${PATH}

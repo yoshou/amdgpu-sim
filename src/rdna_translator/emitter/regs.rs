@@ -204,7 +204,6 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(self.context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
         let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
-        let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
         if self.use_vgpr_cache {
             return self.emit_load_stack_vgpr_u32xn::<N>(reg, elem);
@@ -230,14 +229,13 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
 
-        let value = intrinsic.emit_call(
+        let value = intrinsic.emit_masked_call(
             ty_i32xn,
             &[
                 value_ptr,
-                alignment,
                 mask,
                 llvm::core::LLVMGetPoison(ty_i32xn),
-            ],
+            ], 0, 4,
         );
         value
     }
@@ -357,7 +355,6 @@ impl IREmitter {
         let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
         let ty_void = llvm::core::LLVMVoidTypeInContext(context);
         let empty_name = std::ffi::CString::new("").unwrap();
-        let alignment = llvm::core::LLVMConstInt(ty_i32, 4, 0);
 
         if self.use_vgpr_cache {
             return self.emit_store_stack_vgpr_u32xn::<N>(reg, elem, value, mask);
@@ -382,7 +379,7 @@ impl IREmitter {
         );
 
         let intrinsic = self.get_intrinsic_declaration("llvm.masked.store.", &[ty_i32xn, ty_p0]);
-        intrinsic.emit_call(ty_void, &[value, value_ptr, alignment, mask]);
+        intrinsic.emit_masked_call(ty_void, &[value, value_ptr, mask], 1, 4);
     }
 
     pub(crate) unsafe fn emit_store_vgpr_u64(

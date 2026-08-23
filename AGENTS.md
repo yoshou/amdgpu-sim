@@ -2,8 +2,8 @@
 
 ## Build, test, and run commands
 
-- `cargo build` or `cargo build --release` builds the library and examples. This crate depends on `llvm-sys = "201.0.1"` with `llvm-sys/prefer-dynamic`, so local builds/tests require a compatible system LLVM installation or `LLVM_SYS_201_PREFIX`.
-- The checked-in devcontainer now installs LLVM 20 from apt.llvm.org and sets `LLVM_SYS_201_PREFIX=/usr/lib/llvm-20`, which is the expected containerized build environment for this repo.
+- `cargo build` or `cargo build --release` builds the library and examples. This crate depends on `llvm-sys = "221.0.1"` with `llvm-sys/prefer-dynamic`, so local builds/tests require a compatible system LLVM installation or `LLVM_SYS_221_PREFIX`.
+- The checked-in devcontainer now installs LLVM 22 from apt.llvm.org and sets `LLVM_SYS_221_PREFIX=/usr/lib/llvm-22`, which is the expected containerized build environment for this repo.
 - `cargo test` is the standard test entry point. To run a filtered test, use `cargo test <filter>` or `cargo test <filter> -- --exact`.
 - Example binaries are the main executable surface:
   - `cargo run --release --example smallpt`
