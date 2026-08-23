@@ -3,6 +3,22 @@
 ## About
 This simulator executes the HSA code object for AMD GPU on CPU.
 
+## Building and testing
+
+This crate links against LLVM 22 through `llvm-sys`, so a matching system LLVM
+is required. Point `LLVM_SYS_221_PREFIX` at it (the checked-in devcontainer
+installs LLVM 22 from apt.llvm.org and sets `LLVM_SYS_221_PREFIX=/usr/lib/llvm-22`).
+
+Dependencies are pinned in `Cargo.lock`, so builds and tests should be run with
+`--locked` to reproduce an exact commit:
+
+```sh
+cargo build --locked --all-targets
+cargo test --locked
+```
+
+The same commands run in CI (`.github/workflows/ci.yml`).
+
 ## Supporting GPUs
 * Radeon RX 9060 XT (gfx1200)
 * Radeon R9 Nano (gfx803)
