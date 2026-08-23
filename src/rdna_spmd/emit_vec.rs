@@ -52,6 +52,49 @@ fn succs_for_emit(block: &super::ir::ScalarBlock) -> Vec<usize> {
     }
 }
 
+/// A set of SGPRs and VGPRs.
+#[derive(Clone, Copy, Default, PartialEq)]
+pub(super) struct RegSet {
+    sgpr: u128,
+    vgpr: [u128; 2],
+}
+
+impl RegSet {
+    /// Registers outside the architectural files (128 SGPRs, 256 VGPRs) are
+    /// dropped: operand encodings can name reserved indices, and aliasing one
+    /// onto a real register would be worse than ignoring it.
+    pub(super) fn add_sgpr(&mut self, reg: u32) {
+        if reg < 128 {
+            self.sgpr |= 1 << reg;
+        }
+    }
+    pub(super) fn add_vgpr(&mut self, reg: u32) {
+        if reg < 256 {
+            self.vgpr[(reg >> 7) as usize] |= 1 << (reg & 127);
+        }
+    }
+    pub(super) fn has_sgpr(&self, reg: u32) -> bool {
+        reg < 128 && self.sgpr & (1 << reg) != 0
+    }
+    fn has_vgpr(&self, reg: u32) -> bool {
+        reg < 256 && self.vgpr[(reg >> 7) as usize] & (1 << (reg & 127)) != 0
+    }
+    pub(super) fn vgprs(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..256u32).filter(move |&reg| self.has_vgpr(reg))
+    }
+}
+
+/// What the host-applied wave-level op at a boundary touches: the registers it
+/// reads out of the packet (which the kernel stores before yielding) and the
+/// ones it writes back (which the kernel reloads afterwards). A partial write
+/// — writelane touches one lane of the packed vector — belongs in `reads` too,
+/// so the lanes it leaves alone survive the round trip.
+#[derive(Clone, Copy, Default)]
+pub(super) struct BoundaryIo {
+    pub(super) reads: RegSet,
+    pub(super) writes: RegSet,
+}
+
 fn normal_f64_pow2_exponent(op: &SourceOperand) -> bool {
     let value = match op {
         SourceOperand::IntegerConstant(value) => *value as u32 as i32,
@@ -200,8 +243,10 @@ mod cooperative_vgpr_tests {
         };
 
         assert_eq!(cooperative_vgpr_count(&program, 16, &BTreeMap::new()), 28);
+        let mut boundary = BoundaryIo::default();
+        boundary.writes.add_vgpr(31);
         assert_eq!(
-            cooperative_vgpr_count(&program, 16, &BTreeMap::from([(2, vec![31])])),
+            cooperative_vgpr_count(&program, 16, &BTreeMap::from([(2, boundary)])),
             32
         );
         assert_eq!(cooperative_vgpr_count(&program, 64, &BTreeMap::new()), 64);
@@ -349,41 +394,18 @@ pub struct CoopVecKernel {
     addr: u64,
     pub num_vgprs: usize,
     pub width: u32,
-    pub entry_pc: usize,
 }
 
 unsafe impl Send for CoopVecKernel {}
 unsafe impl Sync for CoopVecKernel {}
 
 impl CoopVecKernel {
-    /// `sgprs` points to 129 packet-local scalar slots (SCC at 128), `vgprs`
-    /// uses register-major SoA layout (`num_vgprs * W`), and `spill` persists
-    /// the uniform readlane/writelane spill idiom across yields. `lane_base` is
-    /// the packet's first lane within its owning 32-lane wave and is used only
-    /// to select the corresponding private scratch segments.
-    pub unsafe fn run(
-        &self,
-        sgprs: *mut u32,
-        vgprs: *mut u32,
-        scratch_base: u64,
-        scratch_stride: u64,
-        spill: *mut u32,
-        resume_pc: u64,
-        lane_base: u64,
-    ) -> u64 {
-        let f = std::mem::transmute::<
-            u64,
-            extern "C" fn(*mut u32, *mut u32, u64, u64, *mut u32, u64, u64) -> u64,
-        >(self.addr);
-        f(
-            sgprs,
-            vgprs,
-            scratch_base,
-            scratch_stride,
-            spill,
-            resume_pc,
-            lane_base,
-        )
+    /// Entry address of the compiled packet kernel. It is not callable
+    /// directly: the kernel yields by switching stacks, so it has to be
+    /// started on a fiber ([`super::fiber::FiberCtx`] documents its
+    /// arguments).
+    pub fn addr(&self) -> u64 {
+        self.addr
     }
 }
 
@@ -394,7 +416,7 @@ struct Cg {
     b: LLVMBuilderRef,
     w: u32,
     coop: bool,
-    writeback_vgprs: usize,
+    num_vgprs: usize,
     // per-lane scratch base vector <W×i64> (broadcast(base) + lane*stride)
     scratch_vec: LLVMValueRef,
     store_sink: std::cell::Cell<LLVMValueRef>,
@@ -480,6 +502,9 @@ struct Cg {
     ldexp_normal_pow2: std::cell::Cell<bool>,
     structured_loop_masks: Option<StructuredLoopMasks>,
     current_pc: std::cell::Cell<usize>,
+    /// Cooperative kernels: what the host op at each resume pc touches. A
+    /// barrier stores its reads, yields, and reloads its writes.
+    boundary: BTreeMap<usize, BoundaryIo>,
 }
 
 /// Lane-mask storage used inside one conservatively selected leaf loop. EXEC,
@@ -1573,25 +1598,14 @@ impl Cg {
 
 pub fn compile_program(program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
     let num_vgprs = num_vgprs.max(256);
-    let addr = unsafe { compile_inner(program, num_vgprs, width, false, &BTreeMap::new()) };
+    let addr = unsafe { compile_inner(program, num_vgprs, width, None) };
     VecKernel { addr, num_vgprs, width }
-}
-
-/// Compile a resumable width-W packet whose host-side barriers do not mutate
-/// VGPRs. Cross-lane programs must use `coop_xlane::compile_xlane_vec` so the
-/// divergence/frame analyses receive writelane and WMMA boundary effects.
-pub fn compile_cooperative(
-    program: &ScalarProgram,
-    num_vgprs: usize,
-    width: u32,
-) -> CoopVecKernel {
-    compile_cooperative_with_boundary_writes(program, num_vgprs, width, &BTreeMap::new())
 }
 
 fn cooperative_vgpr_count(
     program: &ScalarProgram,
     declared_vgprs: usize,
-    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+    boundary: &BTreeMap<usize, BoundaryIo>,
 ) -> usize {
     // Some gfx1200 callers still decode the descriptor with the older 4-VGPR
     // granularity, so retain every register the IR or a lifted boundary can
@@ -1606,37 +1620,41 @@ fn cooperative_vgpr_count(
             regs.extend(super::freshness::vgpr_writes(inst));
             regs
         })
-        .chain(boundary_writes.values().flatten().copied())
+        .chain(boundary.values().flat_map(|io| io.writes.vgprs()))
         .max()
         .map_or(1, |reg| reg as usize + 1);
     declared_vgprs.max(required_vgprs)
 }
 
-pub(super) fn compile_cooperative_with_boundary_writes(
+/// Compile a width-W packet of a cross-lane program. `boundary` describes the
+/// host-applied wave-level op at each barrier's resume pc.
+///
+/// The kernel runs as a fiber: at a barrier it stores the op's read footprint,
+/// switches to the driver through `amdgpu_sim_fiber_yield`, reloads the op's
+/// write footprint, and falls through to the resume block. Everything else
+/// stays live in SSA on the fiber's stack. See [`super::fiber`].
+pub(super) fn compile_cooperative(
     program: &ScalarProgram,
     num_vgprs: usize,
     width: u32,
-    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+    boundary: &BTreeMap<usize, BoundaryIo>,
 ) -> CoopVecKernel {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
-    let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary_writes);
-    let addr = unsafe { compile_inner(program, num_vgprs, width, true, boundary_writes) };
-    CoopVecKernel {
-        addr,
-        num_vgprs,
-        width,
-        entry_pc: program.entry_pc,
-    }
+    let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary);
+    let addr = unsafe { compile_inner(program, num_vgprs, width, Some(boundary)) };
+    CoopVecKernel { addr, num_vgprs, width }
 }
 
+/// `boundary` selects the ABI: `Some` compiles a resumable cooperative packet
+/// (fiber), `None` a whole-program kernel.
 unsafe fn compile_inner(
     program: &ScalarProgram,
     num_vgprs: usize,
     width: u32,
-    coop: bool,
-    boundary_writes: &BTreeMap<usize, Vec<u32>>,
+    boundary: Option<&BTreeMap<usize, BoundaryIo>>,
 ) -> u64 {
     let w = width;
+    let coop = boundary.is_some();
 
     llvm::target::LLVM_InitializeNativeTarget();
     llvm::target::LLVM_InitializeNativeAsmParser();
@@ -1665,8 +1683,10 @@ unsafe fn compile_inner(
     // `i64 kernel(sgprs[129], vgprs, wave_scratch_base, scratch_stride,
     //             spill, resume_pc, packet_lane_base)`.
     let func = if coop {
-        let mut params = [ptr, ptr, i64t, i64t, ptr, i64t, i64t];
-        let fty = llvm::core::LLVMFunctionType(i64t, params.as_mut_ptr(), 7, 0);
+        // Fiber ABI: the cooperative arguments plus the FiberCtx (see
+        // `super::fiber::FiberCtx`); the resume-pc slot is unused.
+        let mut params = [ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr];
+        let fty = llvm::core::LLVMFunctionType(i64t, params.as_mut_ptr(), 8, 0);
         llvm::core::LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, fty)
     } else {
         let mut params = [ptr, ptr, i64t, i64t];
@@ -1726,7 +1746,7 @@ unsafe fn compile_inner(
     };
 
     let mut cg = Cg {
-        ctx, module, func, b, w, coop, writeback_vgprs: num_vgprs,
+        ctx, module, func, b, w, coop, num_vgprs,
         scratch_vec: scratch_base, // placeholder, set below
         store_sink: std::cell::Cell::new(std::ptr::null_mut()),
         scratch_base_scalar: scratch_base,
@@ -1747,6 +1767,7 @@ unsafe fn compile_inner(
         ldexp_normal_pow2: std::cell::Cell::new(false),
         structured_loop_masks: None,
         current_pc: std::cell::Cell::new(usize::MAX),
+        boundary: boundary.cloned().unwrap_or_default(),
     };
 
     // Select at most one leaf loop whose EXEC save/restore pairs are entirely
@@ -1785,31 +1806,9 @@ unsafe fn compile_inner(
     cg.scratch_vec = cg.v_add(base_v, off);
     cg.store_sink.set(llvm::core::LLVMBuildAlloca(b, i64t, cstr("store_sink").as_ptr()));
 
-    // Initialize SGPRs (scalar, from uniform sgprs_p) and VGPRs (<W×i32> SoA).
-    for i in 0..128u32 {
-        let gep = llvm::core::LLVMBuildGEP2(b, i32t, sgprs_p, [cg.ci32(i)].as_mut_ptr(), 1, cg.n());
-        let v = llvm::core::LLVMBuildLoad2(b, i32t, gep, cg.n());
-        cg.st_sgpr32(i, v);
-    }
-    for i in 0..num_vgprs as u32 {
-        // lanes of register i are contiguous at vgprs_p[i*W .. i*W+W]
-        let gep = llvm::core::LLVMBuildGEP2(b, i32t, vgprs_p, [cg.ci32(i * w)].as_mut_ptr(), 1, cg.n());
-        let ld = llvm::core::LLVMBuildLoad2(b, vi32, gep, cg.n());
-        llvm::core::LLVMSetAlignment(ld, 4);
-        llvm::core::LLVMBuildStore(b, ld, cg.vgpr[i as usize]);
-    }
-    // Seed each f64-canonical pair's cell directly from its two i32 arg halves
-    // (the cell is its sole storage; the i32 slots are unused for canonical pairs).
-    for p in 0..num_vgprs as u32 {
-        if super::regtype::bget(&cg.f64c, p) && (p + 1) < num_vgprs as u32 {
-            let lo = cg.zext64v(llvm::core::LLVMBuildLoad2(b, vi32, cg.vgpr[p as usize], cg.n()));
-            let hi = cg.zext64v(llvm::core::LLVMBuildLoad2(b, vi32, cg.vgpr[p as usize + 1], cg.n()));
-            let hi = llvm::core::LLVMBuildShl(b, hi, cg.splat(cg.ci64(32), vi64), cg.n());
-            let u = cg.v_or(hi, lo);
-            let d = llvm::core::LLVMBuildBitCast(b, u, vf64, cg.n());
-            llvm::core::LLVMBuildStore(b, d, cg.vgpr_f64[p as usize]);
-        }
-    }
+    // Load the packet's incoming register state; from here it lives in the
+    // allocas, and across a boundary in SSA on the fiber's stack.
+    cg.emit_load(None);
     if coop {
         // SCC is persisted in the packet-local extension slot sgprs[128].
         let gep = llvm::core::LLVMBuildGEP2(
@@ -1847,38 +1846,30 @@ unsafe fn compile_inner(
             loop_masks.exit_bbs.insert((from, to), llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
         }
     }
-    if coop {
-        let resume = llvm::core::LLVMGetParam(func, 5);
-        let mut targets: Vec<usize> = program
-            .blocks
-            .values()
-            .filter_map(|block| match block.term {
-                Terminator::Barrier { resume } => Some(resume),
-                _ => None,
-            })
-            .collect();
-        targets.sort_unstable();
-        targets.dedup();
-        let switch = llvm::core::LLVMBuildSwitch(
-            b,
-            resume,
-            bbs[&program.entry_pc],
-            targets.len() as u32,
-        );
-        for pc in targets {
-            llvm::core::LLVMAddCase(switch, cg.ci64(pc as u64), bbs[&pc]);
-        }
-    } else {
-        llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
-    }
+    // A fiber enters the kernel once and suspends in place at a boundary, so
+    // there is no resume dispatch here.
+    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
 
     let base_pred = true;
+    // Registers the host writes on a Barrier->resume edge; the divergence and
+    // frame analyses must not read a host-written value as a uniform one.
+    let boundary_writes: BTreeMap<usize, Vec<u32>> = boundary
+        .map(|map| map.iter().map(|(&pc, io)| (pc, io.writes.vgprs().collect())).collect())
+        .unwrap_or_default();
     // Mask elision: a VGPR write skips EXEC predication when none of its
     // destinations is live at a CFG reconvergence point or caller-observed
-    // fragment exit. Reconvergence-visible state stays predicated, while
-    // transient arithmetic may run mask-free; memory and compare writes remain
+    // exit. Reconvergence-visible state stays predicated, while transient
+    // arithmetic may run mask-free; memory and compare writes remain
     // EXEC-masked. See [super::vec_live].
-    let elide = super::vec_live::analyze_with_exit_live(program, &[]);
+    //
+    // A packet's caller-observed exits are its boundaries, and the host reads
+    // the op's sources in EVERY lane (WMMA mixes lanes and ignores EXEC), so
+    // those registers must stay predicated. Nothing observes the register file
+    // after the kernel returns.
+    let boundary_reads: Vec<u32> = boundary
+        .map(|map| map.values().flat_map(|io| io.reads.vgprs()).collect())
+        .unwrap_or_default();
+    let elide = super::vec_live::analyze_with_exit_live(program, &boundary_reads);
     let f64_fresh_in = super::freshness::analyze(program);
     cg.fresh_in = f64_fresh_in.clone();
     let div_in = if coop {
@@ -1887,31 +1878,25 @@ unsafe fn compile_inner(
         super::vec_live::divergent_entry_with_seed_and_boundary_writes(
             program,
             seed,
-            boundary_writes,
+            &boundary_writes,
         )
     } else {
         super::vec_live::divergent_entry(program)
     };
     let frame_in = if coop {
-        super::vec_live::frame_entry_with_boundary_writes(program, boundary_writes)
+        super::vec_live::frame_entry_with_boundary_writes(program, &boundary_writes)
     } else {
         super::vec_live::frame_entry(program)
     };
-    // Enable the reconvergence-liveness rule computed above (see vec_live):
-    // arithmetic temps unmasked, reconvergence-visible state updates masked.
-    // The cooperative ABI materializes the register file at every coroutine
-    // boundary. Keep all VALU writes EXEC-predicated there; the whole-program
-    // path can still use the reconvergence-liveness elision.
-    let do_elide = !coop;
+    // Both this rule and the specialization below now apply to cooperative
+    // packets as well: a fiber's state never leaves SSA at a boundary (what
+    // the host observes there is `boundary_reads`), and EXEC stays in its
+    // alloca across the switch.
     // All supported widths are powers of two. Divergent-pointer load clustering
     // uses power-of-two transpose tiles up to 8 lanes, then concatenates tiles
     // for wider packets.
     let do_cluster = w.is_power_of_two();
-    // All-lanes-active block specialization (see the clone emission below).
-    // Restricted to the whole-program path: the cooperative ABI re-materializes
-    // the register file at every coroutine boundary, so its blocks are entered
-    // with masks this test cannot reason about.
-    let do_specialize = !coop;
+
 
     for (&pc, block) in &program.blocks {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
@@ -1960,10 +1945,10 @@ unsafe fn compile_inner(
             .iter()
             .enumerate()
             .filter(|(idx, inst)| {
-                !(do_elide && flags[*idx]) && !super::freshness::vgpr_writes(inst).is_empty()
+                !flags[*idx] && !super::freshness::vgpr_writes(inst).is_empty()
             })
             .count();
-        let specialize = do_specialize && predicated_writes > 0;
+        let specialize = predicated_writes > 0;
         let variants: Vec<(bool, LLVMBasicBlockRef)> = if specialize {
             let fast = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, cstr(&format!("b{:x}.allactive", pc)).as_ptr());
             let slow = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, cstr(&format!("b{:x}.masked", pc)).as_ptr());
@@ -2008,7 +1993,7 @@ unsafe fn compile_inner(
                 if cluster_rest > 0 {
                     cluster_rest -= 1;
                 } else {
-                    cg.predicate.set(variant_pred && base_pred && !(do_elide && flags[idx]));
+                    cg.predicate.set(variant_pred && base_pred && !flags[idx]);
                     let cluster = if do_cluster { vg_cluster(&block.body[idx..]) } else { None };
                     if let Some(SqrtCollapse::Rescale { site, vdst }) = sqrt_collapse[idx].clone() {
                         let root = cg.vsqrt(sqrt_inputs[&site]);
@@ -2019,7 +2004,7 @@ unsafe fn compile_inner(
                             .map(|i| match i { InstFormat::VGLOBAL(g) => g, _ => unreachable!() })
                             .collect();
                         let preds: Vec<bool> = (0..c.len)
-                            .map(|m| variant_pred && base_pred && !(do_elide && flags[idx + m]))
+                            .map(|m| variant_pred && base_pred && !flags[idx + m])
                             .collect();
                         cg.emit_vglobal_cluster(&members, c.lo, c.span, &preds);
                         cluster_rest = c.len - 1;
@@ -2056,44 +2041,79 @@ unsafe fn compile_inner(
 }
 
 impl Cg {
-    /// Persist packet state at a cross-lane yield or final return. Values are
-    /// loaded through the canonical accessors so lazily materialized f64 cells
-    /// are written back correctly without first forcing their shadow slots.
-    unsafe fn emit_coop_writeback(&self) {
+    /// Load registers from the caller's packet buffers into the packed
+    /// allocas. `set` selects which (`None` = the whole register file, which
+    /// is what kernel entry needs).
+    unsafe fn emit_load(&self, set: Option<&RegSet>) {
         let sgprs_p = llvm::core::LLVMGetParam(self.func, 0);
         let vgprs_p = llvm::core::LLVMGetParam(self.func, 1);
-        for i in 0..128u32 {
-            let gep = llvm::core::LLVMBuildGEP2(
-                self.b,
-                self.i32t,
-                sgprs_p,
-                [self.ci32(i)].as_mut_ptr(),
-                1,
-                self.n(),
-            );
-            llvm::core::LLVMBuildStore(self.b, self.ld_sgpr32(i), gep);
+        let num_vgprs = self.num_vgprs as u32;
+        let want_sgpr = |reg: u32| set.map_or(true, |s| s.has_sgpr(reg));
+        // An f64-canonical pair's cell is seeded from both halves, so selecting
+        // either half pulls in its partner.
+        let want_vgpr = |reg: u32| {
+            let selected = |r: u32| r < num_vgprs && set.map_or(true, |s| s.has_vgpr(r));
+            selected(reg)
+                || (super::regtype::bget(&self.f64c, reg) && selected(reg + 1))
+                || (reg > 0 && super::regtype::bget(&self.f64c, reg - 1) && selected(reg - 1))
+        };
+        for reg in 0..128u32 {
+            if !want_sgpr(reg) {
+                continue;
+            }
+            let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, sgprs_p, [self.ci32(reg)].as_mut_ptr(), 1, self.n());
+            let value = llvm::core::LLVMBuildLoad2(self.b, self.i32t, gep, self.n());
+            self.st_sgpr32(reg, value);
         }
-        let scc_gep = llvm::core::LLVMBuildGEP2(
-            self.b,
-            self.i32t,
-            sgprs_p,
-            [self.ci32(128)].as_mut_ptr(),
-            1,
-            self.n(),
-        );
-        let scc = llvm::core::LLVMBuildZExt(self.b, self.ld_scc(), self.i32t, self.n());
-        llvm::core::LLVMBuildStore(self.b, scc, scc_gep);
+        for reg in 0..num_vgprs {
+            if !want_vgpr(reg) {
+                continue;
+            }
+            // lanes of register `reg` are contiguous at vgprs_p[reg*W ..][..W]
+            let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, vgprs_p, [self.ci32(reg * self.w)].as_mut_ptr(), 1, self.n());
+            let load = llvm::core::LLVMBuildLoad2(self.b, self.vi32, gep, self.n());
+            llvm::core::LLVMSetAlignment(load, 4);
+            llvm::core::LLVMBuildStore(self.b, load, self.vgpr[reg as usize]);
+        }
+        // Seed each selected f64-canonical pair's cell from its two i32 halves
+        // (the cell is its sole storage; the i32 slots stay unused).
+        for pair in 0..num_vgprs {
+            if super::regtype::bget(&self.f64c, pair) && (pair + 1) < num_vgprs && want_vgpr(pair) {
+                let lo = self.zext64v(llvm::core::LLVMBuildLoad2(self.b, self.vi32, self.vgpr[pair as usize], self.n()));
+                let hi = self.zext64v(llvm::core::LLVMBuildLoad2(self.b, self.vi32, self.vgpr[pair as usize + 1], self.n()));
+                let hi = llvm::core::LLVMBuildShl(self.b, hi, self.splat(self.ci64(32), self.vi64), self.n());
+                let value = llvm::core::LLVMBuildBitCast(self.b, self.v_or(hi, lo), self.vf64, self.n());
+                llvm::core::LLVMBuildStore(self.b, value, self.vgpr_f64[pair as usize]);
+            }
+        }
+    }
 
-        for i in 0..self.writeback_vgprs as u32 {
-            let gep = llvm::core::LLVMBuildGEP2(
-                self.b,
-                self.i32t,
-                vgprs_p,
-                [self.ci32(i * self.w)].as_mut_ptr(),
-                1,
-                self.n(),
-            );
-            let store = llvm::core::LLVMBuildStore(self.b, self.ld_vgpr32(i), gep);
+    /// Store registers back to the caller's packet buffers. `set` selects which
+    /// (`None` = the whole register file plus SCC). Values are read through the
+    /// canonical accessors, so lazily materialized f64 cells are stored
+    /// correctly without first forcing their shadow slots.
+    unsafe fn emit_store(&self, set: Option<&RegSet>) {
+        let sgprs_p = llvm::core::LLVMGetParam(self.func, 0);
+        let vgprs_p = llvm::core::LLVMGetParam(self.func, 1);
+        for reg in 0..128u32 {
+            if set.map_or(false, |s| !s.has_sgpr(reg)) {
+                continue;
+            }
+            let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, sgprs_p, [self.ci32(reg)].as_mut_ptr(), 1, self.n());
+            llvm::core::LLVMBuildStore(self.b, self.ld_sgpr32(reg), gep);
+        }
+        if set.is_none() {
+            // SCC lives in the packet-local extension slot sgprs[128].
+            let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, sgprs_p, [self.ci32(128)].as_mut_ptr(), 1, self.n());
+            let scc = llvm::core::LLVMBuildZExt(self.b, self.ld_scc(), self.i32t, self.n());
+            llvm::core::LLVMBuildStore(self.b, scc, gep);
+        }
+        for reg in 0..self.num_vgprs as u32 {
+            if set.map_or(false, |s| !s.has_vgpr(reg)) {
+                continue;
+            }
+            let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, vgprs_p, [self.ci32(reg * self.w)].as_mut_ptr(), 1, self.n());
+            let store = llvm::core::LLVMBuildStore(self.b, self.ld_vgpr32(reg), gep);
             llvm::core::LLVMSetAlignment(store, 4);
         }
     }
@@ -2102,7 +2122,10 @@ impl Cg {
         match term {
             Terminator::Return => {
                 if self.coop {
-                    self.emit_coop_writeback();
+                    // A finished packet materializes its whole register file:
+                    // a sibling packet of the same wave may still reach a
+                    // wave-level boundary, and those ops read all 32 lanes.
+                    self.emit_store(None);
                     llvm::core::LLVMBuildRet(self.b, self.ci64(super::emit::COOP_DONE));
                 } else {
                     llvm::core::LLVMBuildRetVoid(self.b);
@@ -2123,11 +2146,31 @@ impl Cg {
                 );
             }
             Terminator::Barrier { resume } => {
-                if !self.coop {
-                    panic!("the packed-work-item backend does not support workgroup barriers");
-                }
-                self.emit_coop_writeback();
-                llvm::core::LLVMBuildRet(self.b, self.ci64(*resume as u64));
+                let io = self.boundary.get(resume).unwrap_or_else(|| {
+                    panic!("cross-lane boundary at {:#x} has no host op", resume)
+                });
+                // Hand the host op its operands, switch to the driver, take
+                // back what it wrote, and fall through to the resume block.
+                // The rest of the packet state never leaves SSA.
+                self.emit_store(Some(&io.reads));
+                // The resume block is entered with nothing f64-fresh (the
+                // analyses treat barrier edges as carrying nothing), so
+                // materialize the stale slots before the switch.
+                self.sync_stale_for(&[*resume]);
+                let void = llvm::core::LLVMVoidTypeInContext(self.ctx);
+                self.call(
+                    "amdgpu_sim_fiber_yield",
+                    void,
+                    &[self.ptr, self.i64t, self.ptr, self.ptr],
+                    &[
+                        llvm::core::LLVMGetParam(self.func, 7),
+                        self.ci64(*resume as u64),
+                        llvm::core::LLVMGetParam(self.func, 0),
+                        llvm::core::LLVMGetParam(self.func, 1),
+                    ],
+                );
+                self.emit_load(Some(&io.writes));
+                llvm::core::LLVMBuildBr(self.b, bbs[resume]);
             }
         }
     }

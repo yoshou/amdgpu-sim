@@ -94,6 +94,9 @@ mod runtime;
 mod segmented;
 mod structured;
 mod vec_live;
+mod wmma;
+
+pub mod fiber;
 
 pub use cooperative::dispatch_cooperative;
 pub use coop_xlane::{
@@ -101,12 +104,7 @@ pub use coop_xlane::{
 };
 pub use dispatch::{dispatch_parallel, dispatch_parallel_vec, GridDims};
 pub use emit::{compile_cooperative, compile_program, CoopKernel, ScalarKernel};
-pub use emit_vec::{
-    compile_cooperative as compile_cooperative_vec,
-    compile_program as compile_program_vec,
-    CoopVecKernel,
-    VecKernel,
-};
+pub use emit_vec::{compile_program as compile_program_vec, CoopVecKernel, VecKernel};
 pub use ir::{build_scalar_program, split_at_barriers, Cond, ScalarBlock, ScalarProgram, Terminator};
 pub use segmented::{dispatch_segmented, SegmentedProgram};
 pub use structured::analyze_structured;
