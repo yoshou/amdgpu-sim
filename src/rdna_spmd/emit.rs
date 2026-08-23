@@ -186,8 +186,8 @@ struct Cg {
 }
 
 impl Cg {
-    unsafe fn n(&self) -> *const i8 {
-        b"\0".as_ptr() as *const i8
+    unsafe fn n(&self) -> *const std::ffi::c_char {
+        b"\0".as_ptr() as *const std::ffi::c_char
     }
 
     // ---- intrinsic / external function declaration -----------------------

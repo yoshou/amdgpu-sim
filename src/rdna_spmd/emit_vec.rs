@@ -526,8 +526,8 @@ struct StructuredLoopMasks {
 }
 
 impl Cg {
-    unsafe fn n(&self) -> *const i8 {
-        b"\0".as_ptr() as *const i8
+    unsafe fn n(&self) -> *const std::ffi::c_char {
+        b"\0".as_ptr() as *const std::ffi::c_char
     }
 
     // ---- intrinsics / externals -----------------------------------------
@@ -1294,14 +1294,17 @@ impl Cg {
     /// semantics of the clamped-multiply chain below), 5 ops per 16 lanes
     /// instead of ~45; otherwise the clamped-multiply chain.
     unsafe fn vldexp(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        if self.w == 4
-            && std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx512vl")
+        #[cfg(target_arch = "x86_64")]
         {
-            return self.vldexp_scalef_256(value, exp);
-        }
-        if self.w % 8 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
-            return self.vldexp_scalef(value, exp);
+            if self.w == 4
+                && std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+            {
+                return self.vldexp_scalef_256(value, exp);
+            }
+            if self.w % 8 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
+                return self.vldexp_scalef(value, exp);
+            }
         }
         self.vldexp_chain(value, exp)
     }
@@ -1392,47 +1395,50 @@ impl Cg {
     /// hosts `vscalefps` is the same operation in one instruction per 16 lanes.
     unsafe fn vldexp_f32(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
         let n = self.n();
-        if self.w % 16 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
-            let i16t = llvm::core::LLVMIntTypeInContext(self.ctx, 16);
-            let v16f32 = llvm::core::LLVMVectorType(self.f32t, 16);
-            let chunks = (self.w / 16) as usize;
-            let mut parts: Vec<LLVMValueRef> = Vec::with_capacity(chunks);
-            for c in 0..chunks {
-                let (xc, ec) = if chunks == 1 {
-                    (value, exp)
-                } else {
-                    let mut mask: Vec<LLVMValueRef> =
-                        (0..16).map(|k| self.ci32((c * 16 + k) as u32)).collect();
-                    let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), 16);
-                    let poison_f = llvm::core::LLVMGetPoison(self.vf32);
-                    let poison_i = llvm::core::LLVMGetPoison(self.vi32);
-                    (
-                        llvm::core::LLVMBuildShuffleVector(self.b, value, poison_f, m, n),
-                        llvm::core::LLVMBuildShuffleVector(self.b, exp, poison_i, m, n),
-                    )
-                };
-                let ef = llvm::core::LLVMBuildSIToFP(self.b, ec, v16f32, n);
-                parts.push(self.call(
-                    "llvm.x86.avx512.mask.scalef.ps.512",
-                    v16f32,
-                    &[v16f32, v16f32, v16f32, i16t, self.i32t],
-                    &[xc, ef, xc, llvm::core::LLVMConstInt(i16t, 0xFFFF, 0), self.ci32(4)],
-                ));
-            }
-            let mut width = 16u32;
-            let mut vals = parts;
-            while vals.len() > 1 {
-                let mut next = Vec::with_capacity(vals.len() / 2);
-                for p in vals.chunks(2) {
-                    let mut mask: Vec<LLVMValueRef> =
-                        (0..width * 2).map(|k| self.ci32(k)).collect();
-                    let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), width * 2);
-                    next.push(llvm::core::LLVMBuildShuffleVector(self.b, p[0], p[1], m, n));
+        #[cfg(target_arch = "x86_64")]
+        {
+            if self.w % 16 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
+                let i16t = llvm::core::LLVMIntTypeInContext(self.ctx, 16);
+                let v16f32 = llvm::core::LLVMVectorType(self.f32t, 16);
+                let chunks = (self.w / 16) as usize;
+                let mut parts: Vec<LLVMValueRef> = Vec::with_capacity(chunks);
+                for c in 0..chunks {
+                    let (xc, ec) = if chunks == 1 {
+                        (value, exp)
+                    } else {
+                        let mut mask: Vec<LLVMValueRef> =
+                            (0..16).map(|k| self.ci32((c * 16 + k) as u32)).collect();
+                        let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), 16);
+                        let poison_f = llvm::core::LLVMGetPoison(self.vf32);
+                        let poison_i = llvm::core::LLVMGetPoison(self.vi32);
+                        (
+                            llvm::core::LLVMBuildShuffleVector(self.b, value, poison_f, m, n),
+                            llvm::core::LLVMBuildShuffleVector(self.b, exp, poison_i, m, n),
+                        )
+                    };
+                    let ef = llvm::core::LLVMBuildSIToFP(self.b, ec, v16f32, n);
+                    parts.push(self.call(
+                        "llvm.x86.avx512.mask.scalef.ps.512",
+                        v16f32,
+                        &[v16f32, v16f32, v16f32, i16t, self.i32t],
+                        &[xc, ef, xc, llvm::core::LLVMConstInt(i16t, 0xFFFF, 0), self.ci32(4)],
+                    ));
                 }
-                width *= 2;
-                vals = next;
+                let mut width = 16u32;
+                let mut vals = parts;
+                while vals.len() > 1 {
+                    let mut next = Vec::with_capacity(vals.len() / 2);
+                    for p in vals.chunks(2) {
+                        let mut mask: Vec<LLVMValueRef> =
+                            (0..width * 2).map(|k| self.ci32(k)).collect();
+                        let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), width * 2);
+                        next.push(llvm::core::LLVMBuildShuffleVector(self.b, p[0], p[1], m, n));
+                    }
+                    width *= 2;
+                    vals = next;
+                }
+                return vals[0];
             }
-            return vals[0];
         }
         self.call(
             &format!("llvm.ldexp.v{}f32.v{}i32", self.w, self.w),
