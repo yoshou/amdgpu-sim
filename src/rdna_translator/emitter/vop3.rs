@@ -945,16 +945,20 @@ impl IREmitter {
             I::V_CMP_GT_U32
             | I::V_CMP_LT_U32
             | I::V_CMP_GE_U32
+            | I::V_CMP_LE_U32
             | I::V_CMP_EQ_U32
             | I::V_CMP_NE_U32
-            | I::V_CMP_GT_I32 => {
+            | I::V_CMP_GT_I32
+            | I::V_CMP_LT_I32 => {
                 let pred = match inst.op {
                     I::V_CMP_GT_U32 => llvm::LLVMIntPredicate::LLVMIntUGT,
                     I::V_CMP_LT_U32 => llvm::LLVMIntPredicate::LLVMIntULT,
                     I::V_CMP_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMP_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
                     I::V_CMP_EQ_U32 => llvm::LLVMIntPredicate::LLVMIntEQ,
                     I::V_CMP_NE_U32 => llvm::LLVMIntPredicate::LLVMIntNE,
                     I::V_CMP_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMP_LT_I32 => llvm::LLVMIntPredicate::LLVMIntSLT,
                     _ => unreachable!(),
                 };
                 if USE_SIMD {
