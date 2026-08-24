@@ -39,7 +39,7 @@ impl IREmitter {
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     let ioffset_value =
-                        llvm::core::LLVMConstInt(ty_i64, inst.ioffset as i32 as i64 as u64, 0);
+                        llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
 
                     let zero_vec = llvm::core::LLVMConstVector(
                         [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
@@ -229,7 +229,7 @@ impl IREmitter {
                         let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
 
                         let ioffset_value =
-                            llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                            llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
                         let addr_value = emitter.emit_load_vgpr_u64(inst.vaddr as u32, elem);
                         let global_offset = llvm::core::LLVMBuildAdd(
                             builder,
@@ -369,7 +369,7 @@ impl IREmitter {
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     let ioffset_value =
-                        llvm::core::LLVMConstInt(ty_i64, inst.ioffset as i32 as i64 as u64, 0);
+                        llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
 
                     let zero_vec = llvm::core::LLVMConstVector(
                         [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
@@ -527,7 +527,7 @@ impl IREmitter {
                         let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
 
                         let ioffset_value =
-                            llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                            llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
                         let addr_value = emitter.emit_load_vgpr_u64(inst.vaddr as u32, elem);
                         let global_offset = llvm::core::LLVMBuildAdd(
                             builder,
@@ -2864,7 +2864,7 @@ impl IREmitter {
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
                     let saddr_value = llvm::core::LLVMBuildZExt(
                         builder,
                         saddr_value,
@@ -2938,7 +2938,7 @@ impl IREmitter {
                     let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
 
                     let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
                     let saddr_value = llvm::core::LLVMBuildZExt(
                         builder,
                         saddr_value,
@@ -3047,7 +3047,7 @@ impl IREmitter {
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
                     let saddr_value = llvm::core::LLVMBuildZExt(
                         builder,
                         saddr_value,
@@ -3128,7 +3128,7 @@ impl IREmitter {
                     for i in 0..32 {
                         let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
                         let ioffset_value =
-                            llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                            llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
                         let saddr_value = llvm::core::LLVMBuildZExt(
                             builder,
                             saddr_value,

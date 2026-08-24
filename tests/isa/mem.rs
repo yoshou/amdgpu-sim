@@ -169,8 +169,6 @@ pub(crate) fn check_ds(op: u32, cases: &[DsCase]) {
     report(failures, cases.len() * 2);
 }
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_b128_load() {
     // GLOBAL_LOAD_B128.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -188,8 +186,6 @@ fn global_load_b128_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_b32_load() {
     // GLOBAL_LOAD_B32.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -207,8 +203,6 @@ fn global_load_b32_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_b64_load() {
     // GLOBAL_LOAD_B64.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -226,8 +220,6 @@ fn global_load_b64_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_b96_load() {
     // GLOBAL_LOAD_B96.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -245,8 +237,6 @@ fn global_load_b96_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_i16_load() {
     // GLOBAL_LOAD_I16.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -264,8 +254,6 @@ fn global_load_i16_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_i8_load() {
     // GLOBAL_LOAD_I8.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -283,8 +271,6 @@ fn global_load_i8_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_u16_load() {
     // GLOBAL_LOAD_U16.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -302,8 +288,6 @@ fn global_load_u16_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_load_u8_load() {
     // GLOBAL_LOAD_U8.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -321,8 +305,6 @@ fn global_load_u8_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_store_b128_store() {
     // GLOBAL_STORE_B128.
     // The word in the buffer after the store is what is checked; the test
@@ -341,8 +323,6 @@ fn global_store_b128_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_store_b16_store() {
     // GLOBAL_STORE_B16.
     // The word in the buffer after the store is what is checked; the test
@@ -361,8 +341,6 @@ fn global_store_b16_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_store_b32_store() {
     // GLOBAL_STORE_B32.
     // The word in the buffer after the store is what is checked; the test
@@ -381,8 +359,6 @@ fn global_store_b32_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_store_b64_store() {
     // GLOBAL_STORE_B64.
     // The word in the buffer after the store is what is checked; the test
@@ -401,8 +377,6 @@ fn global_store_b64_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_store_b8_store() {
     // GLOBAL_STORE_B8.
     // The word in the buffer after the store is what is checked; the test
@@ -421,8 +395,6 @@ fn global_store_b8_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn global_store_b96_store() {
     // GLOBAL_STORE_B96.
     // The word in the buffer after the store is what is checked; the test
@@ -441,8 +413,6 @@ fn global_store_b96_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_b128_load() {
     // FLAT_LOAD_B128.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -460,8 +430,6 @@ fn flat_load_b128_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_b32_load() {
     // FLAT_LOAD_B32.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -479,8 +447,6 @@ fn flat_load_b32_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_b64_load() {
     // FLAT_LOAD_B64.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -498,8 +464,6 @@ fn flat_load_b64_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_b96_load() {
     // FLAT_LOAD_B96.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -517,8 +481,6 @@ fn flat_load_b96_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_i16_load() {
     // FLAT_LOAD_I16.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -536,8 +498,6 @@ fn flat_load_i16_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_i8_load() {
     // FLAT_LOAD_I8.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -555,8 +515,6 @@ fn flat_load_i8_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_u16_load() {
     // FLAT_LOAD_U16.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -574,8 +532,6 @@ fn flat_load_u16_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_load_u8_load() {
     // FLAT_LOAD_U8.
     // Lane n addresses word n of the buffer, so the value that comes back
@@ -593,8 +549,6 @@ fn flat_load_u8_load() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_store_b128_store() {
     // FLAT_STORE_B128.
     // The word in the buffer after the store is what is checked; the test
@@ -613,8 +567,6 @@ fn flat_store_b128_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_store_b16_store() {
     // FLAT_STORE_B16.
     // The word in the buffer after the store is what is checked; the test
@@ -633,8 +585,6 @@ fn flat_store_b16_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_store_b32_store() {
     // FLAT_STORE_B32.
     // The word in the buffer after the store is what is checked; the test
@@ -653,8 +603,6 @@ fn flat_store_b32_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_store_b64_store() {
     // FLAT_STORE_B64.
     // The word in the buffer after the store is what is checked; the test
@@ -673,8 +621,6 @@ fn flat_store_b64_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_store_b8_store() {
     // FLAT_STORE_B8.
     // The word in the buffer after the store is what is checked; the test
@@ -693,8 +639,6 @@ fn flat_store_b8_store() {
 }
 
 #[test]
-#[ignore = "the interpreter faults on these: it takes the test process down \
-           with SIGSEGV rather than reporting a wrong value"]
 fn flat_store_b96_store() {
     // FLAT_STORE_B96.
     // The word in the buffer after the store is what is checked; the test

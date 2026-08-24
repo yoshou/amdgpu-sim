@@ -165,13 +165,21 @@ impl Harness {
         // The memory harness takes a fourth argument: the buffer it loads from
         // and stores into. Word k holds a value that identifies k, so a loaded
         // value says which address it came from.
-        let mut data: Vec<u32> = (0..256u32).map(data_word).collect();
+        // Word k of the buffer holds a value that identifies k. The zeroed words
+        // on either side stand in for the memory around the hardware's
+        // allocation, so a case whose offset reaches outside the buffer reads
+        // the same zeros the hardware read rather than whatever happens to be
+        // next to this process's allocation.
+        const GUARD: usize = 64;
+        let mut data: Vec<u32> = vec![0; GUARD];
+        data.extend((0..256u32).map(data_word));
+        data.extend(std::iter::repeat(0).take(GUARD));
         let mut arg_buffer = vec![0u8; self.kernarg_size];
         set_u64(&mut arg_buffer, 0, out.as_mut_ptr() as u64);
         set_u64(&mut arg_buffer, 8, src.as_ptr() as u64);
         set_u64(&mut arg_buffer, 16, uni.as_ptr() as u64);
         if self.kernarg_size >= 32 {
-            set_u64(&mut arg_buffer, 24, data.as_mut_ptr() as u64);
+            set_u64(&mut arg_buffer, 24, unsafe { data.as_mut_ptr().add(GUARD) } as u64);
         }
 
         let aql = HsaKernelDispatchPacket {
