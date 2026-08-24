@@ -3654,6 +3654,187 @@ impl IREmitter {
                     });
                 }
             }
+            I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
+                if USE_SIMD {
+                    let emitter = self;
+                    let exec_value = emitter.emit_load_sgpr_u32(126);
+                    let vcc_value = emitter.emit_load_sgpr_u32(106);
+
+                    const N: usize = SIMD_WIDTH;
+
+                    let empty_name = std::ffi::CString::new("").unwrap();
+                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                    let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                    let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
+
+                    let mut cmp_values = Vec::new();
+
+                    for i in (0..32).step_by(N) {
+                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+                        let vcc_value = emitter.emit_bits_to_mask_u32xn::<N>(vcc_value, i);
+
+                        let s0_value =
+                            emitter.emit_vector_source_operand_u32xn::<N>(&inst.src0, i, mask);
+
+                        let s1_value =
+                            emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc1 as u32, i, mask);
+
+                        let s0_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            s0_value,
+                            ty_i64xn,
+                            empty_name.as_ptr(),
+                        );
+                        let s1_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            s1_value,
+                            ty_i64xn,
+                            empty_name.as_ptr(),
+                        );
+                        let vcc_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            vcc_value,
+                            ty_i64xn,
+                            empty_name.as_ptr(),
+                        );
+
+                        // SUBREV takes the sources the other way round.
+                        let (first, second) = match inst.op {
+                            I::V_SUBREV_CO_CI_U32 => (s1_value, s0_value),
+                            _ => (s0_value, s1_value),
+                        };
+                        let added = llvm::core::LLVMBuildSub(
+                            builder,
+                            llvm::core::LLVMBuildSub(
+                                builder,
+                                first,
+                                second,
+                                empty_name.as_ptr(),
+                            ),
+                            vcc_value,
+                            empty_name.as_ptr(),
+                        );
+
+                        // A borrow, rather than a carry, is what leaves the subtraction.
+                        let cmp_value = llvm::core::LLVMBuildICmp(
+                            builder,
+                            llvm::LLVMIntPredicate::LLVMIntSLT,
+                            added,
+                            llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
+                                N as u32,
+                            ),
+                            empty_name.as_ptr(),
+                        );
+
+                        cmp_values.push(cmp_value);
+
+                        let d_value = llvm::core::LLVMBuildTrunc(
+                            builder,
+                            added,
+                            ty_i32xn,
+                            empty_name.as_ptr(),
+                        );
+
+                        emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, d_value, mask);
+                    }
+
+                    let cmp_value = emitter.emit_concat::<N>(&cmp_values);
+
+                    let d_value = llvm::core::LLVMBuildBitCast(
+                        builder,
+                        cmp_value,
+                        ty_i32,
+                        empty_name.as_ptr(),
+                    );
+
+                    emitter.emit_store_sgpr_u32(106, d_value);
+                } else {
+                    bb = self.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
+                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let s2_value = emitter.emit_load_sgpr_u32(106);
+
+                        let index_mask = llvm::core::LLVMBuildShl(
+                            builder,
+                            llvm::core::LLVMConstInt(ty_i32, 1, 0),
+                            elem,
+                            empty_name.as_ptr(),
+                        );
+                        let masked = llvm::core::LLVMBuildAnd(
+                            builder,
+                            s2_value,
+                            index_mask,
+                            empty_name.as_ptr(),
+                        );
+                        let vcc_value = llvm::core::LLVMBuildICmp(
+                            builder,
+                            llvm::LLVMIntPredicate::LLVMIntNE,
+                            masked,
+                            llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                            empty_name.as_ptr(),
+                        );
+
+                        let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+
+                        let s1_value = emitter.emit_load_vgpr_u32(inst.vsrc1 as u32, elem);
+
+                        let s0_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            s0_value,
+                            ty_i64,
+                            empty_name.as_ptr(),
+                        );
+                        let s1_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            s1_value,
+                            ty_i64,
+                            empty_name.as_ptr(),
+                        );
+                        let vcc_value = llvm::core::LLVMBuildZExt(
+                            builder,
+                            vcc_value,
+                            ty_i64,
+                            empty_name.as_ptr(),
+                        );
+
+                        // SUBREV takes the sources the other way round.
+                        let (first, second) = match inst.op {
+                            I::V_SUBREV_CO_CI_U32 => (s1_value, s0_value),
+                            _ => (s0_value, s1_value),
+                        };
+                        let added = llvm::core::LLVMBuildSub(
+                            builder,
+                            llvm::core::LLVMBuildSub(
+                                builder,
+                                first,
+                                second,
+                                empty_name.as_ptr(),
+                            ),
+                            vcc_value,
+                            empty_name.as_ptr(),
+                        );
+
+                        let cmp_value = llvm::core::LLVMBuildICmp(
+                            builder,
+                            llvm::LLVMIntPredicate::LLVMIntSLT,
+                            added,
+                            llvm::core::LLVMConstInt(ty_i64, 0, 0),
+                            empty_name.as_ptr(),
+                        );
+
+                        let d0_value =
+                            llvm::core::LLVMBuildTrunc(builder, added, ty_i32, empty_name.as_ptr());
+
+                        emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d0_value);
+
+                        (bb, cmp_value)
+                    });
+                }
+            }
             I::V_AND_B32 => {
                 if USE_SIMD {
                     let emitter = self;

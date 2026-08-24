@@ -7478,7 +7478,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = s0_value.ceil();
+            let d_value = quiet_nan_f32(s0_value.ceil());
             self.write_vgpr(elem, d, f32_to_u32(quiet_nan_f32(d_value)));
         }
     }
@@ -7497,7 +7497,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
-            let d_value = s0_value.ceil();
+            let d_value = quiet_nan_f32(s0_value.ceil());
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
@@ -7880,7 +7880,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
-            let d_value = s0_value.floor();
+            let d_value = quiet_nan_f64(s0_value.floor());
             self.write_vgpr_pair(elem, d, f64_to_u64(quiet_nan_f64(d_value)));
         }
     }
@@ -7899,7 +7899,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
-            let d_value = s0_value.floor();
+            let d_value = quiet_nan_f64(s0_value.floor());
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }
@@ -7910,7 +7910,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = s0_value.trunc();
+            let d_value = quiet_nan_f32(s0_value.trunc());
             self.write_vgpr(elem, d, f32_to_u32(quiet_nan_f32(d_value)));
         }
     }
@@ -7929,7 +7929,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
-            let d_value = s0_value.trunc();
+            let d_value = quiet_nan_f32(s0_value.trunc());
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
@@ -7940,7 +7940,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
-            let d_value = s0_value.trunc();
+            let d_value = quiet_nan_f64(s0_value.trunc());
             self.write_vgpr_pair(elem, d, f64_to_u64(quiet_nan_f64(d_value)));
         }
     }
@@ -7959,7 +7959,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
-            let d_value = s0_value.trunc();
+            let d_value = quiet_nan_f64(s0_value.trunc());
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }

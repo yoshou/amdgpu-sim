@@ -918,6 +918,13 @@ impl RDNATranslator {
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                     reg_usage.def_sgpr_u32(106);
                 }
+                I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.use_sgpr_u32(106);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
                 I::V_SUB_NC_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);

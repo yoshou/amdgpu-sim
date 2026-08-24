@@ -6037,8 +6037,6 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f64xn, &[s0_value, s1_value]);
                         let d_value =
                             emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
-
-                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -6055,8 +6053,6 @@ impl IREmitter {
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value, s1_value]);
-                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
-
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
