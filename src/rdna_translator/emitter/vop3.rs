@@ -888,6 +888,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -934,6 +935,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1871,6 +1873,7 @@ impl IREmitter {
                             d_value
                         };
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1896,6 +1899,7 @@ impl IREmitter {
                             d_value
                         };
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1925,6 +1929,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fmul(s0_value, s1_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1945,6 +1950,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1979,6 +1985,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fma_f64xn::<N>(s0_value, s1_value, s2_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1998,6 +2005,7 @@ impl IREmitter {
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f64]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value, s1_value, s2_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2058,6 +2066,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2115,6 +2124,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2155,6 +2165,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2175,6 +2186,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2202,6 +2214,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_ldexp_f64xn::<N>(s0_value, s1_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2217,6 +2230,7 @@ impl IREmitter {
                             emitter.get_intrinsic_declaration("llvm.ldexp.", &[ty_f64, ty_i32]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value, s1_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2504,6 +2518,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fadd(s0_value, s1_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2522,6 +2537,7 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2552,6 +2568,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fma_f32xn::<N>(s0_value, s1_value, d_old);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2569,6 +2586,7 @@ impl IREmitter {
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value, s1_value, d_old]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2604,6 +2622,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2622,6 +2641,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2651,6 +2671,7 @@ impl IREmitter {
                             emitter.get_intrinsic_declaration("llvm.floor.", &[ty_f32xn]);
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2664,6 +2685,7 @@ impl IREmitter {
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.floor.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3522,6 +3544,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_ldexp_f32(result, scale);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3558,6 +3581,7 @@ impl IREmitter {
                         let d_value =
                             emitter.emit_omod_clamp_f64xn::<N>(inst.omod, inst.cm, d_value, 0);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -3576,6 +3600,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value, s1_value]);
                         let d_value = emitter.emit_omod_clamp(inst.omod, inst.cm, d_value, 0);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3704,6 +3729,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -3720,6 +3746,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3754,6 +3781,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -3774,6 +3802,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3803,6 +3832,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fmul(s0_value, s1_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -3821,6 +3851,7 @@ impl IREmitter {
                             s1_value,
                             empty_name.as_ptr(),
                         );
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3855,6 +3886,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_fma_f32xn::<N>(s0_value, s1_value, s2_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -3874,6 +3906,7 @@ impl IREmitter {
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.fma.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value, s1_value, s2_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -3984,6 +4017,7 @@ impl IREmitter {
                             emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f32xn]);
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value, s1_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -4000,6 +4034,7 @@ impl IREmitter {
                             emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value, s1_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -4032,6 +4067,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -4049,6 +4085,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -4105,8 +4142,10 @@ impl IREmitter {
                         );
 
                         if is_double {
+                            let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                             emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                         } else {
+                            let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                             emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                         }
                     }
@@ -4146,8 +4185,10 @@ impl IREmitter {
                         );
 
                         if is_double {
+                            let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                             emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
                         } else {
+                            let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                             emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
                         }
 
@@ -4303,6 +4344,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_div_fmas_f32(s0_value, s1_value, s2_value, cond);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -4342,6 +4384,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_div_fmas_f32(s0_value, s1_value, s2_value, cond);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -4376,6 +4419,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_div_fixup_f32(s0_value, s1_value, s2_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -4388,6 +4432,7 @@ impl IREmitter {
 
                         let d_value = emitter.emit_div_fixup_f32(s0_value, s1_value, s2_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -4427,6 +4472,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_exp2_f32xn::<N>(s1_value);
                         let d_value = emitter.emit_fmul(s0_value, s1_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -4442,6 +4488,7 @@ impl IREmitter {
                             emitter.get_intrinsic_declaration("llvm.ldexp.", &[ty_f32, ty_i32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value, s1_value]);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -5050,6 +5097,7 @@ impl IREmitter {
                         let (d_value, vcc_value) =
                             emitter.emit_div_scale_f32(s0_value, s1_value, s2_value);
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
 
                         vcc_values.push(vcc_value);
@@ -5121,6 +5169,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
 

@@ -341,6 +341,62 @@ impl IREmitter {
         value
     }
 
+    /// The VOP3 output modifiers: OMOD scales the result by 1, 2, 4 or 1/2, and
+    /// CLAMP then holds it in [0,1]. OMOD is a two-bit enum here, unlike the
+    /// per-half selector the packed helpers below take.
+    pub(crate) unsafe fn emit_vop3_omod_clamp(
+        &mut self,
+        omod: u8,
+        clamp: u8,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(value);
+        let elem_ty = if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+
+        let splat = |emitter: &mut Self, v: f64| {
+            let constant = llvm::core::LLVMConstReal(elem_ty, v);
+            let _ = &emitter;
+            if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+
+        let value = match omod {
+            1 => {
+                let scale = splat(self, 2.0);
+                llvm::core::LLVMBuildFMul(builder, value, scale, empty_name.as_ptr())
+            }
+            2 => {
+                let scale = splat(self, 4.0);
+                llvm::core::LLVMBuildFMul(builder, value, scale, empty_name.as_ptr())
+            }
+            3 => {
+                let scale = splat(self, 0.5);
+                llvm::core::LLVMBuildFMul(builder, value, scale, empty_name.as_ptr())
+            }
+            _ => value,
+        };
+
+        if clamp == 0 {
+            return value;
+        }
+        let zero = splat(self, 0.0);
+        let one = splat(self, 1.0);
+        let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty]);
+        let value = intrinsic.emit_call(ty, &[value, one]);
+        let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty]);
+        intrinsic.emit_call(ty, &[value, zero])
+    }
+
     pub(crate) unsafe fn emit_omod_clamp(
         &mut self,
         omod: u8,
