@@ -4304,8 +4304,8 @@ impl SIMD32 {
         s0: SourceOperand,
         abs: u8,
         neg: u8,
-        _clamp: bool,
-        _omod: u8,
+        clamp: bool,
+        omod: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -4318,7 +4318,11 @@ impl SIMD32 {
                 libm::frexpf(s0_value).0
             };
 
-            self.write_vgpr(elem, d, f32_to_u32(quiet_nan_f32(d_value)));
+            self.write_vgpr(
+                elem,
+                d,
+                f32_to_u32_omod_clamp(quiet_nan_f32(d_value), omod, clamp),
+            );
         }
     }
 
@@ -8067,7 +8071,11 @@ impl SIMD32 {
             } else {
                 libm::frexp(s0_value).0
             };
-            self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
+            self.write_vgpr_pair(
+                elem,
+                d,
+                f64_to_u64_omod_clamp(quiet_nan_f64(d_value), omod, clamp),
+            );
         }
     }
 

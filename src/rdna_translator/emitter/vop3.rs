@@ -6759,24 +6759,9 @@ impl IREmitter {
                             emitter.emit_abs_neg_f32xn::<N>(value, inst.abs, inst.neg, 0)
                         };
 
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.frexp.", &[ty, ty_i32xn]);
-                        let mut return_tys = vec![ty, ty_i32xn];
-                        let frexp_value = intrinsic.emit_call(
-                            llvm::core::LLVMStructTypeInContext(
-                                context,
-                                return_tys.as_mut_ptr(),
-                                return_tys.len() as u32,
-                                0,
-                            ),
-                            &[s0_value],
-                        );
-                        let d_value = llvm::core::LLVMBuildExtractValue(
-                            builder,
-                            frexp_value,
-                            0,
-                            empty_name.as_ptr(),
-                        );
+                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
+                        let _ = (mant_value, exp_value);
+                        let d_value = mant_value;
 
                         if is_double {
                             let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
@@ -6802,24 +6787,9 @@ impl IREmitter {
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, value, 0)
                         };
 
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.frexp.", &[ty, ty_i32]);
-                        let mut return_tys = vec![ty, ty_i32];
-                        let frexp_value = intrinsic.emit_call(
-                            llvm::core::LLVMStructTypeInContext(
-                                context,
-                                return_tys.as_mut_ptr(),
-                                return_tys.len() as u32,
-                                0,
-                            ),
-                            &[s0_value],
-                        );
-                        let d_value = llvm::core::LLVMBuildExtractValue(
-                            builder,
-                            frexp_value,
-                            0,
-                            empty_name.as_ptr(),
-                        );
+                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
+                        let _ = (mant_value, exp_value);
+                        let d_value = mant_value;
 
                         if is_double {
                             let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);

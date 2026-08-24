@@ -2100,25 +2100,9 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.frexp.", &[ty_f64xn, ty_i32xn]);
-                        let mut return_tys = vec![ty_f64xn, ty_i32xn];
-                        let frexp_value = intrinsic.emit_call(
-                            llvm::core::LLVMStructTypeInContext(
-                                context,
-                                return_tys.as_mut_ptr(),
-                                return_tys.len() as u32,
-                                0,
-                            ),
-                            &[s0_value],
-                        );
-
-                        let d_value = llvm::core::LLVMBuildExtractValue(
-                            builder,
-                            frexp_value,
-                            0,
-                            empty_name.as_ptr(),
-                        );
+                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
+                        let _ = (mant_value, exp_value);
+                        let d_value = mant_value;
 
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
@@ -2130,25 +2114,9 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.frexp.", &[ty_f64, ty_i32]);
-                        let mut return_tys = vec![ty_f64, ty_i32];
-                        let frexp_value = intrinsic.emit_call(
-                            llvm::core::LLVMStructTypeInContext(
-                                context,
-                                return_tys.as_mut_ptr(),
-                                return_tys.len() as u32,
-                                0,
-                            ),
-                            &[s0_value],
-                        );
-
-                        let d_value = llvm::core::LLVMBuildExtractValue(
-                            builder,
-                            frexp_value,
-                            0,
-                            empty_name.as_ptr(),
-                        );
+                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
+                        let _ = (mant_value, exp_value);
+                        let d_value = mant_value;
 
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 

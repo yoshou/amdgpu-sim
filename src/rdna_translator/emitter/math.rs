@@ -53,20 +53,9 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32, ty_i32]);
-        let mut return_tys = vec![ty_f32, ty_i32];
-        let frexp_value = intrinsic.emit_call(
-            llvm::core::LLVMStructTypeInContext(
-                context,
-                return_tys.as_mut_ptr(),
-                return_tys.len() as u32,
-                0,
-            ),
-            &[value],
-        );
-
-        let fract_value =
-            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 0, empty_name.as_ptr());
+        let (mant_value, exp_value) = self.emit_frexp(value);
+        let _ = (mant_value, exp_value);
+        let fract_value = mant_value;
         fract_value
     }
 
@@ -80,20 +69,9 @@ impl IREmitter {
         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32, ty_i32]);
-        let mut return_tys = vec![ty_f32, ty_i32];
-        let frexp_value = intrinsic.emit_call(
-            llvm::core::LLVMStructTypeInContext(
-                context,
-                return_tys.as_mut_ptr(),
-                return_tys.len() as u32,
-                0,
-            ),
-            &[value],
-        );
-
-        let exp_value =
-            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 1, empty_name.as_ptr());
+        let (mant_value, exp_value) = self.emit_frexp(value);
+        let _ = (mant_value, exp_value);
+        let exp_value = exp_value;
         exp_value
     }
 
@@ -107,20 +85,9 @@ impl IREmitter {
         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f64, ty_i32]);
-        let mut return_tys = vec![ty_f64, ty_i32];
-        let frexp_value = intrinsic.emit_call(
-            llvm::core::LLVMStructTypeInContext(
-                context,
-                return_tys.as_mut_ptr(),
-                return_tys.len() as u32,
-                0,
-            ),
-            &[value],
-        );
-
-        let exp_value =
-            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 1, empty_name.as_ptr());
+        let (mant_value, exp_value) = self.emit_frexp(value);
+        let _ = (mant_value, exp_value);
+        let exp_value = exp_value;
         exp_value
     }
 
@@ -136,20 +103,9 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f64xn, ty_i32xn]);
-        let mut return_tys = vec![ty_f64xn, ty_i32xn];
-        let frexp_value = intrinsic.emit_call(
-            llvm::core::LLVMStructTypeInContext(
-                context,
-                return_tys.as_mut_ptr(),
-                return_tys.len() as u32,
-                0,
-            ),
-            &[value],
-        );
-
-        let exp_value =
-            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 1, empty_name.as_ptr());
+        let (mant_value, exp_value) = self.emit_frexp(value);
+        let _ = (mant_value, exp_value);
+        let exp_value = exp_value;
         exp_value
     }
 
@@ -165,20 +121,9 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32xn, ty_i32xn]);
-        let mut return_tys = vec![ty_f32xn, ty_i32xn];
-        let frexp_value = intrinsic.emit_call(
-            llvm::core::LLVMStructTypeInContext(
-                context,
-                return_tys.as_mut_ptr(),
-                return_tys.len() as u32,
-                0,
-            ),
-            &[value],
-        );
-
-        let fract_value =
-            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 0, empty_name.as_ptr());
+        let (mant_value, exp_value) = self.emit_frexp(value);
+        let _ = (mant_value, exp_value);
+        let fract_value = mant_value;
         fract_value
     }
 
@@ -194,20 +139,9 @@ impl IREmitter {
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
         let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
-        let intrinsic = self.get_intrinsic_declaration("llvm.frexp.", &[ty_f32xn, ty_i32xn]);
-        let mut return_tys = vec![ty_f32xn, ty_i32xn];
-        let frexp_value = intrinsic.emit_call(
-            llvm::core::LLVMStructTypeInContext(
-                context,
-                return_tys.as_mut_ptr(),
-                return_tys.len() as u32,
-                0,
-            ),
-            &[value],
-        );
-
-        let exp_value =
-            llvm::core::LLVMBuildExtractValue(builder, frexp_value, 1, empty_name.as_ptr());
+        let (mant_value, exp_value) = self.emit_frexp(value);
+        let _ = (mant_value, exp_value);
+        let exp_value = exp_value;
         exp_value
     }
 
@@ -588,6 +522,203 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
         llvm::core::LLVMBuildSelect(builder, is_negative, nan, value, empty_name.as_ptr())
+    }
+
+    /// The significand and exponent of a float, as FREXP defines them: the
+    /// significand lies in [0.5, 1) with the operand's sign, and a zero, an
+    /// infinity or a NaN comes back unchanged with a zero exponent. A denormal
+    /// is normalised, which is why this counts leading zeros rather than reading
+    /// the exponent field alone.
+    pub(crate) unsafe fn emit_frexp(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> (llvm::prelude::LLVMValueRef, llvm::prelude::LLVMValueRef) {
+        let builder = self.builder;
+        let context = self.context;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(value);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let lanes = if is_vector {
+            llvm::core::LLVMGetVectorSize(ty)
+        } else {
+            0
+        };
+        let elem_ty = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let is_double =
+            llvm::core::LLVMGetTypeKind(elem_ty) == llvm::LLVMTypeKind::LLVMDoubleTypeKind;
+
+        let (bits, frac_bits, exp_mask, half_exp) = if is_double {
+            (64u32, 52u32, 0x7FFu64, 1022u64)
+        } else {
+            (32, 23, 0xFF, 126)
+        };
+        let int_elem = llvm::core::LLVMIntTypeInContext(context, bits);
+        let int_ty = if is_vector {
+            llvm::core::LLVMVectorType(int_elem, lanes)
+        } else {
+            int_elem
+        };
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let i32_ty = if is_vector {
+            llvm::core::LLVMVectorType(ty_i32, lanes)
+        } else {
+            ty_i32
+        };
+        let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+
+        let splat = |elem: llvm::prelude::LLVMTypeRef, v: u64| {
+            let constant = llvm::core::LLVMConstInt(elem, v, 0);
+            if is_vector {
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+        let build = |op: unsafe extern "C" fn(
+            llvm::prelude::LLVMBuilderRef,
+            llvm::prelude::LLVMValueRef,
+            llvm::prelude::LLVMValueRef,
+            *const std::os::raw::c_char,
+        ) -> llvm::prelude::LLVMValueRef,
+                     a,
+                     b| op(builder, a, b, empty_name.as_ptr());
+
+        let raw = llvm::core::LLVMBuildBitCast(builder, value, int_ty, empty_name.as_ptr());
+        let sign = build(
+            llvm::core::LLVMBuildAnd,
+            raw,
+            splat(int_elem, 1u64 << (bits - 1)),
+        );
+        let frac = build(
+            llvm::core::LLVMBuildAnd,
+            raw,
+            splat(int_elem, (1u64 << frac_bits) - 1),
+        );
+        let exp_field = build(
+            llvm::core::LLVMBuildAnd,
+            build(
+                llvm::core::LLVMBuildLShr,
+                raw,
+                splat(int_elem, frac_bits as u64),
+            ),
+            splat(int_elem, exp_mask),
+        );
+
+        // The significand keeps the fraction and takes the exponent of 0.5.
+        let half = splat(int_elem, half_exp << frac_bits);
+        let mant_normal = build(
+            llvm::core::LLVMBuildOr,
+            build(llvm::core::LLVMBuildOr, sign, half),
+            frac,
+        );
+        let exp_normal = build(
+            llvm::core::LLVMBuildSub,
+            llvm::core::LLVMBuildTrunc(builder, exp_field, i32_ty, empty_name.as_ptr()),
+            splat(ty_i32, half_exp),
+        );
+
+        // A denormal is shifted up until its highest set bit reaches the
+        // significand's, and the exponent counts how far it moved.
+        let intrinsic = self.get_intrinsic_declaration("llvm.ctlz.", &[int_ty]);
+        let leading = intrinsic.emit_call(int_ty, &[frac, llvm::core::LLVMConstInt(ty_i1, 0, 0)]);
+        let shift = build(
+            llvm::core::LLVMBuildSub,
+            leading,
+            splat(int_elem, (bits - frac_bits - 1) as u64),
+        );
+        let frac_denorm = build(
+            llvm::core::LLVMBuildAnd,
+            build(llvm::core::LLVMBuildShl, frac, shift),
+            splat(int_elem, (1u64 << frac_bits) - 1),
+        );
+        let mant_denorm = build(
+            llvm::core::LLVMBuildOr,
+            build(llvm::core::LLVMBuildOr, sign, half),
+            frac_denorm,
+        );
+        let exp_denorm = build(
+            llvm::core::LLVMBuildSub,
+            splat(
+                ty_i32,
+                ((bits as i64) - (half_exp as i64) - (frac_bits as i64)) as u64,
+            ),
+            llvm::core::LLVMBuildTrunc(builder, leading, i32_ty, empty_name.as_ptr()),
+        );
+
+        let is_denorm = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            exp_field,
+            splat(int_elem, 0),
+            empty_name.as_ptr(),
+        );
+
+        let mant = llvm::core::LLVMBuildSelect(
+            builder,
+            is_denorm,
+            mant_denorm,
+            mant_normal,
+            empty_name.as_ptr(),
+        );
+        let exp = llvm::core::LLVMBuildSelect(
+            builder,
+            is_denorm,
+            exp_denorm,
+            exp_normal,
+            empty_name.as_ptr(),
+        );
+
+        // A zero, an infinity and a NaN come through unchanged.
+        let magnitude = build(
+            llvm::core::LLVMBuildAnd,
+            raw,
+            splat(int_elem, (1u64 << (bits - 1)) - 1),
+        );
+        let is_zero = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            magnitude,
+            splat(int_elem, 0),
+            empty_name.as_ptr(),
+        );
+        let is_special = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntEQ,
+            exp_field,
+            splat(int_elem, exp_mask),
+            empty_name.as_ptr(),
+        );
+        let untouched =
+            llvm::core::LLVMBuildOr(builder, is_zero, is_special, empty_name.as_ptr());
+
+        // A signalling NaN comes back quiet.
+        let quieted = build(
+            llvm::core::LLVMBuildOr,
+            raw,
+            splat(int_elem, 1u64 << (frac_bits - 1)),
+        );
+        let is_nan = llvm::core::LLVMBuildICmp(
+            builder,
+            llvm::LLVMIntPredicate::LLVMIntUGT,
+            magnitude,
+            splat(int_elem, exp_mask << frac_bits),
+            empty_name.as_ptr(),
+        );
+        let raw = llvm::core::LLVMBuildSelect(builder, is_nan, quieted, raw, empty_name.as_ptr());
+        let mant = llvm::core::LLVMBuildSelect(builder, untouched, raw, mant, empty_name.as_ptr());
+        let mant = llvm::core::LLVMBuildBitCast(builder, mant, ty, empty_name.as_ptr());
+        let exp = llvm::core::LLVMBuildSelect(
+            builder,
+            untouched,
+            splat(ty_i32, 0),
+            exp,
+            empty_name.as_ptr(),
+        );
+        (mant, exp)
     }
 
     /// An integer constant shaped like `like`, which is either a scalar or a
