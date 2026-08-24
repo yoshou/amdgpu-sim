@@ -241,6 +241,26 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOPC(inst) => match inst.op {
+                I::V_CMP_CLASS_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_CLASS_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_EQ_U16 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_GT_U16 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
                 I::V_CMPX_EQ_I64 => {
                     reg_usage.use_operand_u64(&inst.src0);
                     reg_usage.use_vgpr_u64(inst.vsrc1 as u32);
