@@ -452,6 +452,33 @@ fn f64_to_u64(value: f64) -> u64 {
     f64::to_bits(value)
 }
 
+/// A signalling NaN is quieted on the way out, keeping its payload and sign.
+fn quiet_nan_f32(value: f32) -> f32 {
+    if value.is_nan() {
+        f32::from_bits(value.to_bits() | 0x0040_0000)
+    } else {
+        value
+    }
+}
+
+fn quiet_nan_f64(value: f64) -> f64 {
+    if value.is_nan() {
+        f64::from_bits(value.to_bits() | 0x0008_0000_0000_0000)
+    } else {
+        value
+    }
+}
+
+/// The transcendental unit flushes denormals on input and on output, whatever
+/// the mode register says (ISA §V_RCP_F32, §V_SQRT_F32, §V_RSQ_F32).
+fn ftz_f32(value: f32) -> f32 {
+    if value != 0.0 && value.abs() < f32::MIN_POSITIVE {
+        f32::copysign(0.0, value)
+    } else {
+        value
+    }
+}
+
 fn clamp_f32(value: f32, clamp: bool) -> f32 {
     if clamp {
         value.clamp(0.0, 1.0)
@@ -1901,7 +1928,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = 1.0 / s0_value;
+            let d_value = ftz_f32(1.0 / ftz_f32(s0_value));
 
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
@@ -1913,7 +1940,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = 1.0 / s0_value;
+            let d_value = ftz_f32(1.0 / ftz_f32(s0_value));
 
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
@@ -1925,7 +1952,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = s0_value.sqrt();
+            let d_value = ftz_f32(ftz_f32(s0_value).sqrt());
 
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
@@ -1937,13 +1964,9 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let mut d_value = (s0_value + 0.5).floor();
-            // Round-ties-to-even with FLOOR-based fract (ISA §V_RNDNE): Rust
-            // f32::fract() truncates, giving a negative fraction for negative x
-            // and never firing the tie adjust.
-            if s0_value.floor() % 2.0 == 0.0 && (s0_value - s0_value.floor()) == 0.5 {
-                d_value -= 1.0;
-            }
+            // roundToIntegralTiesToEven. Rounding by hand as floor(x + 0.5)
+            // loses the sign of a zero result, which the hardware keeps.
+            let d_value = quiet_nan_f32(s0_value.round_ties_even());
 
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
@@ -1981,7 +2004,14 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
             // FLOOR-based fractional part (ISA §V_FRACT): fract(-1.2) = 0.8.
             // Rust f64::fract() truncates, giving the wrong sign for negatives.
-            let d_value = s0_value - s0_value.floor();
+            // The result is in [0,1), so clamp: the subtraction rounds up to
+            // exactly 1.0 for a tiny negative input.
+            let frac = s0_value - s0_value.floor();
+            let d_value = if frac >= 1.0 {
+                f64::from_bits(0x3FEF_FFFF_FFFF_FFFF)
+            } else {
+                frac
+            };
 
             self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
         }
@@ -2052,11 +2082,9 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
-            let mut d_value = (s0_value + 0.5).floor();
-            // Round-ties-to-even with FLOOR-based fract (see V_RNDNE_F32).
-            if s0_value.floor() % 2.0 == 0.0 && (s0_value - s0_value.floor()) == 0.5 {
-                d_value -= 1.0;
-            }
+            // roundToIntegralTiesToEven. Rounding by hand as floor(x + 0.5)
+            // loses the sign of a zero result, which the hardware keeps.
+            let d_value = quiet_nan_f64(s0_value.round_ties_even());
 
             self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
         }
@@ -2074,7 +2102,7 @@ impl SIMD32 {
                 libm::frexpf(s0_value).0
             };
 
-            self.write_vgpr(elem, d, f32_to_u32(d_value));
+            self.write_vgpr(elem, d, f32_to_u32(quiet_nan_f32(d_value)));
         }
     }
 
@@ -3400,7 +3428,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
-            let d_value = 1.0 / s0_value;
+            let d_value = ftz_f32(1.0 / ftz_f32(s0_value));
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
@@ -4300,7 +4328,7 @@ impl SIMD32 {
             if (s0_value < 0.0) && (s0_value != d_value) {
                 d_value += -1.0;
             }
-            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
+            self.write_vgpr(elem, d, f32_to_u32_omod_clamp(quiet_nan_f32(d_value), omod, clamp));
         }
     }
 
