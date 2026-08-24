@@ -957,20 +957,30 @@ impl IREmitter {
             | I::V_CMPX_GT_I32
             | I::V_CMPX_LT_I32 => {
                 let pred = match inst.op {
-                    I::V_CMP_GT_U32 => llvm::LLVMIntPredicate::LLVMIntUGT,
-                    I::V_CMP_LT_U32 => llvm::LLVMIntPredicate::LLVMIntULT,
-                    I::V_CMP_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
-                    I::V_CMP_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
-                    I::V_CMP_EQ_U32 => llvm::LLVMIntPredicate::LLVMIntEQ,
-                    I::V_CMP_NE_U32 => llvm::LLVMIntPredicate::LLVMIntNE,
-                    I::V_CMP_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
-                    I::V_CMP_LT_I32 => llvm::LLVMIntPredicate::LLVMIntSLT,
-                    I::V_CMPX_EQ_U32 => llvm::LLVMIntPredicate::LLVMIntEQ,
-                    I::V_CMPX_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
-                    I::V_CMPX_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
-                    I::V_CMPX_LT_U32 => llvm::LLVMIntPredicate::LLVMIntULT,
-                    I::V_CMPX_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
-                    I::V_CMPX_LT_I32 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMP_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMP_NE_U64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMP_LT_U64 => llvm::LLVMIntPredicate::LLVMIntULT,
+                    I::V_CMP_LE_U64 => llvm::LLVMIntPredicate::LLVMIntULE,
+                    I::V_CMP_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    I::V_CMP_GE_U64 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMP_EQ_I64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMP_NE_I64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMP_LT_I64 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMP_LE_I64 => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    I::V_CMP_GT_I64 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMP_GE_I64 => llvm::LLVMIntPredicate::LLVMIntSGE,
+                    I::V_CMPX_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMPX_NE_U64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_LT_U64 => llvm::LLVMIntPredicate::LLVMIntULT,
+                    I::V_CMPX_LE_U64 => llvm::LLVMIntPredicate::LLVMIntULE,
+                    I::V_CMPX_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    I::V_CMPX_GE_U64 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMPX_EQ_I64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMPX_NE_I64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_LT_I64 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMPX_LE_I64 => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    I::V_CMPX_GT_I64 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMPX_GE_I64 => llvm::LLVMIntPredicate::LLVMIntSGE,
                     _ => unreachable!(),
                 };
                 if USE_SIMD {
@@ -1642,7 +1652,57 @@ impl IREmitter {
                     });
                 }
             }
-            I::V_CMP_EQ_U64 => {
+            I::V_CMP_EQ_U64
+            | I::V_CMP_NE_U64
+            | I::V_CMP_LT_U64
+            | I::V_CMP_LE_U64
+            | I::V_CMP_GT_U64
+            | I::V_CMP_GE_U64
+            | I::V_CMP_EQ_I64
+            | I::V_CMP_NE_I64
+            | I::V_CMP_LT_I64
+            | I::V_CMP_LE_I64
+            | I::V_CMP_GT_I64
+            | I::V_CMP_GE_I64
+            | I::V_CMPX_EQ_U64
+            | I::V_CMPX_NE_U64
+            | I::V_CMPX_LT_U64
+            | I::V_CMPX_LE_U64
+            | I::V_CMPX_GT_U64
+            | I::V_CMPX_GE_U64
+            | I::V_CMPX_EQ_I64
+            | I::V_CMPX_NE_I64
+            | I::V_CMPX_LT_I64
+            | I::V_CMPX_LE_I64
+            | I::V_CMPX_GT_I64
+            | I::V_CMPX_GE_I64 => {
+                let pred = match inst.op {
+                    I::V_CMP_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMP_NE_U64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMP_LT_U64 => llvm::LLVMIntPredicate::LLVMIntULT,
+                    I::V_CMP_LE_U64 => llvm::LLVMIntPredicate::LLVMIntULE,
+                    I::V_CMP_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    I::V_CMP_GE_U64 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMP_EQ_I64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMP_NE_I64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMP_LT_I64 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMP_LE_I64 => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    I::V_CMP_GT_I64 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMP_GE_I64 => llvm::LLVMIntPredicate::LLVMIntSGE,
+                    I::V_CMPX_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMPX_NE_U64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_LT_U64 => llvm::LLVMIntPredicate::LLVMIntULT,
+                    I::V_CMPX_LE_U64 => llvm::LLVMIntPredicate::LLVMIntULE,
+                    I::V_CMPX_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    I::V_CMPX_GE_U64 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMPX_EQ_I64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMPX_NE_I64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_LT_I64 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMPX_LE_I64 => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    I::V_CMPX_GT_I64 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMPX_GE_I64 => llvm::LLVMIntPredicate::LLVMIntSGE,
+                    _ => unreachable!(),
+                };
                 if USE_SIMD {
                     let emitter = self;
                     let empty_name = std::ffi::CString::new("").unwrap();
@@ -1665,7 +1725,7 @@ impl IREmitter {
 
                         let cmp_value = llvm::core::LLVMBuildICmp(
                             builder,
-                            llvm::LLVMIntPredicate::LLVMIntEQ,
+                            pred,
                             s0_value,
                             s1_value,
                             empty_name.as_ptr(),
@@ -1684,9 +1744,40 @@ impl IREmitter {
                     );
 
                     let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
-                    emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
+                    // The CMPX forms write EXEC rather than the SGPR in VDST.
+                    let destination = match inst.op {
+                        I::V_CMPX_EQ_U64 => 126,
+                        I::V_CMPX_NE_U64 => 126,
+                        I::V_CMPX_LT_U64 => 126,
+                        I::V_CMPX_LE_U64 => 126,
+                        I::V_CMPX_GT_U64 => 126,
+                        I::V_CMPX_GE_U64 => 126,
+                        I::V_CMPX_EQ_I64 => 126,
+                        I::V_CMPX_NE_I64 => 126,
+                        I::V_CMPX_LT_I64 => 126,
+                        I::V_CMPX_LE_I64 => 126,
+                        I::V_CMPX_GT_I64 => 126,
+                        I::V_CMPX_GE_I64 => 126,
+                        _ => inst.vdst as u32,
+                    };
+                    emitter.emit_store_sgpr_u32(destination, d_value);
                 } else {
-                    bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
+                    let destination = match inst.op {
+                        I::V_CMPX_EQ_U64 => 126,
+                        I::V_CMPX_NE_U64 => 126,
+                        I::V_CMPX_LT_U64 => 126,
+                        I::V_CMPX_LE_U64 => 126,
+                        I::V_CMPX_GT_U64 => 126,
+                        I::V_CMPX_GE_U64 => 126,
+                        I::V_CMPX_EQ_I64 => 126,
+                        I::V_CMPX_NE_I64 => 126,
+                        I::V_CMPX_LT_I64 => 126,
+                        I::V_CMPX_LE_I64 => 126,
+                        I::V_CMPX_GT_I64 => 126,
+                        I::V_CMPX_GE_I64 => 126,
+                        _ => inst.vdst as u32,
+                    };
+                    bb = self.emit_vop_update_sgpr(bb, destination, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
 
                         let s0_value = emitter.emit_vector_source_operand_u64(&inst.src0, elem);
@@ -1694,7 +1785,7 @@ impl IREmitter {
 
                         let cmp_value = llvm::core::LLVMBuildICmp(
                             builder,
-                            llvm::LLVMIntPredicate::LLVMIntEQ,
+                            pred,
                             s0_value,
                             s1_value,
                             empty_name.as_ptr(),

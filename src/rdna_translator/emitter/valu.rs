@@ -107,6 +107,148 @@ impl IREmitter {
                     });
                 }
             }
+            I::V_CMP_EQ_U64
+            | I::V_CMP_NE_U64
+            | I::V_CMP_LT_U64
+            | I::V_CMP_LE_U64
+            | I::V_CMP_GT_U64
+            | I::V_CMP_GE_U64
+            | I::V_CMP_EQ_I64
+            | I::V_CMP_NE_I64
+            | I::V_CMP_LT_I64
+            | I::V_CMP_LE_I64
+            | I::V_CMP_GT_I64
+            | I::V_CMP_GE_I64
+            | I::V_CMPX_EQ_U64
+            | I::V_CMPX_NE_U64
+            | I::V_CMPX_LT_U64
+            | I::V_CMPX_LE_U64
+            | I::V_CMPX_GT_U64
+            | I::V_CMPX_GE_U64
+            | I::V_CMPX_EQ_I64
+            | I::V_CMPX_NE_I64
+            | I::V_CMPX_LT_I64
+            | I::V_CMPX_LE_I64
+            | I::V_CMPX_GT_I64
+            | I::V_CMPX_GE_I64 => {
+                let pred = match inst.op {
+                    I::V_CMP_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMP_NE_U64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMP_LT_U64 => llvm::LLVMIntPredicate::LLVMIntULT,
+                    I::V_CMP_LE_U64 => llvm::LLVMIntPredicate::LLVMIntULE,
+                    I::V_CMP_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    I::V_CMP_GE_U64 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMP_EQ_I64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMP_NE_I64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMP_LT_I64 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMP_LE_I64 => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    I::V_CMP_GT_I64 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMP_GE_I64 => llvm::LLVMIntPredicate::LLVMIntSGE,
+                    I::V_CMPX_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMPX_NE_U64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_LT_U64 => llvm::LLVMIntPredicate::LLVMIntULT,
+                    I::V_CMPX_LE_U64 => llvm::LLVMIntPredicate::LLVMIntULE,
+                    I::V_CMPX_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    I::V_CMPX_GE_U64 => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    I::V_CMPX_EQ_I64 => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    I::V_CMPX_NE_I64 => llvm::LLVMIntPredicate::LLVMIntNE,
+                    I::V_CMPX_LT_I64 => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    I::V_CMPX_LE_I64 => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    I::V_CMPX_GT_I64 => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    I::V_CMPX_GE_I64 => llvm::LLVMIntPredicate::LLVMIntSGE,
+                    _ => unreachable!(),
+                };
+                if USE_SIMD {
+                    let emitter = self;
+                    let empty_name = std::ffi::CString::new("").unwrap();
+                    let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                    const N: usize = SIMD_WIDTH;
+
+                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                    let mut cmp_values = Vec::new();
+
+                    for i in (0..32).step_by(N) {
+                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                        let s0_value =
+                            emitter.emit_vector_source_operand_u64xn::<N>(&inst.src0, i, mask);
+
+                        let s1_value =
+                            emitter.emit_load_vgpr_u64xn::<N>(inst.vsrc1 as u32, i, mask);
+
+                        let cmp_value = llvm::core::LLVMBuildICmp(
+                            builder,
+                            pred,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
+
+                        cmp_values.push(cmp_value);
+                    }
+
+                    let cmp_value = emitter.emit_concat::<N>(&cmp_values);
+
+                    let d_value = llvm::core::LLVMBuildBitCast(
+                        builder,
+                        cmp_value,
+                        ty_i32,
+                        empty_name.as_ptr(),
+                    );
+
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
+                    // The CMPX forms write EXEC rather than the usual destination.
+                    let destination = match inst.op {
+                        I::V_CMPX_EQ_U64 => 126,
+                        I::V_CMPX_NE_U64 => 126,
+                        I::V_CMPX_LT_U64 => 126,
+                        I::V_CMPX_LE_U64 => 126,
+                        I::V_CMPX_GT_U64 => 126,
+                        I::V_CMPX_GE_U64 => 126,
+                        I::V_CMPX_EQ_I64 => 126,
+                        I::V_CMPX_NE_I64 => 126,
+                        I::V_CMPX_LT_I64 => 126,
+                        I::V_CMPX_LE_I64 => 126,
+                        I::V_CMPX_GT_I64 => 126,
+                        I::V_CMPX_GE_I64 => 126,
+                        _ => 106,
+                    };
+                    emitter.emit_store_sgpr_u32(destination, d_value);
+                } else {
+                    let destination = match inst.op {
+                        I::V_CMPX_EQ_U64 => 126,
+                        I::V_CMPX_NE_U64 => 126,
+                        I::V_CMPX_LT_U64 => 126,
+                        I::V_CMPX_LE_U64 => 126,
+                        I::V_CMPX_GT_U64 => 126,
+                        I::V_CMPX_GE_U64 => 126,
+                        I::V_CMPX_EQ_I64 => 126,
+                        I::V_CMPX_NE_I64 => 126,
+                        I::V_CMPX_LT_I64 => 126,
+                        I::V_CMPX_LE_I64 => 126,
+                        I::V_CMPX_GT_I64 => 126,
+                        I::V_CMPX_GE_I64 => 126,
+                        _ => 106,
+                    };
+                    bb = self.emit_vop_update_sgpr(bb, destination, |emitter, bb, elem| {
+                        let empty_name = std::ffi::CString::new("").unwrap();
+
+                        let s0_value = emitter.emit_vector_source_operand_u64(&inst.src0, elem);
+                        let s1_value = emitter.emit_load_vgpr_u64(inst.vsrc1 as u32, elem);
+                        let cmp_value = llvm::core::LLVMBuildICmp(
+                            builder,
+                            pred,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
+
+                        (bb, cmp_value)
+                    });
+                }
+            }
             I::V_CMPX_NE_U32 | I::V_CMPX_LT_U32 | I::V_CMPX_GT_U32 | I::V_CMPX_EQ_U32 => {
                 let pred = match inst.op {
                     I::V_CMPX_NE_U32 => llvm::LLVMIntPredicate::LLVMIntNE,
