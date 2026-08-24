@@ -2064,6 +2064,20 @@ impl RDNATranslator {
                 }
             },
             InstFormat::SOP1(inst) => match inst.op {
+                I::S_CVT_I32_F32 => {
+                    reg_usage.use_operand_f32(&inst.ssrc0);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_CVT_U32_F32 => {
+                    reg_usage.use_operand_f32(&inst.ssrc0);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
+                I::S_XOR_SAVEEXEC_B32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_sgpr_u32(126);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                    reg_usage.def_sgpr_u32(126);
+                }
                 I::S_BARRIER_SIGNAL => {}
                 I::S_AND_NOT1_SAVEEXEC_B32 => {
                     reg_usage.use_operand_u32(&inst.ssrc0);

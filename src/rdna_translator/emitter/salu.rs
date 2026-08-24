@@ -248,6 +248,35 @@ impl IREmitter {
 
                 emitter.emit_store_scc_u8(scc_value);
             }
+            I::S_XOR_SAVEEXEC_B32 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+
+                let s1_value = emitter.emit_load_sgpr_u32(126);
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, s1_value);
+
+                let d_value =
+                    llvm::core::LLVMBuildXor(builder, s0_value, s1_value, empty_name.as_ptr());
+
+                emitter.emit_store_sgpr_u32(126, d_value);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntNE,
+                    d_value,
+                    llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
             I::S_AND_NOT1_SAVEEXEC_B32 => {
                 let emitter = self;
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
@@ -339,6 +368,36 @@ impl IREmitter {
                     llvm::core::LLVMBuildSIToFP(builder, s0_value, ty_f32, empty_name.as_ptr());
 
                 emitter.emit_store_sgpr_f32(inst.sdst as u32, d_value);
+            }
+            I::S_CVT_I32_F32 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                let s0_bits = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s0_value =
+                    llvm::core::LLVMBuildBitCast(builder, s0_bits, ty_f32, empty_name.as_ptr());
+
+                let d_value =
+                    llvm::core::LLVMBuildFPToSI(builder, s0_value, ty_i32, empty_name.as_ptr());
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
+            }
+            I::S_CVT_U32_F32 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                let s0_bits = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s0_value =
+                    llvm::core::LLVMBuildBitCast(builder, s0_bits, ty_f32, empty_name.as_ptr());
+
+                let d_value =
+                    llvm::core::LLVMBuildFPToUI(builder, s0_value, ty_i32, empty_name.as_ptr());
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
             }
             I::S_CVT_F32_U32 => {
                 let emitter = self;
