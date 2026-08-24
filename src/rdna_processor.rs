@@ -7152,7 +7152,18 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = (s0_value * std::f32::consts::TAU).cos();
+// The input is in revolutions; see V_SIN_F32 for the reduction.
+            // Reduce to the nearest turn; see V_SIN_F32.
+            let turns = s0_value - s0_value.round_ties_even();
+            let d_value = if turns == 0.0 {
+                1.0
+            } else if turns.abs() == 0.25 {
+                0.0
+            } else if turns.abs() == 0.5 {
+                -1.0
+            } else {
+                (turns * std::f32::consts::TAU).cos()
+            };
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
     }
@@ -7171,7 +7182,18 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
-            let d_value = (s0_value * std::f32::consts::TAU).cos();
+// The input is in revolutions; see V_SIN_F32 for the reduction.
+            // Reduce to the nearest turn; see V_SIN_F32.
+            let turns = s0_value - s0_value.round_ties_even();
+            let d_value = if turns == 0.0 {
+                1.0
+            } else if turns.abs() == 0.25 {
+                0.0
+            } else if turns.abs() == 0.5 {
+                -1.0
+            } else {
+                (turns * std::f32::consts::TAU).cos()
+            };
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
@@ -7182,7 +7204,28 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
-            let d_value = (s0_value * std::f32::consts::TAU).sin();
+// The input is in revolutions. The hardware reduces it to one turn before
+            // scaling, so a huge argument still lands on an exact value, and the
+            // quarter turns are exact rather than the 1e-16 a scaled sine gives
+            // (ISA §V_SIN_F32 functional examples).
+            let d_value = if s0_value == 0.0 {
+                s0_value
+            } else {
+                // Reduce to the nearest turn, which keeps a tiny argument exact
+                // rather than folding it against 1.0.
+                let turns = s0_value - s0_value.round_ties_even();
+                if turns == 0.0 {
+                    0.0
+                } else if turns == 0.25 {
+                    1.0
+                } else if turns == -0.25 {
+                    -1.0
+                } else if turns.abs() == 0.5 {
+                    0.0
+                } else {
+                    (turns * std::f32::consts::TAU).sin()
+                }
+            };
             self.write_vgpr(elem, d, f32_to_u32(d_value));
         }
     }
@@ -7201,7 +7244,28 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
-            let d_value = (s0_value * std::f32::consts::TAU).sin();
+// The input is in revolutions. The hardware reduces it to one turn before
+            // scaling, so a huge argument still lands on an exact value, and the
+            // quarter turns are exact rather than the 1e-16 a scaled sine gives
+            // (ISA §V_SIN_F32 functional examples).
+            let d_value = if s0_value == 0.0 {
+                s0_value
+            } else {
+                // Reduce to the nearest turn, which keeps a tiny argument exact
+                // rather than folding it against 1.0.
+                let turns = s0_value - s0_value.round_ties_even();
+                if turns == 0.0 {
+                    0.0
+                } else if turns == 0.25 {
+                    1.0
+                } else if turns == -0.25 {
+                    -1.0
+                } else if turns.abs() == 0.5 {
+                    0.0
+                } else {
+                    (turns * std::f32::consts::TAU).sin()
+                }
+            };
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }

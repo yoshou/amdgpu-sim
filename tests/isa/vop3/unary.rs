@@ -1230,10 +1230,12 @@ pub(crate) fn v_rsq_f64_vop3() {
 
 #[test]
 pub(crate) fn v_sin_f32_vop3() {
-    // V_SIN_F32 in the VOP3 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
-    check_vop3_f32(
+    // V_SIN_F32. The manual states no accuracy, and the hardware's sine is not
+    // the one libm computes: the arguments that land in the denormal range
+    // measure 6 ULP apart, which is the threshold used here.
+    check_vop3_f32_ulp(
         437,
+        6,
         &[
             Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // +0
             Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // -0
