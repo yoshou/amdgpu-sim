@@ -512,6 +512,157 @@ fn ftz_f32(value: f32) -> f32 {
     }
 }
 
+/// Rounds toward zero rather than to nearest, which is what the dot-product
+/// accumulator does with the sum it has built up.
+fn f64_to_f32_toward_zero(value: f64) -> f32 {
+    let nearest = value as f32;
+    if nearest == 0.0 || !nearest.is_finite() {
+        return nearest;
+    }
+    if (nearest as f64).abs() > value.abs() {
+        f32::from_bits(nearest.to_bits() - 1)
+    } else {
+        nearest
+    }
+}
+
+/// The per-half modifiers a VOP3P instruction carries.
+#[derive(Clone, Copy)]
+struct PackedMods {
+    opsel: u8,
+    opsel_hi: u8,
+    neg: u8,
+    neg_hi: u8,
+    clamp: bool,
+}
+
+impl PackedMods {
+    /// The two halves of a source before NEG has any say, which is what a dot
+    /// product wants: there NEG says whether the source is signed rather than
+    /// negating it.
+    fn halves_unsigned(&self, raw: u32, position: usize) -> (u16, u16) {
+        let pick = |select: u8| {
+            if (select >> position) & 1 != 0 {
+                (raw >> 16) as u16
+            } else {
+                raw as u16
+            }
+        };
+        (pick(self.opsel), pick(self.opsel_hi))
+    }
+
+    /// The two halves of a source as the instruction sees them: the half OPSEL
+    /// picks for the low result and the one OPSEL_HI picks for the high result,
+    /// each with NEG or NEG_HI applied to its sign bit.
+    fn halves(&self, raw: u32, position: usize) -> (u16, u16) {
+        let pick = |select: u8| {
+            if (select >> position) & 1 != 0 {
+                (raw >> 16) as u16
+            } else {
+                raw as u16
+            }
+        };
+        let mut low = pick(self.opsel);
+        let mut high = pick(self.opsel_hi);
+        if (self.neg >> position) & 1 != 0 {
+            low ^= 0x8000;
+        }
+        if (self.neg_hi >> position) & 1 != 0 {
+            high ^= 0x8000;
+        }
+        (low, high)
+    }
+}
+
+/// Where a mixed-precision result goes.
+#[derive(Clone, Copy)]
+enum MixResult {
+    F32,
+    F16Low,
+    F16High,
+}
+
+fn clamp_f16(value: f16, clamp: bool) -> f16 {
+    if clamp {
+        // CLAMP turns a NaN into zero rather than passing it through.
+        if value.is_nan() {
+            f16::from_f32(0.0)
+        } else {
+            f16::from_f32(value.to_f32().clamp(0.0, 1.0))
+        }
+    } else {
+        value
+    }
+}
+
+/// IEEE minNum and maxNum: a NaN gives way to the other operand.
+fn min_num_f16(a: f16, b: f16) -> f16 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a.to_f32() < b.to_f32() {
+        a
+    } else {
+        b
+    }
+}
+
+fn max_num_f16(a: f16, b: f16) -> f16 {
+    if a.is_nan() {
+        b
+    } else if b.is_nan() {
+        a
+    } else if a.to_f32() > b.to_f32() {
+        a
+    } else {
+        b
+    }
+}
+
+/// IEEE 754-2019 minimum and maximum: a NaN propagates, and the sign of a zero
+/// decides between the two zeroes.
+fn minimum_f16(a: f16, b: f16) -> f16 {
+    if a.is_nan() {
+        a
+    } else if b.is_nan() {
+        b
+    } else if a.to_f32() == 0.0 && b.to_f32() == 0.0 {
+        if a.to_bits() & 0x8000 != 0 {
+            a
+        } else {
+            b
+        }
+    } else if a.to_f32() < b.to_f32() {
+        a
+    } else {
+        b
+    }
+}
+
+fn maximum_f16(a: f16, b: f16) -> f16 {
+    if a.is_nan() {
+        a
+    } else if b.is_nan() {
+        b
+    } else if a.to_f32() == 0.0 && b.to_f32() == 0.0 {
+        if a.to_bits() & 0x8000 == 0 {
+            a
+        } else {
+            b
+        }
+    } else if a.to_f32() > b.to_f32() {
+        a
+    } else {
+        b
+    }
+}
+
+/// A bfloat16 is the top half of an f32.
+fn bf16_to_f32(value: u16) -> f32 {
+    f32::from_bits((value as u32) << 16)
+}
+
 fn clamp_f32(value: f32, clamp: bool) -> f32 {
     if clamp {
         // CLAMP turns a NaN into zero rather than passing it through.
@@ -9511,21 +9662,341 @@ impl SIMD32 {
         let s0 = inst.src0;
         let s1 = inst.src1;
         let s2 = inst.src2;
+        let sources = [s0, s1, s2];
         let opsel = inst.opsel;
         let opsel_hi = inst.opsel_hi | (inst.opsel_hi2 << 2);
         let neg = inst.neg;
         let neg_hi = inst.neg_hi;
         let clamp = inst.cm != 0;
+        let mods = PackedMods {
+            opsel,
+            opsel_hi,
+            neg,
+            neg_hi,
+            clamp,
+        };
         match inst.op {
-            I::V_WMMA_F32_16X16X16_F16 => {
-                self.v_wmma_f32_16x16x16_f16(d, s0, s1, s2);
+            I::V_PK_ADD_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, _| {
+                    f16::from_f64(a.to_f64() + b.to_f64())
+                });
+            }
+            I::V_PK_MUL_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, _| {
+                    f16::from_f64(a.to_f64() * b.to_f64())
+                });
+            }
+            I::V_PK_FMA_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, c| {
+                    f16::from_f64(a.to_f64() * b.to_f64() + c.to_f64())
+                });
+            }
+            I::V_PK_MIN_NUM_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, _| min_num_f16(a, b));
+            }
+            I::V_PK_MAX_NUM_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, _| max_num_f16(a, b));
+            }
+            I::V_PK_MINIMUM_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, _| minimum_f16(a, b));
+            }
+            I::V_PK_MAXIMUM_F16 => {
+                self.vop3p_f16(d, sources, mods, |a, b, _| maximum_f16(a, b));
+            }
+            I::V_PK_ADD_U16 => {
+                self.vop3p_u16(d, sources, mods, |a, b, _| a + b);
+            }
+            I::V_PK_SUB_U16 => {
+                self.vop3p_u16(d, sources, mods, |a, b, _| a - b);
+            }
+            I::V_PK_ADD_I16 => {
+                self.vop3p_i16(d, sources, mods, |a, b, _| a + b);
+            }
+            I::V_PK_SUB_I16 => {
+                self.vop3p_i16(d, sources, mods, |a, b, _| a - b);
+            }
+            I::V_PK_MUL_LO_U16 => {
+                // The low half is what this one keeps, saturation or not.
+                self.vop3p_packed(d, sources, mods, |a, b, _| a.wrapping_mul(b));
+            }
+            I::V_PK_MAD_U16 => {
+                self.vop3p_u16(d, sources, mods, |a, b, c| a * b + c);
+            }
+            I::V_PK_MAD_I16 => {
+                self.vop3p_i16(d, sources, mods, |a, b, c| a * b + c);
+            }
+            I::V_PK_MAX_U16 => {
+                self.vop3p_u16(d, sources, mods, |a, b, _| a.max(b));
+            }
+            I::V_PK_MIN_U16 => {
+                self.vop3p_u16(d, sources, mods, |a, b, _| a.min(b));
+            }
+            I::V_PK_MAX_I16 => {
+                self.vop3p_i16(d, sources, mods, |a, b, _| a.max(b));
+            }
+            I::V_PK_MIN_I16 => {
+                self.vop3p_i16(d, sources, mods, |a, b, _| a.min(b));
+            }
+            I::V_PK_LSHLREV_B16 => {
+                // The shift amount is the first source; the value is the second.
+                self.vop3p_packed(d, sources, mods, |a, b, _| b << (a & 15));
+            }
+            I::V_PK_LSHRREV_B16 => {
+                self.vop3p_packed(d, sources, mods, |a, b, _| b >> (a & 15));
+            }
+            I::V_PK_ASHRREV_I16 => {
+                self.vop3p_packed(d, sources, mods, |a, b, _| {
+                    ((b as i16) >> (a & 15)) as u16
+                });
+            }
+            I::V_DOT2_F32_F16 => {
+                self.vop3p_dot_f32(d, sources, mods, |a, b| {
+                    (f16::from_bits(a).to_f32(), f16::from_bits(b).to_f32())
+                });
+            }
+            I::V_DOT2_F32_BF16 => {
+                self.vop3p_dot_f32(d, sources, mods, |a, b| {
+                    (bf16_to_f32(a), bf16_to_f32(b))
+                });
+            }
+            I::V_DOT4_U32_U8 => {
+                self.vop3p_dot_int(d, sources, mods, 8, false);
+            }
+            I::V_DOT4_I32_IU8 => {
+                self.vop3p_dot_int(d, sources, mods, 8, true);
+            }
+            I::V_DOT8_U32_U4 => {
+                self.vop3p_dot_int(d, sources, mods, 4, false);
+            }
+            I::V_DOT8_I32_IU4 => {
+                self.vop3p_dot_int(d, sources, mods, 4, true);
+            }
+            I::V_FMA_MIX_F32 => {
+                self.v_fma_mix(d, sources, mods, MixResult::F32);
             }
             I::V_FMA_MIXLO_F16 => {
-                self.v_fma_mixlo_f16(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
+                self.v_fma_mix(d, sources, mods, MixResult::F16Low);
+            }
+            I::V_FMA_MIXHI_F16 => {
+                self.v_fma_mix(d, sources, mods, MixResult::F16High);
+            }
+            I::V_WMMA_F32_16X16X16_F16 => {
+                self.v_wmma_f32_16x16x16_f16(d, s0, s1, s2);
             }
             op => unimplemented!("{:?}", op),
         }
         Signals::None
+    }
+
+    /// Runs a packed operation on both halves of every active lane and writes
+    /// the pair back as one dword.
+    fn vop3p_packed(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        op: impl Fn(u16, u16, u16) -> u16,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let mut low = [0u16; 3];
+            let mut high = [0u16; 3];
+            for (position, source) in sources.iter().enumerate() {
+                let raw = self.read_vector_source_operand_u32(elem, *source);
+                let (l, h) = mods.halves(raw, position);
+                low[position] = l;
+                high[position] = h;
+            }
+            let low = op(low[0], low[1], low[2]);
+            let high = op(high[0], high[1], high[2]);
+            self.write_vgpr(elem, d, (low as u32) | ((high as u32) << 16));
+        }
+    }
+
+    fn vop3p_f16(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        op: impl Fn(f16, f16, f16) -> f16,
+    ) {
+        self.vop3p_packed(d, sources, mods, |a, b, c| {
+            let value = op(f16::from_bits(a), f16::from_bits(b), f16::from_bits(c));
+            clamp_f16(value, mods.clamp).to_bits()
+        });
+    }
+
+    /// An unsigned packed operation. CLAMP saturates each half rather than
+    /// letting it wrap, so the operation is done wide enough to see that.
+    fn vop3p_u16(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        op: impl Fn(i64, i64, i64) -> i64,
+    ) {
+        self.vop3p_packed(d, sources, mods, |a, b, c| {
+            let value = op(a as i64, b as i64, c as i64);
+            if mods.clamp {
+                value.clamp(0, u16::MAX as i64) as u16
+            } else {
+                value as u16
+            }
+        });
+    }
+
+    /// A signed packed operation, saturating under CLAMP the same way.
+    fn vop3p_i16(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        op: impl Fn(i64, i64, i64) -> i64,
+    ) {
+        self.vop3p_packed(d, sources, mods, |a, b, c| {
+            let value = op(a as i16 as i64, b as i16 as i64, c as i16 as i64);
+            if mods.clamp {
+                value.clamp(i16::MIN as i64, i16::MAX as i64) as i16 as u16
+            } else {
+                value as i16 as u16
+            }
+        });
+    }
+
+    /// The two-term dot products: both halves of the first two sources are
+    /// multiplied and added to the 32-bit third source.
+    fn vop3p_dot_f32(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        widen: impl Fn(u16, u16) -> (f32, f32),
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let raw0 = self.read_vector_source_operand_u32(elem, sources[0]);
+            let raw1 = self.read_vector_source_operand_u32(elem, sources[1]);
+            let (a_low, a_high) = mods.halves(raw0, 0);
+            let (b_low, b_high) = mods.halves(raw1, 1);
+            // The addend is a whole dword rather than a pair of halves, and
+            // either of its sign bits negates it.
+            let c = self.read_vector_source_operand_f32(elem, sources[2]);
+            let c = if ((mods.neg | mods.neg_hi) >> 2) & 1 != 0 {
+                -c
+            } else {
+                c
+            };
+
+            let (a0, b0) = widen(a_low, b_low);
+            let (a1, b1) = widen(a_high, b_high);
+            // The products and the addend are exact in double precision, so
+            // this is the sum before the accumulator rounds it.
+            let sum = c as f64 + a0 as f64 * b0 as f64 + a1 as f64 * b1 as f64;
+            // CLAMP has no say over a dot product's result.
+            self.write_vgpr(elem, d, f32_to_u32(sum as f32));
+        }
+    }
+
+    /// The four- and eight-term integer dot products. NEG picks whether each of
+    /// the two multiplied sources is read as signed.
+    fn vop3p_dot_int(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        bits: u32,
+        signed_form: bool,
+    ) {
+        let terms = 32 / bits;
+        let mask = (1u32 << bits) - 1;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            // OPSEL assembles each source out of the halves it names before
+            // the terms are taken from it.
+            let assemble = |mods: &PackedMods, raw: u32, position: usize| {
+                let (low, high) = mods.halves_unsigned(raw, position);
+                (low as u32) | ((high as u32) << 16)
+            };
+            let raw0 = assemble(
+                &mods,
+                self.read_vector_source_operand_u32(elem, sources[0]),
+                0,
+            );
+            let raw1 = assemble(
+                &mods,
+                self.read_vector_source_operand_u32(elem, sources[1]),
+                1,
+            );
+            let mut sum = self.read_vector_source_operand_u32(elem, sources[2]) as i32 as i64;
+            let signed0 = signed_form && (mods.neg & 1) != 0;
+            let signed1 = signed_form && (mods.neg & 2) != 0;
+            for term in 0..terms {
+                let shift = term * bits;
+                let extend = |value: u32, signed: bool| -> i64 {
+                    let value = (value >> shift) & mask;
+                    if signed && (value >> (bits - 1)) & 1 != 0 {
+                        (value as i64) - (1i64 << bits)
+                    } else {
+                        value as i64
+                    }
+                };
+                sum += extend(raw0, signed0) * extend(raw1, signed1);
+            }
+            self.write_vgpr(elem, d, sum as u32);
+        }
+    }
+
+    /// The mixed-precision fused multiply-add: each source is an f32 or one
+    /// half of a dword, and the result is an f32 or one half of the
+    /// destination.
+    fn v_fma_mix(
+        &mut self,
+        d: usize,
+        sources: [SourceOperand; 3],
+        mods: PackedMods,
+        result: MixResult,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let mut value = [0f32; 3];
+            for (position, source) in sources.iter().enumerate() {
+                // {OPSEL_HI[i], OPSEL[i]} selects the source: OPSEL_HI=0 is an
+                // f32, otherwise OPSEL picks which half of the dword to widen.
+                // NEG_HI is the abs modifier here, and NEG the sign one.
+                let raw = if (mods.opsel_hi >> position) & 1 == 0 {
+                    self.read_vector_source_operand_f32(elem, *source)
+                } else if (mods.opsel >> position) & 1 != 0 {
+                    self.read_vector_source_operand_f16_hi(elem, *source).to_f32()
+                } else {
+                    self.read_vector_source_operand_f16(elem, *source).to_f32()
+                };
+                value[position] = abs_neg(raw, mods.neg_hi, mods.neg, position);
+            }
+            let fused = fma(value[0], value[1], value[2]);
+            match result {
+                MixResult::F32 => {
+                    self.write_vgpr(elem, d, f32_to_u32(clamp_f32(fused, mods.clamp)));
+                }
+                MixResult::F16Low => {
+                    let half = f16::from_f32(clamp_f32(fused, mods.clamp));
+                    let kept = self.read_vgpr(elem, d) & 0xFFFF_0000;
+                    self.write_vgpr(elem, d, kept | half.to_bits() as u32);
+                }
+                MixResult::F16High => {
+                    let half = f16::from_f32(clamp_f32(fused, mods.clamp));
+                    let kept = self.read_vgpr(elem, d) & 0x0000_FFFF;
+                    self.write_vgpr(elem, d, kept | ((half.to_bits() as u32) << 16));
+                }
+            }
+        }
     }
 
     fn v_wmma_f32_16x16x16_f16(

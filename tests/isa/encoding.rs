@@ -56,6 +56,37 @@ pub(crate) const fn vop3(
     [lo, hi]
 }
 
+/// VOP3P: [31:24] = 11001100, [25:16] = OP, [15] = CLAMP, [14] = OPSEL_HI[2],
+/// [13:11] = OPSEL, [10:8] = NEG_HI, [7:0] = VDST, then [40:32] SRC0,
+/// [49:41] SRC1, [58:50] SRC2, [60:59] = OPSEL_HI[1:0], [63:61] = NEG.
+#[allow(clippy::too_many_arguments)]
+pub(crate) const fn vop3p(
+    op: u32,
+    vdst: u32,
+    src0: u32,
+    src1: u32,
+    src2: u32,
+    opsel: u32,
+    opsel_hi: u32,
+    neg: u32,
+    neg_hi: u32,
+    clamp: bool,
+) -> [u32; 2] {
+    let lo = (0b1100_1100 << 24)
+        | (op << 16)
+        | ((clamp as u32) << 15)
+        | (((opsel_hi >> 2) & 1) << 14)
+        | ((opsel & 7) << 11)
+        | ((neg_hi & 7) << 8)
+        | (vdst & 0xFF);
+    let hi = (src0 & 0x1FF)
+        | ((src1 & 0x1FF) << 9)
+        | ((src2 & 0x1FF) << 18)
+        | ((opsel_hi & 3) << 27)
+        | ((neg & 7) << 29);
+    [lo, hi]
+}
+
 /// Where a source operand comes from. These are the encodings of the 9-bit
 /// operand field, not a classification of our own. The value is 64 bits because
 /// the harness always fills a register pair; a 32-bit instruction reads only the

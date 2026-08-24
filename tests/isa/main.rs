@@ -23,3 +23,4 @@ mod salu;
 mod vopc;
 mod ds;
 mod scratch;
+mod vop3p;

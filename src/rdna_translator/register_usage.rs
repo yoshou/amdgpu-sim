@@ -1997,10 +1997,44 @@ impl RDNATranslator {
                     reg_usage.use_operand_f32_vec::<8>(&inst.src2);
                     reg_usage.def_vgpr_f32_vec::<8>(inst.vdst as u32);
                 }
-                I::V_FMA_MIXLO_F16 => {
+                I::V_FMA_MIX_F32
+                | I::V_FMA_MIXLO_F16
+                | I::V_FMA_MIXHI_F16
+                | I::V_PK_ADD_F16
+                | I::V_PK_MUL_F16
+                | I::V_PK_FMA_F16
+                | I::V_PK_MIN_NUM_F16
+                | I::V_PK_MAX_NUM_F16
+                | I::V_PK_MINIMUM_F16
+                | I::V_PK_MAXIMUM_F16
+                | I::V_PK_ADD_U16
+                | I::V_PK_SUB_U16
+                | I::V_PK_ADD_I16
+                | I::V_PK_SUB_I16
+                | I::V_PK_MUL_LO_U16
+                | I::V_PK_MAD_U16
+                | I::V_PK_MAD_I16
+                | I::V_PK_MAX_U16
+                | I::V_PK_MIN_U16
+                | I::V_PK_MAX_I16
+                | I::V_PK_MIN_I16
+                | I::V_PK_LSHLREV_B16
+                | I::V_PK_LSHRREV_B16
+                | I::V_PK_ASHRREV_I16
+                | I::V_DOT2_F32_F16
+                | I::V_DOT2_F32_BF16
+                | I::V_DOT4_I32_IU8
+                | I::V_DOT4_U32_U8
+                | I::V_DOT8_I32_IU4
+                | I::V_DOT8_U32_U4 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
                     reg_usage.use_operand_u32(&inst.src2);
+                    // The two forms that write half the destination read the
+                    // other half back out of it.
+                    if matches!(inst.op, I::V_FMA_MIXLO_F16 | I::V_FMA_MIXHI_F16) {
+                        reg_usage.use_vgpr_u32(inst.vdst as u32);
+                    }
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
                 }
                 _ => {

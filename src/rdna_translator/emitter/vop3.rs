@@ -8317,6 +8317,262 @@ impl IREmitter {
         bb
     }
 
+    /// One half of a packed operation: the three sources arrive as 16-bit lane
+    /// vectors and the result leaves the same way.
+    pub(crate) unsafe fn emit_packed_half(
+        &mut self,
+        op: I,
+        sources: [llvm::prelude::LLVMValueRef; 3],
+        clamp: bool,
+    ) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        const N: usize = SIMD_WIDTH;
+        let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
+        let ty_i16xn = llvm::core::LLVMVectorType(ty_i16, N as u32);
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+        let ty_f16 = llvm::core::LLVMHalfTypeInContext(context);
+        let ty_f16xn = llvm::core::LLVMVectorType(ty_f16, N as u32);
+
+        let splat16 = |value: u64| {
+            llvm::core::LLVMConstVector(
+                [llvm::core::LLVMConstInt(ty_i16, value, 0); N].as_mut_ptr(),
+                N as u32,
+            )
+        };
+        let as_half = |value: llvm::prelude::LLVMValueRef| {
+            llvm::core::LLVMBuildBitCast(builder, value, ty_f16xn, empty_name.as_ptr())
+        };
+        let as_bits = |value: llvm::prelude::LLVMValueRef| {
+            llvm::core::LLVMBuildBitCast(builder, value, ty_i16xn, empty_name.as_ptr())
+        };
+        let [a, b, c] = sources;
+
+        // The float operations, on which CLAMP means [0, 1] and a NaN becomes
+        // zero; the integer ones saturate instead, and only where the result
+        // can overflow.
+        let float_result = |emitter: &mut Self, value: llvm::prelude::LLVMValueRef| {
+            if !clamp {
+                return as_bits(value);
+            }
+            let zero = llvm::core::LLVMConstVector(
+                [llvm::core::LLVMConstReal(ty_f16, 0.0); N].as_mut_ptr(),
+                N as u32,
+            );
+            let one = llvm::core::LLVMConstVector(
+                [llvm::core::LLVMConstReal(ty_f16, 1.0); N].as_mut_ptr(),
+                N as u32,
+            );
+            let is_nan = llvm::core::LLVMBuildFCmp(
+                builder,
+                llvm::LLVMRealPredicate::LLVMRealUNO,
+                value,
+                value,
+                empty_name.as_ptr(),
+            );
+            let intrinsic = emitter.get_intrinsic_declaration("llvm.minnum.", &[ty_f16xn]);
+            let clamped = intrinsic.emit_call(ty_f16xn, &[value, one]);
+            let intrinsic = emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f16xn]);
+            let clamped = intrinsic.emit_call(ty_f16xn, &[clamped, zero]);
+            let clamped =
+                llvm::core::LLVMBuildSelect(builder, is_nan, zero, clamped, empty_name.as_ptr());
+            as_bits(clamped)
+        };
+
+        // A saturating integer result, which CLAMP asks for on the operations
+        // that can overflow.
+        let saturating = |emitter: &mut Self, wide: llvm::prelude::LLVMValueRef, signed: bool| {
+            if !clamp {
+                return llvm::core::LLVMBuildTrunc(builder, wide, ty_i16xn, empty_name.as_ptr());
+            }
+            let _ = &emitter;
+            let (low, high) = if signed {
+                (i16::MIN as i64 as u64, i16::MAX as u64)
+            } else {
+                (0, u16::MAX as u64)
+            };
+            let bound = |value: u64| {
+                llvm::core::LLVMConstVector(
+                    [llvm::core::LLVMConstInt(ty_i32, value, 0); N].as_mut_ptr(),
+                    N as u32,
+                )
+            };
+            // The widened result holds the true value, which an unsigned
+            // operation can still have taken below zero, so the bounds are
+            // compared signed whichever way the sources were read.
+            let below = llvm::core::LLVMBuildICmp(
+                builder,
+                llvm::LLVMIntPredicate::LLVMIntSLT,
+                wide,
+                bound(low),
+                empty_name.as_ptr(),
+            );
+            let above = llvm::core::LLVMBuildICmp(
+                builder,
+                llvm::LLVMIntPredicate::LLVMIntSGT,
+                wide,
+                bound(high),
+                empty_name.as_ptr(),
+            );
+            let value =
+                llvm::core::LLVMBuildSelect(builder, below, bound(low), wide, empty_name.as_ptr());
+            let value = llvm::core::LLVMBuildSelect(
+                builder,
+                above,
+                bound(high),
+                value,
+                empty_name.as_ptr(),
+            );
+            llvm::core::LLVMBuildTrunc(builder, value, ty_i16xn, empty_name.as_ptr())
+        };
+
+        let widen = |value: llvm::prelude::LLVMValueRef, signed: bool| {
+            if signed {
+                llvm::core::LLVMBuildSExt(builder, value, ty_i32xn, empty_name.as_ptr())
+            } else {
+                llvm::core::LLVMBuildZExt(builder, value, ty_i32xn, empty_name.as_ptr())
+            }
+        };
+
+        match op {
+            I::V_PK_ADD_F16 => {
+                let value =
+                    llvm::core::LLVMBuildFAdd(builder, as_half(a), as_half(b), empty_name.as_ptr());
+                float_result(self, value)
+            }
+            I::V_PK_MUL_F16 => {
+                let value =
+                    llvm::core::LLVMBuildFMul(builder, as_half(a), as_half(b), empty_name.as_ptr());
+                float_result(self, value)
+            }
+            I::V_PK_FMA_F16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.fma.", &[ty_f16xn]);
+                let value =
+                    intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b), as_half(c)]);
+                float_result(self, value)
+            }
+            I::V_PK_MIN_NUM_F16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_f16xn]);
+                let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b)]);
+                float_result(self, value)
+            }
+            I::V_PK_MAX_NUM_F16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_f16xn]);
+                let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b)]);
+                float_result(self, value)
+            }
+            I::V_PK_MINIMUM_F16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.minimum.", &[ty_f16xn]);
+                let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b)]);
+                float_result(self, value)
+            }
+            I::V_PK_MAXIMUM_F16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.maximum.", &[ty_f16xn]);
+                let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b)]);
+                float_result(self, value)
+            }
+            I::V_PK_ADD_U16 => {
+                let value = llvm::core::LLVMBuildAdd(
+                    builder,
+                    widen(a, false),
+                    widen(b, false),
+                    empty_name.as_ptr(),
+                );
+                saturating(self, value, false)
+            }
+            I::V_PK_SUB_U16 => {
+                let value = llvm::core::LLVMBuildSub(
+                    builder,
+                    widen(a, false),
+                    widen(b, false),
+                    empty_name.as_ptr(),
+                );
+                saturating(self, value, false)
+            }
+            I::V_PK_ADD_I16 => {
+                let value = llvm::core::LLVMBuildAdd(
+                    builder,
+                    widen(a, true),
+                    widen(b, true),
+                    empty_name.as_ptr(),
+                );
+                saturating(self, value, true)
+            }
+            I::V_PK_SUB_I16 => {
+                let value = llvm::core::LLVMBuildSub(
+                    builder,
+                    widen(a, true),
+                    widen(b, true),
+                    empty_name.as_ptr(),
+                );
+                saturating(self, value, true)
+            }
+            I::V_PK_MAD_U16 => {
+                let value = llvm::core::LLVMBuildAdd(
+                    builder,
+                    llvm::core::LLVMBuildMul(
+                        builder,
+                        widen(a, false),
+                        widen(b, false),
+                        empty_name.as_ptr(),
+                    ),
+                    widen(c, false),
+                    empty_name.as_ptr(),
+                );
+                saturating(self, value, false)
+            }
+            I::V_PK_MAD_I16 => {
+                let value = llvm::core::LLVMBuildAdd(
+                    builder,
+                    llvm::core::LLVMBuildMul(
+                        builder,
+                        widen(a, true),
+                        widen(b, true),
+                        empty_name.as_ptr(),
+                    ),
+                    widen(c, true),
+                    empty_name.as_ptr(),
+                );
+                saturating(self, value, true)
+            }
+            // The low half is what this one keeps, saturation or not.
+            I::V_PK_MUL_LO_U16 => llvm::core::LLVMBuildMul(builder, a, b, empty_name.as_ptr()),
+            I::V_PK_MAX_U16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.umax.", &[ty_i16xn]);
+                intrinsic.emit_call(ty_i16xn, &[a, b])
+            }
+            I::V_PK_MIN_U16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.umin.", &[ty_i16xn]);
+                intrinsic.emit_call(ty_i16xn, &[a, b])
+            }
+            I::V_PK_MAX_I16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.smax.", &[ty_i16xn]);
+                intrinsic.emit_call(ty_i16xn, &[a, b])
+            }
+            I::V_PK_MIN_I16 => {
+                let intrinsic = self.get_intrinsic_declaration("llvm.smin.", &[ty_i16xn]);
+                intrinsic.emit_call(ty_i16xn, &[a, b])
+            }
+            // The shift amount is the first source; the value is the second.
+            I::V_PK_LSHLREV_B16 => {
+                let amount = llvm::core::LLVMBuildAnd(builder, a, splat16(15), empty_name.as_ptr());
+                llvm::core::LLVMBuildShl(builder, b, amount, empty_name.as_ptr())
+            }
+            I::V_PK_LSHRREV_B16 => {
+                let amount = llvm::core::LLVMBuildAnd(builder, a, splat16(15), empty_name.as_ptr());
+                llvm::core::LLVMBuildLShr(builder, b, amount, empty_name.as_ptr())
+            }
+            I::V_PK_ASHRREV_I16 => {
+                let amount = llvm::core::LLVMBuildAnd(builder, a, splat16(15), empty_name.as_ptr());
+                llvm::core::LLVMBuildAShr(builder, b, amount, empty_name.as_ptr())
+            }
+            op => unimplemented!("{:?}", op),
+        }
+    }
+
     pub(crate) unsafe fn emit_vop3p(
         &mut self,
         bb: llvm::prelude::LLVMBasicBlockRef,
@@ -8327,6 +8583,340 @@ impl IREmitter {
         let mut bb = bb;
 
         match inst.op {
+            I::V_PK_ADD_F16
+            | I::V_PK_MUL_F16
+            | I::V_PK_FMA_F16
+            | I::V_PK_MIN_NUM_F16
+            | I::V_PK_MAX_NUM_F16
+            | I::V_PK_MINIMUM_F16
+            | I::V_PK_MAXIMUM_F16
+            | I::V_PK_ADD_U16
+            | I::V_PK_SUB_U16
+            | I::V_PK_ADD_I16
+            | I::V_PK_SUB_I16
+            | I::V_PK_MUL_LO_U16
+            | I::V_PK_MAD_U16
+            | I::V_PK_MAD_I16
+            | I::V_PK_MAX_U16
+            | I::V_PK_MIN_U16
+            | I::V_PK_MAX_I16
+            | I::V_PK_MIN_I16
+            | I::V_PK_LSHLREV_B16
+            | I::V_PK_LSHRREV_B16
+            | I::V_PK_ASHRREV_I16 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                const N: usize = SIMD_WIDTH;
+
+                let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
+                let ty_i16xn = llvm::core::LLVMVectorType(ty_i16, N as u32);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                let opsel = inst.opsel;
+                let opsel_hi = inst.opsel_hi | (inst.opsel_hi2 << 2);
+                let clamp = inst.cm != 0;
+
+                let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i as u32);
+
+                    let sources = [&inst.src0, &inst.src1, &inst.src2];
+                    let mut low = [std::ptr::null_mut(); 3];
+                    let mut high = [std::ptr::null_mut(); 3];
+                    for (position, source) in sources.iter().enumerate() {
+                        let raw = emitter
+                            .emit_vector_source_operand_u32xn::<N>(source, i as u32, mask);
+                        // OPSEL picks the half that feeds the low result and
+                        // OPSEL_HI the one that feeds the high result; NEG and
+                        // NEG_HI then act on the sign bit of what was picked.
+                        let half = |emitter: &mut Self, select: u8, negate: u8| {
+                            let _ = &emitter;
+                            let shifted = if (select >> position) & 1 != 0 {
+                                llvm::core::LLVMBuildLShr(
+                                    builder,
+                                    raw,
+                                    llvm::core::LLVMConstVector(
+                                        [llvm::core::LLVMConstInt(ty_i32, 16, 0); N].as_mut_ptr(),
+                                        N as u32,
+                                    ),
+                                    empty_name.as_ptr(),
+                                )
+                            } else {
+                                raw
+                            };
+                            let value = llvm::core::LLVMBuildTrunc(
+                                builder,
+                                shifted,
+                                ty_i16xn,
+                                empty_name.as_ptr(),
+                            );
+                            if (negate >> position) & 1 != 0 {
+                                llvm::core::LLVMBuildXor(
+                                    builder,
+                                    value,
+                                    llvm::core::LLVMConstVector(
+                                        [llvm::core::LLVMConstInt(ty_i16, 0x8000, 0); N]
+                                            .as_mut_ptr(),
+                                        N as u32,
+                                    ),
+                                    empty_name.as_ptr(),
+                                )
+                            } else {
+                                value
+                            }
+                        };
+                        low[position] = half(emitter, opsel, inst.neg);
+                        high[position] = half(emitter, opsel_hi, inst.neg_hi);
+                    }
+
+                    let low = emitter.emit_packed_half(inst.op, low, clamp);
+                    let high = emitter.emit_packed_half(inst.op, high, clamp);
+
+                    let low = llvm::core::LLVMBuildZExt(builder, low, ty_i32xn, empty_name.as_ptr());
+                    let high =
+                        llvm::core::LLVMBuildZExt(builder, high, ty_i32xn, empty_name.as_ptr());
+                    let high = llvm::core::LLVMBuildShl(
+                        builder,
+                        high,
+                        llvm::core::LLVMConstVector(
+                            [llvm::core::LLVMConstInt(ty_i32, 16, 0); N].as_mut_ptr(),
+                            N as u32,
+                        ),
+                        empty_name.as_ptr(),
+                    );
+                    let d_value =
+                        llvm::core::LLVMBuildOr(builder, low, high, empty_name.as_ptr());
+
+                    emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i as u32, d_value, mask);
+                }
+            }
+            I::V_DOT2_F32_F16
+            | I::V_DOT2_F32_BF16
+            | I::V_DOT4_I32_IU8
+            | I::V_DOT4_U32_U8
+            | I::V_DOT8_I32_IU4
+            | I::V_DOT8_U32_U4 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                const N: usize = SIMD_WIDTH;
+
+                let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
+                let ty_i16xn = llvm::core::LLVMVectorType(ty_i16, N as u32);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                let ty_f16 = llvm::core::LLVMHalfTypeInContext(context);
+                let ty_f16xn = llvm::core::LLVMVectorType(ty_f16, N as u32);
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+
+                let opsel = inst.opsel;
+                let opsel_hi = inst.opsel_hi | (inst.opsel_hi2 << 2);
+                let is_float = matches!(inst.op, I::V_DOT2_F32_F16 | I::V_DOT2_F32_BF16);
+                // How many terms the sum has, and how wide each of them is.
+                let bits: u32 = match inst.op {
+                    I::V_DOT4_I32_IU8 | I::V_DOT4_U32_U8 => 8,
+                    I::V_DOT8_I32_IU4 | I::V_DOT8_U32_U4 => 4,
+                    _ => 16,
+                };
+                let terms = 32 / bits;
+                // On the integer forms NEG says whether a source is signed
+                // rather than negating it.
+                let signed_form = matches!(inst.op, I::V_DOT4_I32_IU8 | I::V_DOT8_I32_IU4);
+
+                let splat32 = |value: u64| {
+                    llvm::core::LLVMConstVector(
+                        [llvm::core::LLVMConstInt(ty_i32, value, 0); N].as_mut_ptr(),
+                        N as u32,
+                    )
+                };
+
+                let exec_value = emitter.emit_load_sgpr_u32(126);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i as u32);
+
+                    // OPSEL assembles each of the two multiplied sources out of
+                    // the halves it names before the terms are taken from it.
+                    let sources = [&inst.src0, &inst.src1];
+                    let mut assembled = [std::ptr::null_mut(); 2];
+                    for (position, source) in sources.iter().enumerate() {
+                        let raw = emitter
+                            .emit_vector_source_operand_u32xn::<N>(source, i as u32, mask);
+                        let half = |select: u8| {
+                            let shifted = if (select >> position) & 1 != 0 {
+                                llvm::core::LLVMBuildLShr(
+                                    builder,
+                                    raw,
+                                    splat32(16),
+                                    empty_name.as_ptr(),
+                                )
+                            } else {
+                                raw
+                            };
+                            llvm::core::LLVMBuildAnd(builder, shifted, splat32(0xFFFF), empty_name.as_ptr())
+                        };
+                        let low = half(opsel);
+                        let high = llvm::core::LLVMBuildShl(
+                            builder,
+                            half(opsel_hi),
+                            splat32(16),
+                            empty_name.as_ptr(),
+                        );
+                        assembled[position] =
+                            llvm::core::LLVMBuildOr(builder, low, high, empty_name.as_ptr());
+                    }
+
+                    let addend = emitter
+                        .emit_vector_source_operand_u32xn::<N>(&inst.src2, i as u32, mask);
+
+                    let d_value = if is_float {
+                        // Either of the addend's sign bits negates it.
+                        let addend = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            addend,
+                            ty_f32xn,
+                            empty_name.as_ptr(),
+                        );
+                        let addend = if ((inst.neg | inst.neg_hi) >> 2) & 1 != 0 {
+                            llvm::core::LLVMBuildFNeg(builder, addend, empty_name.as_ptr())
+                        } else {
+                            addend
+                        };
+
+                        let mut sum = addend;
+                        for term in 0..2 {
+                            let mut factors = [std::ptr::null_mut(); 2];
+                            for position in 0..2 {
+                                let shifted = if term == 1 {
+                                    llvm::core::LLVMBuildLShr(
+                                        builder,
+                                        assembled[position],
+                                        splat32(16),
+                                        empty_name.as_ptr(),
+                                    )
+                                } else {
+                                    assembled[position]
+                                };
+                                let value = if matches!(inst.op, I::V_DOT2_F32_BF16) {
+                                    // A bfloat16 is the top half of an f32.
+                                    let value = llvm::core::LLVMBuildShl(
+                                        builder,
+                                        shifted,
+                                        splat32(16),
+                                        empty_name.as_ptr(),
+                                    );
+                                    llvm::core::LLVMBuildBitCast(
+                                        builder,
+                                        value,
+                                        ty_f32xn,
+                                        empty_name.as_ptr(),
+                                    )
+                                } else {
+                                    let value = llvm::core::LLVMBuildTrunc(
+                                        builder,
+                                        shifted,
+                                        ty_i16xn,
+                                        empty_name.as_ptr(),
+                                    );
+                                    let value = llvm::core::LLVMBuildBitCast(
+                                        builder,
+                                        value,
+                                        ty_f16xn,
+                                        empty_name.as_ptr(),
+                                    );
+                                    llvm::core::LLVMBuildFPExt(
+                                        builder,
+                                        value,
+                                        ty_f32xn,
+                                        empty_name.as_ptr(),
+                                    )
+                                };
+                                // NEG and NEG_HI negate the half that feeds each
+                                // term of the sum.
+                                let negate = if term == 1 { inst.neg_hi } else { inst.neg };
+                                factors[position] = if (negate >> position) & 1 != 0 {
+                                    llvm::core::LLVMBuildFNeg(builder, value, empty_name.as_ptr())
+                                } else {
+                                    value
+                                };
+                            }
+                            let product = llvm::core::LLVMBuildFMul(
+                                builder,
+                                factors[0],
+                                factors[1],
+                                empty_name.as_ptr(),
+                            );
+                            sum = llvm::core::LLVMBuildFAdd(
+                                builder,
+                                sum,
+                                product,
+                                empty_name.as_ptr(),
+                            );
+                        }
+                        llvm::core::LLVMBuildBitCast(builder, sum, ty_i32xn, empty_name.as_ptr())
+                    } else {
+                        let signed = [
+                            signed_form && (inst.neg & 1) != 0,
+                            signed_form && (inst.neg & 2) != 0,
+                        ];
+                        let mut sum = addend;
+                        for term in 0..terms {
+                            let mut factors = [std::ptr::null_mut(); 2];
+                            for position in 0..2 {
+                                let shifted = llvm::core::LLVMBuildLShr(
+                                    builder,
+                                    assembled[position],
+                                    splat32((term * bits) as u64),
+                                    empty_name.as_ptr(),
+                                );
+                                let value = llvm::core::LLVMBuildAnd(
+                                    builder,
+                                    shifted,
+                                    splat32(((1u64 << bits) - 1) as u64),
+                                    empty_name.as_ptr(),
+                                );
+                                // A signed term is sign-extended out of its own
+                                // width; an unsigned one is already there.
+                                factors[position] = if signed[position] {
+                                    let up = llvm::core::LLVMBuildShl(
+                                        builder,
+                                        value,
+                                        splat32((32 - bits) as u64),
+                                        empty_name.as_ptr(),
+                                    );
+                                    llvm::core::LLVMBuildAShr(
+                                        builder,
+                                        up,
+                                        splat32((32 - bits) as u64),
+                                        empty_name.as_ptr(),
+                                    )
+                                } else {
+                                    value
+                                };
+                            }
+                            let product = llvm::core::LLVMBuildMul(
+                                builder,
+                                factors[0],
+                                factors[1],
+                                empty_name.as_ptr(),
+                            );
+                            sum = llvm::core::LLVMBuildAdd(
+                                builder,
+                                sum,
+                                product,
+                                empty_name.as_ptr(),
+                            );
+                        }
+                        sum
+                    };
+
+                    emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i as u32, d_value, mask);
+                }
+            }
             I::V_WMMA_F32_16X16X16_F16 => {
                 if USE_SIMD {
                     let emitter = self;
@@ -8979,7 +9569,7 @@ impl IREmitter {
                     });
                 }
             }
-            I::V_FMA_MIXLO_F16 => {
+            I::V_FMA_MIX_F32 | I::V_FMA_MIXLO_F16 | I::V_FMA_MIXHI_F16 => {
                 if USE_SIMD {
                     let emitter = self;
                     let ty_f16 = llvm::core::LLVMHalfTypeInContext(context);
@@ -9080,35 +9670,65 @@ impl IREmitter {
                             emitter.emit_abs_neg_f32xn::<N>(s2_value, inst.neg_hi, inst.neg, 2);
 
                         let d_value = emitter.emit_fma_f32xn::<N>(s0_value, s1_value, s2_value);
+                        let d_value = emitter.emit_vop3_omod_clamp(0, inst.cm, d_value);
 
-                        let d_value = llvm::core::LLVMBuildFPTrunc(
-                            builder,
-                            d_value,
-                            ty_f16xn,
-                            empty_name.as_ptr(),
-                        );
-
-                        let d_value = llvm::core::LLVMBuildBitCast(
-                            builder,
-                            d_value,
-                            ty_i16xn,
-                            empty_name.as_ptr(),
-                        );
-
-                        let d_value = llvm::core::LLVMBuildZExt(
-                            builder,
-                            d_value,
-                            ty_i32xn,
-                            empty_name.as_ptr(),
-                        );
-                        // MIXLO writes vdst[15:0]; preserve the existing high 16 bits.
-                        let old = emitter.emit_load_vgpr_u32xn::<N>(inst.vdst as u32, i, mask);
-                        let himask = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstInt(ty_i32, 0xffff_0000, 0); N].as_mut_ptr(),
-                            N as u32,
-                        );
-                        let hi = llvm::core::LLVMBuildAnd(builder, old, himask, empty_name.as_ptr());
-                        let d_value = llvm::core::LLVMBuildOr(builder, hi, d_value, empty_name.as_ptr());
+                        let d_value = if matches!(inst.op, I::V_FMA_MIX_F32) {
+                            // The F32 form writes the whole register.
+                            llvm::core::LLVMBuildBitCast(
+                                builder,
+                                d_value,
+                                ty_i32xn,
+                                empty_name.as_ptr(),
+                            )
+                        } else {
+                            let narrow = llvm::core::LLVMBuildFPTrunc(
+                                builder,
+                                d_value,
+                                ty_f16xn,
+                                empty_name.as_ptr(),
+                            );
+                            let narrow = llvm::core::LLVMBuildBitCast(
+                                builder,
+                                narrow,
+                                ty_i16xn,
+                                empty_name.as_ptr(),
+                            );
+                            let narrow = llvm::core::LLVMBuildZExt(
+                                builder,
+                                narrow,
+                                ty_i32xn,
+                                empty_name.as_ptr(),
+                            );
+                            // Each of these two writes half the register and
+                            // leaves the other half as it was.
+                            let high = matches!(inst.op, I::V_FMA_MIXHI_F16);
+                            let keep = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(
+                                    ty_i32,
+                                    if high { 0x0000_ffff } else { 0xffff_0000 },
+                                    0,
+                                ); N]
+                                    .as_mut_ptr(),
+                                N as u32,
+                            );
+                            let old = emitter.emit_load_vgpr_u32xn::<N>(inst.vdst as u32, i, mask);
+                            let old =
+                                llvm::core::LLVMBuildAnd(builder, old, keep, empty_name.as_ptr());
+                            let narrow = if high {
+                                llvm::core::LLVMBuildShl(
+                                    builder,
+                                    narrow,
+                                    llvm::core::LLVMConstVector(
+                                        [llvm::core::LLVMConstInt(ty_i32, 16, 0); N].as_mut_ptr(),
+                                        N as u32,
+                                    ),
+                                    empty_name.as_ptr(),
+                                )
+                            } else {
+                                narrow
+                            };
+                            llvm::core::LLVMBuildOr(builder, old, narrow, empty_name.as_ptr())
+                        };
                         emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
