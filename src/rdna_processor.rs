@@ -8,8 +8,15 @@ use crate::rdna_translator::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
-static USE_INTERPRETER: bool = false;
 static USE_ENTIRE_KERNEL_TRANSLATION: bool = true;
+
+/// Which execution engine a processor runs its waves on. Selected per instance
+/// so that one process can exercise both, which the conformance tests rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    Interpreter,
+    LlvmJit,
+}
 
 pub trait RegisterFile<T: Copy> {
     fn new(num_elems: usize, count: usize, default: T) -> Self;
@@ -96,6 +103,7 @@ struct SIMD32 {
     num_vgprs: usize,
     lds: Rc<RefCell<Vec<u8>>>,
     translator: RDNATranslator,
+    engine: Engine,
 }
 
 #[inline(always)]
@@ -908,7 +916,7 @@ impl SIMD32 {
             insts: &self.insts[self.ctx.pc as usize..],
         };
 
-        if USE_INTERPRETER {
+        if self.engine == Engine::Interpreter {
             if let Ok((inst, size)) = decode_rdna4(inst_stream) {
                 let result = self.execute_inst(inst);
                 self.ctx.pc += size as u64;
@@ -6743,7 +6751,13 @@ struct ComputeUnit {
 use std::collections::HashMap;
 
 impl ComputeUnit {
-    pub fn new(pc: usize, insts: Vec<u8>, num_vgprs: usize, lds: Rc<RefCell<Vec<u8>>>) -> Self {
+    pub fn new(
+        pc: usize,
+        insts: Vec<u8>,
+        num_vgprs: usize,
+        lds: Rc<RefCell<Vec<u8>>>,
+        engine: Engine,
+    ) -> Self {
         let mut simds = vec![];
         for _ in 0..2 {
             let num_wave_slot = 16;
@@ -6761,6 +6775,7 @@ impl ComputeUnit {
                 num_vgprs: num_vgprs,
                 lds: lds.clone(),
                 translator: RDNATranslator::new(),
+                engine: engine,
             })));
         }
 
@@ -6783,6 +6798,7 @@ pub struct RDNAProcessor<'a> {
     aql_packet_address: u64,
     kernel_args_ptr: u64,
     aql: HsaKernelDispatchPacket<'a>,
+    engine: Engine,
 }
 
 unsafe impl<'a> Send for SIMD32 {}
@@ -6793,6 +6809,16 @@ impl<'a> RDNAProcessor<'a> {
         num_cunits: usize,
         wavefront_size: usize,
         mem: &Vec<u8>,
+    ) -> Self {
+        Self::with_engine(aql, num_cunits, wavefront_size, mem, Engine::LlvmJit)
+    }
+
+    pub fn with_engine(
+        aql: &HsaKernelDispatchPacket<'a>,
+        num_cunits: usize,
+        wavefront_size: usize,
+        mem: &Vec<u8>,
+        engine: Engine,
     ) -> Self {
         let insts = aql.kernel_object.object.to_vec();
         let kd = aql.kernel_object.offset;
@@ -6813,6 +6839,7 @@ impl<'a> RDNAProcessor<'a> {
                     mem.clone(),
                     kernel_desc.granulated_workitem_vgpr_count,
                     lds.clone(),
+                    engine,
                 );
                 cunits_in_wgp.push(cu);
             }
@@ -6834,6 +6861,7 @@ impl<'a> RDNAProcessor<'a> {
             aql_packet_address: aql_packet_address,
             entry_address: entry_address,
             aql: *aql,
+            engine: engine,
         }
     }
 
@@ -6976,7 +7004,7 @@ impl<'a> RDNAProcessor<'a> {
         let insts = self.aql.kernel_object.object.to_vec();
         let entry_address = self.entry_address;
 
-        if USE_ENTIRE_KERNEL_TRANSLATION {
+        if USE_ENTIRE_KERNEL_TRANSLATION && self.engine == Engine::LlvmJit {
             let mut translator = RDNATranslator::new();
 
             if translator.insts_blocks.is_empty() {
