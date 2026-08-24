@@ -1150,6 +1150,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value]);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1164,6 +1165,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1192,6 +1194,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value]);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1206,6 +1209,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1368,6 +1372,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1390,6 +1395,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1839,6 +1845,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value]);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1853,6 +1860,7 @@ impl IREmitter {
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -2396,6 +2404,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2415,6 +2424,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -4554,8 +4564,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_value =
-                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_value, inst.abs, inst.neg, 0);
@@ -4571,6 +4581,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -4578,7 +4589,8 @@ impl IREmitter {
                         let empty_name = std::ffi::CString::new("").unwrap();
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
-                        let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
+                        let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
+                        let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_value, 0);
 
@@ -4590,6 +4602,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb

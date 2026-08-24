@@ -341,6 +341,49 @@ impl IREmitter {
         value
     }
 
+    /// The transcendental unit flushes denormals on input and on output, whatever
+    /// the mode register says (ISA §V_RCP_F32, §V_SQRT_F32, §V_RSQ_F32). The
+    /// value keeps its sign, so a negative denormal becomes -0.
+    pub(crate) unsafe fn emit_ftz_f32(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(value);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let elem_ty = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let splat = |v: f64| {
+            let constant = llvm::core::LLVMConstReal(elem_ty, v);
+            if is_vector {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty]);
+        let magnitude = intrinsic.emit_call(ty, &[value]);
+        let smallest = splat(f32::MIN_POSITIVE as f64);
+        let is_denorm = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOLT,
+            magnitude,
+            smallest,
+            empty_name.as_ptr(),
+        );
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.copysign.", &[ty]);
+        let zero = intrinsic.emit_call(ty, &[splat(0.0), value]);
+
+        llvm::core::LLVMBuildSelect(builder, is_denorm, zero, value, empty_name.as_ptr())
+    }
+
     /// The VOP3 output modifiers: OMOD scales the result by 1, 2, 4 or 1/2, and
     /// CLAMP then holds it in [0,1]. OMOD is a two-bit enum here, unlike the
     /// per-half selector the packed helpers below take.
