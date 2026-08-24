@@ -175,7 +175,15 @@ impl IREmitter {
 
         match operand {
             SourceOperand::LiteralConstant(value) => {
-                llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value) as f64)
+                // A literal reaching a 16-bit operand carries the half in its low bits.
+                llvm::core::LLVMConstBitCast(
+                    llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt16TypeInContext(self.context),
+                        (*value) as u16 as u64,
+                        0,
+                    ),
+                    ty_f16,
+                )
             }
             SourceOperand::IntegerConstant(value) => {
                 llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value as u32) as f64)
@@ -208,7 +216,15 @@ impl IREmitter {
 
         match operand {
             SourceOperand::LiteralConstant(value) => {
-                llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value) as f64)
+                // A literal reaching a 16-bit operand carries the half in its high bits.
+                llvm::core::LLVMConstBitCast(
+                    llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt16TypeInContext(self.context),
+                        (*value >> 16) as u16 as u64,
+                        0,
+                    ),
+                    ty_f16,
+                )
             }
             SourceOperand::IntegerConstant(value) => {
                 llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value as u32) as f64)
@@ -253,7 +269,15 @@ impl IREmitter {
 
         match operand {
             SourceOperand::LiteralConstant(value) => {
-                vec![llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value) as f64); 8]
+                // A literal reaching a 16-bit operand carries the half in its low bits.
+                vec![llvm::core::LLVMConstBitCast(
+                    llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt16TypeInContext(self.context),
+                        (*value) as u16 as u64,
+                        0,
+                    ),
+                    ty_f16,
+                ); 8]
             }
             SourceOperand::IntegerConstant(value) => {
                 vec![llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value as u32) as f64); 8]
@@ -784,7 +808,15 @@ impl IREmitter {
 
         match operand {
             SourceOperand::LiteralConstant(value) => {
-                let value = llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value) as f64);
+                // A literal reaching a 16-bit operand carries the half in its low bits.
+                let value = llvm::core::LLVMConstBitCast(
+                    llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt16TypeInContext(self.context),
+                        (*value) as u16 as u64,
+                        0,
+                    ),
+                    ty_f16,
+                );
                 let value = llvm::core::LLVMConstVector([value; N].as_mut_ptr(), N as u32);
                 value
             }
@@ -850,7 +882,15 @@ impl IREmitter {
 
         match operand {
             SourceOperand::LiteralConstant(value) => {
-                let value = llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value) as f64);
+                // A literal reaching a 16-bit operand carries the half in its high bits.
+                let value = llvm::core::LLVMConstBitCast(
+                    llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt16TypeInContext(self.context),
+                        (*value >> 16) as u16 as u64,
+                        0,
+                    ),
+                    ty_f16,
+                );
                 let value = llvm::core::LLVMConstVector([value; N].as_mut_ptr(), N as u32);
                 value
             }
@@ -936,7 +976,15 @@ impl IREmitter {
 
         match operand {
             SourceOperand::LiteralConstant(value) => {
-                let value = llvm::core::LLVMConstReal(ty_f16, f32::from_bits(*value) as f64);
+                // A literal reaching a 16-bit operand carries the half in its low bits.
+                let value = llvm::core::LLVMConstBitCast(
+                    llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt16TypeInContext(self.context),
+                        (*value) as u16 as u64,
+                        0,
+                    ),
+                    ty_f16,
+                );
                 let value = llvm::core::LLVMConstVector([value; N].as_mut_ptr(), N as u32);
                 vec![value; 8]
             }

@@ -538,6 +538,28 @@ fn clamp_f64(value: f64, clamp: bool) -> f64 {
     }
 }
 
+/// OMOD and CLAMP act on the 16-bit result, which is the width the instruction
+/// wrote.
+fn f16_to_u32_omod_clamp(value: half::f16, omod: u8, clamp: bool) -> u32 {
+    let scaled = match omod {
+        1 => value.to_f32() * 2.0,
+        2 => value.to_f32() * 4.0,
+        3 => value.to_f32() * 0.5,
+        _ => value.to_f32(),
+    };
+    let clamped = if clamp {
+        // CLAMP turns a NaN into zero rather than passing it through.
+        if scaled.is_nan() {
+            0.0
+        } else {
+            scaled.clamp(0.0, 1.0)
+        }
+    } else {
+        scaled
+    };
+    half::f16::from_f32(clamped).to_bits() as u32
+}
+
 fn f32_to_u32_omod_clamp(value: f32, omod: u8, clamp: bool) -> u32 {
     let value = match omod {
         1 => value * 2.0,
@@ -7750,8 +7772,8 @@ impl SIMD32 {
         s0: SourceOperand,
         abs: u8,
         neg: u8,
-        _clamp: bool,
-        _omod: u8,
+        clamp: bool,
+        omod: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -7759,7 +7781,7 @@ impl SIMD32 {
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0);
             let d_value = half::f16::from_f32(s0_value);
-            self.write_vgpr(elem, d, d_value.to_bits() as u32);
+            self.write_vgpr(elem, d, f16_to_u32_omod_clamp(d_value, omod, clamp));
         }
     }
 

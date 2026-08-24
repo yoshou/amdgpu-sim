@@ -1735,6 +1735,10 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        // OMOD and CLAMP act on the 16-bit result, which is the
+                        // width the instruction wrote.
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+
                         // The f16 result occupies the low half of the register.
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
@@ -1768,6 +1772,10 @@ impl IREmitter {
                             ty_f16,
                             empty_name.as_ptr(),
                         );
+
+                        // OMOD and CLAMP act on the 16-bit result, which is the
+                        // width the instruction wrote.
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         let d_value = llvm::core::LLVMBuildBitCast(
                             builder,
                             d_value,
@@ -6240,6 +6248,11 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        // ABS and NEG act on the sign bit, which the widening
+                        // conversion carries across unchanged.
+                        let d_value =
+                            emitter.emit_abs_neg_f32xn::<N>(d_value, inst.abs, inst.neg, 0);
+
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
@@ -6260,6 +6273,8 @@ impl IREmitter {
                             ty_f32,
                             empty_name.as_ptr(),
                         );
+
+                        let d_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, d_value, 0);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
