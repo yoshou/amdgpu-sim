@@ -11214,203 +11214,175 @@ impl SIMD32 {
         let vaddr = inst.vaddr as usize;
         let vsrc = inst.vsrc as usize;
         let vdst = inst.vdst as usize;
-        let ioffset = inst.ioffset as u32;
+        // SVE says whether the VGPR takes part in the address; SADDR being NULL
+        // says the same of the SGPR.
+        let use_vaddr = inst.sve != 0;
+        let use_saddr = inst.saddr != 0x7C;
+        let ioffset = ((inst.ioffset << 8) as i32 >> 8) as i64;
         match inst.op {
-            I::SCRATCH_STORE_B32 => {
-                self.scratch_store_b32(vaddr, vsrc, saddr, ioffset);
+            I::SCRATCH_LOAD_U8 => {
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 8, false);
             }
-            I::SCRATCH_STORE_B64 => {
-                self.scratch_store_b64(vaddr, vsrc, saddr, ioffset);
+            I::SCRATCH_LOAD_I8 => {
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 8, true);
             }
-            I::SCRATCH_STORE_B96 => {
-                self.scratch_store_b96(vaddr, vsrc, saddr, ioffset);
+            I::SCRATCH_LOAD_U16 => {
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 16, false);
             }
-            I::SCRATCH_STORE_B128 => {
-                self.scratch_store_b128(vaddr, vsrc, saddr, ioffset);
+            I::SCRATCH_LOAD_I16 => {
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 16, true);
             }
             I::SCRATCH_LOAD_B32 => {
-                self.scratch_load_b32(vaddr, vdst, saddr, ioffset);
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 32, false);
             }
             I::SCRATCH_LOAD_B64 => {
-                self.scratch_load_b64(vaddr, vdst, saddr, ioffset);
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 64, false);
             }
             I::SCRATCH_LOAD_B96 => {
-                self.scratch_load_b96(vaddr, vdst, saddr, ioffset);
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 96, false);
             }
             I::SCRATCH_LOAD_B128 => {
-                self.scratch_load_b128(vaddr, vdst, saddr, ioffset);
+                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 128, false);
+            }
+            I::SCRATCH_STORE_B8 => {
+                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 8);
+            }
+            I::SCRATCH_STORE_B16 => {
+                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 16);
+            }
+            I::SCRATCH_STORE_B32 => {
+                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 32);
+            }
+            I::SCRATCH_STORE_B64 => {
+                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 64);
+            }
+            I::SCRATCH_STORE_B96 => {
+                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 96);
+            }
+            I::SCRATCH_STORE_B128 => {
+                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 128);
             }
             op => unimplemented!("{:?}", op),
         }
         Signals::None
     }
 
-    fn scratch_store_b32(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+    /// Where byte `offset` of a lane's own view of the private segment lives.
+    /// The segment is swizzled across the lanes a dword at a time, so the dword
+    /// at `offset` sits a lane-stride apart from its neighbours and an
+    /// unaligned access runs on into the next dword's slot.
+    fn scratch_address(&self, elem: usize, offset: i64) -> u64 {
+        let base = self.ctx.scratch.borrow().as_ptr() as u64;
+        let dword = offset >> 2;
+        let byte = (offset & 3) as u64;
+        (base as i64 + dword * 128) as u64 + (elem as u64) * 4 + byte
+    }
+
+    /// The address the lane's access starts at. VADDR and SADDR each take part
+    /// only when the instruction says so.
+    #[allow(clippy::too_many_arguments)]
+    fn scratch_offset(
+        &self,
+        elem: usize,
+        vaddr: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) -> i64 {
+        let vaddr_value = if use_vaddr {
+            self.read_vgpr(elem, vaddr) as i64
+        } else {
+            0
+        };
+        // The scratch SGPR offset is a signed 32-bit byte offset.
+        let saddr_value = if use_saddr {
+            self.read_sgpr(saddr) as i32 as i64
+        } else {
+            0
+        };
+        vaddr_value + saddr_value + ioffset
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scratch_load(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+        bits: u32,
+        signed: bool,
+    ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let data = self.read_vgpr(elem, vsrc);
-            let vaddr_val = 0u64;
-            // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-            let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64)) * 32 + (elem as u64) * 4;
-            let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
-            assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-            let ptr = addr as *mut u32;
-            unsafe {
-                *ptr = data;
-            }
-        }
-    }
-
-    fn scratch_store_b64(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
-        for i in 0..2 {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            match bits {
+                8 => {
+                    let ptr = self.scratch_address(elem, start) as *const u8;
+                    let data = unsafe { *ptr };
+                    let data = if signed { data as i8 as i32 as u32 } else { data as u32 };
+                    self.write_vgpr(elem, vdst, data);
                 }
-                let data = self.read_vgpr(elem, vsrc + i);
-                let vaddr_val = 0u64;
-                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
-                    + (elem as u64) * 4;
-                let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
-                assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-                let ptr = addr as *mut u32;
-                unsafe {
-                    *ptr = data;
+                16 => {
+                    // A sub-dword access can straddle two swizzled dwords, so it
+                    // is put together a byte at a time.
+                    let mut data = 0u32;
+                    for byte in 0..2 {
+                        let ptr = self.scratch_address(elem, start + byte) as *const u8;
+                        data |= (unsafe { *ptr } as u32) << (byte * 8);
+                    }
+                    let data = if signed {
+                        data as u16 as i16 as i32 as u32
+                    } else {
+                        data
+                    };
+                    self.write_vgpr(elem, vdst, data);
                 }
-            }
-        }
-    }
-
-    fn scratch_store_b96(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
-        for i in 0..3 {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let data = self.read_vgpr(elem, vsrc + i);
-                let vaddr_val = 0u64;
-                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
-                    + (elem as u64) * 4;
-                let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
-                assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-                let ptr = addr as *mut u32;
-                unsafe {
-                    *ptr = data;
+                _ => {
+                    for word in 0..(bits as usize / 32) {
+                        let mut data = 0u32;
+                        for byte in 0..4 {
+                            let ptr = self
+                                .scratch_address(elem, start + (word * 4) as i64 + byte)
+                                as *const u8;
+                            data |= (unsafe { *ptr } as u32) << (byte * 8);
+                        }
+                        self.write_vgpr(elem, vdst + word, data);
+                    }
                 }
             }
         }
     }
 
-    fn scratch_store_b128(&mut self, _vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
-        for i in 0..4 {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let data = self.read_vgpr(elem, vsrc + i);
-                let vaddr_val = 0u64;
-                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
-                    + (elem as u64) * 4;
-                let addr = self.ctx.scratch.borrow_mut().as_mut_ptr() as u64 + offset;
-                assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-                let ptr = addr as *mut u32;
-                unsafe {
-                    *ptr = data;
-                }
-            }
-        }
-    }
-
-    fn scratch_load_b32(&mut self, _vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn scratch_store(
+        &mut self,
+        vaddr: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+        bits: u32,
+    ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let vaddr_val = 0u64;
-            // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-            let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64)) * 32 + (elem as u64) * 4;
-            let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
-            assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-            let ptr = addr as *mut u32;
-            let data = unsafe { *ptr };
-            self.write_vgpr(elem, vdst, data);
-        }
-    }
-
-    fn scratch_load_b64(&mut self, _vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
-        for i in 0..2 {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            let bytes = (bits as usize).div_ceil(8);
+            for byte in 0..bytes {
+                let word = byte / 4;
+                let value = self.read_vgpr(elem, vsrc + word);
+                let ptr = self.scratch_address(elem, start + byte as i64) as *mut u8;
+                unsafe {
+                    *ptr = (value >> ((byte % 4) * 8)) as u8;
                 }
-                let vaddr_val = 0u64;
-                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
-                    + (elem as u64) * 4;
-                let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
-                assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-                let ptr = addr as *mut u32;
-                let data = unsafe { *ptr };
-                self.write_vgpr(elem, vdst + i, data);
-            }
-        }
-    }
-
-    fn scratch_load_b96(&mut self, _vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
-        for i in 0..3 {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let vaddr_val = 0u64;
-                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
-                    + (elem as u64) * 4;
-                let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
-                assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-                let ptr = addr as *mut u32;
-                let data = unsafe { *ptr };
-                self.write_vgpr(elem, vdst + i, data);
-            }
-        }
-    }
-
-    fn scratch_load_b128(&mut self, _vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
-        for i in 0..4 {
-            for elem in 0..32 {
-                if !self.get_exec_bit(elem) {
-                    continue;
-                }
-                let vaddr_val = 0u64;
-                // Scratch SGPR offset is a SIGNED 32-bit byte offset (ISA §11.2).
-            let saddr_val = self.read_sgpr(saddr) as i32 as i64 as u64;
-                let offset = (vaddr_val + saddr_val + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4)) * 32
-                    + (elem as u64) * 4;
-                let addr = self.ctx.scratch.borrow().as_ptr() as u64 + offset;
-                assert!(offset < self.ctx.scratch.borrow().len() as u64);
-
-                let ptr = addr as *mut u32;
-                let data = unsafe { *ptr };
-                self.write_vgpr(elem, vdst + i, data);
             }
         }
     }

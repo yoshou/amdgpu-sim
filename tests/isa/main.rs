@@ -22,3 +22,4 @@ mod mem;
 mod salu;
 mod vopc;
 mod ds;
+mod scratch;

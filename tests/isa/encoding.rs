@@ -136,6 +136,28 @@ pub(crate) const fn vmem(enc: u32, op: u32, vdst: u32, vsrc: u32, vaddr: u32, sa
     ]
 }
 
+/// A SCRATCH instruction: three dwords, laid out like the FLAT family but with
+/// an SVE bit that says whether VADDR takes part.
+/// word0 [31:24] = encoding, [21:14] = OP, [6:0] = SADDR.
+/// word1 [7:0] = VDST, [17] = SVE, [30:23] = VSRC.
+/// word2 [7:0] = VADDR, [31:8] = IOFFSET (signed).
+#[allow(clippy::too_many_arguments)]
+pub(crate) const fn vscratch(
+    op: u32,
+    vdst: u32,
+    vsrc: u32,
+    vaddr: u32,
+    saddr: u32,
+    ioffset: i32,
+    sve: u32,
+) -> [u32; 3] {
+    [
+        (VSCRATCH << 24) | (op << 14) | (saddr & 0x7F),
+        (vdst & 0xFF) | (sve << 17) | ((vsrc & 0xFF) << 23),
+        (vaddr & 0xFF) | (((ioffset as u32) & 0x00FF_FFFF) << 8),
+    ]
+}
+
 /// SMEM: [31:26] = 111101, [18:13] = OP, [12:6] = SDATA, [5:0] = SBASE,
 /// IOFFSET in [55:32] and SOFFSET in [63:57]. SBASE is a register *pair* index,
 /// so s[10:11] is 5. SOFFSET must be NULL, or the SGPR it names is added to the

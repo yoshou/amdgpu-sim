@@ -2661,42 +2661,51 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VSCRATCH(inst) => match inst.op {
-                I::SCRATCH_LOAD_B32 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    reg_usage.def_vgpr_u32(inst.vdst as u32);
-                }
-                I::SCRATCH_LOAD_B64 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    for i in 0..2 {
-                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                I::SCRATCH_LOAD_U8
+                | I::SCRATCH_LOAD_I8
+                | I::SCRATCH_LOAD_U16
+                | I::SCRATCH_LOAD_I16
+                | I::SCRATCH_LOAD_B32
+                | I::SCRATCH_LOAD_B64
+                | I::SCRATCH_LOAD_B96
+                | I::SCRATCH_LOAD_B128
+                | I::SCRATCH_STORE_B8
+                | I::SCRATCH_STORE_B16
+                | I::SCRATCH_STORE_B32
+                | I::SCRATCH_STORE_B64
+                | I::SCRATCH_STORE_B96
+                | I::SCRATCH_STORE_B128 => {
+                    let words = match inst.op {
+                        I::SCRATCH_LOAD_B64 | I::SCRATCH_STORE_B64 => 2,
+                        I::SCRATCH_LOAD_B96 | I::SCRATCH_STORE_B96 => 3,
+                        I::SCRATCH_LOAD_B128 | I::SCRATCH_STORE_B128 => 4,
+                        _ => 1,
+                    };
+                    let is_load = matches!(
+                        inst.op,
+                        I::SCRATCH_LOAD_U8
+                            | I::SCRATCH_LOAD_I8
+                            | I::SCRATCH_LOAD_U16
+                            | I::SCRATCH_LOAD_I16
+                            | I::SCRATCH_LOAD_B32
+                            | I::SCRATCH_LOAD_B64
+                            | I::SCRATCH_LOAD_B96
+                            | I::SCRATCH_LOAD_B128
+                    );
+                    // Each of the two address parts is read only when the
+                    // instruction says it takes part.
+                    if inst.saddr != 0x7C {
+                        reg_usage.use_sgpr_u32(inst.saddr as u32);
                     }
-                }
-                I::SCRATCH_LOAD_B96 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    for i in 0..3 {
-                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    if inst.sve != 0 {
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
                     }
-                }
-                I::SCRATCH_LOAD_B128 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    for i in 0..4 {
-                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
-                    }
-                }
-                I::SCRATCH_STORE_B32 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    reg_usage.use_vgpr_u32(inst.vsrc as u32);
-                }
-                I::SCRATCH_STORE_B64 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    for i in 0..2 {
-                        reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
-                    }
-                }
-                I::SCRATCH_STORE_B128 => {
-                    reg_usage.use_sgpr_u32(inst.saddr as u32);
-                    for i in 0..4 {
-                        reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                    for i in 0..words {
+                        if is_load {
+                            reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                        } else {
+                            reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                        }
                     }
                 }
                 _ => {

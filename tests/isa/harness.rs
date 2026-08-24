@@ -29,6 +29,8 @@ pub(crate) struct Harness {
     pub(crate) slot: usize,
     pub(crate) kernel_addr: usize,
     pub(crate) kernarg_size: usize,
+    /// Scratch bytes per work-item, as the kernel declares them.
+    pub(crate) private_segment_size: usize,
     /// Source dwords the kernel reads per lane.
     pub(crate) src_stride: usize,
     /// Result dwords the kernel writes per lane.
@@ -37,8 +39,12 @@ pub(crate) struct Harness {
 
 #[derive(serde::Deserialize)]
 pub(crate) struct KernelMeta {
+    #[serde(alias = ".name")]
+    name: String,
     #[serde(alias = ".kernarg_segment_size")]
     kernarg_segment_size: i64,
+    #[serde(alias = ".private_segment_fixed_size")]
+    private_segment_fixed_size: i64,
 }
 
 #[derive(serde::Deserialize)]
@@ -51,7 +57,10 @@ pub(crate) fn align(value: usize, align: usize) -> usize {
     value.div_ceil(align) * align
 }
 
-pub(crate) fn kernarg_segment_size(note: &[u8]) -> usize {
+/// The kernarg and private segment sizes the named kernel declares. Both come
+/// from the object rather than from a constant here, since the compiler decides
+/// them.
+pub(crate) fn segment_sizes(note: &[u8], kernel: &str) -> (usize, usize) {
     let mut pos = 0;
     while pos < note.len() {
         let name_size = get_u32(note, pos) as usize;
@@ -62,7 +71,15 @@ pub(crate) fn kernarg_segment_size(note: &[u8]) -> usize {
         pos = align(pos + data_size, 4);
         if note_type == 32 {
             let map: Meta = rmp_serde::from_slice(&data).unwrap();
-            return map.amdhsa_kernels[0].kernarg_segment_size as usize;
+            let meta = map
+                .amdhsa_kernels
+                .iter()
+                .find(|k| k.name == kernel)
+                .unwrap_or_else(|| panic!("no metadata for {}", kernel));
+            return (
+                meta.kernarg_segment_size as usize,
+                meta.private_segment_fixed_size as usize,
+            );
         }
     }
     panic!("no MessagePack metadata note in the harness object");
@@ -98,7 +115,7 @@ impl Harness {
     }
 
     pub(crate) fn scratch() -> Self {
-        Self::load("harness_scratch.kd", 0x8888_8888, 4, 8)
+        Self::load("harness_scratch.kd", 0x8888_8888, 4, 16)
     }
 
     pub(crate) fn load(kernel: &str, marker_literal: u32, src_stride: usize, out_stride: usize) -> Self {
@@ -114,7 +131,8 @@ impl Harness {
             .sections()
             .find(|s| s.name() == Some(".note"))
             .expect("no .note section");
-        let kernarg_size = kernarg_segment_size(note.data());
+        let (kernarg_size, private_segment_size) =
+            segment_sizes(note.data(), kernel.trim_end_matches(".kd"));
 
         let mut mem = Vec::<u8>::new();
         for segment in elf.segments() {
@@ -152,6 +170,7 @@ impl Harness {
             slot,
             kernel_addr,
             kernarg_size,
+            private_segment_size,
             src_stride,
             out_stride,
         }
@@ -199,7 +218,7 @@ impl Harness {
             grid_size_x: 1,
             grid_size_y: 1,
             grid_size_z: 1,
-            private_segment_size: 0,
+            private_segment_size: self.private_segment_size as u32,
             group_segment_size: 0,
             kernel_object: Pointer::new(&mem, self.kernel_addr),
             kernarg_address: Pointer::new(&arg_buffer, 0),

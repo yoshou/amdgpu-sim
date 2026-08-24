@@ -4069,381 +4069,290 @@ impl IREmitter {
         let mut bb = bb;
 
         match inst.op {
-            I::SCRATCH_STORE_B32 | I::SCRATCH_STORE_B64 | I::SCRATCH_STORE_B128 => {
-                let num_words = match inst.op {
-                    I::SCRATCH_STORE_B32 => 1,
-                    I::SCRATCH_STORE_B64 => 2,
-                    I::SCRATCH_STORE_B96 => 3,
-                    I::SCRATCH_STORE_B128 => 4,
-                    _ => unreachable!(),
-                };
-
-                if USE_SIMD {
-                    let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-
-                    const N: usize = SIMD_WIDTH;
-
-                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                    let ty_void = llvm::core::LLVMVoidTypeInContext(context);
-
-                    let exec_value = emitter.emit_load_sgpr_u32(126);
-
-                    let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
-                    let saddr_value = llvm::core::LLVMBuildZExt(
-                        builder,
-                        saddr_value,
-                        ty_i64,
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildAdd(
-                        builder,
-                        saddr_value,
-                        ioffset_value,
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildMul(
-                        builder,
-                        offset,
-                        llvm::core::LLVMConstInt(ty_i64, 32, 0),
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildAdd(
-                        builder,
-                        emitter.scratch_base,
-                        offset,
-                        empty_name.as_ptr(),
-                    );
-
-                    for i in (0..32).step_by(N) {
-                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i as u32);
-
-                        let offset = llvm::core::LLVMBuildAdd(
-                            builder,
-                            offset,
-                            llvm::core::LLVMConstInt(ty_i64, (i as u64) * 4, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let ptr = llvm::core::LLVMBuildIntToPtr(
-                            builder,
-                            offset,
-                            ty_p0,
-                            empty_name.as_ptr(),
-                        );
-                        for j in 0..num_words {
-                            let ptr = llvm::core::LLVMBuildGEP2(
-                                builder,
-                                ty_i32,
-                                ptr,
-                                [llvm::core::LLVMConstInt(ty_i32, j as u64 * 32, 0)].as_mut_ptr(),
-                                1,
-                                empty_name.as_ptr(),
-                            );
-
-                            let value = emitter.emit_load_vgpr_u32xn::<N>(
-                                inst.vsrc as u32 + j as u32,
-                                i,
-                                mask,
-                            );
-
-                            let intrinsic = emitter.get_intrinsic_declaration(
-                                "llvm.masked.store.",
-                                &[ty_i32xn, ty_p0],
-                            );
-                            intrinsic.emit_masked_call(
-                                ty_void,
-                                &[value, ptr, mask], 1, 4);
-                        }
-                    }
-                } else {
-                    let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
-
-                    let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
-                    let saddr_value = llvm::core::LLVMBuildZExt(
-                        builder,
-                        saddr_value,
-                        ty_i64,
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildAdd(
-                        builder,
-                        saddr_value,
-                        ioffset_value,
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildMul(
-                        builder,
-                        offset,
-                        llvm::core::LLVMConstInt(ty_i64, 32, 0),
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildAdd(
-                        builder,
-                        emitter.scratch_base,
-                        offset,
-                        empty_name.as_ptr(),
-                    );
-
-                    for i in 0..32 {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
-
-                        let bb_exec = llvm::core::LLVMAppendBasicBlockInContext(
-                            context,
-                            emitter.function,
-                            empty_name.as_ptr(),
-                        );
-
-                        let bb_cont = llvm::core::LLVMAppendBasicBlockInContext(
-                            context,
-                            emitter.function,
-                            empty_name.as_ptr(),
-                        );
-
-                        let exec = emitter.emit_exec_bit(elem);
-
-                        llvm::core::LLVMBuildCondBr(builder, exec, bb_exec, bb_cont);
-
-                        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_exec);
-
-                        let offset = llvm::core::LLVMBuildAdd(
-                            builder,
-                            offset,
-                            llvm::core::LLVMConstInt(ty_i64, (i as u64) * 4, 0),
-                            empty_name.as_ptr(),
-                        );
-
-                        for j in 0..num_words {
-                            let ptr = llvm::core::LLVMBuildIntToPtr(
-                                builder,
-                                offset,
-                                ty_p0,
-                                empty_name.as_ptr(),
-                            );
-                            let ptr = llvm::core::LLVMBuildGEP2(
-                                builder,
-                                ty_i32,
-                                ptr,
-                                [llvm::core::LLVMConstInt(ty_i32, j as u64 * 32, 0)].as_mut_ptr(),
-                                1,
-                                empty_name.as_ptr(),
-                            );
-
-                            let data =
-                                emitter.emit_load_vgpr_u32(inst.vsrc as u32 + j as u32, elem);
-
-                            llvm::core::LLVMBuildStore(builder, data, ptr);
-                        }
-
-                        llvm::core::LLVMBuildBr(builder, bb_cont);
-                        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_cont);
-                        bb = bb_cont;
-                    }
-                }
-            }
-            I::SCRATCH_LOAD_B32
+            I::SCRATCH_LOAD_U8
+            | I::SCRATCH_LOAD_I8
+            | I::SCRATCH_LOAD_U16
+            | I::SCRATCH_LOAD_I16
+            | I::SCRATCH_LOAD_B32
             | I::SCRATCH_LOAD_B64
             | I::SCRATCH_LOAD_B96
-            | I::SCRATCH_LOAD_B128 => {
-                let num_words: usize = match inst.op {
-                    I::SCRATCH_LOAD_B32 => 1,
-                    I::SCRATCH_LOAD_B64 => 2,
-                    I::SCRATCH_LOAD_B96 => 3,
-                    I::SCRATCH_LOAD_B128 => 4,
-                    _ => unreachable!(),
+            | I::SCRATCH_LOAD_B128
+            | I::SCRATCH_STORE_B8
+            | I::SCRATCH_STORE_B16
+            | I::SCRATCH_STORE_B32
+            | I::SCRATCH_STORE_B64
+            | I::SCRATCH_STORE_B96
+            | I::SCRATCH_STORE_B128 => {
+                // How wide the access is, and whether a sub-dword load widens
+                // signed. A store never widens.
+                let (bits, signed): (usize, bool) = match inst.op {
+                    I::SCRATCH_LOAD_U8 | I::SCRATCH_STORE_B8 => (8, false),
+                    I::SCRATCH_LOAD_I8 => (8, true),
+                    I::SCRATCH_LOAD_U16 | I::SCRATCH_STORE_B16 => (16, false),
+                    I::SCRATCH_LOAD_I16 => (16, true),
+                    I::SCRATCH_LOAD_B64 | I::SCRATCH_STORE_B64 => (64, false),
+                    I::SCRATCH_LOAD_B96 | I::SCRATCH_STORE_B96 => (96, false),
+                    I::SCRATCH_LOAD_B128 | I::SCRATCH_STORE_B128 => (128, false),
+                    _ => (32, false),
+                };
+                let is_load = matches!(
+                    inst.op,
+                    I::SCRATCH_LOAD_U8
+                        | I::SCRATCH_LOAD_I8
+                        | I::SCRATCH_LOAD_U16
+                        | I::SCRATCH_LOAD_I16
+                        | I::SCRATCH_LOAD_B32
+                        | I::SCRATCH_LOAD_B64
+                        | I::SCRATCH_LOAD_B96
+                        | I::SCRATCH_LOAD_B128
+                );
+                // SVE says whether the VGPR takes part in the address; SADDR
+                // being NULL says the same of the SGPR.
+                let use_vaddr = inst.sve != 0;
+                let use_saddr = inst.saddr != 0x7C;
+                let ioffset = (((inst.ioffset << 8) as i32) >> 8) as i64;
+
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                const N: usize = SIMD_WIDTH;
+
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let ty_i8xn = llvm::core::LLVMVectorType(ty_i8, N as u32);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
+                let ty_void = llvm::core::LLVMVoidTypeInContext(context);
+
+                let splat64 = |value: i64| {
+                    llvm::core::LLVMConstVector(
+                        [llvm::core::LLVMConstInt(ty_i64, value as u64, 0); N].as_mut_ptr(),
+                        N as u32,
+                    )
                 };
 
-                if USE_SIMD {
-                    let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
+                let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                    const N: usize = SIMD_WIDTH;
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i as u32);
 
-                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-
-                    let exec_value = emitter.emit_load_sgpr_u32(126);
-
-                    let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                    let ioffset_value = llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
-                    let saddr_value = llvm::core::LLVMBuildZExt(
-                        builder,
-                        saddr_value,
-                        ty_i64,
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildAdd(
-                        builder,
-                        saddr_value,
-                        ioffset_value,
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildMul(
-                        builder,
-                        offset,
-                        llvm::core::LLVMConstInt(ty_i64, 32, 0),
-                        empty_name.as_ptr(),
-                    );
-                    let offset = llvm::core::LLVMBuildAdd(
-                        builder,
-                        emitter.scratch_base,
-                        offset,
-                        empty_name.as_ptr(),
-                    );
-
-                    for i in (0..32).step_by(N) {
-                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i as u32);
-
-                        let offset = llvm::core::LLVMBuildAdd(
+                    // The byte the lane's access starts at, in its own view of
+                    // the private segment.
+                    let mut start = splat64(ioffset);
+                    if use_vaddr {
+                        let vaddr_value =
+                            emitter.emit_load_vgpr_u32xn::<N>(inst.vaddr as u32, i as u32, mask);
+                        let vaddr_value = llvm::core::LLVMBuildZExt(
                             builder,
-                            offset,
-                            llvm::core::LLVMConstInt(ty_i64, (i as u64) * 4, 0),
+                            vaddr_value,
+                            ty_i64xn,
                             empty_name.as_ptr(),
                         );
-                        let ptr = llvm::core::LLVMBuildIntToPtr(
-                            builder,
-                            offset,
-                            ty_p0,
-                            empty_name.as_ptr(),
-                        );
-                        for j in 0..num_words {
-                            let ptr = llvm::core::LLVMBuildGEP2(
-                                builder,
-                                ty_i32,
-                                ptr,
-                                [llvm::core::LLVMConstInt(ty_i32, j as u64 * 32, 0)].as_mut_ptr(),
-                                1,
-                                empty_name.as_ptr(),
-                            );
-
-                            let intrinsic = emitter
-                                .get_intrinsic_declaration("llvm.masked.load.", &[ty_i32xn, ty_p0]);
-                            let value = intrinsic.emit_masked_call(
-                                ty_i32xn,
-                                &[
-                                    ptr,
-                                    mask,
-                                    llvm::core::LLVMGetPoison(ty_i32xn),
-                                ], 0, 4,
-                            );
-
-                            emitter.emit_store_vgpr_u32xn::<N>(
-                                inst.vdst as u32 + j as u32,
-                                i as u32,
-                                value,
-                                mask,
-                            );
-                        }
+                        start =
+                            llvm::core::LLVMBuildAdd(builder, start, vaddr_value, empty_name.as_ptr());
                     }
-                } else {
-                    let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                    let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
-
-                    let mut offsets = Vec::new();
-                    for i in 0..32 {
+                    if use_saddr {
                         let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
-                        let ioffset_value =
-                            llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
-                        let saddr_value = llvm::core::LLVMBuildZExt(
+                        // The scratch SGPR offset is a signed byte offset.
+                        let saddr_value = llvm::core::LLVMBuildSExt(
                             builder,
                             saddr_value,
                             ty_i64,
                             empty_name.as_ptr(),
                         );
-                        let offset = llvm::core::LLVMBuildAdd(
+                        let saddr_value = llvm::core::LLVMBuildInsertElement(
+                            builder,
+                            llvm::core::LLVMGetPoison(ty_i64xn),
+                            saddr_value,
+                            llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                            empty_name.as_ptr(),
+                        );
+                        let zero_vec = llvm::core::LLVMConstVector(
+                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                            N as u32,
+                        );
+                        let saddr_value = llvm::core::LLVMBuildShuffleVector(
                             builder,
                             saddr_value,
-                            ioffset_value,
+                            llvm::core::LLVMGetPoison(ty_i64xn),
+                            zero_vec,
                             empty_name.as_ptr(),
                         );
-                        let offset = llvm::core::LLVMBuildMul(
-                            builder,
-                            offset,
-                            llvm::core::LLVMConstInt(ty_i64, 32, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let offset = llvm::core::LLVMBuildAdd(
-                            builder,
-                            offset,
-                            llvm::core::LLVMConstInt(ty_i64, (i as u64) * 4, 0),
-                            empty_name.as_ptr(),
-                        );
-                        let offset = llvm::core::LLVMBuildAdd(
-                            builder,
-                            emitter.scratch_base,
-                            offset,
-                            empty_name.as_ptr(),
-                        );
-                        offsets.push(offset);
+                        start =
+                            llvm::core::LLVMBuildAdd(builder, start, saddr_value, empty_name.as_ptr());
                     }
 
-                    for i in 0..32 {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
+                    // The lane's slot within a swizzled dword.
+                    let lane_offset = llvm::core::LLVMConstVector(
+                        (0..N)
+                            .map(|n| llvm::core::LLVMConstInt(ty_i64, ((i + n) * 4) as u64, 0))
+                            .collect::<Vec<_>>()
+                            .as_mut_ptr(),
+                        N as u32,
+                    );
 
-                        let bb_exec = llvm::core::LLVMAppendBasicBlockInContext(
-                            context,
-                            emitter.function,
+                    // The private segment is swizzled across the lanes a dword
+                    // at a time, so an access is put together a byte at a time:
+                    // an unaligned one runs on into the next dword's slot, which
+                    // is a lane-stride away rather than next door.
+                    let byte_pointer = |emitter: &mut Self, offset: llvm::prelude::LLVMValueRef| {
+                        let dword =
+                            llvm::core::LLVMBuildAShr(builder, offset, splat64(2), empty_name.as_ptr());
+                        let dword = llvm::core::LLVMBuildMul(
+                            builder,
+                            dword,
+                            splat64(128),
                             empty_name.as_ptr(),
                         );
-
-                        let bb_cont = llvm::core::LLVMAppendBasicBlockInContext(
-                            context,
-                            emitter.function,
+                        let byte =
+                            llvm::core::LLVMBuildAnd(builder, offset, splat64(3), empty_name.as_ptr());
+                        let base = llvm::core::LLVMBuildInsertElement(
+                            builder,
+                            llvm::core::LLVMGetPoison(ty_i64xn),
+                            emitter.scratch_base,
+                            llvm::core::LLVMConstInt(ty_i32, 0, 0),
                             empty_name.as_ptr(),
                         );
+                        let zero_vec = llvm::core::LLVMConstVector(
+                            [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                            N as u32,
+                        );
+                        let base = llvm::core::LLVMBuildShuffleVector(
+                            builder,
+                            base,
+                            llvm::core::LLVMGetPoison(ty_i64xn),
+                            zero_vec,
+                            empty_name.as_ptr(),
+                        );
+                        let address =
+                            llvm::core::LLVMBuildAdd(builder, base, dword, empty_name.as_ptr());
+                        let address =
+                            llvm::core::LLVMBuildAdd(builder, address, lane_offset, empty_name.as_ptr());
+                        let address =
+                            llvm::core::LLVMBuildAdd(builder, address, byte, empty_name.as_ptr());
+                        llvm::core::LLVMBuildIntToPtr(builder, address, ty_p0xn, empty_name.as_ptr())
+                    };
 
-                        let exec = emitter.emit_exec_bit(elem);
-
-                        llvm::core::LLVMBuildCondBr(builder, exec, bb_exec, bb_cont);
-
-                        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_exec);
-
-                        let offset = offsets[i];
-
-                        for j in 0..num_words {
-                            let ptr = llvm::core::LLVMBuildIntToPtr(
-                                builder,
-                                offset,
-                                ty_p0,
-                                empty_name.as_ptr(),
+                    let words = bits.div_ceil(32);
+                    for word in 0..words {
+                        let piece = if bits < 32 { bits / 8 } else { 4 };
+                        if is_load {
+                            let mut value = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                                N as u32,
                             );
-                            let ptr = llvm::core::LLVMBuildGEP2(
-                                builder,
-                                ty_i32,
-                                ptr,
-                                [llvm::core::LLVMConstInt(ty_i32, j as u64 * 32, 0)].as_mut_ptr(),
-                                1,
-                                empty_name.as_ptr(),
+                            for byte in 0..piece {
+                                let offset = llvm::core::LLVMBuildAdd(
+                                    builder,
+                                    start,
+                                    splat64((word * 4 + byte) as i64),
+                                    empty_name.as_ptr(),
+                                );
+                                let ptr = byte_pointer(emitter, offset);
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.gather.",
+                                    &[ty_i8xn, ty_p0xn],
+                                );
+                                let data = intrinsic.emit_masked_call(
+                                    ty_i8xn,
+                                    &[ptr, mask, llvm::core::LLVMGetPoison(ty_i8xn)],
+                                    0,
+                                    1,
+                                );
+                                let data = llvm::core::LLVMBuildZExt(
+                                    builder,
+                                    data,
+                                    ty_i32xn,
+                                    empty_name.as_ptr(),
+                                );
+                                let data = llvm::core::LLVMBuildShl(
+                                    builder,
+                                    data,
+                                    llvm::core::LLVMConstVector(
+                                        [llvm::core::LLVMConstInt(ty_i32, (byte * 8) as u64, 0); N]
+                                            .as_mut_ptr(),
+                                        N as u32,
+                                    ),
+                                    empty_name.as_ptr(),
+                                );
+                                value =
+                                    llvm::core::LLVMBuildOr(builder, value, data, empty_name.as_ptr());
+                            }
+                            let value = if bits >= 32 {
+                                value
+                            } else {
+                                // A sub-dword load widens into the destination.
+                                let narrow = llvm::core::LLVMBuildTrunc(
+                                    builder,
+                                    value,
+                                    llvm::core::LLVMVectorType(
+                                        llvm::core::LLVMIntTypeInContext(context, bits as u32),
+                                        N as u32,
+                                    ),
+                                    empty_name.as_ptr(),
+                                );
+                                if signed {
+                                    llvm::core::LLVMBuildSExt(
+                                        builder,
+                                        narrow,
+                                        ty_i32xn,
+                                        empty_name.as_ptr(),
+                                    )
+                                } else {
+                                    llvm::core::LLVMBuildZExt(
+                                        builder,
+                                        narrow,
+                                        ty_i32xn,
+                                        empty_name.as_ptr(),
+                                    )
+                                }
+                            };
+                            emitter.emit_store_vgpr_u32xn::<N>(
+                                inst.vdst as u32 + word as u32,
+                                i as u32,
+                                value,
+                                mask,
                             );
-
-                            let data = llvm::core::LLVMBuildLoad2(
-                                builder,
-                                ty_i32,
-                                ptr,
-                                empty_name.as_ptr(),
+                        } else {
+                            let value = emitter.emit_load_vgpr_u32xn::<N>(
+                                inst.vsrc as u32 + word as u32,
+                                i as u32,
+                                mask,
                             );
-
-                            emitter.emit_store_vgpr_u32(inst.vdst as u32 + j as u32, elem, data);
+                            for byte in 0..piece {
+                                let offset = llvm::core::LLVMBuildAdd(
+                                    builder,
+                                    start,
+                                    splat64((word * 4 + byte) as i64),
+                                    empty_name.as_ptr(),
+                                );
+                                let ptr = byte_pointer(emitter, offset);
+                                let data = llvm::core::LLVMBuildLShr(
+                                    builder,
+                                    value,
+                                    llvm::core::LLVMConstVector(
+                                        [llvm::core::LLVMConstInt(ty_i32, (byte * 8) as u64, 0); N]
+                                            .as_mut_ptr(),
+                                        N as u32,
+                                    ),
+                                    empty_name.as_ptr(),
+                                );
+                                let data = llvm::core::LLVMBuildTrunc(
+                                    builder,
+                                    data,
+                                    ty_i8xn,
+                                    empty_name.as_ptr(),
+                                );
+                                let intrinsic = emitter.get_intrinsic_declaration(
+                                    "llvm.masked.scatter.",
+                                    &[ty_i8xn, ty_p0xn],
+                                );
+                                intrinsic.emit_masked_call(ty_void, &[data, ptr, mask], 1, 1);
+                            }
                         }
-
-                        llvm::core::LLVMBuildBr(builder, bb_cont);
-                        llvm::core::LLVMPositionBuilderAtEnd(builder, bb_cont);
-                        bb = bb_cont;
                     }
                 }
             }
