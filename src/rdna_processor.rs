@@ -3942,8 +3942,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         clamp: bool,
         omod: u8,
     ) {
@@ -3951,7 +3951,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
             let d_value = s0_value as f32;
 
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
@@ -3962,8 +3962,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         clamp: bool,
         omod: u8,
     ) {
@@ -3971,7 +3971,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
             let d_value = s0_value as f64;
 
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
@@ -4044,8 +4044,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         clamp: bool,
         omod: u8,
     ) {
@@ -4053,7 +4053,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as i32;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as i32;
             let d_value = s0_value as f64;
 
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
@@ -4181,8 +4181,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         _clamp: bool,
         _omod: u8,
     ) {
@@ -4190,7 +4190,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
             let d_value = s0_value;
             self.write_vgpr(elem, d, d_value);
         }
@@ -7343,8 +7343,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         _clamp: bool,
         _omod: u8,
     ) {
@@ -7352,7 +7352,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
             let d_value = s0_value.reverse_bits();
             self.write_vgpr(elem, d, d_value);
         }
@@ -7407,8 +7407,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         _clamp: bool,
         _omod: u8,
     ) {
@@ -7416,7 +7416,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
             let d_value = if s0_value == 0 {
                 -1i32 as u32
             } else {
@@ -7685,8 +7685,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         clamp: bool,
         omod: u8,
     ) {
@@ -7694,7 +7694,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as i32;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as i32;
             let d_value = s0_value as f32;
             self.write_vgpr(elem, d, f32_to_u32_omod_clamp(d_value, omod, clamp));
         }
@@ -7941,8 +7941,8 @@ impl SIMD32 {
         &mut self,
         d: usize,
         s0: SourceOperand,
-        _abs: u8,
-        _neg: u8,
+        abs: u8,
+        neg: u8,
         _clamp: bool,
         _omod: u8,
     ) {
@@ -7950,7 +7950,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
             let d_value = !s0_value;
             self.write_vgpr(elem, d, d_value);
         }
