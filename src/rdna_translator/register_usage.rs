@@ -2440,25 +2440,41 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VFLAT(inst) => match inst.op {
-                I::FLAT_LOAD_B32 => {
+                I::FLAT_LOAD_B32
+                | I::FLAT_LOAD_B64
+                | I::FLAT_LOAD_B96
+                | I::FLAT_LOAD_B128
+                | I::FLAT_LOAD_U8
+                | I::FLAT_LOAD_I8
+                | I::FLAT_LOAD_U16
+                | I::FLAT_LOAD_I16 => {
+                    let words = match inst.op {
+                        I::FLAT_LOAD_B64 => 2,
+                        I::FLAT_LOAD_B96 => 3,
+                        I::FLAT_LOAD_B128 => 4,
+                        _ => 1,
+                    };
                     reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                    reg_usage.def_vgpr_u32(inst.vdst as u32);
-                }
-                I::FLAT_LOAD_B64 => {
-                    reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                    for i in 0..2 {
+                    for i in 0..words {
                         reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
                     }
                 }
-                I::FLAT_LOAD_B128 => {
+                I::FLAT_STORE_B8
+                | I::FLAT_STORE_B16
+                | I::FLAT_STORE_B32
+                | I::FLAT_STORE_B64
+                | I::FLAT_STORE_B96
+                | I::FLAT_STORE_B128 => {
+                    let words = match inst.op {
+                        I::FLAT_STORE_B64 => 2,
+                        I::FLAT_STORE_B96 => 3,
+                        I::FLAT_STORE_B128 => 4,
+                        _ => 1,
+                    };
                     reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                    for i in 0..4 {
-                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    for i in 0..words {
+                        reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
                     }
-                }
-                I::FLAT_STORE_B32 => {
-                    reg_usage.use_vgpr_u64(inst.vaddr as u32);
-                    reg_usage.use_vgpr_u32(inst.vsrc as u32);
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);

@@ -15,12 +15,28 @@ impl IREmitter {
         let mut bb = bb;
 
         match inst.op {
-            I::FLAT_LOAD_B32 | I::FLAT_LOAD_B64 | I::FLAT_LOAD_B128 => {
+            I::FLAT_LOAD_B32
+            | I::FLAT_LOAD_B64
+            | I::FLAT_LOAD_B96
+            | I::FLAT_LOAD_B128
+            | I::FLAT_LOAD_U8
+            | I::FLAT_LOAD_I8
+            | I::FLAT_LOAD_U16
+            | I::FLAT_LOAD_I16 => {
                 let num_words = match inst.op {
-                    I::FLAT_LOAD_B32 => 1,
                     I::FLAT_LOAD_B64 => 2,
+                    I::FLAT_LOAD_B96 => 3,
                     I::FLAT_LOAD_B128 => 4,
-                    _ => unreachable!(),
+                    _ => 1,
+                };
+                // A sub-dword load reads its own width and widens it into the
+                // destination, signed or not according to the opcode.
+                let (load_bits, load_signed) = match inst.op {
+                    I::FLAT_LOAD_U8 => (8, false),
+                    I::FLAT_LOAD_I8 => (8, true),
+                    I::FLAT_LOAD_U16 => (16, false),
+                    I::FLAT_LOAD_I16 => (16, true),
+                    _ => (32, false),
                 };
 
                 if USE_SIMD {
@@ -197,18 +213,39 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
+                            let ty_loadxn = llvm::core::LLVMVectorType(
+                                llvm::core::LLVMIntTypeInContext(context, load_bits),
+                                N as u32,
+                            );
                             let intrinsic = emitter.get_intrinsic_declaration(
                                 "llvm.masked.gather.",
-                                &[ty_i32xn, ty_p0xn],
+                                &[ty_loadxn, ty_p0xn],
                             );
                             let data = intrinsic.emit_masked_call(
-                                ty_i32xn,
+                                ty_loadxn,
                                 &[
                                     ptr,
                                     mask,
-                                    llvm::core::LLVMGetPoison(ty_i32xn),
+                                    llvm::core::LLVMGetPoison(ty_loadxn),
                                 ], 0, 4,
                             );
+                            let data = if load_bits == 32 {
+                                data
+                            } else if load_signed {
+                                llvm::core::LLVMBuildSExt(
+                                    builder,
+                                    data,
+                                    ty_i32xn,
+                                    empty_name.as_ptr(),
+                                )
+                            } else {
+                                llvm::core::LLVMBuildZExt(
+                                    builder,
+                                    data,
+                                    ty_i32xn,
+                                    empty_name.as_ptr(),
+                                )
+                            };
 
                             emitter.emit_store_vgpr_u32xn::<N>(
                                 inst.vdst as u32 + j,
@@ -335,12 +372,30 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
+                            let ty_load = llvm::core::LLVMIntTypeInContext(context, load_bits);
                             let data = llvm::core::LLVMBuildLoad2(
                                 builder,
-                                ty_i32,
+                                ty_load,
                                 ptr,
                                 empty_name.as_ptr(),
                             );
+                            let data = if load_bits == 32 {
+                                data
+                            } else if load_signed {
+                                llvm::core::LLVMBuildSExt(
+                                    builder,
+                                    data,
+                                    ty_i32,
+                                    empty_name.as_ptr(),
+                                )
+                            } else {
+                                llvm::core::LLVMBuildZExt(
+                                    builder,
+                                    data,
+                                    ty_i32,
+                                    empty_name.as_ptr(),
+                                )
+                            };
 
                             emitter.emit_store_vgpr_u32(inst.vdst as u32 + j, elem, data);
                         }
@@ -351,7 +406,24 @@ impl IREmitter {
                     }
                 }
             }
-            I::FLAT_STORE_B32 => {
+            I::FLAT_STORE_B8
+            | I::FLAT_STORE_B16
+            | I::FLAT_STORE_B32
+            | I::FLAT_STORE_B64
+            | I::FLAT_STORE_B96
+            | I::FLAT_STORE_B128 => {
+                let num_words = match inst.op {
+                    I::FLAT_STORE_B64 => 2,
+                    I::FLAT_STORE_B96 => 3,
+                    I::FLAT_STORE_B128 => 4,
+                    _ => 1,
+                };
+                // A sub-dword store writes the low bits of the source register.
+                let store_bits = match inst.op {
+                    I::FLAT_STORE_B8 => 8,
+                    I::FLAT_STORE_B16 => 16,
+                    _ => 32,
+                };
                 if USE_SIMD {
                     let emitter = self;
                     let empty_name = std::ffi::CString::new("").unwrap();
@@ -503,13 +575,39 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        {
-                            let value =
-                                emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc as u32, i as u32, mask);
+                        for j in 0..num_words {
+                            let ptr = llvm::core::LLVMBuildGEP2(
+                                builder,
+                                ty_i32,
+                                ptr,
+                                [llvm::core::LLVMConstInt(ty_i32, j as u64, 0)].as_mut_ptr(),
+                                1,
+                                empty_name.as_ptr(),
+                            );
+
+                            let value = emitter.emit_load_vgpr_u32xn::<N>(
+                                inst.vsrc as u32 + j as u32,
+                                i as u32,
+                                mask,
+                            );
+                            let ty_storexn = llvm::core::LLVMVectorType(
+                                llvm::core::LLVMIntTypeInContext(context, store_bits),
+                                N as u32,
+                            );
+                            let value = if store_bits == 32 {
+                                value
+                            } else {
+                                llvm::core::LLVMBuildTrunc(
+                                    builder,
+                                    value,
+                                    ty_storexn,
+                                    empty_name.as_ptr(),
+                                )
+                            };
 
                             let intrinsic = emitter.get_intrinsic_declaration(
                                 "llvm.masked.scatter.",
-                                &[ty_i32xn, ty_p0xn],
+                                &[ty_storexn, ty_p0xn],
                             );
                             intrinsic.emit_masked_call(
                                 ty_void,
@@ -616,9 +714,30 @@ impl IREmitter {
                                 empty_name.as_ptr(),
                             );
 
-                            let value = emitter.emit_load_vgpr_u32(inst.vsrc as u32, elem);
+                            for j in 0..num_words {
+                                let ptr = llvm::core::LLVMBuildGEP2(
+                                    builder,
+                                    ty_i32,
+                                    ptr,
+                                    [llvm::core::LLVMConstInt(ty_i32, j as u64, 0)].as_mut_ptr(),
+                                    1,
+                                    empty_name.as_ptr(),
+                                );
+                                let value = emitter
+                                    .emit_load_vgpr_u32(inst.vsrc as u32 + j as u32, elem);
+                                let value = if store_bits == 32 {
+                                    value
+                                } else {
+                                    llvm::core::LLVMBuildTrunc(
+                                        builder,
+                                        value,
+                                        llvm::core::LLVMIntTypeInContext(context, store_bits),
+                                        empty_name.as_ptr(),
+                                    )
+                                };
 
-                            llvm::core::LLVMBuildStore(builder, value, ptr);
+                                llvm::core::LLVMBuildStore(builder, value, ptr);
+                            }
                         }
 
                         llvm::core::LLVMBuildBr(builder, bb_cont);
