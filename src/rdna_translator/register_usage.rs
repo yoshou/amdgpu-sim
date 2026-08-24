@@ -676,6 +676,14 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOP1(inst) => match inst.op {
+                I::V_CVT_F32_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_CVT_U32_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_CVT_F64_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.def_vgpr_f64(inst.vdst as u32);
@@ -997,6 +1005,18 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOP3(inst) => match inst.op {
+                I::V_CVT_F32_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_CVT_U32_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_CLZ_I32_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
                 I::V_BFREV_B32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.def_vgpr_u32(inst.vdst as u32);
