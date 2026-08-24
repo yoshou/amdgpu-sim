@@ -3466,8 +3466,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as u16;
-            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as u16;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u16 as u64, abs, neg, 0, 16) as u16;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u16 as u64, abs, neg, 1, 16) as u16;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -3492,8 +3492,8 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as u16;
-            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as u16;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u16 as u64, abs, neg, 0, 16) as u16;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u16 as u64, abs, neg, 1, 16) as u16;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }

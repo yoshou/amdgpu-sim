@@ -2768,6 +2768,7 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
                         let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
@@ -2805,9 +2806,11 @@ impl IREmitter {
 
                         let s0_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src0, i, mask);
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
 
                         let s1_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src1, i, mask);
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
                         let cmp_value = llvm::core::LLVMBuildICmp(
                             builder,
@@ -2839,7 +2842,9 @@ impl IREmitter {
                         let empty_name = std::ffi::CString::new("").unwrap();
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
                         let cmp_value = llvm::core::LLVMBuildICmp(
                             builder,
@@ -2918,6 +2923,7 @@ impl IREmitter {
                         empty_name.as_ptr(),
                     );
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
@@ -2925,6 +2931,7 @@ impl IREmitter {
                         let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
                         let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
@@ -3304,6 +3311,7 @@ impl IREmitter {
 
                         let s1_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src1, i, mask);
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
                         let mut cmp_value = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(ty_i1, 0, 0); N].as_mut_ptr(),
@@ -3380,6 +3388,7 @@ impl IREmitter {
                         let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
 
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f32]);
@@ -3520,6 +3529,7 @@ impl IREmitter {
                         let empty_name = std::ffi::CString::new("").unwrap();
 
                         let s0_value = emitter.emit_vector_source_operand_u64(&inst.src0, elem);
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
                         let s1_value = emitter.emit_vector_source_operand_u64(&inst.src1, elem);
                         let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
@@ -3723,6 +3733,7 @@ impl IREmitter {
 
                         let s1_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src1, i, mask);
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
                         let mut cmp_value = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(ty_i1, 0, 0); N].as_mut_ptr(),
@@ -3799,6 +3810,7 @@ impl IREmitter {
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f64]);
