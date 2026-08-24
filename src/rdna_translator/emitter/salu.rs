@@ -997,6 +997,48 @@ impl IREmitter {
 
                 emitter.emit_store_scc_u8(scc_value);
             }
+            I::S_ADD_CO_U32 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let intrinsic =
+                    emitter.get_intrinsic_declaration("llvm.uadd.with.overflow.", &[ty_i32]);
+
+                let mut return_tys = vec![ty_i32, ty_i1];
+                let add_overflow = intrinsic.emit_call(
+                    llvm::core::LLVMStructTypeInContext(
+                        context,
+                        return_tys.as_mut_ptr(),
+                        return_tys.len() as u32,
+                        0,
+                    ),
+                    &[s0_value, s1_value],
+                );
+                let added = llvm::core::LLVMBuildExtractValue(
+                    builder,
+                    add_overflow,
+                    0,
+                    empty_name.as_ptr(),
+                );
+                let cmp = llvm::core::LLVMBuildExtractValue(
+                    builder,
+                    add_overflow,
+                    1,
+                    empty_name.as_ptr(),
+                );
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, added);
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
             I::S_SUB_CO_I32 => {
                 let emitter = self;
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
@@ -1457,12 +1499,56 @@ impl IREmitter {
     ) -> llvm::prelude::LLVMBasicBlockRef {
         let context = self.context;
 
+        let builder = self.builder;
         match inst.op {
             I::S_MOVK_I32 => {
                 let emitter = self;
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                 let d_value = llvm::core::LLVMConstInt(ty_i32, inst.simm16 as i16 as i64 as u64, 0);
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
+            }
+            I::S_CMOVK_I32 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let scc_value = emitter.emit_load_scc_u8();
+                let taken = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntNE,
+                    scc_value,
+                    llvm::core::LLVMConstInt(ty_i8, 0, 0),
+                    empty_name.as_ptr(),
+                );
+
+                let old_value = emitter.emit_load_sgpr_u32(inst.sdst as u32);
+                let imm_value =
+                    llvm::core::LLVMConstInt(ty_i32, inst.simm16 as i16 as i64 as u64, 0);
+
+                let d_value = llvm::core::LLVMBuildSelect(
+                    builder,
+                    taken,
+                    imm_value,
+                    old_value,
+                    empty_name.as_ptr(),
+                );
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
+            }
+            I::S_MULK_I32 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let old_value = emitter.emit_load_sgpr_u32(inst.sdst as u32);
+                let imm_value =
+                    llvm::core::LLVMConstInt(ty_i32, inst.simm16 as i16 as i64 as u64, 0);
+
+                let d_value =
+                    llvm::core::LLVMBuildMul(builder, old_value, imm_value, empty_name.as_ptr());
 
                 emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
             }
