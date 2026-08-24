@@ -52,6 +52,14 @@ impl IREmitter {
                         );
 
                         for cls in 0..10 {
+                            let class_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
+                            let no_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
                             let intrinsic =
                                 emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f32xn]);
                             let class_value = intrinsic.emit_call(
@@ -68,10 +76,10 @@ impl IREmitter {
                                     llvm::core::LLVMBuildAnd(
                                         builder,
                                         s1_value,
-                                        llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0),
+                                        class_bit,
                                         empty_name.as_ptr(),
                                     ),
-                                    llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                                    no_bit,
                                     empty_name.as_ptr(),
                                 ),
                                 empty_name.as_ptr(),
@@ -140,8 +148,8 @@ impl IREmitter {
                     let ty_i1xn = llvm::core::LLVMVectorType(ty_i1, N as u32);
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                    let ty_f64xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+                    let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
+                    let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
                     let empty_name = std::ffi::CString::new("").unwrap();
 
                     let exec_value = emitter.emit_load_sgpr_u32(126);
@@ -166,6 +174,14 @@ impl IREmitter {
                         );
 
                         for cls in 0..10 {
+                            let class_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
+                            let no_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
                             let intrinsic =
                                 emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f64xn]);
                             let class_value = intrinsic.emit_call(
@@ -182,10 +198,10 @@ impl IREmitter {
                                     llvm::core::LLVMBuildAnd(
                                         builder,
                                         s1_value,
-                                        llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0),
+                                        class_bit,
                                         empty_name.as_ptr(),
                                     ),
-                                    llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                                    no_bit,
                                     empty_name.as_ptr(),
                                 ),
                                 empty_name.as_ptr(),
@@ -339,20 +355,6 @@ impl IREmitter {
             I::V_CMP_EQ_U16 => {
                 let pred = llvm::LLVMIntPredicate::LLVMIntEQ;
 
-                let pred = match inst.op {
-                    I::V_CMP_GT_U32 => llvm::LLVMIntPredicate::LLVMIntUGT,
-                    I::V_CMP_LT_U32 => llvm::LLVMIntPredicate::LLVMIntULT,
-                    I::V_CMP_EQ_U32 => llvm::LLVMIntPredicate::LLVMIntEQ,
-                    I::V_CMP_NE_U32 => llvm::LLVMIntPredicate::LLVMIntNE,
-                    I::V_CMP_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
-                    I::V_CMP_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
-                    I::V_CMPX_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
-                    I::V_CMPX_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
-                    I::V_CMPX_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
-                    I::V_CMP_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
-                    I::V_CMP_LT_I32 => llvm::LLVMIntPredicate::LLVMIntSLT,
-                    _ => unreachable!(),
-                };
                 if USE_SIMD {
                     let emitter = self;
                     let empty_name = std::ffi::CString::new("").unwrap();
@@ -438,20 +440,6 @@ impl IREmitter {
             I::V_CMP_GT_U16 => {
                 let pred = llvm::LLVMIntPredicate::LLVMIntUGT;
 
-                let pred = match inst.op {
-                    I::V_CMP_GT_U32 => llvm::LLVMIntPredicate::LLVMIntUGT,
-                    I::V_CMP_LT_U32 => llvm::LLVMIntPredicate::LLVMIntULT,
-                    I::V_CMP_EQ_U32 => llvm::LLVMIntPredicate::LLVMIntEQ,
-                    I::V_CMP_NE_U32 => llvm::LLVMIntPredicate::LLVMIntNE,
-                    I::V_CMP_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
-                    I::V_CMP_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
-                    I::V_CMPX_GE_U32 => llvm::LLVMIntPredicate::LLVMIntUGE,
-                    I::V_CMPX_LE_U32 => llvm::LLVMIntPredicate::LLVMIntULE,
-                    I::V_CMPX_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
-                    I::V_CMP_GT_I32 => llvm::LLVMIntPredicate::LLVMIntSGT,
-                    I::V_CMP_LT_I32 => llvm::LLVMIntPredicate::LLVMIntSLT,
-                    _ => unreachable!(),
-                };
                 if USE_SIMD {
                     let emitter = self;
                     let empty_name = std::ffi::CString::new("").unwrap();

@@ -3319,6 +3319,14 @@ impl IREmitter {
                         );
 
                         for cls in 0..10 {
+                            let class_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
+                            let no_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
                             let intrinsic =
                                 emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f32xn]);
                             let class_value = intrinsic.emit_call(
@@ -3335,10 +3343,10 @@ impl IREmitter {
                                     llvm::core::LLVMBuildAnd(
                                         builder,
                                         s1_value,
-                                        llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0),
+                                        class_bit,
                                         empty_name.as_ptr(),
                                     ),
-                                    llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                                    no_bit,
                                     empty_name.as_ptr(),
                                 ),
                                 empty_name.as_ptr(),
@@ -3741,6 +3749,14 @@ impl IREmitter {
                         );
 
                         for cls in 0..10 {
+                            let class_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
+                            let no_bit = llvm::core::LLVMConstVector(
+                                [llvm::core::LLVMConstInt(ty_i32, 0, 0); N].as_mut_ptr(),
+                                N as u32,
+                            );
                             let intrinsic =
                                 emitter.get_intrinsic_declaration("llvm.is.fpclass.", &[ty_f64xn]);
                             let class_value = intrinsic.emit_call(
@@ -3757,10 +3773,10 @@ impl IREmitter {
                                     llvm::core::LLVMBuildAnd(
                                         builder,
                                         s1_value,
-                                        llvm::core::LLVMConstInt(ty_i32, 1 << cls, 0),
+                                        class_bit,
                                         empty_name.as_ptr(),
                                     ),
-                                    llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                                    no_bit,
                                     empty_name.as_ptr(),
                                 ),
                                 empty_name.as_ptr(),
