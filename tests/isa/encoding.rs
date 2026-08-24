@@ -147,12 +147,20 @@ pub(crate) const fn smem(op: u32, sdata: u32, sbase: u32, ioffset: i32) -> [u32;
     ]
 }
 
-/// DS: [31:26] = 110110, [24:17] = OP, and the second dword carries
-/// [7:0] ADDR, [15:8] DATA0, [23:16] DATA1, [31:24] VDST, with the two byte
-/// offsets in [15:0] of the first dword.
-pub(crate) const fn ds(op: u32, vdst: u32, addr: u32, data0: u32, offset0: u32) -> [u32; 2] {
+/// DS: [31:26] = 110110, [25:18] = OP, [15:8] = OFFSET1, [7:0] = OFFSET0, and
+/// the second dword carries [7:0] ADDR, [15:8] DATA0, [23:16] DATA1,
+/// [31:24] VDST.
+pub(crate) const fn ds(
+    op: u32,
+    vdst: u32,
+    addr: u32,
+    data0: u32,
+    data1: u32,
+    offset0: u32,
+    offset1: u32,
+) -> [u32; 2] {
     [
-        (0b110110 << 26) | (op << 17) | (offset0 & 0xFF),
-        addr | (data0 << 8) | (vdst << 24),
+        (0b110110 << 26) | (op << 18) | ((offset1 & 0xFF) << 8) | (offset0 & 0xFF),
+        (addr & 0xFF) | ((data0 & 0xFF) << 8) | ((data1 & 0xFF) << 16) | ((vdst & 0xFF) << 24),
     ]
 }

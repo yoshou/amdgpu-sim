@@ -2704,13 +2704,51 @@ impl RDNATranslator {
                 }
             },
             InstFormat::DS(inst) => match inst.op {
-                I::DS_LOAD_U8 => {
+                I::DS_LOAD_U8
+                | I::DS_LOAD_I8
+                | I::DS_LOAD_U16
+                | I::DS_LOAD_I16
+                | I::DS_LOAD_B32
+                | I::DS_LOAD_B64
+                | I::DS_LOAD_B96
+                | I::DS_LOAD_B128
+                | I::DS_LOAD_2ADDR_B32
+                | I::DS_LOAD_2ADDR_B64 => {
+                    let registers = match inst.op {
+                        I::DS_LOAD_B64 | I::DS_LOAD_2ADDR_B32 => 2,
+                        I::DS_LOAD_B96 => 3,
+                        I::DS_LOAD_B128 | I::DS_LOAD_2ADDR_B64 => 4,
+                        _ => 1,
+                    };
                     reg_usage.use_vgpr_u32(inst.addr as u32);
-                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    for i in 0..registers {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
                 }
-                I::DS_STORE_B8 => {
+                I::DS_STORE_B8
+                | I::DS_STORE_B16
+                | I::DS_STORE_B32
+                | I::DS_STORE_B64
+                | I::DS_STORE_B96
+                | I::DS_STORE_B128
+                | I::DS_STORE_2ADDR_B32
+                | I::DS_STORE_2ADDR_B64 => {
+                    let registers = match inst.op {
+                        I::DS_STORE_B64 | I::DS_STORE_2ADDR_B64 => 2,
+                        I::DS_STORE_B96 => 3,
+                        I::DS_STORE_B128 => 4,
+                        _ => 1,
+                    };
                     reg_usage.use_vgpr_u32(inst.addr as u32);
-                    reg_usage.use_vgpr_u32(inst.data0 as u32);
+                    for i in 0..registers {
+                        reg_usage.use_vgpr_u32(inst.data0 as u32 + i);
+                    }
+                    // The two-address forms take their second value from DATA1.
+                    if matches!(inst.op, I::DS_STORE_2ADDR_B32 | I::DS_STORE_2ADDR_B64) {
+                        for i in 0..registers {
+                            reg_usage.use_vgpr_u32(inst.data1 as u32 + i);
+                        }
+                    }
                 }
                 I::DS_BPERMUTE_B32 => {
                     reg_usage.use_vgpr_u32(inst.addr as u32);

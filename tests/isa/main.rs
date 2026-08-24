@@ -21,3 +21,4 @@ mod vop3;
 mod mem;
 mod salu;
 mod vopc;
+mod ds;

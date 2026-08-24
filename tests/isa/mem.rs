@@ -18,7 +18,6 @@ use amdgpu_sim::rdna_processor::Engine;
 const VDST: usize = 0;
 const SDST: usize = 4;
 const DATA: usize = 12;
-const LDS: usize = 13;
 
 pub(crate) struct MemLoad {
     pub(crate) ioffset: i32,
@@ -138,36 +137,6 @@ pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
     report(failures, cases.len() * 2);
 }
 
-/// A DS instruction. The harness seeds LDS word `n` with buffer word `n`, so
-/// both the loaded value and the LDS word after the instruction are checked.
-pub(crate) struct DsCase {
-    pub(crate) store_value: u64,
-    pub(crate) offset0: u32,
-    pub(crate) expected_vdst: u32,
-    pub(crate) expected_lds: u32,
-}
-
-pub(crate) fn check_ds(op: u32, cases: &[DsCase]) {
-    let harness = Harness::mem();
-    let mut failures = Vec::new();
-    for (i, case) in cases.iter().enumerate() {
-        // v4 holds the lane's LDS byte offset; v2 holds the value to store.
-        let words = ds(op, 6, 4, 2, case.offset0).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
-            let out = read_all(&harness, engine, &words, case.store_value);
-            let (vdst, lds) = (out[VDST], out[LDS]);
-            if vdst == case.expected_vdst && lds == case.expected_lds {
-                continue;
-            }
-            failures.push(format!(
-                "  {:<11} case {} offset0={} hardware=(vdst 0x{:08X}, lds 0x{:08X}) simulator=(vdst 0x{:08X}, lds 0x{:08X})",
-                engine_name(engine), i, case.offset0,
-                case.expected_vdst, case.expected_lds, vdst, lds,
-            ));
-        }
-    }
-    report(failures, cases.len() * 2);
-}
 #[test]
 fn global_load_b128_load() {
     // GLOBAL_LOAD_B128.

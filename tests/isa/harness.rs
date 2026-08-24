@@ -93,6 +93,14 @@ impl Harness {
         Self::load("harness_mem.kd", 0x6666_6666, 2, 16)
     }
 
+    pub(crate) fn lds() -> Self {
+        Self::load("harness_lds.kd", 0x7777_7777, 4, 16)
+    }
+
+    pub(crate) fn scratch() -> Self {
+        Self::load("harness_scratch.kd", 0x8888_8888, 4, 8)
+    }
+
     pub(crate) fn load(kernel: &str, marker_literal: u32, src_stride: usize, out_stride: usize) -> Self {
         let marker = slot_marker(marker_literal);
         let mut data = vec![];

@@ -12215,17 +12215,471 @@ impl SIMD32 {
         }
     }
 
+    fn ds_load_u8_16(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let ptr = lds.wrapping_add(addr[elem] + offset) as *const u8;
+            let data = unsafe { ptr.read_unaligned() };
+
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
+    fn ds_load_i8(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let ptr = lds.wrapping_add(addr[elem] + offset) as *const i8;
+            let data = unsafe { ptr.read_unaligned() };
+
+            self.write_vgpr(elem, vdst, (data as i32) as u32);
+        }
+    }
+
+    fn ds_load_u16(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let ptr = lds.wrapping_add(addr[elem] + offset) as *const u16;
+            let data = unsafe { ptr.read_unaligned() };
+
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
+    fn ds_load_i16(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let ptr = lds.wrapping_add(addr[elem] + offset) as *const i16;
+            let data = unsafe { ptr.read_unaligned() };
+
+            self.write_vgpr(elem, vdst, (data as i32) as u32);
+        }
+    }
+
+    fn ds_load_b32(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..1 {
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *const u32;
+                let data = unsafe { ptr.read_unaligned() };
+
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn ds_load_b64(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..2 {
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *const u32;
+                let data = unsafe { ptr.read_unaligned() };
+
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn ds_load_b96(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..3 {
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *const u32;
+                let data = unsafe { ptr.read_unaligned() };
+
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn ds_load_b128(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..4 {
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *const u32;
+                let data = unsafe { ptr.read_unaligned() };
+
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn ds_store_b8_16(&mut self, addr: usize, data0: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let data = self.read_vgpr(elem, data0) as u8;
+            let ptr = lds.wrapping_add(addr[elem] + offset) as *mut u8;
+            unsafe {
+                ptr.write_unaligned(data);
+            }
+        }
+    }
+
+    fn ds_store_b16(&mut self, addr: usize, data0: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let data = self.read_vgpr(elem, data0) as u16;
+            let ptr = lds.wrapping_add(addr[elem] + offset) as *mut u16;
+            unsafe {
+                ptr.write_unaligned(data);
+            }
+        }
+    }
+
+    fn ds_store_b32(&mut self, addr: usize, data0: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..1 {
+                let data = self.read_vgpr(elem, data0 + i);
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *mut u32;
+                unsafe {
+                    ptr.write_unaligned(data);
+                }
+            }
+        }
+    }
+
+    fn ds_store_b64(&mut self, addr: usize, data0: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..2 {
+                let data = self.read_vgpr(elem, data0 + i);
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *mut u32;
+                unsafe {
+                    ptr.write_unaligned(data);
+                }
+            }
+        }
+    }
+
+    fn ds_store_b96(&mut self, addr: usize, data0: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..3 {
+                let data = self.read_vgpr(elem, data0 + i);
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *mut u32;
+                unsafe {
+                    ptr.write_unaligned(data);
+                }
+            }
+        }
+    }
+
+    fn ds_store_b128(&mut self, addr: usize, data0: usize, offset0: u8, offset1: u8) {
+        // A single-address DS instruction takes the whole 16-bit offset.
+        let offset = ((offset1 as usize) << 8) | (offset0 as usize);
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for i in 0..4 {
+                let data = self.read_vgpr(elem, data0 + i);
+                let ptr = lds.wrapping_add(addr[elem] + offset + i * 4) as *mut u32;
+                unsafe {
+                    ptr.write_unaligned(data);
+                }
+            }
+        }
+    }
+
+    fn ds_load_2addr_b32(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A two-address DS instruction indexes the two offsets by the size it
+        // moves rather than adding them as bytes.
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for (slot, offset) in [offset0, offset1].iter().enumerate() {
+                for i in 0..1 {
+                    let byte = addr[elem] + (*offset as usize) * 4 + i * 4;
+                    let ptr = lds.wrapping_add(byte) as *const u32;
+                    let data = unsafe { ptr.read_unaligned() };
+
+                    self.write_vgpr(elem, vdst + slot * 1 + i, data);
+                }
+            }
+        }
+    }
+
+    fn ds_load_2addr_b64(&mut self, addr: usize, vdst: usize, offset0: u8, offset1: u8) {
+        // A two-address DS instruction indexes the two offsets by the size it
+        // moves rather than adding them as bytes.
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow().as_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for (slot, offset) in [offset0, offset1].iter().enumerate() {
+                for i in 0..2 {
+                    let byte = addr[elem] + (*offset as usize) * 8 + i * 4;
+                    let ptr = lds.wrapping_add(byte) as *const u32;
+                    let data = unsafe { ptr.read_unaligned() };
+
+                    self.write_vgpr(elem, vdst + slot * 2 + i, data);
+                }
+            }
+        }
+    }
+
+    fn ds_store_2addr_b32(&mut self, addr: usize, data0: usize, data1: usize, offset0: u8, offset1: u8) {
+        // A two-address DS instruction indexes the two offsets by the size it
+        // moves rather than adding them as bytes.
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for (data, offset) in [(data0, offset0), (data1, offset1)] {
+                for i in 0..1 {
+                    let value = self.read_vgpr(elem, data + i);
+                    let byte = addr[elem] + (offset as usize) * 4 + i * 4;
+                    let ptr = lds.wrapping_add(byte) as *mut u32;
+                    unsafe {
+                        ptr.write_unaligned(value);
+                    }
+                }
+            }
+        }
+    }
+
+    fn ds_store_2addr_b64(&mut self, addr: usize, data0: usize, data1: usize, offset0: u8, offset1: u8) {
+        // A two-address DS instruction indexes the two offsets by the size it
+        // moves rather than adding them as bytes.
+        let addr = (0..32)
+            .map(|elem| self.read_vgpr(elem, addr) as usize)
+            .collect::<Vec<usize>>();
+
+        let lds = self.lds.borrow_mut().as_mut_ptr();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            for (data, offset) in [(data0, offset0), (data1, offset1)] {
+                for i in 0..2 {
+                    let value = self.read_vgpr(elem, data + i);
+                    let byte = addr[elem] + (offset as usize) * 8 + i * 4;
+                    let ptr = lds.wrapping_add(byte) as *mut u32;
+                    unsafe {
+                        ptr.write_unaligned(value);
+                    }
+                }
+            }
+        }
+    }
+
     fn execute_ds(&mut self, inst: DS) -> Signals {
         let addr = inst.addr as usize;
         let data0 = inst.data0 as usize;
+        let data1 = inst.data1 as usize;
         let vdst = inst.vdst as usize;
         let offset0 = inst.offset0;
+        let offset1 = inst.offset1;
         match inst.op {
             I::DS_LOAD_U8 => {
-                self.ds_load_u8(addr, vdst, offset0);
+                self.ds_load_u8_16(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_I8 => {
+                self.ds_load_i8(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_U16 => {
+                self.ds_load_u16(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_I16 => {
+                self.ds_load_i16(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_B32 => {
+                self.ds_load_b32(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_B64 => {
+                self.ds_load_b64(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_B96 => {
+                self.ds_load_b96(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_B128 => {
+                self.ds_load_b128(addr, vdst, offset0, offset1);
             }
             I::DS_STORE_B8 => {
-                self.ds_store_b8(addr, data0, offset0);
+                self.ds_store_b8_16(addr, data0, offset0, offset1);
+            }
+            I::DS_STORE_B16 => {
+                self.ds_store_b16(addr, data0, offset0, offset1);
+            }
+            I::DS_STORE_B32 => {
+                self.ds_store_b32(addr, data0, offset0, offset1);
+            }
+            I::DS_STORE_B64 => {
+                self.ds_store_b64(addr, data0, offset0, offset1);
+            }
+            I::DS_STORE_B96 => {
+                self.ds_store_b96(addr, data0, offset0, offset1);
+            }
+            I::DS_STORE_B128 => {
+                self.ds_store_b128(addr, data0, offset0, offset1);
+            }
+            I::DS_LOAD_2ADDR_B32 => {
+                self.ds_load_2addr_b32(addr, vdst, offset0, offset1);
+            }
+            I::DS_LOAD_2ADDR_B64 => {
+                self.ds_load_2addr_b64(addr, vdst, offset0, offset1);
+            }
+            I::DS_STORE_2ADDR_B32 => {
+                self.ds_store_2addr_b32(addr, data0, data1, offset0, offset1);
+            }
+            I::DS_STORE_2ADDR_B64 => {
+                self.ds_store_2addr_b64(addr, data0, data1, offset0, offset1);
             }
             I::DS_BPERMUTE_B32 => {
                 self.ds_bpermute_b32(addr, data0, vdst, offset0);
@@ -12252,47 +12706,6 @@ impl SIMD32 {
                 as usize;
             let value = if active[lane] { values[lane] } else { 0 };
             self.write_vgpr(elem, vdst, value);
-        }
-    }
-
-    fn ds_load_u8(&mut self, addr: usize, vdst: usize, offset0: u8) {
-        let addr = (0..32)
-            .map(|elem| self.read_vgpr(elem, addr) as usize)
-            .collect::<Vec<usize>>();
-
-        let lds = self.lds.borrow().as_ptr();
-
-        for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
-            let addr = addr[elem] + (offset0 as usize);
-
-            let ptr = lds.wrapping_add(addr);
-            let data = unsafe { *ptr };
-
-            self.write_vgpr(elem, vdst, data as u32);
-        }
-    }
-
-    fn ds_store_b8(&mut self, addr: usize, data0: usize, offset0: u8) {
-        let addr = (0..32)
-            .map(|elem| self.read_vgpr(elem, addr) as usize)
-            .collect::<Vec<usize>>();
-
-        let lds = self.lds.borrow_mut().as_mut_ptr();
-
-        for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
-            let data = self.read_vgpr(elem, data0) as u8;
-            let addr = addr[elem] + (offset0 as usize);
-
-            let ptr = lds.wrapping_add(addr);
-            unsafe {
-                *ptr = data;
-            }
         }
     }
 
