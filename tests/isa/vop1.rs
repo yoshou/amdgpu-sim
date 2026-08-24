@@ -33,15 +33,16 @@ pub(crate) fn check_vop1_f32_ulp(op: u32, ulp: i64, cases: &[(u64, u32)]) {
                 continue;
             }
             // Special values are pinned by the manual in every case, so the
-            // tolerance never applies to them.
+            // tolerance never applies to them. A denormal result is not one of
+            // them: a flush to zero still fails here, since the flushed side is
+            // a zero, while a denormal an instruction's granted error apart
+            // from the hardware's is within what the manual allows.
             let special = is_nan_f32(*hw)
                 || is_nan_f32(got)
                 || is_zero_f32(*hw)
                 || is_zero_f32(got)
                 || is_inf_f32(*hw)
-                || is_inf_f32(got)
-                || is_denorm_f32(*hw)
-                || is_denorm_f32(got);
+                || is_inf_f32(got);
             let distance = ulp_f32(got, *hw);
             if !special && distance <= ulp {
                 continue;
@@ -102,9 +103,7 @@ pub(crate) fn check_vop1_f64_ulp(op: u32, ulp: i128, cases: &[(u64, u64)]) {
                 || is_zero_f64(*hw)
                 || is_zero_f64(got)
                 || is_inf_f64(*hw)
-                || is_inf_f64(got)
-                || is_denorm_f64(*hw)
-                || is_denorm_f64(got);
+                || is_inf_f64(got);
             let distance = ulp_f64(got, *hw);
             if !special && distance <= ulp {
                 continue;

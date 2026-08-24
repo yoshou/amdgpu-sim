@@ -76,14 +76,17 @@ pub(crate) fn check_vop3_f32_ulp(op: u32, ulp: i64, cases: &[Vop3F32]) {
             if got == case.expected {
                 continue;
             }
+            // Special values are pinned by the manual in every case, so the
+            // tolerance never applies to them. A denormal result is not one of
+            // them: a flush to zero still fails here, since the flushed side is
+            // a zero, while a denormal an instruction's granted error apart
+            // from the hardware's is within what the manual allows.
             let special = is_nan_f32(case.expected)
                 || is_nan_f32(got)
                 || is_zero_f32(case.expected)
                 || is_zero_f32(got)
                 || is_inf_f32(case.expected)
-                || is_inf_f32(got)
-                || is_denorm_f32(case.expected)
-                || is_denorm_f32(got);
+                || is_inf_f32(got);
             let distance = ulp_f32(got, case.expected);
             if !special && distance <= ulp {
                 continue;
@@ -175,14 +178,17 @@ pub(crate) fn check_vop3_f64_ulp(op: u32, ulp: i128, cases: &[Vop3F64]) {
             if got == case.expected {
                 continue;
             }
+            // Special values are pinned by the manual in every case, so the
+            // tolerance never applies to them. A denormal result is not one of
+            // them: a flush to zero still fails here, since the flushed side is
+            // a zero, while a denormal an instruction's granted error apart
+            // from the hardware's is within what the manual allows.
             let special = is_nan_f64(case.expected)
                 || is_nan_f64(got)
                 || is_zero_f64(case.expected)
                 || is_zero_f64(got)
                 || is_inf_f64(case.expected)
-                || is_inf_f64(got)
-                || is_denorm_f64(case.expected)
-                || is_denorm_f64(got);
+                || is_inf_f64(got);
             let distance = ulp_f64(got, case.expected);
             if !special && distance <= ulp {
                 continue;

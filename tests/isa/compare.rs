@@ -17,10 +17,6 @@ pub(crate) fn is_zero_f32(bits: u32) -> bool {
     (bits & 0x7FFF_FFFF) == 0
 }
 
-pub(crate) fn is_denorm_f32(bits: u32) -> bool {
-    (bits & 0x7F80_0000) == 0 && (bits & 0x007F_FFFF) != 0
-}
-
 /// Monotone map from an f32 bit pattern to an ordered integer; the difference
 /// between two such integers is the ULP distance.
 pub(crate) fn ordered_f32(bits: u32) -> i64 {
@@ -49,10 +45,6 @@ pub(crate) fn is_inf_f64(bits: u64) -> bool {
 
 pub(crate) fn is_zero_f64(bits: u64) -> bool {
     (bits & 0x7FFF_FFFF_FFFF_FFFF) == 0
-}
-
-pub(crate) fn is_denorm_f64(bits: u64) -> bool {
-    (bits & 0x7FF0_0000_0000_0000) == 0 && (bits & 0x000F_FFFF_FFFF_FFFF) != 0
 }
 
 pub(crate) fn ordered_f64(bits: u64) -> i128 {
