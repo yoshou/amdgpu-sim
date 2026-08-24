@@ -18,4 +18,5 @@ mod harness;
 mod vop1;
 mod vop2;
 mod vop3;
+mod salu;
 mod vopc;

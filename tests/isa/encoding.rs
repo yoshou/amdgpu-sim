@@ -87,3 +87,30 @@ pub(crate) const fn vop3_sdst(op: u32, sdst: u32, src0: u32, src1: u32, abs: u32
     let hi = src0 | (src1 << 9) | (neg << 29);
     [lo, hi]
 }
+
+/// SOP1: [31:23] = 101111101, [22:16] = SDST, [15:8] = OP, [7:0] = SSRC0.
+pub(crate) const fn sop1(op: u32, sdst: u32, ssrc0: u32) -> u32 {
+    (0b101111101 << 23) | (sdst << 16) | (op << 8) | ssrc0
+}
+
+/// SOP2: [31:30] = 10, [29:23] = OP, [22:16] = SDST, [15:8] = SSRC1,
+/// [7:0] = SSRC0.
+pub(crate) const fn sop2(op: u32, sdst: u32, ssrc1: u32, ssrc0: u32) -> u32 {
+    (0b10 << 30) | (op << 23) | (sdst << 16) | (ssrc1 << 8) | ssrc0
+}
+
+/// SOPC: [31:23] = 101111110, [22:16] = OP, [15:8] = SSRC1, [7:0] = SSRC0.
+/// There is no destination field: the result is SCC.
+pub(crate) const fn sopc(op: u32, ssrc1: u32, ssrc0: u32) -> u32 {
+    (0b101111110 << 23) | (op << 16) | (ssrc1 << 8) | ssrc0
+}
+
+/// SOPK: [31:28] = 1011, [27:23] = OP, [22:16] = SDST, [15:0] = SIMM16.
+pub(crate) const fn sopk(op: u32, sdst: u32, simm16: u32) -> u32 {
+    (0b1011 << 28) | (op << 23) | (sdst << 16) | simm16
+}
+
+/// SOPP: [31:23] = 101111111, [22:16] = OP, [15:0] = SIMM16.
+pub(crate) const fn sopp(op: u32, simm16: u32) -> u32 {
+    (0b101111111 << 23) | (op << 16) | simm16
+}
