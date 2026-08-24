@@ -341,6 +341,32 @@ impl IREmitter {
         value
     }
 
+    /// The ISA requires a FRACT result below 1.0, but `x - floor(x)` rounds up to
+    /// exactly 1.0 for a tiny negative x, so it is held at the value just below.
+    pub(crate) unsafe fn emit_fract_below_one(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let ty = llvm::core::LLVMTypeOf(value);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let elem_ty = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let below_one = llvm::core::LLVMConstReal(elem_ty, f64::from_bits(0x3FEF_FFFF_FFFF_FFFF));
+        let limit = if is_vector {
+            let lanes = llvm::core::LLVMGetVectorSize(ty);
+            llvm::core::LLVMConstVector(vec![below_one; lanes as usize].as_mut_ptr(), lanes)
+        } else {
+            below_one
+        };
+        // minnum keeps the other operand when one is NaN, which is what the
+        // hardware does for an infinite input.
+        let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty]);
+        intrinsic.emit_call(ty, &[value, limit])
+    }
+
     /// The transcendental unit flushes denormals on input and on output, whatever
     /// the mode register says (ISA §V_RCP_F32, §V_SQRT_F32, §V_RSQ_F32). The
     /// value keeps its sign, so a negative denormal becomes -0.

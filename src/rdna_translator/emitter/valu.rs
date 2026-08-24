@@ -2641,6 +2641,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_fract_below_one(d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2660,6 +2661,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_fract_below_one(d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb

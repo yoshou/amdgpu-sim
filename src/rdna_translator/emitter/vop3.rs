@@ -2142,6 +2142,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_fract_below_one(d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2164,6 +2165,7 @@ impl IREmitter {
                         );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_fract_below_one(d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb
