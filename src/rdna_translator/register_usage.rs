@@ -2108,6 +2108,21 @@ impl RDNATranslator {
                 }
             },
             InstFormat::SOP2(inst) => match inst.op {
+                I::S_LSHR_B64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.use_operand_u64(&inst.ssrc1);
+                    reg_usage.def_sgpr_u64(inst.sdst as u32);
+                }
+                I::S_ASHR_I64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.use_operand_u64(&inst.ssrc1);
+                    reg_usage.def_sgpr_u64(inst.sdst as u32);
+                }
+                I::S_CSELECT_B64 => {
+                    reg_usage.use_operand_u64(&inst.ssrc0);
+                    reg_usage.use_operand_u64(&inst.ssrc1);
+                    reg_usage.def_sgpr_u64(inst.sdst as u32);
+                }
                 I::S_AND_B64 => {
                     reg_usage.use_operand_u64(&inst.ssrc0);
                     reg_usage.use_operand_u64(&inst.ssrc1);
