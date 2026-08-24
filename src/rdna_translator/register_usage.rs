@@ -717,6 +717,46 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOP3(inst) => match inst.op {
+                I::V_CMP_GE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NGE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NGE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NLE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NLE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_NLT_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_O_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
+                I::V_CMP_O_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_operand_f64(&inst.src1);
+                    reg_usage.def_sgpr_u32(inst.vdst as u32);
+                }
                 I::V_MAD_U32_U24 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
