@@ -1420,6 +1420,15 @@ impl SIMD32 {
                 let pc = self.ctx.pc + 4 + self.insts.as_ptr() as u64;
                 self.write_sop_dst_pair(d, pc);
             }
+                        I::S_CVT_I32_F32 => {
+                self.s_cvt_i32_f32(d, s0);
+            }
+            I::S_CVT_U32_F32 => {
+                self.s_cvt_u32_f32(d, s0);
+            }
+            I::S_XOR_SAVEEXEC_B32 => {
+                self.s_xor_saveexec_b32(d, s0);
+            }
             op => unimplemented!("{:?}", op),
         }
 
@@ -1568,6 +1577,24 @@ impl SIMD32 {
             I::S_BFE_U32 => {
                 self.s_bfe_u32(d, s0, s1);
             }
+                        I::S_AND_B64 => {
+                self.s_and_b64(d, s0, s1);
+            }
+            I::S_OR_B64 => {
+                self.s_or_b64(d, s0, s1);
+            }
+            I::S_XOR_B64 => {
+                self.s_xor_b64(d, s0, s1);
+            }
+            I::S_ASHR_I64 => {
+                self.s_ashr_i64(d, s0, s1);
+            }
+            I::S_LSHR_B64 => {
+                self.s_lshr_b64(d, s0, s1);
+            }
+            I::S_CSELECT_B64 => {
+                self.s_cselect_b64(d, s0, s1);
+            }
             op => unimplemented!("{:?}", op),
         }
         Signals::None
@@ -1594,6 +1621,111 @@ impl SIMD32 {
         let s1_value = self.read_scalar_source_operand_u64(s1);
         let d_value = s0_value.wrapping_add(s1_value);
         self.write_sop_dst_pair(d, d_value);
+    }
+
+    fn s_cvt_i32_f32(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = u32_to_f32(self.read_scalar_source_operand_u32(s0));
+        self.write_sop_dst(d, s0_value as i32 as u32);
+    }
+
+    fn s_cvt_u32_f32(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = u32_to_f32(self.read_scalar_source_operand_u32(s0));
+        self.write_sop_dst(d, s0_value as u32);
+    }
+
+    fn s_xor_saveexec_b32(&mut self, d: usize, s0: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let exec_value = self.get_exec();
+
+        self.write_sop_dst(d, exec_value);
+
+        let exec_value = s0_value ^ exec_value;
+
+        self.set_exec(exec_value);
+        self.ctx.scc = exec_value != 0;
+    }
+
+    fn s_and_b64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let s1_value = self.read_scalar_source_operand_u64(s1);
+        let d_value = s0_value & s1_value;
+        self.write_sop_dst_pair(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_or_b64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let s1_value = self.read_scalar_source_operand_u64(s1);
+        let d_value = s0_value | s1_value;
+        self.write_sop_dst_pair(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_xor_b64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let s1_value = self.read_scalar_source_operand_u64(s1);
+        let d_value = s0_value ^ s1_value;
+        self.write_sop_dst_pair(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_ashr_i64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0) as i64;
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = (s0_value >> (s1_value & 0x3F)) as u64;
+        self.write_sop_dst_pair(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_lshr_b64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        let d_value = s0_value >> (s1_value & 0x3F);
+        self.write_sop_dst_pair(d, d_value);
+        self.ctx.scc = d_value != 0;
+    }
+
+    fn s_cselect_b64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u64(s0);
+        let s1_value = self.read_scalar_source_operand_u64(s1);
+        let d_value = if self.ctx.scc { s0_value } else { s1_value };
+        self.write_sop_dst_pair(d, d_value);
+    }
+
+    fn s_cmp_eq_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        self.ctx.scc = s0_value == s1_value;
+    }
+
+    fn s_cmp_ge_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        self.ctx.scc = s0_value >= s1_value;
+    }
+
+    fn s_cmp_gt_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        self.ctx.scc = s0_value > s1_value;
+    }
+
+    fn s_cmp_le_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        self.ctx.scc = s0_value <= s1_value;
+    }
+
+    fn s_cmp_lg_i32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0) as i32;
+        let s1_value = self.read_scalar_source_operand_u32(s1) as i32;
+        self.ctx.scc = s0_value != s1_value;
+    }
+
+    fn s_cmp_le_u32(&mut self, s0: SourceOperand, s1: SourceOperand) {
+        let s0_value = self.read_scalar_source_operand_u32(s0);
+        let s1_value = self.read_scalar_source_operand_u32(s1);
+        self.ctx.scc = s0_value <= s1_value;
     }
 
     fn s_and_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
@@ -1757,6 +1889,24 @@ impl SIMD32 {
             I::S_CMP_EQ_U64 => {
                 self.s_cmp_eq_u64(s0, s1);
             }
+                        I::S_CMP_EQ_I32 => {
+                self.s_cmp_eq_i32(s0, s1);
+            }
+            I::S_CMP_GE_I32 => {
+                self.s_cmp_ge_i32(s0, s1);
+            }
+            I::S_CMP_GT_I32 => {
+                self.s_cmp_gt_i32(s0, s1);
+            }
+            I::S_CMP_LE_I32 => {
+                self.s_cmp_le_i32(s0, s1);
+            }
+            I::S_CMP_LG_I32 => {
+                self.s_cmp_lg_i32(s0, s1);
+            }
+            I::S_CMP_LE_U32 => {
+                self.s_cmp_le_u32(s0, s1);
+            }
             op => unimplemented!("{:?}", op),
         }
         Signals::None
@@ -1817,6 +1967,15 @@ impl SIMD32 {
         match inst.op {
             I::S_MOVK_I32 => {
                 self.write_sop_dst(d, simm16 as i32 as u32);
+            }
+                        I::S_CMOVK_I32 => {
+                if self.ctx.scc {
+                    self.write_sop_dst(d, simm16 as i32 as u32);
+                }
+            }
+            I::S_MULK_I32 => {
+                let d_value = (self.read_sgpr(d) as i32).wrapping_mul(simm16 as i32);
+                self.write_sop_dst(d, d_value as u32);
             }
             op => unimplemented!("{:?}", op),
         }
