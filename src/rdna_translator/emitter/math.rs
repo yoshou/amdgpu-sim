@@ -367,6 +367,51 @@ impl IREmitter {
         intrinsic.emit_call(ty, &[value, limit])
     }
 
+    /// ABS and NEG act on the sign bit of the operand, whatever the instruction
+    /// reads it as, so an integer compare sees them too.
+    pub(crate) unsafe fn emit_abs_neg_bits(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+        abs: u8,
+        neg: u8,
+        idx: u32,
+    ) -> llvm::prelude::LLVMValueRef {
+        if ((abs >> idx) & 1) == 0 && ((neg >> idx) & 1) == 0 {
+            return value;
+        }
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(value);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let elem_ty = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let width = llvm::core::LLVMGetIntTypeWidth(elem_ty);
+        let splat = |bits: u64| {
+            let constant = llvm::core::LLVMConstInt(elem_ty, bits, 0);
+            if is_vector {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+        let sign = 1u64 << (width - 1);
+
+        let mut result = value;
+        if ((abs >> idx) & 1) != 0 {
+            let mask = splat(!sign & ((1u128 << width) - 1) as u64);
+            result = llvm::core::LLVMBuildAnd(builder, result, mask, empty_name.as_ptr());
+        }
+        if ((neg >> idx) & 1) != 0 {
+            let mask = splat(sign);
+            result = llvm::core::LLVMBuildXor(builder, result, mask, empty_name.as_ptr());
+        }
+        result
+    }
+
     /// The transcendental unit flushes denormals on input and on output, whatever
     /// the mode register says (ISA §V_RCP_F32, §V_SQRT_F32, §V_RSQ_F32). The
     /// value keeps its sign, so a negative denormal becomes -0.

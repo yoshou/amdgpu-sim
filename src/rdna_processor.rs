@@ -423,6 +423,20 @@ fn f32_to_u32(value: f32) -> u32 {
     f32::to_bits(value)
 }
 
+/// ABS and NEG act on the sign bit of the operand, whatever the compare reads it
+/// as, so an integer compare sees them too.
+fn abs_neg_bits(value: u64, abs: u8, neg: u8, idx: usize, width: u32) -> u64 {
+    let sign = 1u64 << (width - 1);
+    let mut result = value;
+    if ((abs >> idx) & 1) != 0 {
+        result &= !sign;
+    }
+    if ((neg >> idx) & 1) != 0 {
+        result ^= sign;
+    }
+    result
+}
+
 fn abs_neg<T: num::Float>(value: T, abs: u8, neg: u8, idx: usize) -> T {
     let mut result = value;
     if ((abs >> idx) & 1) != 0 {
@@ -2818,13 +2832,13 @@ impl SIMD32 {
                 self.v_ashrrev_i32_e64(d, s0, s1);
             }
             I::V_CMP_EQ_U16 => {
-                self.v_cmp_eq_u16_e64(d, s0, s1);
+                self.v_cmp_eq_u16_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GT_U16 => {
-                self.v_cmp_gt_u16_e64(d, s0, s1);
+                self.v_cmp_gt_u16_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LT_U32 => {
-                self.v_cmp_lt_u32_e64(d, s0, s1);
+                self.v_cmp_lt_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_MUL_LO_U32 => {
                 self.v_mul_lo_u32(d, s0, s1);
@@ -2986,28 +3000,28 @@ impl SIMD32 {
                 self.v_add_lshl_u32(d, s0, s1, s2);
             }
             I::V_CMP_NE_U32 => {
-                self.v_cmp_ne_u32_e64(d, s0, s1);
+                self.v_cmp_ne_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_EQ_U32 => {
-                self.v_cmp_eq_u32_e64(d, s0, s1);
+                self.v_cmp_eq_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GT_U32 => {
-                self.v_cmp_gt_u32_e64(d, s0, s1);
+                self.v_cmp_gt_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GE_U32 => {
-                self.v_cmp_ge_u32_e64(d, s0, s1);
+                self.v_cmp_ge_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_NE_U32 => {
-                self.v_cmpx_ne_u32_e64(d, s0, s1);
+                self.v_cmpx_ne_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GT_I32 => {
-                self.v_cmp_gt_i32_e64(d, s0, s1);
+                self.v_cmp_gt_i32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LT_U64 => {
-                self.v_cmp_lt_u64_e64(d, s0, s1);
+                self.v_cmp_lt_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_EQ_U64 => {
-                self.v_cmp_eq_u64_e64(d, s0, s1);
+                self.v_cmp_eq_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_TRIG_PREOP_F64 => {
                 self.v_trig_preop_f64(d, s0, s1, abs, neg, clamp, omod);
@@ -3058,16 +3072,16 @@ impl SIMD32 {
                 self.v_sqrt_f32_e64(d, s0, abs, neg, clamp, omod);
             }
                         I::V_CMPX_EQ_U32 => {
-                self.v_cmpx_eq_u32_e64(d, s0, s1);
+                self.v_cmpx_eq_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GT_U32 => {
-                self.v_cmpx_gt_u32_e64(d, s0, s1);
+                self.v_cmpx_gt_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LT_I32 => {
-                self.v_cmpx_lt_i32_e64(d, s0, s1);
+                self.v_cmpx_lt_i32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LT_U32 => {
-                self.v_cmpx_lt_u32_e64(d, s0, s1);
+                self.v_cmpx_lt_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_NGE_F64 => {
                 self.v_cmpx_nge_f64_e64(d, s0, s1);
@@ -3079,7 +3093,7 @@ impl SIMD32 {
                 self.v_cmpx_nlt_f64_e64(d, s0, s1);
             }
             I::V_CMP_GT_U64 => {
-                self.v_cmp_gt_u64_e64(d, s0, s1);
+                self.v_cmp_gt_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_NGT_F32 => {
                 self.v_cmp_ngt_f32_e64(d, s0, s1);
@@ -3091,10 +3105,10 @@ impl SIMD32 {
                 self.v_cmpx_eq_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMPX_EQ_I64 => {
-                self.v_cmpx_eq_i64_e64(d, s0, s1);
+                self.v_cmpx_eq_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_EQ_U64 => {
-                self.v_cmpx_eq_u64_e64(d, s0, s1);
+                self.v_cmpx_eq_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GE_F32 => {
                 self.v_cmpx_ge_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3103,13 +3117,13 @@ impl SIMD32 {
                 self.v_cmpx_ge_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMPX_GE_I64 => {
-                self.v_cmpx_ge_i64_e64(d, s0, s1);
+                self.v_cmpx_ge_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GE_U32 => {
-                self.v_cmpx_ge_u32_e64(d, s0, s1);
+                self.v_cmpx_ge_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GE_U64 => {
-                self.v_cmpx_ge_u64_e64(d, s0, s1);
+                self.v_cmpx_ge_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GT_F32 => {
                 self.v_cmpx_gt_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3118,13 +3132,13 @@ impl SIMD32 {
                 self.v_cmpx_gt_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMPX_GT_I32 => {
-                self.v_cmpx_gt_i32_e64(d, s0, s1);
+                self.v_cmpx_gt_i32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GT_I64 => {
-                self.v_cmpx_gt_i64_e64(d, s0, s1);
+                self.v_cmpx_gt_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_GT_U64 => {
-                self.v_cmpx_gt_u64_e64(d, s0, s1);
+                self.v_cmpx_gt_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LE_F32 => {
                 self.v_cmpx_le_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3133,13 +3147,13 @@ impl SIMD32 {
                 self.v_cmpx_le_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMPX_LE_I64 => {
-                self.v_cmpx_le_i64_e64(d, s0, s1);
+                self.v_cmpx_le_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LE_U32 => {
-                self.v_cmpx_le_u32_e64(d, s0, s1);
+                self.v_cmpx_le_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LE_U64 => {
-                self.v_cmpx_le_u64_e64(d, s0, s1);
+                self.v_cmpx_le_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LG_F32 => {
                 self.v_cmpx_lg_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3154,10 +3168,10 @@ impl SIMD32 {
                 self.v_cmpx_lt_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMPX_LT_I64 => {
-                self.v_cmpx_lt_i64_e64(d, s0, s1);
+                self.v_cmpx_lt_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_LT_U64 => {
-                self.v_cmpx_lt_u64_e64(d, s0, s1);
+                self.v_cmpx_lt_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_NEQ_F32 => {
                 self.v_cmpx_neq_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3166,10 +3180,10 @@ impl SIMD32 {
                 self.v_cmpx_neq_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMPX_NE_I64 => {
-                self.v_cmpx_ne_i64_e64(d, s0, s1);
+                self.v_cmpx_ne_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_NE_U64 => {
-                self.v_cmpx_ne_u64_e64(d, s0, s1);
+                self.v_cmpx_ne_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMPX_NGE_F32 => {
                 self.v_cmpx_nge_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3193,43 +3207,43 @@ impl SIMD32 {
                 self.v_cmp_eq_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMP_EQ_I64 => {
-                self.v_cmp_eq_i64_e64(d, s0, s1);
+                self.v_cmp_eq_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GE_F64 => {
                 self.v_cmp_ge_f64_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMP_GE_I64 => {
-                self.v_cmp_ge_i64_e64(d, s0, s1);
+                self.v_cmp_ge_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GE_U64 => {
-                self.v_cmp_ge_u64_e64(d, s0, s1);
+                self.v_cmp_ge_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_GT_I64 => {
-                self.v_cmp_gt_i64_e64(d, s0, s1);
+                self.v_cmp_gt_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LE_I64 => {
-                self.v_cmp_le_i64_e64(d, s0, s1);
+                self.v_cmp_le_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LE_U32 => {
-                self.v_cmp_le_u32_e64(d, s0, s1);
+                self.v_cmp_le_u32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LE_U64 => {
-                self.v_cmp_le_u64_e64(d, s0, s1);
+                self.v_cmp_le_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LT_I32 => {
-                self.v_cmp_lt_i32_e64(d, s0, s1);
+                self.v_cmp_lt_i32_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_LT_I64 => {
-                self.v_cmp_lt_i64_e64(d, s0, s1);
+                self.v_cmp_lt_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_NEQ_F32 => {
                 self.v_cmp_neq_f32_e64(d, s0, s1, abs, neg, clamp, omod);
             }
             I::V_CMP_NE_I64 => {
-                self.v_cmp_ne_i64_e64(d, s0, s1);
+                self.v_cmp_ne_i64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_NE_U64 => {
-                self.v_cmp_ne_u64_e64(d, s0, s1);
+                self.v_cmp_ne_u64_e64(d, s0, s1, abs, neg);
             }
             I::V_CMP_NGE_F32 => {
                 self.v_cmp_nge_f32_e64(d, s0, s1, abs, neg, clamp, omod);
@@ -3439,14 +3453,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_eq_u16_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_eq_u16_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
-            let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as u16;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as u16;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -3458,14 +3479,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_gt_u16_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_gt_u16_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
-            let s1_value = self.read_vector_source_operand_u32(elem, s1) as u16;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as u16;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as u16;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -3477,14 +3505,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_lt_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_lt_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4522,14 +4557,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_eq_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_eq_u32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4541,14 +4583,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_gt_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_gt_u32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4560,14 +4609,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_lt_i32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_lt_i32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as i32;
-            let s1_value = self.read_vector_source_operand_u32(elem, s1) as i32;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as i32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as i32;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4579,14 +4635,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_lt_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_lt_u32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4655,14 +4718,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_gt_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_gt_u64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4670,7 +4740,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
 
@@ -4689,7 +4759,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+            self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
 
@@ -4787,14 +4857,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_eq_i64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_eq_i64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4825,14 +4902,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_eq_u64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_eq_u64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4957,14 +5041,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_ge_i64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_ge_i64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value >= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -4995,14 +5086,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_ge_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_ge_u32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value >= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5033,14 +5131,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_ge_u64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_ge_u64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value >= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5165,14 +5270,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_gt_i32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_gt_i32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as i32;
-            let s1_value = self.read_vector_source_operand_u32(elem, s1) as i32;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as i32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as i32;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5203,14 +5315,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_gt_i64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_gt_i64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5241,14 +5360,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_gt_u64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_gt_u64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5373,14 +5499,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_le_i64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_le_i64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value <= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5411,14 +5544,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_le_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_le_u32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value <= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5449,14 +5589,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_le_u64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_le_u64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value <= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5679,14 +5826,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_lt_i64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_lt_i64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5717,14 +5871,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_lt_u64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_lt_u64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5849,14 +6010,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_ne_i64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_ne_i64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -5887,14 +6055,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_ne_u64_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_ne_u64_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6254,14 +6429,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_eq_i64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_eq_i64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6339,14 +6521,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_ge_i64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_ge_i64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value >= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6377,14 +6566,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_ge_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_ge_u64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value >= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6415,14 +6611,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_gt_i64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_gt_i64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6453,14 +6656,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_le_i64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_le_i64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value <= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6491,14 +6701,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_le_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_le_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value <= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6529,14 +6746,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_le_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_le_u64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value <= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6567,14 +6791,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_lt_i32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_lt_i32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as i32;
-            let s1_value = self.read_vector_source_operand_u32(elem, s1) as i32;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as i32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as i32;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6605,14 +6836,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_lt_i64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_lt_i64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6690,14 +6928,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_ne_i64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_ne_i64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0) as i64;
-            let s1_value = self.read_vector_source_operand_u64(elem, s1) as i64;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64 as i64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64 as i64;
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -6728,14 +6973,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_ne_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_ne_u64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8426,14 +8678,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_ne_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_ne_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8445,14 +8704,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_eq_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_eq_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8464,14 +8730,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_gt_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_gt_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8483,14 +8756,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_ge_u32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_ge_u32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value >= s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8502,14 +8782,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmpx_ne_u32_e64(&mut self, _d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmpx_ne_u32_e64(
+        &mut self,
+        _d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0);
-            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32;
             let d_value = s0_value != s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8521,14 +8808,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_gt_i32_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_gt_i32_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u32(elem, s0) as i32;
-            let s1_value = self.read_vector_source_operand_u32(elem, s1) as i32;
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s0) as u64, abs, neg, 0, 32) as u32 as i32;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u32(elem, s1) as u64, abs, neg, 1, 32) as u32 as i32;
             let d_value = s0_value > s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8540,14 +8834,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_lt_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_lt_u64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value < s1_value;
             vcc |= (d_value as u32) << elem;
         }
@@ -8559,14 +8860,21 @@ impl SIMD32 {
         }
     }
 
-    fn v_cmp_eq_u64_e64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
+    fn v_cmp_eq_u64_e64(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
         let mut vcc = 0u32;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let s0_value = self.read_vector_source_operand_u64(elem, s0);
-            let s1_value = self.read_vector_source_operand_u64(elem, s1);
+            let s0_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s0) as u64, abs, neg, 0, 64) as u64;
+            let s1_value = abs_neg_bits(self.read_vector_source_operand_u64(elem, s1) as u64, abs, neg, 1, 64) as u64;
             let d_value = s0_value == s1_value;
             vcc |= (d_value as u32) << elem;
         }
