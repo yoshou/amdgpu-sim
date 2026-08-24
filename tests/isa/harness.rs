@@ -16,6 +16,12 @@ use std::io::Read;
 
 pub(crate) const LANES: usize = 32;
 
+/// The pattern the memory harness puts in its buffer: word `k` holds this, so a
+/// loaded value says which address it came from.
+pub(crate) const fn data_word(k: u32) -> u32 {
+    0xA000_0000 | k.wrapping_mul(0x0101_0101)
+}
+
 /// One instruction format's harness kernel: where it puts the sources, what it
 /// reads back, and the slot it executes in between.
 pub(crate) struct Harness {
@@ -81,6 +87,10 @@ impl Harness {
 
     pub(crate) fn salu() -> Self {
         Self::load("harness_salu.kd", 0x5555_5555, 4, 4)
+    }
+
+    pub(crate) fn mem() -> Self {
+        Self::load("harness_mem.kd", 0x6666_6666, 2, 16)
     }
 
     pub(crate) fn load(kernel: &str, marker_literal: u32, src_stride: usize, out_stride: usize) -> Self {
@@ -152,10 +162,17 @@ impl Harness {
         }
 
         let mut out = vec![0u32; LANES * self.out_stride];
+        // The memory harness takes a fourth argument: the buffer it loads from
+        // and stores into. Word k holds a value that identifies k, so a loaded
+        // value says which address it came from.
+        let mut data: Vec<u32> = (0..256u32).map(data_word).collect();
         let mut arg_buffer = vec![0u8; self.kernarg_size];
         set_u64(&mut arg_buffer, 0, out.as_mut_ptr() as u64);
         set_u64(&mut arg_buffer, 8, src.as_ptr() as u64);
         set_u64(&mut arg_buffer, 16, uni.as_ptr() as u64);
+        if self.kernarg_size >= 32 {
+            set_u64(&mut arg_buffer, 24, data.as_mut_ptr() as u64);
+        }
 
         let aql = HsaKernelDispatchPacket {
             header: 0,

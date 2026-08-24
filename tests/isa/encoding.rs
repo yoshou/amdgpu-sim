@@ -114,3 +114,45 @@ pub(crate) const fn sopk(op: u32, sdst: u32, simm16: u32) -> u32 {
 pub(crate) const fn sopp(op: u32, simm16: u32) -> u32 {
     (0b101111111 << 23) | (op << 16) | simm16
 }
+
+/// The FLAT-family encodings, which differ only in these top bits.
+pub(crate) const VFLAT: u32 = 0b1110_1100;
+pub(crate) const VGLOBAL: u32 = 0b1110_1110;
+pub(crate) const VSCRATCH: u32 = 0b1110_1101;
+
+/// SADDR = NULL, meaning the address is the full 64 bits in the VGPR pair
+/// rather than an SGPR base plus a 32-bit offset.
+pub(crate) const SADDR_NULL: u32 = 0x7C;
+
+/// A FLAT, GLOBAL or SCRATCH instruction: three dwords.
+/// word0 [31:24] = encoding, [21:14] = OP, [6:0] = SADDR.
+/// word1 [7:0] = VDST, [30:23] = VSRC.
+/// word2 [7:0] = VADDR, [31:8] = IOFFSET (signed).
+pub(crate) const fn vmem(enc: u32, op: u32, vdst: u32, vsrc: u32, vaddr: u32, saddr: u32, ioffset: i32) -> [u32; 3] {
+    [
+        (enc << 24) | (op << 14) | saddr,
+        vdst | (vsrc << 23),
+        (vaddr & 0xFF) | (((ioffset as u32) & 0x00FF_FFFF) << 8),
+    ]
+}
+
+/// SMEM: [31:26] = 111101, [18:13] = OP, [12:6] = SDATA, [5:0] = SBASE,
+/// IOFFSET in [55:32] and SOFFSET in [63:57]. SBASE is a register *pair* index,
+/// so s[10:11] is 5. SOFFSET must be NULL, or the SGPR it names is added to the
+/// address.
+pub(crate) const fn smem(op: u32, sdata: u32, sbase: u32, ioffset: i32) -> [u32; 2] {
+    [
+        (0b111101 << 26) | (op << 13) | (sdata << 6) | sbase,
+        ((ioffset as u32) & 0x00FF_FFFF) | (SADDR_NULL << 25),
+    ]
+}
+
+/// DS: [31:26] = 110110, [24:17] = OP, and the second dword carries
+/// [7:0] ADDR, [15:8] DATA0, [23:16] DATA1, [31:24] VDST, with the two byte
+/// offsets in [15:0] of the first dword.
+pub(crate) const fn ds(op: u32, vdst: u32, addr: u32, data0: u32, offset0: u32) -> [u32; 2] {
+    [
+        (0b110110 << 26) | (op << 17) | (offset0 & 0xFF),
+        addr | (data0 << 8) | (vdst << 24),
+    ]
+}
