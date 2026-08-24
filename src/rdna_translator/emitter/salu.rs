@@ -959,6 +959,126 @@ impl IREmitter {
 
                 emitter.emit_store_scc_u8(scc_value);
             }
+            I::S_CMP_EQ_I32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntEQ,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_CMP_LG_I32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntNE,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_CMP_GT_I32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntSGT,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_CMP_GE_I32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntSGE,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_CMP_LE_I32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntSLE,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_CMP_LE_U32 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntULE,
+                    s0_value,
+                    s1_value,
+                    empty_name.as_ptr(),
+                );
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
             I::S_CMP_LT_U32 => {
                 let emitter = self;
                 let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);

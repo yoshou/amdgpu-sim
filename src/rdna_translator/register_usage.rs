@@ -2198,6 +2198,30 @@ impl RDNATranslator {
                 }
             },
             InstFormat::SOPC(inst) => match inst.op {
+                I::S_CMP_EQ_I32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_GE_I32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_GT_I32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_LE_I32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_LE_U32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
+                I::S_CMP_LG_I32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                }
                 I::S_CMP_LG_U32 => {
                     reg_usage.use_operand_u32(&inst.ssrc0);
                     reg_usage.use_operand_u32(&inst.ssrc1);
