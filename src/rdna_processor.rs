@@ -7085,7 +7085,7 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
             let d_value = s0_value.ceil();
-            self.write_vgpr(elem, d, f32_to_u32(d_value));
+            self.write_vgpr(elem, d, f32_to_u32(quiet_nan_f32(d_value)));
         }
     }
 
@@ -7423,7 +7423,7 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
             let d_value = s0_value.floor();
-            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+            self.write_vgpr_pair(elem, d, f64_to_u64(quiet_nan_f64(d_value)));
         }
     }
 
@@ -7453,7 +7453,7 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
             let d_value = s0_value.trunc();
-            self.write_vgpr(elem, d, f32_to_u32(d_value));
+            self.write_vgpr(elem, d, f32_to_u32(quiet_nan_f32(d_value)));
         }
     }
 
@@ -7483,7 +7483,7 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f64(elem, s0);
             let d_value = s0_value.trunc();
-            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+            self.write_vgpr_pair(elem, d, f64_to_u64(quiet_nan_f64(d_value)));
         }
     }
 
@@ -7555,7 +7555,7 @@ impl SIMD32 {
             } else {
                 libm::frexp(s0_value).0
             };
-            self.write_vgpr_pair(elem, d, f64_to_u64(d_value));
+            self.write_vgpr_pair(elem, d, f64_to_u64(quiet_nan_f64(d_value)));
         }
     }
 
