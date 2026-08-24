@@ -718,7 +718,7 @@ impl IREmitter {
                 let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
                 let empty_name = std::ffi::CString::new("").unwrap();
 
-                let s0_value = emitter.emit_scalar_source_operand_u64(&inst.ssrc0);
+                let s0_value = emitter.emit_scalar_source_operand_i64(&inst.ssrc0);
                 let s1_value = emitter.emit_scalar_source_operand_u64(&inst.ssrc1);
 
                 let s1_value = llvm::core::LLVMBuildAnd(
@@ -807,12 +807,33 @@ impl IREmitter {
                 let shifted =
                     llvm::core::LLVMBuildLShr(builder, s0_value, offset, empty_name.as_ptr());
 
-                // mask = (1 << width) - 1
+                // mask = (1 << width) - 1, and every bit once the 7-bit width
+                // reaches the width of the destination.
                 let one = llvm::core::LLVMConstInt(ty_i32, 1, 0);
-                let mask = llvm::core::LLVMBuildSub(
+                let narrow_width = llvm::core::LLVMBuildAnd(
                     builder,
-                    llvm::core::LLVMBuildShl(builder, one, width, empty_name.as_ptr()),
+                    width,
+                    llvm::core::LLVMConstInt(ty_i32, 0x1F, 0),
+                    empty_name.as_ptr(),
+                );
+                let narrow_mask = llvm::core::LLVMBuildSub(
+                    builder,
+                    llvm::core::LLVMBuildShl(builder, one, narrow_width, empty_name.as_ptr()),
                     one,
+                    empty_name.as_ptr(),
+                );
+                let is_wide = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntUGE,
+                    width,
+                    llvm::core::LLVMConstInt(ty_i32, 32, 0),
+                    empty_name.as_ptr(),
+                );
+                let mask = llvm::core::LLVMBuildSelect(
+                    builder,
+                    is_wide,
+                    llvm::core::LLVMConstInt(ty_i32, 0xFFFF_FFFF, 0),
+                    narrow_mask,
                     empty_name.as_ptr(),
                 );
 

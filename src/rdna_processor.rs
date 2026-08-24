@@ -1239,6 +1239,15 @@ impl SIMD32 {
         }
     }
 
+    /// A 32-bit literal reaching a signed 64-bit operand is sign-extended, where
+    /// an unsigned or bitwise one is zero-extended.
+    fn read_scalar_source_operand_i64(&self, addr: SourceOperand) -> i64 {
+        match addr {
+            SourceOperand::LiteralConstant(value) => value as i32 as i64,
+            _ => self.read_scalar_source_operand_u64(addr) as i64,
+        }
+    }
+
     fn read_vector_source_operand_u32(&self, elem: usize, addr: SourceOperand) -> u32 {
         match addr {
             SourceOperand::LiteralConstant(value) => value,
@@ -1713,7 +1722,7 @@ impl SIMD32 {
     }
 
     fn s_ashr_i64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
-        let s0_value = self.read_scalar_source_operand_u64(s0) as i64;
+        let s0_value = self.read_scalar_source_operand_i64(s0);
         let s1_value = self.read_scalar_source_operand_u32(s1);
         let d_value = (s0_value >> (s1_value & 0x3F)) as u64;
         self.write_sop_dst_pair(d, d_value);

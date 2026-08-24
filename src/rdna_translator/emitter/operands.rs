@@ -47,6 +47,23 @@ impl IREmitter {
         }
     }
 
+    /// A 32-bit literal reaching a signed 64-bit operand is sign-extended, where
+    /// an unsigned or bitwise one is zero-extended.
+    pub(crate) unsafe fn emit_scalar_source_operand_i64(
+        &mut self,
+        operand: &SourceOperand,
+    ) -> llvm::prelude::LLVMValueRef {
+        let context = self.context;
+        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+
+        match operand {
+            SourceOperand::LiteralConstant(value) => {
+                llvm::core::LLVMConstInt(ty_i64, *value as i32 as i64 as u64, 0)
+            }
+            _ => self.emit_scalar_source_operand_u64(operand),
+        }
+    }
+
     pub(crate) unsafe fn emit_vector_source_operand_u32(
         &mut self,
         operand: &SourceOperand,
