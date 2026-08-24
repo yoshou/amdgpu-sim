@@ -33,7 +33,6 @@ pub(crate) fn check_vop3_f32(op: u32, cases: &[Vop3F32]) {
 
 /// As above, with a tolerance on finite non-zero results.
 pub(crate) fn check_vop3_f32_ulp(op: u32, ulp: i64, cases: &[Vop3F32]) {
-    assert!(cases.len() <= LANES, "at most {} cases per call", LANES);
     let harness = Harness::vop3();
 
     let mut failures = Vec::new();
