@@ -1895,6 +1895,51 @@ impl RDNATranslator {
                     reg_usage.use_operand_u32(&inst.src1);
                     reg_usage.def_vgpr_f32(inst.vdst as u32);
                 }
+                I::V_OR_B32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_SUBREV_NC_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MAX_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MIN_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MUL_I32_I24 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MUL_U32_U24 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_MIN_NUM_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_SUB_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
+                I::V_SUBREV_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_operand_f32(&inst.src1);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }

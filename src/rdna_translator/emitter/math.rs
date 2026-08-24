@@ -460,6 +460,92 @@ impl IREmitter {
         result
     }
 
+    /// The hardware subtracts by negating and adding: a NaN operand comes through
+    /// quieted, and the negated one comes through with its sign flipped.
+    pub(crate) unsafe fn emit_sub_f32(
+        &mut self,
+        a: llvm::prelude::LLVMValueRef,
+        b: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let context = self.context;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(a);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let int_ty = if is_vector {
+            llvm::core::LLVMVectorType(ty_i32, llvm::core::LLVMGetVectorSize(ty))
+        } else {
+            ty_i32
+        };
+
+        let negated = llvm::core::LLVMBuildFNeg(builder, b, empty_name.as_ptr());
+        let sum = llvm::core::LLVMBuildFAdd(builder, a, negated, empty_name.as_ptr());
+
+        let mut quiet = |emitter: &mut Self, value: llvm::prelude::LLVMValueRef| {
+            let _ = &emitter;
+            let bits = llvm::core::LLVMBuildBitCast(builder, value, int_ty, empty_name.as_ptr());
+            let quiet_bit = llvm::core::LLVMConstInt(ty_i32, 0x0040_0000, 0);
+            let quiet_bit = if is_vector {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![quiet_bit; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                quiet_bit
+            };
+            let bits = llvm::core::LLVMBuildOr(builder, bits, quiet_bit, empty_name.as_ptr());
+            llvm::core::LLVMBuildBitCast(builder, bits, ty, empty_name.as_ptr())
+        };
+
+        let quiet_negated = quiet(self, negated);
+        let is_nan_negated = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            negated,
+            negated,
+            empty_name.as_ptr(),
+        );
+        let result = llvm::core::LLVMBuildSelect(
+            builder,
+            is_nan_negated,
+            quiet_negated,
+            sum,
+            empty_name.as_ptr(),
+        );
+
+        let quiet_a = quiet(self, a);
+        let is_nan_a = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            a,
+            a,
+            empty_name.as_ptr(),
+        );
+        llvm::core::LLVMBuildSelect(builder, is_nan_a, quiet_a, result, empty_name.as_ptr())
+    }
+
+    /// An integer constant shaped like `like`, which is either a scalar or a
+    /// vector of the same integer type.
+    pub(crate) unsafe fn emit_splat_u32(
+        &mut self,
+        value: u64,
+        like: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let ty = llvm::core::LLVMTypeOf(like);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let elem_ty = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let constant = llvm::core::LLVMConstInt(elem_ty, value, 0);
+        if is_vector {
+            let lanes = llvm::core::LLVMGetVectorSize(ty);
+            llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+        } else {
+            constant
+        }
+    }
+
     /// ABS and NEG act on the sign bit of the operand, whatever the instruction
     /// reads it as, so an integer compare sees them too.
     pub(crate) unsafe fn emit_abs_neg_bits(
@@ -611,115 +697,6 @@ impl IREmitter {
         let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty]);
         let clamped = intrinsic.emit_call(ty, &[clamped, zero]);
         llvm::core::LLVMBuildSelect(builder, is_nan, zero, clamped, empty_name.as_ptr())
-    }
-
-    pub(crate) unsafe fn emit_omod_clamp(
-        &mut self,
-        omod: u8,
-        clamp: u8,
-        value: llvm::prelude::LLVMValueRef,
-        idx: u32,
-    ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-
-        let value = if (omod >> idx) & 1 != 0 {
-            assert!(llvm::core::LLVMTypeOf(value) == ty_f64);
-            let two = llvm::core::LLVMConstReal(ty_f64, 2.0);
-            let four = llvm::core::LLVMConstReal(ty_f64, 4.0);
-            let half = llvm::core::LLVMConstReal(ty_f64, 0.5);
-
-            match idx {
-                0 => llvm::core::LLVMBuildFMul(builder, value, two, empty_name.as_ptr()),
-                1 => llvm::core::LLVMBuildFMul(builder, value, four, empty_name.as_ptr()),
-                2 => llvm::core::LLVMBuildFMul(builder, value, half, empty_name.as_ptr()),
-                _ => value,
-            }
-        } else {
-            value
-        };
-
-        let value = if (clamp >> idx) & 1 != 0 {
-            assert!(llvm::core::LLVMTypeOf(value) == ty_f64);
-            let zero = llvm::core::LLVMConstReal(ty_f64, 0.0);
-            let one = llvm::core::LLVMConstReal(ty_f64, 1.0);
-
-            let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_f64]);
-            let min_value = intrinsic.emit_call(ty_f64, &[value, one]);
-
-            let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64]);
-            let max_value = intrinsic.emit_call(ty_f64, &[min_value, zero]);
-
-            max_value
-        } else {
-            value
-        };
-
-        value
-    }
-
-    pub(crate) unsafe fn emit_omod_clamp_f64xn<const N: usize>(
-        &mut self,
-        omod: u8,
-        clamp: u8,
-        value: llvm::prelude::LLVMValueRef,
-        idx: u32,
-    ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-        let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
-
-        let value = if (omod >> idx) & 1 != 0 {
-            assert!(llvm::core::LLVMTypeOf(value) == ty_f64);
-            let two = llvm::core::LLVMConstVector(
-                [llvm::core::LLVMConstReal(ty_f64, 2.0); N].as_mut_ptr(),
-                N as u32,
-            );
-            let four = llvm::core::LLVMConstVector(
-                [llvm::core::LLVMConstReal(ty_f64, 4.0); N].as_mut_ptr(),
-                N as u32,
-            );
-            let half = llvm::core::LLVMConstVector(
-                [llvm::core::LLVMConstReal(ty_f64, 0.5); N].as_mut_ptr(),
-                N as u32,
-            );
-
-            match idx {
-                0 => llvm::core::LLVMBuildFMul(builder, value, two, empty_name.as_ptr()),
-                1 => llvm::core::LLVMBuildFMul(builder, value, four, empty_name.as_ptr()),
-                2 => llvm::core::LLVMBuildFMul(builder, value, half, empty_name.as_ptr()),
-                _ => value,
-            }
-        } else {
-            value
-        };
-
-        let value = if (clamp >> idx) & 1 != 0 {
-            let zero = llvm::core::LLVMConstVector(
-                [llvm::core::LLVMConstReal(ty_f64, 0.0); N].as_mut_ptr(),
-                N as u32,
-            );
-            let one = llvm::core::LLVMConstVector(
-                [llvm::core::LLVMConstReal(ty_f64, 1.0); N].as_mut_ptr(),
-                N as u32,
-            );
-
-            let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty_f64xn]);
-            let min_value = intrinsic.emit_call(ty_f64xn, &[value, one]);
-
-            let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64xn]);
-            let max_value = intrinsic.emit_call(ty_f64xn, &[min_value, zero]);
-
-            max_value
-        } else {
-            value
-        };
-
-        value
     }
 
     pub(crate) unsafe fn emit_fma_f32xn<const N: usize>(
