@@ -995,6 +995,7 @@ impl IREmitter {
                         empty_name.as_ptr(),
                     );
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
@@ -1064,6 +1065,7 @@ impl IREmitter {
                     let d_value =
                         llvm::core::LLVMBuildAnd(builder, d_value, exec_value, empty_name.as_ptr());
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(126, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {
@@ -1414,6 +1416,7 @@ impl IREmitter {
                         empty_name.as_ptr(),
                     );
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
@@ -1598,6 +1601,7 @@ impl IREmitter {
                         empty_name.as_ptr(),
                     );
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
@@ -1692,6 +1696,7 @@ impl IREmitter {
                         empty_name.as_ptr(),
                     );
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(inst.vdst as u32, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, inst.vdst as u32, |emitter, bb, elem| {
@@ -3926,6 +3931,7 @@ impl IREmitter {
                     let d_value =
                         llvm::core::LLVMBuildAnd(builder, d_value, exec_value, empty_name.as_ptr());
 
+                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
                     emitter.emit_store_sgpr_u32(126, d_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, 126, |emitter, bb, elem| {

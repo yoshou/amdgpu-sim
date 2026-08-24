@@ -380,6 +380,19 @@ impl IREmitter {
         bit_mask
     }
 
+    /// A vector compare contributes a zero bit for every inactive lane, so the
+    /// assembled mask is masked by EXEC before it lands in its destination. The
+    /// scalar path gets this from skipping inactive lanes; the packed path
+    /// builds every lane and has to mask here.
+    pub(crate) unsafe fn emit_mask_with_exec(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+        exec: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let empty_name = std::ffi::CString::new("").unwrap();
+        llvm::core::LLVMBuildAnd(self.builder, value, exec, empty_name.as_ptr())
+    }
+
     pub(crate) unsafe fn emit_bits_to_mask_u32xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
