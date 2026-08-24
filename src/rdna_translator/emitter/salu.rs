@@ -555,8 +555,6 @@ impl IREmitter {
             }
             I::S_MUL_U64 => {
                 let emitter = self;
-                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
-                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
                 let empty_name = std::ffi::CString::new("").unwrap();
 
                 let s0_value = emitter.emit_scalar_source_operand_u64(&inst.ssrc0);

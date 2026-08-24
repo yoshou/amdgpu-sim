@@ -1622,7 +1622,6 @@ impl IREmitter {
 
                         // A zero remainder keeps the sign of the operand, which
                         // sin() carries into its result.
-                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -1674,7 +1673,6 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -5229,7 +5227,6 @@ impl IREmitter {
             I::V_MAX_I32 => {
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
@@ -5257,7 +5254,6 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let _ = ty_i32;
 
@@ -5280,7 +5276,6 @@ impl IREmitter {
             I::V_MIN_I32 => {
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
@@ -5308,7 +5303,6 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                         let _ = ty_i32;
 
@@ -6733,22 +6727,14 @@ impl IREmitter {
                 let is_double = matches!(inst.op, I::V_FREXP_MANT_F64);
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
 
-                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-                    let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-                    let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let ty = if is_double { ty_f64xn } else { ty_f32xn };
                         let s0_value = if is_double {
                             let value =
                                 emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
@@ -6773,12 +6759,7 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
-                        let ty = if is_double { ty_f64 } else { ty_f32 };
                         let s0_value = if is_double {
                             let value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
                             emitter.emit_abs_neg_f64(inst.abs, inst.neg, value, 0)

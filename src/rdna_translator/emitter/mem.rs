@@ -433,7 +433,6 @@ impl IREmitter {
                     let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
                     let ty_p0xn = llvm::core::LLVMVectorType(ty_p0, N as u32);
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
                     let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                     let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
                     let ty_void = llvm::core::LLVMVoidTypeInContext(context);

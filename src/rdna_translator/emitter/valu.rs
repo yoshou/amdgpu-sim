@@ -1831,7 +1831,6 @@ impl IREmitter {
 
                         // A zero remainder keeps the sign of the operand, which
                         // sin() carries into its result.
-                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -1880,7 +1879,6 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -2084,15 +2082,10 @@ impl IREmitter {
             I::V_FREXP_MANT_F64 => {
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
 
-                    let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-                    let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -2108,9 +2101,6 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 

@@ -47,102 +47,48 @@ impl IREmitter {
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-
-        let (mant_value, exp_value) = self.emit_frexp(value);
-        let _ = (mant_value, exp_value);
-        let fract_value = mant_value;
-        fract_value
+        // FREXP splits the operand; this wrapper keeps the significand.
+        self.emit_frexp(value).0
     }
 
     pub(crate) unsafe fn emit_exp_f32(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-
-        let (mant_value, exp_value) = self.emit_frexp(value);
-        let _ = (mant_value, exp_value);
-        let exp_value = exp_value;
-        exp_value
+        // FREXP splits the operand; this wrapper keeps the exponent.
+        self.emit_frexp(value).1
     }
 
     pub(crate) unsafe fn _emit_exp_f64(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-
-        let (mant_value, exp_value) = self.emit_frexp(value);
-        let _ = (mant_value, exp_value);
-        let exp_value = exp_value;
-        exp_value
+        // FREXP splits the operand; this wrapper keeps the exponent.
+        self.emit_frexp(value).1
     }
 
     pub(crate) unsafe fn _emit_exp_f64xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
-        let ty_f64xn = llvm::core::LLVMVectorType(ty_f64, N as u32);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-
-        let (mant_value, exp_value) = self.emit_frexp(value);
-        let _ = (mant_value, exp_value);
-        let exp_value = exp_value;
-        exp_value
+        // FREXP splits the operand; this wrapper keeps the exponent.
+        self.emit_frexp(value).1
     }
 
     pub(crate) unsafe fn emit_fract_f32xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-        let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-
-        let (mant_value, exp_value) = self.emit_frexp(value);
-        let _ = (mant_value, exp_value);
-        let fract_value = mant_value;
-        fract_value
+        // FREXP splits the operand; this wrapper keeps the significand.
+        self.emit_frexp(value).0
     }
 
     pub(crate) unsafe fn emit_exp_f32xn<const N: usize>(
         &mut self,
         value: llvm::prelude::LLVMValueRef,
     ) -> llvm::prelude::LLVMValueRef {
-        let context = self.context;
-        let builder = self.builder;
-        let empty_name = std::ffi::CString::new("").unwrap();
-        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-        let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-
-        let (mant_value, exp_value) = self.emit_frexp(value);
-        let _ = (mant_value, exp_value);
-        let exp_value = exp_value;
-        exp_value
+        // FREXP splits the operand; this wrapper keeps the exponent.
+        self.emit_frexp(value).1
     }
 
     pub(crate) unsafe fn emit_abs_neg_f32(
@@ -424,8 +370,7 @@ impl IREmitter {
         let negated = llvm::core::LLVMBuildFNeg(builder, b, empty_name.as_ptr());
         let sum = llvm::core::LLVMBuildFAdd(builder, a, negated, empty_name.as_ptr());
 
-        let mut quiet = |emitter: &mut Self, value: llvm::prelude::LLVMValueRef| {
-            let _ = &emitter;
+        let quiet = |value: llvm::prelude::LLVMValueRef| {
             let bits = llvm::core::LLVMBuildBitCast(builder, value, int_ty, empty_name.as_ptr());
             let quiet_bit = llvm::core::LLVMConstInt(ty_i32, 0x0040_0000, 0);
             let quiet_bit = if is_vector {
@@ -438,7 +383,7 @@ impl IREmitter {
             llvm::core::LLVMBuildBitCast(builder, bits, ty, empty_name.as_ptr())
         };
 
-        let quiet_negated = quiet(self, negated);
+        let quiet_negated = quiet(negated);
         let is_nan_negated = llvm::core::LLVMBuildFCmp(
             builder,
             llvm::LLVMRealPredicate::LLVMRealUNO,
@@ -454,7 +399,7 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
 
-        let quiet_a = quiet(self, a);
+        let quiet_a = quiet(a);
         let is_nan_a = llvm::core::LLVMBuildFCmp(
             builder,
             llvm::LLVMRealPredicate::LLVMRealUNO,
