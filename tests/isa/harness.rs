@@ -75,6 +75,10 @@ impl Harness {
         Self::load("harness_vop3.kd", 0x3333_3333, 6, 2)
     }
 
+    pub(crate) fn vopc() -> Self {
+        Self::load("harness_vopc.kd", 0x4444_4444, 4, 4)
+    }
+
     pub(crate) fn load(kernel: &str, marker_literal: u32, src_stride: usize, out_stride: usize) -> Self {
         let marker = slot_marker(marker_literal);
         let mut data = vec![];

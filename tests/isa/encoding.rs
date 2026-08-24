@@ -72,3 +72,18 @@ pub(crate) enum Src {
     /// Literal constant: operand field 255 plus a following dword.
     Literal(u32),
 }
+
+/// VOPC: [31:25] = 0111110, [24:17] = OP, [16:9] = VSRC1, [8:0] = SRC0.
+/// VSRC1 is a bare VGPR index.
+pub(crate) const fn vopc(op: u32, vsrc1: u32, src0: u32) -> u32 {
+    (0b0111110 << 25) | (op << 17) | (vsrc1 << 9) | src0
+}
+
+/// The VOP3 encoding of a compare. The destination is an SGPR named by the
+/// same [7:0] field a VOP3 uses for its VGPR destination, and the opcode is the
+/// VOPC opcode unchanged. There is no clamp or omod.
+pub(crate) const fn vop3_sdst(op: u32, sdst: u32, src0: u32, src1: u32, abs: u32, neg: u32) -> [u32; 2] {
+    let lo = sdst | (abs << 8) | (op << 16) | (0b110101 << 26);
+    let hi = src0 | (src1 << 9) | (neg << 29);
+    [lo, hi]
+}
