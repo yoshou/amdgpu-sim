@@ -10767,6 +10767,274 @@ impl SIMD32 {
         self.write_sgpr(sdata, data as u32);
     }
 
+    fn flat_load_u8(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+            let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr =
+                    offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let ptr = addr as *mut u8;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
+    fn flat_load_i8(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+            let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr =
+                    offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let ptr = addr as *mut i8;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, (data as i32) as u32);
+        }
+    }
+
+    fn flat_load_u16(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+            let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr =
+                    offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let ptr = addr as *mut u16;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, data as u32);
+        }
+    }
+
+    fn flat_load_i16(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+            let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr =
+                    offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let ptr = addr as *mut i16;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, (data as i32) as u32);
+        }
+    }
+
+    fn flat_load_b96(&mut self, vaddr: usize, vdst: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for i in 0..3 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+                let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                    offset[elem] as i64 + (ioffset as i64) + i as i64 * 4
+                } else {
+                    let lane_addr =
+                        offset[elem] as i64 + (ioffset as i64) + i as i64 * 4 - scratch_base as i64;
+                    scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+                };
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn flat_store_b8(&mut self, vaddr: usize, vsrc: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+            let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr =
+                    offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let data = self.read_vgpr(elem, vsrc);
+            let ptr = addr as *mut u8;
+            unsafe {
+                *ptr = data as u8;
+            }
+        }
+    }
+
+    fn flat_store_b16(&mut self, vaddr: usize, vsrc: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+            let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+            let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+            let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                offset[elem] as i64 + (ioffset as i64)
+            } else {
+                let lane_addr =
+                    offset[elem] as i64 + (ioffset as i64) - scratch_base as i64;
+                scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+            };
+            let data = self.read_vgpr(elem, vsrc);
+            let ptr = addr as *mut u16;
+            unsafe {
+                *ptr = data as u16;
+            }
+        }
+    }
+
+    fn flat_store_b64(&mut self, vaddr: usize, vsrc: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for i in 0..2 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+                let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                    offset[elem] as i64 + (ioffset as i64) + i as i64 * 4
+                } else {
+                    let lane_addr =
+                        offset[elem] as i64 + (ioffset as i64) + i as i64 * 4 - scratch_base as i64;
+                    scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+                };
+                let data = self.read_vgpr(elem, vsrc + i);
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
+    fn flat_store_b96(&mut self, vaddr: usize, vsrc: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for i in 0..3 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+                let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                    offset[elem] as i64 + (ioffset as i64) + i as i64 * 4
+                } else {
+                    let lane_addr =
+                        offset[elem] as i64 + (ioffset as i64) + i as i64 * 4 - scratch_base as i64;
+                    scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+                };
+                let data = self.read_vgpr(elem, vsrc + i);
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
+    fn flat_store_b128(&mut self, vaddr: usize, vsrc: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| self.read_vgpr_pair(elem, vaddr))
+            .collect::<Vec<u64>>();
+
+        for i in 0..4 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
+                let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
+                let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
+                    offset[elem] as i64 + (ioffset as i64) + i as i64 * 4
+                } else {
+                    let lane_addr =
+                        offset[elem] as i64 + (ioffset as i64) + i as i64 * 4 - scratch_base as i64;
+                    scratch_base as i64 + lane_addr * 32 + elem as i64 * 4
+                };
+                let data = self.read_vgpr(elem, vsrc + i);
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
     fn execute_vflat(&mut self, inst: VFLAT) -> Signals {
         let vaddr = inst.vaddr as usize;
         let vsrc = inst.vsrc as usize;
@@ -10784,6 +11052,36 @@ impl SIMD32 {
             }
             I::FLAT_STORE_B32 => {
                 self.flat_store_b32(vaddr, vsrc, ioffset);
+            }
+            I::FLAT_LOAD_U8 => {
+                self.flat_load_u8(vaddr, vdst, ioffset);
+            }
+            I::FLAT_LOAD_I8 => {
+                self.flat_load_i8(vaddr, vdst, ioffset);
+            }
+            I::FLAT_LOAD_U16 => {
+                self.flat_load_u16(vaddr, vdst, ioffset);
+            }
+            I::FLAT_LOAD_I16 => {
+                self.flat_load_i16(vaddr, vdst, ioffset);
+            }
+            I::FLAT_LOAD_B96 => {
+                self.flat_load_b96(vaddr, vdst, ioffset);
+            }
+            I::FLAT_STORE_B8 => {
+                self.flat_store_b8(vaddr, vsrc, ioffset);
+            }
+            I::FLAT_STORE_B16 => {
+                self.flat_store_b16(vaddr, vsrc, ioffset);
+            }
+            I::FLAT_STORE_B64 => {
+                self.flat_store_b64(vaddr, vsrc, ioffset);
+            }
+            I::FLAT_STORE_B96 => {
+                self.flat_store_b96(vaddr, vsrc, ioffset);
+            }
+            I::FLAT_STORE_B128 => {
+                self.flat_store_b128(vaddr, vsrc, ioffset);
             }
             op => unimplemented!("{:?}", op),
         }
@@ -10884,6 +11182,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
+            let ioffset = ((ioffset << 8) as i32) >> 8;
             let scratch_base = self.ctx.scratch.borrow_mut().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if ((offset[elem] as u64) < scratch_base)
@@ -11108,6 +11407,133 @@ impl SIMD32 {
         }
     }
 
+    fn global_load_i8(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+
+            let ptr = addr as *mut i8;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, (data as i32) as u32);
+        }
+    }
+
+    fn global_load_i16(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+
+            let ptr = addr as *mut i16;
+            let data = unsafe { *ptr };
+            self.write_vgpr(elem, vdst, (data as i32) as u32);
+        }
+    }
+
+    fn global_load_b96(&mut self, vaddr: usize, vdst: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for i in 0..3 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let addr = offset[elem]
+                    + (((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    + (i as u64 * 4);
+
+                let ptr = addr as *mut u32;
+                let data = unsafe { *ptr };
+                self.write_vgpr(elem, vdst + i, data);
+            }
+        }
+    }
+
+    fn global_store_b8(&mut self, vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let data = self.read_vgpr(elem, vsrc);
+            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+
+            let ptr = addr as *mut u8;
+            unsafe {
+                *ptr = data as u8;
+            }
+        }
+    }
+
+    fn global_store_b96(&mut self, vaddr: usize, vsrc: usize, saddr: usize, ioffset: u32) {
+        let offset = (0..32)
+            .map(|elem| {
+                if saddr != 124 {
+                    self.read_sgpr_pair(saddr) + self.read_vgpr(elem, vaddr) as u64
+                } else {
+                    self.read_vgpr_pair(elem, vaddr)
+                }
+            })
+            .collect::<Vec<u64>>();
+
+        for i in 0..3 {
+            for elem in 0..32 {
+                if !self.get_exec_bit(elem) {
+                    continue;
+                }
+                let data = self.read_vgpr(elem, vsrc + i);
+                let addr = offset[elem]
+                    + (((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    + (i as u64 * 4);
+
+                let ptr = addr as *mut u32;
+                unsafe {
+                    *ptr = data;
+                }
+            }
+        }
+    }
+
     fn execute_vglobal(&mut self, inst: VGLOBAL) -> Signals {
         let saddr = inst.saddr as usize;
         let vaddr = inst.vaddr as usize;
@@ -11144,6 +11570,21 @@ impl SIMD32 {
             }
             I::GLOBAL_ATOMIC_ADD_U32 => {
                 self.global_atomic_add_u32(vaddr, vdst, vsrc, saddr, ioffset);
+            }
+            I::GLOBAL_LOAD_I8 => {
+                self.global_load_i8(vaddr, vdst, saddr, ioffset);
+            }
+            I::GLOBAL_LOAD_I16 => {
+                self.global_load_i16(vaddr, vdst, saddr, ioffset);
+            }
+            I::GLOBAL_LOAD_B96 => {
+                self.global_load_b96(vaddr, vdst, saddr, ioffset);
+            }
+            I::GLOBAL_STORE_B8 => {
+                self.global_store_b8(vaddr, vsrc, saddr, ioffset);
+            }
+            I::GLOBAL_STORE_B96 => {
+                self.global_store_b96(vaddr, vsrc, saddr, ioffset);
             }
             I::GLOBAL_WB => {}
             I::GLOBAL_INV => {}

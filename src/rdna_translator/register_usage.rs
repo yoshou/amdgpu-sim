@@ -2465,7 +2465,31 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VGLOBAL(inst) => match inst.op {
+                I::GLOBAL_LOAD_I8 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..1 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
                 I::GLOBAL_LOAD_U8 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..1 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
+                I::GLOBAL_LOAD_I16 => {
                     if inst.saddr != 124 {
                         reg_usage.use_sgpr_u64(inst.saddr as u32);
                         reg_usage.use_vgpr_u32(inst.vaddr as u32);
@@ -2513,6 +2537,18 @@ impl RDNATranslator {
                         reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
                     }
                 }
+                I::GLOBAL_LOAD_B96 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..4 {
+                        reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
+                    }
+                }
                 I::GLOBAL_LOAD_B128 => {
                     if inst.saddr != 124 {
                         reg_usage.use_sgpr_u64(inst.saddr as u32);
@@ -2524,6 +2560,16 @@ impl RDNATranslator {
                     for i in 0..4 {
                         reg_usage.def_vgpr_u32(inst.vdst as u32 + i);
                     }
+                }
+                I::GLOBAL_STORE_B8 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    reg_usage.use_vgpr_u32(inst.vsrc as u32);
                 }
                 I::GLOBAL_STORE_B16 => {
                     if inst.saddr != 124 {
@@ -2554,6 +2600,18 @@ impl RDNATranslator {
                     }
 
                     for i in 0..2 {
+                        reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
+                    }
+                }
+                I::GLOBAL_STORE_B96 => {
+                    if inst.saddr != 124 {
+                        reg_usage.use_sgpr_u64(inst.saddr as u32);
+                        reg_usage.use_vgpr_u32(inst.vaddr as u32);
+                    } else {
+                        reg_usage.use_vgpr_u64(inst.vaddr as u32);
+                    }
+
+                    for i in 0..4 {
                         reg_usage.use_vgpr_u32(inst.vsrc as u32 + i);
                     }
                 }
