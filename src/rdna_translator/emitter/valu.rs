@@ -230,6 +230,9 @@ impl IREmitter {
             | I::V_CMP_NGT_F32
             | I::V_CMP_NEQ_F32
             | I::V_CMP_NLT_F32
+            | I::V_CMP_NGE_F32
+            | I::V_CMP_NLE_F32
+            | I::V_CMP_LG_F32
             | I::V_CMP_O_F32
             | I::V_CMP_EQ_F32 => {
                 let pred = match inst.op {
@@ -242,12 +245,19 @@ impl IREmitter {
                     // operands compare true.
                     I::V_CMP_NEQ_F32 => llvm::LLVMRealPredicate::LLVMRealOEQ,
                     I::V_CMP_NLT_F32 => llvm::LLVMRealPredicate::LLVMRealOLT,
+                    I::V_CMP_NGE_F32 => llvm::LLVMRealPredicate::LLVMRealOGE,
+                    I::V_CMP_NLE_F32 => llvm::LLVMRealPredicate::LLVMRealOLE,
+                    I::V_CMP_LG_F32 => llvm::LLVMRealPredicate::LLVMRealONE,
                     I::V_CMP_O_F32 => llvm::LLVMRealPredicate::LLVMRealORD,
                     I::V_CMP_EQ_F32 => llvm::LLVMRealPredicate::LLVMRealOEQ,
                     _ => unreachable!(),
                 };
                 let not = match inst.op {
-                    I::V_CMP_NGT_F32 | I::V_CMP_NEQ_F32 | I::V_CMP_NLT_F32 => true,
+                    I::V_CMP_NGT_F32
+                    | I::V_CMP_NEQ_F32
+                    | I::V_CMP_NLT_F32
+                    | I::V_CMP_NGE_F32
+                    | I::V_CMP_NLE_F32 => true,
                     _ => false,
                 };
                 if USE_SIMD {
@@ -393,6 +403,9 @@ impl IREmitter {
             | I::V_CMP_LE_F64
             | I::V_CMP_NEQ_F64
             | I::V_CMP_NGE_F64
+            | I::V_CMP_GE_F64
+            | I::V_CMP_NLE_F64
+            | I::V_CMP_LG_F64
             | I::V_CMP_EQ_F64
             | I::V_CMP_O_F64 => {
                 let pred = match inst.op {
@@ -403,14 +416,19 @@ impl IREmitter {
                     I::V_CMP_NLT_F64 => llvm::LLVMRealPredicate::LLVMRealOLT,
                     I::V_CMP_NEQ_F64 => llvm::LLVMRealPredicate::LLVMRealOEQ,
                     I::V_CMP_NGE_F64 => llvm::LLVMRealPredicate::LLVMRealOGE,
+                    I::V_CMP_GE_F64 => llvm::LLVMRealPredicate::LLVMRealOGE,
+                    I::V_CMP_NLE_F64 => llvm::LLVMRealPredicate::LLVMRealOLE,
+                    I::V_CMP_LG_F64 => llvm::LLVMRealPredicate::LLVMRealONE,
                     I::V_CMP_EQ_F64 => llvm::LLVMRealPredicate::LLVMRealOEQ,
                     I::V_CMP_O_F64 => llvm::LLVMRealPredicate::LLVMRealORD,
                     _ => unreachable!(),
                 };
                 let not = match inst.op {
-                    I::V_CMP_NGT_F64 | I::V_CMP_NLT_F64 | I::V_CMP_NEQ_F64 | I::V_CMP_NGE_F64 => {
-                        true
-                    }
+                    I::V_CMP_NGT_F64
+                    | I::V_CMP_NLT_F64
+                    | I::V_CMP_NEQ_F64
+                    | I::V_CMP_NGE_F64
+                    | I::V_CMP_NLE_F64 => true,
                     _ => false,
                 };
                 if USE_SIMD {

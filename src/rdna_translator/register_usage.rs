@@ -241,6 +241,36 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOPC(inst) => match inst.op {
+                I::V_CMP_GE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_LG_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_LG_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NGE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NLE_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
+                I::V_CMP_NLE_F64 => {
+                    reg_usage.use_operand_f64(&inst.src0);
+                    reg_usage.use_vgpr_f64(inst.vsrc1 as u32);
+                    reg_usage.def_sgpr_u32(106);
+                }
                 I::V_CMP_GT_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
