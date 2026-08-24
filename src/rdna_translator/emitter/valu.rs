@@ -1713,32 +1713,11 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        // A zero remainder keeps the sign of the operand, which
-                        // sin() carries into its result.
-                        let zero = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstReal(ty_f32, 0.0); N].as_mut_ptr(),
-                            N as u32,
-                        );
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = emitter.emit_keep_turn_sign(reduced, s0_value);
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
-                            reduced,
+                            reduced_turns,
                             ty_f64xn,
                             empty_name.as_ptr(),
                         );
@@ -1764,6 +1743,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_sin_exact_turns(reduced_turns, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -1783,27 +1763,11 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let zero = llvm::core::LLVMConstReal(ty_f32, 0.0);
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = emitter.emit_keep_turn_sign(reduced, s0_value);
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
-                            reduced,
+                            reduced_turns,
                             ty_f64,
                             empty_name.as_ptr(),
                         );
@@ -1824,6 +1788,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_sin_exact_turns(reduced_turns, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
                         bb
@@ -1864,26 +1829,7 @@ impl IREmitter {
 
                         // A zero remainder keeps the sign of the operand, which
                         // sin() carries into its result.
-                        let zero = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstReal(ty_f32, 0.0); N].as_mut_ptr(),
-                            N as u32,
-                        );
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -1932,23 +1878,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let zero = llvm::core::LLVMConstReal(ty_f32, 0.0);
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,

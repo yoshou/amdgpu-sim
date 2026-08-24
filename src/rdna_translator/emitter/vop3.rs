@@ -1485,7 +1485,6 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
-                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         // The ISA operand is in revolutions: D = sin(S0 * 2 * PI).
                         // Subtracting the nearest integer is exact in binary and
@@ -1500,32 +1499,11 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        // A zero remainder keeps the sign of the operand, which
-                        // sin() carries into its result.
-                        let zero = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstReal(ty_f32, 0.0); N].as_mut_ptr(),
-                            N as u32,
-                        );
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = emitter.emit_keep_turn_sign(reduced, s0_value);
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
-                            reduced,
+                            reduced_turns,
                             ty_f64xn,
                             empty_name.as_ptr(),
                         );
@@ -1551,6 +1529,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_sin_exact_turns(reduced_turns, d_value);
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
@@ -1563,7 +1542,6 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
-                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.rint.", &[ty_f32]);
                         let rounded = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1574,27 +1552,11 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let zero = llvm::core::LLVMConstReal(ty_f32, 0.0);
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = emitter.emit_keep_turn_sign(reduced, s0_value);
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
-                            reduced,
+                            reduced_turns,
                             ty_f64,
                             empty_name.as_ptr(),
                         );
@@ -1615,6 +1577,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
+                        let d_value = emitter.emit_sin_exact_turns(reduced_turns, d_value);
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
@@ -1641,7 +1604,6 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
-                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         // The ISA operand is in revolutions: D = cos(S0 * 2 * PI).
                         // Subtracting the nearest integer is exact in binary and
@@ -1658,26 +1620,7 @@ impl IREmitter {
 
                         // A zero remainder keeps the sign of the operand, which
                         // sin() carries into its result.
-                        let zero = llvm::core::LLVMConstVector(
-                            [llvm::core::LLVMConstReal(ty_f32, 0.0); N].as_mut_ptr(),
-                            N as u32,
-                        );
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -1719,7 +1662,6 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
-                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.rint.", &[ty_f32]);
                         let rounded = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1730,23 +1672,7 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let zero = llvm::core::LLVMConstReal(ty_f32, 0.0);
-                        let is_zero = llvm::core::LLVMBuildFCmp(
-                            builder,
-                            llvm::LLVMRealPredicate::LLVMRealOEQ,
-                            reduced,
-                            zero,
-                            empty_name.as_ptr(),
-                        );
-                        let signed_zero =
-                            llvm::core::LLVMBuildFMul(builder, s0_value, zero, empty_name.as_ptr());
-                        let reduced = llvm::core::LLVMBuildSelect(
-                            builder,
-                            is_zero,
-                            signed_zero,
-                            reduced,
-                            empty_name.as_ptr(),
-                        );
+                        let reduced_turns = reduced;
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,

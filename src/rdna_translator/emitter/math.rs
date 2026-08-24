@@ -367,6 +367,99 @@ impl IREmitter {
         intrinsic.emit_call(ty, &[value, limit])
     }
 
+    /// x - rint(x) is +0 even where x is -0, so the sign of a zero operand has to
+    /// be put back before sin() can carry it into the result. A negative whole
+    /// turn is not a zero operand, and the hardware returns +0 for it.
+    pub(crate) unsafe fn emit_keep_turn_sign(
+        &mut self,
+        reduced: llvm::prelude::LLVMValueRef,
+        operand: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(reduced);
+        let intrinsic = self.get_intrinsic_declaration("llvm.copysign.", &[ty]);
+        let signed = intrinsic.emit_call(ty, &[reduced, operand]);
+        let zero = {
+            let elem_ty =
+                if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+                    llvm::core::LLVMGetElementType(ty)
+                } else {
+                    ty
+                };
+            let constant = llvm::core::LLVMConstReal(elem_ty, 0.0);
+            if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+        let is_zero = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOEQ,
+            operand,
+            zero,
+            empty_name.as_ptr(),
+        );
+        llvm::core::LLVMBuildSelect(builder, is_zero, signed, reduced, empty_name.as_ptr())
+    }
+
+    /// The sine unit returns exact results at the quarter turns: zero at a half
+    /// turn and +-1 at a quarter turn, whatever the library sine of the scaled
+    /// angle would round to. A whole turn keeps the sign the library sine gives.
+    pub(crate) unsafe fn emit_sin_exact_turns(
+        &mut self,
+        turns: llvm::prelude::LLVMValueRef,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(value);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let elem_ty = if is_vector {
+            llvm::core::LLVMGetElementType(ty)
+        } else {
+            ty
+        };
+        let splat = |v: f64| {
+            let constant = llvm::core::LLVMConstReal(elem_ty, v);
+            if is_vector {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+
+        let intrinsic = self.get_intrinsic_declaration("llvm.fabs.", &[ty]);
+        let magnitude = intrinsic.emit_call(ty, &[turns]);
+
+        let mut result = value;
+        for (probe, exact, on_magnitude) in [
+            (0.5, 0.0, true),
+            (0.25, 1.0, false),
+            (-0.25, -1.0, false),
+        ] {
+            let subject = if on_magnitude { magnitude } else { turns };
+            let is_probe = llvm::core::LLVMBuildFCmp(
+                builder,
+                llvm::LLVMRealPredicate::LLVMRealOEQ,
+                subject,
+                splat(probe),
+                empty_name.as_ptr(),
+            );
+            result = llvm::core::LLVMBuildSelect(
+                builder,
+                is_probe,
+                splat(exact),
+                result,
+                empty_name.as_ptr(),
+            );
+        }
+        result
+    }
+
     /// ABS and NEG act on the sign bit of the operand, whatever the instruction
     /// reads it as, so an integer compare sees them too.
     pub(crate) unsafe fn emit_abs_neg_bits(
