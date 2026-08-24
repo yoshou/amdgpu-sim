@@ -1488,6 +1488,7 @@ impl IREmitter {
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32xn]);
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value]);
+                        let d_value = emitter.emit_negative_log_nan(s0_value, d_value);
 
                         let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
@@ -1501,6 +1502,7 @@ impl IREmitter {
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
+                        let d_value = emitter.emit_negative_log_nan(s0_value, d_value);
 
                         let d_value = emitter.emit_ftz_f32(d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);

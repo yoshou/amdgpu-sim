@@ -1251,6 +1251,7 @@ impl IREmitter {
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32xn]);
                         let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value]);
+                        let d_value = emitter.emit_negative_log_nan(s0_value, d_value);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         let d_value = emitter.emit_ftz_f32(d_value);
@@ -1267,6 +1268,7 @@ impl IREmitter {
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
+                        let d_value = emitter.emit_negative_log_nan(s0_value, d_value);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         let d_value = emitter.emit_ftz_f32(d_value);
@@ -2137,8 +2139,9 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        // The result is below one before OMOD scales it.
                         let d_value = emitter.emit_fract_below_one(d_value);
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -2160,8 +2163,9 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        // The result is below one before OMOD scales it.
                         let d_value = emitter.emit_fract_below_one(d_value);
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
                         bb

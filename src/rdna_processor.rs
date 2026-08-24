@@ -8357,10 +8357,7 @@ impl SIMD32 {
                 continue;
             }
             let s0_value = abs_neg(self.read_vector_source_operand_f64(elem, s0), abs, neg, 0);
-            let mut d_value = (s0_value + 0.5).floor();
-            if s0_value.floor() % 2.0 == 0.0 && s0_value.fract() == 0.5 {
-                d_value -= 1.0;
-            }
+            let d_value = quiet_nan_f64(s0_value.round_ties_even());
             self.write_vgpr_pair(elem, d, f64_to_u64_omod_clamp(d_value, omod, clamp));
         }
     }

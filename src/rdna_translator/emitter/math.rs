@@ -361,10 +361,18 @@ impl IREmitter {
         } else {
             below_one
         };
-        // minnum keeps the other operand when one is NaN, which is what the
-        // hardware does for an infinite input.
-        let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty]);
-        intrinsic.emit_call(ty, &[value, limit])
+        // A NaN is not below the limit and must stay a NaN, which minnum would
+        // instead replace with the limit.
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let at_limit = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOGE,
+            value,
+            limit,
+            empty_name.as_ptr(),
+        );
+        llvm::core::LLVMBuildSelect(builder, at_limit, limit, value, empty_name.as_ptr())
     }
 
     /// x - rint(x) is +0 even where x is -0, so the sign of a zero operand has to
@@ -521,6 +529,65 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
         llvm::core::LLVMBuildSelect(builder, is_nan_a, quiet_a, result, empty_name.as_ptr())
+    }
+
+    /// The logarithm of a negative operand is the negative quiet NaN, not the
+    /// positive one a library log2 returns.
+    pub(crate) unsafe fn emit_negative_log_nan(
+        &mut self,
+        operand: llvm::prelude::LLVMValueRef,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> llvm::prelude::LLVMValueRef {
+        let builder = self.builder;
+        let context = self.context;
+        let empty_name = std::ffi::CString::new("").unwrap();
+        let ty = llvm::core::LLVMTypeOf(value);
+        let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
+        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+        let int_ty = if is_vector {
+            llvm::core::LLVMVectorType(ty_i32, llvm::core::LLVMGetVectorSize(ty))
+        } else {
+            ty_i32
+        };
+        let splat = |bits: u64, elem_ty: llvm::prelude::LLVMTypeRef| {
+            let constant = llvm::core::LLVMConstInt(elem_ty, bits, 0);
+            if is_vector {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+        let nan = llvm::core::LLVMBuildBitCast(
+            builder,
+            splat(0xFFC0_0000, ty_i32),
+            ty,
+            empty_name.as_ptr(),
+        );
+        let _ = int_ty;
+
+        let zero = {
+            let elem_ty = if is_vector {
+                llvm::core::LLVMGetElementType(ty)
+            } else {
+                ty
+            };
+            let constant = llvm::core::LLVMConstReal(elem_ty, 0.0);
+            if is_vector {
+                let lanes = llvm::core::LLVMGetVectorSize(ty);
+                llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
+            } else {
+                constant
+            }
+        };
+        let is_negative = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealOLT,
+            operand,
+            zero,
+            empty_name.as_ptr(),
+        );
+        llvm::core::LLVMBuildSelect(builder, is_negative, nan, value, empty_name.as_ptr())
     }
 
     /// An integer constant shaped like `like`, which is either a scalar or a
