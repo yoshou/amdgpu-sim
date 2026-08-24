@@ -394,8 +394,11 @@ impl IREmitter {
                 let s0_value =
                     llvm::core::LLVMBuildBitCast(builder, s0_bits, ty_f32, empty_name.as_ptr());
 
-                let d_value =
-                    llvm::core::LLVMBuildFPToSI(builder, s0_value, ty_i32, empty_name.as_ptr());
+                // The saturating form gives zero for a NaN and the nearest
+                // representable value out of range, as the hardware does.
+                let intrinsic =
+                    emitter.get_intrinsic_declaration("llvm.fptosi.sat.", &[ty_i32, ty_f32]);
+                let d_value = intrinsic.emit_call(ty_i32, &[s0_value]);
 
                 emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
             }
@@ -409,8 +412,11 @@ impl IREmitter {
                 let s0_value =
                     llvm::core::LLVMBuildBitCast(builder, s0_bits, ty_f32, empty_name.as_ptr());
 
-                let d_value =
-                    llvm::core::LLVMBuildFPToUI(builder, s0_value, ty_i32, empty_name.as_ptr());
+                // The saturating form gives zero for a NaN and the nearest
+                // representable value out of range, as the hardware does.
+                let intrinsic =
+                    emitter.get_intrinsic_declaration("llvm.fptoui.sat.", &[ty_i32, ty_f32]);
+                let d_value = intrinsic.emit_call(ty_i32, &[s0_value]);
 
                 emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
             }
@@ -1078,40 +1084,40 @@ impl IREmitter {
             I::S_ADD_CO_CI_U32 => {
                 let emitter = self;
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
                 let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
-                let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
                 let empty_name = std::ffi::CString::new("").unwrap();
 
                 let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
                 let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+                // SCC is the carry in as well as the carry out.
+                let scc_value = emitter.emit_load_scc_u8();
 
-                let intrinsic =
-                    emitter.get_intrinsic_declaration("llvm.uadd.with.overflow.", &[ty_i32]);
+                let s0_value =
+                    llvm::core::LLVMBuildZExt(builder, s0_value, ty_i64, empty_name.as_ptr());
+                let s1_value =
+                    llvm::core::LLVMBuildZExt(builder, s1_value, ty_i64, empty_name.as_ptr());
+                let carry_in =
+                    llvm::core::LLVMBuildZExt(builder, scc_value, ty_i64, empty_name.as_ptr());
 
-                let mut return_tys = vec![ty_i32, ty_i1];
-                let add_overflow = intrinsic.emit_call(
-                    llvm::core::LLVMStructTypeInContext(
-                        context,
-                        return_tys.as_mut_ptr(),
-                        return_tys.len() as u32,
-                        0,
-                    ),
-                    &[s0_value, s1_value],
-                );
-                let added = llvm::core::LLVMBuildExtractValue(
+                let added = llvm::core::LLVMBuildAdd(
                     builder,
-                    add_overflow,
-                    0,
-                    empty_name.as_ptr(),
-                );
-                let cmp = llvm::core::LLVMBuildExtractValue(
-                    builder,
-                    add_overflow,
-                    1,
+                    llvm::core::LLVMBuildAdd(builder, s0_value, s1_value, empty_name.as_ptr()),
+                    carry_in,
                     empty_name.as_ptr(),
                 );
 
-                emitter.emit_store_sgpr_u32(inst.sdst as u32, added);
+                let d_value =
+                    llvm::core::LLVMBuildTrunc(builder, added, ty_i32, empty_name.as_ptr());
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
+
+                let cmp = llvm::core::LLVMBuildICmp(
+                    builder,
+                    llvm::LLVMIntPredicate::LLVMIntUGE,
+                    added,
+                    llvm::core::LLVMConstInt(ty_i64, 0x1_0000_0000, 0),
+                    empty_name.as_ptr(),
+                );
 
                 let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
 
