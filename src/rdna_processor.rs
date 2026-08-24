@@ -118,6 +118,12 @@ fn add_u32(a: u32, b: u32, c: u32) -> (u32, bool) {
 }
 
 #[inline(always)]
+fn sub_u32(a: u32, b: u32, c: u32) -> (u32, bool) {
+    let d = (a as u64).wrapping_sub(b as u64).wrapping_sub(c as u64);
+    ((d & 0xFFFF_FFFF) as u32, (b as u64) + (c as u64) > (a as u64))
+}
+
+#[inline(always)]
 fn mul_u32(a: u32, b: u32) -> u32 {
     let c = (a as u64) * (b as u64);
     (c & 0xFFFFFFFF) as u32
@@ -2445,6 +2451,12 @@ impl SIMD32 {
             I::V_SUBREV_F32 => {
                 self.v_subrev_f32_e32(d, s0, s1);
             }
+                        I::V_SUB_CO_CI_U32 => {
+                self.v_sub_co_ci_u32_e32(d, s0, s1);
+            }
+            I::V_SUBREV_CO_CI_U32 => {
+                self.v_subrev_co_ci_u32_e32(d, s0, s1);
+            }
             op => unimplemented!("{:?}", op),
         }
         Signals::None
@@ -2548,6 +2560,48 @@ impl SIMD32 {
             let s1_value = self.read_vgpr(elem, s1);
             let carry = self.get_vcc_bit(elem);
             let (d_value, carry) = add_u32(s0_value, s1_value, carry as u32);
+            self.write_vgpr(elem, d, d_value);
+            vcc |= (carry as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_sub_co_ci_u32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let carry = self.get_vcc_bit(elem);
+            let (d_value, carry) = sub_u32(s0_value, s1_value, carry as u32);
+            self.write_vgpr(elem, d, d_value);
+            vcc |= (carry as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_subrev_co_ci_u32_e32(&mut self, d: usize, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let carry = self.get_vcc_bit(elem);
+            let (d_value, carry) = sub_u32(s1_value, s0_value, carry as u32);
             self.write_vgpr(elem, d, d_value);
             vcc |= (carry as u32) << elem;
         }

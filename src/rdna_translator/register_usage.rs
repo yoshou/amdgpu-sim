@@ -833,6 +833,16 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOP2(inst) => match inst.op {
+                I::V_MIN_I32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                }
+                I::V_SUBREV_F32 => {
+                    reg_usage.use_operand_f32(&inst.src0);
+                    reg_usage.use_vgpr_f32(inst.vsrc1 as u32);
+                    reg_usage.def_vgpr_f32(inst.vdst as u32);
+                }
                 I::V_MAX_I32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_vgpr_u32(inst.vsrc1 as u32);
@@ -2064,6 +2074,10 @@ impl RDNATranslator {
                 }
             },
             InstFormat::SOP1(inst) => match inst.op {
+                I::S_SEXT_I32_I16 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
                 I::S_CVT_I32_F32 => {
                     reg_usage.use_operand_f32(&inst.ssrc0);
                     reg_usage.def_sgpr_u32(inst.sdst as u32);
@@ -2122,6 +2136,11 @@ impl RDNATranslator {
                 }
             },
             InstFormat::SOP2(inst) => match inst.op {
+                I::S_ADD_CO_CI_U32 => {
+                    reg_usage.use_operand_u32(&inst.ssrc0);
+                    reg_usage.use_operand_u32(&inst.ssrc1);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
                 I::S_ADD_CO_U32 => {
                     reg_usage.use_operand_u32(&inst.ssrc0);
                     reg_usage.use_operand_u32(&inst.ssrc1);

@@ -369,6 +369,21 @@ impl IREmitter {
 
                 emitter.emit_store_sgpr_f32(inst.sdst as u32, d_value);
             }
+            I::S_SEXT_I32_I16 => {
+                let emitter = self;
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+
+                let truncated =
+                    llvm::core::LLVMBuildTrunc(builder, s0_value, ty_i16, empty_name.as_ptr());
+                let d_value =
+                    llvm::core::LLVMBuildSExt(builder, truncated, ty_i32, empty_name.as_ptr());
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, d_value);
+            }
             I::S_CVT_I32_F32 => {
                 let emitter = self;
                 let empty_name = std::ffi::CString::new("").unwrap();
@@ -998,6 +1013,48 @@ impl IREmitter {
                 emitter.emit_store_scc_u8(scc_value);
             }
             I::S_ADD_CO_U32 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let s0_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc0);
+                let s1_value = emitter.emit_scalar_source_operand_u32(&inst.ssrc1);
+
+                let intrinsic =
+                    emitter.get_intrinsic_declaration("llvm.uadd.with.overflow.", &[ty_i32]);
+
+                let mut return_tys = vec![ty_i32, ty_i1];
+                let add_overflow = intrinsic.emit_call(
+                    llvm::core::LLVMStructTypeInContext(
+                        context,
+                        return_tys.as_mut_ptr(),
+                        return_tys.len() as u32,
+                        0,
+                    ),
+                    &[s0_value, s1_value],
+                );
+                let added = llvm::core::LLVMBuildExtractValue(
+                    builder,
+                    add_overflow,
+                    0,
+                    empty_name.as_ptr(),
+                );
+                let cmp = llvm::core::LLVMBuildExtractValue(
+                    builder,
+                    add_overflow,
+                    1,
+                    empty_name.as_ptr(),
+                );
+
+                emitter.emit_store_sgpr_u32(inst.sdst as u32, added);
+
+                let scc_value = llvm::core::LLVMBuildZExt(builder, cmp, ty_i8, empty_name.as_ptr());
+
+                emitter.emit_store_scc_u8(scc_value);
+            }
+            I::S_ADD_CO_CI_U32 => {
                 let emitter = self;
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                 let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
