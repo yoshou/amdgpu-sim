@@ -1200,6 +1200,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f32xn]);
@@ -1216,6 +1217,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1244,6 +1246,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32xn]);
@@ -1260,6 +1263,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1413,6 +1417,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32xn]);
@@ -1441,6 +1446,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32]);
                         let sqrt_value = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1479,6 +1485,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         // The ISA operand is in revolutions: D = sin(S0 * 2 * PI).
                         // Subtracting the nearest integer is exact in binary and
@@ -1556,6 +1563,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.rint.", &[ty_f32]);
                         let rounded = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1633,6 +1641,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         // The ISA operand is in revolutions: D = cos(S0 * 2 * PI).
                         // Subtracting the nearest integer is exact in binary and
@@ -1710,6 +1719,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.rint.", &[ty_f32]);
                         let rounded = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1897,6 +1907,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32xn]);
@@ -1913,6 +1924,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -2456,6 +2468,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
                             builder,
@@ -2479,6 +2492,7 @@ impl IREmitter {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s0_value =
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
                             builder,
@@ -4703,6 +4717,7 @@ impl IREmitter {
 
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_value, inst.abs, inst.neg, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
                             builder,
@@ -4727,6 +4742,7 @@ impl IREmitter {
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_value, 0);
+                        let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
                             builder,

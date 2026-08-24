@@ -501,7 +501,12 @@ fn ftz_f32(value: f32) -> f32 {
 
 fn clamp_f32(value: f32, clamp: bool) -> f32 {
     if clamp {
-        value.clamp(0.0, 1.0)
+        // CLAMP turns a NaN into zero rather than passing it through.
+        if value.is_nan() {
+            0.0
+        } else {
+            value.clamp(0.0, 1.0)
+        }
     } else {
         value
     }
@@ -509,7 +514,12 @@ fn clamp_f32(value: f32, clamp: bool) -> f32 {
 
 fn clamp_f64(value: f64, clamp: bool) -> f64 {
     if clamp {
-        value.clamp(0.0, 1.0)
+        // CLAMP turns a NaN into zero rather than passing it through.
+        if value.is_nan() {
+            0.0
+        } else {
+            value.clamp(0.0, 1.0)
+        }
     } else {
         value
     }

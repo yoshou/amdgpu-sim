@@ -505,10 +505,19 @@ impl IREmitter {
         }
         let zero = splat(self, 0.0);
         let one = splat(self, 1.0);
+        // CLAMP turns a NaN into zero, which minnum/maxnum would instead drop.
+        let is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            value,
+            value,
+            empty_name.as_ptr(),
+        );
         let intrinsic = self.get_intrinsic_declaration("llvm.minnum.", &[ty]);
-        let value = intrinsic.emit_call(ty, &[value, one]);
+        let clamped = intrinsic.emit_call(ty, &[value, one]);
         let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty]);
-        intrinsic.emit_call(ty, &[value, zero])
+        let clamped = intrinsic.emit_call(ty, &[clamped, zero]);
+        llvm::core::LLVMBuildSelect(builder, is_nan, zero, clamped, empty_name.as_ptr())
     }
 
     pub(crate) unsafe fn emit_omod_clamp(
