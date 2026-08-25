@@ -15,12 +15,12 @@ mod compare;
 mod encoding;
 mod harness;
 
+mod ds;
+mod mem;
+mod salu;
+mod scratch;
 mod vop1;
 mod vop2;
 mod vop3;
-mod mem;
-mod salu;
-mod vopc;
-mod ds;
-mod scratch;
 mod vop3p;
+mod vopc;

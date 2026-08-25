@@ -204,7 +204,9 @@ pub(crate) fn check_vop3_f64_ulp(op: u32, ulp: i128, cases: &[Vop3F64]) {
     assert!(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
-        failures.len(), cases.len() * 2, failures.join("\n"),
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
     );
 }
 
@@ -266,7 +268,9 @@ pub(crate) fn check_vop3_u32_ulp(op: u32, tolerance: i64, cases: &[Vop3F32]) {
     assert!(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
-        failures.len(), cases.len() * 2, failures.join("\n"),
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
     );
 }
 

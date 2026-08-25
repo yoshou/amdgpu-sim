@@ -2112,4 +2112,3 @@ fn v_fma_mixhi_f16_vop3p() {
         ],
     );
 }
-

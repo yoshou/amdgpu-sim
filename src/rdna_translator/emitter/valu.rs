@@ -137,7 +137,8 @@ impl IREmitter {
                         (bb, class_value)
                     });
                 }
-            }            I::V_CMP_CLASS_F64 => {
+            }
+            I::V_CMP_CLASS_F64 => {
                 if USE_SIMD {
                     let emitter = self;
                     let context = emitter.context;
@@ -856,11 +857,11 @@ impl IREmitter {
                     | I::V_CMP_NLT_F32
                     | I::V_CMP_NGE_F32
                     | I::V_CMP_NLE_F32 => true,
-                        I::V_CMPX_NEQ_F32 => true,
-                        I::V_CMPX_NGE_F32 => true,
-                        I::V_CMPX_NGT_F32 => true,
-                        I::V_CMPX_NLE_F32 => true,
-                        I::V_CMPX_NLT_F32 => true,
+                    I::V_CMPX_NEQ_F32 => true,
+                    I::V_CMPX_NGE_F32 => true,
+                    I::V_CMPX_NGT_F32 => true,
+                    I::V_CMPX_NLE_F32 => true,
+                    I::V_CMPX_NLT_F32 => true,
                     _ => false,
                 };
                 if USE_SIMD {
@@ -948,72 +949,6 @@ impl IREmitter {
                     });
                 }
             }
-            I::V_CMP_GT_U64 | I::V_CMP_EQ_U64 => {
-                let pred = match inst.op {
-                    I::V_CMP_GT_U64 => llvm::LLVMIntPredicate::LLVMIntUGT,
-                    I::V_CMP_EQ_U64 => llvm::LLVMIntPredicate::LLVMIntEQ,
-                    _ => unreachable!(),
-                };
-                if USE_SIMD {
-                    let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-                    let exec_value = emitter.emit_load_sgpr_u32(126);
-
-                    const N: usize = SIMD_WIDTH;
-
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-
-                    let mut cmp_values = Vec::new();
-
-                    for i in (0..32).step_by(N) {
-                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
-
-                        let s0_value =
-                            emitter.emit_vector_source_operand_u64xn::<N>(&inst.src0, i, mask);
-
-                        let s1_value =
-                            emitter.emit_load_vgpr_u64xn::<N>(inst.vsrc1 as u32, i, mask);
-
-                        let cmp_value = llvm::core::LLVMBuildICmp(
-                            builder,
-                            pred,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
-
-                        cmp_values.push(cmp_value);
-                    }
-
-                    let cmp_value = emitter.emit_concat::<N>(&cmp_values);
-
-                    let d_value = llvm::core::LLVMBuildBitCast(
-                        builder,
-                        cmp_value,
-                        ty_i32,
-                        empty_name.as_ptr(),
-                    );
-
-                    let d_value = emitter.emit_mask_with_exec(d_value, exec_value);
-                    emitter.emit_store_sgpr_u32(106, d_value);
-                } else {
-                    bb = self.emit_vop_update_sgpr(bb, 106, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-
-                        let s0_value = emitter.emit_vector_source_operand_u64(&inst.src0, elem);
-                        let s1_value = emitter.emit_load_vgpr_u64(inst.vsrc1 as u32, elem);
-                        let cmp_value = llvm::core::LLVMBuildICmp(
-                            builder,
-                            pred,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
-
-                        (bb, cmp_value)
-                    });
-                }
-            }
             I::V_CMP_GT_F64
             | I::V_CMP_LT_F64
             | I::V_CMP_NLT_F64
@@ -1065,9 +1000,9 @@ impl IREmitter {
                     | I::V_CMP_NEQ_F64
                     | I::V_CMP_NGE_F64
                     | I::V_CMP_NLE_F64 => true,
-                        I::V_CMPX_NEQ_F64 => true,
-                        I::V_CMPX_NLE_F64 => true,
-                        I::V_CMPX_NLT_F64 => true,
+                    I::V_CMPX_NEQ_F64 => true,
+                    I::V_CMPX_NLE_F64 => true,
+                    I::V_CMPX_NLT_F64 => true,
                     _ => false,
                 };
                 if USE_SIMD {
@@ -1442,7 +1377,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let intrinsic =
@@ -1482,7 +1418,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let intrinsic =
@@ -1637,7 +1574,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let intrinsic =
@@ -1879,7 +1817,6 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
                             reduced,
@@ -2086,27 +2023,21 @@ impl IREmitter {
 
                     const N: usize = SIMD_WIDTH;
 
-
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
                         let s0_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
-                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
-                        let _ = (mant_value, exp_value);
-                        let d_value = mant_value;
+                        let d_value = emitter.emit_frexp(s0_value).0;
 
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
-                        let _ = (mant_value, exp_value);
-                        let d_value = mant_value;
+                        let d_value = emitter.emit_frexp(s0_value).0;
 
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
 
@@ -2193,7 +2124,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
@@ -2244,7 +2176,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let intrinsic =
@@ -2597,8 +2530,12 @@ impl IREmitter {
                         let s0_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
-                        let d_value =
-                            llvm::core::LLVMBuildFPTrunc(builder, s0_value, ty_f32xn, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildFPTrunc(
+                            builder,
+                            s0_value,
+                            ty_f32xn,
+                            empty_name.as_ptr(),
+                        );
 
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
@@ -2609,8 +2546,12 @@ impl IREmitter {
 
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
-                        let d_value =
-                            llvm::core::LLVMBuildFPTrunc(builder, s0_value, ty_f32, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildFPTrunc(
+                            builder,
+                            s0_value,
+                            ty_f32,
+                            empty_name.as_ptr(),
+                        );
 
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
 
@@ -2870,7 +2811,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
@@ -3666,12 +3608,7 @@ impl IREmitter {
                         };
                         let added = llvm::core::LLVMBuildSub(
                             builder,
-                            llvm::core::LLVMBuildSub(
-                                builder,
-                                first,
-                                second,
-                                empty_name.as_ptr(),
-                            ),
+                            llvm::core::LLVMBuildSub(builder, first, second, empty_name.as_ptr()),
                             vcc_value,
                             empty_name.as_ptr(),
                         );
@@ -3768,12 +3705,7 @@ impl IREmitter {
                         };
                         let added = llvm::core::LLVMBuildSub(
                             builder,
-                            llvm::core::LLVMBuildSub(
-                                builder,
-                                first,
-                                second,
-                                empty_name.as_ptr(),
-                            ),
+                            llvm::core::LLVMBuildSub(builder, first, second, empty_name.as_ptr()),
                             vcc_value,
                             empty_name.as_ptr(),
                         );

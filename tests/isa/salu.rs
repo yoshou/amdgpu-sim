@@ -110,8 +110,16 @@ pub(crate) fn check_sop1(op: u32, cases: &[Sop1Case]) {
         for engine in [Engine::Interpreter, Engine::LlvmJit] {
             let got = run(&harness, engine, &words, &uni);
             let ctx = format!("scc_in={} exec_in=0x{:08X}", case.scc_in, case.exec_in);
-            compare(engine, i, &got, case.expected, case.expected_scc, case.expected_exec,
-                    &ctx, &mut failures);
+            compare(
+                engine,
+                i,
+                &got,
+                case.expected,
+                case.expected_scc,
+                case.expected_exec,
+                &ctx,
+                &mut failures,
+            );
         }
     }
     report(failures, cases.len() * 2);
@@ -198,10 +206,20 @@ pub(crate) fn check_sopk(op: u32, cases: &[SopkCase]) {
         let words = vec![sop1(0, SDST, 255), case.dst_in, sopk(op, SDST, case.simm16)];
         for engine in [Engine::Interpreter, Engine::LlvmJit] {
             let got = run(&harness, engine, &words, &uni);
-            let ctx = format!("simm16=0x{:04X} dst_in=0x{:08X} scc_in={}",
-                              case.simm16, case.dst_in, case.scc_in);
-            compare(engine, i, &got, case.expected, case.expected_scc, 0xFFFF_FFFF,
-                    &ctx, &mut failures);
+            let ctx = format!(
+                "simm16=0x{:04X} dst_in=0x{:08X} scc_in={}",
+                case.simm16, case.dst_in, case.scc_in
+            );
+            compare(
+                engine,
+                i,
+                &got,
+                case.expected,
+                case.expected_scc,
+                0xFFFF_FFFF,
+                &ctx,
+                &mut failures,
+            );
         }
     }
     report(failures, cases.len() * 2);

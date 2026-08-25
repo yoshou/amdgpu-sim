@@ -41,12 +41,6 @@ pub(crate) struct SmemLoad {
     pub(crate) expected: [u32; 8],
 }
 
-fn read(harness: &Harness, engine: Engine, words: &[u32], lane: usize, at: usize) -> u32 {
-    let src = vec![0u32; LANES * harness.src_stride];
-    let uni = vec![0u32; 8];
-    harness.run(engine, words, &src, &uni)[lane * harness.out_stride + at]
-}
-
 fn read_all(harness: &Harness, engine: Engine, words: &[u32], store: u64) -> Vec<u32> {
     let mut src = vec![0u32; LANES * harness.src_stride];
     for lane in 0..LANES {
@@ -130,7 +124,11 @@ pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
             }
             failures.push(format!(
                 "  {:<11} case {} ioffset={} hardware={:08X?} simulator={:08X?}",
-                engine_name(engine), i, case.ioffset, case.expected, got,
+                engine_name(engine),
+                i,
+                case.ioffset,
+                case.expected,
+                got,
             ));
         }
     }
@@ -143,7 +141,9 @@ fn global_load_b128_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 23,
+    check_vmem_load(
+        VGLOBAL,
+        23,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0xA303_0303] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404] },
@@ -160,7 +160,9 @@ fn global_load_b32_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 20,
+    check_vmem_load(
+        VGLOBAL,
+        20,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -177,7 +179,9 @@ fn global_load_b64_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 21,
+    check_vmem_load(
+        VGLOBAL,
+        21,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0xA101_0101, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0xA202_0202, 0x0000_0000, 0x0000_0000] },
@@ -194,7 +198,9 @@ fn global_load_b96_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 22,
+    check_vmem_load(
+        VGLOBAL,
+        22,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0x0000_0000] },
@@ -211,7 +217,9 @@ fn global_load_i16_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 19,
+    check_vmem_load(
+        VGLOBAL,
+        19,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -228,7 +236,9 @@ fn global_load_i8_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 17,
+    check_vmem_load(
+        VGLOBAL,
+        17,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -245,7 +255,9 @@ fn global_load_u16_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 18,
+    check_vmem_load(
+        VGLOBAL,
+        18,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -262,7 +274,9 @@ fn global_load_u8_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VGLOBAL, 16,
+    check_vmem_load(
+        VGLOBAL,
+        16,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -279,7 +293,9 @@ fn global_store_b128_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VGLOBAL, 29,
+    check_vmem_store(
+        VGLOBAL,
+        29,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -297,7 +313,9 @@ fn global_store_b16_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VGLOBAL, 25,
+    check_vmem_store(
+        VGLOBAL,
+        25,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -315,7 +333,9 @@ fn global_store_b32_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VGLOBAL, 26,
+    check_vmem_store(
+        VGLOBAL,
+        26,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -333,7 +353,9 @@ fn global_store_b64_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VGLOBAL, 27,
+    check_vmem_store(
+        VGLOBAL,
+        27,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -351,7 +373,9 @@ fn global_store_b8_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VGLOBAL, 24,
+    check_vmem_store(
+        VGLOBAL,
+        24,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -369,7 +393,9 @@ fn global_store_b96_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VGLOBAL, 28,
+    check_vmem_store(
+        VGLOBAL,
+        28,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -387,7 +413,9 @@ fn flat_load_b128_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 23,
+    check_vmem_load(
+        VFLAT,
+        23,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0xA303_0303] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404] },
@@ -404,7 +432,9 @@ fn flat_load_b32_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 20,
+    check_vmem_load(
+        VFLAT,
+        20,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -421,7 +451,9 @@ fn flat_load_b64_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 21,
+    check_vmem_load(
+        VFLAT,
+        21,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0xA101_0101, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0xA202_0202, 0x0000_0000, 0x0000_0000] },
@@ -438,7 +470,9 @@ fn flat_load_b96_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 22,
+    check_vmem_load(
+        VFLAT,
+        22,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0x0000_0000] },
@@ -455,7 +489,9 @@ fn flat_load_i16_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 19,
+    check_vmem_load(
+        VFLAT,
+        19,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -472,7 +508,9 @@ fn flat_load_i8_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 17,
+    check_vmem_load(
+        VFLAT,
+        17,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -489,7 +527,9 @@ fn flat_load_u16_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 18,
+    check_vmem_load(
+        VFLAT,
+        18,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -506,7 +546,9 @@ fn flat_load_u8_load() {
     // Lane n addresses word n of the buffer, so the value that comes back
     // identifies the address the instruction used. IOFFSET is varied, including
     // a negative one.
-    check_vmem_load(VFLAT, 16,
+    check_vmem_load(
+        VFLAT,
+        16,
         &[
             MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
             MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
@@ -523,7 +565,9 @@ fn flat_store_b128_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VFLAT, 29,
+    check_vmem_store(
+        VFLAT,
+        29,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -541,7 +585,9 @@ fn flat_store_b16_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VFLAT, 25,
+    check_vmem_store(
+        VFLAT,
+        25,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -559,7 +605,9 @@ fn flat_store_b32_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VFLAT, 26,
+    check_vmem_store(
+        VFLAT,
+        26,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -577,7 +625,9 @@ fn flat_store_b64_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VFLAT, 27,
+    check_vmem_store(
+        VFLAT,
+        27,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -595,7 +645,9 @@ fn flat_store_b8_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VFLAT, 24,
+    check_vmem_store(
+        VFLAT,
+        24,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -613,7 +665,9 @@ fn flat_store_b96_store() {
     // The word in the buffer after the store is what is checked; the test
     // also requires the destination register to be untouched, since a store
     // has none.
-    check_vmem_store(VFLAT, 28,
+    check_vmem_store(
+        VFLAT,
+        28,
         &[
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 0, saddr: SADDR_NULL, expected_data: 0x0000_0000 },
             MemStore { store_value: 0x0000_0000_0000_0000, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
@@ -630,11 +684,7 @@ fn s_load_b128_smem() {
     // S_LOAD_B128.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(2,
-        &[
-
-        ],
-    );
+    check_smem_load(2, &[]);
 }
 
 #[test]
@@ -642,11 +692,7 @@ fn s_load_b256_smem() {
     // S_LOAD_B256.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(3,
-        &[
-
-        ],
-    );
+    check_smem_load(3, &[]);
 }
 
 #[test]
@@ -654,11 +700,7 @@ fn s_load_b32_smem() {
     // S_LOAD_B32.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(0,
-        &[
-
-        ],
-    );
+    check_smem_load(0, &[]);
 }
 
 #[test]
@@ -666,11 +708,7 @@ fn s_load_b512_smem() {
     // S_LOAD_B512.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(4,
-        &[
-
-        ],
-    );
+    check_smem_load(4, &[]);
 }
 
 #[test]
@@ -678,11 +716,7 @@ fn s_load_b64_smem() {
     // S_LOAD_B64.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(1,
-        &[
-
-        ],
-    );
+    check_smem_load(1, &[]);
 }
 
 #[test]
@@ -690,11 +724,7 @@ fn s_load_b96_smem() {
     // S_LOAD_B96.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(5,
-        &[
-
-        ],
-    );
+    check_smem_load(5, &[]);
 }
 
 #[test]
@@ -702,11 +732,7 @@ fn s_load_i16_smem() {
     // S_LOAD_I16.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(10,
-        &[
-
-        ],
-    );
+    check_smem_load(10, &[]);
 }
 
 #[test]
@@ -714,11 +740,7 @@ fn s_load_i8_smem() {
     // S_LOAD_I8.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(8,
-        &[
-
-        ],
-    );
+    check_smem_load(8, &[]);
 }
 
 #[test]
@@ -726,11 +748,7 @@ fn s_load_u16_smem() {
     // S_LOAD_U16.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(11,
-        &[
-
-        ],
-    );
+    check_smem_load(11, &[]);
 }
 
 #[test]
@@ -738,9 +756,5 @@ fn s_load_u8_smem() {
     // S_LOAD_U8.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(9,
-        &[
-
-        ],
-    );
+    check_smem_load(9, &[]);
 }

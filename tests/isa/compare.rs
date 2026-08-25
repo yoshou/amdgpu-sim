@@ -3,7 +3,6 @@
 //! Split by result type, because the bit layout, the ULP distance and the way a
 //! failure needs to be printed all differ.
 
-
 // ---------------------------------------------------------------- comparison
 pub(crate) fn is_nan_f32(bits: u32) -> bool {
     (bits & 0x7F80_0000) == 0x7F80_0000 && (bits & 0x007F_FFFF) != 0

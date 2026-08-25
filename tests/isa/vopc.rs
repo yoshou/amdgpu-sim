@@ -74,7 +74,12 @@ pub(crate) struct Vopc3Case {
 /// The SGPR the harness gives the VOP3 compares as a destination.
 const SDST: u32 = 16;
 
-fn fill(harness: &Harness, src0: VopcSrc0, vsrc1: u64, uni: &mut [u32]) -> (Vec<u32>, u32, Vec<u32>) {
+fn fill(
+    harness: &Harness,
+    src0: VopcSrc0,
+    vsrc1: u64,
+    uni: &mut [u32],
+) -> (Vec<u32>, u32, Vec<u32>) {
     let mut src = vec![0u32; LANES * harness.src_stride];
     for lane in 0..LANES {
         src[lane * harness.src_stride + 2] = vsrc1 as u32;

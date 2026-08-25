@@ -759,4 +759,3 @@ fn scratch_store_b96_vscratch() {
         ],
     );
 }
-

@@ -3,7 +3,6 @@
 //! Nothing here interprets an instruction; these are the bit positions the ISA
 //! manual gives for each format, and the encodings of the 9-bit operand field.
 
-
 /// Bytes reserved for the patch slot: an 8-byte marker plus 30 `s_nop`. Enough
 /// for setup instructions ahead of the instruction under test. Must match the
 /// `.rept` count in tools/isa_probe/harness.hip.
@@ -39,7 +38,6 @@ pub(crate) const fn vop2(op: u32, vdst: u32, vsrc1: u32, src0: u32) -> u32 {
 /// VOP3: [7:0] VDST, [10:8] ABS, [14:11] OPSEL, [15] CLAMP, [25:16] OP,
 /// [31:26] = 110101, [40:32] SRC0, [49:41] SRC1, [58:50] SRC2, [60:59] OMOD,
 /// [63:61] NEG.
-#[allow(clippy::too_many_arguments)]
 pub(crate) const fn vop3(
     op: u32,
     vdst: u32,
@@ -59,7 +57,6 @@ pub(crate) const fn vop3(
 /// VOP3P: [31:24] = 11001100, [25:16] = OP, [15] = CLAMP, [14] = OPSEL_HI[2],
 /// [13:11] = OPSEL, [10:8] = NEG_HI, [7:0] = VDST, then [40:32] SRC0,
 /// [49:41] SRC1, [58:50] SRC2, [60:59] = OPSEL_HI[1:0], [63:61] = NEG.
-#[allow(clippy::too_many_arguments)]
 pub(crate) const fn vop3p(
     op: u32,
     vdst: u32,
@@ -113,7 +110,14 @@ pub(crate) const fn vopc(op: u32, vsrc1: u32, src0: u32) -> u32 {
 /// The VOP3 encoding of a compare. The destination is an SGPR named by the
 /// same [7:0] field a VOP3 uses for its VGPR destination, and the opcode is the
 /// VOPC opcode unchanged. There is no clamp or omod.
-pub(crate) const fn vop3_sdst(op: u32, sdst: u32, src0: u32, src1: u32, abs: u32, neg: u32) -> [u32; 2] {
+pub(crate) const fn vop3_sdst(
+    op: u32,
+    sdst: u32,
+    src0: u32,
+    src1: u32,
+    abs: u32,
+    neg: u32,
+) -> [u32; 2] {
     let lo = sdst | (abs << 8) | (op << 16) | (0b110101 << 26);
     let hi = src0 | (src1 << 9) | (neg << 29);
     [lo, hi]
@@ -141,11 +145,6 @@ pub(crate) const fn sopk(op: u32, sdst: u32, simm16: u32) -> u32 {
     (0b1011 << 28) | (op << 23) | (sdst << 16) | simm16
 }
 
-/// SOPP: [31:23] = 101111111, [22:16] = OP, [15:0] = SIMM16.
-pub(crate) const fn sopp(op: u32, simm16: u32) -> u32 {
-    (0b101111111 << 23) | (op << 16) | simm16
-}
-
 /// The FLAT-family encodings, which differ only in these top bits.
 pub(crate) const VFLAT: u32 = 0b1110_1100;
 pub(crate) const VGLOBAL: u32 = 0b1110_1110;
@@ -159,7 +158,15 @@ pub(crate) const SADDR_NULL: u32 = 0x7C;
 /// word0 [31:24] = encoding, [21:14] = OP, [6:0] = SADDR.
 /// word1 [7:0] = VDST, [30:23] = VSRC.
 /// word2 [7:0] = VADDR, [31:8] = IOFFSET (signed).
-pub(crate) const fn vmem(enc: u32, op: u32, vdst: u32, vsrc: u32, vaddr: u32, saddr: u32, ioffset: i32) -> [u32; 3] {
+pub(crate) const fn vmem(
+    enc: u32,
+    op: u32,
+    vdst: u32,
+    vsrc: u32,
+    vaddr: u32,
+    saddr: u32,
+    ioffset: i32,
+) -> [u32; 3] {
     [
         (enc << 24) | (op << 14) | saddr,
         vdst | (vsrc << 23),
@@ -172,7 +179,6 @@ pub(crate) const fn vmem(enc: u32, op: u32, vdst: u32, vsrc: u32, vaddr: u32, sa
 /// word0 [31:24] = encoding, [21:14] = OP, [6:0] = SADDR.
 /// word1 [7:0] = VDST, [17] = SVE, [30:23] = VSRC.
 /// word2 [7:0] = VADDR, [31:8] = IOFFSET (signed).
-#[allow(clippy::too_many_arguments)]
 pub(crate) const fn vscratch(
     op: u32,
     vdst: u32,

@@ -168,7 +168,9 @@ pub(crate) fn check_vop1_u32_ulp(op: u32, tolerance: i64, cases: &[(u64, u32)]) 
     assert!(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
-        failures.len(), cases.len() * 2, failures.join("\n"),
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
     );
 }
 
@@ -176,7 +178,7 @@ pub(crate) fn check_vop1_u32_ulp(op: u32, tolerance: i64, cases: &[(u64, u32)]) 
 #[test]
 pub(crate) fn v_bfrev_b32_vop1() {
     // V_BFREV_B32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         56,
         &[
@@ -197,7 +199,7 @@ pub(crate) fn v_bfrev_b32_vop1() {
 #[test]
 pub(crate) fn v_ceil_f32_vop1() {
     // V_CEIL_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         34,
         &[
@@ -225,7 +227,7 @@ pub(crate) fn v_ceil_f32_vop1() {
 #[test]
 pub(crate) fn v_clz_i32_u32_vop1() {
     // V_CLZ_I32_U32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         57,
         &[
@@ -246,7 +248,7 @@ pub(crate) fn v_clz_i32_u32_vop1() {
 #[test]
 pub(crate) fn v_cos_f32_vop1() {
     // V_COS_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         54,
         &[
@@ -274,7 +276,7 @@ pub(crate) fn v_cos_f32_vop1() {
 #[test]
 pub(crate) fn v_cvt_f16_f32_vop1() {
     // V_CVT_F16_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         10,
         &[
@@ -302,7 +304,7 @@ pub(crate) fn v_cvt_f16_f32_vop1() {
 #[test]
 pub(crate) fn v_cvt_f32_f16_vop1() {
     // V_CVT_F32_F16 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         11,
         &[
@@ -325,7 +327,7 @@ pub(crate) fn v_cvt_f32_f16_vop1() {
 #[test]
 pub(crate) fn v_cvt_f32_f64_vop1() {
     // V_CVT_F32_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         15,
         &[
@@ -353,7 +355,7 @@ pub(crate) fn v_cvt_f32_f64_vop1() {
 #[test]
 pub(crate) fn v_cvt_f32_i32_vop1() {
     // V_CVT_F32_I32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         5,
         &[
@@ -374,7 +376,7 @@ pub(crate) fn v_cvt_f32_i32_vop1() {
 #[test]
 pub(crate) fn v_cvt_f32_u32_vop1() {
     // V_CVT_F32_U32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         6,
         &[
@@ -395,7 +397,7 @@ pub(crate) fn v_cvt_f32_u32_vop1() {
 #[test]
 pub(crate) fn v_cvt_f64_f32_vop1() {
     // V_CVT_F64_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         16,
         &[
@@ -423,7 +425,7 @@ pub(crate) fn v_cvt_f64_f32_vop1() {
 #[test]
 pub(crate) fn v_cvt_f64_i32_vop1() {
     // V_CVT_F64_I32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         4,
         &[
@@ -444,7 +446,7 @@ pub(crate) fn v_cvt_f64_i32_vop1() {
 #[test]
 pub(crate) fn v_cvt_f64_u32_vop1() {
     // V_CVT_F64_U32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         22,
         &[
@@ -493,7 +495,7 @@ pub(crate) fn v_cvt_i32_f32_vop1() {
 #[test]
 pub(crate) fn v_cvt_i32_f64_vop1() {
     // V_CVT_I32_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         3,
         &[
@@ -549,7 +551,7 @@ pub(crate) fn v_cvt_u32_f32_vop1() {
 #[test]
 pub(crate) fn v_cvt_u32_f64_vop1() {
     // V_CVT_U32_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         21,
         &[
@@ -605,7 +607,7 @@ pub(crate) fn v_exp_f32_vop1() {
 #[test]
 pub(crate) fn v_floor_f32_vop1() {
     // V_FLOOR_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         36,
         &[
@@ -633,7 +635,7 @@ pub(crate) fn v_floor_f32_vop1() {
 #[test]
 pub(crate) fn v_floor_f64_vop1() {
     // V_FLOOR_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         26,
         &[
@@ -661,7 +663,7 @@ pub(crate) fn v_floor_f64_vop1() {
 #[test]
 pub(crate) fn v_fract_f64_vop1() {
     // V_FRACT_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         62,
         &[
@@ -689,7 +691,7 @@ pub(crate) fn v_fract_f64_vop1() {
 #[test]
 pub(crate) fn v_frexp_exp_i32_f32_vop1() {
     // V_FREXP_EXP_I32_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         63,
         &[
@@ -717,7 +719,7 @@ pub(crate) fn v_frexp_exp_i32_f32_vop1() {
 #[test]
 pub(crate) fn v_frexp_exp_i32_f64_vop1() {
     // V_FREXP_EXP_I32_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         60,
         &[
@@ -745,7 +747,7 @@ pub(crate) fn v_frexp_exp_i32_f64_vop1() {
 #[test]
 pub(crate) fn v_frexp_mant_f32_vop1() {
     // V_FREXP_MANT_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         64,
         &[
@@ -773,7 +775,7 @@ pub(crate) fn v_frexp_mant_f32_vop1() {
 #[test]
 pub(crate) fn v_frexp_mant_f64_vop1() {
     // V_FREXP_MANT_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         61,
         &[
@@ -829,7 +831,7 @@ pub(crate) fn v_log_f32_vop1() {
 #[test]
 pub(crate) fn v_mov_b32_vop1() {
     // V_MOV_B32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         1,
         &[
@@ -850,7 +852,7 @@ pub(crate) fn v_mov_b32_vop1() {
 #[test]
 pub(crate) fn v_not_b32_vop1() {
     // V_NOT_B32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_u32(
         55,
         &[
@@ -955,7 +957,7 @@ pub(crate) fn v_rcp_iflag_f32_vop1() {
 #[test]
 pub(crate) fn v_rndne_f32_vop1() {
     // V_RNDNE_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         35,
         &[
@@ -983,7 +985,7 @@ pub(crate) fn v_rndne_f32_vop1() {
 #[test]
 pub(crate) fn v_rndne_f64_vop1() {
     // V_RNDNE_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         25,
         &[
@@ -1153,7 +1155,7 @@ pub(crate) fn v_sqrt_f64_vop1() {
 #[test]
 pub(crate) fn v_trunc_f32_vop1() {
     // V_TRUNC_F32 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f32(
         33,
         &[
@@ -1181,7 +1183,7 @@ pub(crate) fn v_trunc_f32_vop1() {
 #[test]
 pub(crate) fn v_trunc_f64_vop1() {
     // V_TRUNC_F64 in the VOP1 encoding. No accuracy statement in the manual, so the pseudo
-// code determines the result exactly.
+    // code determines the result exactly.
     check_vop1_f64(
         23,
         &[

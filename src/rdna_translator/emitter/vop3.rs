@@ -1113,7 +1113,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1129,8 +1130,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.trunc.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1155,7 +1155,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1171,8 +1172,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.ceil.", &[ty_f32]);
                         let d_value = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1197,7 +1197,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
@@ -1215,8 +1216,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.exp2.", &[ty_f32]);
@@ -1243,7 +1243,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
@@ -1262,8 +1263,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.log2.", &[ty_f32]);
@@ -1291,7 +1291,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1307,8 +1308,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.floor.", &[ty_f64]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value]);
@@ -1333,7 +1333,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1349,8 +1350,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.trunc.", &[ty_f64]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value]);
@@ -1416,7 +1416,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
@@ -1446,8 +1447,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32]);
@@ -1484,7 +1484,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1542,8 +1543,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.rint.", &[ty_f32]);
                         let rounded = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1603,7 +1603,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1661,8 +1662,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.rint.", &[ty_f32]);
                         let rounded = intrinsic.emit_call(ty_f32, &[s0_value]);
@@ -1672,7 +1672,6 @@ impl IREmitter {
                             rounded,
                             empty_name.as_ptr(),
                         );
-
 
                         let reduced = llvm::core::LLVMBuildFPExt(
                             builder,
@@ -1722,7 +1721,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1761,8 +1761,7 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = llvm::core::LLVMBuildFPTrunc(
                             builder,
@@ -1803,7 +1802,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1814,8 +1814,7 @@ impl IREmitter {
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = emitter._emit_exp_f64(s0_value);
 
@@ -1838,7 +1837,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
@@ -1856,8 +1856,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f32]);
@@ -1884,7 +1883,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1900,8 +1900,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.roundeven.", &[ty_f32]);
@@ -1927,7 +1926,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -1949,8 +1949,7 @@ impl IREmitter {
                         let empty_name = std::ffi::CString::new("").unwrap();
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
                             builder,
@@ -1985,7 +1984,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2001,8 +2001,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f64]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value]);
@@ -2028,7 +2027,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2054,8 +2054,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.sqrt.", &[ty_f64]);
                         let sqrt_value = intrinsic.emit_call(ty_f64, &[s0_value]);
@@ -2086,7 +2085,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2102,8 +2102,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.roundeven.", &[ty_f64]);
@@ -2130,7 +2129,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2156,8 +2156,7 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let intrinsic = emitter.get_intrinsic_declaration("llvm.floor.", &[ty_f64]);
                         let d_value = intrinsic.emit_call(ty_f64, &[s0_value]);
@@ -2191,7 +2190,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2204,8 +2204,7 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = emitter.emit_fp_to_si_sat(s0_value, ty_i32);
 
@@ -2277,7 +2276,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2290,8 +2290,7 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = emitter.emit_fp_to_ui_sat(s0_value, ty_i32);
 
@@ -2364,7 +2363,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2377,8 +2377,7 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = emitter.emit_fp_to_si_sat(s0_value, ty_i32);
 
@@ -2401,7 +2400,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
@@ -2426,8 +2426,7 @@ impl IREmitter {
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
                         let s0_value = emitter.emit_ftz_f32(s0_value);
 
                         let d_value = llvm::core::LLVMBuildFDiv(
@@ -2455,7 +2454,8 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f32xn::<N>(s0_raw, inst.abs, inst.neg, 0);
 
@@ -2466,8 +2466,7 @@ impl IREmitter {
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let s0_raw = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_raw, 0);
 
                         let d_value = emitter.emit_exp_f32(s0_value);
 
@@ -2490,10 +2489,12 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                         let s0_value =
                             emitter.emit_abs_neg_f64xn::<N>(s0_raw, inst.abs, inst.neg, 0);
-                        let s1_raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src1, i, mask);
+                        let s1_raw =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src1, i, mask);
                         let s1_value =
                             emitter.emit_abs_neg_f64xn::<N>(s1_raw, inst.abs, inst.neg, 1);
 
@@ -2509,11 +2510,9 @@ impl IREmitter {
                         let ty_f64 = llvm::core::LLVMDoubleTypeInContext(context);
 
                         let s0_raw = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
-                        let s0_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_raw, 0);
                         let s1_raw = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
-                        let s1_value =
-                            emitter.emit_abs_neg_f64(inst.abs, inst.neg, s1_raw, 1);
+                        let s1_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s1_raw, 1);
 
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.minnum.", &[ty_f64]);
@@ -2525,7 +2524,8 @@ impl IREmitter {
                         bb
                     });
                 }
-            }            I::V_CVT_F32_F64 => {
+            }
+            I::V_CVT_F32_F64 => {
                 if USE_SIMD {
                     let emitter = self;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
@@ -2539,14 +2539,18 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_value =
-                            {
-                            let raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_value = {
+                            let raw =
+                                emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                             emitter.emit_abs_neg_f64xn::<N>(raw, inst.abs, inst.neg, 0)
                         };
 
-                        let d_value =
-                            llvm::core::LLVMBuildFPTrunc(builder, s0_value, ty_f32xn, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildFPTrunc(
+                            builder,
+                            s0_value,
+                            ty_f32xn,
+                            empty_name.as_ptr(),
+                        );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32xn::<N>(inst.vdst as u32, i, d_value, mask);
@@ -2561,8 +2565,12 @@ impl IREmitter {
                             emitter.emit_abs_neg_f64(inst.abs, inst.neg, raw, 0)
                         };
 
-                        let d_value =
-                            llvm::core::LLVMBuildFPTrunc(builder, s0_value, ty_f32, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildFPTrunc(
+                            builder,
+                            s0_value,
+                            ty_f32,
+                            empty_name.as_ptr(),
+                        );
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f32(inst.vdst as u32, elem, d_value);
@@ -2570,7 +2578,8 @@ impl IREmitter {
                         bb
                     });
                 }
-            }            I::V_CVT_U32_F64 => {
+            }
+            I::V_CVT_U32_F64 => {
                 if USE_SIMD {
                     let emitter = self;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
@@ -2583,9 +2592,9 @@ impl IREmitter {
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_value =
-                            {
-                            let raw = emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
+                        let s0_value = {
+                            let raw =
+                                emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
                             emitter.emit_abs_neg_f64xn::<N>(raw, inst.abs, inst.neg, 0)
                         };
 
@@ -3631,11 +3640,11 @@ impl IREmitter {
                     | I::V_CMP_NGE_F64
                     | I::V_CMP_NLE_F64
                     | I::V_CMP_NEQ_F64 => true,
-                        I::V_CMPX_NEQ_F64 => true,
-                        I::V_CMPX_NGE_F64 => true,
-                        I::V_CMPX_NGT_F64 => true,
-                        I::V_CMPX_NLE_F64 => true,
-                        I::V_CMPX_NLT_F64 => true,
+                    I::V_CMPX_NEQ_F64 => true,
+                    I::V_CMPX_NGE_F64 => true,
+                    I::V_CMPX_NGT_F64 => true,
+                    I::V_CMPX_NLE_F64 => true,
+                    I::V_CMPX_NLT_F64 => true,
                     _ => false,
                 };
                 if USE_SIMD {
@@ -4648,7 +4657,8 @@ impl IREmitter {
 
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                        let s0_raw = emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
+                        let s0_raw =
+                            emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0, i, mask);
                         let s0_value = emitter.emit_ftz_f32(s0_raw);
 
                         let s0_value =
@@ -5102,10 +5112,6 @@ impl IREmitter {
 
                     const N: usize = SIMD_WIDTH;
 
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let _ = ty_i32xn;
-
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
@@ -5129,8 +5135,6 @@ impl IREmitter {
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let _ = ty_i32;
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
@@ -5158,10 +5162,6 @@ impl IREmitter {
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
-
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let _ = ty_i32xn;
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5194,8 +5194,6 @@ impl IREmitter {
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let _ = ty_i32;
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
@@ -5233,7 +5231,6 @@ impl IREmitter {
 
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let _ = ty_i32xn;
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5255,7 +5252,6 @@ impl IREmitter {
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let _ = ty_i32;
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
@@ -5263,8 +5259,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
                         let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.smax.", &[ty_i32]);
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.smax.", &[ty_i32]);
                         let d_value = intrinsic.emit_call(ty_i32, &[s0_value, s1_value]);
 
                         emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
@@ -5282,7 +5277,6 @@ impl IREmitter {
 
                     let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
                     let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let _ = ty_i32xn;
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -5304,7 +5298,6 @@ impl IREmitter {
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let _ = ty_i32;
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
@@ -5312,8 +5305,7 @@ impl IREmitter {
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
                         let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
-                        let intrinsic =
-                            emitter.get_intrinsic_declaration("llvm.smin.", &[ty_i32]);
+                        let intrinsic = emitter.get_intrinsic_declaration("llvm.smin.", &[ty_i32]);
                         let d_value = intrinsic.emit_call(ty_i32, &[s0_value, s1_value]);
 
                         emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
@@ -5330,10 +5322,6 @@ impl IREmitter {
 
                     const N: usize = SIMD_WIDTH;
 
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let _ = ty_i32xn;
-
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
@@ -5349,22 +5337,32 @@ impl IREmitter {
                         let shift = emitter.emit_splat_u32(8, s0_value);
                         let s0_value =
                             llvm::core::LLVMBuildShl(builder, s0_value, shift, empty_name.as_ptr());
-                        let s0_value =
-                            llvm::core::LLVMBuildAShr(builder, s0_value, shift, empty_name.as_ptr());
+                        let s0_value = llvm::core::LLVMBuildAShr(
+                            builder,
+                            s0_value,
+                            shift,
+                            empty_name.as_ptr(),
+                        );
                         let s1_value =
                             llvm::core::LLVMBuildShl(builder, s1_value, shift, empty_name.as_ptr());
-                        let s1_value =
-                            llvm::core::LLVMBuildAShr(builder, s1_value, shift, empty_name.as_ptr());
-                        let d_value =
-                            llvm::core::LLVMBuildMul(builder, s0_value, s1_value, empty_name.as_ptr());
+                        let s1_value = llvm::core::LLVMBuildAShr(
+                            builder,
+                            s1_value,
+                            shift,
+                            empty_name.as_ptr(),
+                        );
+                        let d_value = llvm::core::LLVMBuildMul(
+                            builder,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
 
                         emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let _ = ty_i32;
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
@@ -5376,14 +5374,26 @@ impl IREmitter {
                         let shift = emitter.emit_splat_u32(8, s0_value);
                         let s0_value =
                             llvm::core::LLVMBuildShl(builder, s0_value, shift, empty_name.as_ptr());
-                        let s0_value =
-                            llvm::core::LLVMBuildAShr(builder, s0_value, shift, empty_name.as_ptr());
+                        let s0_value = llvm::core::LLVMBuildAShr(
+                            builder,
+                            s0_value,
+                            shift,
+                            empty_name.as_ptr(),
+                        );
                         let s1_value =
                             llvm::core::LLVMBuildShl(builder, s1_value, shift, empty_name.as_ptr());
-                        let s1_value =
-                            llvm::core::LLVMBuildAShr(builder, s1_value, shift, empty_name.as_ptr());
-                        let d_value =
-                            llvm::core::LLVMBuildMul(builder, s0_value, s1_value, empty_name.as_ptr());
+                        let s1_value = llvm::core::LLVMBuildAShr(
+                            builder,
+                            s1_value,
+                            shift,
+                            empty_name.as_ptr(),
+                        );
+                        let d_value = llvm::core::LLVMBuildMul(
+                            builder,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
 
                         emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
 
@@ -5399,10 +5409,6 @@ impl IREmitter {
 
                     const N: usize = SIMD_WIDTH;
 
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                    let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
-                    let _ = ty_i32xn;
-
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
@@ -5420,16 +5426,18 @@ impl IREmitter {
                             llvm::core::LLVMBuildAnd(builder, s0_value, low24, empty_name.as_ptr());
                         let s1_value =
                             llvm::core::LLVMBuildAnd(builder, s1_value, low24, empty_name.as_ptr());
-                        let d_value =
-                            llvm::core::LLVMBuildMul(builder, s0_value, s1_value, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildMul(
+                            builder,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
 
                         emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
                         let empty_name = std::ffi::CString::new("").unwrap();
-                        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-                        let _ = ty_i32;
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
                         let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
@@ -5443,8 +5451,12 @@ impl IREmitter {
                             llvm::core::LLVMBuildAnd(builder, s0_value, low24, empty_name.as_ptr());
                         let s1_value =
                             llvm::core::LLVMBuildAnd(builder, s1_value, low24, empty_name.as_ptr());
-                        let d_value =
-                            llvm::core::LLVMBuildMul(builder, s0_value, s1_value, empty_name.as_ptr());
+                        let d_value = llvm::core::LLVMBuildMul(
+                            builder,
+                            s0_value,
+                            s1_value,
+                            empty_name.as_ptr(),
+                        );
 
                         emitter.emit_store_vgpr_u32(inst.vdst as u32, elem, d_value);
 
@@ -6041,8 +6053,7 @@ impl IREmitter {
                         let intrinsic =
                             emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f64xn]);
                         let d_value = intrinsic.emit_call(ty_f64xn, &[s0_value, s1_value]);
-                        let d_value =
-                            emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                        let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
@@ -6461,15 +6472,12 @@ impl IREmitter {
             I::V_MIN_NUM_F32 => {
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-                    let _ = &empty_name;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
 
                     let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
                     let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-                    let _ = ty_f32xn;
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -6493,10 +6501,7 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let _ = &empty_name;
                         let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                        let _ = ty_f32;
 
                         let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s1_value = emitter.emit_vector_source_operand_f32(&inst.src1, elem);
@@ -6518,15 +6523,9 @@ impl IREmitter {
             I::V_SUB_F32 => {
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-                    let _ = &empty_name;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
-
-                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-                    let _ = ty_f32xn;
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -6548,11 +6547,6 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let _ = &empty_name;
-                        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                        let _ = ty_f32;
-
                         let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s1_value = emitter.emit_vector_source_operand_f32(&inst.src1, elem);
 
@@ -6571,15 +6565,9 @@ impl IREmitter {
             I::V_SUBREV_F32 => {
                 if USE_SIMD {
                     let emitter = self;
-                    let empty_name = std::ffi::CString::new("").unwrap();
-                    let _ = &empty_name;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
                     const N: usize = SIMD_WIDTH;
-
-                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
-                    let _ = ty_f32xn;
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -6601,11 +6589,6 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-                        let _ = &empty_name;
-                        let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
-                        let _ = ty_f32;
-
                         let s0_value = emitter.emit_vector_source_operand_f32(&inst.src0, elem);
                         let s1_value = emitter.emit_vector_source_operand_f32(&inst.src1, elem);
 
@@ -6731,7 +6714,6 @@ impl IREmitter {
 
                     const N: usize = SIMD_WIDTH;
 
-
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
@@ -6745,9 +6727,7 @@ impl IREmitter {
                             emitter.emit_abs_neg_f32xn::<N>(value, inst.abs, inst.neg, 0)
                         };
 
-                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
-                        let _ = (mant_value, exp_value);
-                        let d_value = mant_value;
+                        let d_value = emitter.emit_frexp(s0_value).0;
 
                         if is_double {
                             let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
@@ -6759,7 +6739,6 @@ impl IREmitter {
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-
                         let s0_value = if is_double {
                             let value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
                             emitter.emit_abs_neg_f64(inst.abs, inst.neg, value, 0)
@@ -6768,9 +6747,7 @@ impl IREmitter {
                             emitter.emit_abs_neg_f32(inst.abs, inst.neg, value, 0)
                         };
 
-                        let (mant_value, exp_value) = emitter.emit_frexp(s0_value);
-                        let _ = (mant_value, exp_value);
-                        let d_value = mant_value;
+                        let d_value = emitter.emit_frexp(s0_value).0;
 
                         if is_double {
                             let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
@@ -8384,11 +8361,10 @@ impl IREmitter {
 
         // A saturating integer result, which CLAMP asks for on the operations
         // that can overflow.
-        let saturating = |emitter: &mut Self, wide: llvm::prelude::LLVMValueRef, signed: bool| {
+        let saturating = |wide: llvm::prelude::LLVMValueRef, signed: bool| {
             if !clamp {
                 return llvm::core::LLVMBuildTrunc(builder, wide, ty_i16xn, empty_name.as_ptr());
             }
-            let _ = &emitter;
             let (low, high) = if signed {
                 (i16::MIN as i64 as u64, i16::MAX as u64)
             } else {
@@ -8450,8 +8426,7 @@ impl IREmitter {
             }
             I::V_PK_FMA_F16 => {
                 let intrinsic = self.get_intrinsic_declaration("llvm.fma.", &[ty_f16xn]);
-                let value =
-                    intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b), as_half(c)]);
+                let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b), as_half(c)]);
                 float_result(self, value)
             }
             I::V_PK_MIN_NUM_F16 => {
@@ -8481,7 +8456,7 @@ impl IREmitter {
                     widen(b, false),
                     empty_name.as_ptr(),
                 );
-                saturating(self, value, false)
+                saturating(value, false)
             }
             I::V_PK_SUB_U16 => {
                 let value = llvm::core::LLVMBuildSub(
@@ -8490,7 +8465,7 @@ impl IREmitter {
                     widen(b, false),
                     empty_name.as_ptr(),
                 );
-                saturating(self, value, false)
+                saturating(value, false)
             }
             I::V_PK_ADD_I16 => {
                 let value = llvm::core::LLVMBuildAdd(
@@ -8499,7 +8474,7 @@ impl IREmitter {
                     widen(b, true),
                     empty_name.as_ptr(),
                 );
-                saturating(self, value, true)
+                saturating(value, true)
             }
             I::V_PK_SUB_I16 => {
                 let value = llvm::core::LLVMBuildSub(
@@ -8508,7 +8483,7 @@ impl IREmitter {
                     widen(b, true),
                     empty_name.as_ptr(),
                 );
-                saturating(self, value, true)
+                saturating(value, true)
             }
             I::V_PK_MAD_U16 => {
                 let value = llvm::core::LLVMBuildAdd(
@@ -8522,7 +8497,7 @@ impl IREmitter {
                     widen(c, false),
                     empty_name.as_ptr(),
                 );
-                saturating(self, value, false)
+                saturating(value, false)
             }
             I::V_PK_MAD_I16 => {
                 let value = llvm::core::LLVMBuildAdd(
@@ -8536,7 +8511,7 @@ impl IREmitter {
                     widen(c, true),
                     empty_name.as_ptr(),
                 );
-                saturating(self, value, true)
+                saturating(value, true)
             }
             // The low half is what this one keeps, saturation or not.
             I::V_PK_MUL_LO_U16 => llvm::core::LLVMBuildMul(builder, a, b, empty_name.as_ptr()),
@@ -8627,13 +8602,12 @@ impl IREmitter {
                     let mut low = [std::ptr::null_mut(); 3];
                     let mut high = [std::ptr::null_mut(); 3];
                     for (position, source) in sources.iter().enumerate() {
-                        let raw = emitter
-                            .emit_vector_source_operand_u32xn::<N>(source, i as u32, mask);
+                        let raw =
+                            emitter.emit_vector_source_operand_u32xn::<N>(source, i as u32, mask);
                         // OPSEL picks the half that feeds the low result and
                         // OPSEL_HI the one that feeds the high result; NEG and
                         // NEG_HI then act on the sign bit of what was picked.
-                        let half = |emitter: &mut Self, select: u8, negate: u8| {
-                            let _ = &emitter;
+                        let half = |select: u8, negate: u8| {
                             let shifted = if (select >> position) & 1 != 0 {
                                 llvm::core::LLVMBuildLShr(
                                     builder,
@@ -8668,14 +8642,15 @@ impl IREmitter {
                                 value
                             }
                         };
-                        low[position] = half(emitter, opsel, inst.neg);
-                        high[position] = half(emitter, opsel_hi, inst.neg_hi);
+                        low[position] = half(opsel, inst.neg);
+                        high[position] = half(opsel_hi, inst.neg_hi);
                     }
 
                     let low = emitter.emit_packed_half(inst.op, low, clamp);
                     let high = emitter.emit_packed_half(inst.op, high, clamp);
 
-                    let low = llvm::core::LLVMBuildZExt(builder, low, ty_i32xn, empty_name.as_ptr());
+                    let low =
+                        llvm::core::LLVMBuildZExt(builder, low, ty_i32xn, empty_name.as_ptr());
                     let high =
                         llvm::core::LLVMBuildZExt(builder, high, ty_i32xn, empty_name.as_ptr());
                     let high = llvm::core::LLVMBuildShl(
@@ -8687,8 +8662,7 @@ impl IREmitter {
                         ),
                         empty_name.as_ptr(),
                     );
-                    let d_value =
-                        llvm::core::LLVMBuildOr(builder, low, high, empty_name.as_ptr());
+                    let d_value = llvm::core::LLVMBuildOr(builder, low, high, empty_name.as_ptr());
 
                     emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i as u32, d_value, mask);
                 }
@@ -8744,8 +8718,8 @@ impl IREmitter {
                     let sources = [&inst.src0, &inst.src1];
                     let mut assembled = [std::ptr::null_mut(); 2];
                     for (position, source) in sources.iter().enumerate() {
-                        let raw = emitter
-                            .emit_vector_source_operand_u32xn::<N>(source, i as u32, mask);
+                        let raw =
+                            emitter.emit_vector_source_operand_u32xn::<N>(source, i as u32, mask);
                         let half = |select: u8| {
                             let shifted = if (select >> position) & 1 != 0 {
                                 llvm::core::LLVMBuildLShr(
@@ -8757,7 +8731,12 @@ impl IREmitter {
                             } else {
                                 raw
                             };
-                            llvm::core::LLVMBuildAnd(builder, shifted, splat32(0xFFFF), empty_name.as_ptr())
+                            llvm::core::LLVMBuildAnd(
+                                builder,
+                                shifted,
+                                splat32(0xFFFF),
+                                empty_name.as_ptr(),
+                            )
                         };
                         let low = half(opsel);
                         let high = llvm::core::LLVMBuildShl(
@@ -8770,8 +8749,8 @@ impl IREmitter {
                             llvm::core::LLVMBuildOr(builder, low, high, empty_name.as_ptr());
                     }
 
-                    let addend = emitter
-                        .emit_vector_source_operand_u32xn::<N>(&inst.src2, i as u32, mask);
+                    let addend =
+                        emitter.emit_vector_source_operand_u32xn::<N>(&inst.src2, i as u32, mask);
 
                     let d_value = if is_float {
                         // Either of the addend's sign bits negates it.

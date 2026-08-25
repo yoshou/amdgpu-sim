@@ -132,15 +132,20 @@ pub(crate) fn check_vop2_f64(op: u32, cases: &[Vop2F64]) {
             }
             failures.push(format!(
                 "  {:<11} case {} vsrc1={} hardware={} simulator={}",
-                engine_name(engine), i, show_f64(case.vsrc1),
-                show_f64(case.expected), show_f64(got),
+                engine_name(engine),
+                i,
+                show_f64(case.vsrc1),
+                show_f64(case.expected),
+                show_f64(got),
             ));
         }
     }
     assert!(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
-        failures.len(), cases.len() * 2, failures.join("\n"),
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
     );
 }
 
@@ -190,15 +195,20 @@ pub(crate) fn check_vop2_literal_f32(op: u32, cases: &[Vop2Literal]) {
             }
             failures.push(format!(
                 "  {:<11} case {} k={} hardware={} simulator={}",
-                engine_name(engine), i, show_f32(case.k),
-                show_f32(case.expected), show_f32(got),
+                engine_name(engine),
+                i,
+                show_f32(case.k),
+                show_f32(case.expected),
+                show_f32(got),
             ));
         }
     }
     assert!(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
-        failures.len(), cases.len() * 2, failures.join("\n"),
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
     );
 }
 
@@ -246,7 +256,9 @@ pub(crate) fn check_vop2_vcc(op: u32, cases: &[Vop2Vcc]) {
     assert!(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
-        failures.len(), cases.len() * 2, failures.join("\n"),
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
     );
 }
 

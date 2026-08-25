@@ -54,8 +54,11 @@ impl IREmitter {
 
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                    let ioffset_value =
-                        llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
+                    let ioffset_value = llvm::core::LLVMConstInt(
+                        ty_i64,
+                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                        0,
+                    );
 
                     let zero_vec = llvm::core::LLVMConstVector(
                         [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
@@ -223,11 +226,9 @@ impl IREmitter {
                             );
                             let data = intrinsic.emit_masked_call(
                                 ty_loadxn,
-                                &[
-                                    ptr,
-                                    mask,
-                                    llvm::core::LLVMGetPoison(ty_loadxn),
-                                ], 0, 4,
+                                &[ptr, mask, llvm::core::LLVMGetPoison(ty_loadxn)],
+                                0,
+                                4,
                             );
                             let data = if load_bits == 32 {
                                 data
@@ -265,8 +266,11 @@ impl IREmitter {
                     for i in 0..32 {
                         let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
 
-                        let ioffset_value =
-                            llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
+                        let ioffset_value = llvm::core::LLVMConstInt(
+                            ty_i64,
+                            ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                            0,
+                        );
                         let addr_value = emitter.emit_load_vgpr_u64(inst.vaddr as u32, elem);
                         let global_offset = llvm::core::LLVMBuildAdd(
                             builder,
@@ -439,8 +443,11 @@ impl IREmitter {
 
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                    let ioffset_value =
-                        llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
+                    let ioffset_value = llvm::core::LLVMConstInt(
+                        ty_i64,
+                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                        0,
+                    );
 
                     let zero_vec = llvm::core::LLVMConstVector(
                         [llvm::core::LLVMConstInt(ty_i64, 0, 0); N].as_mut_ptr(),
@@ -623,8 +630,11 @@ impl IREmitter {
                     for i in 0..32 {
                         let elem = llvm::core::LLVMConstInt(ty_i32, i as u64, 0);
 
-                        let ioffset_value =
-                            llvm::core::LLVMConstInt(ty_i64, ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64, 0);
+                        let ioffset_value = llvm::core::LLVMConstInt(
+                            ty_i64,
+                            ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                            0,
+                        );
                         let addr_value = emitter.emit_load_vgpr_u64(inst.vaddr as u32, elem);
                         let global_offset = llvm::core::LLVMBuildAdd(
                             builder,
@@ -722,8 +732,8 @@ impl IREmitter {
                                     1,
                                     empty_name.as_ptr(),
                                 );
-                                let value = emitter
-                                    .emit_load_vgpr_u32(inst.vsrc as u32 + j as u32, elem);
+                                let value =
+                                    emitter.emit_load_vgpr_u32(inst.vsrc as u32 + j as u32, elem);
                                 let value = if store_bits == 32 {
                                     value
                                 } else {
@@ -1218,11 +1228,9 @@ impl IREmitter {
                             );
                             let data = intrinsic.emit_masked_call(
                                 ty_i8xn,
-                                &[
-                                    ptr,
-                                    mask,
-                                    llvm::core::LLVMGetPoison(ty_i8xn),
-                                ], 0, 1,
+                                &[ptr, mask, llvm::core::LLVMGetPoison(ty_i8xn)],
+                                0,
+                                1,
                             );
 
                             let data = llvm::core::LLVMBuildZExt(
@@ -1418,11 +1426,9 @@ impl IREmitter {
                             );
                             let data = intrinsic.emit_masked_call(
                                 ty_i16xn,
-                                &[
-                                    ptr,
-                                    mask,
-                                    llvm::core::LLVMGetPoison(ty_i16xn),
-                                ], 0, 2,
+                                &[ptr, mask, llvm::core::LLVMGetPoison(ty_i16xn)],
+                                0,
+                                2,
                             );
 
                             let data = llvm::core::LLVMBuildSExt(
@@ -1618,11 +1624,9 @@ impl IREmitter {
                             );
                             let data = intrinsic.emit_masked_call(
                                 ty_i16xn,
-                                &[
-                                    ptr,
-                                    mask,
-                                    llvm::core::LLVMGetPoison(ty_i16xn),
-                                ], 0, 2,
+                                &[ptr, mask, llvm::core::LLVMGetPoison(ty_i16xn)],
+                                0,
+                                2,
                             );
 
                             let data = llvm::core::LLVMBuildZExt(
@@ -1827,11 +1831,9 @@ impl IREmitter {
                             );
                             let data = intrinsic.emit_masked_call(
                                 ty_i32xn,
-                                &[
-                                    ptr,
-                                    mask,
-                                    llvm::core::LLVMGetPoison(ty_i32xn),
-                                ], 0, 4,
+                                &[ptr, mask, llvm::core::LLVMGetPoison(ty_i32xn)],
+                                0,
+                                4,
                             );
 
                             emitter.emit_store_vgpr_u32xn::<N>(
@@ -2024,11 +2026,9 @@ impl IREmitter {
                                 );
                                 let data = intrinsic.emit_masked_call(
                                     ty_i32xn,
-                                    &[
-                                        ptr,
-                                        mask,
-                                        llvm::core::LLVMGetPoison(ty_i32xn),
-                                    ], 0, 4,
+                                    &[ptr, mask, llvm::core::LLVMGetPoison(ty_i32xn)],
+                                    0,
+                                    4,
                                 );
 
                                 emitter.emit_store_vgpr_u32xn::<N>(
@@ -2290,11 +2290,9 @@ impl IREmitter {
                                 );
                                 let data = intrinsic.emit_masked_call(
                                     ty_i32xn,
-                                    &[
-                                        ptr,
-                                        mask,
-                                        llvm::core::LLVMGetPoison(ty_i32xn),
-                                    ], 0, 4,
+                                    &[ptr, mask, llvm::core::LLVMGetPoison(ty_i32xn)],
+                                    0,
+                                    4,
                                 );
 
                                 emitter.emit_store_vgpr_u32xn::<N>(
@@ -2350,11 +2348,9 @@ impl IREmitter {
                                 );
                                 let data = intrinsic.emit_masked_call(
                                     ty_i32xn,
-                                    &[
-                                        ptr,
-                                        mask,
-                                        llvm::core::LLVMGetPoison(ty_i32xn),
-                                    ], 0, 4,
+                                    &[ptr, mask, llvm::core::LLVMGetPoison(ty_i32xn)],
+                                    0,
+                                    4,
                                 );
 
                                 emitter.emit_store_vgpr_u32xn::<N>(
@@ -2556,11 +2552,9 @@ impl IREmitter {
                                 );
                                 let data = intrinsic.emit_masked_call(
                                     ty_i64xn,
-                                    &[
-                                        ptr,
-                                        mask,
-                                        llvm::core::LLVMGetPoison(ty_i64xn),
-                                    ], 0, 4,
+                                    &[ptr, mask, llvm::core::LLVMGetPoison(ty_i64xn)],
+                                    0,
+                                    4,
                                 );
 
                                 emitter.emit_store_vgpr_u64xn::<N>(
@@ -2613,11 +2607,9 @@ impl IREmitter {
                                 );
                                 let data = intrinsic.emit_masked_call(
                                     ty_i64xn,
-                                    &[
-                                        ptr,
-                                        mask,
-                                        llvm::core::LLVMGetPoison(ty_i64xn),
-                                    ], 0, 4,
+                                    &[ptr, mask, llvm::core::LLVMGetPoison(ty_i64xn)],
+                                    0,
+                                    4,
                                 );
 
                                 emitter.emit_store_vgpr_u64xn::<N>(
@@ -2816,13 +2808,9 @@ impl IREmitter {
                             empty_name.as_ptr(),
                         );
 
-                        let intrinsic = emitter.get_intrinsic_declaration(
-                            "llvm.masked.scatter.",
-                            &[ty_i8xn, ty_p0xn],
-                        );
-                        intrinsic.emit_masked_call(
-                            ty_void,
-                            &[value, ptr, mask], 1, 2);
+                        let intrinsic = emitter
+                            .get_intrinsic_declaration("llvm.masked.scatter.", &[ty_i8xn, ty_p0xn]);
+                        intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 2);
                     }
                 } else {
                     let emitter = self;
@@ -3013,9 +3001,7 @@ impl IREmitter {
                             "llvm.masked.scatter.",
                             &[ty_i16xn, ty_p0xn],
                         );
-                        intrinsic.emit_masked_call(
-                            ty_void,
-                            &[value, ptr, mask], 1, 2);
+                        intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 2);
                     }
                 } else {
                     let emitter = self;
@@ -3214,9 +3200,7 @@ impl IREmitter {
                                 "llvm.masked.scatter.",
                                 &[ty_i32xn, ty_p0xn],
                             );
-                            intrinsic.emit_masked_call(
-                                ty_void,
-                                &[value, ptr, mask], 1, 4);
+                            intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                         }
                     }
                 } else {
@@ -3411,9 +3395,7 @@ impl IREmitter {
                                     "llvm.masked.scatter.",
                                     &[ty_i64xn, ty_p0xn],
                                 );
-                                intrinsic.emit_masked_call(
-                                    ty_void,
-                                    &[value, ptr, mask], 1, 4);
+                                intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                             }
                         } else {
                             let vaddr_value =
@@ -3462,9 +3444,7 @@ impl IREmitter {
                                     "llvm.masked.scatter.",
                                     &[ty_i64xn, ty_p0xn],
                                 );
-                                intrinsic.emit_masked_call(
-                                    ty_void,
-                                    &[value, ptr, mask], 1, 4);
+                                intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                             }
                         }
                     }
@@ -3660,9 +3640,7 @@ impl IREmitter {
                                     "llvm.masked.scatter.",
                                     &[ty_i64xn, ty_p0xn],
                                 );
-                                intrinsic.emit_masked_call(
-                                    ty_void,
-                                    &[value, ptr, mask], 1, 4);
+                                intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                             }
                         } else {
                             let vaddr_value =
@@ -3711,9 +3689,7 @@ impl IREmitter {
                                     "llvm.masked.scatter.",
                                     &[ty_i64xn, ty_p0xn],
                                 );
-                                intrinsic.emit_masked_call(
-                                    ty_void,
-                                    &[value, ptr, mask], 1, 4);
+                                intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                             }
                         }
                     }
@@ -3909,9 +3885,7 @@ impl IREmitter {
                                     "llvm.masked.scatter.",
                                     &[ty_i64xn, ty_p0xn],
                                 );
-                                intrinsic.emit_masked_call(
-                                    ty_void,
-                                    &[value, ptr, mask], 1, 4);
+                                intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                             }
                         } else {
                             let vaddr_value =
@@ -3960,9 +3934,7 @@ impl IREmitter {
                                     "llvm.masked.scatter.",
                                     &[ty_i64xn, ty_p0xn],
                                 );
-                                intrinsic.emit_masked_call(
-                                    ty_void,
-                                    &[value, ptr, mask], 1, 4);
+                                intrinsic.emit_masked_call(ty_void, &[value, ptr, mask], 1, 4);
                             }
                         }
                     }
@@ -4066,7 +4038,6 @@ impl IREmitter {
     ) -> llvm::prelude::LLVMBasicBlockRef {
         let context = self.context;
         let builder = self.builder;
-        let mut bb = bb;
 
         match inst.op {
             I::SCRATCH_LOAD_U8
@@ -4151,8 +4122,12 @@ impl IREmitter {
                             ty_i64xn,
                             empty_name.as_ptr(),
                         );
-                        start =
-                            llvm::core::LLVMBuildAdd(builder, start, vaddr_value, empty_name.as_ptr());
+                        start = llvm::core::LLVMBuildAdd(
+                            builder,
+                            start,
+                            vaddr_value,
+                            empty_name.as_ptr(),
+                        );
                     }
                     if use_saddr {
                         let saddr_value = emitter.emit_load_sgpr_u32(inst.saddr as u32);
@@ -4181,8 +4156,12 @@ impl IREmitter {
                             zero_vec,
                             empty_name.as_ptr(),
                         );
-                        start =
-                            llvm::core::LLVMBuildAdd(builder, start, saddr_value, empty_name.as_ptr());
+                        start = llvm::core::LLVMBuildAdd(
+                            builder,
+                            start,
+                            saddr_value,
+                            empty_name.as_ptr(),
+                        );
                     }
 
                     // The lane's slot within a swizzled dword.
@@ -4199,16 +4178,24 @@ impl IREmitter {
                     // an unaligned one runs on into the next dword's slot, which
                     // is a lane-stride away rather than next door.
                     let byte_pointer = |emitter: &mut Self, offset: llvm::prelude::LLVMValueRef| {
-                        let dword =
-                            llvm::core::LLVMBuildAShr(builder, offset, splat64(2), empty_name.as_ptr());
+                        let dword = llvm::core::LLVMBuildAShr(
+                            builder,
+                            offset,
+                            splat64(2),
+                            empty_name.as_ptr(),
+                        );
                         let dword = llvm::core::LLVMBuildMul(
                             builder,
                             dword,
                             splat64(128),
                             empty_name.as_ptr(),
                         );
-                        let byte =
-                            llvm::core::LLVMBuildAnd(builder, offset, splat64(3), empty_name.as_ptr());
+                        let byte = llvm::core::LLVMBuildAnd(
+                            builder,
+                            offset,
+                            splat64(3),
+                            empty_name.as_ptr(),
+                        );
                         let base = llvm::core::LLVMBuildInsertElement(
                             builder,
                             llvm::core::LLVMGetPoison(ty_i64xn),
@@ -4229,11 +4216,20 @@ impl IREmitter {
                         );
                         let address =
                             llvm::core::LLVMBuildAdd(builder, base, dword, empty_name.as_ptr());
-                        let address =
-                            llvm::core::LLVMBuildAdd(builder, address, lane_offset, empty_name.as_ptr());
+                        let address = llvm::core::LLVMBuildAdd(
+                            builder,
+                            address,
+                            lane_offset,
+                            empty_name.as_ptr(),
+                        );
                         let address =
                             llvm::core::LLVMBuildAdd(builder, address, byte, empty_name.as_ptr());
-                        llvm::core::LLVMBuildIntToPtr(builder, address, ty_p0xn, empty_name.as_ptr())
+                        llvm::core::LLVMBuildIntToPtr(
+                            builder,
+                            address,
+                            ty_p0xn,
+                            empty_name.as_ptr(),
+                        )
                     };
 
                     let words = bits.div_ceil(32);
@@ -4278,8 +4274,12 @@ impl IREmitter {
                                     ),
                                     empty_name.as_ptr(),
                                 );
-                                value =
-                                    llvm::core::LLVMBuildOr(builder, value, data, empty_name.as_ptr());
+                                value = llvm::core::LLVMBuildOr(
+                                    builder,
+                                    value,
+                                    data,
+                                    empty_name.as_ptr(),
+                                );
                             }
                             let value = if bits >= 32 {
                                 value
@@ -4826,9 +4826,19 @@ impl IREmitter {
                             let data = if bits == 32 {
                                 data
                             } else if signed {
-                                llvm::core::LLVMBuildSExt(builder, data, ty_i32, empty_name.as_ptr())
+                                llvm::core::LLVMBuildSExt(
+                                    builder,
+                                    data,
+                                    ty_i32,
+                                    empty_name.as_ptr(),
+                                )
                             } else {
-                                llvm::core::LLVMBuildZExt(builder, data, ty_i32, empty_name.as_ptr())
+                                llvm::core::LLVMBuildZExt(
+                                    builder,
+                                    data,
+                                    ty_i32,
+                                    empty_name.as_ptr(),
+                                )
                             };
 
                             emitter.emit_store_vgpr_u32(reg, elem, data);

@@ -118,7 +118,12 @@ impl Harness {
         Self::load("harness_scratch.kd", 0x8888_8888, 4, 16)
     }
 
-    pub(crate) fn load(kernel: &str, marker_literal: u32, src_stride: usize, out_stride: usize) -> Self {
+    pub(crate) fn load(
+        kernel: &str,
+        marker_literal: u32,
+        src_stride: usize,
+        out_stride: usize,
+    ) -> Self {
         let marker = slot_marker(marker_literal);
         let mut data = vec![];
         File::open("tests/data/harness_gfx1200.o")
@@ -140,8 +145,7 @@ impl Harness {
             let size = segment.size() as usize;
             let new_size = mem.len().max(offset + size);
             mem.resize(new_size, 0);
-            mem[offset..(offset + size.min(segment.data().len()))]
-                .copy_from_slice(segment.data());
+            mem[offset..(offset + size.min(segment.data().len()))].copy_from_slice(segment.data());
         }
 
         let slot = mem
@@ -181,7 +185,10 @@ impl Harness {
     /// puts in SGPRs; the result is `out_stride` dwords per lane.
     pub(crate) fn run(&self, engine: Engine, words: &[u32], src: &[u32], uni: &[u32]) -> Vec<u32> {
         assert_eq!(src.len(), LANES * self.src_stride);
-        assert!(words.len() * 4 <= SLOT_BYTES, "instruction sequence exceeds the slot");
+        assert!(
+            words.len() * 4 <= SLOT_BYTES,
+            "instruction sequence exceeds the slot"
+        );
         let mut mem = self.mem.clone();
         for i in 0..(SLOT_BYTES / 4) {
             let word = words.get(i).copied().unwrap_or(S_NOP);
@@ -191,12 +198,11 @@ impl Harness {
         let mut out = vec![0u32; LANES * self.out_stride];
         // The memory harness takes a fourth argument: the buffer it loads from
         // and stores into. Word k holds a value that identifies k, so a loaded
-        // value says which address it came from.
-        // Word k of the buffer holds a value that identifies k. The zeroed words
-        // on either side stand in for the memory around the hardware's
-        // allocation, so a case whose offset reaches outside the buffer reads
-        // the same zeros the hardware read rather than whatever happens to be
-        // next to this process's allocation.
+        // value says which address it came from. The zeroed words on either side
+        // stand in for the memory around the hardware's allocation, so a case
+        // whose offset reaches outside the buffer reads the same zeros the
+        // hardware read rather than whatever happens to be next to this
+        // process's allocation.
         const GUARD: usize = 64;
         let mut data: Vec<u32> = vec![0; GUARD];
         data.extend((0..256u32).map(data_word));
@@ -206,7 +212,8 @@ impl Harness {
         set_u64(&mut arg_buffer, 8, src.as_ptr() as u64);
         set_u64(&mut arg_buffer, 16, uni.as_ptr() as u64);
         if self.kernarg_size >= 32 {
-            set_u64(&mut arg_buffer, 24, unsafe { data.as_mut_ptr().add(GUARD) } as u64);
+            set_u64(&mut arg_buffer, 24, unsafe { data.as_mut_ptr().add(GUARD) }
+                as u64);
         }
 
         let aql = HsaKernelDispatchPacket {

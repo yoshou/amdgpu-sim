@@ -564,7 +564,6 @@ impl IREmitter {
                     llvm::core::LLVMBuildMul(builder, s0_value, s1_value, empty_name.as_ptr());
 
                 emitter.emit_store_sgpr_u64(inst.sdst as u32, d_value);
-
             }
             I::S_OR_B32 => {
                 let emitter = self;

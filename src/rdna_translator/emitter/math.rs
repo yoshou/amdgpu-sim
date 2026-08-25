@@ -324,11 +324,9 @@ impl IREmitter {
         let magnitude = intrinsic.emit_call(ty, &[turns]);
 
         let mut result = value;
-        for (probe, exact, on_magnitude) in [
-            (0.5, 0.0, true),
-            (0.25, 1.0, false),
-            (-0.25, -1.0, false),
-        ] {
+        for (probe, exact, on_magnitude) in
+            [(0.5, 0.0, true), (0.25, 1.0, false), (-0.25, -1.0, false)]
+        {
             let subject = if on_magnitude { magnitude } else { turns };
             let is_probe = llvm::core::LLVMBuildFCmp(
                 builder,
@@ -423,11 +421,6 @@ impl IREmitter {
         let ty = llvm::core::LLVMTypeOf(value);
         let is_vector = llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind;
         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let int_ty = if is_vector {
-            llvm::core::LLVMVectorType(ty_i32, llvm::core::LLVMGetVectorSize(ty))
-        } else {
-            ty_i32
-        };
         let splat = |bits: u64, elem_ty: llvm::prelude::LLVMTypeRef| {
             let constant = llvm::core::LLVMConstInt(elem_ty, bits, 0);
             if is_vector {
@@ -443,7 +436,6 @@ impl IREmitter {
             ty,
             empty_name.as_ptr(),
         );
-        let _ = int_ty;
 
         let zero = {
             let elem_ty = if is_vector {
@@ -637,8 +629,7 @@ impl IREmitter {
             splat(int_elem, exp_mask),
             empty_name.as_ptr(),
         );
-        let untouched =
-            llvm::core::LLVMBuildOr(builder, is_zero, is_special, empty_name.as_ptr());
+        let untouched = llvm::core::LLVMBuildOr(builder, is_zero, is_special, empty_name.as_ptr());
 
         // A signalling NaN comes back quiet.
         let quieted = build(
@@ -795,9 +786,8 @@ impl IREmitter {
             ty
         };
 
-        let splat = |emitter: &mut Self, v: f64| {
+        let splat = |v: f64| {
             let constant = llvm::core::LLVMConstReal(elem_ty, v);
-            let _ = &emitter;
             if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
                 let lanes = llvm::core::LLVMGetVectorSize(ty);
                 llvm::core::LLVMConstVector(vec![constant; lanes as usize].as_mut_ptr(), lanes)
@@ -808,15 +798,15 @@ impl IREmitter {
 
         let value = match omod {
             1 => {
-                let scale = splat(self, 2.0);
+                let scale = splat(2.0);
                 llvm::core::LLVMBuildFMul(builder, value, scale, empty_name.as_ptr())
             }
             2 => {
-                let scale = splat(self, 4.0);
+                let scale = splat(4.0);
                 llvm::core::LLVMBuildFMul(builder, value, scale, empty_name.as_ptr())
             }
             3 => {
-                let scale = splat(self, 0.5);
+                let scale = splat(0.5);
                 llvm::core::LLVMBuildFMul(builder, value, scale, empty_name.as_ptr())
             }
             _ => value,
@@ -825,8 +815,8 @@ impl IREmitter {
         if clamp == 0 {
             return value;
         }
-        let zero = splat(self, 0.0);
-        let one = splat(self, 1.0);
+        let zero = splat(0.0);
+        let one = splat(1.0);
         // CLAMP turns a NaN into zero, which minnum/maxnum would instead drop.
         let is_nan = llvm::core::LLVMBuildFCmp(
             builder,
