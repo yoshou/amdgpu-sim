@@ -112,6 +112,11 @@ fn u64_from_u32_u32(lo: u32, hi: u32) -> u64 {
 }
 
 #[inline(always)]
+fn u32_from_u16_u16(lo: u16, hi: u16) -> u32 {
+    ((hi as u32) << 16) | (lo as u32)
+}
+
+#[inline(always)]
 fn add_u32(a: u32, b: u32, c: u32) -> (u32, bool) {
     let d = (a as u64) + (b as u64) + (c as u64);
     ((d & 0xFFFF_FFFF) as u32, d >= (0x1_0000_0000 as u64))
@@ -515,74 +520,56 @@ fn ftz_f32(value: f32) -> f32 {
     }
 }
 
-/// Rounds toward zero rather than to nearest, which is what the dot-product
-/// accumulator does with the sum it has built up.
-fn f64_to_f32_toward_zero(value: f64) -> f32 {
-    let nearest = value as f32;
-    if nearest == 0.0 || !nearest.is_finite() {
-        return nearest;
-    }
-    if (nearest as f64).abs() > value.abs() {
-        f32::from_bits(nearest.to_bits() - 1)
+/// The half of a packed source that a selector names: OPSEL names the one that
+/// feeds the low result and OPSEL_HI the one that feeds the high result.
+fn packed_half(raw: u32, select: u8, idx: usize) -> u16 {
+    if (select >> idx) & 1 != 0 {
+        (raw >> 16) as u16
     } else {
-        nearest
+        raw as u16
     }
 }
 
-/// The per-half modifiers a VOP3P instruction carries.
-#[derive(Clone, Copy)]
-struct PackedMods {
-    opsel: u8,
-    opsel_hi: u8,
-    neg: u8,
-    neg_hi: u8,
-    clamp: bool,
+/// The two halves of a packed source as the instruction sees them, each with
+/// NEG or NEG_HI applied to its sign bit.
+fn packed_halves(raw: u32, opsel: u8, opsel_hi: u8, neg: u8, neg_hi: u8, idx: usize) -> (u16, u16) {
+    let mut low = packed_half(raw, opsel, idx);
+    let mut high = packed_half(raw, opsel_hi, idx);
+    if (neg >> idx) & 1 != 0 {
+        low ^= 0x8000;
+    }
+    if (neg_hi >> idx) & 1 != 0 {
+        high ^= 0x8000;
+    }
+    (low, high)
 }
 
-impl PackedMods {
-    /// The two halves of a source before NEG has any say, which is what a dot
-    /// product wants: there NEG says whether the source is signed rather than
-    /// negating it.
-    fn halves_unsigned(&self, raw: u32, position: usize) -> (u16, u16) {
-        let pick = |select: u8| {
-            if (select >> position) & 1 != 0 {
-                (raw >> 16) as u16
-            } else {
-                raw as u16
-            }
-        };
-        (pick(self.opsel), pick(self.opsel_hi))
-    }
+/// The dword a dot product reads its terms out of, assembled from the halves
+/// OPSEL names. NEG has no say here: it tells a dot product whether a source is
+/// signed rather than negating it.
+fn packed_dword(raw: u32, opsel: u8, opsel_hi: u8, idx: usize) -> u32 {
+    let low = packed_half(raw, opsel, idx);
+    let high = packed_half(raw, opsel_hi, idx);
+    (low as u32) | ((high as u32) << 16)
+}
 
-    /// The two halves of a source as the instruction sees them: the half OPSEL
-    /// picks for the low result and the one OPSEL_HI picks for the high result,
-    /// each with NEG or NEG_HI applied to its sign bit.
-    fn halves(&self, raw: u32, position: usize) -> (u16, u16) {
-        let pick = |select: u8| {
-            if (select >> position) & 1 != 0 {
-                (raw >> 16) as u16
-            } else {
-                raw as u16
-            }
-        };
-        let mut low = pick(self.opsel);
-        let mut high = pick(self.opsel_hi);
-        if (self.neg >> position) & 1 != 0 {
-            low ^= 0x8000;
-        }
-        if (self.neg_hi >> position) & 1 != 0 {
-            high ^= 0x8000;
-        }
-        (low, high)
+/// CLAMP saturates a packed unsigned result rather than letting it wrap, so the
+/// operation is done wide enough to see that.
+fn clamp_u16(value: i64, clamp: bool) -> u16 {
+    if clamp {
+        value.clamp(0, u16::MAX as i64) as u16
+    } else {
+        value as u16
     }
 }
 
-/// Where a mixed-precision result goes.
-#[derive(Clone, Copy)]
-enum MixResult {
-    F32,
-    F16Low,
-    F16High,
+/// CLAMP saturates a packed signed result the same way.
+fn clamp_i16(value: i64, clamp: bool) -> u16 {
+    if clamp {
+        value.clamp(i16::MIN as i64, i16::MAX as i64) as i16 as u16
+    } else {
+        value as i16 as u16
+    }
 }
 
 fn clamp_f16(value: f16, clamp: bool) -> f16 {
@@ -1462,6 +1449,26 @@ impl SIMD32 {
                 f16::from_bits(((self.read_vgpr(elem, value as usize) >> 16) & 0xFFFF) as u16)
             }
             SourceOperand::PrivateBase => panic!(),
+        }
+    }
+
+    /// The source a mixed-precision instruction reads: {OPSEL_HI[i], OPSEL[i]}
+    /// selects it, OPSEL_HI=0 meaning a whole f32 and OPSEL otherwise picking
+    /// which half of the dword to widen.
+    fn read_vector_source_operand_mix_f32(
+        &self,
+        elem: usize,
+        addr: SourceOperand,
+        idx: usize,
+        opsel: u8,
+        opsel_hi: u8,
+    ) -> f32 {
+        if (opsel_hi >> idx) & 1 == 0 {
+            self.read_vector_source_operand_f32(elem, addr)
+        } else if (opsel >> idx) & 1 != 0 {
+            self.read_vector_source_operand_f16_hi(elem, addr).to_f32()
+        } else {
+            self.read_vector_source_operand_f16(elem, addr).to_f32()
         }
     }
 
@@ -10513,123 +10520,101 @@ impl SIMD32 {
         let s0 = inst.src0;
         let s1 = inst.src1;
         let s2 = inst.src2;
-        let sources = [s0, s1, s2];
         let opsel = inst.opsel;
         let opsel_hi = inst.opsel_hi | (inst.opsel_hi2 << 2);
         let neg = inst.neg;
         let neg_hi = inst.neg_hi;
         let clamp = inst.cm != 0;
-        let mods = PackedMods {
-            opsel,
-            opsel_hi,
-            neg,
-            neg_hi,
-            clamp,
-        };
         match inst.op {
             I::V_PK_ADD_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, _| {
-                    f16::from_f64(a.to_f64() + b.to_f64())
-                });
+                self.v_pk_add_f16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MUL_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, _| {
-                    f16::from_f64(a.to_f64() * b.to_f64())
-                });
+                self.v_pk_mul_f16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_FMA_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, c| {
-                    f16::from_f64(a.to_f64() * b.to_f64() + c.to_f64())
-                });
+                self.v_pk_fma_f16(d, s0, s1, s2, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MIN_NUM_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, _| min_num_f16(a, b));
+                self.v_pk_min_num_f16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MAX_NUM_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, _| max_num_f16(a, b));
+                self.v_pk_max_num_f16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MINIMUM_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, _| minimum_f16(a, b));
+                self.v_pk_minimum_f16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MAXIMUM_F16 => {
-                self.vop3p_f16(d, sources, mods, |a, b, _| maximum_f16(a, b));
+                self.v_pk_maximum_f16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_ADD_U16 => {
-                self.vop3p_u16(d, sources, mods, |a, b, _| a + b);
+                self.v_pk_add_u16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_SUB_U16 => {
-                self.vop3p_u16(d, sources, mods, |a, b, _| a - b);
-            }
-            I::V_PK_ADD_I16 => {
-                self.vop3p_i16(d, sources, mods, |a, b, _| a + b);
-            }
-            I::V_PK_SUB_I16 => {
-                self.vop3p_i16(d, sources, mods, |a, b, _| a - b);
-            }
-            I::V_PK_MUL_LO_U16 => {
-                // The low half is what this one keeps, saturation or not.
-                self.vop3p_packed(d, sources, mods, |a, b, _| a.wrapping_mul(b));
+                self.v_pk_sub_u16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MAD_U16 => {
-                self.vop3p_u16(d, sources, mods, |a, b, c| a * b + c);
-            }
-            I::V_PK_MAD_I16 => {
-                self.vop3p_i16(d, sources, mods, |a, b, c| a * b + c);
+                self.v_pk_mad_u16(d, s0, s1, s2, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MAX_U16 => {
-                self.vop3p_u16(d, sources, mods, |a, b, _| a.max(b));
+                self.v_pk_max_u16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MIN_U16 => {
-                self.vop3p_u16(d, sources, mods, |a, b, _| a.min(b));
+                self.v_pk_min_u16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
+            }
+            I::V_PK_ADD_I16 => {
+                self.v_pk_add_i16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
+            }
+            I::V_PK_SUB_I16 => {
+                self.v_pk_sub_i16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
+            }
+            I::V_PK_MAD_I16 => {
+                self.v_pk_mad_i16(d, s0, s1, s2, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MAX_I16 => {
-                self.vop3p_i16(d, sources, mods, |a, b, _| a.max(b));
+                self.v_pk_max_i16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
             }
             I::V_PK_MIN_I16 => {
-                self.vop3p_i16(d, sources, mods, |a, b, _| a.min(b));
+                self.v_pk_min_i16(d, s0, s1, neg, neg_hi, clamp, opsel, opsel_hi);
+            }
+            I::V_PK_MUL_LO_U16 => {
+                self.v_pk_mul_lo_u16(d, s0, s1, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_PK_LSHLREV_B16 => {
-                // The shift amount is the first source; the value is the second.
-                self.vop3p_packed(d, sources, mods, |a, b, _| b << (a & 15));
+                self.v_pk_lshlrev_b16(d, s0, s1, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_PK_LSHRREV_B16 => {
-                self.vop3p_packed(d, sources, mods, |a, b, _| b >> (a & 15));
+                self.v_pk_lshrrev_b16(d, s0, s1, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_PK_ASHRREV_I16 => {
-                self.vop3p_packed(d, sources, mods, |a, b, _| {
-                    ((b as i16) >> (a & 15)) as u16
-                });
+                self.v_pk_ashrrev_i16(d, s0, s1, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_DOT2_F32_F16 => {
-                self.vop3p_dot_f32(d, sources, mods, |a, b| {
-                    (f16::from_bits(a).to_f32(), f16::from_bits(b).to_f32())
-                });
+                self.v_dot2_f32_f16(d, s0, s1, s2, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_DOT2_F32_BF16 => {
-                self.vop3p_dot_f32(d, sources, mods, |a, b| {
-                    (bf16_to_f32(a), bf16_to_f32(b))
-                });
+                self.v_dot2_f32_bf16(d, s0, s1, s2, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_DOT4_U32_U8 => {
-                self.vop3p_dot_int(d, sources, mods, 8, false);
+                self.v_dot4_u32_u8(d, s0, s1, s2, opsel, opsel_hi);
             }
             I::V_DOT4_I32_IU8 => {
-                self.vop3p_dot_int(d, sources, mods, 8, true);
+                self.v_dot4_i32_iu8(d, s0, s1, s2, neg, opsel, opsel_hi);
             }
             I::V_DOT8_U32_U4 => {
-                self.vop3p_dot_int(d, sources, mods, 4, false);
+                self.v_dot8_u32_u4(d, s0, s1, s2, opsel, opsel_hi);
             }
             I::V_DOT8_I32_IU4 => {
-                self.vop3p_dot_int(d, sources, mods, 4, true);
+                self.v_dot8_i32_iu4(d, s0, s1, s2, neg, opsel, opsel_hi);
             }
             I::V_FMA_MIX_F32 => {
-                self.v_fma_mix(d, sources, mods, MixResult::F32);
+                self.v_fma_mix_f32(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
             }
             I::V_FMA_MIXLO_F16 => {
-                self.v_fma_mix(d, sources, mods, MixResult::F16Low);
+                self.v_fma_mixlo_f16(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
             }
             I::V_FMA_MIXHI_F16 => {
-                self.v_fma_mix(d, sources, mods, MixResult::F16High);
+                self.v_fma_mixhi_f16(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
             }
             I::V_WMMA_F32_16X16X16_F16 => {
                 self.v_wmma_f32_16x16x16_f16(d, s0, s1, s2);
@@ -10639,214 +10624,917 @@ impl SIMD32 {
         Signals::None
     }
 
-    /// Runs a packed operation on both halves of every active lane and writes
-    /// the pair back as one dword.
-    fn vop3p_packed(
+    /// The sum is exact in double precision, so the half sees one rounding.
+    fn v_pk_add_f16(
         &mut self,
         d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        op: impl Fn(u16, u16, u16) -> u16,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let mut low = [0u16; 3];
-            let mut high = [0u16; 3];
-            for (position, source) in sources.iter().enumerate() {
-                let raw = self.read_vector_source_operand_u32(elem, *source);
-                let (l, h) = mods.halves(raw, position);
-                low[position] = l;
-                high[position] = h;
-            }
-            let low = op(low[0], low[1], low[2]);
-            let high = op(high[0], high[1], high[2]);
-            self.write_vgpr(elem, d, (low as u32) | ((high as u32) << 16));
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low =
+                f16::from_f64(f16::from_bits(s0_low).to_f64() + f16::from_bits(s1_low).to_f64());
+            let low = clamp_f16(low, clamp).to_bits();
+            let high =
+                f16::from_f64(f16::from_bits(s0_high).to_f64() + f16::from_bits(s1_high).to_f64());
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
         }
     }
 
-    fn vop3p_f16(
+    fn v_pk_mul_f16(
         &mut self,
         d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        op: impl Fn(f16, f16, f16) -> f16,
-    ) {
-        self.vop3p_packed(d, sources, mods, |a, b, c| {
-            let value = op(f16::from_bits(a), f16::from_bits(b), f16::from_bits(c));
-            clamp_f16(value, mods.clamp).to_bits()
-        });
-    }
-
-    /// An unsigned packed operation. CLAMP saturates each half rather than
-    /// letting it wrap, so the operation is done wide enough to see that.
-    fn vop3p_u16(
-        &mut self,
-        d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        op: impl Fn(i64, i64, i64) -> i64,
-    ) {
-        self.vop3p_packed(d, sources, mods, |a, b, c| {
-            let value = op(a as i64, b as i64, c as i64);
-            if mods.clamp {
-                value.clamp(0, u16::MAX as i64) as u16
-            } else {
-                value as u16
-            }
-        });
-    }
-
-    /// A signed packed operation, saturating under CLAMP the same way.
-    fn vop3p_i16(
-        &mut self,
-        d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        op: impl Fn(i64, i64, i64) -> i64,
-    ) {
-        self.vop3p_packed(d, sources, mods, |a, b, c| {
-            let value = op(a as i16 as i64, b as i16 as i64, c as i16 as i64);
-            if mods.clamp {
-                value.clamp(i16::MIN as i64, i16::MAX as i64) as i16 as u16
-            } else {
-                value as i16 as u16
-            }
-        });
-    }
-
-    /// The two-term dot products: both halves of the first two sources are
-    /// multiplied and added to the 32-bit third source.
-    fn vop3p_dot_f32(
-        &mut self,
-        d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        widen: impl Fn(u16, u16) -> (f32, f32),
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let raw0 = self.read_vector_source_operand_u32(elem, sources[0]);
-            let raw1 = self.read_vector_source_operand_u32(elem, sources[1]);
-            let (a_low, a_high) = mods.halves(raw0, 0);
-            let (b_low, b_high) = mods.halves(raw1, 1);
-            // The addend is a whole dword rather than a pair of halves, and
-            // either of its sign bits negates it.
-            let c = self.read_vector_source_operand_f32(elem, sources[2]);
-            let c = if ((mods.neg | mods.neg_hi) >> 2) & 1 != 0 {
-                -c
-            } else {
-                c
-            };
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low =
+                f16::from_f64(f16::from_bits(s0_low).to_f64() * f16::from_bits(s1_low).to_f64());
+            let low = clamp_f16(low, clamp).to_bits();
+            let high =
+                f16::from_f64(f16::from_bits(s0_high).to_f64() * f16::from_bits(s1_high).to_f64());
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
 
-            let (a0, b0) = widen(a_low, b_low);
-            let (a1, b1) = widen(a_high, b_high);
+    fn v_pk_fma_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let (s2_low, s2_high) = packed_halves(s2_value, opsel, opsel_hi, neg, neg_hi, 2);
+            let low = f16::from_f64(
+                f16::from_bits(s0_low).to_f64() * f16::from_bits(s1_low).to_f64()
+                    + f16::from_bits(s2_low).to_f64(),
+            );
+            let low = clamp_f16(low, clamp).to_bits();
+            let high = f16::from_f64(
+                f16::from_bits(s0_high).to_f64() * f16::from_bits(s1_high).to_f64()
+                    + f16::from_bits(s2_high).to_f64(),
+            );
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_min_num_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = min_num_f16(f16::from_bits(s0_low), f16::from_bits(s1_low));
+            let low = clamp_f16(low, clamp).to_bits();
+            let high = min_num_f16(f16::from_bits(s0_high), f16::from_bits(s1_high));
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_max_num_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = max_num_f16(f16::from_bits(s0_low), f16::from_bits(s1_low));
+            let low = clamp_f16(low, clamp).to_bits();
+            let high = max_num_f16(f16::from_bits(s0_high), f16::from_bits(s1_high));
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_minimum_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = minimum_f16(f16::from_bits(s0_low), f16::from_bits(s1_low));
+            let low = clamp_f16(low, clamp).to_bits();
+            let high = minimum_f16(f16::from_bits(s0_high), f16::from_bits(s1_high));
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_maximum_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = maximum_f16(f16::from_bits(s0_low), f16::from_bits(s1_low));
+            let low = clamp_f16(low, clamp).to_bits();
+            let high = maximum_f16(f16::from_bits(s0_high), f16::from_bits(s1_high));
+            let high = clamp_f16(high, clamp).to_bits();
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_add_u16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_u16(s0_low as i64 + s1_low as i64, clamp);
+            let high = clamp_u16(s0_high as i64 + s1_high as i64, clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_sub_u16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_u16(s0_low as i64 - s1_low as i64, clamp);
+            let high = clamp_u16(s0_high as i64 - s1_high as i64, clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_mad_u16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let (s2_low, s2_high) = packed_halves(s2_value, opsel, opsel_hi, neg, neg_hi, 2);
+            let low = clamp_u16(s0_low as i64 * s1_low as i64 + s2_low as i64, clamp);
+            let high = clamp_u16(s0_high as i64 * s1_high as i64 + s2_high as i64, clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_max_u16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_u16((s0_low as i64).max(s1_low as i64), clamp);
+            let high = clamp_u16((s0_high as i64).max(s1_high as i64), clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_min_u16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_u16((s0_low as i64).min(s1_low as i64), clamp);
+            let high = clamp_u16((s0_high as i64).min(s1_high as i64), clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_add_i16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_i16(s0_low as i16 as i64 + s1_low as i16 as i64, clamp);
+            let high = clamp_i16(s0_high as i16 as i64 + s1_high as i16 as i64, clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_sub_i16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_i16(s0_low as i16 as i64 - s1_low as i16 as i64, clamp);
+            let high = clamp_i16(s0_high as i16 as i64 - s1_high as i16 as i64, clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_mad_i16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let s2_value = self.read_vector_source_operand_u32(elem, s2);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let (s2_low, s2_high) = packed_halves(s2_value, opsel, opsel_hi, neg, neg_hi, 2);
+            let low = clamp_i16(
+                s0_low as i16 as i64 * s1_low as i16 as i64 + s2_low as i16 as i64,
+                clamp,
+            );
+            let high = clamp_i16(
+                s0_high as i16 as i64 * s1_high as i16 as i64 + s2_high as i16 as i64,
+                clamp,
+            );
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_max_i16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_i16((s0_low as i16 as i64).max(s1_low as i16 as i64), clamp);
+            let high = clamp_i16((s0_high as i16 as i64).max(s1_high as i16 as i64), clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_min_i16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = clamp_i16((s0_low as i16 as i64).min(s1_low as i16 as i64), clamp);
+            let high = clamp_i16((s0_high as i16 as i64).min(s1_high as i16 as i64), clamp);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    /// The low half is what this one keeps, saturation or not.
+    fn v_pk_mul_lo_u16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = s0_low.wrapping_mul(s1_low);
+            let high = s0_high.wrapping_mul(s1_high);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    /// The shift amount is the first source; the value is the second.
+    fn v_pk_lshlrev_b16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = s1_low << (s0_low & 15);
+            let high = s1_high << (s0_high & 15);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_lshrrev_b16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = s1_low >> (s0_low & 15);
+            let high = s1_high >> (s0_high & 15);
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    fn v_pk_ashrrev_i16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let low = ((s1_low as i16) >> (s0_low & 15)) as u16;
+            let high = ((s1_high as i16) >> (s0_high & 15)) as u16;
+            let d_value = u32_from_u16_u16(low, high);
+            self.write_vgpr(elem, d, d_value);
+        }
+    }
+
+    /// The addend is a whole dword rather than a pair of halves, and either of
+    /// its sign bits negates it. CLAMP has no say over a dot product's result.
+    fn v_dot2_f32_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let s2_value = self.read_vector_source_operand_f32(elem, s2);
+            let s2_value = if ((neg | neg_hi) >> 2) & 1 != 0 {
+                -s2_value
+            } else {
+                s2_value
+            };
             // The products and the addend are exact in double precision, so
             // this is the sum before the accumulator rounds it.
-            let sum = c as f64 + a0 as f64 * b0 as f64 + a1 as f64 * b1 as f64;
-            // CLAMP has no say over a dot product's result.
+            let sum = s2_value as f64
+                + f16::from_bits(s0_low).to_f64() * f16::from_bits(s1_low).to_f64()
+                + f16::from_bits(s0_high).to_f64() * f16::from_bits(s1_high).to_f64();
             self.write_vgpr(elem, d, f32_to_u32(sum as f32));
         }
     }
 
-    /// The four- and eight-term integer dot products. NEG picks whether each of
-    /// the two multiplied sources is read as signed.
-    fn vop3p_dot_int(
+    fn v_dot2_f32_bf16(
         &mut self,
         d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        bits: u32,
-        signed_form: bool,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        neg_hi: u8,
+        opsel: u8,
+        opsel_hi: u8,
     ) {
-        let terms = 32 / bits;
-        let mask = (1u32 << bits) - 1;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            // OPSEL assembles each source out of the halves it names before
-            // the terms are taken from it.
-            let assemble = |mods: &PackedMods, raw: u32, position: usize| {
-                let (low, high) = mods.halves_unsigned(raw, position);
-                (low as u32) | ((high as u32) << 16)
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (s0_low, s0_high) = packed_halves(s0_value, opsel, opsel_hi, neg, neg_hi, 0);
+            let (s1_low, s1_high) = packed_halves(s1_value, opsel, opsel_hi, neg, neg_hi, 1);
+            let s2_value = self.read_vector_source_operand_f32(elem, s2);
+            let s2_value = if ((neg | neg_hi) >> 2) & 1 != 0 {
+                -s2_value
+            } else {
+                s2_value
             };
-            let raw0 = assemble(
-                &mods,
-                self.read_vector_source_operand_u32(elem, sources[0]),
-                0,
-            );
-            let raw1 = assemble(
-                &mods,
-                self.read_vector_source_operand_u32(elem, sources[1]),
-                1,
-            );
-            let mut sum = self.read_vector_source_operand_u32(elem, sources[2]) as i32 as i64;
-            let signed0 = signed_form && (mods.neg & 1) != 0;
-            let signed1 = signed_form && (mods.neg & 2) != 0;
-            for term in 0..terms {
-                let shift = term * bits;
-                let extend = |value: u32, signed: bool| -> i64 {
-                    let value = (value >> shift) & mask;
-                    if signed && (value >> (bits - 1)) & 1 != 0 {
-                        (value as i64) - (1i64 << bits)
-                    } else {
-                        value as i64
-                    }
-                };
-                sum += extend(raw0, signed0) * extend(raw1, signed1);
-            }
-            self.write_vgpr(elem, d, sum as u32);
+            let sum = s2_value as f64
+                + bf16_to_f32(s0_low) as f64 * bf16_to_f32(s1_low) as f64
+                + bf16_to_f32(s0_high) as f64 * bf16_to_f32(s1_high) as f64;
+            self.write_vgpr(elem, d, f32_to_u32(sum as f32));
         }
     }
 
-    /// The mixed-precision fused multiply-add: each source is an f32 or one
-    /// half of a dword, and the result is an f32 or one half of the
-    /// destination.
-    fn v_fma_mix(
+    /// Four terms of eight bits each, added to the 32-bit third source.
+    fn v_dot4_u32_u8(
         &mut self,
         d: usize,
-        sources: [SourceOperand; 3],
-        mods: PackedMods,
-        result: MixResult,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        opsel: u8,
+        opsel_hi: u8,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let mut value = [0f32; 3];
-            for (position, source) in sources.iter().enumerate() {
-                // {OPSEL_HI[i], OPSEL[i]} selects the source: OPSEL_HI=0 is an
-                // f32, otherwise OPSEL picks which half of the dword to widen.
-                // NEG_HI is the abs modifier here, and NEG the sign one.
-                let raw = if (mods.opsel_hi >> position) & 1 == 0 {
-                    self.read_vector_source_operand_f32(elem, *source)
-                } else if (mods.opsel >> position) & 1 != 0 {
-                    self.read_vector_source_operand_f16_hi(elem, *source).to_f32()
+            let s0_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s0),
+                opsel,
+                opsel_hi,
+                0,
+            );
+            let s1_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s1),
+                opsel,
+                opsel_hi,
+                1,
+            );
+            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i32 as i64;
+            for term in 0..4 {
+                let shift = term * 8;
+                d_value += ((s0_value >> shift) as u8 as i64) * ((s1_value >> shift) as u8 as i64);
+            }
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    /// The same four terms, except that NEG says whether each multiplied source
+    /// is read as signed rather than negating it.
+    fn v_dot4_i32_iu8(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s0),
+                opsel,
+                opsel_hi,
+                0,
+            );
+            let s1_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s1),
+                opsel,
+                opsel_hi,
+                1,
+            );
+            let s0_signed = (neg & 1) != 0;
+            let s1_signed = (neg & 2) != 0;
+            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i32 as i64;
+            for term in 0..4 {
+                let shift = term * 8;
+                let a = (s0_value >> shift) as u8;
+                let b = (s1_value >> shift) as u8;
+                let a = if s0_signed { a as i8 as i64 } else { a as i64 };
+                let b = if s1_signed { b as i8 as i64 } else { b as i64 };
+                d_value += a * b;
+            }
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    /// Eight terms of four bits each, added to the 32-bit third source.
+    fn v_dot8_u32_u4(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s0),
+                opsel,
+                opsel_hi,
+                0,
+            );
+            let s1_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s1),
+                opsel,
+                opsel_hi,
+                1,
+            );
+            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i32 as i64;
+            for term in 0..8 {
+                let shift = term * 4;
+                d_value +=
+                    (((s0_value >> shift) & 0xF) as i64) * (((s1_value >> shift) & 0xF) as i64);
+            }
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    /// The same eight terms, with NEG picking a signed reading of each source.
+    fn v_dot8_i32_iu4(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        neg: u8,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s0),
+                opsel,
+                opsel_hi,
+                0,
+            );
+            let s1_value = packed_dword(
+                self.read_vector_source_operand_u32(elem, s1),
+                opsel,
+                opsel_hi,
+                1,
+            );
+            let s0_signed = (neg & 1) != 0;
+            let s1_signed = (neg & 2) != 0;
+            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i32 as i64;
+            for term in 0..8 {
+                let shift = term * 4;
+                let a = (s0_value >> shift) & 0xF;
+                let b = (s1_value >> shift) & 0xF;
+                let a = if s0_signed && a & 0x8 != 0 {
+                    a as i64 - 16
                 } else {
-                    self.read_vector_source_operand_f16(elem, *source).to_f32()
+                    a as i64
                 };
-                value[position] = abs_neg(raw, mods.neg_hi, mods.neg, position);
+                let b = if s1_signed && b & 0x8 != 0 {
+                    b as i64 - 16
+                } else {
+                    b as i64
+                };
+                d_value += a * b;
             }
-            let fused = fma(value[0], value[1], value[2]);
-            match result {
-                MixResult::F32 => {
-                    self.write_vgpr(elem, d, f32_to_u32(clamp_f32(fused, mods.clamp)));
-                }
-                MixResult::F16Low => {
-                    let half = f16::from_f32(clamp_f32(fused, mods.clamp));
-                    let kept = self.read_vgpr(elem, d) & 0xFFFF_0000;
-                    self.write_vgpr(elem, d, kept | half.to_bits() as u32);
-                }
-                MixResult::F16High => {
-                    let half = f16::from_f32(clamp_f32(fused, mods.clamp));
-                    let kept = self.read_vgpr(elem, d) & 0x0000_FFFF;
-                    self.write_vgpr(elem, d, kept | ((half.to_bits() as u32) << 16));
-                }
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    /// The mixed-precision fused multiply-add, whole-width result. Each source
+    /// is an f32 or one half of a dword: {OPSEL_HI[i], OPSEL[i]} selects it,
+    /// OPSEL_HI=0 meaning an f32 and OPSEL otherwise picking which half of the
+    /// dword to widen. NEG_HI is the abs modifier here (passed as `abs`), and
+    /// NEG the sign one.
+    fn v_fma_mix_f32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
             }
+            let s0_value = self.read_vector_source_operand_mix_f32(elem, s0, 0, opsel, opsel_hi);
+            let s0_value = abs_neg(s0_value, abs, neg, 0);
+            let s1_value = self.read_vector_source_operand_mix_f32(elem, s1, 1, opsel, opsel_hi);
+            let s1_value = abs_neg(s1_value, abs, neg, 1);
+            let s2_value = self.read_vector_source_operand_mix_f32(elem, s2, 2, opsel, opsel_hi);
+            let s2_value = abs_neg(s2_value, abs, neg, 2);
+
+            let d_value = fma(s0_value, s1_value, s2_value);
+
+            self.write_vgpr(elem, d, f32_to_u32(clamp_f32(d_value, clamp)));
+        }
+    }
+
+    /// `D0[15:0].f16 = f32_to_f16(fma)`: the low half is written and the high
+    /// half of the destination is preserved.
+    fn v_fma_mixlo_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_mix_f32(elem, s0, 0, opsel, opsel_hi);
+            let s0_value = abs_neg(s0_value, abs, neg, 0);
+            let s1_value = self.read_vector_source_operand_mix_f32(elem, s1, 1, opsel, opsel_hi);
+            let s1_value = abs_neg(s1_value, abs, neg, 1);
+            let s2_value = self.read_vector_source_operand_mix_f32(elem, s2, 2, opsel, opsel_hi);
+            let s2_value = abs_neg(s2_value, abs, neg, 2);
+
+            let d_value = f16::from_f32(clamp_f32(fma(s0_value, s1_value, s2_value), clamp));
+
+            let kept = self.read_vgpr(elem, d) & 0xFFFF_0000;
+            self.write_vgpr(elem, d, kept | d_value.to_bits() as u32);
+        }
+    }
+
+    /// `D0[31:16].f16 = f32_to_f16(fma)`: the high half is written and the low
+    /// half of the destination is preserved.
+    fn v_fma_mixhi_f16(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+        clamp: bool,
+        opsel: u8,
+        opsel_hi: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_mix_f32(elem, s0, 0, opsel, opsel_hi);
+            let s0_value = abs_neg(s0_value, abs, neg, 0);
+            let s1_value = self.read_vector_source_operand_mix_f32(elem, s1, 1, opsel, opsel_hi);
+            let s1_value = abs_neg(s1_value, abs, neg, 1);
+            let s2_value = self.read_vector_source_operand_mix_f32(elem, s2, 2, opsel, opsel_hi);
+            let s2_value = abs_neg(s2_value, abs, neg, 2);
+
+            let d_value = f16::from_f32(clamp_f32(fma(s0_value, s1_value, s2_value), clamp));
+
+            let kept = self.read_vgpr(elem, d) & 0x0000_FFFF;
+            self.write_vgpr(elem, d, kept | ((d_value.to_bits() as u32) << 16));
         }
     }
 
@@ -10907,60 +11595,6 @@ impl SIMD32 {
                 let col = (elem % 16) as usize;
                 self.write_vgpr(elem, d + i, f32_to_u32(matrix_d[row][col]));
             }
-        }
-    }
-
-    fn v_fma_mixlo_f16(
-        &mut self,
-        d: usize,
-        s0: SourceOperand,
-        s1: SourceOperand,
-        s2: SourceOperand,
-        abs: u8,
-        neg: u8,
-        clamp: bool,
-        opsel: u8,
-        opsel_hi: u8,
-    ) {
-        for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
-            // RDNA4 ISA §V_FMA_MIXLO_F16: {OPSEL_HI[i], OPSEL[i]} selects each src —
-            // OPSEL_HI=0 → f32; OPSEL_HI=1 & OPSEL=1 → hi f16; OPSEL_HI=1 & OPSEL=0
-            // → lo f16. NEG_HI acts as the abs modifier (passed as `abs`).
-            let s0_value = if opsel_hi & 1 == 0 {
-                abs_neg(self.read_vector_source_operand_f32(elem, s0), abs, neg, 0)
-            } else if opsel & 1 != 0 {
-                abs_neg_f16(self.read_vector_source_operand_f16_hi(elem, s0), abs, neg, 0).to_f32()
-            } else {
-                abs_neg_f16(self.read_vector_source_operand_f16(elem, s0), abs, neg, 0).to_f32()
-            };
-
-            let s1_value = if opsel_hi & 2 == 0 {
-                abs_neg(self.read_vector_source_operand_f32(elem, s1), abs, neg, 1)
-            } else if opsel & 2 != 0 {
-                abs_neg_f16(self.read_vector_source_operand_f16_hi(elem, s1), abs, neg, 1).to_f32()
-            } else {
-                abs_neg_f16(self.read_vector_source_operand_f16(elem, s1), abs, neg, 1).to_f32()
-            };
-
-            let s2_value = if opsel_hi & 4 == 0 {
-                abs_neg(self.read_vector_source_operand_f32(elem, s2), abs, neg, 2)
-            } else if opsel & 4 != 0 {
-                abs_neg_f16(self.read_vector_source_operand_f16_hi(elem, s2), abs, neg, 2).to_f32()
-            } else {
-                abs_neg_f16(self.read_vector_source_operand_f16(elem, s2), abs, neg, 2).to_f32()
-            };
-
-            let d_value = fma(s0_value, s1_value, s2_value);
-
-            // `D0[15:0].f16 = f32_to_f16(fma)`: write the low 16 bits and preserve
-            // the destination's high 16 bits; no clamp (not in the ISA pseudocode).
-            let _ = clamp;
-            let old = self.read_vgpr(elem, d);
-            let lo = f16::from_f32(d_value).to_bits() as u32;
-            self.write_vgpr(elem, d, (old & 0xffff_0000) | lo);
         }
     }
 
@@ -12537,46 +13171,46 @@ impl SIMD32 {
         let ioffset = ((inst.ioffset << 8) as i32 >> 8) as i64;
         match inst.op {
             I::SCRATCH_LOAD_U8 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 8, false);
+                self.scratch_load_u8(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_I8 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 8, true);
+                self.scratch_load_i8(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_U16 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 16, false);
+                self.scratch_load_u16(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_I16 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 16, true);
+                self.scratch_load_i16(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_B32 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 32, false);
+                self.scratch_load_b32(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_B64 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 64, false);
+                self.scratch_load_b64(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_B96 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 96, false);
+                self.scratch_load_b96(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_LOAD_B128 => {
-                self.scratch_load(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr, 128, false);
+                self.scratch_load_b128(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_STORE_B8 => {
-                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 8);
+                self.scratch_store_b8(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_STORE_B16 => {
-                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 16);
+                self.scratch_store_b16(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_STORE_B32 => {
-                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 32);
+                self.scratch_store_b32(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_STORE_B64 => {
-                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 64);
+                self.scratch_store_b64(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_STORE_B96 => {
-                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 96);
+                self.scratch_store_b96(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr);
             }
             I::SCRATCH_STORE_B128 => {
-                self.scratch_store(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr, 128);
+                self.scratch_store_b128(vaddr, vsrc, saddr, ioffset, use_vaddr, use_saddr);
             }
             op => unimplemented!("{:?}", op),
         }
@@ -12619,8 +13253,7 @@ impl SIMD32 {
         vaddr_value + saddr_value + ioffset
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scratch_load(
+    fn scratch_load_u8(
         &mut self,
         vaddr: usize,
         vdst: usize,
@@ -12628,54 +13261,321 @@ impl SIMD32 {
         ioffset: i64,
         use_vaddr: bool,
         use_saddr: bool,
-        bits: u32,
-        signed: bool,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
             let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
-            match bits {
-                8 => {
-                    let ptr = self.scratch_address(elem, start) as *const u8;
-                    let data = unsafe { *ptr };
-                    let data = if signed { data as i8 as i32 as u32 } else { data as u32 };
-                    self.write_vgpr(elem, vdst, data);
+            let ptr = self.scratch_address(elem, start) as *const u8;
+            let data = unsafe { *ptr } as u32;
+            self.write_vgpr(elem, vdst, data);
+        }
+    }
+
+    fn scratch_load_i8(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            let ptr = self.scratch_address(elem, start) as *const u8;
+            let data = unsafe { *ptr } as i8 as i32 as u32;
+            self.write_vgpr(elem, vdst, data);
+        }
+    }
+
+    /// A sub-dword access can straddle two swizzled dwords, so it is put
+    /// together a byte at a time.
+    fn scratch_load_u16(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            let mut data = 0u32;
+            for byte in 0..2 {
+                let ptr = self.scratch_address(elem, start + byte) as *const u8;
+                data |= (unsafe { *ptr } as u32) << (byte * 8);
+            }
+            let data = data;
+            self.write_vgpr(elem, vdst, data);
+        }
+    }
+
+    fn scratch_load_i16(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            let mut data = 0u32;
+            for byte in 0..2 {
+                let ptr = self.scratch_address(elem, start + byte) as *const u8;
+                data |= (unsafe { *ptr } as u32) << (byte * 8);
+            }
+            let data = data as u16 as i16 as i32 as u32;
+            self.write_vgpr(elem, vdst, data);
+        }
+    }
+
+    /// Each dword is assembled a byte at a time for the same reason.
+    fn scratch_load_b32(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for word in 0..1 {
+                let mut data = 0u32;
+                for byte in 0..4 {
+                    let ptr =
+                        self.scratch_address(elem, start + (word * 4) as i64 + byte) as *const u8;
+                    data |= (unsafe { *ptr } as u32) << (byte * 8);
                 }
-                16 => {
-                    // A sub-dword access can straddle two swizzled dwords, so it
-                    // is put together a byte at a time.
-                    let mut data = 0u32;
-                    for byte in 0..2 {
-                        let ptr = self.scratch_address(elem, start + byte) as *const u8;
-                        data |= (unsafe { *ptr } as u32) << (byte * 8);
-                    }
-                    let data = if signed {
-                        data as u16 as i16 as i32 as u32
-                    } else {
-                        data
-                    };
-                    self.write_vgpr(elem, vdst, data);
+                self.write_vgpr(elem, vdst + word, data);
+            }
+        }
+    }
+
+    fn scratch_load_b64(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for word in 0..2 {
+                let mut data = 0u32;
+                for byte in 0..4 {
+                    let ptr =
+                        self.scratch_address(elem, start + (word * 4) as i64 + byte) as *const u8;
+                    data |= (unsafe { *ptr } as u32) << (byte * 8);
                 }
-                _ => {
-                    for word in 0..(bits as usize / 32) {
-                        let mut data = 0u32;
-                        for byte in 0..4 {
-                            let ptr = self
-                                .scratch_address(elem, start + (word * 4) as i64 + byte)
-                                as *const u8;
-                            data |= (unsafe { *ptr } as u32) << (byte * 8);
-                        }
-                        self.write_vgpr(elem, vdst + word, data);
-                    }
+                self.write_vgpr(elem, vdst + word, data);
+            }
+        }
+    }
+
+    fn scratch_load_b96(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for word in 0..3 {
+                let mut data = 0u32;
+                for byte in 0..4 {
+                    let ptr =
+                        self.scratch_address(elem, start + (word * 4) as i64 + byte) as *const u8;
+                    data |= (unsafe { *ptr } as u32) << (byte * 8);
+                }
+                self.write_vgpr(elem, vdst + word, data);
+            }
+        }
+    }
+
+    fn scratch_load_b128(
+        &mut self,
+        vaddr: usize,
+        vdst: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for word in 0..4 {
+                let mut data = 0u32;
+                for byte in 0..4 {
+                    let ptr =
+                        self.scratch_address(elem, start + (word * 4) as i64 + byte) as *const u8;
+                    data |= (unsafe { *ptr } as u32) << (byte * 8);
+                }
+                self.write_vgpr(elem, vdst + word, data);
+            }
+        }
+    }
+
+    /// The bytes go out one at a time, since the swizzle can put them in two
+    /// different dwords.
+    fn scratch_store_b8(
+        &mut self,
+        vaddr: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for byte in 0..1 {
+                let word = byte / 4;
+                let data = self.read_vgpr(elem, vsrc + word);
+                let ptr = self.scratch_address(elem, start + byte as i64) as *mut u8;
+                unsafe {
+                    *ptr = (data >> ((byte % 4) * 8)) as u8;
                 }
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn scratch_store(
+    fn scratch_store_b16(
+        &mut self,
+        vaddr: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for byte in 0..2 {
+                let word = byte / 4;
+                let data = self.read_vgpr(elem, vsrc + word);
+                let ptr = self.scratch_address(elem, start + byte as i64) as *mut u8;
+                unsafe {
+                    *ptr = (data >> ((byte % 4) * 8)) as u8;
+                }
+            }
+        }
+    }
+
+    fn scratch_store_b32(
+        &mut self,
+        vaddr: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for byte in 0..4 {
+                let word = byte / 4;
+                let data = self.read_vgpr(elem, vsrc + word);
+                let ptr = self.scratch_address(elem, start + byte as i64) as *mut u8;
+                unsafe {
+                    *ptr = (data >> ((byte % 4) * 8)) as u8;
+                }
+            }
+        }
+    }
+
+    fn scratch_store_b64(
+        &mut self,
+        vaddr: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for byte in 0..8 {
+                let word = byte / 4;
+                let data = self.read_vgpr(elem, vsrc + word);
+                let ptr = self.scratch_address(elem, start + byte as i64) as *mut u8;
+                unsafe {
+                    *ptr = (data >> ((byte % 4) * 8)) as u8;
+                }
+            }
+        }
+    }
+
+    fn scratch_store_b96(
+        &mut self,
+        vaddr: usize,
+        vsrc: usize,
+        saddr: usize,
+        ioffset: i64,
+        use_vaddr: bool,
+        use_saddr: bool,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let start = self.scratch_offset(elem, vaddr, saddr, ioffset, use_vaddr, use_saddr);
+            for byte in 0..12 {
+                let word = byte / 4;
+                let data = self.read_vgpr(elem, vsrc + word);
+                let ptr = self.scratch_address(elem, start + byte as i64) as *mut u8;
+                unsafe {
+                    *ptr = (data >> ((byte % 4) * 8)) as u8;
+                }
+            }
+        }
+    }
+
+    fn scratch_store_b128(
         &mut self,
         vaddr: usize,
         vsrc: usize,
