@@ -2195,6 +2195,24 @@ impl RDNATranslator {
                         reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
                     }
                 }
+                I::S_LOAD_B512 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    for i in 0..16 {
+                        reg_usage.def_sgpr_u32(inst.sdata as u32 + i);
+                    }
+                }
+                I::S_LOAD_U8 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    reg_usage.def_sgpr_u32(inst.sdata as u32);
+                }
+                I::S_LOAD_I8 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    reg_usage.def_sgpr_u32(inst.sdata as u32);
+                }
+                I::S_LOAD_I16 => {
+                    reg_usage.use_sgpr_u64(inst.sbase as u32 * 2);
+                    reg_usage.def_sgpr_u32(inst.sdata as u32);
+                }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);
                 }

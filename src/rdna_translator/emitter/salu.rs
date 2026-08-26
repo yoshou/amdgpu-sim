@@ -172,6 +172,108 @@ impl IREmitter {
                     emitter.emit_store_sgpr_u32(inst.sdata as u32 + i, data);
                 }
             }
+            I::S_LOAD_U8 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
+
+                {
+                    let offset = llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                    let addr =
+                        llvm::core::LLVMBuildAdd(builder, sbase, offset, empty_name.as_ptr());
+
+                    let ptr =
+                        llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
+
+                    let data =
+                        llvm::core::LLVMBuildLoad2(builder, ty_i8, ptr, empty_name.as_ptr());
+
+                    let data =
+                        llvm::core::LLVMBuildZExt(builder, data, ty_i32, empty_name.as_ptr());
+
+                    emitter.emit_store_sgpr_u32(inst.sdata as u32, data);
+                }
+            }
+            I::S_LOAD_I8 => {
+                let emitter = self;
+                let ty_i8 = llvm::core::LLVMInt8TypeInContext(context);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
+
+                {
+                    let offset = llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                    let addr =
+                        llvm::core::LLVMBuildAdd(builder, sbase, offset, empty_name.as_ptr());
+
+                    let ptr =
+                        llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
+
+                    let data =
+                        llvm::core::LLVMBuildLoad2(builder, ty_i8, ptr, empty_name.as_ptr());
+
+                    let data =
+                        llvm::core::LLVMBuildSExt(builder, data, ty_i32, empty_name.as_ptr());
+
+                    emitter.emit_store_sgpr_u32(inst.sdata as u32, data);
+                }
+            }
+            I::S_LOAD_I16 => {
+                let emitter = self;
+                let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
+
+                {
+                    let offset = llvm::core::LLVMConstInt(ty_i64, inst.ioffset as u64, 0);
+                    let addr =
+                        llvm::core::LLVMBuildAdd(builder, sbase, offset, empty_name.as_ptr());
+
+                    let ptr =
+                        llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
+
+                    let data =
+                        llvm::core::LLVMBuildLoad2(builder, ty_i16, ptr, empty_name.as_ptr());
+
+                    let data =
+                        llvm::core::LLVMBuildSExt(builder, data, ty_i32, empty_name.as_ptr());
+
+                    emitter.emit_store_sgpr_u32(inst.sdata as u32, data);
+                }
+            }
+            I::S_LOAD_B512 => {
+                let emitter = self;
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                let ty_p0 = llvm::core::LLVMPointerTypeInContext(context, 0);
+                let empty_name = std::ffi::CString::new("").unwrap();
+
+                let sbase = emitter.emit_load_sgpr_u64(inst.sbase as u32 * 2);
+
+                for i in 0..16 {
+                    let offset = llvm::core::LLVMConstInt(ty_i64, (inst.ioffset + i * 4) as u64, 0);
+                    let addr =
+                        llvm::core::LLVMBuildAdd(builder, sbase, offset, empty_name.as_ptr());
+                    let ptr =
+                        llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
+                    let data =
+                        llvm::core::LLVMBuildLoad2(builder, ty_i32, ptr, empty_name.as_ptr());
+
+                    emitter.emit_store_sgpr_u32(inst.sdata as u32 + i, data);
+                }
+            }
             _ => {
                 panic!("Unsupported instruction: {:?}", inst);
             }

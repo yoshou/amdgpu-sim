@@ -684,7 +684,15 @@ fn s_load_b128_smem() {
     // S_LOAD_B128.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(2, &[]);
+    check_smem_load(
+        2,
+        &[
+            SmemLoad { ioffset: 0, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0xA303_0303, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 8, expected: [0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 64, expected: [0xB010_1010, 0xB111_1111, 0xB212_1212, 0xB313_1313, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -692,7 +700,15 @@ fn s_load_b256_smem() {
     // S_LOAD_B256.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(3, &[]);
+    check_smem_load(
+        3,
+        &[
+            SmemLoad { ioffset: 0, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0xA606_0606, 0xA707_0707] },
+            SmemLoad { ioffset: 4, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0xA606_0606, 0xA707_0707, 0xA808_0808] },
+            SmemLoad { ioffset: 8, expected: [0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0xA606_0606, 0xA707_0707, 0xA808_0808, 0xA909_0909] },
+            SmemLoad { ioffset: 64, expected: [0xB010_1010, 0xB111_1111, 0xB212_1212, 0xB313_1313, 0xB414_1414, 0xB515_1515, 0xB616_1616, 0xB717_1717] },
+        ],
+    );
 }
 
 #[test]
@@ -700,7 +716,15 @@ fn s_load_b32_smem() {
     // S_LOAD_B32.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(0, &[]);
+    check_smem_load(
+        0,
+        &[
+            SmemLoad { ioffset: 0, expected: [0xA000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0xA101_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 8, expected: [0xA202_0202, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 64, expected: [0xB010_1010, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -708,7 +732,15 @@ fn s_load_b512_smem() {
     // S_LOAD_B512.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(4, &[]);
+    check_smem_load(
+        4,
+        &[
+            SmemLoad { ioffset: 0, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0xA606_0606, 0xA707_0707] },
+            SmemLoad { ioffset: 4, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0xA606_0606, 0xA707_0707, 0xA808_0808] },
+            SmemLoad { ioffset: 8, expected: [0xA202_0202, 0xA303_0303, 0xA404_0404, 0xA505_0505, 0xA606_0606, 0xA707_0707, 0xA808_0808, 0xA909_0909] },
+            SmemLoad { ioffset: 64, expected: [0xB010_1010, 0xB111_1111, 0xB212_1212, 0xB313_1313, 0xB414_1414, 0xB515_1515, 0xB616_1616, 0xB717_1717] },
+        ],
+    );
 }
 
 #[test]
@@ -716,7 +748,15 @@ fn s_load_b64_smem() {
     // S_LOAD_B64.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(1, &[]);
+    check_smem_load(
+        1,
+        &[
+            SmemLoad { ioffset: 0, expected: [0xA000_0000, 0xA101_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0xA101_0101, 0xA202_0202, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 8, expected: [0xA202_0202, 0xA303_0303, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 64, expected: [0xB010_1010, 0xB111_1111, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -724,7 +764,15 @@ fn s_load_b96_smem() {
     // S_LOAD_B96.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(5, &[]);
+    check_smem_load(
+        5,
+        &[
+            SmemLoad { ioffset: 0, expected: [0xA000_0000, 0xA101_0101, 0xA202_0202, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0xA101_0101, 0xA202_0202, 0xA303_0303, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 8, expected: [0xA202_0202, 0xA303_0303, 0xA404_0404, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 64, expected: [0xB010_1010, 0xB111_1111, 0xB212_1212, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -732,7 +780,15 @@ fn s_load_i16_smem() {
     // S_LOAD_I16.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(10, &[]);
+    check_smem_load(
+        10,
+        &[
+            SmemLoad { ioffset: 0, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 2, expected: [0xFFFF_A000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 6, expected: [0xFFFF_A101, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -740,7 +796,17 @@ fn s_load_i8_smem() {
     // S_LOAD_I8.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(8, &[]);
+    check_smem_load(
+        8,
+        &[
+            SmemLoad { ioffset: 0, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 1, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 2, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 3, expected: [0xFFFF_FFA0, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 7, expected: [0xFFFF_FFA1, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -748,7 +814,15 @@ fn s_load_u16_smem() {
     // S_LOAD_U16.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(11, &[]);
+    check_smem_load(
+        11,
+        &[
+            SmemLoad { ioffset: 0, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 2, expected: [0x0000_A000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 6, expected: [0x0000_A101, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
 
 #[test]
@@ -756,5 +830,15 @@ fn s_load_u8_smem() {
     // S_LOAD_U8.
     // SMEM reads through the wave-uniform base in s[10:11]. The eight SGPRs
     // the harness reads back cover up to a 256-bit load.
-    check_smem_load(9, &[]);
+    check_smem_load(
+        9,
+        &[
+            SmemLoad { ioffset: 0, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 1, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 2, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 3, expected: [0x0000_00A0, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 4, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            SmemLoad { ioffset: 7, expected: [0x0000_00A1, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
 }
