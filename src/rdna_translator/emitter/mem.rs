@@ -5251,6 +5251,10 @@ impl IREmitter {
                             emitter.emit_load_vgpr_u64xn::<N>(inst.vaddr0 as u32, i, mask);
                         let ray_extent =
                             emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr1 as u32, i, mask);
+                        // The ray's instance mask shares VADDR1's group with
+                        // the extent.
+                        let instance_mask =
+                            emitter.emit_load_vgpr_u32xn::<N>(inst.vaddr1 as u32 + 1, i, mask);
 
                         let ray_origin_x =
                             emitter.emit_load_vgpr_f32xn::<N>(inst.vaddr2 as u32, i, mask);
@@ -5276,6 +5280,7 @@ impl IREmitter {
                             ray_dir_y,
                             ray_dir_z,
                             node_index,
+                            instance_mask,
                         ];
 
                         llvm::core::LLVMBuildStore(
@@ -5370,6 +5375,12 @@ impl IREmitter {
                             ty_i32,
                             empty_name.as_ptr(),
                         );
+                        let instance_mask = llvm::core::LLVMBuildBitCast(
+                            builder,
+                            values[8],
+                            ty_i32,
+                            empty_name.as_ptr(),
+                        );
 
                         let image_bvh8_intersect_ray_func = llvm::core::LLVMGetNamedFunction(
                             emitter.module,
@@ -5378,7 +5389,8 @@ impl IREmitter {
 
                         let mut param_tys = vec![
                             ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0,
-                            ty_i64, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_i32,
+                            ty_i64, ty_f32, ty_i32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
+                            ty_i32,
                         ];
                         let image_bvh8_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                             ty_void,
@@ -5433,6 +5445,7 @@ impl IREmitter {
                                 results_ptr[9],
                                 node_base,
                                 ray_extent,
+                                instance_mask,
                                 ray_origin_x,
                                 ray_origin_y,
                                 ray_origin_z,
@@ -5490,6 +5503,10 @@ impl IREmitter {
 
                         let node_base = emitter.emit_load_vgpr_u64(inst.vaddr0 as u32, elem);
                         let ray_extent = emitter.emit_load_vgpr_f32(inst.vaddr1 as u32, elem);
+                        // The ray's instance mask shares VADDR1's group with the
+                        // extent.
+                        let instance_mask =
+                            emitter.emit_load_vgpr_u32(inst.vaddr1 as u32 + 1, elem);
                         let ray_origin_x = emitter.emit_load_vgpr_f32(inst.vaddr2 as u32, elem);
                         let ray_origin_y = emitter.emit_load_vgpr_f32(inst.vaddr2 as u32 + 1, elem);
                         let ray_origin_z = emitter.emit_load_vgpr_f32(inst.vaddr2 as u32 + 2, elem);
@@ -5505,7 +5522,8 @@ impl IREmitter {
 
                         let mut param_tys = vec![
                             ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0,
-                            ty_i64, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_i32,
+                            ty_i64, ty_f32, ty_i32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
+                            ty_i32,
                         ];
                         let image_bvh8_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                             ty_void,
@@ -5560,6 +5578,7 @@ impl IREmitter {
                                 results_ptr[9],
                                 node_base,
                                 ray_extent,
+                                instance_mask,
                                 ray_origin_x,
                                 ray_origin_y,
                                 ray_origin_z,
@@ -5616,15 +5635,21 @@ impl IREmitter {
 
                 let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                // The 8-dword image resource descriptor is uniform across lanes.
+                // The 8-dword image resource descriptor and the 4-dword sampler
+                // are uniform across lanes.
                 let rsrc_values = (0..8)
                     .map(|i| emitter.emit_load_sgpr_u32(inst.rsrc as u32 + i))
                     .collect::<Vec<_>>();
+                let samp_values = (0..4)
+                    .map(|i| emitter.emit_load_sgpr_u32(inst.samp as u32 + i))
+                    .collect::<Vec<_>>();
 
                 // Declare (or find) the runtime helper `image_sample_lz`, resolved
-                // by the JIT through the process symbol table.
+                // by the JIT through the process symbol table. It answers for one
+                // component of the fetch, which is what the DMASK counts.
                 let mut param_tys = vec![
-                    ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_f32, ty_f32,
+                    ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32, ty_i32,
+                    ty_i32, ty_i32, ty_i32, ty_i32, ty_f32, ty_f32,
                 ];
                 let func_ty = llvm::core::LLVMFunctionType(
                     ty_i32,
@@ -5648,63 +5673,77 @@ impl IREmitter {
 
                 let vaddr0 = inst.vaddr0 as u32;
                 let vaddr1 = inst.vaddr1 as u32;
-                let vdata = inst.vdata as u32;
+                let mut vdata = inst.vdata as u32;
 
-                for i in (0..32).step_by(N) {
-                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
-
-                    let u_vec = emitter.emit_load_vgpr_f32xn::<N>(vaddr0, i, mask);
-                    let v_vec = emitter.emit_load_vgpr_f32xn::<N>(vaddr1, i, mask);
-
-                    // The fetch is side-effect free, so sampling every lane and
-                    // discarding inactive ones via the masked store is safe.
-                    let mut result_vec = llvm::core::LLVMGetPoison(ty_i32xn);
-                    for lane in 0..N {
-                        let lane_idx = llvm::core::LLVMConstInt(ty_i32, lane as u64, 0);
-                        let u = llvm::core::LLVMBuildExtractElement(
-                            builder,
-                            u_vec,
-                            lane_idx,
-                            empty_name.as_ptr(),
-                        );
-                        let v = llvm::core::LLVMBuildExtractElement(
-                            builder,
-                            v_vec,
-                            lane_idx,
-                            empty_name.as_ptr(),
-                        );
-
-                        let mut args = vec![
-                            rsrc_values[0],
-                            rsrc_values[1],
-                            rsrc_values[2],
-                            rsrc_values[3],
-                            rsrc_values[4],
-                            rsrc_values[5],
-                            rsrc_values[6],
-                            rsrc_values[7],
-                            u,
-                            v,
-                        ];
-                        let result = llvm::core::LLVMBuildCall2(
-                            builder,
-                            func_ty,
-                            func,
-                            args.as_mut_ptr(),
-                            args.len() as u32,
-                            empty_name.as_ptr(),
-                        );
-
-                        result_vec = llvm::core::LLVMBuildInsertElement(
-                            builder,
-                            result_vec,
-                            result,
-                            lane_idx,
-                            empty_name.as_ptr(),
-                        );
+                // The components the DMASK asks for go to consecutive
+                // registers.
+                for component in 0..4 {
+                    if inst.dmask & (1 << component) == 0 {
+                        continue;
                     }
+                    for i in (0..32).step_by(N) {
+                        let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
 
-                    emitter.emit_store_vgpr_u32xn::<N>(vdata, i, result_vec, mask);
+                        let u_vec = emitter.emit_load_vgpr_f32xn::<N>(vaddr0, i, mask);
+                        let v_vec = emitter.emit_load_vgpr_f32xn::<N>(vaddr1, i, mask);
+
+                        // The fetch is side-effect free, so sampling every lane and
+                        // discarding inactive ones via the masked store is safe.
+                        let mut result_vec = llvm::core::LLVMGetPoison(ty_i32xn);
+                        for lane in 0..N {
+                            let lane_idx = llvm::core::LLVMConstInt(ty_i32, lane as u64, 0);
+                            let u = llvm::core::LLVMBuildExtractElement(
+                                builder,
+                                u_vec,
+                                lane_idx,
+                                empty_name.as_ptr(),
+                            );
+                            let v = llvm::core::LLVMBuildExtractElement(
+                                builder,
+                                v_vec,
+                                lane_idx,
+                                empty_name.as_ptr(),
+                            );
+
+                            let mut args = vec![
+                                rsrc_values[0],
+                                rsrc_values[1],
+                                rsrc_values[2],
+                                rsrc_values[3],
+                                rsrc_values[4],
+                                rsrc_values[5],
+                                rsrc_values[6],
+                                rsrc_values[7],
+                                samp_values[0],
+                                samp_values[1],
+                                samp_values[2],
+                                samp_values[3],
+                                llvm::core::LLVMConstInt(ty_i32, component as u64, 0),
+                                llvm::core::LLVMConstInt(ty_i32, inst.unrm as u64, 0),
+                                u,
+                                v,
+                            ];
+                            let result = llvm::core::LLVMBuildCall2(
+                                builder,
+                                func_ty,
+                                func,
+                                args.as_mut_ptr(),
+                                args.len() as u32,
+                                empty_name.as_ptr(),
+                            );
+
+                            result_vec = llvm::core::LLVMBuildInsertElement(
+                                builder,
+                                result_vec,
+                                result,
+                                lane_idx,
+                                empty_name.as_ptr(),
+                            );
+                        }
+
+                        emitter.emit_store_vgpr_u32xn::<N>(vdata, i, result_vec, mask);
+                    }
+                    vdata += 1;
                 }
             }
             op => unimplemented!("{:?}", op),

@@ -259,3 +259,44 @@ pub(crate) const fn ds(
         (addr & 0xFF) | ((data0 & 0xFF) << 8) | ((data1 & 0xFF) << 16) | ((vdst & 0xFF) << 24),
     ]
 }
+
+/// VIMAGE: the image format that takes no sampler, which the ray-tracing
+/// instructions use. [2:0] DIM, [4] R128, [5] D16, [6] A16, [21:14] OP,
+/// [25:22] DMASK, [31:26] = 110100, then [39:32] VDATA, [49:41] RSRC,
+/// [51:50] SCOPE, [54:52] TH, [55] TFE, [63:56] VADDR4, and the third dword
+/// holds VADDR0..VADDR3. The BVH opcodes read their address VGPRs in groups,
+/// so each VADDR field names the first register of its group.
+pub(crate) const fn vimage(
+    op: u32,
+    dim: u32,
+    r128: u32,
+    dmask: u32,
+    vdata: u32,
+    rsrc: u32,
+    vaddr: [u32; 5],
+) -> [u32; 3] {
+    [
+        (0b110100 << 26) | (dmask << 22) | (op << 14) | (r128 << 4) | dim,
+        (vdata & 0xFF) | ((rsrc & 0x1FF) << 9) | (vaddr[4] << 24),
+        vaddr[0] | (vaddr[1] << 8) | (vaddr[2] << 16) | (vaddr[3] << 24),
+    ]
+}
+
+/// VSAMPLE: the image format that takes a sampler. Laid out like VIMAGE except
+/// that [3] is TFE, [13] UNRM, [40] LWE and [63:55] SAMP, which names the S#.
+pub(crate) const fn vsample(
+    op: u32,
+    dim: u32,
+    dmask: u32,
+    unrm: u32,
+    vdata: u32,
+    rsrc: u32,
+    samp: u32,
+    vaddr: [u32; 4],
+) -> [u32; 3] {
+    [
+        (0b111001 << 26) | (dmask << 22) | (op << 14) | (unrm << 13) | dim,
+        (vdata & 0xFF) | ((rsrc & 0x1FF) << 9) | ((samp & 0x1FF) << 23),
+        vaddr[0] | (vaddr[1] << 8) | (vaddr[2] << 16) | (vaddr[3] << 24),
+    ]
+}

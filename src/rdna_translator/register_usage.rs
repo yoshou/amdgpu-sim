@@ -2900,7 +2900,10 @@ impl RDNATranslator {
                     for i in 0..4 {
                         reg_usage.use_sgpr_u32(inst.samp as u32 + i);
                     }
-                    reg_usage.def_vgpr_u32(inst.vdata as u32);
+                    // One register per component the DMASK asks for.
+                    for i in 0..inst.dmask.count_ones() {
+                        reg_usage.def_vgpr_u32(inst.vdata as u32 + i);
+                    }
                 }
                 _ => {
                     panic!("Unsupported instruction: {:?}", inst);

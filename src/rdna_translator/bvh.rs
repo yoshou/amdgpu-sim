@@ -1,11 +1,58 @@
 use crate::buffer::get_bits_u32;
 use itertools::Itertools;
 
-/// Runtime helper for IMAGE_SAMPLE_LZ. Mirrors the interpreter's
-/// `image_sample_lz` (see rdna_processor.rs): nearest-texel fetch of an
-/// 8-bit single-channel 2D image at LOD 0, returning the raw texel byte as
-/// a u32. Called per lane from generated IR; resolved by the JIT via the
-/// process symbol table like the `image_bvh*_intersect_ray` helpers.
+/// Where a coordinate lands in a row or a column of `size` texels, or None
+/// when it lands on the border instead. The modes are the ones Table 61 names.
+fn clamp_texel(coord: i32, size: i32, mode: u32) -> Option<i32> {
+    // Mirroring once folds the coordinates below the image back over it.
+    let mirror_once = |coord: i32| if coord < 0 { -1 - coord } else { coord };
+    match mode {
+        0 => Some(coord.rem_euclid(size)),
+        1 => {
+            let folded = coord.rem_euclid(2 * size);
+            Some(if folded < size {
+                folded
+            } else {
+                2 * size - 1 - folded
+            })
+        }
+        2 | 4 => Some(coord.clamp(0, size - 1)),
+        3 | 5 => Some(mirror_once(coord).clamp(0, size - 1)),
+        6 => (0..size).contains(&coord).then_some(coord),
+        7 => {
+            let mirrored = mirror_once(coord);
+            (0..size).contains(&mirrored).then_some(mirrored)
+        }
+        mode => unimplemented!("image clamp mode {}", mode),
+    }
+}
+
+/// What a texel of `format` holds. Every format here has a single channel of
+/// eight bits, which the part gives to whichever channel a selector names.
+
+fn texel_value(format: u32, raw: u8) -> u32 {
+    match format {
+        1 => f32::to_bits(raw as f32 / 255.0),
+        2 => f32::to_bits((raw as i8).max(-127) as f32 / 127.0),
+        5 => raw as u32,
+        6 => ((raw as i8) as i32) as u32,
+        format => unimplemented!("image data format {}", format),
+    }
+}
+
+/// What the selector SEL_1 and an opaque-white border stand for: one, as the
+/// format counts it.
+fn format_one(format: u32) -> u32 {
+    match format {
+        1 | 2 => f32::to_bits(1.0),
+        _ => 1,
+    }
+}
+
+/// Runtime helper for IMAGE_SAMPLE_LZ, called once per component the DMASK
+/// asks for. Mirrors the interpreter's `image_sample_lz` (see
+/// rdna_processor.rs); resolved by the JIT via the process symbol table like
+/// the `image_bvh*_intersect_ray` helpers.
 #[unsafe(no_mangle)]
 pub extern "C" fn image_sample_lz(
     r0: u32,
@@ -16,28 +63,73 @@ pub extern "C" fn image_sample_lz(
     r5: u32,
     r6: u32,
     r7: u32,
+    s0: u32,
+    s1: u32,
+    s2: u32,
+    s3: u32,
+    component: u32,
+    unrm: u32,
     u: f32,
     v: f32,
 ) -> u32 {
-    let rsrc_value = [r0, r1, r2, r3, r4, r5, r6, r7];
+    let rsrc = [r0, r1, r2, r3, r4, r5, r6, r7];
+    let samp = [s0, s1, s2, s3];
 
-    let w = get_bits_u32(&rsrc_value, 62, 16) + 1;
-    let h = get_bits_u32(&rsrc_value, 78, 16) + 1;
+    let format = get_bits_u32(&rsrc, 49, 8);
+    let width = get_bits_u32(&rsrc, 62, 16) + 1;
+    let height = get_bits_u32(&rsrc, 78, 16) + 1;
+    let base_addr = (((rsrc[1] as u64) << 40) | ((rsrc[0] as u64) << 8)) & ((1u64 << 48) - 1);
+    // The resource can give a row pitch of its own, and the part rounds a row
+    // up to 128 bytes whatever it says. The formats read here are a byte a
+    // texel, so a row of texels is a row of bytes.
+    let pitch = get_bits_u32(&rsrc, 128, 14) | (get_bits_u32(&rsrc, 142, 2) << 14);
+    let row = if pitch != 0 { pitch + 1 } else { width }.max(128) as u64;
 
-    let base_addr =
-        (((rsrc_value[1] as u64) << 40) | ((rsrc_value[0] as u64) << 8)) & ((1u64 << 48) - 1);
-    let pixels = base_addr as *const u8;
+    if get_bits_u32(&samp, 84, 2) != 0 {
+        unimplemented!("IMAGE_SAMPLE_LZ with a filter other than point");
+    }
 
-    let x = ((u - 0.5) * (w as f32) + 0.5).floor() as i32;
-    let y = ((v - 0.5) * (h as f32) + 0.5).floor() as i32;
+    // What the selector this component names asks for: a constant needs
+    // neither an address nor a texel.
+    match get_bits_u32(&rsrc, 96 + component as usize * 3, 3) {
+        0 => return 0,
+        1 => return format_one(format),
+        4..=7 => {}
+        select => unimplemented!("image destination select {}", select),
+    }
 
-    if x < 0 || x >= (w as i32) || y < 0 || y >= (h as i32) {
-        0u32
-    } else {
-        let offset = y as u64 * w as u64 + x as u64;
-        let ptr = unsafe { pixels.add(offset as usize) };
-        let data = unsafe { std::ptr::read_unaligned(ptr) };
-        data as u32
+    // The instruction can force the address to be unnormalized, and so can the
+    // sampler; otherwise it spans the image.
+    let unnormalized = unrm != 0 || get_bits_u32(&samp, 15, 1) != 0;
+    let texel = |coord: f32, size: u32| {
+        if unnormalized {
+            coord
+        } else {
+            coord * size as f32
+        }
+        .floor() as i32
+    };
+    // Unnormalized coordinates cannot repeat the image, so the two modes that
+    // repeat it fold it over once instead.
+    let mode = |axis: usize| match get_bits_u32(&samp, axis * 3, 3) {
+        0 if unnormalized => 2,
+        1 if unnormalized => 3,
+        mode => mode,
+    };
+    let x = clamp_texel(texel(u, width), width as i32, mode(0));
+    let y = clamp_texel(texel(v, height), height as i32, mode(1));
+
+    match (x, y) {
+        (Some(x), Some(y)) => {
+            let ptr = (base_addr + y as u64 * row + x as u64) as *const u8;
+            texel_value(format, unsafe { std::ptr::read_unaligned(ptr) })
+        }
+        // Off the image, the sampler's border colour stands in for the texel.
+        _ => match get_bits_u32(&samp, 126, 2) {
+            0 | 1 => 0,
+            2 => format_one(format),
+            _ => unimplemented!("IMAGE_SAMPLE_LZ with a border colour of its own"),
+        },
     }
 }
 
@@ -190,14 +282,6 @@ fn intersect_triangle_frac(
     let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
     let s1 = cross(ray_direction, e2);
     let denom = dot(s1, e1);
-    if denom == 0.0 {
-        let result0 = f32::INFINITY;
-        let result1 = 0.0;
-        let result2 = 0.0;
-        let result3 = 0.0;
-
-        return (result0, result1, result2, result3);
-    }
     let d = [
         ray_origin[0] - v0[0],
         ray_origin[1] - v0[1],
@@ -208,22 +292,28 @@ fn intersect_triangle_frac(
     let b_z = dot(ray_direction, s2);
     let t: f32 = dot(e2, s2);
     let b_x = denom - b_y - b_z;
-    let barycentrics = [b_x, b_y, b_z];
+    // The flags name a barycentric in two bits each; the fourth encoding is
+    // reserved, and the part answers it with the first barycentric.
+    let barycentrics = [b_x, b_y, b_z, b_x];
 
-    let result0 = if (denom > 0.0)
-        && (b_y < 0.0 || b_y > denom || b_z < 0.0 || (b_y + b_z) > denom || (t < 0.0))
-    {
-        f32::INFINITY
-    } else if (denom < 0.0)
-        && (b_y > 0.0 || b_y < denom || b_z > 0.0 || (b_y + b_z) < denom || (t > 0.0))
-    {
-        f32::INFINITY
+    let hit = if denom > 0.0 {
+        !(b_y < 0.0 || b_y > denom || b_z < 0.0 || (b_y + b_z) > denom || (t < 0.0))
+    } else if denom < 0.0 {
+        !(b_y > 0.0 || b_y < denom || b_z > 0.0 || (b_y + b_z) < denom || (t > 0.0))
     } else {
-        t
+        // A ray running in the plane of the triangle meets nothing.
+        false
     };
 
+    // A miss is an infinite numerator, signed with the denominator so that the
+    // quotient is positive infinity whichever way round the triangle faces.
+    let result0 = if hit {
+        t
+    } else {
+        f32::INFINITY.copysign(denom)
+    };
     let result1 = denom;
-    let result2 = barycentrics[((flags >> 0) & 3) as usize];
+    let result2 = barycentrics[(flags & 3) as usize];
     let result3 = barycentrics[((flags >> 2) & 3) as usize];
 
     (result0, result1, result2, result3)
@@ -327,7 +417,10 @@ pub extern "C" fn image_bvh64_intersect_ray(
             let tri = if node_type & 1 == 0 {
                 [node.tri_pair.v0, node.tri_pair.v1, node.tri_pair.v2]
             } else {
-                [node.tri_pair.v3, node.tri_pair.v2, node.tri_pair.v1]
+                // The pair's second triangle, wound the way the part takes
+                // it: the same three vertices as (v3, v2, v1), rotated so that
+                // the barycentrics come back in the order the flags name.
+                [node.tri_pair.v1, node.tri_pair.v3, node.tri_pair.v2]
             };
             let result = intersect_triangle_frac(
                 [ray_origin_x, ray_origin_y, ray_origin_z],
@@ -508,6 +601,12 @@ impl Box8Node {
         child_addr
     }
 
+    /// The instance mask that can cull this child: the ray carries one of its
+    /// own, and a child whose mask has no bit in common with it is skipped.
+    pub fn get_child_mask(&self, index: usize) -> u32 {
+        (self.data[9 + index * 3] >> 24) & 0xFF
+    }
+
     pub fn get_child_index(&self, index: usize) -> u32 {
         (self.get_child_addr(index) << 4) | (self.get_child_type(index) as u32)
     }
@@ -631,18 +730,11 @@ fn intersect_triangle(
     v0: [f32; 3],
     v1: [f32; 3],
     v2: [f32; 3],
-) -> (f32, f32, f32) {
+) -> (f32, f32, f32, f32) {
     let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
     let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
     let s1 = cross(ray_direction, e2);
     let denom = dot(s1, e1);
-    if denom == 0.0 {
-        let result0 = f32::INFINITY;
-        let result1 = 0.0;
-        let result2 = 0.0;
-
-        return (result0, result1, result2);
-    }
     let d = [
         ray_origin[0] - v0[0],
         ray_origin[1] - v0[1],
@@ -654,13 +746,17 @@ fn intersect_triangle(
     let b_z = dot(ray_direction, s2) * inv_denom;
     let t: f32 = dot(e2, s2) * inv_denom;
 
-    let t = if b_y < 0.0 || b_y > 1.0 || b_z < 0.0 || (b_y + b_z) > 1.0 {
+    // A ray running in the plane of the triangle meets nothing, and neither
+    // does one that crosses it outside its edges. The barycentrics stand
+    // either way, which for a zero denominator leaves them what dividing by
+    // zero makes of them.
+    let t = if denom == 0.0 || b_y < 0.0 || b_y > 1.0 || b_z < 0.0 || (b_y + b_z) > 1.0 {
         f32::INFINITY
     } else {
         t
     };
 
-    (t, b_y, b_z)
+    (t, b_y, b_z, denom)
 }
 
 #[unsafe(no_mangle)]
@@ -677,6 +773,7 @@ pub extern "C" fn image_bvh8_intersect_ray(
     result9_ptr: *mut u32,
     node_base: u64,
     ray_extent: f32,
+    instance_mask: u32,
     ray_origin_x: f32,
     ray_origin_y: f32,
     ray_origin_z: f32,
@@ -709,11 +806,16 @@ pub extern "C" fn image_bvh8_intersect_ray(
                 tri1[2],
             );
 
-            let prim0 = node.get_prim_index(tri_pair_index as u32, 0);
-            let prim1 = node.get_prim_index(tri_pair_index as u32, 1);
+            // A triangle is named by its primitive index doubled, with the low
+            // bit saying which way round the ray met it.
+            let prim0 =
+                (node.get_prim_index(tri_pair_index as u32, 0) << 1) | (result0.3 < 0.0) as u32;
+            let prim1 =
+                (node.get_prim_index(tri_pair_index as u32, 1) << 1) | (result1.3 < 0.0) as u32;
 
             let node_end = (tri_pair_index as u32 + 1) == node.get_triangle_pair_count();
             let range_end = node.is_range_end(tri_pair_index as u32);
+            let ends = ((range_end as u32) << 1) | (node_end as u32);
 
             unsafe {
                 *result0_ptr = f32::to_bits(result0.0);
@@ -724,8 +826,10 @@ pub extern "C" fn image_bvh8_intersect_ray(
                 *result5_ptr = f32::to_bits(result1.1);
                 *result6_ptr = f32::to_bits(result1.2);
                 *result7_ptr = prim1;
-                *result8_ptr = ((range_end as u32) << 1) | (node_end as u32);
-                *result9_ptr = 0;
+                // The last two dwords stand for the pair's two triangles, and
+                // both say where the pair ends.
+                *result8_ptr = ends;
+                *result9_ptr = ends;
             }
         }
         5 => {
@@ -734,38 +838,34 @@ pub extern "C" fn image_bvh8_intersect_ray(
             let ray_inv_dir_y = 1.0 / ray_dir_y;
             let ray_inv_dir_z = 1.0 / ray_dir_z;
 
-            let child_count = node.get_child_count();
+            let child_count = node.get_child_count() as usize;
 
-            let boxes = (0..child_count)
-                .map(|i| node.get_child_box(i as usize))
-                .collect::<Vec<Aabb>>();
-
-            let s = boxes
-                .iter()
-                .map(|aabb| {
-                    intersect(
-                        [ray_origin_x, ray_origin_y, ray_origin_z],
-                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                        aabb,
-                        ray_extent,
-                    )
-                })
-                .collect::<Vec<(f32, f32)>>();
-
+            // A child the node does not have is a miss, and so is one whose
+            // instance mask has nothing in common with the ray's.
             let results = (0..8)
                 .map(|i| {
-                    if i < 8 && s[i as usize].0 <= s[i as usize].1 {
-                        node.get_child_index(i as usize)
+                    if i >= child_count {
+                        return (0xFFFF_FFFFu32, f32::INFINITY);
+                    }
+                    let (t0, t1) = intersect(
+                        [ray_origin_x, ray_origin_y, ray_origin_z],
+                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                        &node.get_child_box(i),
+                        ray_extent,
+                    );
+                    let hit = t0 <= t1 && (instance_mask & node.get_child_mask(i)) != 0;
+                    let index = if hit {
+                        node.get_child_index(i)
                     } else {
                         0xFFFF_FFFF
-                    }
+                    };
+                    (index, t0)
                 })
-                .collect::<Vec<u32>>();
+                .collect::<Vec<(u32, f32)>>();
 
             let results = results
                 .into_iter()
-                .zip(s.into_iter())
-                .sorted_by(|&(_idx_a, (dist_a, _)), &(_idx_b, (dist_b, _))| {
+                .sorted_by(|&(_idx_a, dist_a), &(_idx_b, dist_b)| {
                     if (_idx_b != 0xFFFF_FFFF && dist_b < dist_a) || _idx_a == 0xFFFF_FFFF {
                         std::cmp::Ordering::Greater
                     } else {
@@ -784,8 +884,10 @@ pub extern "C" fn image_bvh8_intersect_ray(
                 *result5_ptr = results[5];
                 *result6_ptr = results[6];
                 *result7_ptr = results[7];
-                *result8_ptr = 0;
-                *result9_ptr = 0;
+                // A box node has nothing to say in the two dwords a triangle
+                // node names its triangles with.
+                *result8_ptr = 0xFFFF_FFFF;
+                *result9_ptr = 0xFFFF_FFFF;
             }
         }
         _ => {

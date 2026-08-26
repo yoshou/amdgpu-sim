@@ -2540,25 +2540,41 @@ impl Cg {
                 let bits_to_f32 = |r: u32| -> LLVMValueRef {
                     llvm::core::LLVMBuildBitCast(self.b, self.ld_vgpr32(r), self.f32t, self.n())
                 };
-                let args = [
-                    self.ld_sgpr32(i.rsrc as u32),
-                    self.ld_sgpr32(i.rsrc as u32 + 1),
-                    self.ld_sgpr32(i.rsrc as u32 + 2),
-                    self.ld_sgpr32(i.rsrc as u32 + 3),
-                    self.ld_sgpr32(i.rsrc as u32 + 4),
-                    self.ld_sgpr32(i.rsrc as u32 + 5),
-                    self.ld_sgpr32(i.rsrc as u32 + 6),
-                    self.ld_sgpr32(i.rsrc as u32 + 7),
-                    bits_to_f32(i.vaddr0 as u32),
-                    bits_to_f32(i.vaddr1 as u32),
-                ];
                 let params = [
                     self.i32t, self.i32t, self.i32t, self.i32t,
                     self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.f32t, self.f32t,
+                    self.i32t, self.i32t, self.i32t, self.i32t,
+                    self.i32t, self.i32t, self.f32t, self.f32t,
                 ];
-                let data = self.call("image_sample_lz", self.i32t, &params, &args);
-                self.st_vgpr32(i.vdata as u32, data);
+                // The helper answers for one component of the fetch, and the
+                // components the DMASK asks for go to consecutive registers.
+                let mut vdata = i.vdata as u32;
+                for component in 0..4 {
+                    if i.dmask & (1 << component) == 0 {
+                        continue;
+                    }
+                    let args = [
+                        self.ld_sgpr32(i.rsrc as u32),
+                        self.ld_sgpr32(i.rsrc as u32 + 1),
+                        self.ld_sgpr32(i.rsrc as u32 + 2),
+                        self.ld_sgpr32(i.rsrc as u32 + 3),
+                        self.ld_sgpr32(i.rsrc as u32 + 4),
+                        self.ld_sgpr32(i.rsrc as u32 + 5),
+                        self.ld_sgpr32(i.rsrc as u32 + 6),
+                        self.ld_sgpr32(i.rsrc as u32 + 7),
+                        self.ld_sgpr32(i.samp as u32),
+                        self.ld_sgpr32(i.samp as u32 + 1),
+                        self.ld_sgpr32(i.samp as u32 + 2),
+                        self.ld_sgpr32(i.samp as u32 + 3),
+                        self.ci32(component as u32),
+                        self.ci32(i.unrm as u32),
+                        bits_to_f32(i.vaddr0 as u32),
+                        bits_to_f32(i.vaddr1 as u32),
+                    ];
+                    let data = self.call("image_sample_lz", self.i32t, &params, &args);
+                    self.st_vgpr32(vdata, data);
+                    vdata += 1;
+                }
             }
             _ => panic!("scalar: unsupported VSAMPLE {:?}", i.op),
         }

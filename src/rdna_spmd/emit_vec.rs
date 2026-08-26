@@ -4032,13 +4032,13 @@ impl Cg {
                     n,
                 );
                 let vtx = |slot: u64, axis: u64| tfield(slot * 12 + axis * 4, self.f32t);
-                // tri = odd ? [v3, v2, v1] : [v0, v1, v2]
+                // tri = odd ? [v1, v3, v2] : [v0, v1, v2]
                 let pick = |a: u64, b: u64, axis: u64| {
                     llvm::core::LLVMBuildSelect(self.b, odd, vtx(a, axis), vtx(b, axis), n)
                 };
-                let t0v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(3, 0, k), self.vf32)).collect();
-                let t1v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(2, 1, k), self.vf32)).collect();
-                let t2v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(1, 2, k), self.vf32)).collect();
+                let t0v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(1, 0, k), self.vf32)).collect();
+                let t1v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(3, 1, k), self.vf32)).collect();
+                let t2v: Vec<LLVMValueRef> = (0..3).map(|k| self.splat(pick(2, 2, k), self.vf32)).collect();
                 let flags_raw = tfield(60, self.i32t);
                 let flags = llvm::core::LLVMBuildLShr(
                     self.b,
@@ -4081,7 +4081,6 @@ impl Cg {
                 let b_x = self.vfsub(self.vfsub(denom, b_y), b_z);
 
                 let zero = llvm::core::LLVMConstNull(self.vf32);
-                let inf = self.vcf32(f32::INFINITY);
                 let fc = |p, a, b| llvm::core::LLVMBuildFCmp(self.b, p, a, b, n);
                 let or = |a, b| llvm::core::LLVMBuildOr(self.b, a, b, n);
                 let and = |a, b| llvm::core::LLVMBuildAnd(self.b, a, b, n);
@@ -4106,9 +4105,23 @@ impl Cg {
                         fc(LLVMRealOGT, t_hit, zero),
                     ),
                 );
-                let miss = or(reject_pos, reject_neg);
-                let degenerate = fc(LLVMRealOEQ, denom, zero);
+                // A ray in the plane of the triangle meets nothing either.
+                let miss = or(or(reject_pos, reject_neg), fc(LLVMRealOEQ, denom, zero));
                 let sel = |c, a, b| llvm::core::LLVMBuildSelect(self.b, c, a, b, n);
+                // The numerator a miss returns is infinite, signed with the
+                // denominator so that the quotient is positive infinity
+                // whichever way round the triangle faces.
+                let missed = self.vf32_of(llvm::core::LLVMBuildOr(
+                    self.b,
+                    llvm::core::LLVMBuildAnd(
+                        self.b,
+                        self.vf32_bits(denom),
+                        self.vci32(0x8000_0000u32 as u32),
+                        n,
+                    ),
+                    self.vci32(0x7F80_0000),
+                    n,
+                ));
                 // `flags` picks a barycentric per output; it is uniform, so the
                 // index is a scalar and the selects are scalar-controlled.
                 let bary = |shift: u32| -> LLVMValueRef {
@@ -4118,16 +4131,13 @@ impl Cg {
                         self.ci32(3),
                         n,
                     );
-                    let is0 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, idx, self.ci32(0), n);
                     let is1 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, idx, self.ci32(1), n);
-                    sel(is0, b_x, sel(is1, b_y, b_z))
+                    let is2 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, idx, self.ci32(2), n);
+                    // The fourth encoding is reserved, and the part answers it
+                    // with the first barycentric.
+                    sel(is1, b_y, sel(is2, b_z, b_x))
                 };
-                let tri_res = [
-                    sel(degenerate, inf, sel(miss, inf, t_hit)),
-                    sel(degenerate, zero, denom),
-                    sel(degenerate, zero, bary(0)),
-                    sel(degenerate, zero, bary(2)),
-                ];
+                let tri_res = [sel(miss, missed, t_hit), denom, bary(0), bary(2)];
                 let tri_bits: Vec<LLVMValueRef> =
                     tri_res.iter().map(|&v| self.vf32_bits(v)).collect();
                 llvm::core::LLVMBuildBr(self.b, join);
@@ -4217,17 +4227,34 @@ impl Cg {
     unsafe fn emit_vsample(&self, i: &VSAMPLE) {
         match i.op {
             I::IMAGE_SAMPLE_LZ => {
-                let mut in_vecs: Vec<LLVMValueRef> =
-                    (0..8).map(|k| self.splat(self.ld_sgpr32(i.rsrc as u32 + k), self.vi32)).collect();
-                in_vecs.push(self.vf32_of(self.ld_vgpr32(i.vaddr0 as u32)));
-                in_vecs.push(self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32)));
                 let in_tys = [
                     self.i32t, self.i32t, self.i32t, self.i32t,
                     self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.f32t, self.f32t,
+                    self.i32t, self.i32t, self.i32t, self.i32t,
+                    self.i32t, self.i32t, self.f32t, self.f32t,
                 ];
-                let data = self.per_lane("image_sample_lz", self.i32t, &in_vecs, &in_tys, self.vi32);
-                self.st_vgpr32(i.vdata as u32, data);
+                // The helper answers for one component of the fetch, and the
+                // components the DMASK asks for go to consecutive registers.
+                let mut vdata = i.vdata as u32;
+                for component in 0..4 {
+                    if i.dmask & (1 << component) == 0 {
+                        continue;
+                    }
+                    let mut in_vecs: Vec<LLVMValueRef> = (0..8)
+                        .map(|k| self.splat(self.ld_sgpr32(i.rsrc as u32 + k), self.vi32))
+                        .collect();
+                    in_vecs.extend(
+                        (0..4).map(|k| self.splat(self.ld_sgpr32(i.samp as u32 + k), self.vi32)),
+                    );
+                    in_vecs.push(self.splat(self.ci32(component as u32), self.vi32));
+                    in_vecs.push(self.splat(self.ci32(i.unrm as u32), self.vi32));
+                    in_vecs.push(self.vf32_of(self.ld_vgpr32(i.vaddr0 as u32)));
+                    in_vecs.push(self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32)));
+                    let data =
+                        self.per_lane("image_sample_lz", self.i32t, &in_vecs, &in_tys, self.vi32);
+                    self.st_vgpr32(vdata, data);
+                    vdata += 1;
+                }
             }
             _ => panic!("vec: unsupported VSAMPLE {:?}", i.op),
         }

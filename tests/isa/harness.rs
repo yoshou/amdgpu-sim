@@ -7,6 +7,7 @@
 //! engine. It carries no knowledge of what any instruction means.
 
 use crate::encoding::{slot_marker, SLOT_BYTES, S_NOP};
+use aligned_vec::{AVec, ConstAlign};
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_processor::*;
@@ -122,6 +123,14 @@ impl Harness {
         Self::load("harness_scratch.kd", 0x8888_8888, 4, 16)
     }
 
+    pub(crate) fn vimage() -> Self {
+        Self::load("harness_vimage.kd", 0xAAAA_AAAA, 12, 16)
+    }
+
+    pub(crate) fn vsample() -> Self {
+        Self::load("harness_vsample.kd", 0xBBBB_BBBB, 4, 4)
+    }
+
     pub(crate) fn load(
         kernel: &str,
         marker_literal: u32,
@@ -188,6 +197,21 @@ impl Harness {
     /// `src` holds `src_stride` dwords per lane and `uni` the values the kernel
     /// puts in SGPRs; the result is `out_stride` dwords per lane.
     pub(crate) fn run(&self, engine: Engine, words: &[u32], src: &[u32], uni: &[u32]) -> Vec<u32> {
+        self.run_with_data(engine, words, src, uni, &[])
+    }
+
+    /// As `run`, but with the data buffer holding `data`. The image formats
+    /// read what they work on -- BVH nodes, texels -- from memory, so their
+    /// tests state the buffer's contents; an empty slice leaves the pattern the
+    /// memory harness expects.
+    pub(crate) fn run_with_data(
+        &self,
+        engine: Engine,
+        words: &[u32],
+        src: &[u32],
+        uni: &[u32],
+        given: &[u32],
+    ) -> Vec<u32> {
         assert_eq!(src.len(), LANES * self.src_stride);
         assert!(
             words.len() * 4 <= SLOT_BYTES,
@@ -207,10 +231,18 @@ impl Harness {
         // whose offset reaches outside the buffer reads the same zeros the
         // hardware read rather than whatever happens to be next to this
         // process's allocation.
+        // The buffer is aligned like the hardware's allocation, since an image
+        // resource names its base address in 256-byte units.
         const GUARD: usize = 64;
-        let mut data: Vec<u32> = vec![0; GUARD];
-        data.extend((0..256u32).map(data_word));
-        data.extend(std::iter::repeat(0).take(GUARD));
+        let mut data = AVec::<u32, ConstAlign<256>>::new(256);
+        data.resize(GUARD + 256 + GUARD, 0);
+        for k in 0..256 {
+            data[GUARD + k] = if given.is_empty() {
+                data_word(k as u32)
+            } else {
+                given.get(k).copied().unwrap_or(0)
+            };
+        }
         let mut arg_buffer = vec![0u8; self.kernarg_size];
         set_u64(&mut arg_buffer, 0, out.as_mut_ptr() as u64);
         set_u64(&mut arg_buffer, 8, src.as_ptr() as u64);
