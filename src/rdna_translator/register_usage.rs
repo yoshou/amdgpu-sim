@@ -1952,6 +1952,12 @@ impl RDNATranslator {
                 }
             },
             InstFormat::VOP3SD(inst) => match inst.op {
+                I::V_SUB_CO_U32 | I::V_SUBREV_CO_U32 => {
+                    reg_usage.use_operand_u32(&inst.src0);
+                    reg_usage.use_operand_u32(&inst.src1);
+                    reg_usage.def_vgpr_u32(inst.vdst as u32);
+                    reg_usage.def_sgpr_u32(inst.sdst as u32);
+                }
                 I::V_DIV_SCALE_F32 => {
                     reg_usage.use_operand_f32(&inst.src0);
                     reg_usage.use_operand_f32(&inst.src1);
@@ -1973,7 +1979,7 @@ impl RDNATranslator {
                     reg_usage.def_vgpr_f64(inst.vdst as u32);
                     reg_usage.def_sgpr_u32(inst.sdst as u32);
                 }
-                I::V_ADD_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
+                I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
                     reg_usage.use_operand_u32(&inst.src0);
                     reg_usage.use_operand_u32(&inst.src1);
                     reg_usage.use_operand_u32(&inst.src2);

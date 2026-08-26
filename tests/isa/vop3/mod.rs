@@ -274,6 +274,87 @@ pub(crate) fn check_vop3_u32_ulp(op: u32, tolerance: i64, cases: &[Vop3F32]) {
     );
 }
 
+/// The SGPR a VOP3SD case names as its scalar destination.
+const SDST: u32 = 16;
+
+/// One VOP3SD case: the operands, and both destinations the format writes.
+pub(crate) struct Vop3sdCase {
+    src0: Src,
+    src1: Src,
+    src2: Src,
+    /// One bit per source position.
+    neg: u32,
+    /// The destination register pair of the lane the case is read from.
+    expected: u64,
+    /// The lane mask the instruction wrote to its scalar destination.
+    expected_sdst: u32,
+}
+
+/// Bit-exact comparison of a VOP3SD instruction against captured hardware. The
+/// sources are wave-uniform, so every lane computes the same thing and the
+/// scalar destination is the same mask whichever lane is read.
+pub(crate) fn check_vop3sd(op: u32, cases: &[Vop3sdCase]) {
+    let harness = Harness::vop3();
+
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let mut src = vec![0u32; LANES * harness.src_stride];
+        let mut uni = vec![0u32; 8];
+        let mut literal = Vec::new();
+        let mut field = [0u32; 3];
+        for (position, s) in [case.src0, case.src1, case.src2].iter().enumerate() {
+            field[position] = match s {
+                Src::Vgpr(value) => {
+                    for lane in 0..LANES {
+                        src[lane * harness.src_stride + position * 2] = *value as u32;
+                        src[lane * harness.src_stride + position * 2 + 1] = (*value >> 32) as u32;
+                    }
+                    vgpr(position as u32 * 2)
+                }
+                Src::Sgpr(value) => {
+                    uni[position * 2] = *value as u32;
+                    uni[position * 2 + 1] = (*value >> 32) as u32;
+                    10 + position as u32 * 2
+                }
+                Src::Inline(encoding) => *encoding,
+                Src::Literal(value) => {
+                    literal.push(*value as u32);
+                    255
+                }
+            };
+        }
+        let mut words = vop3sd(op, 6, SDST, field[0], field[1], field[2], case.neg).to_vec();
+        words.extend(literal);
+
+        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+            let out = harness.run(engine, &words, &src, &uni);
+            let got = out[0] as u64 | ((out[1] as u64) << 32);
+            let got_sdst = out[2];
+            if got == case.expected && got_sdst == case.expected_sdst {
+                continue;
+            }
+            failures.push(format!(
+                "  {:<11} case {} (neg={:#03b}) hardware=({}, sdst {:#010X}) simulator=({}, sdst {:#010X})",
+                engine_name(engine),
+                i,
+                case.neg,
+                show_f64(case.expected),
+                case.expected_sdst,
+                show_f64(got),
+                got_sdst,
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} case-results differ from hardware:\n{}",
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
+    );
+}
+
 mod binary;
+mod scalar_dst;
 mod ternary;
 mod unary;

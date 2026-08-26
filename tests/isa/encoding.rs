@@ -123,6 +123,23 @@ pub(crate) const fn vop3_sdst(
     [lo, hi]
 }
 
+/// VOP3SD: the VOP3 encoding of the instructions that write a scalar
+/// destination as well, which [14:8] names. There is no ABS or OPSEL, and the
+/// opcode alone decides that the format is this one.
+pub(crate) const fn vop3sd(
+    op: u32,
+    vdst: u32,
+    sdst: u32,
+    src0: u32,
+    src1: u32,
+    src2: u32,
+    neg: u32,
+) -> [u32; 2] {
+    let lo = vdst | (sdst << 8) | (op << 16) | (0b110101 << 26);
+    let hi = src0 | (src1 << 9) | (src2 << 18) | (neg << 29);
+    [lo, hi]
+}
+
 /// SOP1: [31:23] = 101111101, [22:16] = SDST, [15:8] = OP, [7:0] = SSRC0.
 pub(crate) const fn sop1(op: u32, sdst: u32, ssrc0: u32) -> u32 {
     (0b101111101 << 23) | (sdst << 16) | (op << 8) | ssrc0

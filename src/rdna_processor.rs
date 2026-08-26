@@ -148,77 +148,105 @@ fn get_exp_f32(val: f32) -> i16 {
 }
 
 fn div_scale_f32(s0: f32, s1: f32, s2: f32) -> (f32, bool) {
-    let mut vcc = false;
-    let mut d = s0 * s2 / s1;
-    let s1_exp = get_exp_f32(s1);
-    let s2_exp = get_exp_f32(s2);
-    if s2 == 0.0 || s1 == 0.0 {
-        d = f32::NAN;
-    } else if s2_exp - s1_exp >= 96 {
-        // N/D near MAX_FLOAT
-        vcc = true;
-        if s0 == s1 {
-            // Only scale the denominator
-            d = s0 * 64f32.exp2();
-        }
-    } else if !s1.is_normal() {
-        d = s0 * 64f32.exp2();
-    } else if (!(1.0 / s1).is_normal()) && (!(s2 / s1).is_normal()) {
-        vcc = true;
-        if s0 == s1 {
-            // Only scale the denominator
-            d = s0 * 64f32.exp2();
-        }
-    } else if !(1.0 / s1).is_normal() {
-        d = s0 * (-64f32).exp2();
-    } else if !(s2 / s1).is_normal() {
-        vcc = true;
-        if s0 == s2 {
-            // Only scale the numerator
-            d = s0 * 64f32.exp2();
-        }
-    } else if s2_exp <= 23 {
-        // Numerator is tiny
-        d = s0 * 64f32.exp2();
+    // ISA §V_DIV_SCALE_F32, with the three places the part departs from the
+    // pseudo code: the quotient-underflow case triggers on the exponent
+    // difference, symmetric with the overflow one; the reciprocal test is a
+    // test on the denominator's own exponent; and the NaN a zero operand
+    // returns is the negative quiet one, with VCC set.
+    let denominator_exponent = get_exp_f32(s1);
+    let numerator_exponent = get_exp_f32(s2);
+    let delta = numerator_exponent - denominator_exponent;
+
+    let returns_nan = s1 == 0.0 || s2 == 0.0;
+    let overflows = delta >= 96;
+    let underflows = delta <= -96;
+    let reciprocal_is_subnormal = denominator_exponent >= 253;
+    let operands_are_tiny = denominator_exponent == 0 || numerator_exponent <= 23;
+
+    let scaled_up = libm::ldexpf(s0, 64);
+    let scaled_down = libm::ldexpf(s0, -64);
+    // Only the operand this call was handed is scaled; the other one passes
+    // through unchanged.
+    let denominator_up = if s0 == s1 { scaled_up } else { s0 };
+    let denominator_down = if s0 == s1 { scaled_down } else { s0 };
+    let numerator_up = if s0 == s2 { scaled_up } else { s0 };
+
+    // The cases are applied in reverse, so that an earlier one wins.
+    let mut d = s0;
+    if operands_are_tiny {
+        d = scaled_up;
     }
-    (d, vcc)
+    if reciprocal_is_subnormal {
+        d = scaled_down;
+    }
+    if underflows {
+        // Scale the numerator up, unless the reciprocal is already subnormal,
+        // in which case the denominator is scaled down.
+        d = if reciprocal_is_subnormal {
+            denominator_down
+        } else {
+            numerator_up
+        };
+    }
+    if overflows {
+        d = denominator_up;
+    }
+    if returns_nan {
+        d = u32_to_f32(0xFFC0_0000);
+    }
+
+    (d, overflows || underflows)
 }
 
 fn div_scale_f64(s0: f64, s1: f64, s2: f64) -> (f64, bool) {
-    let mut vcc = false;
-    let mut d = s0 * s2 / s1;
-    let s1_exp = get_exp_f64(s1);
-    let s2_exp = get_exp_f64(s2);
-    if s2 == 0.0 || s1 == 0.0 {
-        d = f64::NAN;
-    } else if s2_exp - s1_exp >= 768 {
-        // N/D near MAX_FLOAT
-        vcc = true;
-        if s0 == s1 {
-            // Only scale the denominator
-            d = s0 * 128f64.exp2();
-        }
-    } else if !s1.is_normal() {
-        d = s0 * 128f64.exp2();
-    } else if (!(1.0 / s1).is_normal()) && (!(s2 / s1).is_normal()) {
-        vcc = true;
-        if s0 == s1 {
-            // Only scale the denominator
-            d = s0 * 128f64.exp2();
-        }
-    } else if !(1.0 / s1).is_normal() {
-        d = s0 * (-128f64).exp2();
-    } else if !(s2 / s1).is_normal() {
-        vcc = true;
-        if s0 == s2 {
-            // Only scale the numerator
-            d = s0 * 128f64.exp2();
-        }
-    } else if s2_exp <= 53 {
-        // Numerator is tiny
-        d = s0 * 128f64.exp2();
+    // ISA §V_DIV_SCALE_F64, with the three places the part departs from the
+    // pseudo code: the quotient-underflow case triggers on the exponent
+    // difference, symmetric with the overflow one; the reciprocal test is a
+    // test on the denominator's own exponent; and the NaN a zero operand
+    // returns is the negative quiet one, with VCC set.
+    let denominator_exponent = get_exp_f64(s1);
+    let numerator_exponent = get_exp_f64(s2);
+    let delta = numerator_exponent - denominator_exponent;
+
+    let returns_nan = s1 == 0.0 || s2 == 0.0;
+    let overflows = delta >= 768;
+    let underflows = delta <= -768;
+    let reciprocal_is_subnormal = denominator_exponent >= 2045;
+    let operands_are_tiny = denominator_exponent == 0 || numerator_exponent <= 53;
+
+    let scaled_up = libm::ldexp(s0, 128);
+    let scaled_down = libm::ldexp(s0, -128);
+    // Only the operand this call was handed is scaled; the other one passes
+    // through unchanged.
+    let denominator_up = if s0 == s1 { scaled_up } else { s0 };
+    let denominator_down = if s0 == s1 { scaled_down } else { s0 };
+    let numerator_up = if s0 == s2 { scaled_up } else { s0 };
+
+    // The cases are applied in reverse, so that an earlier one wins.
+    let mut d = s0;
+    if operands_are_tiny {
+        d = scaled_up;
     }
-    (d, vcc)
+    if reciprocal_is_subnormal {
+        d = scaled_down;
+    }
+    if underflows {
+        // Scale the numerator up, unless the reciprocal is already subnormal,
+        // in which case the denominator is scaled down.
+        d = if reciprocal_is_subnormal {
+            denominator_down
+        } else {
+            numerator_up
+        };
+    }
+    if overflows {
+        d = denominator_up;
+    }
+    if returns_nan {
+        d = u64_to_f64(0xFFF8_0000_0000_0000);
+    }
+
+    (d, overflows || underflows)
 }
 
 fn div_fixup_f32(s0: f32, s1: f32, s2: f32) -> f32 {
@@ -10814,6 +10842,19 @@ impl SIMD32 {
                 // VOP3SD spends the ABS field on SDST, so only NEG reaches the sources.
                 self.v_add_co_ci_u32_e64(d0, d1, s0, s1, s2, 0, neg);
             }
+            I::V_SUB_CO_U32 => {
+                self.v_sub_co_u32(d0, d1, s0, s1);
+            }
+            I::V_SUBREV_CO_U32 => {
+                self.v_subrev_co_u32(d0, d1, s0, s1);
+            }
+            I::V_SUB_CO_CI_U32 => {
+                // VOP3SD spends the ABS field on SDST, so only NEG reaches the sources.
+                self.v_sub_co_ci_u32_e64(d0, d1, s0, s1, s2, 0, neg);
+            }
+            I::V_SUBREV_CO_CI_U32 => {
+                self.v_subrev_co_ci_u32_e64(d0, d1, s0, s1, s2, 0, neg);
+            }
             I::V_MAD_CO_U64_U32 => {
                 self.v_mad_co_u64_u32(d0, d1, s0, s1, s2);
             }
@@ -10837,6 +10878,135 @@ impl SIMD32 {
             let s0_value = self.read_vector_source_operand_u32(elem, s0);
             let s1_value = self.read_vector_source_operand_u32(elem, s1);
             let (d0_value, d1_value) = add_u32(s0_value, s1_value, 0);
+            self.write_vgpr(elem, d0, d0_value);
+            vcc |= (d1_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d1, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    /// ISA §V_SUB_CO_U32: the borrow out lands in the scalar destination.
+    fn v_sub_co_u32(&mut self, d0: usize, d1: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (d0_value, d1_value) = sub_u32(s0_value, s1_value, 0);
+            self.write_vgpr(elem, d0, d0_value);
+            vcc |= (d1_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d1, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    /// ISA §V_SUBREV_CO_U32: the same, with the sources the other way round.
+    fn v_subrev_co_u32(&mut self, d0: usize, d1: usize, s0: SourceOperand, s1: SourceOperand) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vector_source_operand_u32(elem, s1);
+            let (d0_value, d1_value) = sub_u32(s1_value, s0_value, 0);
+            self.write_vgpr(elem, d0, d0_value);
+            vcc |= (d1_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d1, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    /// ISA §V_SUB_CO_CI_U32: the third source is the borrow in, one bit per
+    /// lane, and the borrow out goes to the scalar destination.
+    fn v_sub_co_ci_u32_e64(
+        &mut self,
+        d0: usize,
+        d1: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s0) as u64,
+                abs,
+                neg,
+                0,
+                32,
+            ) as u32;
+            let s1_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s1) as u64,
+                abs,
+                neg,
+                1,
+                32,
+            ) as u32;
+            let s2_value = self.read_scalar_source_operand_u32(s2);
+            let (d0_value, d1_value) = sub_u32(s0_value, s1_value, (s2_value >> elem) & 1);
+            self.write_vgpr(elem, d0, d0_value);
+            vcc |= (d1_value as u32) << elem;
+        }
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            self.set_sgpr_bit(d1, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    /// ISA §V_SUBREV_CO_CI_U32: the same, with the sources the other way round.
+    fn v_subrev_co_ci_u32_e64(
+        &mut self,
+        d0: usize,
+        d1: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s0) as u64,
+                abs,
+                neg,
+                0,
+                32,
+            ) as u32;
+            let s1_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s1) as u64,
+                abs,
+                neg,
+                1,
+                32,
+            ) as u32;
+            let s2_value = self.read_scalar_source_operand_u32(s2);
+            let (d0_value, d1_value) = sub_u32(s1_value, s0_value, (s2_value >> elem) & 1);
             self.write_vgpr(elem, d0, d0_value);
             vcc |= (d1_value as u32) << elem;
         }
@@ -15376,8 +15546,8 @@ impl SIMD32 {
                 continue;
             }
 
-            let lane = ((self.read_vgpr(elem, addr).wrapping_add(offset0 as u32) >> 2) & 31)
-                as usize;
+            let lane =
+                ((self.read_vgpr(elem, addr).wrapping_add(offset0 as u32) >> 2) & 31) as usize;
             let value = if active[lane] { values[lane] } else { 0 };
             self.write_vgpr(elem, vdst, value);
         }

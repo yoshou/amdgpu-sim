@@ -95,7 +95,7 @@ impl Harness {
     }
 
     pub(crate) fn vop3() -> Self {
-        Self::load("harness_vop3.kd", 0x3333_3333, 6, 2)
+        Self::load("harness_vop3.kd", 0x3333_3333, 6, 4)
     }
 
     pub(crate) fn vopc() -> Self {
