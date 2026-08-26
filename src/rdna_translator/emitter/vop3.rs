@@ -4175,10 +4175,6 @@ impl IREmitter {
                 }
             }
             I::V_DIV_FIXUP_F64 => {
-                // S1 and S2 are the original denominator and numerator, so the
-                // IEEE quotient can be computed here directly. This makes the
-                // upstream div_scale/rcp/div_fmas refinement chain dead code,
-                // which the instruction combine pass removes.
                 if USE_SIMD {
                     let emitter = self;
                     let exec_value = emitter.emit_load_sgpr_u32(126);
@@ -4186,9 +4182,10 @@ impl IREmitter {
                     const N: usize = SIMD_WIDTH;
 
                     for i in (0..32).step_by(N) {
-                        let empty_name = std::ffi::CString::new("").unwrap();
-
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                        let s0_value =
+                            emitter.emit_vector_source_operand_f64xn::<N>(&inst.src0, i, mask);
 
                         let s1_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src1, i, mask);
@@ -4196,38 +4193,31 @@ impl IREmitter {
                         let s2_value =
                             emitter.emit_vector_source_operand_f64xn::<N>(&inst.src2, i, mask);
 
+                        let s0_value =
+                            emitter.emit_abs_neg_f64xn::<N>(s0_value, inst.abs, inst.neg, 0);
                         let s1_value =
                             emitter.emit_abs_neg_f64xn::<N>(s1_value, inst.abs, inst.neg, 1);
                         let s2_value =
                             emitter.emit_abs_neg_f64xn::<N>(s2_value, inst.abs, inst.neg, 2);
 
-                        let d_value = llvm::core::LLVMBuildFDiv(
-                            builder,
-                            s2_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                        let d_value = emitter.emit_div_fixup_f64(s0_value, s1_value, s2_value);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
                     }
                 } else {
                     bb = self.emit_vop(bb, |emitter, bb, elem| {
-                        let empty_name = std::ffi::CString::new("").unwrap();
+                        let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
                         let s1_value = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
 
                         let s2_value = emitter.emit_vector_source_operand_f64(&inst.src2, elem);
 
+                        let s0_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s0_value, 0);
                         let s1_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s1_value, 1);
                         let s2_value = emitter.emit_abs_neg_f64(inst.abs, inst.neg, s2_value, 2);
 
-                        let d_value = llvm::core::LLVMBuildFDiv(
-                            builder,
-                            s2_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                        let d_value = emitter.emit_div_fixup_f64(s0_value, s1_value, s2_value);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d_value);
