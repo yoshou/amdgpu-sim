@@ -34,6 +34,7 @@ use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef
 use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
+use super::freshness::vgpr_writes;
 use super::ir::{Cond, ScalarProgram, Terminator};
 
 const EXEC: u32 = 126;
@@ -115,27 +116,24 @@ fn normal_pow2_cndmask_def(inst: &InstFormat) -> Option<u32> {
         .then_some(i.vdst as u32)
 }
 
-/// The VGPRs an instruction writes, or `None` for a form this file does not
-/// model. Used to tell whether an instruction standing between two steps of the
-/// idiom leaves the registers it carries alone, so a destination is taken to
-/// cover the pair a 64-bit result would.
-fn valu_written_vgprs(inst: &InstFormat) -> Option<Vec<u32>> {
-    let pair = |vdst: u32| vec![vdst, vdst + 1];
+/// The VGPRs an instruction between two steps of the idiom writes, or `None`
+/// for a form the search will not step over. The ALU and scalar formats are
+/// modelled by `vgpr_writes`; the memory ones are left out so that only
+/// register effects have to be reasoned about here.
+fn steppable_vgpr_writes(inst: &InstFormat) -> Option<Vec<u32>> {
     match inst {
-        InstFormat::VOP1(i) => Some(pair(i.vdst as u32)),
-        InstFormat::VOP2(i) => Some(pair(i.vdst as u32)),
-        InstFormat::VOP3(i) => Some(pair(i.vdst as u32)),
-        InstFormat::VOP3SD(i) => Some(pair(i.vdst as u32)),
-        // A compare writes the SGPR it names, and no VGPR.
-        InstFormat::VOPC(_) => Some(Vec::new()),
-        InstFormat::VOPD(i) => {
-            // The Y half's real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1), the
-            // opposite parity of X, rather than vdsty itself.
-            let y = ((i.vdsty as u32) << 1) | (((i.vdstx as u32) & 1) ^ 1);
-            let mut written = pair(i.vdstx as u32);
-            written.extend(pair(y));
-            Some(written)
-        }
+        InstFormat::VOP1(_)
+        | InstFormat::VOP2(_)
+        | InstFormat::VOP3(_)
+        | InstFormat::VOP3SD(_)
+        | InstFormat::VOP3P(_)
+        | InstFormat::VOPC(_)
+        | InstFormat::VOPD(_)
+        | InstFormat::SOP1(_)
+        | InstFormat::SOP2(_)
+        | InstFormat::SOPC(_)
+        | InstFormat::SOPK(_)
+        | InstFormat::SOPP(_) => Some(vgpr_writes(inst)),
         _ => None,
     }
 }
@@ -154,12 +152,21 @@ fn find_step(
         if matches(inst) {
             return Some(from + offset);
         }
-        let written = valu_written_vgprs(inst)?;
+        let written = steppable_vgpr_writes(inst)?;
         if written.iter().any(|reg| live.contains(reg)) {
             return None;
         }
     }
     None
+}
+
+/// Whether `body[from..until]` leaves `live` alone, which is what lets a step
+/// found out of order still belong to the idiom.
+fn keeps_live(body: &[InstFormat], from: usize, until: usize, live: &[u32]) -> bool {
+    body[from..until].iter().all(|inst| {
+        steppable_vgpr_writes(inst)
+            .is_some_and(|written| !written.iter().any(|reg| live.contains(reg)))
+    })
 }
 
 fn ldexp_f64_with_exponent(inst: &InstFormat, exponent: u32) -> bool {
@@ -169,13 +176,14 @@ fn ldexp_f64_with_exponent(inst: &InstFormat, exponent: u32) -> bool {
 }
 
 /// Recognize the object-level normalization idiom
-/// `scale -> sqrt -> refine -> classify -> rescale`.  Returning instruction
-/// indices keeps the profitability decision local to the complete idiom rather
-/// than expanding every individually-safe LDEXP in the object.
+/// `scale -> sqrt -> refine -> classify -> rescale`.  Returning the two ends of
+/// each idiom keeps the profitability decision local to the complete idiom
+/// rather than expanding every individually-safe LDEXP in the object.
 ///
-/// The steps need not be adjacent: an unrelated expansion the compiler
-/// interleaved is allowed between them, as long as it leaves the registers the
-/// idiom carries alone.
+/// The steps need not be adjacent, nor in one fixed order: the compiler
+/// interleaves an unrelated expansion with them and hoists the second exponent
+/// and the classify around the square root. What has to hold is the dataflow —
+/// every register the idiom carries reaches its next step unwritten.
 fn normal_sqrt_ldexp_pairs(body: &[InstFormat]) -> Vec<(usize, usize)> {
     let mut pairs = Vec::new();
     for start in 0..body.len() {
@@ -205,34 +213,45 @@ fn normal_sqrt_ldexp_pairs(body: &[InstFormat]) -> Vec<(usize, usize)> {
         };
         let root = sqrt.vdst as u32;
 
-        let live = [scaled, scaled + 1, root, root + 1];
-        let Some(i_second_exp) = find_step(body, i_sqrt + 1, &live, |inst| {
-            normal_pow2_cndmask_def(inst).is_some()
-        }) else {
-            continue;
-        };
-        let Some(second_exp) = normal_pow2_cndmask_def(&body[i_second_exp]) else {
-            continue;
-        };
-
-        let live = [scaled, scaled + 1, root, root + 1, second_exp];
-        let Some(i_class) = find_step(body, i_second_exp + 1, &live, |inst| {
-            matches!(inst, InstFormat::VOP3(i)
-                if matches!(i.op, I::V_CMP_CLASS_F64)
-                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst))
-        }) else {
-            continue;
-        };
-
-        let live = [root, root + 1, second_exp];
-        let Some(i_rescale) = find_step(body, i_class + 1, &live, |inst| {
+        // The rescale is the far end: an LDEXP of the root by an exponent from
+        // a second cndmask of the same shape.
+        let Some(i_rescale) = find_step(body, i_sqrt + 1, &[root, root + 1], |inst| {
             matches!(inst, InstFormat::VOP3(i)
                 if matches!(i.op, I::V_LDEXP_F64)
                     && matches!(i.src0, SourceOperand::VectorRegister(r) if r == sqrt.vdst)
-                    && matches!(i.src1, SourceOperand::VectorRegister(r) if r as u32 == second_exp))
+                    && matches!(i.src1, SourceOperand::VectorRegister(_)))
         }) else {
             continue;
         };
+        let InstFormat::VOP3(second_scale) = &body[i_rescale] else {
+            continue;
+        };
+        let SourceOperand::VectorRegister(second_exp) = second_scale.src1 else {
+            continue;
+        };
+        let second_exp = second_exp as u32;
+
+        // The second exponent may be computed anywhere before the rescale, as
+        // long as it reaches it unwritten.
+        let defines_second_exp = (start..i_rescale).rev().any(|at| {
+            normal_pow2_cndmask_def(&body[at]) == Some(second_exp)
+                && keeps_live(body, at + 1, i_rescale, &[second_exp])
+        });
+        if !defines_second_exp {
+            continue;
+        }
+
+        // The classify reads the scaled value, so that value has to survive
+        // from the scale to it.
+        let has_class = (i_scale + 1..i_rescale).any(|at| {
+            matches!(&body[at], InstFormat::VOP3(i)
+                if matches!(i.op, I::V_CMP_CLASS_F64)
+                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst))
+                && keeps_live(body, i_scale + 1, at, &[scaled, scaled + 1])
+        });
+        if !has_class {
+            continue;
+        }
 
         pairs.push((i_scale, i_rescale));
     }

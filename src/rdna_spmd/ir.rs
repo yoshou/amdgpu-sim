@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use crate::instructions::I;
 use crate::rdna_instructions::InstFormat;
-use crate::rdna_translator::RDNAProgram;
+use crate::rdna_translator::{collapse_div_expansions, RDNAProgram};
 
 /// Branch condition recovered from a block's terminating SOPP instruction.
 /// For a single lane EXEC/VCC are 1-bit; these become ordinary scalar branches.
@@ -178,11 +178,12 @@ pub fn build_scalar_program(program: &RDNAProgram) -> ScalarProgram {
         );
 
         let body_src: &[InstFormat] = if last_is_term { head } else { insts };
-        let body: Vec<InstFormat> = body_src
-            .iter()
-            .filter(|i| !is_noop(i))
-            .cloned()
-            .collect();
+        let mut body: Vec<InstFormat> =
+            body_src.iter().filter(|i| !is_noop(i)).cloned().collect();
+        // This backend computes a V_DIV_FIXUP_F64 quotient from the original
+        // operands, which leaves the expansion feeding it dead. The other two
+        // engines apply the real fixup and keep it.
+        collapse_div_expansions(&mut body);
 
         blocks.insert(pc, ScalarBlock { pc, body, term });
     }

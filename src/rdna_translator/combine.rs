@@ -708,6 +708,302 @@ fn match_sqrt_f64(insts: &[InstFormat], effects: &[InstEffects], anchor: usize) 
     })
 }
 
+fn operand_eq(a: &SourceOperand, b: &SourceOperand) -> bool {
+    match (a, b) {
+        (SourceOperand::ScalarRegister(x), SourceOperand::ScalarRegister(y)) => x == y,
+        (SourceOperand::VectorRegister(x), SourceOperand::VectorRegister(y)) => x == y,
+        (SourceOperand::FloatConstant(x), SourceOperand::FloatConstant(y)) => {
+            x.to_bits() == y.to_bits()
+        }
+        (SourceOperand::IntegerConstant(x), SourceOperand::IntegerConstant(y)) => x == y,
+        (SourceOperand::LiteralConstant(x), SourceOperand::LiteralConstant(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn is_const_one(op: &SourceOperand) -> bool {
+    matches!(op, SourceOperand::FloatConstant(v) if v.to_bits() == 1.0f64.to_bits())
+}
+
+fn is_fma_f64(
+    inst: &InstFormat,
+) -> Option<(u32, SourceOperand, SourceOperand, SourceOperand, u8, u8)> {
+    if let InstFormat::VOP3(i) = inst {
+        if matches!(i.op, I::V_FMA_F64) && i.omod == 0 && i.opsel == 0 && i.cm == 0 {
+            return Some((i.vdst as u32, i.src0, i.src1, i.src2, i.neg, i.abs));
+        }
+    }
+    None
+}
+
+fn is_mul_f64(inst: &InstFormat) -> Option<(SourceOperand, SourceOperand)> {
+    match inst {
+        InstFormat::VOP3(i) => {
+            if matches!(i.op, I::V_MUL_F64)
+                && i.neg == 0
+                && i.abs == 0
+                && i.omod == 0
+                && i.cm == 0
+            {
+                return Some((i.src0, i.src1));
+            }
+            None
+        }
+        InstFormat::VOP2(i) => {
+            if matches!(i.op, I::V_MUL_F64) {
+                return Some((i.src0, SourceOperand::VectorRegister(i.vsrc1)));
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn is_rcp_f64(inst: &InstFormat, src_reg: u32) -> bool {
+    match inst {
+        InstFormat::VOP1(i) => {
+            matches!(i.op, I::V_RCP_F64) && vgpr_pair(&i.src0) == Some(src_reg)
+        }
+        InstFormat::VOP3(i) => {
+            matches!(i.op, I::V_RCP_F64)
+                && i.neg == 0
+                && i.abs == 0
+                && i.omod == 0
+                && vgpr_pair(&i.src0) == Some(src_reg)
+        }
+        _ => false,
+    }
+}
+
+fn is_div_scale_f64(
+    inst: &InstFormat,
+) -> Option<(u32, SourceOperand, SourceOperand, SourceOperand)> {
+    if let InstFormat::VOP3SD(i) = inst {
+        if matches!(i.op, I::V_DIV_SCALE_F64) && i.neg == 0 && i.omod == 0 && i.cm == 0 {
+            return Some((i.sdst as u32, i.src0, i.src1, i.src2));
+        }
+    }
+    None
+}
+
+// Finds the instruction defining the full VGPR pair `reg` strictly before
+// `before`. Fails on a partial-pair write or an instruction with unknown
+// effects, which could also write it.
+fn find_def(effects: &[InstEffects], before: usize, reg: u32) -> Option<usize> {
+    for j in (0..before).rev() {
+        let e = &effects[j];
+        if !e.known {
+            return None;
+        }
+        let lo = e.kills.contains(&(VGPR_BASE + reg));
+        let hi = e.kills.contains(&(VGPR_BASE + reg + 1));
+        if lo && hi {
+            return Some(j);
+        }
+        if lo || hi {
+            return None;
+        }
+    }
+    None
+}
+
+// Matches the compiler's f64 division expansion feeding a V_DIV_FIXUP_F64 at
+// `anchor`:
+//
+//   a   = v_div_scale_f64 (den, den, num)
+//   r0  = v_rcp_f64 a
+//   t   = v_fma_f64 -a, r, 1.0            (repeated with r = fma(r, t, r))
+//   n_s = v_div_scale_f64 vcc, (num, den, num)
+//   q   = v_mul_f64 n_s, r
+//   f   = v_fma_f64 -a, q, n_s
+//   e   = v_div_fmas_f64 f, r, q
+//   dst = v_div_fixup_f64 e, den, num
+//
+// Returns the instruction indices of the chain (everything but the anchor)
+// for removal. The expansion's temporaries are dead past the anchor by
+// construction; the only assumption made beyond in-block dataflow is that
+// their stale values are not read by later blocks, which holds for
+// compiler-generated code because the expansion is emitted as a unit.
+fn match_div_f64(
+    insts: &[InstFormat],
+    effects: &[InstEffects],
+    anchor: usize,
+) -> Option<Vec<usize>> {
+    let (e_reg, den, num) = if let InstFormat::VOP3(i) = &insts[anchor] {
+        if !matches!(i.op, I::V_DIV_FIXUP_F64) {
+            return None;
+        }
+        (vgpr_pair(&i.src0)?, i.src1, i.src2)
+    } else {
+        return None;
+    };
+
+    let mut matched = Vec::new();
+
+    // e = div_fmas(f, r, q)
+    let i_fmas = find_def(effects, anchor, e_reg)?;
+    let (f_reg, r_reg, q_reg) = if let InstFormat::VOP3(i) = &insts[i_fmas] {
+        if !matches!(i.op, I::V_DIV_FMAS_F64) || i.neg != 0 || i.abs != 0 {
+            return None;
+        }
+        (
+            vgpr_pair(&i.src0)?,
+            vgpr_pair(&i.src1)?,
+            vgpr_pair(&i.src2)?,
+        )
+    } else {
+        return None;
+    };
+    matched.push(i_fmas);
+
+    // q = n_s * r
+    let i_mul = find_def(effects, i_fmas, q_reg)?;
+    let (m0, m1) = is_mul_f64(&insts[i_mul])?;
+    let ns_reg = if vgpr_pair(&m1) == Some(r_reg) {
+        vgpr_pair(&m0)?
+    } else if vgpr_pair(&m0) == Some(r_reg) {
+        vgpr_pair(&m1)?
+    } else {
+        return None;
+    };
+    matched.push(i_mul);
+
+    // f = fma(-a, q, n_s)
+    let i_f = find_def(effects, i_fmas, f_reg)?;
+    let (_, f0, f1, f2, neg, abs) = is_fma_f64(&insts[i_f])?;
+    if neg != 1 || abs != 0 {
+        return None;
+    }
+    let a_reg = vgpr_pair(&f0)?;
+    if vgpr_pair(&f1) != Some(q_reg) || vgpr_pair(&f2) != Some(ns_reg) {
+        return None;
+    }
+    matched.push(i_f);
+
+    // n_s = div_scale(num, den, num)
+    let i_dsn = find_def(effects, i_mul.min(i_f), ns_reg)?;
+    let (_, d0, d1, d2) = is_div_scale_f64(&insts[i_dsn])?;
+    if !operand_eq(&d0, &num) || !operand_eq(&d1, &den) || !operand_eq(&d2, &num) {
+        return None;
+    }
+    matched.push(i_dsn);
+
+    // Newton-Raphson refinement: r = fma(r', t, r'), t = fma(-a, r', 1.0),
+    // bottoming out at r = rcp(a).
+    let mut i_r = find_def(effects, i_mul, r_reg)?;
+    let mut found_rcp = false;
+    for _ in 0..8 {
+        if is_rcp_f64(&insts[i_r], a_reg) {
+            matched.push(i_r);
+            found_rcp = true;
+            break;
+        }
+        let (_, r0, r1, r2, neg, abs) = is_fma_f64(&insts[i_r])?;
+        if neg != 0 || abs != 0 {
+            return None;
+        }
+        let r_prev = vgpr_pair(&r0)?;
+        if vgpr_pair(&r2) != Some(r_prev) {
+            return None;
+        }
+        let t_reg = vgpr_pair(&r1)?;
+        matched.push(i_r);
+
+        let i_t = find_def(effects, i_r, t_reg)?;
+        let (_, t0, t1, t2, tneg, tabs) = is_fma_f64(&insts[i_t])?;
+        if tneg != 1 || tabs != 0 {
+            return None;
+        }
+        if vgpr_pair(&t0) != Some(a_reg) || vgpr_pair(&t1) != Some(r_prev) || !is_const_one(&t2)
+        {
+            return None;
+        }
+        matched.push(i_t);
+
+        i_r = find_def(effects, i_t, r_prev)?;
+    }
+    if !found_rcp {
+        return None;
+    }
+
+    // a = div_scale(den, den, num)
+    let earliest = *matched.iter().min().unwrap();
+    let i_dsa = find_def(effects, earliest, a_reg)?;
+    let (_, a0, a1, a2) = is_div_scale_f64(&insts[i_dsa])?;
+    if !operand_eq(&a0, &den) || !operand_eq(&a1, &den) || !operand_eq(&a2, &num) {
+        return None;
+    }
+    matched.push(i_dsa);
+
+    // The chain's results must not be observable outside the matched set:
+    // every register a matched instruction writes may only be read by other
+    // matched instructions before being fully rewritten. VGPR temporaries may
+    // reach the block end (dead past the anchor by the expansion contract);
+    // an SGPR written by something other than div_scale must be rewritten
+    // within the block, since branches and later blocks may read it.
+    for &i in &matched {
+        for &reg in &effects[i].kills {
+            let mut killed = false;
+            for j in (i + 1)..insts.len() {
+                let ej = &effects[j];
+                if matched.contains(&j) {
+                    if ej.kills.contains(&reg) {
+                        killed = true;
+                        break;
+                    }
+                    continue;
+                }
+                if !ej.known {
+                    return None;
+                }
+                if ej.reads.contains(&reg) {
+                    return None;
+                }
+                if ej.kills.contains(&reg) {
+                    killed = true;
+                    break;
+                }
+            }
+            // div_scale's SGPR flag is overwritten by the emitter with a
+            // constant rather than the architected scale flags, so no correct
+            // reader depends on it past the consuming div_fmas; any genuine
+            // outside reader is already rejected by the loop above.
+            let div_scale_sdst = reg < VGPR_BASE
+                && matches!(&insts[i], InstFormat::VOP3SD(d) if matches!(d.op, I::V_DIV_SCALE_F64));
+            if !killed && reg < VGPR_BASE && !div_scale_sdst {
+                return None;
+            }
+        }
+    }
+
+    Some(matched)
+}
+
+
+// Removes the expansions of the compiler's f64 division that a consumer
+// computing the quotient from the original operands makes dead. The SPMD
+// backend does that; the interpreter and the JIT apply the real fixup, so they
+// must keep the expansion and do not call this.
+pub(crate) fn collapse_div_expansions(insts: &mut Vec<InstFormat>) -> usize {
+    let effects: Vec<InstEffects> = insts.iter().map(effects_of).collect();
+    let mut remove = vec![false; insts.len()];
+
+    for anchor in 0..insts.len() {
+        if let Some(matched) = match_div_f64(insts, &effects, anchor) {
+            if matched.iter().all(|&i| !remove[i]) {
+                for &i in &matched {
+                    remove[i] = true;
+                }
+            }
+        }
+    }
+
+    let removed = remove.iter().filter(|&&r| r).count();
+    let mut keep = remove.iter().map(|&r| !r);
+    insts.retain(|_| keep.next().unwrap());
+    removed
+}
+
 // Removes instructions whose results are provably dead within the block.
 // Returns the number of removed instructions.
 pub(crate) fn combine_block(insts: &mut Vec<InstFormat>) -> usize {
