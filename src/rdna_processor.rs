@@ -13014,6 +13014,24 @@ impl SIMD32 {
                     inst.literal_constant.unwrap(),
                 );
             }
+            I::V_DUAL_SUBREV_F32 => {
+                self.v_dual_subrev_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_MUL_DX9_ZERO_F32 => {
+                self.v_dual_mul_dx9_zero_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_MAX_NUM_F32 => {
+                self.v_dual_max_num_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_MIN_NUM_F32 => {
+                self.v_dual_min_num_f32(&mut dual_result0_u32, s0, s1);
+            }
+            I::V_DUAL_DOT2ACC_F32_F16 => {
+                self.v_dual_dot2acc_f32_f16(&mut dual_result0_u32, s0, s1, d);
+            }
+            I::V_DUAL_DOT2ACC_F32_BF16 => {
+                self.v_dual_dot2acc_f32_bf16(&mut dual_result0_u32, s0, s1, d);
+            }
             op => unimplemented!("{:?}", op),
         }
         let s0 = inst.src0y;
@@ -13055,6 +13073,32 @@ impl SIMD32 {
                     inst.literal_constant.unwrap(),
                 );
             }
+            I::V_DUAL_FMAMK_F32 => {
+                self.v_dual_fmamk_f32(
+                    &mut dual_result1_u32,
+                    s0,
+                    s1,
+                    inst.literal_constant.unwrap(),
+                );
+            }
+            I::V_DUAL_SUBREV_F32 => {
+                self.v_dual_subrev_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_MUL_DX9_ZERO_F32 => {
+                self.v_dual_mul_dx9_zero_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_MAX_NUM_F32 => {
+                self.v_dual_max_num_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_MIN_NUM_F32 => {
+                self.v_dual_min_num_f32(&mut dual_result1_u32, s0, s1);
+            }
+            I::V_DUAL_DOT2ACC_F32_F16 => {
+                self.v_dual_dot2acc_f32_f16(&mut dual_result1_u32, s0, s1, d);
+            }
+            I::V_DUAL_DOT2ACC_F32_BF16 => {
+                self.v_dual_dot2acc_f32_bf16(&mut dual_result1_u32, s0, s1, d);
+            }
             op => unimplemented!("{:?}", op),
         }
         let d = inst.vdstx as usize;
@@ -13066,7 +13110,13 @@ impl SIMD32 {
             | I::V_DUAL_ADD_F32
             | I::V_DUAL_SUB_F32
             | I::V_DUAL_FMAMK_F32
-            | I::V_DUAL_FMAAK_F32 => {
+            | I::V_DUAL_FMAAK_F32
+            | I::V_DUAL_SUBREV_F32
+            | I::V_DUAL_MUL_DX9_ZERO_F32
+            | I::V_DUAL_MAX_NUM_F32
+            | I::V_DUAL_MIN_NUM_F32
+            | I::V_DUAL_DOT2ACC_F32_F16
+            | I::V_DUAL_DOT2ACC_F32_BF16 => {
                 for elem in 0..32 {
                     if !self.get_exec_bit(elem) {
                         continue;
@@ -13087,7 +13137,14 @@ impl SIMD32 {
             | I::V_DUAL_ADD_F32
             | I::V_DUAL_SUB_F32
             | I::V_DUAL_FMAC_F32
-            | I::V_DUAL_FMAAK_F32 => {
+            | I::V_DUAL_FMAAK_F32
+            | I::V_DUAL_FMAMK_F32
+            | I::V_DUAL_SUBREV_F32
+            | I::V_DUAL_MUL_DX9_ZERO_F32
+            | I::V_DUAL_MAX_NUM_F32
+            | I::V_DUAL_MIN_NUM_F32
+            | I::V_DUAL_DOT2ACC_F32_F16
+            | I::V_DUAL_DOT2ACC_F32_BF16 => {
                 for elem in 0..32 {
                     if !self.get_exec_bit(elem) {
                         continue;
@@ -13207,7 +13264,107 @@ impl SIMD32 {
             }
             let s0_value = self.read_vector_source_operand_f32(elem, s0);
             let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
-            let d_value = s0_value - s1_value;
+            let d_value = sub_f32(s0_value, s1_value);
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    /// ISA §V_DUAL_SUBREV_F32: the subtract with its sources the other way
+    /// round.
+    fn v_dual_subrev_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = sub_f32(s1_value, s0_value);
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    /// ISA §V_MUL_DX9_ZERO_F32: DX9 rules, where a zero operand gives zero
+    /// whatever the other one is.
+    fn v_dual_mul_dx9_zero_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = if s0_value == 0.0 || s1_value == 0.0 {
+                0.0
+            } else {
+                s0_value * s1_value
+            };
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    fn v_dual_max_num_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value.max(s1_value);
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    fn v_dual_min_num_f32(&mut self, d_values: &mut [u32], s0: SourceOperand, s1: usize) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_f32(elem, s0);
+            let s1_value = u32_to_f32(self.read_vgpr(elem, s1));
+            let d_value = s0_value.min(s1_value);
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    /// ISA §V_DUAL_DOT2ACC_F32_F16: the two halves of each source are widened,
+    /// multiplied and added to what the destination already holds.
+    fn v_dual_dot2acc_f32_f16(
+        &mut self,
+        d_values: &mut [u32],
+        s0: SourceOperand,
+        s1: usize,
+        d: usize,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s1_value = self.read_vgpr(elem, s1);
+            let mut d_value = u32_to_f32(self.read_vgpr(elem, d));
+            d_value += self.read_vector_source_operand_f16(elem, s0).to_f32()
+                * f16::from_bits(s1_value as u16).to_f32();
+            d_value += self.read_vector_source_operand_f16_hi(elem, s0).to_f32()
+                * f16::from_bits((s1_value >> 16) as u16).to_f32();
+            d_values[elem] = f32_to_u32(d_value);
+        }
+    }
+
+    /// ISA §V_DUAL_DOT2ACC_F32_BF16: the same over brain floats.
+    fn v_dual_dot2acc_f32_bf16(
+        &mut self,
+        d_values: &mut [u32],
+        s0: SourceOperand,
+        s1: usize,
+        d: usize,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0);
+            let s1_value = self.read_vgpr(elem, s1);
+            let mut d_value = u32_to_f32(self.read_vgpr(elem, d));
+            d_value += bf16_to_f32(s0_value as u16) * bf16_to_f32(s1_value as u16);
+            d_value += bf16_to_f32((s0_value >> 16) as u16) * bf16_to_f32((s1_value >> 16) as u16);
             d_values[elem] = f32_to_u32(d_value);
         }
     }

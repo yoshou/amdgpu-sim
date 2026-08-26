@@ -140,6 +140,25 @@ pub(crate) const fn vop3sd(
     [lo, hi]
 }
 
+/// VOPD: two operations in one instruction. [8:0] SRCX0, [16:9] VSRCX1,
+/// [21:17] OPY, [25:22] OPX, [31:26] = 110010, [40:32] SRCY0, [48:41] VSRCY1,
+/// [55:49] VDSTY without its low bit, which the hardware takes as the opposite
+/// of VDSTX's, and [63:56] VDSTX.
+pub(crate) const fn vopd(
+    opx: u32,
+    opy: u32,
+    vdstx: u32,
+    vdsty: u32,
+    srcx0: u32,
+    vsrcx1: u32,
+    srcy0: u32,
+    vsrcy1: u32,
+) -> [u32; 2] {
+    let lo = srcx0 | (vsrcx1 << 9) | (opy << 17) | (opx << 22) | (0b110010 << 26);
+    let hi = srcy0 | (vsrcy1 << 9) | ((vdsty >> 1) << 17) | (vdstx << 24);
+    [lo, hi]
+}
+
 /// SOP1: [31:23] = 101111101, [22:16] = SDST, [15:8] = OP, [7:0] = SSRC0.
 pub(crate) const fn sop1(op: u32, sdst: u32, ssrc0: u32) -> u32 {
     (0b101111101 << 23) | (sdst << 16) | (op << 8) | ssrc0

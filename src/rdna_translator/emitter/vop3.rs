@@ -10231,6 +10231,196 @@ impl IREmitter {
                     ));
                 }
             }
+            I::V_DUAL_MIN_NUM_F32 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0x, i, mask);
+
+                    let s1_value = emitter.emit_load_vgpr_f32xn::<N>(inst.vsrc1x as u32, i, mask);
+
+                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+
+                    let intrinsic = emitter.get_intrinsic_declaration("llvm.minnum.", &[ty_f32xn]);
+                    let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value, s1_value]);
+
+                    opx_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_SUBREV_F32 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0x, i, mask);
+
+                    let s1_value = emitter.emit_load_vgpr_f32xn::<N>(inst.vsrc1x as u32, i, mask);
+
+                    let d_value =
+                        llvm::core::LLVMBuildFSub(builder, s1_value, s0_value, empty_name.as_ptr());
+                    let d_value = emitter.emit_sub_nan_sign(d_value, s1_value, s0_value);
+
+                    opx_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_MUL_DX9_ZERO_F32 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0x, i, mask);
+
+                    let s1_value = emitter.emit_load_vgpr_f32xn::<N>(inst.vsrc1x as u32, i, mask);
+
+                    // DX9 rules: a zero operand gives zero whatever the other
+                    // one is, infinity and NaN included.
+                    let zero = llvm::core::LLVMConstNull(ty_f32xn);
+                    let s0_is_zero = llvm::core::LLVMBuildFCmp(
+                        builder,
+                        llvm::LLVMRealPredicate::LLVMRealOEQ,
+                        s0_value,
+                        zero,
+                        empty_name.as_ptr(),
+                    );
+                    let s1_is_zero = llvm::core::LLVMBuildFCmp(
+                        builder,
+                        llvm::LLVMRealPredicate::LLVMRealOEQ,
+                        s1_value,
+                        zero,
+                        empty_name.as_ptr(),
+                    );
+                    let either_is_zero = llvm::core::LLVMBuildOr(
+                        builder,
+                        s0_is_zero,
+                        s1_is_zero,
+                        empty_name.as_ptr(),
+                    );
+                    let product =
+                        llvm::core::LLVMBuildFMul(builder, s0_value, s1_value, empty_name.as_ptr());
+                    let d_value = llvm::core::LLVMBuildSelect(
+                        builder,
+                        either_is_zero,
+                        zero,
+                        product,
+                        empty_name.as_ptr(),
+                    );
+
+                    opx_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_DOT2ACC_F32_F16 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s1_value = emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc1x as u32, i, mask);
+                    // The initial value of the destination is the addend.
+                    let d_value = emitter.emit_load_vgpr_f32xn::<N>(vdstx, i, mask);
+
+                    // The halves are read through the operand readers, which
+                    // know that a constant reaching a 16-bit operand is a half
+                    // in both positions rather than the bits of a dword.
+                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+                    let s0_low = llvm::core::LLVMBuildFPExt(
+                        builder,
+                        emitter.emit_vector_source_operand_f16xn::<N>(&inst.src0x, i, mask),
+                        ty_f32xn,
+                        empty_name.as_ptr(),
+                    );
+                    let s0_high = llvm::core::LLVMBuildFPExt(
+                        builder,
+                        emitter.emit_vector_source_operand_hi_f16xn::<N>(&inst.src0x, i, mask),
+                        ty_f32xn,
+                        empty_name.as_ptr(),
+                    );
+                    let (s1_low, s1_high) = emitter.emit_f16_to_f32xn::<N>(s1_value);
+
+                    let low =
+                        llvm::core::LLVMBuildFMul(builder, s0_low, s1_low, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, low, empty_name.as_ptr());
+                    let high =
+                        llvm::core::LLVMBuildFMul(builder, s0_high, s1_high, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, high, empty_name.as_ptr());
+
+                    opx_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_DOT2ACC_F32_BF16 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_u32xn::<N>(&inst.src0x, i, mask);
+                    let s1_value = emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc1x as u32, i, mask);
+                    // The initial value of the destination is the addend.
+                    let d_value = emitter.emit_load_vgpr_f32xn::<N>(vdstx, i, mask);
+
+                    let (s0_low, s0_high) = emitter.emit_bf16_to_f32xn::<N>(s0_value);
+                    let (s1_low, s1_high) = emitter.emit_bf16_to_f32xn::<N>(s1_value);
+
+                    let low =
+                        llvm::core::LLVMBuildFMul(builder, s0_low, s1_low, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, low, empty_name.as_ptr());
+                    let high =
+                        llvm::core::LLVMBuildFMul(builder, s0_high, s1_high, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, high, empty_name.as_ptr());
+
+                    opx_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
             I::V_DUAL_MAX_NUM_F32 => {
                 let empty_name = std::ffi::CString::new("").unwrap();
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
@@ -10404,6 +10594,196 @@ impl IREmitter {
             }
         }
         match inst.opy {
+            I::V_DUAL_MIN_NUM_F32 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0y, i, mask);
+
+                    let s1_value = emitter.emit_load_vgpr_f32xn::<N>(inst.vsrc1y as u32, i, mask);
+
+                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+
+                    let intrinsic = emitter.get_intrinsic_declaration("llvm.minnum.", &[ty_f32xn]);
+                    let d_value = intrinsic.emit_call(ty_f32xn, &[s0_value, s1_value]);
+
+                    opy_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_SUBREV_F32 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0y, i, mask);
+
+                    let s1_value = emitter.emit_load_vgpr_f32xn::<N>(inst.vsrc1y as u32, i, mask);
+
+                    let d_value =
+                        llvm::core::LLVMBuildFSub(builder, s1_value, s0_value, empty_name.as_ptr());
+                    let d_value = emitter.emit_sub_nan_sign(d_value, s1_value, s0_value);
+
+                    opy_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_MUL_DX9_ZERO_F32 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+                let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_f32xn::<N>(&inst.src0y, i, mask);
+
+                    let s1_value = emitter.emit_load_vgpr_f32xn::<N>(inst.vsrc1y as u32, i, mask);
+
+                    // DX9 rules: a zero operand gives zero whatever the other
+                    // one is, infinity and NaN included.
+                    let zero = llvm::core::LLVMConstNull(ty_f32xn);
+                    let s0_is_zero = llvm::core::LLVMBuildFCmp(
+                        builder,
+                        llvm::LLVMRealPredicate::LLVMRealOEQ,
+                        s0_value,
+                        zero,
+                        empty_name.as_ptr(),
+                    );
+                    let s1_is_zero = llvm::core::LLVMBuildFCmp(
+                        builder,
+                        llvm::LLVMRealPredicate::LLVMRealOEQ,
+                        s1_value,
+                        zero,
+                        empty_name.as_ptr(),
+                    );
+                    let either_is_zero = llvm::core::LLVMBuildOr(
+                        builder,
+                        s0_is_zero,
+                        s1_is_zero,
+                        empty_name.as_ptr(),
+                    );
+                    let product =
+                        llvm::core::LLVMBuildFMul(builder, s0_value, s1_value, empty_name.as_ptr());
+                    let d_value = llvm::core::LLVMBuildSelect(
+                        builder,
+                        either_is_zero,
+                        zero,
+                        product,
+                        empty_name.as_ptr(),
+                    );
+
+                    opy_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_DOT2ACC_F32_F16 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s1_value = emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc1y as u32, i, mask);
+                    // The initial value of the destination is the addend.
+                    let d_value = emitter.emit_load_vgpr_f32xn::<N>(vdsty, i, mask);
+
+                    // The halves are read through the operand readers, which
+                    // know that a constant reaching a 16-bit operand is a half
+                    // in both positions rather than the bits of a dword.
+                    let ty_f32 = llvm::core::LLVMFloatTypeInContext(context);
+                    let ty_f32xn = llvm::core::LLVMVectorType(ty_f32, N as u32);
+                    let s0_low = llvm::core::LLVMBuildFPExt(
+                        builder,
+                        emitter.emit_vector_source_operand_f16xn::<N>(&inst.src0y, i, mask),
+                        ty_f32xn,
+                        empty_name.as_ptr(),
+                    );
+                    let s0_high = llvm::core::LLVMBuildFPExt(
+                        builder,
+                        emitter.emit_vector_source_operand_hi_f16xn::<N>(&inst.src0y, i, mask),
+                        ty_f32xn,
+                        empty_name.as_ptr(),
+                    );
+                    let (s1_low, s1_high) = emitter.emit_f16_to_f32xn::<N>(s1_value);
+
+                    let low =
+                        llvm::core::LLVMBuildFMul(builder, s0_low, s1_low, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, low, empty_name.as_ptr());
+                    let high =
+                        llvm::core::LLVMBuildFMul(builder, s0_high, s1_high, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, high, empty_name.as_ptr());
+
+                    opy_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
+            I::V_DUAL_DOT2ACC_F32_BF16 => {
+                let empty_name = std::ffi::CString::new("").unwrap();
+                let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+                let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
+
+                for i in (0..32).step_by(N) {
+                    let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
+
+                    let s0_value =
+                        emitter.emit_vector_source_operand_u32xn::<N>(&inst.src0y, i, mask);
+                    let s1_value = emitter.emit_load_vgpr_u32xn::<N>(inst.vsrc1y as u32, i, mask);
+                    // The initial value of the destination is the addend.
+                    let d_value = emitter.emit_load_vgpr_f32xn::<N>(vdsty, i, mask);
+
+                    let (s0_low, s0_high) = emitter.emit_bf16_to_f32xn::<N>(s0_value);
+                    let (s1_low, s1_high) = emitter.emit_bf16_to_f32xn::<N>(s1_value);
+
+                    let low =
+                        llvm::core::LLVMBuildFMul(builder, s0_low, s1_low, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, low, empty_name.as_ptr());
+                    let high =
+                        llvm::core::LLVMBuildFMul(builder, s0_high, s1_high, empty_name.as_ptr());
+                    let d_value =
+                        llvm::core::LLVMBuildFAdd(builder, d_value, high, empty_name.as_ptr());
+
+                    opy_results.push(llvm::core::LLVMBuildBitCast(
+                        builder,
+                        d_value,
+                        ty_i32xn,
+                        empty_name.as_ptr(),
+                    ));
+                }
+            }
             I::V_DUAL_MAX_NUM_F32 => {
                 let empty_name = std::ffi::CString::new("").unwrap();
                 let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);

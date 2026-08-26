@@ -1812,6 +1812,73 @@ impl IREmitter {
         )
     }
 
+    /// The two halves of a packed pair of half-precision values, widened to
+    /// f32: the one in the low 16 bits first.
+    pub(crate) unsafe fn emit_f16_to_f32xn<const N: usize>(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> (llvm::prelude::LLVMValueRef, llvm::prelude::LLVMValueRef) {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty_i16xn = llvm::core::LLVMVectorType(
+            llvm::core::LLVMInt16TypeInContext(context),
+            N as u32,
+        );
+        let ty_f16xn = llvm::core::LLVMVectorType(
+            llvm::core::LLVMHalfTypeInContext(context),
+            N as u32,
+        );
+        let ty_f32xn = llvm::core::LLVMVectorType(
+            llvm::core::LLVMFloatTypeInContext(context),
+            N as u32,
+        );
+        let ty_i32xn = llvm::core::LLVMTypeOf(value);
+
+        let mut widen = |bits: llvm::prelude::LLVMValueRef| {
+            let narrow = llvm::core::LLVMBuildTrunc(builder, bits, ty_i16xn, empty_name.as_ptr());
+            let half = llvm::core::LLVMBuildBitCast(builder, narrow, ty_f16xn, empty_name.as_ptr());
+            llvm::core::LLVMBuildFPExt(builder, half, ty_f32xn, empty_name.as_ptr())
+        };
+
+        let low = widen(value);
+        let shift = self.const_int_like(ty_i32xn, 16);
+        let high = widen(llvm::core::LLVMBuildLShr(
+            builder,
+            value,
+            shift,
+            empty_name.as_ptr(),
+        ));
+        (low, high)
+    }
+
+    /// The same for brain floats, which are the top half of an f32.
+    pub(crate) unsafe fn emit_bf16_to_f32xn<const N: usize>(
+        &mut self,
+        value: llvm::prelude::LLVMValueRef,
+    ) -> (llvm::prelude::LLVMValueRef, llvm::prelude::LLVMValueRef) {
+        let context = self.context;
+        let builder = self.builder;
+        let empty_name = std::ffi::CString::new("").unwrap();
+
+        let ty_f32xn = llvm::core::LLVMVectorType(
+            llvm::core::LLVMFloatTypeInContext(context),
+            N as u32,
+        );
+        let ty_i32xn = llvm::core::LLVMTypeOf(value);
+
+        let shift = self.const_int_like(ty_i32xn, 16);
+        let low_bits = llvm::core::LLVMBuildShl(builder, value, shift, empty_name.as_ptr());
+        let high_mask = self.const_int_like(ty_i32xn, 0xFFFF_0000u32 as i32 as i64);
+        let high_bits = llvm::core::LLVMBuildAnd(builder, value, high_mask, empty_name.as_ptr());
+
+        (
+            llvm::core::LLVMBuildBitCast(builder, low_bits, ty_f32xn, empty_name.as_ptr()),
+            llvm::core::LLVMBuildBitCast(builder, high_bits, ty_f32xn, empty_name.as_ptr()),
+        )
+    }
+
     /// `V_DIV_SCALE_F32`: scale an operand of the division macro so that no
     /// subnormal terms appear during the Newton-Raphson correction. Operands
     /// follow the ISA order (S0 value to scale, S1 denominator, S2 numerator).

@@ -2051,6 +2051,20 @@ impl RDNATranslator {
                 let vdstx = inst.vdstx as u32;
                 let vdsty = ((inst.vdsty << 1) | ((inst.vdstx & 1) ^ 1)) as u32;
                 match inst.opx {
+                    I::V_DUAL_SUBREV_F32
+                    | I::V_DUAL_MUL_DX9_ZERO_F32
+                    | I::V_DUAL_MIN_NUM_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0x);
+                        reg_usage.use_vgpr_f32(inst.vsrc1x as u32);
+                        reg_usage.def_vgpr_f32(vdstx);
+                    }
+                    I::V_DUAL_DOT2ACC_F32_F16 | I::V_DUAL_DOT2ACC_F32_BF16 => {
+                        reg_usage.use_operand_u32(&inst.src0x);
+                        reg_usage.use_vgpr_u32(inst.vsrc1x as u32);
+                        // The initial value of the destination is the addend.
+                        reg_usage.use_vgpr_f32(vdstx);
+                        reg_usage.def_vgpr_f32(vdstx);
+                    }
                     I::V_DUAL_MAX_NUM_F32 => {
                         reg_usage.use_operand_f32(&inst.src0x);
                         reg_usage.use_vgpr_f32(inst.vsrc1x as u32);
@@ -2102,6 +2116,20 @@ impl RDNATranslator {
                     }
                 }
                 match inst.opy {
+                    I::V_DUAL_SUBREV_F32
+                    | I::V_DUAL_MUL_DX9_ZERO_F32
+                    | I::V_DUAL_MIN_NUM_F32 => {
+                        reg_usage.use_operand_f32(&inst.src0y);
+                        reg_usage.use_vgpr_f32(inst.vsrc1y as u32);
+                        reg_usage.def_vgpr_f32(vdsty);
+                    }
+                    I::V_DUAL_DOT2ACC_F32_F16 | I::V_DUAL_DOT2ACC_F32_BF16 => {
+                        reg_usage.use_operand_u32(&inst.src0y);
+                        reg_usage.use_vgpr_u32(inst.vsrc1y as u32);
+                        // The initial value of the destination is the addend.
+                        reg_usage.use_vgpr_f32(vdsty);
+                        reg_usage.def_vgpr_f32(vdsty);
+                    }
                     I::V_DUAL_MAX_NUM_F32 => {
                         reg_usage.use_operand_f32(&inst.src0y);
                         reg_usage.use_vgpr_f32(inst.vsrc1y as u32);

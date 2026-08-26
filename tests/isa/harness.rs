@@ -102,6 +102,10 @@ impl Harness {
         Self::load("harness_vopc.kd", 0x4444_4444, 4, 4)
     }
 
+    pub(crate) fn vopd() -> Self {
+        Self::load("harness_vopd.kd", 0x9999_9999, 6, 4)
+    }
+
     pub(crate) fn salu() -> Self {
         Self::load("harness_salu.kd", 0x5555_5555, 4, 4)
     }
