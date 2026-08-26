@@ -33,18 +33,18 @@ impl IREmitter {
 
                         let s0_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src0, i, mask);
-                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
-
                         let s1_value =
                             emitter.emit_vector_source_operand_u32xn::<N>(&inst.src1, i, mask);
-                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
+                        // The sources are 16 bits wide here, so the sign bit
+                        // the modifiers act on is bit 15, not bit 31.
                         let s0_value = llvm::core::LLVMBuildTrunc(
                             builder,
                             s0_value,
                             ty_i16xn,
                             empty_name.as_ptr(),
                         );
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
 
                         let s1_value = llvm::core::LLVMBuildTrunc(
                             builder,
@@ -52,13 +52,22 @@ impl IREmitter {
                             ty_i16xn,
                             empty_name.as_ptr(),
                         );
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
-                        let d_value = llvm::core::LLVMBuildAdd(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                        // CLAMP saturates the unsigned result instead of
+                        // letting it wrap.
+                        let d_value = if inst.cm != 0 {
+                            let intrinsic =
+                                emitter.get_intrinsic_declaration("llvm.uadd.sat.", &[ty_i16xn]);
+                            intrinsic.emit_call(ty_i16xn, &[s0_value, s1_value])
+                        } else {
+                            llvm::core::LLVMBuildAdd(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            )
+                        };
 
                         let d_value = llvm::core::LLVMBuildZExt(
                             builder,
@@ -76,17 +85,17 @@ impl IREmitter {
                         let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
 
                         let s0_value = emitter.emit_vector_source_operand_u32(&inst.src0, elem);
-                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
-
                         let s1_value = emitter.emit_vector_source_operand_u32(&inst.src1, elem);
-                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
+                        // The sources are 16 bits wide here, so the sign bit
+                        // the modifiers act on is bit 15, not bit 31.
                         let s0_value = llvm::core::LLVMBuildTrunc(
                             builder,
                             s0_value,
                             ty_i16,
                             empty_name.as_ptr(),
                         );
+                        let s0_value = emitter.emit_abs_neg_bits(s0_value, inst.abs, inst.neg, 0);
 
                         let s1_value = llvm::core::LLVMBuildTrunc(
                             builder,
@@ -94,13 +103,22 @@ impl IREmitter {
                             ty_i16,
                             empty_name.as_ptr(),
                         );
+                        let s1_value = emitter.emit_abs_neg_bits(s1_value, inst.abs, inst.neg, 1);
 
-                        let d_value = llvm::core::LLVMBuildAdd(
-                            builder,
-                            s0_value,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                        // CLAMP saturates the unsigned result instead of
+                        // letting it wrap.
+                        let d_value = if inst.cm != 0 {
+                            let intrinsic =
+                                emitter.get_intrinsic_declaration("llvm.uadd.sat.", &[ty_i16]);
+                            intrinsic.emit_call(ty_i16, &[s0_value, s1_value])
+                        } else {
+                            llvm::core::LLVMBuildAdd(
+                                builder,
+                                s0_value,
+                                s1_value,
+                                empty_name.as_ptr(),
+                            )
+                        };
 
                         let d_value = llvm::core::LLVMBuildZExt(
                             builder,
@@ -5837,6 +5855,8 @@ impl IREmitter {
 
                         llvm::core::LLVMPositionBuilderAtEnd(builder, bb_loop_exit);
 
+                        let next_d_value =
+                            emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, next_d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, next_d_value, mask);
 
                         bb = bb_loop_exit

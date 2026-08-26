@@ -1362,6 +1362,23 @@ impl IREmitter {
             empty_name.as_ptr(),
         );
 
+        // A NaN quotient means the division overflowed, which the fixup turns
+        // into an infinity of the quotient's sign rather than passing it on.
+        let quotient_is_nan = llvm::core::LLVMBuildFCmp(
+            builder,
+            llvm::LLVMRealPredicate::LLVMRealUNO,
+            quotient,
+            quotient,
+            empty_name.as_ptr(),
+        );
+        let d_value = llvm::core::LLVMBuildSelect(
+            builder,
+            quotient_is_nan,
+            signed_inf,
+            d_value,
+            empty_name.as_ptr(),
+        );
+
         // The selects are applied in reverse so that earlier ISA cases win.
         let d_value = llvm::core::LLVMBuildSelect(
             builder,

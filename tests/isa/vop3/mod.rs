@@ -275,4 +275,5 @@ pub(crate) fn check_vop3_u32_ulp(op: u32, tolerance: i64, cases: &[Vop3F32]) {
 }
 
 mod binary;
+mod ternary;
 mod unary;
