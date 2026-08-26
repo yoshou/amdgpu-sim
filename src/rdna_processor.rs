@@ -2036,7 +2036,7 @@ impl SIMD32 {
     fn s_mul_u64(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let s0_value = self.read_scalar_source_operand_u64(s0);
         let s1_value = self.read_scalar_source_operand_u64(s1);
-        let d_value = s0_value * s1_value;
+        let d_value = s0_value.wrapping_mul(s1_value);
         self.write_sop_dst_pair(d, d_value);
     }
 
@@ -2106,7 +2106,10 @@ impl SIMD32 {
     fn s_bfe_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let s0_value = self.read_scalar_source_operand_u32(s0);
         let s1_value = self.read_scalar_source_operand_u32(s1);
-        let d_value = (s0_value >> (s1_value & 0x1F)) & ((1 << ((s1_value >> 16) & 0x7F)) - 1);
+        let offset = s1_value & 0x1F;
+        let width = ((s1_value >> 16) & 0x7F).min(32);
+        let mask = ((1u64 << width) - 1) as u32;
+        let d_value = (s0_value >> offset) & mask;
         self.write_sop_dst(d, d_value as u32);
         self.ctx.scc = d_value != 0;
     }
@@ -14095,7 +14098,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut i8;
             let data = unsafe { *ptr };
@@ -14118,7 +14121,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut i16;
             let data = unsafe { *ptr };
@@ -14142,8 +14145,9 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let addr =
-                    offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
+                let addr = offset[elem]
+                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 let data = unsafe { *ptr };
@@ -14168,7 +14172,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u8;
             unsafe {
@@ -14194,8 +14198,9 @@ impl SIMD32 {
                     continue;
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
-                let addr =
-                    offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
+                let addr = offset[elem]
+                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -14280,7 +14285,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u16;
             unsafe {
@@ -14305,7 +14310,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u32;
             unsafe {
@@ -14331,8 +14336,9 @@ impl SIMD32 {
                     continue;
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
-                let addr =
-                    offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
+                let addr = offset[elem]
+                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -14359,8 +14365,9 @@ impl SIMD32 {
                     continue;
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
-                let addr =
-                    offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
+                let addr = offset[elem]
+                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 unsafe {
@@ -14385,7 +14392,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u8;
             let data = unsafe { *ptr };
@@ -14408,7 +14415,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u16;
             let data = unsafe { *ptr };
@@ -14431,7 +14438,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
 
             let ptr = addr as *mut u32;
             let data = unsafe { *ptr };
@@ -14455,8 +14462,9 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let addr =
-                    offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64) + (i as u64 * 4);
+                let addr = offset[elem]
+                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
                 let data = unsafe { *ptr };
@@ -14513,7 +14521,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem] + (((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
             let data = self.read_vgpr(elem, vsrc);
 
             let ptr = addr as *mut u32;
