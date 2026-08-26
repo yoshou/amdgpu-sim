@@ -163,10 +163,11 @@ mod object_predicate_tests {
             "examples/smallpt/kernel_gfx1200.o",
             "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd",
         );
-        // Seven idioms, both ends of each. One more than the fixed-order
-        // search saw: it missed the instance whose second exponent is hoisted
-        // above the square root.
-        assert_eq!(sites.len(), 14);
+        // Eleven idioms, both ends of each: every square root in the object
+        // but one. The fixed-order search saw six, and the dead-code pass used
+        // to take the rest apart along with the division expansion it thought
+        // nothing read.
+        assert_eq!(sites.len(), 22);
     }
 
     #[test]

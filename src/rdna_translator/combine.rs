@@ -288,15 +288,6 @@ fn effects_of(inst: &InstFormat) -> InstEffects {
                 let mut kills = Vec::new();
                 kill_sgpr(inst.vdst as u32, 1, &mut kills);
                 InstEffects::known(reads, kills, false)
-            } else if let I::V_DIV_FIXUP_F64 = inst.op {
-                // The emitter computes src2/src1 directly and never reads
-                // src0, so the refinement chain feeding src0 can die.
-                let mut reads = Vec::new();
-                read_src(&inst.src1, 2, &mut reads);
-                read_src(&inst.src2, 2, &mut reads);
-                let mut kills = Vec::new();
-                kill_vgpr(inst.vdst as u32, 2, &mut kills);
-                InstEffects::known(reads, kills, true)
             } else {
                 match vop3_arith_widths(&inst.op) {
                     Some((src_words, dst_words)) => {
@@ -739,11 +730,7 @@ fn is_fma_f64(
 fn is_mul_f64(inst: &InstFormat) -> Option<(SourceOperand, SourceOperand)> {
     match inst {
         InstFormat::VOP3(i) => {
-            if matches!(i.op, I::V_MUL_F64)
-                && i.neg == 0
-                && i.abs == 0
-                && i.omod == 0
-                && i.cm == 0
+            if matches!(i.op, I::V_MUL_F64) && i.neg == 0 && i.abs == 0 && i.omod == 0 && i.cm == 0
             {
                 return Some((i.src0, i.src1));
             }
@@ -761,9 +748,7 @@ fn is_mul_f64(inst: &InstFormat) -> Option<(SourceOperand, SourceOperand)> {
 
 fn is_rcp_f64(inst: &InstFormat, src_reg: u32) -> bool {
     match inst {
-        InstFormat::VOP1(i) => {
-            matches!(i.op, I::V_RCP_F64) && vgpr_pair(&i.src0) == Some(src_reg)
-        }
+        InstFormat::VOP1(i) => matches!(i.op, I::V_RCP_F64) && vgpr_pair(&i.src0) == Some(src_reg),
         InstFormat::VOP3(i) => {
             matches!(i.op, I::V_RCP_F64)
                 && i.neg == 0
@@ -914,8 +899,7 @@ fn match_div_f64(
         if tneg != 1 || tabs != 0 {
             return None;
         }
-        if vgpr_pair(&t0) != Some(a_reg) || vgpr_pair(&t1) != Some(r_prev) || !is_const_one(&t2)
-        {
+        if vgpr_pair(&t0) != Some(a_reg) || vgpr_pair(&t1) != Some(r_prev) || !is_const_one(&t2) {
             return None;
         }
         matched.push(i_t);
@@ -978,7 +962,6 @@ fn match_div_f64(
 
     Some(matched)
 }
-
 
 // Removes the expansions of the compiler's f64 division that a consumer
 // computing the quotient from the original operands makes dead. The SPMD

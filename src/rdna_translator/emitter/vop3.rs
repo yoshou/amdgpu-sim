@@ -7745,11 +7745,14 @@ impl IREmitter {
             I::V_DIV_SCALE_F64 => {
                 if USE_SIMD {
                     let emitter = self;
+                    let empty_name = std::ffi::CString::new("").unwrap();
                     let exec_value = emitter.emit_load_sgpr_u32(126);
 
-                    let empty_name = std::ffi::CString::new("").unwrap();
-
                     const N: usize = SIMD_WIDTH;
+
+                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
+
+                    let mut vcc_values = Vec::new();
 
                     for i in (0..32).step_by(N) {
                         let mask = emitter.emit_bits_to_mask_u32xn::<N>(exec_value, i);
@@ -7769,53 +7772,34 @@ impl IREmitter {
 
                         let s2_value = emitter.emit_abs_neg_f64xn::<N>(s2_value, 0, inst.neg, 2);
 
-                        let muled = llvm::core::LLVMBuildFMul(
-                            builder,
-                            s0_value,
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
-                        let d_value = llvm::core::LLVMBuildFDiv(
-                            builder,
-                            muled,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
+                        let (d_value, vcc_value) =
+                            emitter.emit_div_scale_f64(s0_value, s1_value, s2_value);
 
                         let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
                         emitter.emit_store_vgpr_f64xn::<N>(inst.vdst as u32, i, d_value, mask);
+
+                        vcc_values.push(vcc_value);
                     }
 
-                    let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-
-                    emitter.emit_store_sgpr_u32(
-                        inst.sdst as u32,
-                        llvm::core::LLVMConstInt(ty_i32, 0, 0),
+                    let vcc_value = emitter.emit_concat::<N>(&vcc_values);
+                    let vcc_value = llvm::core::LLVMBuildBitCast(
+                        builder,
+                        vcc_value,
+                        ty_i32,
+                        empty_name.as_ptr(),
                     );
+
+                    emitter.emit_store_sgpr_u32(inst.sdst as u32, vcc_value);
                 } else {
                     bb = self.emit_vop_update_sgpr(bb, inst.sdst as u32, |emitter, bb, elem| {
-                        let ty_i1 = llvm::core::LLVMInt1TypeInContext(context);
-                        let empty_name = std::ffi::CString::new("").unwrap();
-
                         let s0_value = emitter.emit_vector_source_operand_f64(&inst.src0, elem);
 
                         let s1_value = emitter.emit_vector_source_operand_f64(&inst.src1, elem);
 
                         let s2_value = emitter.emit_vector_source_operand_f64(&inst.src2, elem);
 
-                        let muled = llvm::core::LLVMBuildFMul(
-                            builder,
-                            s0_value,
-                            s2_value,
-                            empty_name.as_ptr(),
-                        );
-                        let d0_value = llvm::core::LLVMBuildFDiv(
-                            builder,
-                            muled,
-                            s1_value,
-                            empty_name.as_ptr(),
-                        );
-                        let d1_value = llvm::core::LLVMConstInt(ty_i1, 0, 0);
+                        let (d0_value, d1_value) =
+                            emitter.emit_div_scale_f64(s0_value, s1_value, s2_value);
 
                         emitter.emit_store_vgpr_f64(inst.vdst as u32, elem, d0_value);
 

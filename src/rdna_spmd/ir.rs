@@ -178,8 +178,7 @@ pub fn build_scalar_program(program: &RDNAProgram) -> ScalarProgram {
         );
 
         let body_src: &[InstFormat] = if last_is_term { head } else { insts };
-        let mut body: Vec<InstFormat> =
-            body_src.iter().filter(|i| !is_noop(i)).cloned().collect();
+        let mut body: Vec<InstFormat> = body_src.iter().filter(|i| !is_noop(i)).cloned().collect();
         // This backend computes a V_DIV_FIXUP_F64 quotient from the original
         // operands, which leaves the expansion feeding it dead. The other two
         // engines apply the real fixup and keep it.
