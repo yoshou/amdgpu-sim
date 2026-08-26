@@ -2,9 +2,11 @@
 //! instructions.
 //!
 //! These read what they work on from memory, so each case states the node the
-//! harness puts in its data buffer as well as the ray. The node pointer the
-//! harness builds is the node's whole address in eight-byte units, which is
-//! what a resource whose base address is zero asks for.
+//! harness puts in its data buffer as well as the ray. The address of a node
+//! is split between the resource's base address and the node pointer, and the
+//! harness builds both: `origin` says how much of the buffer is behind the
+//! base, in the 256-byte units a base address is given in, and the pointer
+//! carries the rest in eight-byte ones.
 //!
 //! The results are the ten VGPRs image_bvh8_intersect_ray writes;
 //! image_bvh64_intersect_ray writes the first four and the rest stay clear, so
@@ -16,10 +18,22 @@ use crate::harness::*;
 use amdgpu_sim::rdna_processor::Engine;
 
 /// The BVH resource for image_bvh64_intersect_ray, as Table 65 lays it out:
-/// a base address of zero, box sorting on with the closest-first heuristic and
-/// no box growth, a size covering the whole address space, and the triangle
-/// return mode that gives barycentrics rather than a triangle ID.
+/// box sorting on with the closest-first heuristic and no box growth, a size
+/// covering the whole address space, and the triangle return mode that gives
+/// barycentrics rather than a triangle ID. The base address is left clear for
+/// the harness to fold in.
 const BVH64_RSRC: [u32; 4] = [0, 0x8000_0000, 0xFFFF_FFFF, 0x8100_03FF];
+
+/// The same resource asking for the children that point at triangle nodes to
+/// be sorted before the ones that point at boxes.
+const BVH64_RSRC_TRIANGLES_FIRST: [u32; 4] = [0, 0x8010_0000, 0xFFFF_FFFF, 0x8100_03FF];
+
+/// The same resource with box sorting off, which leaves the children in the
+/// order the node holds them.
+const BVH64_RSRC_UNSORTED: [u32; 4] = [0, 0x0000_0000, 0xFFFF_FFFF, 0x8100_03FF];
+
+/// The eight-wide resource with box sorting off.
+const BVH8_RSRC_UNSORTED: [u32; 4] = [0, 0x0010_0000, 0xFFFF_FFFF, 0x8168_03FF];
 
 /// The resource for image_bvh8_intersect_ray, which asks for more: triangles
 /// sorted before boxes, sorting across all eight children, and bit 115, which
@@ -241,9 +255,11 @@ fn packet_node(
 }
 
 /// Bit-exact comparison of one BVH instruction against captured hardware.
-fn check_vimage(words: &[u32], rsrc: [u32; 4], cases: &[VimageCase]) {
+fn check_vimage(words: &[u32], rsrc: [u32; 4], origin: u32, cases: &[VimageCase]) {
     let harness = Harness::vimage();
-    let uni = rsrc.to_vec();
+    let mut uni = vec![0u32; 8];
+    uni[..4].copy_from_slice(&rsrc);
+    uni[4] = origin;
 
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
@@ -286,17 +302,30 @@ fn check_vimage(words: &[u32], rsrc: [u32; 4], cases: &[VimageCase]) {
 /// image_bvh64_intersect_ray: VDATA is v12, the resource s[12:15], and the
 /// address groups are the ones the harness fills.
 fn bvh64(cases: &[VimageCase]) {
+    bvh64_with(BVH64_RSRC, 0, cases);
+}
+
+/// As `bvh64`, but against a resource of the case's own, based `origin`
+/// 256-byte units into the data buffer.
+fn bvh64_with(rsrc: [u32; 4], origin: u32, cases: &[VimageCase]) {
     check_vimage(
         &vimage(26, 0, 1, 0xF, 12, 12, [0, 2, 3, 6, 9]),
-        BVH64_RSRC,
+        rsrc,
+        origin,
         cases,
     );
 }
 
 fn bvh8(cases: &[VimageCase]) {
+    bvh8_with(BVH8_RSRC, cases);
+}
+
+/// As `bvh8`, but against a resource of the case's own.
+fn bvh8_with(rsrc: [u32; 4], cases: &[VimageCase]) {
     check_vimage(
         &vimage(129, 0, 1, 0xF, 12, 12, [0, 2, 4, 7, 10]),
-        BVH8_RSRC,
+        rsrc,
+        0,
         cases,
     );
 }
@@ -310,6 +339,25 @@ fn box4() -> Vec<u32> {
             [1.0, -1.0, -1.0, 2.0, 1.0, 1.0],
             [5.0, -1.0, -1.0, 6.0, 1.0, 1.0],
             [-2.0, -1.0, -1.0, -1.0, 1.0, 1.0],
+        ],
+    )
+}
+
+/// The same four boxes with child pointers of the case's own: the low three
+/// bits of a pointer are the type of the node it points at, which is what
+/// decides where the child sorts when triangles come first.
+fn box4_types(types: [u32; 4]) -> Vec<u32> {
+    let mut children = [0u32; 4];
+    for (i, child) in children.iter_mut().enumerate() {
+        *child = (0x10 * (i as u32 + 1)) | types[i];
+    }
+    box4_node(
+        children,
+        [
+            [1.0, -1.0, -1.0, 2.0, 1.0, 1.0],
+            [3.0, -1.0, -1.0, 4.0, 1.0, 1.0],
+            [5.0, -1.0, -1.0, 6.0, 1.0, 1.0],
+            [7.0, -1.0, -1.0, 8.0, 1.0, 1.0],
         ],
     )
 }
@@ -569,4 +617,187 @@ fn image_bvh8_intersect_ray_triangle() {
             ],
         }, // neither triangle hit, with the barycentrics of both kept
     ]);
+}
+
+#[test]
+fn image_bvh64_intersect_ray_resource_base() {
+    // The address of a node is the resource's base address plus the node
+    // pointer, so the same node is reached however the two are split. The node
+    // sits 512 bytes into the buffer, and the resource is based at its start,
+    // 256 bytes in, and at the node itself.
+    let mut node = vec![0u32; 128];
+    node.extend(box4_types([5, 5, 5, 5]));
+    let mut ray = ray64(5, 100.0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+    ray[0] = 512;
+    for origin in [0, 1, 2] {
+        bvh64_with(
+            BVH64_RSRC,
+            origin,
+            &[VimageCase {
+                node: node.clone(),
+                ray,
+                expected: [
+                    0x0000_0015, 0x0000_0025, 0x0000_0035, 0x0000_0045, 0, 0, 0, 0, 0, 0,
+                ],
+            }],
+        );
+    }
+}
+
+#[test]
+fn image_bvh64_intersect_ray_sorted_triangles_first() {
+    // With the resource asking for it, the children that point at triangle
+    // nodes come before the ones that point at boxes, each group in the order
+    // the ray reaches them. Table 65 calls types 0 to 3 the triangle ones; the
+    // part puts type 1 ahead of the other three as well.
+    let cases = |types: [u32; 4], expected: [u32; 4]| VimageCase {
+        node: box4_types(types),
+        ray: ray64(5, 100.0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+        expected: [expected[0], expected[1], expected[2], expected[3], 0, 0, 0, 0, 0, 0],
+    };
+
+    // Without it, the children come back in the order the ray reaches them
+    // whatever they point at.
+    bvh64(&[
+        cases([5, 0, 5, 0], [0x0000_0015, 0x0000_0020, 0x0000_0035, 0x0000_0040]),
+        cases([1, 0, 2, 5], [0x0000_0011, 0x0000_0020, 0x0000_0032, 0x0000_0045]),
+        cases([1, 1, 5, 0], [0x0000_0011, 0x0000_0021, 0x0000_0035, 0x0000_0040]),
+    ]);
+
+    bvh64_with(
+        BVH64_RSRC_TRIANGLES_FIRST,
+        0,
+        &[
+            cases([5, 0, 5, 0], [0x0000_0020, 0x0000_0040, 0x0000_0015, 0x0000_0035]),
+            cases([1, 0, 2, 5], [0x0000_0011, 0x0000_0020, 0x0000_0032, 0x0000_0045]),
+            cases([1, 1, 5, 0], [0x0000_0011, 0x0000_0021, 0x0000_0040, 0x0000_0035]),
+        ],
+    );
+}
+
+#[test]
+fn image_bvh8_intersect_ray_sorted_triangles_first() {
+    // The eight-wide instruction sorts its triangle children first too -- the
+    // part answers a node with nothing at all unless the resource asks for it
+    // -- and there it keeps them in the order the ray reaches them, whichever
+    // of the triangle types they name.
+    let children: Vec<Box8Child> = [5, 0, 5, 1, 5, 2, 5, 3]
+        .iter()
+        .enumerate()
+        .map(|(i, &node_type)| Box8Child {
+            min: [2 * i as u32 + 1, 0, 0],
+            max: [2 * i as u32 + 2, 100, 100],
+            node_type,
+            range: 1,
+            mask: 0xFF,
+        })
+        .collect();
+    bvh8(&[VimageCase {
+        node: box8_node(0x10, 0x20, [0.0, 0.0, 0.0], [139, 139, 139], &children),
+        ray: ray8(5, 100.0, 0xFF, [0.0, 5.0, 5.0], [1.0, 0.0, 0.0]),
+        expected: [
+            0x0000_0020, 0x0000_0031, 0x0000_0042, 0x0000_0053, 0x0000_0015, 0x0000_0025,
+            0x0000_0035, 0x0000_0045, 0xFFFF_FFFF, 0xFFFF_FFFF,
+        ],
+    }]);
+}
+
+#[test]
+fn image_bvh64_intersect_ray_unsorted() {
+    // With box sorting off the children come back in the order the node holds
+    // them, and a child the ray never reached keeps its place rather than
+    // going last. The boxes here run from the farthest to the nearest, so the
+    // two orders cannot be confused.
+    let node = |miss: &[usize]| {
+        let mut boxes = [[0.0f32; 6]; 4];
+        for (k, b) in boxes.iter_mut().enumerate() {
+            let near = 2.0 * (3 - k) as f32 + 1.0;
+            *b = if miss.contains(&k) {
+                // behind the ray, which is a miss
+                [-2.0 * k as f32 - 2.0, -1.0, -1.0, -2.0 * k as f32 - 1.0, 1.0, 1.0]
+            } else {
+                [near, -1.0, -1.0, near + 1.0, 1.0, 1.0]
+            };
+        }
+        box4_node([0x15, 0x25, 0x35, 0x45], boxes)
+    };
+    let ray = ray64(5, 100.0, [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+
+    bvh64_with(
+        BVH64_RSRC_UNSORTED,
+        0,
+        &[
+            VimageCase {
+                node: node(&[]),
+                ray,
+                expected: [0x0000_0015, 0x0000_0025, 0x0000_0035, 0x0000_0045, 0, 0, 0, 0, 0, 0],
+            }, // every child hit
+            VimageCase {
+                node: node(&[1]),
+                ray,
+                expected: [0x0000_0015, 0xFFFF_FFFF, 0x0000_0035, 0x0000_0045, 0, 0, 0, 0, 0, 0],
+            }, // the second child missed, and stays where it is
+            VimageCase {
+                node: node(&[0, 2]),
+                ray,
+                expected: [0xFFFF_FFFF, 0x0000_0025, 0xFFFF_FFFF, 0x0000_0045, 0, 0, 0, 0, 0, 0],
+            }, // two missed
+        ],
+    );
+
+    // The same nodes with sorting on, which is the order the other tests use.
+    bvh64(&[
+        VimageCase {
+            node: node(&[]),
+            ray,
+            expected: [0x0000_0045, 0x0000_0035, 0x0000_0025, 0x0000_0015, 0, 0, 0, 0, 0, 0],
+        },
+        VimageCase {
+            node: node(&[1]),
+            ray,
+            expected: [0x0000_0045, 0x0000_0035, 0x0000_0015, 0xFFFF_FFFF, 0, 0, 0, 0, 0, 0],
+        },
+        VimageCase {
+            node: node(&[0, 2]),
+            ray,
+            expected: [0x0000_0045, 0x0000_0025, 0xFFFF_FFFF, 0xFFFF_FFFF, 0, 0, 0, 0, 0, 0],
+        },
+    ]);
+}
+
+#[test]
+fn image_bvh8_intersect_ray_unsorted() {
+    // The eight-wide instruction leaves its children alone the same way. Its
+    // boxes run from the farthest to the nearest too.
+    let children: Vec<Box8Child> = (0..8)
+        .map(|i| Box8Child {
+            min: [2 * (7 - i) + 1, 0, 0],
+            max: [2 * (7 - i) + 2, 100, 100],
+            node_type: 5,
+            range: 1,
+            mask: 0xFF,
+        })
+        .collect();
+    let node = || box8_node(0x10, 0x20, [0.0, 0.0, 0.0], [139, 139, 139], &children);
+    let ray = ray8(5, 100.0, 0xFF, [0.0, 5.0, 5.0], [1.0, 0.0, 0.0]);
+
+    bvh8_with(
+        BVH8_RSRC_UNSORTED,
+        &[VimageCase {
+            node: node(),
+            ray,
+            expected: [
+                0x0000_0015, 0x0000_0025, 0x0000_0035, 0x0000_0045, 0x0000_0055, 0x0000_0065,
+                0x0000_0075, 0x0000_0085, 0xFFFF_FFFF, 0xFFFF_FFFF,
+            ],
+        }],
+    );
+    bvh8(&[VimageCase {
+        node: node(),
+        ray,
+        expected: [
+            0x0000_0085, 0x0000_0075, 0x0000_0065, 0x0000_0055, 0x0000_0045, 0x0000_0035,
+            0x0000_0025, 0x0000_0015, 0xFFFF_FFFF, 0xFFFF_FFFF,
+        ],
+    }]);
 }

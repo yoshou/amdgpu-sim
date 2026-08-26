@@ -3837,6 +3837,65 @@ impl Cg {
                 let slow = bb("bvh.general");
                 let join = bb("bvh.join");
 
+                // The resource names the base of the BVH in 256-byte units,
+                // and says whether the children that point at triangle nodes
+                // sort before the ones that point at boxes.
+                let base_hi = llvm::core::LLVMBuildShl(
+                    self.b,
+                    self.zext64s(llvm::core::LLVMBuildAnd(
+                        self.b,
+                        self.ld_sgpr32(i.rsrc as u32 + 1),
+                        self.ci32(0xFF),
+                        n,
+                    )),
+                    self.ci64(32),
+                    n,
+                );
+                let bvh_base = llvm::core::LLVMBuildShl(
+                    self.b,
+                    llvm::core::LLVMBuildOr(
+                        self.b,
+                        self.zext64s(self.ld_sgpr32(i.rsrc as u32)),
+                        base_hi,
+                        n,
+                    ),
+                    self.ci64(8),
+                    n,
+                );
+                let sorts_boxes = llvm::core::LLVMBuildICmp(
+                    self.b,
+                    LLVMIntNE,
+                    llvm::core::LLVMBuildAnd(
+                        self.b,
+                        llvm::core::LLVMBuildLShr(
+                            self.b,
+                            self.ld_sgpr32(i.rsrc as u32 + 1),
+                            self.ci32(31),
+                            n,
+                        ),
+                        self.ci32(1),
+                        n,
+                    ),
+                    self.ci32(0),
+                    n,
+                );
+                let sorts_triangles_first = llvm::core::LLVMBuildICmp(
+                    self.b,
+                    LLVMIntNE,
+                    llvm::core::LLVMBuildAnd(
+                        self.b,
+                        llvm::core::LLVMBuildLShr(
+                            self.b,
+                            self.ld_sgpr32(i.rsrc as u32 + 1),
+                            self.ci32(20),
+                            n,
+                        ),
+                        self.ci32(1),
+                        n,
+                    ),
+                    self.ci32(0),
+                    n,
+                );
                 let addr = self.ld_vgpr64(i.vaddr0 as u32);
                 let extent = self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32));
                 let origin: Vec<LLVMValueRef> = (0..3)
@@ -3898,10 +3957,25 @@ impl Cg {
                     self.ci32(0),
                     n,
                 );
+                // The inline path sorts the children by the time the ray
+                // reaches them and nothing else, which is what a resource that
+                // sorts its boxes and leaves triangle nodes where they are
+                // asks for; the helper knows the rest of Table 65.
+                let plainly_sorted = llvm::core::LLVMBuildAnd(
+                    self.b,
+                    sorts_boxes,
+                    llvm::core::LLVMBuildNot(self.b, sorts_triangles_first, n),
+                    n,
+                );
                 let take = llvm::core::LLVMBuildAnd(
                     self.b,
-                    llvm::core::LLVMBuildAnd(self.b, uniform, known, n),
-                    any_active,
+                    llvm::core::LLVMBuildAnd(
+                        self.b,
+                        llvm::core::LLVMBuildAnd(self.b, uniform, known, n),
+                        any_active,
+                        n,
+                    ),
+                    plainly_sorted,
                     n,
                 );
                 llvm::core::LLVMBuildCondBr(self.b, take, uni_bb, slow);
@@ -3910,10 +3984,15 @@ impl Cg {
 
                 // ---- every active lane at the same box node ----------------
                 llvm::core::LLVMPositionBuilderAtEnd(self.b, fast);
-                let node_ptr = llvm::core::LLVMBuildShl(
+                let node_ptr = llvm::core::LLVMBuildAdd(
                     self.b,
-                    llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(!0x7u64), n),
-                    self.ci64(3),
+                    bvh_base,
+                    llvm::core::LLVMBuildShl(
+                        self.b,
+                        llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(!0x7u64), n),
+                        self.ci64(3),
+                        n,
+                    ),
                     n,
                 );
                 // Box4Node: child_index[4], then aabb[4] of { min[3], max[3] }.
@@ -4010,10 +4089,15 @@ impl Cg {
 
                 // ---- every active lane at the same triangle-pair node ------
                 llvm::core::LLVMPositionBuilderAtEnd(self.b, tri_bb);
-                let tnode = llvm::core::LLVMBuildShl(
+                let tnode = llvm::core::LLVMBuildAdd(
                     self.b,
-                    llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(!0x7u64), n),
-                    self.ci64(3),
+                    bvh_base,
+                    llvm::core::LLVMBuildShl(
+                        self.b,
+                        llvm::core::LLVMBuildAnd(self.b, rep, self.ci64(!0x7u64), n),
+                        self.ci64(3),
+                        n,
+                    ),
                     n,
                 );
                 let tfield = |off: u64, ty: LLVMTypeRef| -> LLVMValueRef {
@@ -4175,8 +4259,14 @@ impl Cg {
                 self.call(
                     "image_bvh64_intersect_ray_packet",
                     llvm::core::LLVMVoidTypeInContext(self.ctx),
-                    &[self.ptr, self.i32t, self.i32t],
-                    &[self.bvh_packet, self.ci32(self.w), self.ld_sgpr32(EXEC)],
+                    &[self.ptr, self.i32t, self.i32t, self.i32t, self.i32t],
+                    &[
+                        self.bvh_packet,
+                        self.ci32(self.w),
+                        self.ld_sgpr32(EXEC),
+                        self.ld_sgpr32(i.rsrc as u32),
+                        self.ld_sgpr32(i.rsrc as u32 + 1),
+                    ],
                 );
                 let slow_res: Vec<LLVMValueRef> = (0..4)
                     .map(|k| {

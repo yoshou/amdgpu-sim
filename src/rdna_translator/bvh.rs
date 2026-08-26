@@ -140,6 +140,61 @@ pub struct Aabb {
     pub max: [f32; 3],
 }
 
+/// Where a child pointer sorts when the resource asks for triangle nodes to
+/// come first. Table 65 puts them before the box nodes -- types 0 to 3 for the
+/// four-wide instructions -- and the part puts type 1 before the other three
+/// as well.
+fn box4_child_rank(node_type: u32) -> u32 {
+    match node_type {
+        1 => 0,
+        0 | 2 | 3 => 1,
+        _ => 2,
+    }
+}
+
+/// The same for the eight-wide instruction, whose triangle nodes are the
+/// packet types and which keeps them in the order the ray reaches them.
+fn box8_child_rank(node_type: u32) -> u32 {
+    match node_type {
+        0..=3 | 8..=11 => 0,
+        _ => 1,
+    }
+}
+
+/// Whether the child `b` belongs before the child `a` when the resource sorts
+/// its boxes and nothing else: one the ray never reached goes last, and the
+/// rest go by the time the ray enters them.
+fn closer_than(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
+    (b.0 != 0xFFFF_FFFF && b.2 < a.2) || a.0 == 0xFFFF_FFFF
+}
+
+/// The network the part sorts its four children with.
+const BOX4_NETWORK: [(usize, usize); 5] = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
+
+/// Whether the child `b` belongs before the child `a`: one the ray never
+/// reached goes last, and the rest go by rank and then by the time the ray
+/// enters them. Each child is its pointer, its rank and that time.
+fn sorts_before(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
+    (b.0 != 0xFFFF_FFFF && (b.1 < a.1 || (b.1 == a.1 && b.2 < a.2))) || a.0 == 0xFFFF_FFFF
+}
+
+/// The base of the BVH the resource names, which the node pointers count from.
+/// Table 65 gives it in 256-byte units.
+fn bvh_base_addr(r0: u32, r1: u32) -> u64 {
+    ((((r1 as u64) & 0xFF) << 32) | (r0 as u64)) << 8
+}
+
+/// Whether the resource asks for triangle nodes to be sorted first.
+fn bvh_sorts_triangles_first(r1: u32) -> bool {
+    (r1 >> 20) & 1 != 0
+}
+
+/// Whether it asks for the children to be sorted at all. Without it they come
+/// back in the order the node holds them.
+fn bvh_sorts_boxes(r1: u32) -> bool {
+    (r1 >> 31) & 1 != 0
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct Box4Node {
@@ -343,6 +398,8 @@ pub extern "C" fn image_bvh64_intersect_ray(
     result1_ptr: *mut u32,
     result2_ptr: *mut u32,
     result3_ptr: *mut u32,
+    r0: u32,
+    r1: u32,
     node_addr: u64,
     ray_extent: f32,
     ray_origin_x: f32,
@@ -355,64 +412,64 @@ pub extern "C" fn image_bvh64_intersect_ray(
     ray_inv_dir_y: f32,
     ray_inv_dir_z: f32,
 ) {
+    let base_addr = bvh_base_addr(r0, r1);
+    let sort_triangles_first = bvh_sorts_triangles_first(r1);
+    let box_sort = bvh_sorts_boxes(r1);
     let node_type = (node_addr & 0x7) as u8;
     match node_type {
         5 => {
-            let node_ptr = (node_addr & !0x7u64) << 3;
+            let node_ptr = base_addr + ((node_addr & !0x7u64) << 3);
             let node = unsafe { *(node_ptr as *const Box4Node) };
 
-            let (mut t0, t1) = intersect4(
+            let (t0, t1) = intersect4(
                 [ray_origin_x, ray_origin_y, ray_origin_z],
                 [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
                 &node.aabb,
                 ray_extent,
             );
 
-            let result0 = if t0[0] <= t1[0] {
-                node.child_index[0]
-            } else {
-                0xFFFF_FFFF
-            };
-            let result1 = if t0[1] <= t1[1] {
-                node.child_index[1]
-            } else {
-                0xFFFF_FFFF
-            };
-            let result2 = if t0[2] <= t1[2] {
-                node.child_index[2]
-            } else {
-                0xFFFF_FFFF
-            };
-            let result3 = if t0[3] <= t1[3] {
-                node.child_index[3]
-            } else {
-                0xFFFF_FFFF
-            };
+            let mut children = [(0u32, 0u32, 0.0f32); 4];
+            for (i, child) in children.iter_mut().enumerate() {
+                let index = node.child_index[i];
+                let rank = if sort_triangles_first {
+                    box4_child_rank(index & 7)
+                } else {
+                    0
+                };
+                *child = (
+                    if t0[i] <= t1[i] { index } else { 0xFFFF_FFFF },
+                    rank,
+                    t0[i],
+                );
+            }
 
-            let mut child = [result0, result1, result2, result3];
-            let sort = |child: &mut [u32; 4], dist: &mut [f32; 4], a: usize, b: usize| {
-                if (child[b] != 0xFFFF_FFFF && dist[b] < dist[a]) || child[a] == 0xFFFF_FFFF {
-                    child.swap(a, b);
-                    dist.swap(a, b);
+            // The children are sorted only if the resource asks for it;
+            // otherwise they come back in the order the node holds them.
+            // Ranking them is work the common case does not need, so the two
+            // orders have a pass each.
+            if box_sort && sort_triangles_first {
+                for (a, b) in BOX4_NETWORK {
+                    if sorts_before(children[b], children[a]) {
+                        children.swap(a, b);
+                    }
                 }
-            };
-
-            sort(&mut child, &mut t0, 0, 2);
-            sort(&mut child, &mut t0, 1, 3);
-            sort(&mut child, &mut t0, 0, 1);
-            sort(&mut child, &mut t0, 2, 3);
-            sort(&mut child, &mut t0, 1, 2);
-            let [result0, result1, result2, result3] = child;
+            } else if box_sort {
+                for (a, b) in BOX4_NETWORK {
+                    if closer_than(children[b], children[a]) {
+                        children.swap(a, b);
+                    }
+                }
+            }
 
             unsafe {
-                *result0_ptr = result0;
-                *result1_ptr = result1;
-                *result2_ptr = result2;
-                *result3_ptr = result3;
+                *result0_ptr = children[0].0;
+                *result1_ptr = children[1].0;
+                *result2_ptr = children[2].0;
+                *result3_ptr = children[3].0;
             }
         }
         0 | 1 => {
-            let node_ptr = (node_addr & !(0x7u64)) << 3;
+            let node_ptr = base_addr + ((node_addr & !(0x7u64)) << 3);
             let node = unsafe { *(node_ptr as *const TrianglePairNode) };
             let tri = if node_type & 1 == 0 {
                 [node.tri_pair.v0, node.tri_pair.v1, node.tri_pair.v2]
@@ -470,6 +527,8 @@ pub extern "C" fn image_bvh64_intersect_ray_packet(
     packet: *mut BvhRayPacket,
     lane_count: u32,
     active_mask: u32,
+    r0: u32,
+    r1: u32,
 ) {
     assert!(lane_count as usize <= BVH_RAY_PACKET_LANES);
     let packet = unsafe { &mut *packet };
@@ -486,6 +545,8 @@ pub extern "C" fn image_bvh64_intersect_ray_packet(
             &mut packet.result1[lane],
             &mut packet.result2[lane],
             &mut packet.result3[lane],
+            r0,
+            r1,
             packet.node_addr[lane],
             packet.ray_extent[lane],
             packet.ray_origin_x[lane],
@@ -771,6 +832,8 @@ pub extern "C" fn image_bvh8_intersect_ray(
     result7_ptr: *mut u32,
     result8_ptr: *mut u32,
     result9_ptr: *mut u32,
+    r0: u32,
+    r1: u32,
     node_base: u64,
     ray_extent: f32,
     instance_mask: u32,
@@ -782,7 +845,9 @@ pub extern "C" fn image_bvh8_intersect_ray(
     ray_dir_z: f32,
     node_index: u32,
 ) {
-    let node_ptr = (node_base + (node_index & !0xF) as u64) << 3;
+    let node_ptr = bvh_base_addr(r0, r1) + ((node_base + (node_index & !0xF) as u64) << 3);
+    let sort_triangles_first = bvh_sorts_triangles_first(r1);
+    let box_sort = bvh_sorts_boxes(r1);
     let node_type = (node_index & 0xF) as u8;
     match node_type {
         0..3 | 8..11 => {
@@ -845,7 +910,7 @@ pub extern "C" fn image_bvh8_intersect_ray(
             let results = (0..8)
                 .map(|i| {
                     if i >= child_count {
-                        return (0xFFFF_FFFFu32, f32::INFINITY);
+                        return (0xFFFF_FFFF, 0, f32::INFINITY);
                     }
                     let (t0, t1) = intersect(
                         [ray_origin_x, ray_origin_y, ray_origin_z],
@@ -859,21 +924,35 @@ pub extern "C" fn image_bvh8_intersect_ray(
                     } else {
                         0xFFFF_FFFF
                     };
-                    (index, t0)
-                })
-                .collect::<Vec<(u32, f32)>>();
-
-            let results = results
-                .into_iter()
-                .sorted_by(|&(_idx_a, dist_a), &(_idx_b, dist_b)| {
-                    if (_idx_b != 0xFFFF_FFFF && dist_b < dist_a) || _idx_a == 0xFFFF_FFFF {
-                        std::cmp::Ordering::Greater
+                    let rank = if sort_triangles_first {
+                        box8_child_rank(node.get_child_type(i) as u32)
                     } else {
-                        std::cmp::Ordering::Less
-                    }
+                        0
+                    };
+                    (index, rank, t0)
                 })
-                .map(|(idx, _)| idx)
-                .collect::<Vec<u32>>();
+                .collect::<Vec<(u32, u32, f32)>>();
+
+            // The children come back sorted only if the resource asks for
+            // it; otherwise in the order the node holds them.
+            let results = if box_sort {
+                results
+                    .into_iter()
+                    .sorted_by(|&a, &b| {
+                        if sorts_before(b, a) {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    })
+                    .map(|(index, _, _)| index)
+                    .collect::<Vec<u32>>()
+            } else {
+                results
+                    .into_iter()
+                    .map(|(index, _, _)| index)
+                    .collect::<Vec<u32>>()
+            };
 
             unsafe {
                 *result0_ptr = results[0];

@@ -5020,8 +5020,8 @@ impl IREmitter {
                         );
 
                         let mut param_tys = vec![
-                            ty_p0, ty_p0, ty_p0, ty_p0, ty_i64, ty_f32, ty_f32, ty_f32, ty_f32,
-                            ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
+                            ty_p0, ty_p0, ty_p0, ty_p0, ty_i32, ty_i32, ty_i64, ty_f32, ty_f32,
+                            ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
                         ];
                         let image_bvh64_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                             ty_void,
@@ -5068,6 +5068,10 @@ impl IREmitter {
                                 results_ptr[1],
                                 results_ptr[2],
                                 results_ptr[3],
+                                // The resource, which names where the BVH is
+                                // and how its children are sorted.
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32),
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32 + 1),
                                 node_addr,
                                 ray_extent,
                                 ray_origin_x,
@@ -5148,8 +5152,8 @@ impl IREmitter {
                         );
 
                         let mut param_tys = vec![
-                            ty_p0, ty_p0, ty_p0, ty_p0, ty_i64, ty_f32, ty_f32, ty_f32, ty_f32,
-                            ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
+                            ty_p0, ty_p0, ty_p0, ty_p0, ty_i32, ty_i32, ty_i64, ty_f32, ty_f32,
+                            ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
                         ];
                         let image_bvh64_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                             ty_void,
@@ -5196,6 +5200,10 @@ impl IREmitter {
                                 results_ptr[1],
                                 results_ptr[2],
                                 results_ptr[3],
+                                // The resource, which names where the BVH is
+                                // and how its children are sorted.
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32),
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32 + 1),
                                 node_addr,
                                 ray_extent,
                                 ray_origin_x,
@@ -5389,8 +5397,8 @@ impl IREmitter {
 
                         let mut param_tys = vec![
                             ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0,
-                            ty_i64, ty_f32, ty_i32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
-                            ty_i32,
+                            ty_i32, ty_i32, ty_i64, ty_f32, ty_i32, ty_f32, ty_f32, ty_f32, ty_f32,
+                            ty_f32, ty_f32, ty_i32,
                         ];
                         let image_bvh8_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                             ty_void,
@@ -5443,6 +5451,10 @@ impl IREmitter {
                                 results_ptr[7],
                                 results_ptr[8],
                                 results_ptr[9],
+                                // The resource, which names where the BVH is
+                                // and how its children are sorted.
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32),
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32 + 1),
                                 node_base,
                                 ray_extent,
                                 instance_mask,
@@ -5522,8 +5534,8 @@ impl IREmitter {
 
                         let mut param_tys = vec![
                             ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0, ty_p0,
-                            ty_i64, ty_f32, ty_i32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32, ty_f32,
-                            ty_i32,
+                            ty_i32, ty_i32, ty_i64, ty_f32, ty_i32, ty_f32, ty_f32, ty_f32, ty_f32,
+                            ty_f32, ty_f32, ty_i32,
                         ];
                         let image_bvh8_intersect_ray_func_ty = llvm::core::LLVMFunctionType(
                             ty_void,
@@ -5576,6 +5588,10 @@ impl IREmitter {
                                 results_ptr[7],
                                 results_ptr[8],
                                 results_ptr[9],
+                                // The resource, which names where the BVH is
+                                // and how its children are sorted.
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32),
+                                emitter.emit_load_sgpr_u32(inst.rsrc as u32 + 1),
                                 node_base,
                                 ray_extent,
                                 instance_mask,

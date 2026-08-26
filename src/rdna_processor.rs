@@ -819,6 +819,44 @@ pub struct Aabb {
     pub max: [f32; 3],
 }
 
+/// Where a child pointer sorts when the resource asks for triangle nodes to
+/// come first. Table 65 puts them before the box nodes -- types 0 to 3 for the
+/// four-wide instructions -- and the part puts type 1 before the other three
+/// as well.
+fn box4_child_rank(node_type: u32) -> u32 {
+    match node_type {
+        1 => 0,
+        0 | 2 | 3 => 1,
+        _ => 2,
+    }
+}
+
+/// The same for the eight-wide instruction, whose triangle nodes are the
+/// packet types and which keeps them in the order the ray reaches them.
+fn box8_child_rank(node_type: u32) -> u32 {
+    match node_type {
+        0..=3 | 8..=11 => 0,
+        _ => 1,
+    }
+}
+
+/// Whether the child `b` belongs before the child `a` when the resource sorts
+/// its boxes and nothing else: one the ray never reached goes last, and the
+/// rest go by the time the ray enters them.
+fn closer_than(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
+    (b.0 != 0xFFFF_FFFF && b.2 < a.2) || a.0 == 0xFFFF_FFFF
+}
+
+/// The network the part sorts its four children with.
+const BOX4_NETWORK: [(usize, usize); 5] = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
+
+/// Whether the child `b` belongs before the child `a`: one the ray never
+/// reached goes last, and the rest go by rank and then by the time the ray
+/// enters them. Each child is its pointer, its rank and that time.
+fn sorts_before(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
+    (b.0 != 0xFFFF_FFFF && (b.1 < a.1 || (b.1 == a.1 && b.2 < a.2))) || a.0 == 0xFFFF_FFFF
+}
+
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
 pub struct Box4Node {
@@ -14928,7 +14966,11 @@ impl SIMD32 {
         let s1_value = self.read_sgpr(s + 1);
         let _s2_value = self.read_sgpr(s + 2);
         let _s3_value = self.read_sgpr(s + 3);
-        let _base_addr = (((s1_value as u64) << 32) | (s0_value as u64)) & ((1u64 << 48) - 1);
+        // The resource holds the base of the BVH in 256-byte units, and the
+        // node pointer counts from there in eight-byte ones.
+        let base_addr = ((((s1_value as u64) & 0xFF) << 32) | (s0_value as u64)) << 8;
+        let sort_triangles_first = (s1_value >> 20) & 1 != 0;
+        let box_sort = (s1_value >> 31) & 1 != 0;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
@@ -14937,7 +14979,7 @@ impl SIMD32 {
             let node_type = (node_ptr & 0x7) as u8;
             match node_type {
                 5 => {
-                    let node_ptr = (node_ptr & !0x7u64) << 3;
+                    let node_ptr = base_addr + ((node_ptr & !0x7u64) << 3);
                     let node = unsafe { *(node_ptr as *const Box4Node) };
                     let ray_extent = u32_to_f32(self.read_vgpr(elem, vaddr1));
                     let ray_origin_x = u32_to_f32(self.read_vgpr(elem, vaddr2));
@@ -14947,81 +14989,47 @@ impl SIMD32 {
                     let ray_inv_dir_y = u32_to_f32(self.read_vgpr(elem, vaddr4 + 1));
                     let ray_inv_dir_z = u32_to_f32(self.read_vgpr(elem, vaddr4 + 2));
 
-                    let mut s0 = intersect(
-                        [ray_origin_x, ray_origin_y, ray_origin_z],
-                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                        &node.aabb[0],
-                        ray_extent,
-                    );
-                    let mut s1 = intersect(
-                        [ray_origin_x, ray_origin_y, ray_origin_z],
-                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                        &node.aabb[1],
-                        ray_extent,
-                    );
-                    let mut s2 = intersect(
-                        [ray_origin_x, ray_origin_y, ray_origin_z],
-                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                        &node.aabb[2],
-                        ray_extent,
-                    );
-                    let mut s3 = intersect(
-                        [ray_origin_x, ray_origin_y, ray_origin_z],
-                        [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
-                        &node.aabb[3],
-                        ray_extent,
-                    );
+                    let mut children = [(0u32, 0u32, 0.0f32); 4];
+                    for (i, child) in children.iter_mut().enumerate() {
+                        let (t0, t1) = intersect(
+                            [ray_origin_x, ray_origin_y, ray_origin_z],
+                            [ray_inv_dir_x, ray_inv_dir_y, ray_inv_dir_z],
+                            &node.aabb[i],
+                            ray_extent,
+                        );
+                        let index = node.child_index[i];
+                        let rank = if sort_triangles_first {
+                            box4_child_rank(index & 7)
+                        } else {
+                            0
+                        };
+                        *child = (if t0 <= t1 { index } else { 0xFFFF_FFFF }, rank, t0);
+                    }
 
-                    let mut result0 = if s0.0 <= s0.1 {
-                        node.child_index[0]
-                    } else {
-                        0xFFFF_FFFF
-                    };
-                    let mut result1 = if s1.0 <= s1.1 {
-                        node.child_index[1]
-                    } else {
-                        0xFFFF_FFFF
-                    };
-                    let mut result2 = if s2.0 <= s2.1 {
-                        node.child_index[2]
-                    } else {
-                        0xFFFF_FFFF
-                    };
-                    let mut result3 = if s3.0 <= s3.1 {
-                        node.child_index[3]
-                    } else {
-                        0xFFFF_FFFF
-                    };
-
-                    let sort = |child_index_a: &mut u32,
-                                child_index_b: &mut u32,
-                                dist_a: &mut f32,
-                                dist_b: &mut f32| {
-                        if (*child_index_b != 0xFFFF_FFFF && dist_b < dist_a)
-                            || *child_index_a == 0xFFFF_FFFF
-                        {
-                            let t0 = *dist_a;
-                            let t1 = *child_index_a;
-                            *child_index_a = *child_index_b;
-                            *dist_a = *dist_b;
-                            *child_index_b = t1;
-                            *dist_b = t0;
+                    // The children are sorted only if the resource asks for
+                    // it; otherwise they come back in the order the node holds
+                    // them. Ranking them is work the common case does not
+                    // need, so the two orders have a pass each.
+                    if box_sort && sort_triangles_first {
+                        for (a, b) in BOX4_NETWORK {
+                            if sorts_before(children[b], children[a]) {
+                                children.swap(a, b);
+                            }
                         }
-                    };
+                    } else if box_sort {
+                        for (a, b) in BOX4_NETWORK {
+                            if closer_than(children[b], children[a]) {
+                                children.swap(a, b);
+                            }
+                        }
+                    }
 
-                    sort(&mut result0, &mut result2, &mut s0.0, &mut s2.0);
-                    sort(&mut result1, &mut result3, &mut s1.0, &mut s3.0);
-                    sort(&mut result0, &mut result1, &mut s0.0, &mut s1.0);
-                    sort(&mut result2, &mut result3, &mut s2.0, &mut s3.0);
-                    sort(&mut result1, &mut result2, &mut s1.0, &mut s2.0);
-
-                    self.write_vgpr(elem, vdata, result0);
-                    self.write_vgpr(elem, vdata + 1, result1);
-                    self.write_vgpr(elem, vdata + 2, result2);
-                    self.write_vgpr(elem, vdata + 3, result3);
+                    for (i, child) in children.iter().enumerate() {
+                        self.write_vgpr(elem, vdata + i, child.0);
+                    }
                 }
                 0 | 1 => {
-                    let node_ptr = (node_ptr & !(0x7u64)) << 3;
+                    let node_ptr = base_addr + ((node_ptr & !(0x7u64)) << 3);
                     let node = unsafe { *(node_ptr as *const TrianglePairNode) };
                     let tri = if node_type & 1 == 0 {
                         [node.tri_pair.v0, node.tri_pair.v1, node.tri_pair.v2]
@@ -15072,14 +15080,18 @@ impl SIMD32 {
         let s1_value = self.read_sgpr(s + 1);
         let _s2_value = self.read_sgpr(s + 2);
         let _s3_value = self.read_sgpr(s + 3);
-        let _base_addr = (((s1_value as u64) << 32) | (s0_value as u64)) & ((1u64 << 48) - 1);
+        // The resource holds the base of the BVH in 256-byte units, and the
+        // node base and offset count from there in eight-byte ones.
+        let base_addr = ((((s1_value as u64) & 0xFF) << 32) | (s0_value as u64)) << 8;
+        let sort_triangles_first = (s1_value >> 20) & 1 != 0;
+        let box_sort = (s1_value >> 31) & 1 != 0;
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
             let node_base = self.read_vgpr_pair(elem, vaddr0);
             let node_index = self.read_vgpr(elem, vaddr4);
-            let node_ptr = (node_base + (node_index & !0xF) as u64) << 3;
+            let node_ptr = base_addr + ((node_base + (node_index & !0xF) as u64) << 3);
             let node_type = (node_index & 0xF) as u8;
             match node_type {
                 0..3 | 8..11 => {
@@ -15155,7 +15167,7 @@ impl SIMD32 {
                     let results = (0..8)
                         .map(|i| {
                             if i >= child_count {
-                                return (0xFFFF_FFFFu32, f32::INFINITY);
+                                return (0xFFFF_FFFF, 0, f32::INFINITY);
                             }
                             let (t0, t1) = intersect(
                                 [ray_origin_x, ray_origin_y, ray_origin_z],
@@ -15169,21 +15181,35 @@ impl SIMD32 {
                             } else {
                                 0xFFFF_FFFF
                             };
-                            (index, t0)
-                        })
-                        .collect::<Vec<(u32, f32)>>();
-
-                    let results = results
-                        .into_iter()
-                        .sorted_by(|&(_idx_a, dist_a), &(_idx_b, dist_b)| {
-                            if (_idx_b != 0xFFFF_FFFF && dist_b < dist_a) || _idx_a == 0xFFFF_FFFF {
-                                std::cmp::Ordering::Greater
+                            let rank = if sort_triangles_first {
+                                box8_child_rank(node.get_child_type(i) as u32)
                             } else {
-                                std::cmp::Ordering::Less
-                            }
+                                0
+                            };
+                            (index, rank, t0)
                         })
-                        .map(|(idx, _)| idx)
-                        .collect::<Vec<u32>>();
+                        .collect::<Vec<(u32, u32, f32)>>();
+
+                    // The children come back sorted only if the resource asks for
+                    // it; otherwise in the order the node holds them.
+                    let results = if box_sort {
+                        results
+                            .into_iter()
+                            .sorted_by(|&a, &b| {
+                                if sorts_before(b, a) {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            })
+                            .map(|(index, _, _)| index)
+                            .collect::<Vec<u32>>()
+                    } else {
+                        results
+                            .into_iter()
+                            .map(|(index, _, _)| index)
+                            .collect::<Vec<u32>>()
+                    };
 
                     for i in 0..8 {
                         self.write_vgpr(elem, vdata + i as usize, results[i as usize]);

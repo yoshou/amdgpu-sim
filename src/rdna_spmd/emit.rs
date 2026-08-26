@@ -2302,12 +2302,15 @@ impl Cg {
             I::IMAGE_BVH64_INTERSECT_RAY => {
                 let node_addr = self.ld_vgpr64(i.vaddr0 as u32);
                 let params = [
-                    self.ptr, self.ptr, self.ptr, self.ptr, self.i64t,
+                    self.ptr, self.ptr, self.ptr, self.ptr, self.i32t, self.i32t, self.i64t,
                     self.f32t, self.f32t, self.f32t, self.f32t,
                     self.f32t, self.f32t, self.f32t, self.f32t, self.f32t, self.f32t,
                 ];
                 let args = [
                     scratch_ptr(0), scratch_ptr(1), scratch_ptr(2), scratch_ptr(3),
+                    // The resource, which names where the BVH is and how its
+                    // children are sorted.
+                    self.ld_sgpr32(i.rsrc as u32), self.ld_sgpr32(i.rsrc as u32 + 1),
                     node_addr,
                     bits_to_f32(i.vaddr1 as u32),
                     bits_to_f32(i.vaddr2 as u32), bits_to_f32(i.vaddr2 as u32 + 1), bits_to_f32(i.vaddr2 as u32 + 2),

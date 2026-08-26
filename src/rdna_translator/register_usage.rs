@@ -2856,6 +2856,10 @@ impl RDNATranslator {
             },
             InstFormat::VIMAGE(inst) => match inst.op {
                 I::IMAGE_BVH64_INTERSECT_RAY => {
+                    // The two words of the resource that carry the base of the
+                    // BVH and how its children are sorted.
+                    reg_usage.use_sgpr_u32(inst.rsrc as u32);
+                    reg_usage.use_sgpr_u32(inst.rsrc as u32 + 1);
                     reg_usage.use_vgpr_u64(inst.vaddr0 as u32);
                     reg_usage.use_vgpr_f32(inst.vaddr1 as u32);
                     for i in 0..3 {
@@ -2872,6 +2876,10 @@ impl RDNATranslator {
                     }
                 }
                 I::IMAGE_BVH8_INTERSECT_RAY => {
+                    // The two words of the resource that carry the base of the
+                    // BVH and how its children are sorted.
+                    reg_usage.use_sgpr_u32(inst.rsrc as u32);
+                    reg_usage.use_sgpr_u32(inst.rsrc as u32 + 1);
                     reg_usage.use_vgpr_u64(inst.vaddr0 as u32);
                     reg_usage.use_vgpr_f32(inst.vaddr1 as u32);
                     reg_usage.use_vgpr_u32(inst.vaddr1 as u32 + 1);
