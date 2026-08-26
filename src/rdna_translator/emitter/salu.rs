@@ -190,8 +190,7 @@ impl IREmitter {
                     let ptr =
                         llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
 
-                    let data =
-                        llvm::core::LLVMBuildLoad2(builder, ty_i8, ptr, empty_name.as_ptr());
+                    let data = llvm::core::LLVMBuildLoad2(builder, ty_i8, ptr, empty_name.as_ptr());
 
                     let data =
                         llvm::core::LLVMBuildZExt(builder, data, ty_i32, empty_name.as_ptr());
@@ -217,8 +216,7 @@ impl IREmitter {
                     let ptr =
                         llvm::core::LLVMBuildIntToPtr(builder, addr, ty_p0, empty_name.as_ptr());
 
-                    let data =
-                        llvm::core::LLVMBuildLoad2(builder, ty_i8, ptr, empty_name.as_ptr());
+                    let data = llvm::core::LLVMBuildLoad2(builder, ty_i8, ptr, empty_name.as_ptr());
 
                     let data =
                         llvm::core::LLVMBuildSExt(builder, data, ty_i32, empty_name.as_ptr());

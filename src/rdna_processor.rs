@@ -4131,14 +4131,7 @@ impl SIMD32 {
         }
     }
 
-    fn v_mul_hi_u32(
-        &mut self,
-        d: usize,
-        s0: SourceOperand,
-        s1: SourceOperand,
-        abs: u8,
-        neg: u8,
-    ) {
+    fn v_mul_hi_u32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, abs: u8, neg: u8) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
@@ -4421,14 +4414,7 @@ impl SIMD32 {
     }
 
     /// The population count of S0, added to S1.
-    fn v_bcnt_u32_b32(
-        &mut self,
-        d: usize,
-        s0: SourceOperand,
-        s1: SourceOperand,
-        abs: u8,
-        neg: u8,
-    ) {
+    fn v_bcnt_u32_b32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand, abs: u8, neg: u8) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
