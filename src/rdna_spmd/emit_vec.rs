@@ -115,42 +115,137 @@ fn normal_pow2_cndmask_def(inst: &InstFormat) -> Option<u32> {
         .then_some(i.vdst as u32)
 }
 
+/// The VGPRs an instruction writes, or `None` for a form this file does not
+/// model. Used to tell whether an instruction standing between two steps of the
+/// idiom leaves the registers it carries alone, so a destination is taken to
+/// cover the pair a 64-bit result would.
+fn valu_written_vgprs(inst: &InstFormat) -> Option<Vec<u32>> {
+    let pair = |vdst: u32| vec![vdst, vdst + 1];
+    match inst {
+        InstFormat::VOP1(i) => Some(pair(i.vdst as u32)),
+        InstFormat::VOP2(i) => Some(pair(i.vdst as u32)),
+        InstFormat::VOP3(i) => Some(pair(i.vdst as u32)),
+        InstFormat::VOP3SD(i) => Some(pair(i.vdst as u32)),
+        // A compare writes the SGPR it names, and no VGPR.
+        InstFormat::VOPC(_) => Some(Vec::new()),
+        InstFormat::VOPD(i) => {
+            // The Y half's real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1), the
+            // opposite parity of X, rather than vdsty itself.
+            let y = ((i.vdsty as u32) << 1) | (((i.vdstx as u32) & 1) ^ 1);
+            let mut written = pair(i.vdstx as u32);
+            written.extend(pair(y));
+            Some(written)
+        }
+        _ => None,
+    }
+}
+
+/// The next instruction at or after `from` that `matches`, provided every
+/// instruction before it leaves `live` alone. Anything else ends the search:
+/// the idiom's steps have to reach each other through registers no one else
+/// wrote.
+fn find_step(
+    body: &[InstFormat],
+    from: usize,
+    live: &[u32],
+    matches: impl Fn(&InstFormat) -> bool,
+) -> Option<usize> {
+    for (offset, inst) in body[from..].iter().enumerate() {
+        if matches(inst) {
+            return Some(from + offset);
+        }
+        let written = valu_written_vgprs(inst)?;
+        if written.iter().any(|reg| live.contains(reg)) {
+            return None;
+        }
+    }
+    None
+}
+
+fn ldexp_f64_with_exponent(inst: &InstFormat, exponent: u32) -> bool {
+    let InstFormat::VOP3(i) = inst else { return false };
+    matches!(i.op, I::V_LDEXP_F64)
+        && matches!(i.src1, SourceOperand::VectorRegister(r) if r as u32 == exponent)
+}
+
 /// Recognize the object-level normalization idiom
 /// `scale -> sqrt -> refine -> classify -> rescale`.  Returning instruction
 /// indices keeps the profitability decision local to the complete idiom rather
 /// than expanding every individually-safe LDEXP in the object.
+///
+/// The steps need not be adjacent: an unrelated expansion the compiler
+/// interleaved is allowed between them, as long as it leaves the registers the
+/// idiom carries alone.
+fn normal_sqrt_ldexp_pairs(body: &[InstFormat]) -> Vec<(usize, usize)> {
+    let mut pairs = Vec::new();
+    for start in 0..body.len() {
+        let Some(first_exp) = normal_pow2_cndmask_def(&body[start]) else {
+            continue;
+        };
+
+        let Some(i_scale) = find_step(body, start + 1, &[first_exp], |inst| {
+            ldexp_f64_with_exponent(inst, first_exp)
+        }) else {
+            continue;
+        };
+        let InstFormat::VOP3(first_scale) = &body[i_scale] else {
+            continue;
+        };
+        let scaled = first_scale.vdst as u32;
+
+        let Some(i_sqrt) = find_step(body, i_scale + 1, &[scaled, scaled + 1], |inst| {
+            matches!(inst, InstFormat::VOP1(i)
+                if matches!(i.op, I::V_SQRT_F64)
+                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst))
+        }) else {
+            continue;
+        };
+        let InstFormat::VOP1(sqrt) = &body[i_sqrt] else {
+            continue;
+        };
+        let root = sqrt.vdst as u32;
+
+        let live = [scaled, scaled + 1, root, root + 1];
+        let Some(i_second_exp) = find_step(body, i_sqrt + 1, &live, |inst| {
+            normal_pow2_cndmask_def(inst).is_some()
+        }) else {
+            continue;
+        };
+        let Some(second_exp) = normal_pow2_cndmask_def(&body[i_second_exp]) else {
+            continue;
+        };
+
+        let live = [scaled, scaled + 1, root, root + 1, second_exp];
+        let Some(i_class) = find_step(body, i_second_exp + 1, &live, |inst| {
+            matches!(inst, InstFormat::VOP3(i)
+                if matches!(i.op, I::V_CMP_CLASS_F64)
+                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst))
+        }) else {
+            continue;
+        };
+
+        let live = [root, root + 1, second_exp];
+        let Some(i_rescale) = find_step(body, i_class + 1, &live, |inst| {
+            matches!(inst, InstFormat::VOP3(i)
+                if matches!(i.op, I::V_LDEXP_F64)
+                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == sqrt.vdst)
+                    && matches!(i.src1, SourceOperand::VectorRegister(r) if r as u32 == second_exp))
+        }) else {
+            continue;
+        };
+
+        pairs.push((i_scale, i_rescale));
+    }
+    pairs
+}
+
+/// The scale and rescale of every recognized idiom, as one flag per
+/// instruction.
 fn normal_sqrt_ldexp_indices(body: &[InstFormat]) -> Vec<bool> {
     let mut fast = vec![false; body.len()];
-    for start in 0..body.len().saturating_sub(5) {
-        let Some(first_exp) = normal_pow2_cndmask_def(&body[start]) else { continue };
-        let InstFormat::VOP3(first_scale) = &body[start + 1] else { continue };
-        if !matches!(first_scale.op, I::V_LDEXP_F64)
-            || !matches!(first_scale.src1, SourceOperand::VectorRegister(r) if r as u32 == first_exp)
-        {
-            continue;
-        }
-        let InstFormat::VOP1(sqrt) = &body[start + 2] else { continue };
-        if !matches!(sqrt.op, I::V_SQRT_F64)
-            || !matches!(sqrt.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst)
-        {
-            continue;
-        }
-        let Some(second_exp) = normal_pow2_cndmask_def(&body[start + 3]) else { continue };
-        let InstFormat::VOP3(class) = &body[start + 4] else { continue };
-        if !matches!(class.op, I::V_CMP_CLASS_F64)
-            || !matches!(class.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst)
-        {
-            continue;
-        }
-        let InstFormat::VOP3(second_scale) = &body[start + 5] else { continue };
-        if !matches!(second_scale.op, I::V_LDEXP_F64)
-            || !matches!(second_scale.src0, SourceOperand::VectorRegister(r) if r == sqrt.vdst)
-            || !matches!(second_scale.src1, SourceOperand::VectorRegister(r) if r as u32 == second_exp)
-        {
-            continue;
-        }
-        fast[start + 1] = true;
-        fast[start + 5] = true;
+    for (scale, rescale) in normal_sqrt_ldexp_pairs(body) {
+        fast[scale] = true;
+        fast[rescale] = true;
     }
     fast
 }
@@ -181,15 +276,9 @@ enum SqrtCollapse {
 
 fn sqrt_collapse_sites(body: &[InstFormat]) -> Vec<Option<SqrtCollapse>> {
     let mut out: Vec<Option<SqrtCollapse>> = vec![None; body.len()];
-    let fast = normal_sqrt_ldexp_indices(body);
-    for start in 0..body.len().saturating_sub(5) {
-        // `fast` marks exactly the leading scale and the trailing rescale of a
-        // recognized idiom.
-        if !(fast[start + 1] && fast[start + 5]) {
-            continue;
-        }
-        let InstFormat::VOP3(first_scale) = &body[start + 1] else { continue };
-        let InstFormat::VOP3(second_scale) = &body[start + 5] else { continue };
+    for (scale, rescale) in normal_sqrt_ldexp_pairs(body) {
+        let InstFormat::VOP3(first_scale) = &body[scale] else { continue };
+        let InstFormat::VOP3(second_scale) = &body[rescale] else { continue };
         // Source modifiers would change the value being rooted.
         if first_scale.abs != 0
             || first_scale.neg != 0
@@ -198,9 +287,10 @@ fn sqrt_collapse_sites(body: &[InstFormat]) -> Vec<Option<SqrtCollapse>> {
         {
             continue;
         }
-        out[start + 1] =
-            Some(SqrtCollapse::Capture { site: start, src: first_scale.src0.clone() });
-        out[start + 5] = Some(SqrtCollapse::Rescale { site: start, vdst: second_scale.vdst });
+        // The scale names the site, so a collapse cannot pair the ends of two
+        // different idioms.
+        out[scale] = Some(SqrtCollapse::Capture { site: scale, src: first_scale.src0.clone() });
+        out[rescale] = Some(SqrtCollapse::Rescale { site: scale, vdst: second_scale.vdst });
     }
     out
 }

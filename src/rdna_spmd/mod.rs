@@ -163,7 +163,11 @@ mod object_predicate_tests {
             "examples/smallpt/kernel_gfx1200.o",
             "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd",
         );
-        assert_eq!(sites.len(), 12);
+        // Half of the object's idioms are interleaved with a division
+        // expansion that reuses the registers they carry, which the search
+        // stops at. It counted those too while V_DIV_FIXUP_F64 computed the
+        // quotient by itself and the expansion was deleted before this ran.
+        assert_eq!(sites.len(), 6);
     }
 
     #[test]
