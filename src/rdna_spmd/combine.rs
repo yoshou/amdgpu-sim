@@ -942,7 +942,12 @@ fn match_div_f64(
                 if !ej.known {
                     return None;
                 }
-                if ej.reads.contains(&reg) {
+                // The anchor is the consumer this pass exists for: this
+                // backend computes the quotient from the original operands,
+                // so its read of the chain's result is not one.
+                let quotient =
+                    j == anchor && (reg == VGPR_BASE + e_reg || reg == VGPR_BASE + e_reg + 1);
+                if ej.reads.contains(&reg) && !quotient {
                     return None;
                 }
                 if ej.kills.contains(&reg) {
