@@ -496,6 +496,60 @@ impl Cg {
         }
         v
     }
+    /// The fixup the ISA applies to a division's quotient, as the interpreter's
+    /// `div_fixup_f64` and the JIT's `emit_div_fixup_f64` do. This backend has
+    /// no quotient of its own to fix up -- the expansion feeding S0 is
+    /// collapsed away -- so it divides the original operands and answers for
+    /// the cases a division does not answer the ISA's way: a NaN operand, 0/0
+    /// and inf/inf, and a quotient too small to reach the smallest subnormal.
+    unsafe fn div_fixup_f64(
+        &self,
+        quotient: LLVMValueRef,
+        denominator: LLVMValueRef,
+        numerator: LLVMValueRef,
+    ) -> LLVMValueRef {
+        use llvm::LLVMIntPredicate::*;
+        const INFINITY: u64 = 0x7FF0_0000_0000_0000;
+        let n = self.n();
+        let k = |v: u64| self.ci64(v);
+        let bits = |v: LLVMValueRef| llvm::core::LLVMBuildBitCast(self.b, v, self.i64t, n);
+        let icmp = |p, x, y| llvm::core::LLVMBuildICmp(self.b, p, x, y, n);
+        let or = |x, y| llvm::core::LLVMBuildOr(self.b, x, y, n);
+        let and = |x, y| llvm::core::LLVMBuildAnd(self.b, x, y, n);
+        let select = |c, t, f| llvm::core::LLVMBuildSelect(self.b, c, t, f, n);
+
+        let b = bits(denominator);
+        let c = bits(numerator);
+        let abs_b = self.b_and(b, k(0x7FFF_FFFF_FFFF_FFFF));
+        let abs_c = self.b_and(c, k(0x7FFF_FFFF_FFFF_FFFF));
+        let b_nan = icmp(LLVMIntUGT, abs_b, k(INFINITY));
+        let c_nan = icmp(LLVMIntUGT, abs_c, k(INFINITY));
+        let both_zero = and(icmp(LLVMIntEQ, abs_b, k(0)), icmp(LLVMIntEQ, abs_c, k(0)));
+        let both_infinite = and(
+            icmp(LLVMIntEQ, abs_b, k(INFINITY)),
+            icmp(LLVMIntEQ, abs_c, k(INFINITY)),
+        );
+        let exponent =
+            |v: LLVMValueRef| self.b_and(llvm::core::LLVMBuildLShr(self.b, v, k(52), n), k(0x7FF));
+        let underflow = icmp(
+            LLVMIntSLT,
+            self.b_sub(exponent(c), exponent(b)),
+            k((-1075i64) as u64),
+        );
+
+        // The answer for those cases, chosen in reverse so that the earlier
+        // ones of the ISA's order win. It is made of the operands alone, so
+        // only the last select sits on the quotient's dependency chain.
+        let quiet = |v: LLVMValueRef| self.b_or(v, k(0x0008_0000_0000_0000));
+        let signed_zero = self.b_and(self.b_xor(b, c), k(0x8000_0000_0000_0000));
+        let mut fixed = signed_zero;
+        fixed = select(or(both_zero, both_infinite), k(0xFFF8_0000_0000_0000), fixed);
+        fixed = select(b_nan, quiet(b), fixed);
+        fixed = select(c_nan, quiet(c), fixed);
+        let fix = or(or(underflow, or(both_zero, both_infinite)), or(b_nan, c_nan));
+        llvm::core::LLVMBuildBitCast(self.b, select(fix, fixed, bits(quotient)), self.f64t, n)
+    }
+
     unsafe fn clamp_f64(&self, mut v: LLVMValueRef, clamp: u8) -> LLVMValueRef {
         if clamp & 1 != 0 {
             v = self.call("llvm.minnum.f64", self.f64t, &[self.f64t, self.f64t], &[v, self.cf64(1.0)]);
@@ -1452,7 +1506,7 @@ impl Cg {
             I::V_DIV_FIXUP_F64 => {
                 let b = self.absneg_f64(self.src_f64(&i.src1), i.abs, i.neg, 1);
                 let c = self.absneg_f64(self.src_f64(&i.src2), i.abs, i.neg, 2);
-                let r = self.fdiv(c, b);
+                let r = self.div_fixup_f64(self.fdiv(c, b), b, c);
                 self.st_vgpr_f64(i.vdst as u32, r);
             }
             I::V_DIV_FMAS_F64 => {

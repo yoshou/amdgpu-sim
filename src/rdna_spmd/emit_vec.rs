@@ -1272,6 +1272,60 @@ impl Cg {
         self.vf32_of(out)
     }
 
+    /// The fixup the ISA applies to a division's quotient, as the interpreter's
+    /// `div_fixup_f64` and the JIT's `emit_div_fixup_f64` do. This backend has
+    /// no quotient of its own to fix up -- the expansion feeding S0 is
+    /// collapsed away -- so it divides the original operands and answers for
+    /// the cases a division does not answer the ISA's way: a NaN operand, 0/0
+    /// and inf/inf, and a quotient too small to reach the smallest subnormal.
+    unsafe fn vdiv_fixup_f64(
+        &self,
+        quotient: LLVMValueRef,
+        denominator: LLVMValueRef,
+        numerator: LLVMValueRef,
+    ) -> LLVMValueRef {
+        use llvm::LLVMIntPredicate::*;
+        const INFINITY: u64 = 0x7FF0_0000_0000_0000;
+        let n = self.n();
+        let k = |v: u64| self.splat(self.ci64(v), self.vi64);
+        let bits = |v: LLVMValueRef| llvm::core::LLVMBuildBitCast(self.b, v, self.vi64, n);
+        let icmp = |p, x, y| llvm::core::LLVMBuildICmp(self.b, p, x, y, n);
+        let or = |x, y| llvm::core::LLVMBuildOr(self.b, x, y, n);
+        let and = |x, y| llvm::core::LLVMBuildAnd(self.b, x, y, n);
+        let select = |c, t, f| llvm::core::LLVMBuildSelect(self.b, c, t, f, n);
+
+        let b = bits(denominator);
+        let c = bits(numerator);
+        let abs_b = self.v_and(b, k(0x7FFF_FFFF_FFFF_FFFF));
+        let abs_c = self.v_and(c, k(0x7FFF_FFFF_FFFF_FFFF));
+        let b_nan = icmp(LLVMIntUGT, abs_b, k(INFINITY));
+        let c_nan = icmp(LLVMIntUGT, abs_c, k(INFINITY));
+        let both_zero = and(icmp(LLVMIntEQ, abs_b, k(0)), icmp(LLVMIntEQ, abs_c, k(0)));
+        let both_infinite = and(
+            icmp(LLVMIntEQ, abs_b, k(INFINITY)),
+            icmp(LLVMIntEQ, abs_c, k(INFINITY)),
+        );
+        let exponent =
+            |v: LLVMValueRef| self.v_and(llvm::core::LLVMBuildLShr(self.b, v, k(52), n), k(0x7FF));
+        let underflow = icmp(
+            LLVMIntSLT,
+            llvm::core::LLVMBuildSub(self.b, exponent(c), exponent(b), n),
+            k((-1075i64) as u64),
+        );
+
+        // The answer for those cases, chosen in reverse so that the earlier
+        // ones of the ISA's order win. It is made of the operands alone, so
+        // only the last select sits on the quotient's dependency chain.
+        let quiet = |v: LLVMValueRef| self.v_or(v, k(0x0008_0000_0000_0000));
+        let signed_zero = self.v_and(self.v_xor(b, c), k(0x8000_0000_0000_0000));
+        let mut fixed = signed_zero;
+        fixed = select(or(both_zero, both_infinite), k(0xFFF8_0000_0000_0000), fixed);
+        fixed = select(b_nan, quiet(b), fixed);
+        fixed = select(c_nan, quiet(c), fixed);
+        let fix = or(or(underflow, or(both_zero, both_infinite)), or(b_nan, c_nan));
+        llvm::core::LLVMBuildBitCast(self.b, select(fix, fixed, bits(quotient)), self.vf64, n)
+    }
+
     unsafe fn vdiv_scale_f32(
         &self,
         s0: LLVMValueRef,
@@ -2755,7 +2809,12 @@ impl Cg {
                 self.st_vgpr_f64(i.vdst as u32, r);
             }
             I::V_DIV_SCALE_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2); let r = self.vfdiv(self.vfmul(a, c), b); self.st_vgpr_f64(i.vdst as u32, r); }
-            I::V_DIV_FIXUP_F64 => { let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2); let r = self.vfdiv(c, b); self.st_vgpr_f64(i.vdst as u32, r); }
+            I::V_DIV_FIXUP_F64 => {
+                let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1);
+                let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2);
+                let r = self.vdiv_fixup_f64(self.vfdiv(c, b), b, c);
+                self.st_vgpr_f64(i.vdst as u32, r);
+            }
             I::V_DIV_FMAS_F64 => {
                 let a = self.vsrc_f64(&i.src0); let b = self.vsrc_f64(&i.src1); let c = self.vsrc_f64(&i.src2);
                 let fma = self.vfmuladd(a, b, c);
