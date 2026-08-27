@@ -87,6 +87,7 @@ mod dispatch;
 mod emit;
 mod emit_vec;
 mod freshness;
+mod combine;
 mod ir;
 mod mathcombine;
 mod regtype;

@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 
 use crate::instructions::I;
 use crate::rdna_instructions::InstFormat;
-use crate::rdna_translator::{collapse_div_expansions, RDNAProgram};
+use crate::rdna_translator::RDNAProgram;
+
+use super::combine::{collapse_div_expansions, combine_block};
 
 /// Branch condition recovered from a block's terminating SOPP instruction.
 /// For a single lane EXEC/VCC are 1-bit; these become ordinary scalar branches.
@@ -155,7 +157,11 @@ pub fn build_scalar_program(program: &RDNAProgram) -> ScalarProgram {
     let mut blocks = BTreeMap::new();
 
     for (&pc, block) in program.blocks() {
-        let insts = block.insts();
+        // The instruction combine -- the f64 square-root idiom and in-block
+        // dead code -- runs for this backend alone.
+        let mut combined = block.insts().to_vec();
+        combine_block(&mut combined);
+        let insts = &combined[..];
         let (last, head) = insts.split_last().expect("empty block");
 
         let term = lower_terminator(last, block.next_pcs());

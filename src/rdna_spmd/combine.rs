@@ -1,7 +1,9 @@
-use super::*;
+use crate::instructions::I;
+use crate::rdna_instructions::{InstFormat, SourceOperand, VOP1};
 
 // Instruction combine: per-block dead code elimination over the decoded
-// instruction stream, run before IR emission.
+// instruction stream, run before this backend emits its IR. The JIT is the
+// reference and executes what the object holds, so it does not run this.
 //
 // Rewriting an anchor instruction to compute its result from original
 // operands (e.g. V_DIV_FIXUP_F64 emitting the quotient directly) leaves the
