@@ -7,7 +7,6 @@
 //! engine. It carries no knowledge of what any instruction means.
 
 use crate::encoding::{slot_marker, SLOT_BYTES, S_NOP};
-use aligned_vec::{AVec, ConstAlign};
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_processor::*;
@@ -233,11 +232,9 @@ impl Harness {
         // process's allocation.
         // The buffer is aligned like the hardware's allocation, since an image
         // resource names its base address in 256-byte units.
-        const GUARD: usize = 64;
-        let mut data = AVec::<u32, ConstAlign<256>>::new(256);
-        data.resize(GUARD + 256 + GUARD, 0);
+        let mut data = GuardedBuffer::new();
         for k in 0..256 {
-            data[GUARD + k] = if given.is_empty() {
+            data.words()[k] = if given.is_empty() {
                 data_word(k as u32)
             } else {
                 given.get(k).copied().unwrap_or(0)
@@ -248,8 +245,7 @@ impl Harness {
         set_u64(&mut arg_buffer, 8, src.as_ptr() as u64);
         set_u64(&mut arg_buffer, 16, uni.as_ptr() as u64);
         if self.kernarg_size >= 32 {
-            set_u64(&mut arg_buffer, 24, unsafe { data.as_mut_ptr().add(GUARD) }
-                as u64);
+            set_u64(&mut arg_buffer, 24, data.words().as_mut_ptr() as u64);
         }
 
         let aql = HsaKernelDispatchPacket {
@@ -270,6 +266,50 @@ impl Harness {
         let mut processor = RDNAProcessor::with_engine(&aql, 32, 32, &mem, engine);
         processor.execute();
         out
+    }
+}
+
+/// The 256 words the memory harness works on, with room on either side for
+/// every address an instruction's offset can name. The field is 24 bits and
+/// signed, so a case can reach 8 MiB either way; the guard is mapped but
+/// untouched, which costs nothing until a case writes to it, and it holds the
+/// zeros the hardware read outside its own allocation rather than letting the
+/// test process fault on memory it does not own.
+const GUARD: usize = 8 << 20;
+
+pub(crate) struct GuardedBuffer {
+    base: *mut u8,
+}
+
+impl GuardedBuffer {
+    fn new() -> Self {
+        // Anonymous pages come back zeroed and page-aligned, which is also the
+        // 256-byte alignment an image resource's base address is given in.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                GUARD + 1024 + GUARD,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert!(base != libc::MAP_FAILED, "cannot map the harness buffer");
+        Self { base: base as *mut u8 }
+    }
+
+    /// The words the harness hands the kernel, which the guard surrounds.
+    fn words(&mut self) -> &mut [u32] {
+        unsafe { std::slice::from_raw_parts_mut(self.base.add(GUARD) as *mut u32, 256) }
+    }
+}
+
+impl Drop for GuardedBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, GUARD + 1024 + GUARD);
+        }
     }
 }
 
