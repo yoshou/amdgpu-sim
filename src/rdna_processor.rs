@@ -13198,7 +13198,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13222,7 +13222,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13246,7 +13246,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13270,7 +13270,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13295,7 +13295,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
                 let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13321,7 +13321,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13347,7 +13347,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13374,7 +13374,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
                 let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13403,7 +13403,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
                 let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13432,7 +13432,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
                 let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if (offset[elem] < scratch_base) || (offset[elem] >= scratch_limit) {
@@ -13513,7 +13513,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
 
             let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
@@ -13541,7 +13541,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
                 let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if ((offset[elem] as u64) < scratch_base)
@@ -13570,7 +13570,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let scratch_base = self.ctx.scratch.borrow().as_ptr() as u64;
                 let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
                 let addr = if ((offset[elem] as u64) < scratch_base)
@@ -13598,7 +13598,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let ioffset = ((ioffset << 8) as i32) >> 8;
+            let ioffset = sext_ioffset(ioffset);
             let scratch_base = self.ctx.scratch.borrow_mut().as_ptr() as u64;
             let scratch_limit = scratch_base + self.ctx.scratch.borrow().len() as u64 / 32;
             let addr = if ((offset[elem] as u64) < scratch_base)
@@ -13626,7 +13626,7 @@ impl SIMD32 {
         // says the same of the SGPR.
         let use_vaddr = inst.sve != 0;
         let use_saddr = inst.saddr != 0x7C;
-        let ioffset = ((inst.ioffset << 8) as i32 >> 8) as i64;
+        let ioffset = sext_ioffset(inst.ioffset) as i64;
         match inst.op {
             I::SCRATCH_LOAD_U8 => {
                 self.scratch_load_u8(vaddr, vdst, saddr, ioffset, use_vaddr, use_saddr);
@@ -14073,7 +14073,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut i8;
             let data = unsafe { *ptr };
@@ -14096,7 +14096,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut i16;
             let data = unsafe { *ptr };
@@ -14121,7 +14121,7 @@ impl SIMD32 {
                     continue;
                 }
                 let addr = offset[elem]
-                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(sext_ioffset(ioffset) as i64 as u64)
                     .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
@@ -14147,7 +14147,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut u8;
             unsafe {
@@ -14174,7 +14174,7 @@ impl SIMD32 {
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
                 let addr = offset[elem]
-                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(sext_ioffset(ioffset) as i64 as u64)
                     .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
@@ -14260,7 +14260,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut u16;
             unsafe {
@@ -14285,7 +14285,7 @@ impl SIMD32 {
                 continue;
             }
             let data = self.read_vgpr(elem, vsrc);
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut u32;
             unsafe {
@@ -14312,7 +14312,7 @@ impl SIMD32 {
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
                 let addr = offset[elem]
-                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(sext_ioffset(ioffset) as i64 as u64)
                     .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
@@ -14341,7 +14341,7 @@ impl SIMD32 {
                 }
                 let data = self.read_vgpr(elem, vsrc + i);
                 let addr = offset[elem]
-                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(sext_ioffset(ioffset) as i64 as u64)
                     .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
@@ -14367,7 +14367,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut u8;
             let data = unsafe { *ptr };
@@ -14390,7 +14390,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut u16;
             let data = unsafe { *ptr };
@@ -14413,7 +14413,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
 
             let ptr = addr as *mut u32;
             let data = unsafe { *ptr };
@@ -14438,7 +14438,7 @@ impl SIMD32 {
                     continue;
                 }
                 let addr = offset[elem]
-                    .wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64)
+                    .wrapping_add(sext_ioffset(ioffset) as i64 as u64)
                     .wrapping_add(i as u64 * 4);
 
                 let ptr = addr as *mut u32;
@@ -14464,7 +14464,7 @@ impl SIMD32 {
                 if !self.get_exec_bit(elem) {
                     continue;
                 }
-                let ioffset = ((ioffset << 8) as i32) >> 8;
+                let ioffset = sext_ioffset(ioffset);
                 let addr = offset[elem] as i64 + (ioffset as i64) + (i as i64 * 4);
 
                 let ptr = addr as *mut u32;
@@ -14496,7 +14496,7 @@ impl SIMD32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
-            let addr = offset[elem].wrapping_add(((ioffset << 8) as i32 >> 8) as i64 as u64);
+            let addr = offset[elem].wrapping_add(sext_ioffset(ioffset) as i64 as u64);
             let data = self.read_vgpr(elem, vsrc);
 
             let ptr = addr as *mut u32;

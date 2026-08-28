@@ -16,7 +16,7 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, DS, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
+use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, DS, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
 use super::ir::{Cond, ScalarProgram, Terminator};
 
@@ -2293,13 +2293,13 @@ impl Cg {
 
     // ---- VFLAT (flat load/store): flat addressing matches the global path.
     unsafe fn emit_vflat(&self, i: &VFLAT) {
-        let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
+        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
         let base = if i.saddr != 124 {
             self.b_add(self.ld_sgpr64(i.saddr as u32), self.zext64(self.ld_vgpr32(i.vaddr as u32)))
         } else {
             self.ld_vgpr64(i.vaddr as u32)
         };
-        let addr = self.b_add(base, self.ci64(sext_ioffset));
+        let addr = self.b_add(base, self.ci64(ioffset));
         match i.op {
             I::FLAT_LOAD_U8 | I::FLAT_LOAD_I8 | I::FLAT_LOAD_U16 | I::FLAT_LOAD_I16 => {
                 let (ty, signed) = match i.op {
@@ -2460,7 +2460,7 @@ impl Cg {
         if matches!(i.op, I::GLOBAL_WB | I::GLOBAL_INV) {
             return;
         }
-        let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
+        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
         let base = if i.saddr != 124 {
             let s = self.ld_sgpr64(i.saddr as u32);
             let v = self.zext64(self.ld_vgpr32(i.vaddr as u32));
@@ -2468,7 +2468,7 @@ impl Cg {
         } else {
             self.ld_vgpr64(i.vaddr as u32)
         };
-        let addr = self.b_add(base, self.ci64(sext_ioffset));
+        let addr = self.b_add(base, self.ci64(ioffset));
 
         // Sub-dword loads (zero/sign-extended into a 32-bit VGPR).
         match i.op {
@@ -2556,8 +2556,8 @@ impl Cg {
     // `scratch_base`, so — unlike the 32-lane-interleaved vector layout — the
     // address is simply `scratch_base + saddr + ioffset` (bytes).
     unsafe fn emit_vscratch(&self, i: &VSCRATCH) {
-        let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
-        let mut addr = self.b_add(self.scratch_base, self.ci64(sext_ioffset));
+        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
+        let mut addr = self.b_add(self.scratch_base, self.ci64(ioffset));
         // saddr NULL is encoded as 124 (SGPR_NULL) / 127; otherwise a byte offset.
         // Scratch SGPR/VGPR offsets are SIGNED 32-bit byte offsets (ISA §11.2).
         if i.saddr != 124 && i.saddr != 127 {

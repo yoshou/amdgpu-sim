@@ -32,7 +32,7 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
+use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
 use super::freshness::vgpr_writes;
 use super::ir::{Cond, ScalarProgram, Terminator};
@@ -3297,7 +3297,7 @@ impl Cg {
         if matches!(i.op, I::GLOBAL_WB | I::GLOBAL_INV) {
             return;
         }
-        let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
+        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
         // base address per lane (<W×i64>)
         let base = if i.saddr != 124 {
             let s = self.splat(self.ld_sgpr64(i.saddr as u32), self.vi64);
@@ -3306,7 +3306,7 @@ impl Cg {
         } else {
             self.ld_vgpr64(i.vaddr as u32)
         };
-        let addr = self.v_add(base, self.splat(self.ci64(sext_ioffset), self.vi64));
+        let addr = self.v_add(base, self.splat(self.ci64(ioffset), self.vi64));
 
         // Sub-dword global memory uses the same typed masked gather/scatter
         // intrinsics as FLAT memory, then extends/truncates at the VGPR boundary.
@@ -3427,8 +3427,8 @@ impl Cg {
         } else { None };
         if let Some(stride_bytes) = fstride {
             let sp4 = stride_bytes / 4;
-            let ioff_w = (sext_ioffset as i64) / 4;
-            if sp4 >= 1 && sext_ioffset % 4 == 0 && ioff_w >= 0 && (ioff_w as u32 + words) <= sp4 {
+            let ioff_w = (ioffset as i64) / 4;
+            if sp4 >= 1 && ioffset % 4 == 0 && ioff_w >= 0 && (ioff_w as u32 + words) <= sp4 {
                 let grp = self.w.min(8); // lanes per contiguous group (W-aligned, ≤8)
                 let nblk = self.w / grp;
                 let blkty = llvm::core::LLVMVectorType(self.i32t, grp * sp4);
@@ -3748,7 +3748,7 @@ impl Cg {
         llvm::core::LLVMBuildSelect(self.b, in_ap, priv_addr, addr, self.n())
     }
     unsafe fn emit_vflat(&self, i: &VFLAT) {
-        let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
+        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
         let base = if i.saddr != 124 {
             let s = self.splat(self.ld_sgpr64(i.saddr as u32), self.vi64);
             let v = self.zext64v(self.ld_vgpr32(i.vaddr as u32));
@@ -3756,7 +3756,7 @@ impl Cg {
         } else {
             self.ld_vgpr64(i.vaddr as u32)
         };
-        let addr = self.v_add(base, self.splat(self.ci64(sext_ioffset), self.vi64));
+        let addr = self.v_add(base, self.splat(self.ci64(ioffset), self.vi64));
         let addr = self.flat_redirect(base, addr);
         let exec = self.exec_vec();
         let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
@@ -3810,8 +3810,8 @@ impl Cg {
     // ---- VSCRATCH (per-lane private scratch) — each lane addresses its own
     // scratch segment (`scratch_vec` = base + lane*stride).
     unsafe fn emit_vscratch(&self, i: &VSCRATCH) {
-        let sext_ioffset = (((i.ioffset << 8) as i32) >> 8) as i64 as u64;
-        let mut addr = self.v_add(self.scratch_vec, self.splat(self.ci64(sext_ioffset), self.vi64));
+        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
+        let mut addr = self.v_add(self.scratch_vec, self.splat(self.ci64(ioffset), self.vi64));
         // Scratch SGPR/VGPR offsets are SIGNED 32-bit byte offsets (ISA §11.2).
         if i.saddr != 124 && i.saddr != 127 {
             let s = llvm::core::LLVMBuildSExt(self.b, self.ld_sgpr32(i.saddr as u32), self.i64t, self.n());

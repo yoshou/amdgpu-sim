@@ -51,6 +51,11 @@ pub const SOP1_ENCODE: u32 = 0b101111101;
 pub const SOPC_ENCODE: u32 = 0b101111110;
 pub const SOPP_ENCODE: u32 = 0b101111111;
 
+/// The memory instructions carry their immediate offset in 24 bits, signed.
+pub fn sext_ioffset(ioffset: u32) -> i32 {
+    ((ioffset << 8) as i32) >> 8
+}
+
 #[derive(Debug, Clone)]
 pub struct SMEM {
     pub op: I,

@@ -56,7 +56,7 @@ impl IREmitter {
 
                     let ioffset_value = llvm::core::LLVMConstInt(
                         ty_i64,
-                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                        sext_ioffset(inst.ioffset) as i64 as u64,
                         0,
                     );
 
@@ -268,7 +268,7 @@ impl IREmitter {
 
                         let ioffset_value = llvm::core::LLVMConstInt(
                             ty_i64,
-                            ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                            sext_ioffset(inst.ioffset) as i64 as u64,
                             0,
                         );
                         let addr_value = emitter.emit_load_vgpr_u64(inst.vaddr as u32, elem);
@@ -445,7 +445,7 @@ impl IREmitter {
 
                     let ioffset_value = llvm::core::LLVMConstInt(
                         ty_i64,
-                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                        sext_ioffset(inst.ioffset) as i64 as u64,
                         0,
                     );
 
@@ -632,7 +632,7 @@ impl IREmitter {
 
                         let ioffset_value = llvm::core::LLVMConstInt(
                             ty_i64,
-                            ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                            sext_ioffset(inst.ioffset) as i64 as u64,
                             0,
                         );
                         let addr_value = emitter.emit_load_vgpr_u64(inst.vaddr as u32, elem);
@@ -815,11 +815,8 @@ impl IREmitter {
                 };
 
                 let ioffset_vec = llvm::core::LLVMConstVector(
-                    [llvm::core::LLVMConstInt(
-                        ty_i64,
-                        ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
-                        0,
-                    ); N]
+                    [llvm::core::LLVMConstInt(ty_i64, sext_ioffset(inst.ioffset) as i64 as u64, 0);
+                        N]
                         .as_mut_ptr(),
                     N as u32,
                 );
@@ -1001,7 +998,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -1098,7 +1095,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -1201,7 +1198,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -1296,7 +1293,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -1399,7 +1396,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -1494,7 +1491,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -1597,7 +1594,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -1692,7 +1689,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -1795,7 +1792,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -1896,7 +1893,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -1990,7 +1987,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -2045,7 +2042,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -2158,7 +2155,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -2251,7 +2248,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -2309,7 +2306,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -2423,7 +2420,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -2516,7 +2513,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -2571,7 +2568,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -2682,7 +2679,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -2778,7 +2775,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -2873,7 +2870,7 @@ impl IREmitter {
                             offset,
                             llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ),
                             empty_name.as_ptr(),
@@ -2967,7 +2964,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -3064,7 +3061,7 @@ impl IREmitter {
                             offset,
                             llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ),
                             empty_name.as_ptr(),
@@ -3160,7 +3157,7 @@ impl IREmitter {
                         let ioffset = llvm::core::LLVMConstVector(
                             [llvm::core::LLVMConstInt(
                                 ty_i64,
-                                ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                sext_ioffset(inst.ioffset) as i64 as u64,
                                 0,
                             ); N]
                                 .as_mut_ptr(),
@@ -3264,7 +3261,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -3355,7 +3352,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -3404,7 +3401,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -3509,7 +3506,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -3600,7 +3597,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -3649,7 +3646,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -3754,7 +3751,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -3845,7 +3842,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -3894,7 +3891,7 @@ impl IREmitter {
                             let ioffset = llvm::core::LLVMConstVector(
                                 [llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64) as u64,
+                                    sext_ioffset(inst.ioffset) as i64 as u64,
                                     0,
                                 ); N]
                                     .as_mut_ptr(),
@@ -3999,7 +3996,7 @@ impl IREmitter {
                                 offset,
                                 llvm::core::LLVMConstInt(
                                     ty_i64,
-                                    ((((inst.ioffset << 8) as i32) >> 8) as i64 + j * 4) as u64,
+                                    (sext_ioffset(inst.ioffset) as i64 + j * 4) as u64,
                                     0,
                                 ),
                                 empty_name.as_ptr(),
@@ -4081,7 +4078,7 @@ impl IREmitter {
                 // being NULL says the same of the SGPR.
                 let use_vaddr = inst.sve != 0;
                 let use_saddr = inst.saddr != 0x7C;
-                let ioffset = (((inst.ioffset << 8) as i32) >> 8) as i64;
+                let ioffset = sext_ioffset(inst.ioffset) as i64;
 
                 let emitter = self;
                 let empty_name = std::ffi::CString::new("").unwrap();
