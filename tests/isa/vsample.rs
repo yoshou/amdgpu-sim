@@ -34,12 +34,13 @@ const SEL_Y: u32 = 5;
 const SEL_Z: u32 = 6;
 const SEL_W: u32 = 7;
 
-/// The texels, laid out as the part reads them: a row every 128 bytes.
-fn texture() -> Vec<u32> {
-    let mut bytes = vec![0u8; 128 * HEIGHT as usize];
+/// The texels, laid out as the part reads them: `width` of them at the start
+/// of every `row` bytes.
+fn texture(width: u32, row: u32) -> Vec<u32> {
+    let mut bytes = vec![0u8; (row * HEIGHT) as usize];
     for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            bytes[(y * 128 + x) as usize] = (x + WIDTH * y) as u8;
+        for x in 0..width {
+            bytes[(y * row + x) as usize] = (x + width * y) as u8;
         }
     }
     bytes
@@ -60,10 +61,19 @@ fn set_bits(words: &mut [u32], position: usize, size: usize, value: u32) {
 /// missing: the harness folds the address of its data buffer into the first two
 /// words, which is the only way a test can name it.
 fn image_resource(format: u32, dst_sel: [u32; 4]) -> [u32; 8] {
+    image_resource_sized(format, dst_sel, WIDTH, 0)
+}
+
+/// The same with a width and a row pitch of the case's own. The pitch field
+/// holds one less than the pitch and is clear where the width is the pitch.
+fn image_resource_sized(format: u32, dst_sel: [u32; 4], width: u32, pitch: u32) -> [u32; 8] {
     let mut rsrc = [0u32; 8];
     set_bits(&mut rsrc, 49, 8, format);
-    set_bits(&mut rsrc, 62, 16, WIDTH - 1);
+    set_bits(&mut rsrc, 62, 16, width - 1);
     set_bits(&mut rsrc, 78, 16, HEIGHT - 1);
+    if pitch != 0 {
+        set_bits(&mut rsrc, 128, 16, pitch - 1);
+    }
     for (i, select) in dst_sel.iter().enumerate() {
         set_bits(&mut rsrc, 96 + 3 * i, 3, *select);
     }
@@ -94,10 +104,21 @@ pub(crate) struct VsampleCase {
 
 /// Bit-exact comparison of one fetch against captured hardware.
 fn check_vsample(dmask: u32, unrm: u32, rsrc: [u32; 8], samp: [u32; 4], cases: &[VsampleCase]) {
+    check_vsample_texture(dmask, unrm, rsrc, samp, texture(WIDTH, 128), cases);
+}
+
+/// As `check_vsample`, but against texels the case lays out itself.
+fn check_vsample_texture(
+    dmask: u32,
+    unrm: u32,
+    rsrc: [u32; 8],
+    samp: [u32; 4],
+    data: Vec<u32>,
+    cases: &[VsampleCase],
+) {
     let harness = Harness::vsample();
     let words = vsample(31, 1, dmask, unrm, 8, 12, 20, [0, 1, 0, 0]);
     let uni: Vec<u32> = rsrc.iter().chain(samp.iter()).copied().collect();
-    let data = texture();
 
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
@@ -613,6 +634,69 @@ fn image_sample_lz_dmask_w() {
         sampler([0, 0], false, 0),
         &[
             VsampleCase { u: 0.25, v: 0.125, expected: [0x0000_0010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn image_sample_lz_row_pitch() {
+    // A row of a linear image takes a multiple of 128 bytes, so an image whose
+    // width is not one has padding between its rows: 200 texels a row live in
+    // 256 bytes.
+    check_vsample_texture(
+        0x1,
+        0,
+        image_resource_sized(FMT_8_UINT, RGBA, 200, 0),
+        sampler([0, 0], false, 0),
+        texture(200, 256),
+        &[
+            VsampleCase { u: 0.0025, v: 0.125, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.0075, v: 0.125, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.9975, v: 0.125, expected: [0x0000_00C7, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.0025, v: 0.375, expected: [0x0000_00C8, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.5025, v: 0.625, expected: [0x0000_00F4, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.9975, v: 0.875, expected: [0x0000_001F, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn image_sample_lz_row_pitch_from_the_resource() {
+    // The resource can give a pitch wider than the width, and it is rounded up
+    // the same way: 200 becomes 256, so the rows of a 64-texel image sit 256
+    // bytes apart.
+    check_vsample_texture(
+        0x1,
+        0,
+        image_resource_sized(FMT_8_UINT, RGBA, WIDTH, 200),
+        sampler([0, 0], false, 0),
+        texture(WIDTH, 256),
+        &[
+            VsampleCase { u: 0.0078125, v: 0.125, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.0234375, v: 0.125, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.9921875, v: 0.125, expected: [0x0000_003F, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.0078125, v: 0.375, expected: [0x0000_0040, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.5078125, v: 0.625, expected: [0x0000_00A0, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.9921875, v: 0.875, expected: [0x0000_00FF, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn image_sample_lz_row_pitch_below_the_minimum() {
+    // A pitch narrower than 128 bytes is rounded up to it, which for this
+    // image is the same layout as no pitch at all.
+    check_vsample_texture(
+        0x1,
+        0,
+        image_resource_sized(FMT_8_UINT, RGBA, WIDTH, WIDTH),
+        sampler([0, 0], false, 0),
+        texture(WIDTH, 128),
+        &[
+            VsampleCase { u: 0.0078125, v: 0.125, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.9921875, v: 0.125, expected: [0x0000_003F, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.0078125, v: 0.875, expected: [0x0000_00C0, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            VsampleCase { u: 0.9921875, v: 0.875, expected: [0x0000_00FF, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
         ],
     );
 }

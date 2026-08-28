@@ -14809,24 +14809,6 @@ impl SIMD32 {
             .map(|i| self.read_sgpr(rsrc + i))
             .collect::<Vec<u32>>();
 
-        let format = get_bits_u32(&rsrc_value, 49, 8);
-        let width = get_bits_u32(&rsrc_value, 62, 16) + 1;
-        let height = get_bits_u32(&rsrc_value, 78, 16) + 1;
-        let base_addr =
-            (((rsrc_value[1] as u64) << 40) | ((rsrc_value[0] as u64) << 8)) & ((1u64 << 48) - 1);
-        // The resource can give a row pitch of its own, and the part rounds a
-        // row up to 128 bytes whatever it says. The formats read here are a
-        // byte a texel, so a row of texels is a row of bytes.
-        let pitch = get_bits_u32(&rsrc_value, 128, 14) | (get_bits_u32(&rsrc_value, 142, 2) << 14);
-        let row = if pitch != 0 { pitch + 1 } else { width }.max(128) as u64;
-
-        if get_bits_u32(&samp_value, 84, 2) != 0 {
-            unimplemented!("IMAGE_SAMPLE_LZ with a filter other than point");
-        }
-        // The instruction can force the address to be unnormalized, and so can
-        // the sampler; otherwise it spans the image.
-        let unnormalized = unrm != 0 || get_bits_u32(&samp_value, 15, 1) != 0;
-
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
@@ -14834,51 +14816,33 @@ impl SIMD32 {
 
             let u = u32_to_f32(self.read_vgpr(elem, vaddr0));
             let v = u32_to_f32(self.read_vgpr(elem, vaddr1));
-            let texel = |coord: f32, size: u32| {
-                if unnormalized {
-                    coord
-                } else {
-                    coord * size as f32
-                }
-                .floor() as i32
-            };
-            // Unnormalized coordinates cannot repeat the image, so the two
-            // modes that repeat it fold it over once instead.
-            let mode = |axis: usize| match get_bits_u32(&samp_value, axis * 3, 3) {
-                0 if unnormalized => 2,
-                1 if unnormalized => 3,
-                mode => mode,
-            };
-            let x = clamp_texel(texel(u, width), width as i32, mode(0));
-            let y = clamp_texel(texel(v, height), height as i32, mode(1));
-            // Off the image, the sampler's border colour stands in for the
-            // texel; every format here has a single channel, which the part
-            // gives to whichever channel a selector names.
-            let channel = match (x, y) {
-                (Some(x), Some(y)) => {
-                    let ptr = (base_addr + y as u64 * row + x as u64) as *const u8;
-                    texel_value(format, unsafe { std::ptr::read_unaligned(ptr) })
-                }
-                _ => match get_bits_u32(&samp_value, 126, 2) {
-                    0 | 1 => 0,
-                    2 => format_one(format),
-                    _ => unimplemented!("IMAGE_SAMPLE_LZ with a border colour of its own"),
-                },
-            };
 
-            // The components the DMASK asks for go to consecutive registers,
-            // each of them holding what its destination select names.
+            // The components the DMASK asks for go to consecutive registers.
+            // The fetch itself is the one the JIT calls, so the two engines
+            // read an image the same way by construction.
             let mut vgpr = vdata;
             for component in 0..4 {
                 if dmask & (1 << component) == 0 {
                     continue;
                 }
-                let data = match get_bits_u32(&rsrc_value, 96 + component * 3, 3) {
-                    0 => 0,
-                    1 => format_one(format),
-                    4..=7 => channel,
-                    select => unimplemented!("image destination select {}", select),
-                };
+                let data = image_sample_lz(
+                    rsrc_value[0],
+                    rsrc_value[1],
+                    rsrc_value[2],
+                    rsrc_value[3],
+                    rsrc_value[4],
+                    rsrc_value[5],
+                    rsrc_value[6],
+                    rsrc_value[7],
+                    samp_value[0],
+                    samp_value[1],
+                    samp_value[2],
+                    samp_value[3],
+                    component,
+                    unrm,
+                    u,
+                    v,
+                );
                 self.write_vgpr(elem, vgpr, data);
                 vgpr += 1;
             }

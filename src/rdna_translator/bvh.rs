@@ -79,11 +79,13 @@ pub extern "C" fn image_sample_lz(
     let width = get_bits_u32(&rsrc, 62, 16) + 1;
     let height = get_bits_u32(&rsrc, 78, 16) + 1;
     let base_addr = (((rsrc[1] as u64) << 40) | ((rsrc[0] as u64) << 8)) & ((1u64 << 48) - 1);
-    // The resource can give a row pitch of its own, and the part rounds a row
-    // up to 128 bytes whatever it says. The formats read here are a byte a
-    // texel, so a row of texels is a row of bytes.
-    let pitch = get_bits_u32(&rsrc, 128, 14) | (get_bits_u32(&rsrc, 142, 2) << 14);
-    let row = if pitch != 0 { pitch + 1 } else { width }.max(128) as u64;
+    // The resource can give a row pitch of its own -- the field holds one less
+    // than it, and is clear when the width is the pitch -- and the part rounds
+    // a row up to a multiple of 128 bytes whatever it says. The formats read
+    // here are a byte a texel, so a row of texels is a row of bytes.
+    let pitch = get_bits_u32(&rsrc, 128, 16);
+    let row = if pitch != 0 { pitch + 1 } else { width };
+    let row = row.div_ceil(128) as u64 * 128;
 
     if get_bits_u32(&samp, 84, 2) != 0 {
         unimplemented!("IMAGE_SAMPLE_LZ with a filter other than point");
