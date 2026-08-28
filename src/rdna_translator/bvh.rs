@@ -3,7 +3,7 @@ use itertools::Itertools;
 
 /// Where a coordinate lands in a row or a column of `size` texels, or None
 /// when it lands on the border instead. The modes are the ones Table 61 names.
-fn clamp_texel(coord: i32, size: i32, mode: u32) -> Option<i32> {
+pub(crate) fn clamp_texel(coord: i32, size: i32, mode: u32) -> Option<i32> {
     // Mirroring once folds the coordinates below the image back over it.
     let mirror_once = |coord: i32| if coord < 0 { -1 - coord } else { coord };
     match mode {
@@ -30,7 +30,7 @@ fn clamp_texel(coord: i32, size: i32, mode: u32) -> Option<i32> {
 /// What a texel of `format` holds. Every format here has a single channel of
 /// eight bits, which the part gives to whichever channel a selector names.
 
-fn texel_value(format: u32, raw: u8) -> u32 {
+pub(crate) fn texel_value(format: u32, raw: u8) -> u32 {
     match format {
         1 => f32::to_bits(raw as f32 / 255.0),
         2 => f32::to_bits((raw as i8).max(-127) as f32 / 127.0),
@@ -42,7 +42,7 @@ fn texel_value(format: u32, raw: u8) -> u32 {
 
 /// What the selector SEL_1 and an opaque-white border stand for: one, as the
 /// format counts it.
-fn format_one(format: u32) -> u32 {
+pub(crate) fn format_one(format: u32) -> u32 {
     match format {
         1 | 2 => f32::to_bits(1.0),
         _ => 1,
@@ -144,7 +144,7 @@ pub struct Aabb {
 /// come first. Table 65 puts them before the box nodes -- types 0 to 3 for the
 /// four-wide instructions -- and the part puts type 1 before the other three
 /// as well.
-fn box4_child_rank(node_type: u32) -> u32 {
+pub(crate) fn box4_child_rank(node_type: u32) -> u32 {
     match node_type {
         1 => 0,
         0 | 2 | 3 => 1,
@@ -154,7 +154,7 @@ fn box4_child_rank(node_type: u32) -> u32 {
 
 /// The same for the eight-wide instruction, whose triangle nodes are the
 /// packet types and which keeps them in the order the ray reaches them.
-fn box8_child_rank(node_type: u32) -> u32 {
+pub(crate) fn box8_child_rank(node_type: u32) -> u32 {
     match node_type {
         0..=3 | 8..=11 => 0,
         _ => 1,
@@ -164,17 +164,17 @@ fn box8_child_rank(node_type: u32) -> u32 {
 /// Whether the child `b` belongs before the child `a` when the resource sorts
 /// its boxes and nothing else: one the ray never reached goes last, and the
 /// rest go by the time the ray enters them.
-fn closer_than(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
+pub(crate) fn closer_than(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
     (b.0 != 0xFFFF_FFFF && b.2 < a.2) || a.0 == 0xFFFF_FFFF
 }
 
 /// The network the part sorts its four children with.
-const BOX4_NETWORK: [(usize, usize); 5] = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
+pub(crate) const BOX4_NETWORK: [(usize, usize); 5] = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
 
 /// Whether the child `b` belongs before the child `a`: one the ray never
 /// reached goes last, and the rest go by rank and then by the time the ray
 /// enters them. Each child is its pointer, its rank and that time.
-fn sorts_before(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
+pub(crate) fn sorts_before(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
     (b.0 != 0xFFFF_FFFF && (b.1 < a.1 || (b.1 == a.1 && b.2 < a.2))) || a.0 == 0xFFFF_FFFF
 }
 
@@ -295,7 +295,7 @@ fn intersect4(
     (t0, t1)
 }
 
-fn intersect(ray_origin: [f32; 3], inv_direction: [f32; 3], aabb: &Aabb, max_t: f32) -> (f32, f32) {
+pub(crate) fn intersect(ray_origin: [f32; 3], inv_direction: [f32; 3], aabb: &Aabb, max_t: f32) -> (f32, f32) {
     let f = [
         (aabb.max[0] - ray_origin[0]) * inv_direction[0],
         (aabb.max[1] - ray_origin[1]) * inv_direction[1],
@@ -325,7 +325,7 @@ fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
-fn intersect_triangle_frac(
+pub(crate) fn intersect_triangle_frac(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     v0: [f32; 3],
@@ -376,16 +376,16 @@ fn intersect_triangle_frac(
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
-struct TrianglePair {
-    v0: [f32; 3],
-    v1: [f32; 3],
-    v2: [f32; 3],
-    v3: [f32; 3],
+pub(crate) struct TrianglePair {
+    pub v0: [f32; 3],
+    pub v1: [f32; 3],
+    pub v2: [f32; 3],
+    pub v3: [f32; 3],
 }
 
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
-struct TrianglePairNode {
+pub(crate) struct TrianglePairNode {
     pub tri_pair: TrianglePair,
     pub padding: u32,
     pub prim_index: [u32; 2],
@@ -675,7 +675,7 @@ impl Box8Node {
 
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy)]
-struct TrianglePacketNode {
+pub(crate) struct TrianglePacketNode {
     data: [u32; 32],
 }
 
@@ -785,7 +785,7 @@ impl TrianglePacketNode {
     }
 }
 
-fn intersect_triangle(
+pub(crate) fn intersect_triangle(
     ray_origin: [f32; 3],
     ray_direction: [f32; 3],
     v0: [f32; 3],
