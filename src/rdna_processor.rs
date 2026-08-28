@@ -15756,6 +15756,12 @@ impl<'a> RDNAProcessor<'a> {
         for workgroup_id_base in (0..num_workgroups).step_by(num_wgps) {
             for wgp_idx in 0..num_wgps {
                 let workgroup_id = workgroup_id_base + wgp_idx as u32;
+                // The last round of the dispatch has fewer workgroups than
+                // there are processors to run them on: a processor with none
+                // left stays idle rather than running the first one again.
+                if workgroup_id >= num_workgroups {
+                    break;
+                }
                 let workgroup_id_x = workgroup_id % num_workgroup_x;
                 let workgroup_id_y = (workgroup_id / num_workgroup_x) % num_workgroup_y;
                 let workgroup_id_z =
