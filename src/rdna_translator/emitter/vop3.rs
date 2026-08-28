@@ -8699,7 +8699,12 @@ impl IREmitter {
             };
             let bound = |value: u64| {
                 llvm::core::LLVMConstVector(
-                    [llvm::core::LLVMConstInt(ty_i32, value, 0); N].as_mut_ptr(),
+                    [llvm::core::LLVMConstInt(
+                        llvm::core::LLVMInt64TypeInContext(context),
+                        value,
+                        0,
+                    ); N]
+                    .as_mut_ptr(),
                     N as u32,
                 )
             };
@@ -8732,11 +8737,57 @@ impl IREmitter {
             llvm::core::LLVMBuildTrunc(builder, value, ty_i16xn, empty_name.as_ptr())
         };
 
+        // IEEE 754-2019 minimum and maximum answer a NaN operand with that
+        // operand made quiet; the intrinsics answer with a canonical NaN.
+        let propagate_nan = |a: llvm::prelude::LLVMValueRef,
+                             b: llvm::prelude::LLVMValueRef,
+                             value: llvm::prelude::LLVMValueRef| {
+            let quiet_bit = llvm::core::LLVMConstVector(
+                [llvm::core::LLVMConstInt(
+                    llvm::core::LLVMInt16TypeInContext(context),
+                    0x0200,
+                    0,
+                ); N]
+                .as_mut_ptr(),
+                N as u32,
+            );
+            let quiet = |value: llvm::prelude::LLVMValueRef| {
+                as_half(llvm::core::LLVMBuildOr(
+                    builder,
+                    as_bits(value),
+                    quiet_bit,
+                    empty_name.as_ptr(),
+                ))
+            };
+            let is_nan = |value: llvm::prelude::LLVMValueRef| {
+                llvm::core::LLVMBuildFCmp(
+                    builder,
+                    llvm::LLVMRealPredicate::LLVMRealUNO,
+                    value,
+                    value,
+                    empty_name.as_ptr(),
+                )
+            };
+            let value = llvm::core::LLVMBuildSelect(
+                builder,
+                is_nan(b),
+                quiet(b),
+                value,
+                empty_name.as_ptr(),
+            );
+            llvm::core::LLVMBuildSelect(builder, is_nan(a), quiet(a), value, empty_name.as_ptr())
+        };
+
+        // Wide enough to hold a product of two 16-bit values plus an addend,
+        // whichever way they were read, so that the saturation below judges the
+        // true value rather than one that has already wrapped.
+        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+        let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
         let widen = |value: llvm::prelude::LLVMValueRef, signed: bool| {
             if signed {
-                llvm::core::LLVMBuildSExt(builder, value, ty_i32xn, empty_name.as_ptr())
+                llvm::core::LLVMBuildSExt(builder, value, ty_i64xn, empty_name.as_ptr())
             } else {
-                llvm::core::LLVMBuildZExt(builder, value, ty_i32xn, empty_name.as_ptr())
+                llvm::core::LLVMBuildZExt(builder, value, ty_i64xn, empty_name.as_ptr())
             }
         };
 
@@ -8769,12 +8820,12 @@ impl IREmitter {
             I::V_PK_MINIMUM_F16 => {
                 let intrinsic = self.get_intrinsic_declaration("llvm.minimum.", &[ty_f16xn]);
                 let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b)]);
-                float_result(self, value)
+                float_result(self, propagate_nan(as_half(a), as_half(b), value))
             }
             I::V_PK_MAXIMUM_F16 => {
                 let intrinsic = self.get_intrinsic_declaration("llvm.maximum.", &[ty_f16xn]);
                 let value = intrinsic.emit_call(ty_f16xn, &[as_half(a), as_half(b)]);
-                float_result(self, value)
+                float_result(self, propagate_nan(as_half(a), as_half(b), value))
             }
             I::V_PK_ADD_U16 => {
                 let value = llvm::core::LLVMBuildAdd(
@@ -9169,7 +9220,18 @@ impl IREmitter {
                             signed_form && (inst.neg & 1) != 0,
                             signed_form && (inst.neg & 2) != 0,
                         ];
-                        let mut sum = addend;
+                        // CLAMP saturates an integer result, so the sum is
+                        // accumulated wider than the destination.
+                        let ty_i64 = llvm::core::LLVMInt64TypeInContext(context);
+                        let ty_i64xn = llvm::core::LLVMVectorType(ty_i64, N as u32);
+                        let extend = |value: llvm::prelude::LLVMValueRef| {
+                            if signed_form {
+                                llvm::core::LLVMBuildSExt(builder, value, ty_i64xn, empty_name.as_ptr())
+                            } else {
+                                llvm::core::LLVMBuildZExt(builder, value, ty_i64xn, empty_name.as_ptr())
+                            }
+                        };
+                        let mut sum = extend(addend);
                         for term in 0..terms {
                             let mut factors = [std::ptr::null_mut(); 2];
                             for position in 0..2 {
@@ -9213,11 +9275,52 @@ impl IREmitter {
                             sum = llvm::core::LLVMBuildAdd(
                                 builder,
                                 sum,
-                                product,
+                                extend(product),
                                 empty_name.as_ptr(),
                             );
                         }
-                        sum
+                        if inst.cm != 0 {
+                            let bound = |value: u64| {
+                                llvm::core::LLVMConstVector(
+                                    [llvm::core::LLVMConstInt(ty_i64, value, 0); N].as_mut_ptr(),
+                                    N as u32,
+                                )
+                            };
+                            let (low, high) = if signed_form {
+                                (i32::MIN as i64 as u64, i32::MAX as u64)
+                            } else {
+                                (0, u32::MAX as u64)
+                            };
+                            let below = llvm::core::LLVMBuildICmp(
+                                builder,
+                                llvm::LLVMIntPredicate::LLVMIntSLT,
+                                sum,
+                                bound(low),
+                                empty_name.as_ptr(),
+                            );
+                            let above = llvm::core::LLVMBuildICmp(
+                                builder,
+                                llvm::LLVMIntPredicate::LLVMIntSGT,
+                                sum,
+                                bound(high),
+                                empty_name.as_ptr(),
+                            );
+                            sum = llvm::core::LLVMBuildSelect(
+                                builder,
+                                below,
+                                bound(low),
+                                sum,
+                                empty_name.as_ptr(),
+                            );
+                            sum = llvm::core::LLVMBuildSelect(
+                                builder,
+                                above,
+                                bound(high),
+                                sum,
+                                empty_name.as_ptr(),
+                            );
+                        }
+                        llvm::core::LLVMBuildTrunc(builder, sum, ty_i32xn, empty_name.as_ptr())
                     };
 
                     emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i as u32, d_value, mask);

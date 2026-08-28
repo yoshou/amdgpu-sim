@@ -538,6 +538,27 @@ fn sub_f32(a: f32, b: f32) -> f32 {
     }
 }
 
+/// What CLAMP asks of an integer dot product: the sum is accumulated wider
+/// than the destination, and saturates into it rather than wrapping.
+fn saturate_dot(value: i64, clamp: bool, signed: bool) -> u32 {
+    if !clamp {
+        return value as u32;
+    }
+    if signed {
+        value.clamp(i32::MIN as i64, i32::MAX as i64) as u32
+    } else {
+        value.clamp(0, u32::MAX as i64) as u32
+    }
+}
+
+fn quiet_nan_f16(value: f16) -> f16 {
+    if value.is_nan() {
+        f16::from_bits(value.to_bits() | 0x0200)
+    } else {
+        value
+    }
+}
+
 fn quiet_nan_f32(value: f32) -> f32 {
     if value.is_nan() {
         f32::from_bits(value.to_bits() | 0x0040_0000)
@@ -618,11 +639,12 @@ fn clamp_i16(value: i64, clamp: bool) -> u16 {
 
 fn clamp_f16(value: f16, clamp: bool) -> f16 {
     if clamp {
-        // CLAMP turns a NaN into zero rather than passing it through.
+        // CLAMP turns a NaN into zero rather than passing it through, and
+        // clamping to [0.0, 1.0] answers either zero with the positive one.
         if value.is_nan() {
             f16::from_f32(0.0)
         } else {
-            f16::from_f32(value.to_f32().clamp(0.0, 1.0))
+            f16::from_f32(value.to_f32().clamp(0.0, 1.0) + 0.0)
         }
     } else {
         value
@@ -658,9 +680,9 @@ fn max_num_f16(a: f16, b: f16) -> f16 {
 /// decides between the two zeroes.
 fn minimum_f16(a: f16, b: f16) -> f16 {
     if a.is_nan() {
-        a
+        quiet_nan_f16(a)
     } else if b.is_nan() {
-        b
+        quiet_nan_f16(b)
     } else if a.to_f32() == 0.0 && b.to_f32() == 0.0 {
         if a.to_bits() & 0x8000 != 0 {
             a
@@ -676,9 +698,9 @@ fn minimum_f16(a: f16, b: f16) -> f16 {
 
 fn maximum_f16(a: f16, b: f16) -> f16 {
     if a.is_nan() {
-        a
+        quiet_nan_f16(a)
     } else if b.is_nan() {
-        b
+        quiet_nan_f16(b)
     } else if a.to_f32() == 0.0 && b.to_f32() == 0.0 {
         if a.to_bits() & 0x8000 == 0 {
             a
@@ -699,11 +721,12 @@ fn bf16_to_f32(value: u16) -> f32 {
 
 fn clamp_f32(value: f32, clamp: bool) -> f32 {
     if clamp {
-        // CLAMP turns a NaN into zero rather than passing it through.
+        // CLAMP turns a NaN into zero rather than passing it through, and
+        // clamping to [0.0, 1.0] answers either zero with the positive one.
         if value.is_nan() {
             0.0
         } else {
-            value.clamp(0.0, 1.0)
+            value.clamp(0.0, 1.0) + 0.0
         }
     } else {
         value
@@ -712,11 +735,12 @@ fn clamp_f32(value: f32, clamp: bool) -> f32 {
 
 fn clamp_f64(value: f64, clamp: bool) -> f64 {
     if clamp {
-        // CLAMP turns a NaN into zero rather than passing it through.
+        // CLAMP turns a NaN into zero rather than passing it through, and
+        // clamping to [0.0, 1.0] answers either zero with the positive one.
         if value.is_nan() {
             0.0
         } else {
-            value.clamp(0.0, 1.0)
+            value.clamp(0.0, 1.0) + 0.0
         }
     } else {
         value
@@ -733,11 +757,12 @@ fn f16_to_u32_omod_clamp(value: f16, omod: u8, clamp: bool) -> u32 {
         _ => value.to_f32(),
     };
     let clamped = if clamp {
-        // CLAMP turns a NaN into zero rather than passing it through.
+        // CLAMP turns a NaN into zero rather than passing it through, and
+        // clamping to [0.0, 1.0] answers either zero with the positive one.
         if scaled.is_nan() {
             0.0
         } else {
-            scaled.clamp(0.0, 1.0)
+            scaled.clamp(0.0, 1.0) + 0.0
         }
     } else {
         scaled
@@ -10864,16 +10889,16 @@ impl SIMD32 {
                 self.v_dot2_f32_bf16(d, s0, s1, s2, neg, neg_hi, opsel, opsel_hi);
             }
             I::V_DOT4_U32_U8 => {
-                self.v_dot4_u32_u8(d, s0, s1, s2, opsel, opsel_hi);
+                self.v_dot4_u32_u8(d, s0, s1, s2, opsel, opsel_hi, clamp);
             }
             I::V_DOT4_I32_IU8 => {
-                self.v_dot4_i32_iu8(d, s0, s1, s2, neg, opsel, opsel_hi);
+                self.v_dot4_i32_iu8(d, s0, s1, s2, neg, opsel, opsel_hi, clamp);
             }
             I::V_DOT8_U32_U4 => {
-                self.v_dot8_u32_u4(d, s0, s1, s2, opsel, opsel_hi);
+                self.v_dot8_u32_u4(d, s0, s1, s2, opsel, opsel_hi, clamp);
             }
             I::V_DOT8_I32_IU4 => {
-                self.v_dot8_i32_iu4(d, s0, s1, s2, neg, opsel, opsel_hi);
+                self.v_dot8_i32_iu4(d, s0, s1, s2, neg, opsel, opsel_hi, clamp);
             }
             I::V_FMA_MIX_F32 => {
                 self.v_fma_mix_f32(d, s0, s1, s2, neg_hi, neg, clamp, opsel, opsel_hi);
@@ -11553,6 +11578,7 @@ impl SIMD32 {
         s2: SourceOperand,
         opsel: u8,
         opsel_hi: u8,
+        clamp: bool,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -11570,12 +11596,14 @@ impl SIMD32 {
                 opsel_hi,
                 1,
             );
-            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i32 as i64;
+            // The accumulator of an unsigned dot product is unsigned,
+            // which is where its saturation counts from.
+            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i64;
             for term in 0..4 {
                 let shift = term * 8;
                 d_value += ((s0_value >> shift) as u8 as i64) * ((s1_value >> shift) as u8 as i64);
             }
-            self.write_vgpr(elem, d, d_value as u32);
+            self.write_vgpr(elem, d, saturate_dot(d_value, clamp, false));
         }
     }
 
@@ -11590,6 +11618,7 @@ impl SIMD32 {
         neg: u8,
         opsel: u8,
         opsel_hi: u8,
+        clamp: bool,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -11618,7 +11647,7 @@ impl SIMD32 {
                 let b = if s1_signed { b as i8 as i64 } else { b as i64 };
                 d_value += a * b;
             }
-            self.write_vgpr(elem, d, d_value as u32);
+            self.write_vgpr(elem, d, saturate_dot(d_value, clamp, true));
         }
     }
 
@@ -11631,6 +11660,7 @@ impl SIMD32 {
         s2: SourceOperand,
         opsel: u8,
         opsel_hi: u8,
+        clamp: bool,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -11648,13 +11678,15 @@ impl SIMD32 {
                 opsel_hi,
                 1,
             );
-            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i32 as i64;
+            // The accumulator of an unsigned dot product is unsigned,
+            // which is where its saturation counts from.
+            let mut d_value = self.read_vector_source_operand_u32(elem, s2) as i64;
             for term in 0..8 {
                 let shift = term * 4;
                 d_value +=
                     (((s0_value >> shift) & 0xF) as i64) * (((s1_value >> shift) & 0xF) as i64);
             }
-            self.write_vgpr(elem, d, d_value as u32);
+            self.write_vgpr(elem, d, saturate_dot(d_value, clamp, false));
         }
     }
 
@@ -11668,6 +11700,7 @@ impl SIMD32 {
         neg: u8,
         opsel: u8,
         opsel_hi: u8,
+        clamp: bool,
     ) {
         for elem in 0..32 {
             if !self.get_exec_bit(elem) {
@@ -11704,7 +11737,7 @@ impl SIMD32 {
                 };
                 d_value += a * b;
             }
-            self.write_vgpr(elem, d, d_value as u32);
+            self.write_vgpr(elem, d, saturate_dot(d_value, clamp, true));
         }
     }
 

@@ -50,6 +50,7 @@ pub(crate) fn v_add_f32_vop3() {
             Vop3F32 { src0: Src::Vgpr(0xC020_0000), src1: Src::Vgpr(0x3FC0_0000), src2: Src::Vgpr(0), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0xC080_0000 }, // neg on src1
             Vop3F32 { src0: Src::Vgpr(0xC020_0000), src1: Src::Vgpr(0x3FC0_0000), src2: Src::Vgpr(0), abs: 3, neg: 3, clamp: false, omod: 0, expected: 0xC080_0000 }, // abs then neg on both
             Vop3F32 { src0: Src::Vgpr(0xC020_0000), src1: Src::Vgpr(0x3FC0_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0000 }, // clamp
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0000 }, // clamp of a negative zero
             Vop3F32 { src0: Src::Vgpr(0xC020_0000), src1: Src::Vgpr(0x3FC0_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 1, expected: 0xC000_0000 }, // omod x2
             Vop3F32 { src0: Src::Vgpr(0xC020_0000), src1: Src::Vgpr(0x3FC0_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 2, expected: 0xC080_0000 }, // omod x4
             Vop3F32 { src0: Src::Vgpr(0xC020_0000), src1: Src::Vgpr(0x3FC0_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 3, expected: 0xBF00_0000 }, // omod /2
@@ -109,6 +110,7 @@ pub(crate) fn v_add_f64_vop3() {
             Vop3F64 { src0: Src::Vgpr(0xC004_0000_0000_0000), src1: Src::Vgpr(0x3FF8_0000_0000_0000), src2: Src::Vgpr(0), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0xC010_0000_0000_0000 }, // neg on src1
             Vop3F64 { src0: Src::Vgpr(0xC004_0000_0000_0000), src1: Src::Vgpr(0x3FF8_0000_0000_0000), src2: Src::Vgpr(0), abs: 3, neg: 3, clamp: false, omod: 0, expected: 0xC010_0000_0000_0000 }, // abs then neg on both
             Vop3F64 { src0: Src::Vgpr(0xC004_0000_0000_0000), src1: Src::Vgpr(0x3FF8_0000_0000_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0000_0000_0000 }, // clamp
+            Vop3F64 { src0: Src::Vgpr(0x8000_0000_0000_0000), src1: Src::Vgpr(0x8000_0000_0000_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0000_0000_0000 }, // clamp of a negative zero
             Vop3F64 { src0: Src::Vgpr(0xC004_0000_0000_0000), src1: Src::Vgpr(0x3FF8_0000_0000_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 1, expected: 0xC000_0000_0000_0000 }, // omod x2
             Vop3F64 { src0: Src::Vgpr(0xC004_0000_0000_0000), src1: Src::Vgpr(0x3FF8_0000_0000_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 2, expected: 0xC010_0000_0000_0000 }, // omod x4
             Vop3F64 { src0: Src::Vgpr(0xC004_0000_0000_0000), src1: Src::Vgpr(0x3FF8_0000_0000_0000), src2: Src::Vgpr(0), abs: 0, neg: 0, clamp: false, omod: 3, expected: 0xBFE0_0000_0000_0000 }, // omod /2
