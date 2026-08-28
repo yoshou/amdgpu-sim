@@ -801,3 +801,59 @@ fn image_bvh8_intersect_ray_unsorted() {
         ],
     }]);
 }
+
+#[test]
+fn image_bvh8_intersect_ray_every_pair() {
+    // A packet holds up to eight pairs of triangles, and the node type says
+    // which of them the instruction tests: types 0 to 3 name the first four
+    // and types 8 to 11 the last four. The pairs here are the same two
+    // triangles wound both ways, so every type answers differently.
+    let node = || {
+        packet_node(
+            &[
+                [0.0, 0.0, 1.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 1.0, 1.0],
+                [2.0, 0.0, 1.0],
+                [3.0, 0.0, 1.0],
+                [2.0, 1.0, 1.0],
+            ],
+            &[
+                PacketPair { first: [0, 1, 2], second: None, range_end: false },
+                PacketPair { first: [3, 4, 5], second: None, range_end: false },
+                PacketPair { first: [2, 1, 0], second: None, range_end: false },
+                PacketPair { first: [5, 4, 3], second: None, range_end: false },
+                PacketPair { first: [0, 1, 2], second: Some([3, 4, 5]), range_end: false },
+                PacketPair { first: [3, 4, 5], second: Some([0, 1, 2]), range_end: false },
+                PacketPair { first: [2, 1, 0], second: None, range_end: false },
+                PacketPair { first: [5, 4, 3], second: None, range_end: true },
+            ],
+            6,
+            6,
+            700,
+            &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+        )
+    };
+    // The ray meets whichever of the two triangles the pair holds first.
+    let ray = |node_type: u32| {
+        let pair = (node_type & 3) + ((node_type & 8) >> 1);
+        let x = if pair % 2 == 0 { 0.25 } else { 2.25 };
+        ray8(node_type, 100.0, 0xFF, [x, 0.25, 0.0], [0.0, 0.0, 1.0])
+    };
+    let case = |node_type: u32, expected: [u32; 10]| VimageCase {
+        node: node(),
+        ray: ray(node_type),
+        expected,
+    };
+
+    bvh8(&[
+        case(0, [0x3F80_0000, 0x3E80_0000, 0x3E80_0000, 0x0000_0015, 0x7F80_0000, 0xFFC0_0000, 0xFFC0_0000, 0x0000_0016, 0x0000_0000, 0x0000_0000]),
+        case(1, [0x3F80_0000, 0x3E80_0000, 0x3E80_0000, 0x0000_0019, 0x7F80_0000, 0xFFC0_0000, 0xFFC0_0000, 0x0000_001A, 0x0000_0000, 0x0000_0000]),
+        case(2, [0x3F80_0000, 0x3E80_0000, 0x3F00_0000, 0x0000_001C, 0x7F80_0000, 0xFFC0_0000, 0xFFC0_0000, 0x0000_001E, 0x0000_0000, 0x0000_0000]),
+        case(3, [0x3F80_0000, 0x3E80_0000, 0x3F00_0000, 0x0000_0020, 0x7F80_0000, 0xFFC0_0000, 0xFFC0_0000, 0x0000_0022, 0x0000_0000, 0x0000_0000]),
+        case(8, [0x3F80_0000, 0x3E80_0000, 0x3E80_0000, 0x0000_0025, 0x7F80_0000, 0xBFE0_0000, 0x3E80_0000, 0x0000_0027, 0x0000_0000, 0x0000_0000]),
+        case(9, [0x3F80_0000, 0x3E80_0000, 0x3E80_0000, 0x0000_0029, 0x7F80_0000, 0x4010_0000, 0x3E80_0000, 0x0000_002B, 0x0000_0000, 0x0000_0000]),
+        case(10, [0x3F80_0000, 0x3E80_0000, 0x3F00_0000, 0x0000_002C, 0x7F80_0000, 0xFFC0_0000, 0xFFC0_0000, 0x0000_002E, 0x0000_0000, 0x0000_0000]),
+        case(11, [0x3F80_0000, 0x3E80_0000, 0x3F00_0000, 0x0000_0030, 0x7F80_0000, 0xFFC0_0000, 0xFFC0_0000, 0x0000_003A, 0x0000_0003, 0x0000_0003]),
+    ]);
+}

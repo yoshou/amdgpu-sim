@@ -850,7 +850,7 @@ pub extern "C" fn image_bvh8_intersect_ray(
     let box_sort = bvh_sorts_boxes(r1);
     let node_type = (node_index & 0xF) as u8;
     match node_type {
-        0..3 | 8..11 => {
+        0..=3 | 8..=11 => {
             let tri_pair_index = (node_type & 3) + ((node_type & 8) >> 1);
             let node = unsafe { *(node_ptr as *const TrianglePacketNode) };
             let tri0 = node.fetch_triangle(tri_pair_index as u32, 0);
