@@ -4932,7 +4932,9 @@ impl IREmitter {
                 let s0_value = emitter.emit_scalar_source_operand_u32(&inst.src0);
                 let s0_value =
                     llvm::core::LLVMBuildBitCast(builder, s0_value, ty_f32, empty_name.as_ptr());
+                let s0_value = emitter.emit_ftz_f32(s0_value);
                 let s0_value = emitter.emit_abs_neg_f32(inst.abs, inst.neg, s0_value, 0);
+                let s0_value = emitter.emit_ftz_f32(s0_value);
 
                 let d_value = llvm::core::LLVMBuildFDiv(
                     builder,
@@ -4941,6 +4943,11 @@ impl IREmitter {
                     empty_name.as_ptr(),
                 );
 
+                // The output modifier and the clamp belong to the result the
+                // same way they do in the vector form, and the denormals the
+                // ISA says are flushed are flushed on both sides of it.
+                let d_value = emitter.emit_vop3_omod_clamp(inst.omod, inst.cm, d_value);
+                let d_value = emitter.emit_ftz_f32(d_value);
                 emitter.emit_store_sgpr_f32(inst.vdst as u32, d_value);
             }
             I::V_MUL_LO_U32 => {

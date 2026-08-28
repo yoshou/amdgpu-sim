@@ -210,6 +210,25 @@ pub(crate) const fn vmem(
     ]
 }
 
+/// The same, with the cache fields the FLAT family carries: SCOPE and the
+/// temporal hint. For an atomic, TH[0] is what asks for the value the memory
+/// held before the operation.
+/// word1 [19:18] = SCOPE, [22:20] = TH.
+pub(crate) const fn vmem_hint(
+    enc: u32,
+    op: u32,
+    vdst: u32,
+    vsrc: u32,
+    vaddr: u32,
+    saddr: u32,
+    ioffset: i32,
+    th: u32,
+    scope: u32,
+) -> [u32; 3] {
+    let [w0, w1, w2] = vmem(enc, op, vdst, vsrc, vaddr, saddr, ioffset);
+    [w0, w1 | (scope << 18) | (th << 20), w2]
+}
+
 /// A SCRATCH instruction: three dwords, laid out like the FLAT family but with
 /// an SVE bit that says whether VADDR takes part.
 /// word0 [31:24] = encoding, [21:14] = OP, [6:0] = SADDR.

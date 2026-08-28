@@ -3377,7 +3377,10 @@ impl Cg {
                 );
                 result = llvm::core::LLVMBuildInsertElement(self.b, result, old, self.ci32(k), self.n());
             }
-            self.st_vgpr32(i.vdst as u32, result);
+            // Table 15: TH[0] says whether the pre-op value is returned.
+            if i.th & 1 != 0 {
+                self.st_vgpr32(i.vdst as u32, result);
+            }
             return;
         }
 

@@ -108,6 +108,72 @@ pub(crate) fn check_vmem_store(enc: u32, op: u32, cases: &[MemStore]) {
     report(failures, cases.len() * 2);
 }
 
+/// A GLOBAL atomic. Lane `n` operates on word `n` of the buffer, so the case
+/// states both what the word became and what the destination register holds.
+pub(crate) struct MemAtomic {
+    /// The temporal hint. Table 15: TH[0] asks the atomic to return the value
+    /// the memory held before the operation.
+    pub(crate) th: u32,
+    pub(crate) ioffset: i32,
+    pub(crate) saddr: u32,
+    /// The value the lane adds.
+    pub(crate) addend: u32,
+    /// The lane's word in the buffer afterwards.
+    pub(crate) expected_data: u32,
+    /// The destination register of the lane the case is read from. A
+    /// non-returning atomic leaves it as the harness set it, which is zero.
+    pub(crate) expected_vdst: u32,
+}
+
+/// A GLOBAL atomic, checked by both what it left in memory and what it
+/// returned.
+pub(crate) fn check_vmem_atomic(enc: u32, op: u32, cases: &[MemAtomic]) {
+    let harness = Harness::mem();
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let words = vmem_hint(enc, op, 6, 2, 0, case.saddr, case.ioffset, case.th, 0).to_vec();
+        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+            let out = read_all(&harness, engine, &words, case.addend as u64);
+            let (data, vdst) = (out[DATA], out[VDST]);
+            if data == case.expected_data && vdst == case.expected_vdst {
+                continue;
+            }
+            failures.push(format!(
+                "  {:<11} case {} th={} addend=0x{:08X} ioffset={} hardware=(buffer 0x{:08X}, vdst 0x{:08X}) simulator=(buffer 0x{:08X}, vdst 0x{:08X})",
+                engine_name(engine), i, case.th, case.addend, case.ioffset,
+                case.expected_data, case.expected_vdst, data, vdst,
+            ));
+        }
+    }
+    report(failures, cases.len() * 2);
+}
+
+/// An instruction that acts on the caches alone. Nothing it does is visible to
+/// the shader, so the case is that every destination and the buffer are as the
+/// harness left them.
+pub(crate) fn check_vmem_cache_op(enc: u32, op: u32, scopes: &[u32]) {
+    let harness = Harness::mem();
+    let mut failures = Vec::new();
+    for (i, &scope) in scopes.iter().enumerate() {
+        let words = vmem_hint(enc, op, 0, 0, 0, SADDR_NULL, 0, 0, scope).to_vec();
+        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+            let out = read_all(&harness, engine, &words, 0);
+            let touched: Vec<usize> = (0..4)
+                .filter(|&k| out[VDST + k] != 0)
+                .chain((0..8).filter(|&k| out[SDST + k] != 0).map(|k| 4 + k))
+                .collect();
+            if touched.is_empty() && out[DATA] == data_word(0) {
+                continue;
+            }
+            failures.push(format!(
+                "  {:<11} case {} scope={} hardware=(no register written, buffer 0x{:08X}) simulator=(registers {:?} written, buffer 0x{:08X})",
+                engine_name(engine), i, scope, data_word(0), touched, out[DATA],
+            ));
+        }
+    }
+    report(failures, scopes.len() * 2);
+}
+
 /// An SMEM load, which reads through a wave-uniform base in s[10:11] and writes
 /// SGPRs.
 pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
@@ -133,6 +199,38 @@ pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
         }
     }
     report(failures, cases.len() * 2);
+}
+
+#[test]
+fn global_atomic_add_u32_atomic() {
+    // GLOBAL_ATOMIC_ADD_U32.
+    // Lane n adds to word n of the buffer. Table 15: TH[0] asks for the
+    // value the memory held before the operation, and the case states
+    // both that value and what the word became.
+    check_vmem_atomic(
+        VGLOBAL,
+        53,
+        &[
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0x0000_0000 }, // TH 0
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0xA000_0000 }, // TH 1
+            MemAtomic { th: 2, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0x0000_0000 }, // TH 2
+            MemAtomic { th: 3, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0xA000_0000 }, // TH 3
+            MemAtomic { th: 4, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0x0000_0000 }, // TH 4
+            MemAtomic { th: 5, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0xA000_0000 }, // TH 5
+            MemAtomic { th: 6, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0x0000_0000 }, // TH 6
+            MemAtomic { th: 7, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0010, expected_vdst: 0xA000_0000 }, // TH 7
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0000, expected_data: 0xA000_0000, expected_vdst: 0xA000_0000 }, // adding nothing
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0000, expected_data: 0xA000_0000, expected_vdst: 0x0000_0000 }, // adding nothing
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0xFFFF_FFFF, expected_data: 0x9FFF_FFFF, expected_vdst: 0xA000_0000 }, // wrapping
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0xFFFF_FFFF, expected_data: 0x9FFF_FFFF, expected_vdst: 0x0000_0000 }, // wrapping
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0001, expected_data: 0xA000_0001, expected_vdst: 0xA000_0000 }, // adding one
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0001, expected_data: 0xA000_0001, expected_vdst: 0x0000_0000 }, // adding one
+            MemAtomic { th: 1, ioffset: 4, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0000, expected_vdst: 0xA101_0101 }, // offset 4
+            MemAtomic { th: 0, ioffset: 4, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0000, expected_vdst: 0x0000_0000 }, // offset 4
+            MemAtomic { th: 1, ioffset: 64, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0000, expected_vdst: 0xB010_1010 }, // offset 64
+            MemAtomic { th: 0, ioffset: 64, saddr: SADDR_NULL, addend: 0x0000_0010, expected_data: 0xA000_0000, expected_vdst: 0x0000_0000 }, // offset 64
+        ],
+    );
 }
 
 #[test]
@@ -405,6 +503,20 @@ fn global_store_b96_store() {
             MemStore { store_value: 0xCAFE_BABE_1234_5678, ioffset: 4, saddr: SADDR_NULL, expected_data: 0xA000_0000 },
         ],
     );
+}
+
+#[test]
+fn global_inv_cache() {
+    // GLOBAL_INV. The instruction acts on the caches alone: at every scope the
+    // part leaves each destination as the harness set it and the buffer as it
+    // was.
+    check_vmem_cache_op(VGLOBAL, 43, &[0, 1, 2, 3]);
+}
+
+#[test]
+fn global_wb_cache() {
+    // GLOBAL_WB. As above: nothing the shader can see changes at any scope.
+    check_vmem_cache_op(VGLOBAL, 44, &[0, 1, 2, 3]);
 }
 
 #[test]

@@ -10475,7 +10475,9 @@ impl SIMD32 {
             neg,
             0,
         );
-        let d_value = 1.0 / s0_value;
+        // ISA: "Denormals are flushed", on the way in and on the way out,
+        // the same as the vector form of the instruction.
+        let d_value = ftz_f32(1.0 / ftz_f32(s0_value));
         self.write_sgpr(d, f32_to_u32_omod_clamp(d_value, omod, clamp));
     }
 
@@ -14220,7 +14222,7 @@ impl SIMD32 {
                 self.global_load_b128(vaddr, vdst, saddr, ioffset);
             }
             I::GLOBAL_ATOMIC_ADD_U32 => {
-                self.global_atomic_add_u32(vaddr, vdst, vsrc, saddr, ioffset);
+                self.global_atomic_add_u32(vaddr, vdst, vsrc, saddr, ioffset, inst.th);
             }
             I::GLOBAL_LOAD_I8 => {
                 self.global_load_i8(vaddr, vdst, saddr, ioffset);
@@ -14481,7 +14483,11 @@ impl SIMD32 {
         vsrc: usize,
         saddr: usize,
         ioffset: u32,
+        th: u8,
     ) {
+        // Table 15: for a read-modify-write atomic, TH[0] says whether the
+        // value the memory held before the operation is returned at all.
+        let returns = th & 1 != 0;
         let offset = (0..32)
             .map(|elem| {
                 if saddr != 124 {
@@ -14504,7 +14510,9 @@ impl SIMD32 {
                 use std::sync::atomic::{AtomicU32, Ordering};
                 AtomicU32::from_ptr(ptr).fetch_add(data, Ordering::SeqCst)
             };
-            self.write_vgpr(elem, vdst, data);
+            if returns {
+                self.write_vgpr(elem, vdst, data);
+            }
         }
     }
 

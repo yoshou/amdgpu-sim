@@ -923,7 +923,11 @@ impl IREmitter {
                         result_vec = phi;
                     }
 
-                    emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, result_vec, mask);
+                    // Table 15: TH[0] says whether the value the memory held
+                    // before the operation is returned at all.
+                    if inst.th & 1 != 0 {
+                        emitter.emit_store_vgpr_u32xn::<N>(inst.vdst as u32, i, result_vec, mask);
+                    }
                 }
 
                 bb = llvm::core::LLVMGetInsertBlock(builder);

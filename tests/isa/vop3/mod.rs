@@ -354,7 +354,84 @@ pub(crate) fn check_vop3sd(op: u32, cases: &[Vop3sdCase]) {
     );
 }
 
+/// One case for a VOP3 instruction that reads its source as a scalar and
+/// writes an SGPR: the wave computes one result, so the case states the one
+/// word it wrote.
+pub(crate) struct Vop3ScalarF32 {
+    src0: Src,
+    /// One bit per source position.
+    abs: u32,
+    /// One bit per source position.
+    neg: u32,
+    clamp: bool,
+    /// 0 = x1, 1 = x2, 2 = x4, 3 = /2.
+    omod: u32,
+    expected: u32,
+}
+
+/// Comparison of such an instruction against captured hardware, with a
+/// tolerance on finite non-zero results.
+pub(crate) fn check_vop3_scalar_f32_ulp(op: u32, ulp: i64, cases: &[Vop3ScalarF32]) {
+    let harness = Harness::vop3();
+
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let mut uni = vec![0u32; 8];
+        let mut literal = Vec::new();
+        let field = match case.src0 {
+            Src::Sgpr(value) => {
+                uni[0] = value as u32;
+                uni[1] = (value >> 32) as u32;
+                10
+            }
+            Src::Inline(encoding) => encoding,
+            Src::Literal(value) => {
+                literal.push(value as u32);
+                255
+            }
+            Src::Vgpr(_) => unreachable!("a scalar instruction has no vector source"),
+        };
+        let src = vec![0u32; LANES * harness.src_stride];
+        let mut words = vop3(op, SDST, field, 0, 0, case.abs, case.neg, case.clamp, case.omod)
+            .to_vec();
+        words.extend(literal);
+
+        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+            let got = harness.run(engine, &words, &src, &uni)[2];
+            if got == case.expected {
+                continue;
+            }
+            // Special values are pinned by the manual in every case, so the
+            // tolerance never applies to them.
+            let special = is_nan_f32(case.expected)
+                || is_nan_f32(got)
+                || is_zero_f32(case.expected)
+                || is_zero_f32(got)
+                || is_inf_f32(case.expected)
+                || is_inf_f32(got);
+            let distance = ulp_f32(got, case.expected);
+            if !special && distance <= ulp {
+                continue;
+            }
+            failures.push(format!(
+                "  {:<11} case {} (abs={:#03b} neg={:#03b} clamp={} omod={}) hardware={} simulator={}{}",
+                engine_name(engine), i, case.abs, case.neg, case.clamp, case.omod,
+                show_f32(case.expected), show_f32(got),
+                if special { String::new() } else { format!(" ({} ULP, allowed {})", distance, ulp) },
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} case-results differ from hardware:\n{}",
+        failures.len(),
+        cases.len() * 2,
+        failures.join("\n"),
+    );
+}
+
 mod binary;
+mod scalar_alu;
 mod scalar_dst;
 mod ternary;
 mod unary;
