@@ -265,9 +265,15 @@ impl RDNATranslator {
                 }
             }
 
+            // Every register the kernel touches starts from what the register
+            // file holds. A register written under a partial EXEC mask keeps
+            // the file's value in the lanes the mask leaves out, and the block
+            // that writes it back needs that value: without it those lanes are
+            // undefined, which the optimizer is free to turn into anything at
+            // all once a later block reads them.
             reg_usage.incomming_vgprs.clear();
 
-            for reg in 0..1 {
+            for reg in 0..256 {
                 if reg_usage.use_vgprs.contains(&reg) || reg_usage.def_vgprs.contains(&reg) {
                     reg_usage.incomming_vgprs.insert(reg);
                 }
