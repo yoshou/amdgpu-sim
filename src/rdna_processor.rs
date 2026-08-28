@@ -14584,17 +14584,10 @@ impl SIMD32 {
 
                     // The children are sorted only if the resource asks for
                     // it; otherwise they come back in the order the node holds
-                    // them. Ranking them is work the common case does not
-                    // need, so the two orders have a pass each.
-                    if box_sort && sort_triangles_first {
+                    // them.
+                    if box_sort {
                         for (a, b) in BOX4_NETWORK {
-                            if sorts_before(children[b], children[a]) {
-                                children.swap(a, b);
-                            }
-                        }
-                    } else if box_sort {
-                        for (a, b) in BOX4_NETWORK {
-                            if closer_than(children[b], children[a]) {
+                            if child_order(children[b], children[a]).is_lt() {
                                 children.swap(a, b);
                             }
                         }
@@ -14771,13 +14764,7 @@ impl SIMD32 {
                     let results = if box_sort {
                         results
                             .into_iter()
-                            .sorted_by(|&a, &b| {
-                                if sorts_before(b, a) {
-                                    std::cmp::Ordering::Greater
-                                } else {
-                                    std::cmp::Ordering::Less
-                                }
-                            })
+                            .sorted_by(|&a, &b| child_order(a, b))
                             .map(|(index, _, _)| index)
                             .collect::<Vec<u32>>()
                     } else {

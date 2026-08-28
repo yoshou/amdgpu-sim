@@ -163,21 +163,20 @@ pub(crate) fn box8_child_rank(node_type: u32) -> u32 {
     }
 }
 
-/// Whether the child `b` belongs before the child `a` when the resource sorts
-/// its boxes and nothing else: one the ray never reached goes last, and the
-/// rest go by the time the ray enters them.
-pub(crate) fn closer_than(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
-    (b.0 != 0xFFFF_FFFF && b.2 < a.2) || a.0 == 0xFFFF_FFFF
-}
-
 /// The network the part sorts its four children with.
 pub(crate) const BOX4_NETWORK: [(usize, usize); 5] = [(0, 2), (1, 3), (0, 1), (2, 3), (1, 2)];
 
-/// Whether the child `b` belongs before the child `a`: one the ray never
-/// reached goes last, and the rest go by rank and then by the time the ray
-/// enters them. Each child is its pointer, its rank and that time.
-pub(crate) fn sorts_before(b: (u32, u32, f32), a: (u32, u32, f32)) -> bool {
-    (b.0 != 0xFFFF_FFFF && (b.1 < a.1 || (b.1 == a.1 && b.2 < a.2))) || a.0 == 0xFFFF_FFFF
+/// The order the children come back in: one the ray never reached goes last,
+/// and the rest go by rank and then by the time the ray enters them. Two the
+/// order has nothing to separate keep the order the node holds them in, which
+/// is why this answers `Equal` rather than picking one. Each child is its
+/// pointer, its rank and that time. A child that is not ranked has rank zero,
+/// so this is the plain nearest-first order as well.
+pub(crate) fn child_order(a: (u32, u32, f32), b: (u32, u32, f32)) -> std::cmp::Ordering {
+    (a.0 == 0xFFFF_FFFF)
+        .cmp(&(b.0 == 0xFFFF_FFFF))
+        .then(a.1.cmp(&b.1))
+        .then(a.2.total_cmp(&b.2))
 }
 
 /// The base of the BVH the resource names, which the node pointers count from.
@@ -447,17 +446,9 @@ pub extern "C" fn image_bvh64_intersect_ray(
 
             // The children are sorted only if the resource asks for it;
             // otherwise they come back in the order the node holds them.
-            // Ranking them is work the common case does not need, so the two
-            // orders have a pass each.
-            if box_sort && sort_triangles_first {
+            if box_sort {
                 for (a, b) in BOX4_NETWORK {
-                    if sorts_before(children[b], children[a]) {
-                        children.swap(a, b);
-                    }
-                }
-            } else if box_sort {
-                for (a, b) in BOX4_NETWORK {
-                    if closer_than(children[b], children[a]) {
+                    if child_order(children[b], children[a]).is_lt() {
                         children.swap(a, b);
                     }
                 }
@@ -940,13 +931,7 @@ pub extern "C" fn image_bvh8_intersect_ray(
             let results = if box_sort {
                 results
                     .into_iter()
-                    .sorted_by(|&a, &b| {
-                        if sorts_before(b, a) {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Less
-                        }
-                    })
+                    .sorted_by(|&a, &b| child_order(a, b))
                     .map(|(index, _, _)| index)
                     .collect::<Vec<u32>>()
             } else {
