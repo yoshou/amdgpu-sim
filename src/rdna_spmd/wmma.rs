@@ -32,7 +32,7 @@ static APPLY: [OnceLock<u64>; 5] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
 
 fn apply_fn(width: usize) -> ApplyFn {
-    assert!(matches!(width, 1 | 2 | 4 | 8 | 16), "unsupported packet width {width}");
+    assert!(matches!(width, 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", width);
     let addr =
         *APPLY[width.trailing_zeros() as usize].get_or_init(|| unsafe { compile(width as u32) });
     unsafe { std::mem::transmute::<u64, ApplyFn>(addr) }
@@ -210,7 +210,7 @@ unsafe fn jit(module: llvm::prelude::LLVMModuleRef, symbol: &std::ffi::CStr) -> 
     ) != 0
     {
         let message = std::ffi::CStr::from_ptr(error).to_string_lossy().into_owned();
-        panic!("wmma: module failed verification:\n{message}");
+        panic!("wmma: module failed verification:\n{}", message);
     }
 
     let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
@@ -233,7 +233,7 @@ unsafe fn jit(module: llvm::prelude::LLVMModuleRef, symbol: &std::ffi::CStr) -> 
     if !failure.is_null() {
         let message = llvm::error::LLVMGetErrorMessage(failure);
         let message = std::ffi::CStr::from_ptr(message).to_string_lossy().into_owned();
-        panic!("wmma: optimization failed: {message}");
+        panic!("wmma: optimization failed: {}", message);
     }
 
     let builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();

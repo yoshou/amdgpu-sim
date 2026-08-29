@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::thread;
 
-use half::{f16, slice::HalfFloatSliceExt};
+use half::f16;
 
 use crate::instructions::I;
 use crate::processor::KernelDescriptor;
@@ -314,61 +314,6 @@ fn set_packet_vgpr(
     let packet = lane / width;
     let packet_lane = lane % width;
     vgprs[packet][reg * width + packet_lane] = value;
-}
-
-trait PacketLayout: Copy {
-    fn get(self, vgprs: &[Vec<u32>], lane: usize, reg: usize) -> u32;
-    fn set(self, vgprs: &mut [Vec<u32>], lane: usize, reg: usize, value: u32);
-}
-
-#[derive(Clone, Copy)]
-struct FixedPacketLayout<const WIDTH: usize>;
-
-impl<const WIDTH: usize> PacketLayout for FixedPacketLayout<WIDTH> {
-    #[inline(always)]
-    fn get(self, vgprs: &[Vec<u32>], lane: usize, reg: usize) -> u32 {
-        vgprs[lane / WIDTH][reg * WIDTH + lane % WIDTH]
-    }
-
-    #[inline(always)]
-    fn set(self, vgprs: &mut [Vec<u32>], lane: usize, reg: usize, value: u32) {
-        vgprs[lane / WIDTH][reg * WIDTH + lane % WIDTH] = value;
-    }
-}
-
-#[derive(Clone, Copy)]
-struct DynamicPacketLayout(usize);
-
-impl PacketLayout for DynamicPacketLayout {
-    #[inline(always)]
-    fn get(self, vgprs: &[Vec<u32>], lane: usize, reg: usize) -> u32 {
-        packet_vgpr(vgprs, self.0, lane, reg)
-    }
-
-    #[inline(always)]
-    fn set(self, vgprs: &mut [Vec<u32>], lane: usize, reg: usize, value: u32) {
-        set_packet_vgpr(vgprs, self.0, lane, reg, value);
-    }
-}
-
-#[inline(always)]
-fn unpack_f16_fragments(
-    mut read_a: impl FnMut(usize) -> u32,
-    mut read_b: impl FnMut(usize) -> u32,
-) -> [f32; 16] {
-    let mut halves = [f16::from_bits(0); 16];
-    for word_index in 0..4 {
-        let word_a = read_a(word_index);
-        let word_b = read_b(word_index);
-        halves[word_index * 2] = f16::from_bits(word_a as u16);
-        halves[word_index * 2 + 1] = f16::from_bits((word_a >> 16) as u16);
-        halves[8 + word_index * 2] = f16::from_bits(word_b as u16);
-        halves[8 + word_index * 2 + 1] = f16::from_bits((word_b >> 16) as u16);
-    }
-
-    let mut values = [0.0; 16];
-    halves.convert_to_f32_slice(&mut values);
-    values
 }
 
 fn eval_vector_packets(
@@ -849,8 +794,9 @@ mod tests {
                             !finite
                                 && f32::from_bits(actual).is_nan()
                                 && f32::from_bits(expected).is_nan(),
-                            "width={width}, lane={lane}, reg={reg}: \
-                             {actual:#010x} != {expected:#010x} (finite inputs: {finite})"
+                            "width={}, lane={}, reg={}: \
+                             {:#010x} != {:#010x} (finite inputs: {})",
+                            width, lane, reg, actual, expected, finite
                         );
                     }
                 }

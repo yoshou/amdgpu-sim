@@ -1864,7 +1864,6 @@ unsafe fn compile_inner(
     };
 
     let sgprs_p = llvm::core::LLVMGetParam(func, 0);
-    let vgprs_p = llvm::core::LLVMGetParam(func, 1);
     let scratch_base = llvm::core::LLVMGetParam(func, 2);
     let scratch_stride = llvm::core::LLVMGetParam(func, 3);
     let packet_lane_base = if coop {

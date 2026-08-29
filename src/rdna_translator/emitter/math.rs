@@ -1840,7 +1840,7 @@ impl IREmitter {
         );
         let ty_i32xn = llvm::core::LLVMTypeOf(value);
 
-        let mut widen = |bits: llvm::prelude::LLVMValueRef| {
+        let widen = |bits: llvm::prelude::LLVMValueRef| {
             let narrow = llvm::core::LLVMBuildTrunc(builder, bits, ty_i16xn, empty_name.as_ptr());
             let half = llvm::core::LLVMBuildBitCast(builder, narrow, ty_f16xn, empty_name.as_ptr());
             llvm::core::LLVMBuildFPExt(builder, half, ty_f32xn, empty_name.as_ptr())
@@ -2169,7 +2169,7 @@ impl IREmitter {
 
         let exponent_shift = self.const_int_like(ty_int, 52);
         let exponent_mask = self.const_int_like(ty_int, 0x7FF);
-        let mut exponent = |operand: llvm::prelude::LLVMValueRef| {
+        let exponent = |operand: llvm::prelude::LLVMValueRef| {
             let bits = llvm::core::LLVMBuildBitCast(builder, operand, ty_int, empty_name.as_ptr());
             llvm::core::LLVMBuildAnd(
                 builder,
