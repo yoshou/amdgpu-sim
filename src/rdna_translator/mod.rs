@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::c_ulonglong;
 use std::os::raw::c_void;
+use std::sync::Arc;
 
 mod bvh;
 mod emitter;
@@ -41,10 +42,52 @@ pub fn is_terminator(inst: &InstFormat) -> bool {
     }
 }
 
+/// The LLJIT a block was compiled into. The block's entry point is an address
+/// inside the code this JIT owns, so the JIT has to outlive every `InstBlock`
+/// that names it; the `Arc` in `InstBlock` is what keeps it alive, and dropping
+/// the last one releases the compiled code, its module and its ORC session.
+struct Lljit {
+    jit: llvm::orc2::lljit::LLVMOrcLLJITRef,
+    // The module the JIT owns was built in this context, so releasing the JIT
+    // reads from it; holding a reference keeps it alive until then.
+    _context: Arc<LlvmContext>,
+}
+
+unsafe impl Send for Lljit {}
+unsafe impl Sync for Lljit {}
+
+impl Drop for Lljit {
+    fn drop(&mut self) {
+        unsafe {
+            let err = llvm::orc2::lljit::LLVMOrcDisposeLLJIT(self.jit);
+            if !err.is_null() {
+                llvm::error::LLVMConsumeError(err);
+            }
+        }
+    }
+}
+
+/// The context every module a translator builds lives in. A translator is
+/// cloned onto each SIMD that runs the program, so the context is shared and
+/// released once the last clone and the last block compiled in it are gone.
+struct LlvmContext(llvm::prelude::LLVMContextRef);
+
+unsafe impl Send for LlvmContext {}
+unsafe impl Sync for LlvmContext {}
+
+impl Drop for LlvmContext {
+    fn drop(&mut self) {
+        unsafe {
+            llvm::core::LLVMContextDispose(self.0);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct InstBlock {
     context: llvm::prelude::LLVMContextRef,
     module: llvm::prelude::LLVMModuleRef,
+    jit: Option<Arc<Lljit>>,
     addr: u64,
     reg_usage: RegisterUsage,
     pub call_count: u64,
@@ -58,6 +101,7 @@ impl InstBlock {
         InstBlock {
             context: std::ptr::null_mut(),
             module: std::ptr::null_mut(),
+            jit: None,
             addr: 0,
             reg_usage: RegisterUsage::new(),
             call_count: 0,
@@ -120,15 +164,18 @@ pub struct RDNATranslator {
     pub addresses: Vec<u64>,
     pub insts: Vec<InstFormat>,
     context: llvm::prelude::LLVMContextRef,
+    context_owner: Arc<LlvmContext>,
     pub insts_blocks: HashMap<u64, InstBlock>,
 }
 
 impl RDNATranslator {
     pub fn new() -> Self {
+        let context = unsafe { llvm::core::LLVMContextCreate() };
         RDNATranslator {
             addresses: Vec::new(),
             insts: Vec::new(),
-            context: unsafe { llvm::core::LLVMContextCreate() },
+            context,
+            context_owner: Arc::new(LlvmContext(context)),
             insts_blocks: HashMap::new(),
         }
     }
@@ -697,6 +744,10 @@ impl RDNATranslator {
                 panic!("Failed to add LLVM IR module: {}", err_.to_str().unwrap());
             }
 
+            // The module holds its own reference to the context it was added
+            // with, so this hands back the one this scope was given.
+            llvm::orc2::LLVMOrcDisposeThreadSafeContext(tsctx);
+
             let mut func = 0u64;
             let err = llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut func, func_name.as_ptr());
             if !err.is_null() {
@@ -708,6 +759,10 @@ impl RDNATranslator {
 
             inst_block.context = context;
             inst_block.module = module;
+            inst_block.jit = Some(Arc::new(Lljit {
+                jit,
+                _context: self.context_owner.clone(),
+            }));
             inst_block.addr = func;
             inst_block.reg_usage = reg_usage;
             inst_block.num_instructions = instruction_count;
@@ -1070,6 +1125,10 @@ impl RDNATranslator {
                 panic!("Failed to add LLVM IR module: {}", err_.to_str().unwrap());
             }
 
+            // The module holds its own reference to the context it was added
+            // with, so this hands back the one this scope was given.
+            llvm::orc2::LLVMOrcDisposeThreadSafeContext(tsctx);
+
             let mut func = 0u64;
             let err = llvm::orc2::lljit::LLVMOrcLLJITLookup(
                 jit,
@@ -1085,6 +1144,10 @@ impl RDNATranslator {
 
             inst_block.context = context;
             inst_block.module = module;
+            inst_block.jit = Some(Arc::new(Lljit {
+                jit,
+                _context: self.context_owner.clone(),
+            }));
             inst_block.addr = func;
             inst_block.reg_usage = reg_usage;
             inst_block.num_instructions = instruction_count;
