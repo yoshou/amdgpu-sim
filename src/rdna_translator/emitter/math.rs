@@ -829,6 +829,10 @@ impl IREmitter {
         let clamped = intrinsic.emit_call(ty, &[value, one]);
         let intrinsic = self.get_intrinsic_declaration("llvm.maxnum.", &[ty]);
         let clamped = intrinsic.emit_call(ty, &[clamped, zero]);
+        // CLAMP holds the result inside [0.0, 1.0], and the zero it lands on is
+        // the positive one. Which zero maxnum answers with is not specified, so
+        // the sign is settled here rather than left to the target.
+        let clamped = llvm::core::LLVMBuildFAdd(builder, clamped, zero, empty_name.as_ptr());
         llvm::core::LLVMBuildSelect(builder, is_nan, zero, clamped, empty_name.as_ptr())
     }
 

@@ -173,10 +173,14 @@ pub(crate) const BOX4_NETWORK: [(usize, usize); 5] = [(0, 2), (1, 3), (0, 1), (2
 /// pointer, its rank and that time. A child that is not ranked has rank zero,
 /// so this is the plain nearest-first order as well.
 pub(crate) fn child_order(a: (u32, u32, f32), b: (u32, u32, f32)) -> std::cmp::Ordering {
+    // The times are compared the way the arithmetic does: the two zeros are one
+    // value, and a time that is not a number belongs with the children the ray
+    // did not reach rather than anywhere among those it did.
+    let time = |t: f32| if t.is_nan() { f32::INFINITY } else { t + 0.0 };
     (a.0 == 0xFFFF_FFFF)
         .cmp(&(b.0 == 0xFFFF_FFFF))
         .then(a.1.cmp(&b.1))
-        .then(a.2.total_cmp(&b.2))
+        .then(time(a.2).total_cmp(&time(b.2)))
 }
 
 /// The base of the BVH the resource names, which the node pointers count from.

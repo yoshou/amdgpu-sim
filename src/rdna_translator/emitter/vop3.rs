@@ -8643,8 +8643,6 @@ impl IREmitter {
         const N: usize = SIMD_WIDTH;
         let ty_i16 = llvm::core::LLVMInt16TypeInContext(context);
         let ty_i16xn = llvm::core::LLVMVectorType(ty_i16, N as u32);
-        let ty_i32 = llvm::core::LLVMInt32TypeInContext(context);
-        let ty_i32xn = llvm::core::LLVMVectorType(ty_i32, N as u32);
         let ty_f16 = llvm::core::LLVMHalfTypeInContext(context);
         let ty_f16xn = llvm::core::LLVMVectorType(ty_f16, N as u32);
 
@@ -8688,6 +8686,10 @@ impl IREmitter {
             let clamped = intrinsic.emit_call(ty_f16xn, &[value, one]);
             let intrinsic = emitter.get_intrinsic_declaration("llvm.maxnum.", &[ty_f16xn]);
             let clamped = intrinsic.emit_call(ty_f16xn, &[clamped, zero]);
+            // The bound the value meets is a zero of the manual's sign: which
+            // zero maxnum answers with is not specified, so the sign is settled
+            // here rather than left to the target.
+            let clamped = llvm::core::LLVMBuildFAdd(builder, clamped, zero, empty_name.as_ptr());
             let clamped =
                 llvm::core::LLVMBuildSelect(builder, is_nan, zero, clamped, empty_name.as_ptr());
             as_bits(clamped)
