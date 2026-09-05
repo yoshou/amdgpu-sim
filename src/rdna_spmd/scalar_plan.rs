@@ -23,6 +23,7 @@ pub(super) struct ScalarBlockPlan<'a> {
 pub(super) struct ScalarPlan<'a> {
     pub program: &'a ScalarProgram,
     pub mode: ScalarMode,
+    pub function: super::lift::function::Function,
     pub blocks: BTreeMap<usize, ScalarBlockPlan<'a>>,
 }
 
@@ -31,7 +32,7 @@ impl<'a> ScalarPlan<'a> {
         let active = super::active::analyze_states(program);
         let f64_fresh = super::freshness::analyze(program);
         let sgpr_fresh = super::freshness::analyze_sgpr(program);
-        let blocks = program.blocks.iter().map(|(&pc, block)| {
+        let blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             (pc, ScalarBlockPlan {
                 instructions: block.body.iter().map(super::lift::instruction).collect(),
                 active: super::active::body_active_states(block, active[&pc]),
@@ -39,7 +40,9 @@ impl<'a> ScalarPlan<'a> {
                 sgpr_fresh: sgpr_fresh[&pc],
             })
         }).collect();
-        Self { program, mode, blocks }
+        let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().collect())).collect();
+        let function = super::lift::function::Function::new(program, &lowerings, None);
+        Self { program, mode, blocks, function }
     }
 }
 

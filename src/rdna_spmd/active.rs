@@ -90,12 +90,41 @@ fn scalar_dests(inst: &InstFormat) -> u128 {
     }
 }
 
+/// Includes implicit EXEC writes (saveexec and cmpx), not just scalar destinations.
+pub(super) fn writes_exec(inst: &InstFormat) -> bool {
+    scalar_dests(inst) & (1u128 << EXEC) != 0 || matches!(inst,
+        InstFormat::SOP1(i) if matches!(i.op,
+            I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 |
+            I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32))
+}
+
+/// Only mask widening can expose a value from a previously inactive lane.
+/// Unknown writes remain widening; recognize only subset-of-old-EXEC forms.
+pub(super) fn may_enable_lanes(inst: &InstFormat) -> bool {
+    if !writes_exec(inst) { return false; }
+    let exec = |s: &SourceOperand| matches!(s, SourceOperand::ScalarRegister(126));
+    match inst {
+        InstFormat::VOPC(_) => false, // st_cmp: comparison & old EXEC
+        InstFormat::VOP3(i) if format!("{:?}", i.op).starts_with("V_CMP") => false,
+        InstFormat::SOP1(i) if matches!(i.op, I::S_AND_SAVEEXEC_B32) => false,
+        InstFormat::SOP1(i) if i.sdst == 126 && matches!(i.op, I::S_MOV_B32 | I::S_MOV_B64) => {
+            !(exec(&i.ssrc0) || matches!(i.ssrc0,
+                SourceOperand::IntegerConstant(0) | SourceOperand::LiteralConstant(0)))
+        }
+        InstFormat::SOP2(i) if i.sdst == 126 && matches!(i.op, I::S_AND_B32 | I::S_AND_B64) => {
+            !(exec(&i.ssrc0) || exec(&i.ssrc1))
+        }
+        InstFormat::SOP2(i) if matches!(i.op, I::S_AND_NOT1_B32) => !exec(&i.ssrc0),
+        _ => true,
+    }
+}
+
 /// Forward transfer of a single instruction.
 fn transfer(inst: &InstFormat, st: State) -> State {
     let was_active = st.active;
     // Every scalar write invalidates the saved-active status of its destination.
     let mut masks = st.masks & !scalar_dests(inst);
-    let mut active = st.active;
+    let mut active = st.active && !writes_exec(inst);
 
     match inst {
         // Enter a divergent region: sN = old EXEC, EXEC = (M [& ~]) EXEC.
@@ -116,7 +145,12 @@ fn transfer(inst: &InstFormat, st: State) -> State {
         }
         // Direct EXEC writes.
         InstFormat::SOP1(i) if i.sdst as u32 == EXEC => {
-            active = matches!(i.ssrc0, SourceOperand::IntegerConstant(v) if (v & 1) == 1);
+            active = matches!(i.op, I::S_MOV_B32 | I::S_MOV_B64)
+                && match i.ssrc0 {
+                    SourceOperand::IntegerConstant(v) => v & 1 != 0,
+                    SourceOperand::LiteralConstant(v) => v & 1 != 0,
+                    _ => false,
+                };
         }
         InstFormat::SOP2(i) if i.sdst as u32 == EXEC => {
             // `s_or exec, exec, sN`: reconverge — active if EXEC was active OR sN
@@ -130,7 +164,9 @@ fn transfer(inst: &InstFormat, st: State) -> State {
                     },
                 };
                 let sn_active = sn.map_or(false, |r| (masks >> (r & 127)) & 1 == 1);
-                active = active || sn_active;
+                let reads_exec = matches!(i.ssrc0, SourceOperand::ScalarRegister(126))
+                    || matches!(i.ssrc1, SourceOperand::ScalarRegister(126));
+                active = (was_active && reads_exec) || sn_active;
             } else {
                 active = false;
             }
@@ -255,4 +291,24 @@ pub fn analyze_states_ex(prog: &ScalarProgram, sound_for_packing: bool) -> BTree
     }
 
     entry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdna_instructions::{SOP1, SOP2};
+    #[test]
+    fn distinguishes_exec_subsets_from_reactivation() {
+        for (op, widening) in [(I::S_AND_B32, false), (I::S_AND_NOT1_B32, false), (I::S_OR_B32, true), (I::S_XOR_B32, true)] {
+            let inst = InstFormat::SOP2(SOP2 { op, sdst: 126,
+                ssrc0: SourceOperand::ScalarRegister(126), ssrc1: SourceOperand::ScalarRegister(4) });
+            assert!(writes_exec(&inst));
+            assert_eq!(may_enable_lanes(&inst), widening);
+        }
+        // This ISA form is src & !old_exec in the existing emitter and can
+        // enable lanes; do not confuse it with old_exec & !src.
+        let inst = InstFormat::SOP1(SOP1 { op: I::S_AND_NOT1_SAVEEXEC_B32, sdst: 4,
+            ssrc0: SourceOperand::ScalarRegister(6) });
+        assert!(may_enable_lanes(&inst));
+    }
 }

@@ -32,6 +32,7 @@ pub(super) enum InstructionAction {
 pub(super) struct InstructionPlan<'a> {
     pub lowering: super::lift::Lowering<'a>,
     pub elide_predicate: bool,
+    pub entry_exec_unchanged: bool,
     pub normal_ldexp: bool,
     pub sqrt: Option<SqrtCollapse>,
     pub global_load: GlobalLoad,
@@ -56,6 +57,7 @@ pub(super) struct MaskRegion {
 pub(super) struct PacketPlan<'a> {
     pub program: &'a ScalarProgram,
     pub width: u32,
+    pub function: super::lift::function::Function,
     pub boundary: Option<&'a BTreeMap<usize, BoundaryIo>>,
     pub blocks: BTreeMap<usize, BlockPlan<'a>>,
     pub f64_pairs: RegSet,
@@ -92,7 +94,7 @@ impl<'a> PacketPlan<'a> {
         } else {
             super::vec_live::frame_entry(program)
         };
-        let blocks = program.blocks.iter().map(|(&pc, block)| {
+        let blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             let flags = &elide[&pc];
             let normal = sqrt_idiom::normal_sqrt_ldexp_indices(&block.body);
             let sqrt = sqrt_idiom::sqrt_collapse_sites(&block.body);
@@ -100,6 +102,7 @@ impl<'a> PacketPlan<'a> {
             let mut frames = frame_in[&pc].clone();
             let mut cluster_rest = 0;
             let mut instructions = Vec::with_capacity(block.body.len());
+            let mut entry_exec_unchanged = true;
             for (idx, inst) in block.body.iter().enumerate() {
                 let action = if cluster_rest > 0 {
                     cluster_rest -= 1;
@@ -118,6 +121,7 @@ impl<'a> PacketPlan<'a> {
                 instructions.push(InstructionPlan {
                     lowering: super::lift::instruction(inst),
                     elide_predicate: flags[idx],
+                    entry_exec_unchanged,
                     normal_ldexp: normal[idx],
                     sqrt: sqrt[idx].clone(),
                     global_load: match inst {
@@ -126,21 +130,25 @@ impl<'a> PacketPlan<'a> {
                     },
                     action,
                 });
+                entry_exec_unchanged &= !super::active::writes_exec(inst);
                 super::vec_live::div_transfer(inst, &mut divergent);
                 super::vec_live::frame_transfer(inst, &mut frames);
             }
             // A full-EXEC clone avoids preserving the old value of a predicated
             // destination. Keep the existing profitability condition exactly.
             let specialize = block.body.iter().enumerate().any(|(idx, inst)| {
-                !flags[idx] && !super::freshness::vgpr_writes(inst).is_empty()
+                instructions[idx].entry_exec_unchanged && !flags[idx]
+                    && !super::freshness::vgpr_writes(inst).is_empty()
             });
             let fresh = fresh_in[&pc];
             // Canonical pairs have no live i32 slots to synchronize on edges.
             let stale = [fresh[0] & !f64_pairs[0], fresh[1] & !f64_pairs[1]];
             (pc, BlockPlan { block, instructions, fresh, stale, specialize })
         }).collect();
+        let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().map(|i| &i.lowering).collect())).collect();
+        let function = super::lift::function::Function::new(program, &lowerings, boundary);
         let mask_region = select_mask_region(program, boundary.is_some());
-        Self { program, width, boundary, blocks, f64_pairs, fresh_in, mask_region }
+        Self { program, width, boundary, blocks, f64_pairs, fresh_in, mask_region, function }
     }
 }
 

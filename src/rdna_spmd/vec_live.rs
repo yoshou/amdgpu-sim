@@ -46,11 +46,13 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
             src_vgpr(&i.src0, &mut r);
             r.push(i.vsrc1 as u32);
             r.push(i.vsrc1 as u32 + 1);
+            if matches!(i.op, I::V_FMAC_F32) { r.push(i.vdst as u32); }
         }
         InstFormat::VOP3(i) => {
             src_vgpr(&i.src0, &mut r);
             src_vgpr(&i.src1, &mut r);
             src_vgpr(&i.src2, &mut r);
+            if matches!(i.op, I::V_FMAC_F32) { r.push(i.vdst as u32); }
         }
         InstFormat::VOP3SD(i) => {
             src_vgpr(&i.src0, &mut r);
@@ -119,6 +121,16 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
             r.push(i.vaddr0 as u32 + 1);
             r.push(i.vaddr1 as u32);
             r.push(i.vaddr1 as u32 + 1);
+        }
+        InstFormat::DS(i) => {
+            r.push(i.addr as u32);
+            if matches!(i.op, I::DS_STORE_B8) { r.push(i.data0 as u32); }
+        }
+        InstFormat::VOP3P(i) => {
+            src_vgpr(&i.src0, &mut r);
+            src_vgpr(&i.src1, &mut r);
+            src_vgpr(&i.src2, &mut r);
+            if matches!(i.op, I::V_FMA_MIXLO_F16) { r.push(i.vdst as u32); }
         }
         _ => {} // SALU/SMEM/SOPC read SGPRs only
     }
@@ -481,6 +493,13 @@ pub fn analyze_with_exit_live(
     let mut state = external;
     for (&pc, _) in &prog.blocks {
         if preds[&pc] >= 2 { state.union(&live_in(pc)); }
+        // Re-enabling lanes is also a reconvergence point when it occurs
+        // inside a block. Values observed afterwards must survive masked writes.
+        let mut live = live_out[&pc];
+        for inst in prog.blocks[&pc].body.iter().rev() {
+            if super::active::may_enable_lanes(inst) { state.union(&live); }
+            apply_backward(inst, &mut live);
+        }
     }
 
     let mut out: BTreeMap<usize, Vec<bool>> = BTreeMap::new();

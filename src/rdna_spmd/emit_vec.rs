@@ -32,7 +32,7 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
+use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPD, VSAMPLE, VSCRATCH};
 
 use super::boundary::{BoundaryIo, RegSet};
 use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction};
@@ -670,13 +670,6 @@ impl Cg {
         }
         if (neg >> idx) & 1 != 0 {
             v = llvm::core::LLVMBuildFNeg(self.b, v, self.n());
-        }
-        v
-    }
-    unsafe fn vclamp_f64(&self, mut v: LLVMValueRef, clamp: u8) -> LLVMValueRef {
-        if clamp & 1 != 0 {
-            v = self.call(&self.vfn("minnum"), self.vf64, &[self.vf64, self.vf64], &[v, self.vcf64(1.0)]);
-            v = self.call(&self.vfn("maxnum"), self.vf64, &[self.vf64, self.vf64], &[v, self.vcf64(0.0)]);
         }
         v
     }
@@ -1526,6 +1519,7 @@ unsafe fn compile_inner(
     // there is no resume dispatch here.
     llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
 
+    let mut ssa = super::typed_codegen::Values::new(&plan.function, b, Some(plan.width));
     for (&pc, block_plan) in &plan.blocks {
         let block = block_plan.block;
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
@@ -1572,6 +1566,7 @@ unsafe fn compile_inner(
                 cg.stale.set(entry_facts.1);
                 *cg.spill.borrow_mut() = entry_facts.2.clone();
             }
+            ssa.begin_block(&plan.function, pc);
             let mut sqrt_inputs: std::collections::HashMap<usize, LLVMValueRef> =
                 std::collections::HashMap::new();
             for (idx, instruction) in block_plan.instructions.iter().enumerate() {
@@ -1583,7 +1578,7 @@ unsafe fn compile_inner(
                 if matches!(instruction.action, InstructionAction::ClusterMember) {
                     continue;
                 }
-                cg.predicate.set(variant_pred && !instruction.elide_predicate);
+                cg.predicate.set((variant_pred || !instruction.entry_exec_unchanged) && !instruction.elide_predicate);
                 if let Some(SqrtCollapse::Rescale { site, vdst }) = &instruction.sqrt {
                     let root = cg.vsqrt(sqrt_inputs[site]);
                     cg.st_vgpr_f64(*vdst as u32, root);
@@ -1594,22 +1589,21 @@ unsafe fn compile_inner(
                         .collect();
                     let preds: Vec<bool> = block_plan.instructions[idx..idx + c.len]
                         .iter()
-                        .map(|member| variant_pred && !member.elide_predicate)
+                        .map(|member| (variant_pred || !member.entry_exec_unchanged) && !member.elide_predicate)
                         .collect();
                     cg.emit_vglobal_cluster(&members, c.lo, c.span, &preds);
                 } else {
                     match &instruction.lowering {
-                        super::lift::Lowering::TypedAlu { source, expr } => {
-                            let a = cg.vsrc_u32(&source.src0);
-                            let b = cg.ld_vgpr32(source.vsrc1 as u32);
-                            let result = super::typed_codegen::emit(cg.b, expr, &[a, b]);
-                            cg.st_vgpr32(source.vdst as u32, result);
+                        super::lift::Lowering::TypedAlu { .. } => {
+                            ssa.emit(&plan.function, pc, idx, |input| cg.typed_input(input), |output, value| {
+                                cg.typed_output(output, value);
+                            });
                         }
                         super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
                     }
                 }
             }
-            cg.emit_term(&block.term, &bbs);
+            cg.emit_term(&plan.function.terminator(pc, &block.term), &bbs);
         }
     }
 
@@ -1897,7 +1891,6 @@ impl Cg {
             InstFormat::VOP3(i) => self.emit_vop3(i),
             InstFormat::VOP3P(i) => self.emit_vop3p(i),
             InstFormat::VOP3SD(i) => self.emit_vop3sd(i),
-            InstFormat::VOPC(i) => self.emit_vopc(i),
             InstFormat::VOPD(i) => self.emit_vopd(i),
             InstFormat::SOP1(i) => self.emit_sop1(i),
             InstFormat::SOP2(i) => self.emit_sop2(i),
@@ -1915,23 +1908,7 @@ impl Cg {
 
     unsafe fn emit_vop1(&self, i: &VOP1) {
         match i.op {
-            I::V_MOV_B32 => { let v = self.vsrc_u32(&i.src0); self.st_vgpr32(i.vdst as u32, v); }
-            I::V_CVT_F64_I32 => { let s = self.vsrc_u32(&i.src0); let v = llvm::core::LLVMBuildSIToFP(self.b, s, self.vf64, self.n()); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_CVT_F64_U32 => { let s = self.vsrc_u32(&i.src0); let v = llvm::core::LLVMBuildUIToFP(self.b, s, self.vf64, self.n()); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_CVT_I32_F64 => { let s = self.vsrc_f64(&i.src0); let v = self.call(&format!("llvm.fptosi.sat.v{}i32.v{}f64", self.w, self.w), self.vi32, &[self.vf64], &[s]); self.st_vgpr32(i.vdst as u32, v); }
-            I::V_RCP_F64 => { let s = self.vsrc_f64(&i.src0); let v = self.vfdiv(self.vcf64(1.0), s); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_RSQ_F64 => { let s = self.vsrc_f64(&i.src0); let q = self.vsqrt(s); let v = self.vfdiv(self.vcf64(1.0), q); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_SQRT_F64 => { let s = self.vsrc_f64(&i.src0); let v = self.vsqrt(s); self.st_vgpr_f64(i.vdst as u32, v); }
             I::V_FRACT_F64 => { let s = self.vsrc_f64(&i.src0); let f = self.vfloor(s); let v = self.vfadd(s, llvm::core::LLVMBuildFNeg(self.b, f, self.n())); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_RNDNE_F64 => { let s = self.vsrc_f64(&i.src0); let v = self.call(&self.vfn("roundeven"), self.vf64, &[self.vf64], &[s]); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_RCP_F32 | I::V_RCP_IFLAG_F32 => { let s = self.vsrc_f32(&i.src0); let v = self.vfdiv(self.vcf32(1.0), s); self.st_vgpr32(i.vdst as u32, self.vf32_bits(v)); }
-            I::V_SQRT_F32 => { let v = self.call(&self.vfn32("sqrt"), self.vf32, &[self.vf32], &[self.vsrc_f32(&i.src0)]); self.st_vgpr32(i.vdst as u32, self.vf32_bits(v)); }
-            I::V_RSQ_F32 => { let q = self.call(&self.vfn32("sqrt"), self.vf32, &[self.vf32], &[self.vsrc_f32(&i.src0)]); self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.vfdiv(self.vcf32(1.0), q))); }
-            I::V_RNDNE_F32 | I::V_FLOOR_F32 | I::V_CEIL_F32 | I::V_TRUNC_F32 => {
-                let name = match i.op { I::V_RNDNE_F32 => "roundeven", I::V_FLOOR_F32 => "floor", I::V_CEIL_F32 => "ceil", _ => "trunc" };
-                let v = self.call(&self.vfn32(name), self.vf32, &[self.vf32], &[self.vsrc_f32(&i.src0)]);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(v));
-            }
             I::V_CLZ_I32_U32 => {
                 let x = self.vsrc_u32(&i.src0);
                 let lz = self.call(&format!("llvm.ctlz.v{}i32", self.w), self.vi32, &[self.vi32, self.i1], &[x, llvm::core::LLVMConstInt(self.i1, 0, 0)]);
@@ -1940,10 +1917,6 @@ impl Cg {
             }
             I::V_FREXP_MANT_F32 => { let (v, _) = self.vfrexp_f32(self.vsrc_f32(&i.src0)); self.st_vgpr32(i.vdst as u32, self.vf32_bits(v)); }
             I::V_FREXP_EXP_I32_F32 => { let (_, v) = self.vfrexp_f32(self.vsrc_f32(&i.src0)); self.st_vgpr32(i.vdst as u32, v); }
-            I::V_CVT_U32_F32 => { let v = self.call(&format!("llvm.fptoui.sat.v{}i32.v{}f32", self.w, self.w), self.vi32, &[self.vf32], &[self.vsrc_f32(&i.src0)]); self.st_vgpr32(i.vdst as u32, v); }
-            I::V_CVT_I32_F32 => { let v = self.call(&format!("llvm.fptosi.sat.v{}i32.v{}f32", self.w, self.w), self.vi32, &[self.vf32], &[self.vsrc_f32(&i.src0)]); self.st_vgpr32(i.vdst as u32, v); }
-            I::V_CVT_F32_I32 => { let f = llvm::core::LLVMBuildSIToFP(self.b, self.vsrc_u32(&i.src0), self.vf32, self.n()); self.st_vgpr32(i.vdst as u32, self.vf32_bits(f)); }
-            I::V_CVT_F32_U32 => { let f = llvm::core::LLVMBuildUIToFP(self.b, self.vsrc_u32(&i.src0), self.vf32, self.n()); self.st_vgpr32(i.vdst as u32, self.vf32_bits(f)); }
             I::V_READFIRSTLANE_B32 => {
                 // Value from the lowest active lane, broadcast to an SGPR (uniform).
                 // cttz with is_zero_undef=false yields W for EXEC==0 (a block may
@@ -1963,34 +1936,6 @@ impl Cg {
 
     unsafe fn emit_vop2(&self, i: &VOP2) {
         match i.op {
-            I::V_ADD_F64 => { let a = self.vsrc_f64(&i.src0); let b = self.ld_vgpr_f64(i.vsrc1 as u32); let r = self.vfadd(a, b); self.st_vgpr_f64(i.vdst as u32, r); return; }
-            I::V_MUL_F64 => { let a = self.vsrc_f64(&i.src0); let b = self.ld_vgpr_f64(i.vsrc1 as u32); let r = self.vfmul(a, b); self.st_vgpr_f64(i.vdst as u32, r); return; }
-            I::V_MAX_NUM_F64 | I::V_MIN_NUM_F64 => {
-                let a = self.vsrc_f64(&i.src0); let b = self.ld_vgpr_f64(i.vsrc1 as u32);
-                let name = if matches!(i.op, I::V_MAX_NUM_F64) { self.vfn("maxnum") } else { self.vfn("minnum") };
-                let r = self.call(&name, self.vf64, &[self.vf64, self.vf64], &[a, b]); self.st_vgpr_f64(i.vdst as u32, r); return;
-            }
-            I::V_MUL_F32 => { let a = self.vsrc_f32(&i.src0); let b = self.vf32_of(self.ld_vgpr32(i.vsrc1 as u32)); self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.vfmul(a, b))); return; }
-            I::V_ADD_F32 | I::V_SUB_F32 | I::V_SUBREV_F32 => {
-                let a = self.vsrc_f32(&i.src0); let b = self.vf32_of(self.ld_vgpr32(i.vsrc1 as u32));
-                let r = match i.op { I::V_ADD_F32 => self.vfadd(a, b), I::V_SUB_F32 => self.vfsub(a, b), _ => self.vfsub(b, a) };
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r)); return;
-            }
-            I::V_FMAC_F32 => {
-                let d = self.vf32_of(self.ld_vgpr32(i.vdst as u32));
-                let r = self.vfma32(self.vsrc_f32(&i.src0), self.vf32_of(self.ld_vgpr32(i.vsrc1 as u32)), d);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r)); return;
-            }
-            I::V_FMAMK_F32 => {
-                let k = self.vcf32_bits(i.literal_constant.unwrap());
-                let r = self.vfma32(self.vsrc_f32(&i.src0), k, self.vf32_of(self.ld_vgpr32(i.vsrc1 as u32)));
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r)); return;
-            }
-            I::V_FMAAK_F32 => {
-                let k = self.vcf32_bits(i.literal_constant.unwrap());
-                let r = self.vfma32(self.vsrc_f32(&i.src0), self.vf32_of(self.ld_vgpr32(i.vsrc1 as u32)), k);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r)); return;
-            }
             I::V_ADD_CO_CI_U32 => {
                 let s0 = self.zext64v(self.vsrc_u32(&i.src0));
                 let s1 = self.zext64v(self.ld_vgpr32(i.vsrc1 as u32));
@@ -2000,13 +1945,6 @@ impl Cg {
                 let cout = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, sum, self.splat(self.ci64(32), self.vi64), self.n()), self.vi32, self.n());
                 let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.vci32(0), self.n());
                 self.st_mask(VCC, cout); return;
-            }
-            I::V_LSHLREV_B64 => {
-                let amt = self.v_and(self.vsrc_u32(&i.src0), self.vci32(63));
-                let amt = llvm::core::LLVMBuildZExt(self.b, amt, self.vi64, self.n());
-                let v = self.ld_vgpr64(i.vsrc1 as u32);
-                let r = llvm::core::LLVMBuildShl(self.b, v, amt, self.n());
-                self.st_vgpr64(i.vdst as u32, r); return;
             }
             I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
                 let s0 = self.zext64v(self.vsrc_u32(&i.src0));
@@ -2021,63 +1959,11 @@ impl Cg {
             }
             _ => {}
         }
-        let s0 = self.vsrc_u32(&i.src0);
-        let s1 = self.ld_vgpr32(i.vsrc1 as u32);
-        let r = match i.op {
-            I::V_MUL_LO_U32 => llvm::core::LLVMBuildMul(self.b, s0, s1, self.n()),
-            I::V_MAX_I32 => { let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntSGT, s0, s1, self.n()); llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n()) }
-            I::V_MIN_I32 => { let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntSLT, s0, s1, self.n()); llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n()) }
-            I::V_CNDMASK_B32 => { let c = self.vcc_vec(); llvm::core::LLVMBuildSelect(self.b, c, s1, s0, self.n()) }
-            _ => panic!("vec: unsupported VOP2 {:?}", i.op),
-        };
-        self.st_vgpr32(i.vdst as u32, r);
+        panic!("vec: unsupported VOP2 {:?}", i.op);
     }
 
     unsafe fn emit_vop3(&self, i: &VOP3) {
         match i.op {
-            I::V_ADD_NC_U32 => self.vop3_int(i, |c, a, b, _| c.v_add(a, b)),
-            I::V_AND_B32 => self.vop3_int(i, |c, a, b, _| c.v_and(a, b)),
-            I::V_XOR_B32 => self.vop3_int(i, |c, a, b, _| c.v_xor(a, b)),
-            I::V_OR_B32 => self.vop3_int(i, |c, a, b, _| c.v_or(a, b)),
-            I::V_LSHLREV_B32 => self.vop3_int(i, |c, a, b, _| c.v_shl(b, a)),
-            I::V_LSHRREV_B32 => self.vop3_int(i, |c, a, b, _| c.v_lshr(b, a)),
-            I::V_MUL_LO_U32 => self.vop3_int(i, |c, a, b, _| llvm::core::LLVMBuildMul(c.b, a, b, c.n())),
-            I::V_ADD3_U32 => { let a = self.vsrc_u32(&i.src0); let b = self.vsrc_u32(&i.src1); let cc = self.vsrc_u32(&i.src2); let r = self.v_add(self.v_add(a, b), cc); self.st_vgpr32(i.vdst as u32, r); }
-            I::V_XOR3_B32 => { let a = self.vsrc_u32(&i.src0); let b = self.vsrc_u32(&i.src1); let cc = self.vsrc_u32(&i.src2); let r = self.v_xor(self.v_xor(a, b), cc); self.st_vgpr32(i.vdst as u32, r); }
-            I::V_XAD_U32 => { let a = self.vsrc_u32(&i.src0); let b = self.vsrc_u32(&i.src1); let cc = self.vsrc_u32(&i.src2); let r = self.v_add(self.v_xor(a, b), cc); self.st_vgpr32(i.vdst as u32, r); }
-            I::V_BFE_U32 => {
-                let data = self.vsrc_u32(&i.src0); let off = self.vsrc_u32(&i.src1); let wid = self.v_and(self.vsrc_u32(&i.src2), self.vci32(31));
-                let one = self.vci32(1);
-                let mask = llvm::core::LLVMBuildSub(self.b, llvm::core::LLVMBuildShl(self.b, one, wid, self.n()), self.vci32(1), self.n());
-                let r = self.v_and(self.v_lshr(data, off), mask); self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_CNDMASK_B32 => {
-                // e64: abs/neg apply to s0/s1 as floats (no-op when 0); explicit
-                // condition operand (src2). Matches v_cndmask_b32_e64.
-                let s0 = self.vf32_bits(self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0));
-                let s1 = self.vf32_bits(self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1));
-                let c = self.src_mask_vec(&i.src2);
-                let r = llvm::core::LLVMBuildSelect(self.b, c, s1, s0, self.n()); self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_LSHL_OR_B32 | I::V_LSHL_ADD_U32 => {
-                let s0 = self.vsrc_u32(&i.src0); let s1 = self.v_and(self.vsrc_u32(&i.src1), self.vci32(31)); let s2 = self.vsrc_u32(&i.src2);
-                let sh = self.v_shl(s0, s1);
-                let r = if matches!(i.op, I::V_LSHL_OR_B32) { self.v_or(sh, s2) } else { self.v_add(sh, s2) };
-                self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_ADD_LSHL_U32 => {
-                let s2 = self.v_and(self.vsrc_u32(&i.src2), self.vci32(31));
-                let r = self.v_shl(self.v_add(self.vsrc_u32(&i.src0), self.vsrc_u32(&i.src1)), s2);
-                self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_AND_OR_B32 => { let r = self.v_or(self.v_and(self.vsrc_u32(&i.src0), self.vsrc_u32(&i.src1)), self.vsrc_u32(&i.src2)); self.st_vgpr32(i.vdst as u32, r); }
-            I::V_OR3_B32 => { let r = self.v_or(self.v_or(self.vsrc_u32(&i.src0), self.vsrc_u32(&i.src1)), self.vsrc_u32(&i.src2)); self.st_vgpr32(i.vdst as u32, r); }
-            I::V_BFI_B32 => {
-                let a = self.vsrc_u32(&i.src0);
-                let not_a = self.v_xor(a, self.vci32(0xFFFF_FFFF));
-                let r = self.v_or(self.v_and(a, self.vsrc_u32(&i.src1)), self.v_and(not_a, self.vsrc_u32(&i.src2)));
-                self.st_vgpr32(i.vdst as u32, r);
-            }
             I::V_ALIGNBIT_B32 => {
                 let s0 = self.zext64v(self.vsrc_u32(&i.src0));
                 let s1 = self.zext64v(self.vsrc_u32(&i.src1));
@@ -2089,54 +1975,6 @@ impl Cg {
             }
             I::V_LSHLREV_B16 => { let amt = self.v_and(self.vsrc_u32(&i.src0), self.vci32(15)); let v = self.v_and(self.vsrc_u32(&i.src1), self.vci32(0xffff)); self.st_vgpr32(i.vdst as u32, self.v_and(self.v_shl(v, amt), self.vci32(0xffff))); }
             I::V_LSHRREV_B16 => { let amt = self.v_and(self.vsrc_u32(&i.src0), self.vci32(15)); let v = self.v_and(self.vsrc_u32(&i.src1), self.vci32(0xffff)); self.st_vgpr32(i.vdst as u32, self.v_lshr(v, amt)); }
-            I::V_LSHLREV_B64 => { let amt = self.zext64v(self.v_and(self.vsrc_u32(&i.src0), self.vci32(63))); let v = self.vsrc_u64(&i.src1); self.st_vgpr64(i.vdst as u32, llvm::core::LLVMBuildShl(self.b, v, amt, self.n())); }
-            I::V_LSHRREV_B64 => { let amt = self.zext64v(self.v_and(self.vsrc_u32(&i.src0), self.vci32(63))); let v = self.vsrc_u64(&i.src1); self.st_vgpr64(i.vdst as u32, llvm::core::LLVMBuildLShr(self.b, v, amt, self.n())); }
-            I::V_ASHRREV_I32 => { let amt = self.v_and(self.vsrc_u32(&i.src0), self.vci32(31)); let v = self.vsrc_u32(&i.src1); self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildAShr(self.b, v, amt, self.n())); }
-            I::V_MUL_F32 => { let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1); self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.vfmul(a, b))); }
-            I::V_ADD_F32 | I::V_SUB_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let r = if matches!(i.op, I::V_ADD_F32) { self.vfadd(a, b) } else { self.vfsub(a, b) };
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
-            }
-            I::V_MAX_F32 | I::V_MIN_F32 | I::V_MAX_NUM_F32 | I::V_MIN_NUM_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let name = if matches!(i.op, I::V_MAX_F32 | I::V_MAX_NUM_F32) { self.vfn32("maxnum") } else { self.vfn32("minnum") };
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.call(&name, self.vf32, &[self.vf32, self.vf32], &[a, b])));
-            }
-            I::V_FMA_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let c = self.vabsneg_f32(self.vsrc_f32(&i.src2), i.abs, i.neg, 2);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.vfma32(a, b, c)));
-            }
-            I::V_FMAC_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let c = self.vf32_of(self.ld_vgpr32(i.vdst as u32));
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.vfma32(a, b, c)));
-            }
-            I::V_SUB_NC_U32 => self.vop3_int(i, |c, a, b, _| llvm::core::LLVMBuildSub(c.b, a, b, c.n())),
-            I::V_MUL_HI_U32 => {
-                let a = self.zext64v(self.vsrc_u32(&i.src0));
-                let b = self.zext64v(self.vsrc_u32(&i.src1));
-                let prod = llvm::core::LLVMBuildMul(self.b, a, b, self.n());
-                let hi = llvm::core::LLVMBuildLShr(self.b, prod, self.splat(self.ci64(32), self.vi64), self.n());
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildTrunc(self.b, hi, self.vi32, self.n()));
-            }
-            I::V_CVT_F32_U32 => {
-                let f = llvm::core::LLVMBuildUIToFP(self.b, self.vsrc_u32(&i.src0), self.vf32, self.n());
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(f));
-            }
-            I::V_RCP_F32 | I::V_RCP_IFLAG_F32 => {
-                let s = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(self.vfdiv(self.vcf32(1.0), s)));
-            }
-            I::V_RNDNE_F32 | I::V_FLOOR_F32 | I::V_CEIL_F32 | I::V_TRUNC_F32 => {
-                let name = match i.op { I::V_RNDNE_F32 => "roundeven", I::V_FLOOR_F32 => "floor", I::V_CEIL_F32 => "ceil", _ => "trunc" };
-                let s = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let v = self.call(&self.vfn32(name), self.vf32, &[self.vf32], &[s]);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(v));
-            }
             I::V_S_RCP_F32 => {
                 // Scalar reciprocal: uniform SGPR source and SGPR destination.
                 let s = llvm::core::LLVMBuildBitCast(self.b, self.ssrc_u32(&i.src0), self.f32t, self.n());
@@ -2166,14 +2004,6 @@ impl Cg {
                 let r = self.vldexp_f32(a, e);
                 self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
             }
-            op if f32_pred(op).is_some() => {
-                let (pred, invert) = f32_pred(op).unwrap();
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let mut c = llvm::core::LLVMBuildFCmp(self.b, pred, a, b, self.n());
-                if invert { c = llvm::core::LLVMBuildNot(self.b, c, self.n()); }
-                self.st_cmp(i.vdst as u32, c);
-            }
             I::V_CMP_CLASS_F32 => {
                 let a = self.vsrc_f32(&i.src0);
                 let s = match &i.src1 {
@@ -2185,15 +2015,6 @@ impl Cg {
                 let c = self.call(&format!("llvm.is.fpclass.v{}f32", self.w), self.vi1, &[self.vf32, self.i32t], &[a, s]);
                 self.st_cmp(i.vdst as u32, c);
             }
-            op if int64_pred(op).is_some() => {
-                let pred = int64_pred(op).unwrap();
-                let a = self.vsrc_u64(&i.src0); let b = self.vsrc_u64(&i.src1);
-                let c = llvm::core::LLVMBuildICmp(self.b, pred, a, b, self.n());
-                self.st_cmp(i.vdst as u32, c);
-            }
-            I::V_ADD_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.vfadd(a, b); self.st_vgpr_f64(i.vdst as u32, r); }
-            I::V_MUL_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.vfmul(a, b); self.st_vgpr_f64(i.vdst as u32, r); }
-            I::V_FMA_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2); let r = self.vfmuladd(a, b, c); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_CVT_F32_F16 => {
                 // OPSEL[0] chooses the high/low half of each packed source lane.
                 let mut bits = self.vsrc_u32(&i.src0);
@@ -2209,7 +2030,6 @@ impl Cg {
                 let r = self.vabsneg_f32(wide, i.abs, i.neg, 0);
                 self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
             }
-            I::V_MAX_NUM_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let r = self.call(&self.vfn("maxnum"), self.vf64, &[self.vf64, self.vf64], &[a, b]); let r = self.vclamp_f64(r, i.cm); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_LDEXP_F64 => {
                 let a = self.vsrc_f64(&i.src0);
                 let e = self.vsrc_u32(&i.src1);
@@ -2244,14 +2064,6 @@ impl Cg {
                 let r = self.v_trig_preop(a, s);
                 self.st_vgpr_f64(i.vdst as u32, r);
             }
-            op if f64_pred(op).is_some() => {
-                let (pred, invert) = f64_pred(op).unwrap();
-                let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0);
-                let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1);
-                let mut c = llvm::core::LLVMBuildFCmp(self.b, pred, a, b, self.n());
-                if invert { c = llvm::core::LLVMBuildNot(self.b, c, self.n()); }
-                self.st_cmp(i.vdst as u32, c);
-            }
             I::V_CMP_CLASS_F64 => {
                 // llvm.is.fpclass's test mask is a scalar i32 immarg (uniform).
                 let a = self.vsrc_f64(&i.src0);
@@ -2265,17 +2077,6 @@ impl Cg {
                 let c = self.call(&name, self.vi1, &[self.vf64, self.i32t], &[a, s]);
                 self.st_cmp(i.vdst as u32, c);
             }
-            op if int_pred(op).is_some() => {
-                let pred = int_pred(op).unwrap();
-                let a = self.vsrc_u32(&i.src0); let b = self.vsrc_u32(&i.src1);
-                let c = llvm::core::LLVMBuildICmp(self.b, pred, a, b, self.n());
-                self.st_cmp(i.vdst as u32, c);
-            }
-            // ----- uniform cross-lane spill idiom (constant lane) -----
-            // The value is a uniform SGPR (scalar), so "lane K of vD" is identical
-            // across the W packed lanes; model it as a scalar slot keyed by (vD, K).
-            // Mirrors the scalar path; a non-constant lane or VGPR source would be
-            // genuine cross-lane and is rejected here.
             I::V_WRITELANE_B32 => {
                 let lane = lane_const(&i.src1)
                     .expect("vec: v_writelane_b32 needs a constant lane (non-uniform cross-lane unsupported)");
@@ -2407,39 +2208,6 @@ impl Cg {
         llvm::core::LLVMBuildZExt(self.b, v, self.vi32, self.n())
     }
 
-    unsafe fn vop3_int<F: Fn(&Cg, LLVMValueRef, LLVMValueRef, LLVMValueRef) -> LLVMValueRef>(&self, i: &VOP3, f: F) {
-        let a = self.vsrc_u32(&i.src0);
-        let b = self.vsrc_u32(&i.src1);
-        let c = self.vsrc_u32(&i.src2);
-        let r = f(self, a, b, c);
-        self.st_vgpr32(i.vdst as u32, r);
-    }
-
-    unsafe fn emit_vopc(&self, i: &VOPC) {
-        let is_cmpx = format!("{:?}", i.op).starts_with("V_CMPX");
-        let dest = if is_cmpx { EXEC } else { VCC };
-        if let Some((pred, invert)) = f32_pred(i.op) {
-            let a = self.vsrc_f32(&i.src0); let b = self.vf32_of(self.ld_vgpr32(i.vsrc1 as u32));
-            let mut c = llvm::core::LLVMBuildFCmp(self.b, pred, a, b, self.n());
-            if invert { c = llvm::core::LLVMBuildNot(self.b, c, self.n()); }
-            self.st_cmp(dest, c);
-        } else if let Some((pred, invert)) = f64_pred(i.op) {
-            let a = self.vsrc_f64(&i.src0); let b = self.ld_vgpr_f64(i.vsrc1 as u32);
-            let mut c = llvm::core::LLVMBuildFCmp(self.b, pred, a, b, self.n());
-            if invert { c = llvm::core::LLVMBuildNot(self.b, c, self.n()); }
-            self.st_cmp(dest, c);
-        } else if let Some(pred) = int64_pred(i.op) {
-            let a = self.vsrc_u64(&i.src0); let b = self.ld_vgpr64(i.vsrc1 as u32);
-            let c = llvm::core::LLVMBuildICmp(self.b, pred, a, b, self.n());
-            self.st_cmp(dest, c);
-        } else if let Some(pred) = int_pred(i.op) {
-            let a = self.vsrc_u32(&i.src0); let b = self.ld_vgpr32(i.vsrc1 as u32);
-            let c = llvm::core::LLVMBuildICmp(self.b, pred, a, b, self.n());
-            self.st_cmp(dest, c);
-        } else {
-            panic!("vec: unsupported VOPC {:?}", i.op);
-        }
-    }
 
     unsafe fn emit_vopd(&self, i: &VOPD) {
         let dx = i.vdstx as u32;
@@ -3870,72 +3638,7 @@ mod transpose_mask_tests {
 }
 
 // f64 compare opcode -> (predicate, invert result)
-fn f32_pred(op: I) -> Option<(llvm::LLVMRealPredicate, bool)> {
-    use llvm::LLVMRealPredicate::*;
-    Some(match op {
-        I::V_CMP_GT_F32 | I::V_CMPX_GT_F32 => (LLVMRealOGT, false),
-        I::V_CMP_LT_F32 | I::V_CMPX_LT_F32 => (LLVMRealOLT, false),
-        I::V_CMP_LE_F32 | I::V_CMPX_LE_F32 => (LLVMRealOLE, false),
-        I::V_CMP_GE_F32 | I::V_CMPX_GE_F32 => (LLVMRealOGE, false),
-        I::V_CMP_EQ_F32 | I::V_CMPX_EQ_F32 => (LLVMRealOEQ, false),
-        I::V_CMP_LG_F32 | I::V_CMPX_LG_F32 => (LLVMRealONE, false),
-        I::V_CMP_NLT_F32 | I::V_CMPX_NLT_F32 => (LLVMRealOLT, true),
-        I::V_CMP_NGT_F32 | I::V_CMPX_NGT_F32 => (LLVMRealOGT, true),
-        I::V_CMP_NGE_F32 | I::V_CMPX_NGE_F32 => (LLVMRealOGE, true),
-        I::V_CMP_NLE_F32 | I::V_CMPX_NLE_F32 => (LLVMRealOLE, true),
-        I::V_CMP_NEQ_F32 | I::V_CMPX_NEQ_F32 => (LLVMRealOEQ, true),
-        _ => return None,
-    })
-}
 
-fn int64_pred(op: I) -> Option<llvm::LLVMIntPredicate> {
-    use llvm::LLVMIntPredicate::*;
-    Some(match op {
-        I::V_CMP_EQ_U64 | I::V_CMPX_EQ_U64 | I::V_CMP_EQ_I64 | I::V_CMPX_EQ_I64 => LLVMIntEQ,
-        I::V_CMP_NE_U64 | I::V_CMPX_NE_U64 | I::V_CMP_NE_I64 | I::V_CMPX_NE_I64 => LLVMIntNE,
-        I::V_CMP_GT_U64 | I::V_CMPX_GT_U64 => LLVMIntUGT,
-        I::V_CMP_LT_U64 | I::V_CMPX_LT_U64 => LLVMIntULT,
-        I::V_CMP_GE_U64 | I::V_CMPX_GE_U64 => LLVMIntUGE,
-        I::V_CMP_LE_U64 | I::V_CMPX_LE_U64 => LLVMIntULE,
-        I::V_CMP_GT_I64 | I::V_CMPX_GT_I64 => LLVMIntSGT,
-        I::V_CMP_LT_I64 | I::V_CMPX_LT_I64 => LLVMIntSLT,
-        I::V_CMP_GE_I64 | I::V_CMPX_GE_I64 => LLVMIntSGE,
-        I::V_CMP_LE_I64 | I::V_CMPX_LE_I64 => LLVMIntSLE,
-        _ => return None,
-    })
-}
-
-fn f64_pred(op: I) -> Option<(llvm::LLVMRealPredicate, bool)> {
-    use llvm::LLVMRealPredicate::*;
-    Some(match op {
-        I::V_CMP_GT_F64 | I::V_CMPX_GT_F64 => (LLVMRealOGT, false),
-        I::V_CMP_LT_F64 | I::V_CMPX_LT_F64 => (LLVMRealOLT, false),
-        I::V_CMP_LE_F64 | I::V_CMPX_LE_F64 => (LLVMRealOLE, false),
-        I::V_CMP_GE_F64 | I::V_CMPX_GE_F64 => (LLVMRealOGE, false),
-        I::V_CMP_EQ_F64 | I::V_CMPX_EQ_F64 => (LLVMRealOEQ, false),
-        I::V_CMP_LG_F64 | I::V_CMPX_LG_F64 => (LLVMRealONE, false),
-        I::V_CMP_NLT_F64 | I::V_CMPX_NLT_F64 => (LLVMRealOLT, true),
-        I::V_CMP_NGT_F64 | I::V_CMPX_NGT_F64 => (LLVMRealOGT, true),
-        I::V_CMP_NGE_F64 | I::V_CMPX_NGE_F64 => (LLVMRealOGE, true),
-        I::V_CMP_NLE_F64 | I::V_CMPX_NLE_F64 => (LLVMRealOLE, true),
-        I::V_CMP_NEQ_F64 | I::V_CMPX_NEQ_F64 => (LLVMRealOEQ, true),
-        _ => return None,
-    })
-}
-fn int_pred(op: I) -> Option<llvm::LLVMIntPredicate> {
-    use llvm::LLVMIntPredicate::*;
-    Some(match op {
-        I::V_CMP_EQ_U32 | I::V_CMPX_EQ_U32 => LLVMIntEQ,
-        I::V_CMP_NE_U32 | I::V_CMPX_NE_U32 => LLVMIntNE,
-        I::V_CMP_GT_U32 | I::V_CMPX_GT_U32 => LLVMIntUGT,
-        I::V_CMP_LT_U32 | I::V_CMPX_LT_U32 => LLVMIntULT,
-        I::V_CMP_GE_U32 | I::V_CMPX_GE_U32 => LLVMIntUGE,
-        I::V_CMP_LE_U32 | I::V_CMPX_LE_U32 => LLVMIntULE,
-        I::V_CMP_LT_I32 | I::V_CMPX_LT_I32 => LLVMIntSLT,
-        I::V_CMP_GT_I32 | I::V_CMPX_GT_I32 => LLVMIntSGT,
-        _ => return None,
-    })
-}
 
 /// Constant lane index of a writelane/readlane operand, if it is a constant.
 fn lane_const(op: &SourceOperand) -> Option<u32> {
@@ -3951,5 +3654,30 @@ fn vreg_of(op: &SourceOperand) -> Option<u32> {
     match op {
         SourceOperand::VectorRegister(r) => Some(*r as u32),
         _ => None,
+    }
+}
+
+impl Cg {
+    unsafe fn typed_input(&self, input: &super::lift::Input) -> LLVMValueRef {
+        use super::ir::typed::Ty;
+        match input.ty {
+            Ty::I1 => self.src_mask_vec(&input.source),
+            Ty::I32 => self.vsrc_u32(&input.source),
+            Ty::I64 => self.vsrc_u64(&input.source),
+            Ty::F32 => self.vsrc_f32(&input.source),
+            Ty::F64 => self.vsrc_f64(&input.source),
+        }
+    }
+    unsafe fn typed_output(&self, output: super::lift::Output, result: LLVMValueRef) {
+        use super::ir::typed::Ty;
+        use super::lift::Output;
+        match output {
+            Output::Vgpr(reg, Ty::I32) => self.st_vgpr32(reg, result),
+            Output::Vgpr(reg, Ty::I64) => self.st_vgpr64(reg, result),
+            Output::Vgpr(reg, Ty::F32) => self.st_vgpr32(reg, self.vf32_bits(result)),
+            Output::Vgpr(reg, Ty::F64) => self.st_vgpr_f64(reg, result),
+            Output::Compare(reg) => self.st_cmp(reg, result),
+            Output::Vgpr(_, Ty::I1) => unreachable!("boolean VGPR output"),
+        }
     }
 }

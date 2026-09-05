@@ -1,65 +1,302 @@
-//! Width-independent LLVM emission for verified core SSA expressions.
-//! No RDNA opcodes, register accesses, instruction recognition or lane loops.
-
+//! Shared scalar/packet LLVM lowering of the core SSA operations.
+//! No ISA opcodes, register files or per-lane runtime calls.
+use super::ir::typed::*;
+use llvm::core::*;
+use llvm::prelude::*;
 use llvm_sys as llvm;
-use llvm::prelude::{LLVMBuilderRef, LLVMValueRef};
-use super::ir::typed::{IntOp, IntPred, Op, Ty, VerifiedExpr};
 
-/// Parameters already have the scalar or packet LLVM types chosen by the
-/// existing emitter. LLVM arithmetic uses the same rules for both shapes.
-pub(super) unsafe fn emit(
-    b: LLVMBuilderRef, expr: &VerifiedExpr, params: &[LLVMValueRef],
-) -> LLVMValueRef {
-    let expr = expr.expr();
-    assert_eq!(params.len(), expr.params.len());
-    let mut shape = None;
-    for (&value, ty) in params.iter().zip(&expr.params) {
-        let llvm_ty = llvm::core::LLVMTypeOf(value);
-        let (element, lanes) = if llvm::core::LLVMGetTypeKind(llvm_ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
-            (llvm::core::LLVMGetElementType(llvm_ty), Some(llvm::core::LLVMGetVectorSize(llvm_ty)))
-        } else { (llvm_ty, None) };
-        assert_eq!(llvm::core::LLVMGetTypeKind(element), llvm::LLVMTypeKind::LLVMIntegerTypeKind);
-        assert_eq!(llvm::core::LLVMGetIntTypeWidth(element), match ty { Ty::I1 => 1, Ty::I32 => 32 });
-        if let Some(previous) = shape { assert_eq!(previous, lanes, "mixed LLVM packet shapes"); }
-        shape = Some(lanes);
+pub(super) struct Emitter {
+    pub b: LLVMBuilderRef,
+    module: LLVMModuleRef,
+    ctx: LLVMContextRef,
+    width: Option<u32>,
+}
+impl Emitter {
+    pub unsafe fn new(b: LLVMBuilderRef, width: Option<u32>) -> Self {
+        let module = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(b)));
+        Self {
+            b,
+            module,
+            ctx: LLVMGetModuleContext(module),
+            width,
+        }
     }
-    let mut values = Vec::with_capacity(params.len() + expr.insts.len());
-    values.extend_from_slice(params);
-    let n = b"\0".as_ptr().cast();
-    for &(_, op) in &expr.insts {
-        let v = match op {
+    unsafe fn ty(&self, t: Ty) -> LLVMTypeRef {
+        let t = match t {
+            Ty::I1 => LLVMInt1TypeInContext(self.ctx),
+            Ty::I32 => LLVMInt32TypeInContext(self.ctx),
+            Ty::I64 => LLVMInt64TypeInContext(self.ctx),
+            Ty::F32 => LLVMFloatTypeInContext(self.ctx),
+            Ty::F64 => LLVMDoubleTypeInContext(self.ctx),
+        };
+        self.width.map_or(t, |w| LLVMVectorType(t, w))
+    }
+    unsafe fn constant(&self, ty: Ty, bits: u64) -> LLVMValueRef {
+        let t = LLVMIntTypeInContext(self.ctx, ty.bits());
+        let v = LLVMConstInt(t, bits, 0);
+        let v = if let Some(w) = self.width {
+            LLVMConstVector(vec![v; w as usize].as_mut_ptr(), w)
+        } else {
+            v
+        };
+        if ty.integer() {
+            v
+        } else {
+            LLVMConstBitCast(v, self.ty(ty))
+        }
+    }
+    fn suffix(&self, t: Ty) -> String {
+        let t = match t {
+            Ty::I1 => "i1",
+            Ty::I32 => "i32",
+            Ty::I64 => "i64",
+            Ty::F32 => "f32",
+            Ty::F64 => "f64",
+        };
+        self.width.map_or_else(|| t.into(), |w| format!("v{w}{t}"))
+    }
+    unsafe fn call(&self, name: &str, ret: Ty, args: &[LLVMValueRef]) -> LLVMValueRef {
+        let name = std::ffi::CString::new(name).unwrap();
+        let mut types: Vec<_> = args.iter().map(|&v| LLVMTypeOf(v)).collect();
+        let ft = LLVMFunctionType(self.ty(ret), types.as_mut_ptr(), types.len() as u32, 0);
+        let mut f = LLVMGetNamedFunction(self.module, name.as_ptr());
+        if f.is_null() {
+            f = LLVMAddFunction(self.module, name.as_ptr(), ft);
+        }
+        LLVMBuildCall2(
+            self.b,
+            ft,
+            f,
+            args.to_vec().as_mut_ptr(),
+            args.len() as u32,
+            b"\0".as_ptr().cast(),
+        )
+    }
+    pub unsafe fn op(&self, ty: Ty, op: Op, values: &[LLVMValueRef]) -> LLVMValueRef {
+        let b = self.b;
+        let n = b"\0".as_ptr().cast();
+        let v = |id: ValueId| values[id.0];
+        match op {
+            Op::Const(t, bits) => self.constant(t, bits),
             Op::Int(op, a, c) => {
-                let (a, c) = (values[a.0], values[c.0]);
+                let (a, mut c) = (v(a), v(c));
+                if matches!(op, IntOp::Shl | IntOp::LShr | IntOp::AShr) {
+                    c = LLVMBuildAnd(b, c, self.constant(ty, (ty.bits() - 1) as u64), n);
+                }
                 match op {
-                    IntOp::Add => llvm::core::LLVMBuildAdd(b, a, c, n),
-                    IntOp::Sub => llvm::core::LLVMBuildSub(b, a, c, n),
-                    IntOp::And => llvm::core::LLVMBuildAnd(b, a, c, n),
-                    IntOp::Or => llvm::core::LLVMBuildOr(b, a, c, n),
-                    IntOp::Xor => llvm::core::LLVMBuildXor(b, a, c, n),
-                    IntOp::Shl | IntOp::LShr => {
-                        // Core i32 shifts reduce the amount modulo 32 before
-                        // LLVM emission (LLVM's oversized shifts are poison).
-                        let ty = llvm::core::LLVMTypeOf(c);
-                        let mask = if llvm::core::LLVMGetTypeKind(ty) == llvm::LLVMTypeKind::LLVMVectorTypeKind {
-                            let k = llvm::core::LLVMConstInt(llvm::core::LLVMGetElementType(ty), 31, 0);
-                            let mut lanes = vec![k; llvm::core::LLVMGetVectorSize(ty) as usize];
-                            llvm::core::LLVMConstVector(lanes.as_mut_ptr(), lanes.len() as u32)
+                    IntOp::Add => LLVMBuildAdd(b, a, c, n),
+                    IntOp::Sub => LLVMBuildSub(b, a, c, n),
+                    IntOp::Mul => LLVMBuildMul(b, a, c, n),
+                    IntOp::And => LLVMBuildAnd(b, a, c, n),
+                    IntOp::Or => LLVMBuildOr(b, a, c, n),
+                    IntOp::Xor => LLVMBuildXor(b, a, c, n),
+                    IntOp::Shl => LLVMBuildShl(b, a, c, n),
+                    IntOp::LShr => LLVMBuildLShr(b, a, c, n),
+                    IntOp::AShr => LLVMBuildAShr(b, a, c, n),
+                }
+            }
+            Op::Cmp(p, a, c) => LLVMBuildICmp(
+                b,
+                match p {
+                    IntPred::Eq => llvm::LLVMIntPredicate::LLVMIntEQ,
+                    IntPred::Ne => llvm::LLVMIntPredicate::LLVMIntNE,
+                    IntPred::Ult => llvm::LLVMIntPredicate::LLVMIntULT,
+                    IntPred::Ugt => llvm::LLVMIntPredicate::LLVMIntUGT,
+                    IntPred::Ule => llvm::LLVMIntPredicate::LLVMIntULE,
+                    IntPred::Uge => llvm::LLVMIntPredicate::LLVMIntUGE,
+                    IntPred::Slt => llvm::LLVMIntPredicate::LLVMIntSLT,
+                    IntPred::Sgt => llvm::LLVMIntPredicate::LLVMIntSGT,
+                    IntPred::Sle => llvm::LLVMIntPredicate::LLVMIntSLE,
+                    IntPred::Sge => llvm::LLVMIntPredicate::LLVMIntSGE,
+                },
+                v(a),
+                v(c),
+                n,
+            ),
+            Op::FCmp(p, a, c) => LLVMBuildFCmp(
+                b,
+                match p {
+                    FloatPred::Oeq => llvm::LLVMRealPredicate::LLVMRealOEQ,
+                    FloatPred::Ogt => llvm::LLVMRealPredicate::LLVMRealOGT,
+                    FloatPred::Oge => llvm::LLVMRealPredicate::LLVMRealOGE,
+                    FloatPred::Olt => llvm::LLVMRealPredicate::LLVMRealOLT,
+                    FloatPred::Ole => llvm::LLVMRealPredicate::LLVMRealOLE,
+                    FloatPred::One => llvm::LLVMRealPredicate::LLVMRealONE,
+                    FloatPred::Ord => llvm::LLVMRealPredicate::LLVMRealORD,
+                    FloatPred::Uno => llvm::LLVMRealPredicate::LLVMRealUNO,
+                    FloatPred::Ueq => llvm::LLVMRealPredicate::LLVMRealUEQ,
+                    FloatPred::Ugt => llvm::LLVMRealPredicate::LLVMRealUGT,
+                    FloatPred::Uge => llvm::LLVMRealPredicate::LLVMRealUGE,
+                    FloatPred::Ult => llvm::LLVMRealPredicate::LLVMRealULT,
+                    FloatPred::Ule => llvm::LLVMRealPredicate::LLVMRealULE,
+                    FloatPred::Une => llvm::LLVMRealPredicate::LLVMRealUNE,
+                },
+                v(a),
+                v(c),
+                n,
+            ),
+            Op::Select(c, a, d) => LLVMBuildSelect(b, v(c), v(a), v(d), n),
+            Op::Float(op, a, c) => match op {
+                FloatOp::Add => LLVMBuildFAdd(b, v(a), v(c), n),
+                FloatOp::Sub => LLVMBuildFSub(b, v(a), v(c), n),
+                FloatOp::Mul => LLVMBuildFMul(b, v(a), v(c), n),
+                FloatOp::Div => LLVMBuildFDiv(b, v(a), v(c), n),
+                FloatOp::MinNum | FloatOp::MaxNum => self.call(
+                    &format!(
+                        "llvm.{}.{}",
+                        if op == FloatOp::MinNum {
+                            "minnum"
                         } else {
-                            llvm::core::LLVMConstInt(ty, 31, 0)
+                            "maxnum"
+                        },
+                        self.suffix(ty)
+                    ),
+                    ty,
+                    &[v(a), v(c)],
+                ),
+            },
+            Op::Unary(op, a) => {
+                if op == FloatUnary::Neg {
+                    return LLVMBuildFNeg(b, v(a), n);
+                }
+                let name = match op {
+                    FloatUnary::Abs => "fabs",
+                    FloatUnary::Sqrt => "sqrt",
+                    FloatUnary::Floor => "floor",
+                    FloatUnary::Ceil => "ceil",
+                    FloatUnary::Trunc => "trunc",
+                    FloatUnary::RoundEven => "roundeven",
+                    FloatUnary::Neg => unreachable!(),
+                };
+                self.call(&format!("llvm.{name}.{}", self.suffix(ty)), ty, &[v(a)])
+            }
+            Op::Fma(a, c, d) | Op::MulAdd(a, c, d) => self.call(
+                &format!(
+                    "llvm.{}.{}",
+                    if matches!(op, Op::Fma(..)) {
+                        "fma"
+                    } else {
+                        "fmuladd"
+                    },
+                    self.suffix(ty)
+                ),
+                ty,
+                &[v(a), v(c), v(d)],
+            ),
+            Op::Convert(op, to, a) => {
+                let a = v(a);
+                let t = self.ty(to);
+                match op {
+                    Cvt::Bitcast => LLVMBuildBitCast(b, a, t, n),
+                    Cvt::ZExt => LLVMBuildZExt(b, a, t, n),
+                    Cvt::SExt => LLVMBuildSExt(b, a, t, n),
+                    Cvt::Trunc => LLVMBuildTrunc(b, a, t, n),
+                    Cvt::SignedToFloatRte => LLVMBuildSIToFP(b, a, t, n),
+                    Cvt::UnsignedToFloatRte => LLVMBuildUIToFP(b, a, t, n),
+                    Cvt::FloatResizeRte => {
+                        if to == Ty::F64 {
+                            LLVMBuildFPExt(b, a, t, n)
+                        } else {
+                            LLVMBuildFPTrunc(b, a, t, n)
+                        }
+                    }
+                    Cvt::FloatToSignedSatRtz | Cvt::FloatToUnsignedSatRtz => {
+                        let at = LLVMTypeOf(a);
+                        let at = if self.width.is_some() {
+                            LLVMGetElementType(at)
+                        } else {
+                            at
                         };
-                        let c = llvm::core::LLVMBuildAnd(b, c, mask, n);
-                        if op == IntOp::Shl { llvm::core::LLVMBuildShl(b, a, c, n) }
-                        else { llvm::core::LLVMBuildLShr(b, a, c, n) }
+                        let from = if LLVMGetTypeKind(at) == llvm::LLVMTypeKind::LLVMFloatTypeKind {
+                            Ty::F32
+                        } else {
+                            Ty::F64
+                        };
+                        self.call(
+                            &format!(
+                                "llvm.{}.sat.{}.{}",
+                                if op == Cvt::FloatToSignedSatRtz {
+                                    "fptosi"
+                                } else {
+                                    "fptoui"
+                                },
+                                self.suffix(to),
+                                self.suffix(from)
+                            ),
+                            to,
+                            &[a],
+                        )
                     }
                 }
             }
-            Op::Cmp(pred, a, c) => llvm::core::LLVMBuildICmp(b, match pred {
-                IntPred::Ult => llvm::LLVMIntPredicate::LLVMIntULT,
-                IntPred::Ugt => llvm::LLVMIntPredicate::LLVMIntUGT,
-            }, values[a.0], values[c.0], n),
-            Op::Select(c, a, d) => llvm::core::LLVMBuildSelect(b, values[c.0], values[a.0], values[d.0], n),
-        };
-        values.push(v);
+        }
     }
-    values[expr.result.0]
+}
+
+/// Values are addressed by the verified function's SSA IDs. Block arguments
+/// lower through the existing boundary allocas, which LLVM promotes to phis;
+/// within an ALU sequence the effective SSA value is reused directly.
+pub(super) struct Values {
+    emitter: Emitter,
+    values: Vec<LLVMValueRef>,
+}
+impl Values {
+    pub unsafe fn new(
+        f: &super::lift::function::Function,
+        b: LLVMBuilderRef,
+        width: Option<u32>,
+    ) -> Self {
+        Self {
+            emitter: Emitter::new(b, width),
+            values: vec![std::ptr::null_mut(); f.ir.func().types.len()],
+        }
+    }
+    pub fn begin_block(&mut self, f: &super::lift::function::Function, pc: usize) {
+        use super::ir::typed::cfg::*;
+        let block = &f.ir.func().blocks[&BlockId(pc)];
+        for &(v, _) in &block.params {
+            self.values[v.0] = std::ptr::null_mut();
+        }
+        for inst in &block.insts {
+            match inst {
+                Inst::Core { value, .. } => self.values[value.0] = std::ptr::null_mut(),
+                Inst::Boundary { outputs, .. } => {
+                    for &(v, _) in outputs {
+                        self.values[v.0] = std::ptr::null_mut();
+                    }
+                }
+            }
+        }
+    }
+    pub unsafe fn emit(
+        &mut self,
+        f: &super::lift::function::Function,
+        pc: usize,
+        index: usize,
+        mut read: impl FnMut(&super::lift::Input) -> LLVMValueRef,
+        mut write: impl FnMut(super::lift::Output, LLVMValueRef),
+    ) {
+        use super::ir::typed::cfg::*;
+        let alu = f.blocks[&pc].instructions[index]
+            .as_ref()
+            .expect("missing typed lowering");
+        for (input, id) in &alu.inputs {
+            if self.values[id.0].is_null() {
+                self.values[id.0] = read(input);
+            }
+        }
+        let block = &f.ir.func().blocks[&BlockId(pc)];
+        for inst in &block.insts[alu.core.clone()] {
+            let Inst::Core { value, ty, op } = *inst else {
+                unreachable!("adapter in core range")
+            };
+            self.values[value.0] = self.emitter.op(ty, op, &self.values);
+        }
+        // Keep the effective value in its coalesced boundary slot until its
+        // first use, matching the existing emitter's load placement. Loading
+        // immediately after every write perturbs LLVM's optimization order
+        // even when that SSA definition is never read. Later uses still share
+        // the same SSA ID; the lifter invalidates views on overlapping writes.
+        write(alu.output, self.values[alu.result.0]);
+    }
 }

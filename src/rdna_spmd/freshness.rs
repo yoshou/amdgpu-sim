@@ -74,7 +74,7 @@ fn vop3_writes_mask(op: I) -> bool {
 
 /// Opcodes that write a 64-bit (two-register) integer result.
 fn is_wide_int(op: I) -> bool {
-    matches!(op, I::V_MAD_CO_U64_U32 | I::V_LSHLREV_B64 | I::V_ASHR_I64 | I::V_ASHRREV_I64)
+    matches!(op, I::V_MAD_CO_U64_U32 | I::V_LSHLREV_B64 | I::V_LSHRREV_B64 | I::V_ASHR_I64 | I::V_ASHRREV_I64)
 }
 
 /// The f64 pairs this instruction defines (sets fresh). Global loads of ≥2 words
@@ -130,7 +130,7 @@ pub fn vgpr_writes(inst: &InstFormat) -> Vec<u32> {
             if w { vec![i.vdst as u32, i.vdst as u32 + 1] } else { vec![i.vdst as u32] }
         }
         InstFormat::VOP2(i) => {
-            if is_f64_producer(i.op) { vec![i.vdst as u32, i.vdst as u32 + 1] } else { vec![i.vdst as u32] }
+            if is_f64_producer(i.op) || is_wide_int(i.op) { vec![i.vdst as u32, i.vdst as u32 + 1] } else { vec![i.vdst as u32] }
         }
         InstFormat::VOP3(i) => {
             if vop3_writes_mask(i.op) {
@@ -172,6 +172,7 @@ pub fn vgpr_writes(inst: &InstFormat) -> Vec<u32> {
         InstFormat::VSAMPLE(i) if matches!(i.op, I::IMAGE_SAMPLE_LZ) => {
             vec![i.vdata as u32]
         }
+        InstFormat::DS(i) if matches!(i.op, I::DS_LOAD_U8) => vec![i.vdst as u32],
         InstFormat::VOP3P(i) => match i.op {
             // Cross-lane WMMA writes its 8-VGPR f32 accumulator (it is lifted to a
             // wave-level boundary before compilation, but account for its writes so
