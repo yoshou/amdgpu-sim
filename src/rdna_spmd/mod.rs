@@ -89,6 +89,7 @@ mod emit_vec;
 mod freshness;
 mod combine;
 mod ir;
+mod load_cluster;
 mod mathcombine;
 mod regtype;
 mod runtime;

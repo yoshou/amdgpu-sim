@@ -36,6 +36,7 @@ use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, SMEM, SO
 
 use super::freshness::vgpr_writes;
 use super::ir::{Cond, ScalarProgram, Terminator};
+use super::load_cluster::vg_sext_ioff;
 
 const EXEC: u32 = 126;
 const VCC: u32 = 106;
@@ -2060,12 +2061,6 @@ unsafe fn compile_inner(
     // packets as well: a fiber's state never leaves SSA at a boundary (what
     // the host observes there is `boundary_reads`), and EXEC stays in its
     // alloca across the switch.
-    // All supported widths are powers of two. Divergent-pointer load clustering
-    // uses power-of-two transpose tiles up to 8 lanes, then concatenates tiles
-    // for wider packets.
-    let do_cluster = w.is_power_of_two();
-
-
     for (&pc, block) in &program.blocks {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         cg.current_pc.set(pc);
@@ -2162,11 +2157,13 @@ unsafe fn compile_inner(
                     cluster_rest -= 1;
                 } else {
                     cg.predicate.set(variant_pred && base_pred && !flags[idx]);
-                    let cluster = if do_cluster { vg_cluster(&block.body[idx..]) } else { None };
+                    let cluster = super::load_cluster::analyze(
+                        &block.body[idx..], w, cg.div_cur.get(), &cg.frame_cur.borrow(),
+                    );
                     if let Some(SqrtCollapse::Rescale { site, vdst }) = sqrt_collapse[idx].clone() {
                         let root = cg.vsqrt(sqrt_inputs[&site]);
                         cg.st_vgpr_f64(vdst as u32, root);
-                    } else if let Some(c) = cluster.filter(|c| cg.cluster_applicable(c)) {
+                    } else if let Some(c) = cluster {
                         let members: Vec<&VGLOBAL> = block.body[idx..idx + c.len]
                             .iter()
                             .map(|i| match i { InstFormat::VGLOBAL(g) => g, _ => unreachable!() })
@@ -3517,15 +3514,7 @@ impl Cg {
         }
         cur[0]
     }
-    /// Whether a detected load cluster should really take the transpose path:
-    /// a uniform address is served better by scalar-load + broadcast, and an
-    /// affine-frame address by the contiguous coalesced/register-resident
-    /// paths — both handled per-member by `emit_vglobal`.
-    fn cluster_applicable(&self, c: &VgCluster) -> bool {
-        !(self.vgpr_uniform(c.vaddr) && self.vgpr_uniform(c.vaddr + 1))
-            && !self.frame_cur.borrow().contains_key(&c.vaddr)
-    }
-    /// Emit a divergent-pointer load cluster (see `vg_cluster`) as W per-lane
+    /// Emit a divergent-pointer load cluster (see `load_cluster::analyze`) as W per-lane
     /// contiguous <span×f64> loads + a shuffle transpose, replacing the member
     /// masked gathers. Inactive lanes may hold garbage pointers: they are
     /// substituted with an active lane's pointer (umax over active lanes) —
@@ -4412,23 +4401,6 @@ impl Cg {
     }
 }
 
-// ---- divergent-pointer load clustering ------------------------------------
-// A run of *consecutive* VGLOBAL f64-shaped loads (B64/B128) off the same
-// divergent per-lane pointer (saddr=124), together covering a contiguous,
-// pairwise 8-aligned byte span, is one per-lane record read (smallpt: the
-// 9-f64 sphere record at 0x8..0x50). `vg_cluster` recognizes the run so it can
-// be emitted as W contiguous per-lane vector loads + a shuffle transpose
-// instead of one masked gather per f64 column. Consecutive-only keeps this
-// trivially sound: no instruction intervenes, so EXEC, memory and the address
-// VGPRs cannot change inside the run (scheduling no-ops are already filtered
-// out of `body` by ir::is_noop).
-struct VgCluster {
-    len: usize, // number of member instructions (≥ 3)
-    vaddr: u32, // shared per-lane pointer pair
-    lo: i64,    // lowest sign-extended ioffset (span start, bytes)
-    span: u32,  // span length in f64 fields
-}
-
 /// Match a transpose tile to the host's native f64 SIMD width. The LLVM JIT is
 /// also configured for the host CPU, so this keeps each column vector native:
 /// SSE2/NEON=2 lanes, AVX2=4, AVX-512=8. Wider SPMD packets concatenate tiles.
@@ -4512,73 +4484,6 @@ mod transpose_mask_tests {
             }
         }
     }
-}
-
-fn vg_sext_ioff(io: u32) -> i64 {
-    (((io << 8) as i32) >> 8) as i64
-}
-
-fn vg_cluster(body: &[InstFormat]) -> Option<VgCluster> {
-    fn f64_words(g: &VGLOBAL) -> Option<u32> {
-        match g.op {
-            I::GLOBAL_LOAD_B64 => Some(2),
-            I::GLOBAL_LOAD_B128 => Some(4),
-            _ => None,
-        }
-    }
-    let first = match body.first()? {
-        InstFormat::VGLOBAL(g) if g.saddr == 124 && f64_words(g).is_some() => g,
-        _ => return None,
-    };
-    let vaddr = first.vaddr;
-    let mut members: Vec<&VGLOBAL> = Vec::new();
-    for inst in body {
-        let g = match inst {
-            InstFormat::VGLOBAL(g) => g,
-            _ => break,
-        };
-        let Some(w) = f64_words(g) else { break };
-        if g.saddr != 124 || g.vaddr != vaddr {
-            break;
-        }
-        members.push(g);
-        // This load overwrites the pointer pair: later loads would read the
-        // NEW address — stop extending (this member itself is still fine).
-        let dst = g.vdst as u32..g.vdst as u32 + w;
-        if dst.contains(&(vaddr as u32)) || dst.contains(&(vaddr as u32 + 1)) {
-            break;
-        }
-    }
-    if members.len() < 3 {
-        return None;
-    }
-    // Contiguous coverage: every byte in [lo, hi) is read by some member, so
-    // for an ACTIVE lane the whole span is guest-dereferenced (fault-safe).
-    let mut ranges: Vec<(i64, i64)> = members
-        .iter()
-        .map(|g| {
-            let s = vg_sext_ioff(g.ioffset);
-            (s, s + 4 * f64_words(g).unwrap() as i64)
-        })
-        .collect();
-    ranges.sort();
-    let lo = ranges[0].0;
-    let mut hi = ranges[0].1;
-    for &(a, b) in &ranges[1..] {
-        if a > hi {
-            return None;
-        }
-        hi = hi.max(b);
-    }
-    // Members must decompose into f64 columns of the span.
-    if members.iter().any(|g| (vg_sext_ioff(g.ioffset) - lo) % 8 != 0) || (hi - lo) % 8 != 0 {
-        return None;
-    }
-    let span = ((hi - lo) / 8) as u32;
-    if span < 4 {
-        return None;
-    }
-    Some(VgCluster { len: members.len(), vaddr: vaddr as u32, lo, span })
 }
 
 // f64 compare opcode -> (predicate, invert result)
