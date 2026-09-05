@@ -92,6 +92,8 @@ mod combine;
 mod ir;
 mod compiler;
 mod scalar_plan;
+mod lift;
+mod typed_codegen;
 mod load_cluster;
 mod boundary;
 mod packet_plan;

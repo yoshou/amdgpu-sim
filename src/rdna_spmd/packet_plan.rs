@@ -30,7 +30,7 @@ pub(super) enum InstructionAction {
 }
 
 pub(super) struct InstructionPlan<'a> {
-    pub inst: &'a InstFormat,
+    pub lowering: super::lift::Lowering<'a>,
     pub elide_predicate: bool,
     pub normal_ldexp: bool,
     pub sqrt: Option<SqrtCollapse>,
@@ -116,7 +116,7 @@ impl<'a> PacketPlan<'a> {
                     InstructionAction::Emit
                 };
                 instructions.push(InstructionPlan {
-                    inst,
+                    lowering: super::lift::instruction(inst),
                     elide_predicate: flags[idx],
                     normal_ldexp: normal[idx],
                     sqrt: sqrt[idx].clone(),

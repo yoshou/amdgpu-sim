@@ -87,6 +87,11 @@ fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
 
 /// Backward liveness: VGPRs live on exit from each block.
 fn live_out(prog: &ScalarProgram) -> BTreeMap<usize, BTreeSet<u32>> {
+    // Register accesses do not change during this fixpoint. Compute them
+    // once rather than decoding and allocating them on every iteration.
+    let accesses: BTreeMap<_, Vec<_>> = prog.blocks.iter().map(|(&pc, block)| {
+        (pc, block.body.iter().map(|inst| (vgpr_writes(inst), vgpr_reads(inst))).collect())
+    }).collect();
     let mut live_in: BTreeMap<usize, BTreeSet<u32>> =
         prog.blocks.keys().map(|&pc| (pc, BTreeSet::new())).collect();
     loop {
@@ -106,11 +111,11 @@ fn live_out(prog: &ScalarProgram) -> BTreeMap<usize, BTreeSet<u32>> {
             }
             // Transfer backward through the body.
             let mut cur = out;
-            for inst in block.body.iter().rev() {
-                for w in vgpr_writes(inst) {
-                    cur.remove(&w);
+            for (writes, reads) in accesses[&pc].iter().rev() {
+                for w in writes {
+                    cur.remove(w);
                 }
-                for rd in vgpr_reads(inst) {
+                for &rd in reads {
                     cur.insert(rd);
                 }
             }

@@ -1598,7 +1598,15 @@ unsafe fn compile_inner(
                         .collect();
                     cg.emit_vglobal_cluster(&members, c.lo, c.span, &preds);
                 } else {
-                    cg.emit_inst(instruction.inst);
+                    match &instruction.lowering {
+                        super::lift::Lowering::TypedAlu { source, expr } => {
+                            let a = cg.vsrc_u32(&source.src0);
+                            let b = cg.ld_vgpr32(source.vsrc1 as u32);
+                            let result = super::typed_codegen::emit(cg.b, expr, &[a, b]);
+                            cg.st_vgpr32(source.vdst as u32, result);
+                        }
+                        super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
+                    }
                 }
             }
             cg.emit_term(&block.term, &bbs);
@@ -2016,17 +2024,7 @@ impl Cg {
         let s0 = self.vsrc_u32(&i.src0);
         let s1 = self.ld_vgpr32(i.vsrc1 as u32);
         let r = match i.op {
-            I::V_ADD_NC_U32 => self.v_add(s0, s1),
-            I::V_SUB_NC_U32 => llvm::core::LLVMBuildSub(self.b, s0, s1, self.n()),
-            I::V_SUBREV_NC_U32 => llvm::core::LLVMBuildSub(self.b, s1, s0, self.n()),
-            I::V_AND_B32 => self.v_and(s0, s1),
-            I::V_XOR_B32 => self.v_xor(s0, s1),
-            I::V_OR_B32 => self.v_or(s0, s1),
-            I::V_LSHLREV_B32 => self.v_shl(s1, s0),
-            I::V_LSHRREV_B32 => self.v_lshr(s1, s0),
             I::V_MUL_LO_U32 => llvm::core::LLVMBuildMul(self.b, s0, s1, self.n()),
-            I::V_MAX_U32 => { let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntUGT, s0, s1, self.n()); llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n()) }
-            I::V_MIN_U32 => { let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntULT, s0, s1, self.n()); llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n()) }
             I::V_MAX_I32 => { let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntSGT, s0, s1, self.n()); llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n()) }
             I::V_MIN_I32 => { let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntSLT, s0, s1, self.n()); llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n()) }
             I::V_CNDMASK_B32 => { let c = self.vcc_vec(); llvm::core::LLVMBuildSelect(self.b, c, s1, s0, self.n()) }

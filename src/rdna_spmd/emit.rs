@@ -778,11 +778,19 @@ unsafe fn compile_inner(
         cg.sgpr_fresh.set(facts.sgpr_fresh);
         let states = &facts.active;
         cg.mask_def.borrow_mut().clear();
-        for (idx, inst) in block.body.iter().enumerate() {
+        for (idx, instruction) in facts.instructions.iter().enumerate() {
             // Predicate this instruction's vector writes/compares unless the lane
             // is provably active here (then the mask is a no-op and we drop it).
             cg.predicate.set(!states[idx]);
-            cg.emit_inst(inst);
+            match instruction {
+                super::lift::Lowering::TypedAlu { source, expr } => {
+                    let a = cg.src_u32(&source.src0);
+                    let b = cg.ld_vgpr32(source.vsrc1 as u32);
+                    let result = super::typed_codegen::emit(cg.b, expr, &[a, b]);
+                    cg.st_vgpr32(source.vdst as u32, result);
+                }
+                super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
+            }
         }
         cg.emit_term(&block.term, &bbs);
     }
@@ -1332,23 +1340,7 @@ impl Cg {
         let s0 = self.src_u32(&i.src0);
         let s1 = self.ld_vgpr32(i.vsrc1 as u32);
         let r = match i.op {
-            I::V_ADD_NC_U32 => self.b_add(s0, s1),
-            I::V_SUB_NC_U32 => self.b_sub(s0, s1),
-            I::V_SUBREV_NC_U32 => self.b_sub(s1, s0),
             I::V_ADD_NC_U16 => self.b_and(self.b_add(s0, s1), self.ci32(0xffff)),
-            I::V_AND_B32 => self.b_and(s0, s1),
-            I::V_XOR_B32 => self.b_xor(s0, s1),
-            I::V_OR_B32 => self.b_or(s0, s1),
-            I::V_LSHLREV_B32 => self.shl(s1, s0),
-            I::V_LSHRREV_B32 => self.lshr(s1, s0),
-            I::V_MAX_U32 => {
-                let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntUGT, s0, s1, self.n());
-                llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n())
-            }
-            I::V_MIN_U32 => {
-                let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntULT, s0, s1, self.n());
-                llvm::core::LLVMBuildSelect(self.b, c, s0, s1, self.n())
-            }
             I::V_CNDMASK_B32 => {
                 // implicit VCC condition
                 let c = self.vcc_bit();

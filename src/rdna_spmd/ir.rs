@@ -17,6 +17,8 @@ use std::collections::BTreeMap;
 use crate::instructions::I;
 use crate::rdna_instructions::InstFormat;
 
+pub(super) mod typed;
+
 /// Branch condition recovered from a block's terminating SOPP instruction.
 /// For a single lane EXEC/VCC are 1-bit; these become ordinary scalar branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

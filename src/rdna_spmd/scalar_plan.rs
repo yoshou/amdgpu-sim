@@ -13,7 +13,8 @@ pub(super) enum ScalarMode {
     Cooperative,
 }
 
-pub(super) struct ScalarBlockPlan {
+pub(super) struct ScalarBlockPlan<'a> {
+    pub instructions: Vec<super::lift::Lowering<'a>>,
     pub active: Vec<bool>,
     pub f64_fresh: RegSet,
     pub sgpr_fresh: u128,
@@ -22,7 +23,7 @@ pub(super) struct ScalarBlockPlan {
 pub(super) struct ScalarPlan<'a> {
     pub program: &'a ScalarProgram,
     pub mode: ScalarMode,
-    pub blocks: BTreeMap<usize, ScalarBlockPlan>,
+    pub blocks: BTreeMap<usize, ScalarBlockPlan<'a>>,
 }
 
 impl<'a> ScalarPlan<'a> {
@@ -32,6 +33,7 @@ impl<'a> ScalarPlan<'a> {
         let sgpr_fresh = super::freshness::analyze_sgpr(program);
         let blocks = program.blocks.iter().map(|(&pc, block)| {
             (pc, ScalarBlockPlan {
+                instructions: block.body.iter().map(super::lift::instruction).collect(),
                 active: super::active::body_active_states(block, active[&pc]),
                 f64_fresh: f64_fresh[&pc],
                 sgpr_fresh: sgpr_fresh[&pc],
