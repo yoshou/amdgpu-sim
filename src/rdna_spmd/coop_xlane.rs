@@ -28,7 +28,8 @@ use crate::rdna_instructions::{InstFormat, SourceOperand};
 
 use super::dispatch::{setup_sgprs, GridDims};
 use super::emit::{CoopKernel, COOP_DONE, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
-use super::emit_vec::{BoundaryIo, CoopVecKernel, RegSet};
+use super::boundary::{BoundaryIo, RegSet};
+use super::emit_vec::CoopVecKernel;
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 use super::ir::{ScalarBlock, ScalarProgram, Terminator};
 

@@ -34,7 +34,9 @@ use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef
 use crate::instructions::I;
 use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
-use super::freshness::vgpr_writes;
+use super::boundary::{BoundaryIo, RegSet};
+use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction, cooperative_vgpr_count};
+use super::sqrt_idiom::SqrtCollapse;
 use super::ir::{Cond, ScalarProgram, Terminator};
 use super::load_cluster::vg_sext_ioff;
 
@@ -43,438 +45,6 @@ const VCC: u32 = 106;
 
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap()
-}
-
-fn succs_for_emit(block: &super::ir::ScalarBlock) -> Vec<usize> {
-    match block.term {
-        Terminator::Return => vec![],
-        Terminator::Jump(target) => vec![target],
-        Terminator::Branch { taken, fallthrough, .. } => vec![taken, fallthrough],
-        Terminator::Barrier { resume } => vec![resume],
-    }
-}
-
-/// A set of SGPRs and VGPRs.
-#[derive(Clone, Copy, Default, PartialEq)]
-pub(super) struct RegSet {
-    sgpr: u128,
-    vgpr: [u128; 2],
-}
-
-impl RegSet {
-    /// Registers outside the architectural files (128 SGPRs, 256 VGPRs) are
-    /// dropped: operand encodings can name reserved indices, and aliasing one
-    /// onto a real register would be worse than ignoring it.
-    pub(super) fn add_sgpr(&mut self, reg: u32) {
-        if reg < 128 {
-            self.sgpr |= 1 << reg;
-        }
-    }
-    pub(super) fn add_vgpr(&mut self, reg: u32) {
-        if reg < 256 {
-            self.vgpr[(reg >> 7) as usize] |= 1 << (reg & 127);
-        }
-    }
-    pub(super) fn has_sgpr(&self, reg: u32) -> bool {
-        reg < 128 && self.sgpr & (1 << reg) != 0
-    }
-    fn has_vgpr(&self, reg: u32) -> bool {
-        reg < 256 && self.vgpr[(reg >> 7) as usize] & (1 << (reg & 127)) != 0
-    }
-    pub(super) fn vgprs(&self) -> impl Iterator<Item = u32> + '_ {
-        (0..256u32).filter(move |&reg| self.has_vgpr(reg))
-    }
-}
-
-/// What the host-applied wave-level op at a boundary touches: the registers it
-/// reads out of the packet (which the kernel stores before yielding) and the
-/// ones it writes back (which the kernel reloads afterwards). A partial write
-/// — writelane touches one lane of the packed vector — belongs in `reads` too,
-/// so the lanes it leaves alone survive the round trip.
-#[derive(Clone, Copy, Default)]
-pub(super) struct BoundaryIo {
-    pub(super) reads: RegSet,
-    pub(super) writes: RegSet,
-}
-
-fn normal_f64_pow2_exponent(op: &SourceOperand) -> bool {
-    let value = match op {
-        SourceOperand::IntegerConstant(value) => *value as u32 as i32,
-        SourceOperand::LiteralConstant(value) => *value as i32,
-        SourceOperand::FloatConstant(value) => (*value as f32).to_bits() as i32,
-        _ => return false,
-    };
-    (-1022..=1023).contains(&value)
-}
-
-fn normal_pow2_cndmask_def(inst: &InstFormat) -> Option<u32> {
-    let InstFormat::VOP3(i) = inst else { return None };
-    (matches!(i.op, I::V_CNDMASK_B32)
-        && i.abs == 0
-        && i.neg == 0
-        && normal_f64_pow2_exponent(&i.src0)
-        && normal_f64_pow2_exponent(&i.src1))
-        .then_some(i.vdst as u32)
-}
-
-/// The VGPRs an instruction between two steps of the idiom writes, or `None`
-/// for a form the search will not step over. The ALU and scalar formats are
-/// modelled by `vgpr_writes`; the memory ones are left out so that only
-/// register effects have to be reasoned about here.
-fn steppable_vgpr_writes(inst: &InstFormat) -> Option<Vec<u32>> {
-    match inst {
-        InstFormat::VOP1(_)
-        | InstFormat::VOP2(_)
-        | InstFormat::VOP3(_)
-        | InstFormat::VOP3SD(_)
-        | InstFormat::VOP3P(_)
-        | InstFormat::VOPC(_)
-        | InstFormat::VOPD(_)
-        | InstFormat::SOP1(_)
-        | InstFormat::SOP2(_)
-        | InstFormat::SOPC(_)
-        | InstFormat::SOPK(_)
-        | InstFormat::SOPP(_) => Some(vgpr_writes(inst)),
-        _ => None,
-    }
-}
-
-/// The next instruction at or after `from` that `matches`, provided every
-/// instruction before it leaves `live` alone. Anything else ends the search:
-/// the idiom's steps have to reach each other through registers no one else
-/// wrote.
-fn find_step(
-    body: &[InstFormat],
-    from: usize,
-    live: &[u32],
-    matches: impl Fn(&InstFormat) -> bool,
-) -> Option<usize> {
-    for (offset, inst) in body[from..].iter().enumerate() {
-        if matches(inst) {
-            return Some(from + offset);
-        }
-        let written = steppable_vgpr_writes(inst)?;
-        if written.iter().any(|reg| live.contains(reg)) {
-            return None;
-        }
-    }
-    None
-}
-
-/// Whether `body[from..until]` leaves `live` alone, which is what lets a step
-/// found out of order still belong to the idiom.
-fn keeps_live(body: &[InstFormat], from: usize, until: usize, live: &[u32]) -> bool {
-    body[from..until].iter().all(|inst| {
-        steppable_vgpr_writes(inst)
-            .is_some_and(|written| !written.iter().any(|reg| live.contains(reg)))
-    })
-}
-
-fn ldexp_f64_with_exponent(inst: &InstFormat, exponent: u32) -> bool {
-    let InstFormat::VOP3(i) = inst else { return false };
-    matches!(i.op, I::V_LDEXP_F64)
-        && matches!(i.src1, SourceOperand::VectorRegister(r) if r as u32 == exponent)
-}
-
-/// Recognize the object-level normalization idiom
-/// `scale -> sqrt -> refine -> classify -> rescale`.  Returning the two ends of
-/// each idiom keeps the profitability decision local to the complete idiom
-/// rather than expanding every individually-safe LDEXP in the object.
-///
-/// The steps need not be adjacent, nor in one fixed order: the compiler
-/// interleaves an unrelated expansion with them and hoists the second exponent
-/// and the classify around the square root. What has to hold is the dataflow —
-/// every register the idiom carries reaches its next step unwritten.
-fn normal_sqrt_ldexp_pairs(body: &[InstFormat]) -> Vec<(usize, usize)> {
-    let mut pairs = Vec::new();
-    for start in 0..body.len() {
-        let Some(first_exp) = normal_pow2_cndmask_def(&body[start]) else {
-            continue;
-        };
-
-        let Some(i_scale) = find_step(body, start + 1, &[first_exp], |inst| {
-            ldexp_f64_with_exponent(inst, first_exp)
-        }) else {
-            continue;
-        };
-        let InstFormat::VOP3(first_scale) = &body[i_scale] else {
-            continue;
-        };
-        let scaled = first_scale.vdst as u32;
-
-        let Some(i_sqrt) = find_step(body, i_scale + 1, &[scaled, scaled + 1], |inst| {
-            matches!(inst, InstFormat::VOP1(i)
-                if matches!(i.op, I::V_SQRT_F64)
-                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst))
-        }) else {
-            continue;
-        };
-        let InstFormat::VOP1(sqrt) = &body[i_sqrt] else {
-            continue;
-        };
-        let root = sqrt.vdst as u32;
-
-        // The rescale is the far end: an LDEXP of the root by an exponent from
-        // a second cndmask of the same shape.
-        let Some(i_rescale) = find_step(body, i_sqrt + 1, &[root, root + 1], |inst| {
-            matches!(inst, InstFormat::VOP3(i)
-                if matches!(i.op, I::V_LDEXP_F64)
-                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == sqrt.vdst)
-                    && matches!(i.src1, SourceOperand::VectorRegister(_)))
-        }) else {
-            continue;
-        };
-        let InstFormat::VOP3(second_scale) = &body[i_rescale] else {
-            continue;
-        };
-        let SourceOperand::VectorRegister(second_exp) = second_scale.src1 else {
-            continue;
-        };
-        let second_exp = second_exp as u32;
-
-        // The second exponent may be computed anywhere before the rescale, as
-        // long as it reaches it unwritten.
-        let defines_second_exp = (start..i_rescale).rev().any(|at| {
-            normal_pow2_cndmask_def(&body[at]) == Some(second_exp)
-                && keeps_live(body, at + 1, i_rescale, &[second_exp])
-        });
-        if !defines_second_exp {
-            continue;
-        }
-
-        // The classify reads the scaled value, so that value has to survive
-        // from the scale to it.
-        let has_class = (i_scale + 1..i_rescale).any(|at| {
-            matches!(&body[at], InstFormat::VOP3(i)
-                if matches!(i.op, I::V_CMP_CLASS_F64)
-                    && matches!(i.src0, SourceOperand::VectorRegister(r) if r == first_scale.vdst))
-                && keeps_live(body, i_scale + 1, at, &[scaled, scaled + 1])
-        });
-        if !has_class {
-            continue;
-        }
-
-        pairs.push((i_scale, i_rescale));
-    }
-    pairs
-}
-
-/// The scale and rescale of every recognized idiom, as one flag per
-/// instruction.
-fn normal_sqrt_ldexp_indices(body: &[InstFormat]) -> Vec<bool> {
-    let mut fast = vec![false; body.len()];
-    for (scale, rescale) in normal_sqrt_ldexp_pairs(body) {
-        fast[scale] = true;
-        fast[rescale] = true;
-    }
-    fast
-}
-
-/// The scale/sqrt/rescale idiom computes `sqrt(src)` the long way: it scales a
-/// possibly-subnormal input up by an even power of two, takes the hardware
-/// square root, then scales the result back down. The GPU needs that dance
-/// because `V_SQRT_F64` is not correctly rounded over the whole range; x86
-/// `sqrtpd` is, and both scalings are exact powers of two, so the rescaled
-/// result is bit-identical to `sqrt(src)`.
-///
-/// Collapsing the idiom matters for more than instruction count: it puts a
-/// compare, a select and two scales *in series* with the square root, and this
-/// kernel is bound by dependency-chain latency rather than by throughput.
-/// Measured on smallpt at W=16: -1.8% cycles, bit-identical image.
-///
-/// The intermediate scale and hardware square root are still emitted — the class
-/// compare in the middle genuinely reads the scaled value, and anything else
-/// reading the intermediates stays correct; they die if nothing does.
-#[derive(Clone)]
-enum SqrtCollapse {
-    /// Snapshot the pre-scale input: the scale usually writes its source
-    /// register in place, so the value has to be read before it runs.
-    Capture { site: usize, src: SourceOperand },
-    /// Replace the trailing rescale with the square root of that snapshot.
-    Rescale { site: usize, vdst: u8 },
-}
-
-fn sqrt_collapse_sites(body: &[InstFormat]) -> Vec<Option<SqrtCollapse>> {
-    let mut out: Vec<Option<SqrtCollapse>> = vec![None; body.len()];
-    for (scale, rescale) in normal_sqrt_ldexp_pairs(body) {
-        let InstFormat::VOP3(first_scale) = &body[scale] else { continue };
-        let InstFormat::VOP3(second_scale) = &body[rescale] else { continue };
-        // Source modifiers would change the value being rooted.
-        if first_scale.abs != 0
-            || first_scale.neg != 0
-            || second_scale.abs != 0
-            || second_scale.neg != 0
-        {
-            continue;
-        }
-        // The scale names the site, so a collapse cannot pair the ends of two
-        // different idioms.
-        out[scale] = Some(SqrtCollapse::Capture { site: scale, src: first_scale.src0.clone() });
-        out[rescale] = Some(SqrtCollapse::Rescale { site: scale, vdst: second_scale.vdst });
-    }
-    out
-}
-
-#[cfg(test)]
-pub(super) fn normal_sqrt_ldexp_sites(program: &ScalarProgram) -> Vec<(usize, usize)> {
-    program
-        .blocks
-        .iter()
-        .flat_map(|(&pc, block)| {
-            normal_sqrt_ldexp_indices(&block.body)
-                .into_iter()
-                .enumerate()
-                .filter_map(move |(index, fast)| fast.then_some((pc, index)))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod cooperative_vgpr_tests {
-    use super::*;
-    use super::super::ir::ScalarBlock;
-
-    #[test]
-    fn sizes_packet_state_from_ir_and_boundary_registers() {
-        let program = ScalarProgram {
-            entry_pc: 1,
-            blocks: BTreeMap::from([(
-                1,
-                ScalarBlock {
-                    pc: 1,
-                    body: vec![InstFormat::VOP1(VOP1 {
-                        src0: SourceOperand::VectorRegister(26),
-                        op: I::V_MOV_B32,
-                        vdst: 25,
-                    })],
-                    term: Terminator::Return,
-                },
-            )]),
-        };
-
-        assert_eq!(cooperative_vgpr_count(&program, 16, &BTreeMap::new()), 28);
-        let mut boundary = BoundaryIo::default();
-        boundary.writes.add_vgpr(31);
-        assert_eq!(
-            cooperative_vgpr_count(&program, 16, &BTreeMap::from([(2, boundary)])),
-            32
-        );
-        assert_eq!(cooperative_vgpr_count(&program, 64, &BTreeMap::new()), 64);
-    }
-}
-
-#[cfg(test)]
-mod normal_sqrt_tests {
-    use super::*;
-
-    fn vop3(
-        op: I,
-        vdst: u8,
-        src0: SourceOperand,
-        src1: SourceOperand,
-        src2: SourceOperand,
-    ) -> InstFormat {
-        InstFormat::VOP3(VOP3 {
-            vdst,
-            abs: 0,
-            opsel: 0,
-            cm: 0,
-            op,
-            src0,
-            src1,
-            src2,
-            omod: 0,
-            neg: 0,
-        })
-    }
-
-    fn normalization_body(first_exp: u32) -> Vec<InstFormat> {
-        vec![
-            vop3(
-                I::V_CNDMASK_B32,
-                10,
-                SourceOperand::IntegerConstant(0),
-                SourceOperand::LiteralConstant(first_exp),
-                SourceOperand::ScalarRegister(VCC as u8),
-            ),
-            vop3(
-                I::V_LDEXP_F64,
-                8,
-                SourceOperand::VectorRegister(8),
-                SourceOperand::VectorRegister(10),
-                SourceOperand::ScalarRegister(0),
-            ),
-            InstFormat::VOP1(VOP1 {
-                src0: SourceOperand::VectorRegister(8),
-                op: I::V_SQRT_F64,
-                vdst: 10,
-            }),
-            vop3(
-                I::V_CNDMASK_B32,
-                12,
-                SourceOperand::IntegerConstant(0),
-                SourceOperand::LiteralConstant((-128i32) as u32),
-                SourceOperand::ScalarRegister(VCC as u8),
-            ),
-            vop3(
-                I::V_CMP_CLASS_F64,
-                VCC as u8,
-                SourceOperand::VectorRegister(8),
-                SourceOperand::LiteralConstant(0x260),
-                SourceOperand::ScalarRegister(0),
-            ),
-            vop3(
-                I::V_LDEXP_F64,
-                10,
-                SourceOperand::VectorRegister(10),
-                SourceOperand::VectorRegister(12),
-                SourceOperand::ScalarRegister(0),
-            ),
-        ]
-    }
-
-    #[test]
-    fn recognizes_normal_power_of_two_sqrt_idiom() {
-        assert_eq!(
-            normal_sqrt_ldexp_indices(&normalization_body(256)),
-            [false, true, false, false, false, true]
-        );
-    }
-
-    #[test]
-    fn rejects_non_normal_power_of_two_exponent() {
-        assert!(normal_sqrt_ldexp_indices(&normalization_body(1024))
-            .iter()
-            .all(|fast| !fast));
-    }
-
-    #[test]
-    fn rejects_mismatched_exponent_def_use() {
-        let mut body = normalization_body(256);
-        let InstFormat::VOP3(scale) = &mut body[1] else { unreachable!() };
-        scale.src1 = SourceOperand::VectorRegister(11);
-        assert!(normal_sqrt_ldexp_indices(&body).iter().all(|fast| !fast));
-    }
-
-    #[test]
-    fn rejects_non_constant_exponent_choice() {
-        let mut body = normalization_body(256);
-        let InstFormat::VOP3(select) = &mut body[0] else { unreachable!() };
-        select.src0 = SourceOperand::ScalarRegister(4);
-        assert!(normal_sqrt_ldexp_indices(&body).iter().all(|fast| !fast));
-    }
-
-    #[test]
-    fn rejects_modified_or_incomplete_idiom() {
-        let mut modified = normalization_body(256);
-        let InstFormat::VOP3(select) = &mut modified[0] else { unreachable!() };
-        select.abs = 1;
-        assert!(normal_sqrt_ldexp_indices(&modified).iter().all(|fast| !fast));
-
-        let mut incomplete = normalization_body(256);
-        incomplete.remove(4);
-        assert!(normal_sqrt_ldexp_indices(&incomplete).iter().all(|fast| !fast));
-    }
 }
 
 /// A JIT-compiled width-W kernel. Processes W work-items per `run` call.
@@ -565,16 +135,8 @@ struct Cg {
     // <W×f64> cell; a 32-bit access extracts or replaces the requested half.
     // `f64c` contains the low registers of those pairs.
     f64c: super::regtype::RegSet,
-    // Flow-sensitive divergent-VGPR set at the current program point (seeded per
-    // block, transferred per instruction). A global load whose address VGPR is
-    // *uniform* here loads one location for all lanes ⇒ scalar broadcast instead
-    // of a gather (the IPC-crushing op). Flow-sensitive so a reg reused as a
-    // uniform address after being divergent f64 data is seen as uniform.
-    div_cur: std::cell::Cell<[u128; 2]>,
-    // Affine frame pointers at the current point: VGPR pair → per-work-item stride
-    // (bytes). A load with such an address is a contiguous vector load + transpose
-    // instead of a gather (see vec_live::frame_transfer).
-    frame_cur: std::cell::RefCell<std::collections::HashMap<u32, u32>>,
+    // Memory lowering selected by the immutable plan for this instruction.
+    global_load: std::cell::Cell<GlobalLoad>,
     scc: LLVMValueRef,       // scalar i1 alloca
     // scalar types
     i1: LLVMTypeRef,
@@ -1768,32 +1330,9 @@ impl Cg {
 
 pub fn compile_program(program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
     let num_vgprs = num_vgprs.max(256);
-    let addr = unsafe { compile_inner(program, num_vgprs, width, None) };
+    let plan = PacketPlan::new(program, width, None);
+    let addr = unsafe { compile_inner(&plan, num_vgprs) };
     VecKernel { addr, num_vgprs, width }
-}
-
-fn cooperative_vgpr_count(
-    program: &ScalarProgram,
-    declared_vgprs: usize,
-    boundary: &BTreeMap<usize, BoundaryIo>,
-) -> usize {
-    // Some gfx1200 callers still decode the descriptor with the older 4-VGPR
-    // granularity, so retain every register the IR or a lifted boundary can
-    // observe. Unlike the former 256-register floor, this avoids copying 8 KiB
-    // of dead packet state on every coroutine yield in small kernels.
-    let required_vgprs = program
-        .blocks
-        .values()
-        .flat_map(|block| block.body.iter())
-        .flat_map(|inst| {
-            let mut regs = super::vec_live::vgpr_reads(inst);
-            regs.extend(super::freshness::vgpr_writes(inst));
-            regs
-        })
-        .chain(boundary.values().flat_map(|io| io.writes.vgprs()))
-        .max()
-        .map_or(1, |reg| reg as usize + 1);
-    declared_vgprs.max(required_vgprs)
 }
 
 /// Compile a width-W packet of a cross-lane program. `boundary` describes the
@@ -1811,19 +1350,20 @@ pub(super) fn compile_cooperative(
 ) -> CoopVecKernel {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
     let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary);
-    let addr = unsafe { compile_inner(program, num_vgprs, width, Some(boundary)) };
+    let plan = PacketPlan::new(program, width, Some(boundary));
+    let addr = unsafe { compile_inner(&plan, num_vgprs) };
     CoopVecKernel { addr, num_vgprs, width }
 }
 
 /// `boundary` selects the ABI: `Some` compiles a resumable cooperative packet
 /// (fiber), `None` a whole-program kernel.
 unsafe fn compile_inner(
-    program: &ScalarProgram,
+    plan: &PacketPlan<'_>,
     num_vgprs: usize,
-    width: u32,
-    boundary: Option<&BTreeMap<usize, BoundaryIo>>,
 ) -> u64 {
-    let w = width;
+    let program = plan.program;
+    let boundary = plan.boundary;
+    let w = plan.width;
     let coop = boundary.is_some();
 
     llvm::target::LLVM_InitializeNativeTarget();
@@ -1923,10 +1463,9 @@ unsafe fn compile_inner(
         sgpr, vgpr, vgpr_f64, scc,
         f64_fresh: std::cell::Cell::new([0; 2]),
         stale: std::cell::Cell::new([0; 2]),
-        fresh_in: std::collections::BTreeMap::new(),
-        f64c: super::regtype::f64_read_pairs(program),
-        div_cur: std::cell::Cell::new({ let mut s = [0u128; 2]; s[0] |= 1; s }),
-        frame_cur: std::cell::RefCell::new(std::collections::HashMap::new()),
+        fresh_in: plan.fresh_in.clone(),
+        f64c: plan.f64_pairs,
+        global_load: std::cell::Cell::new(GlobalLoad::Gather),
         i1, i32t, i64t, f32t, f64t, iw, ptr,
         vi1, vi32, vi64, vf32, vf64,
         bvh_scratch, bvh_packet, bvh_packet_ty,
@@ -1939,25 +1478,15 @@ unsafe fn compile_inner(
         boundary: boundary.cloned().unwrap_or_default(),
     };
 
-    // Select at most one leaf loop whose EXEC save/restore pairs are entirely
-    // local to that loop. All other blocks keep lane masks packed in SGPRs.
-    let structured_mask_region = (!coop).then(|| super::analyze_structured(program))
-        .and_then(|plan| plan.loops.into_iter().find(|region| {
-            region.children.is_empty()
-                && !region.mask_stack.local_scopes.is_empty()
-                && region.mask_stack.boundary_live_saved.is_empty()
-                && region.mask_stack.unrestored_saved.is_empty()
-                && region.control.branch_conditions.iter().all(|cond| matches!(cond, Cond::ExecZ | Cond::ExecNz | Cond::Scc0 | Cond::Scc1))
-        }));
-    if let Some(region) = structured_mask_region.as_ref() {
-        let mask_regs = region.mask_stack.mask_sgprs.clone();
+    if let Some(region) = plan.mask_region.as_ref() {
+        let mask_regs = &region.registers;
         let masks = mask_regs.iter().copied().map(|reg| {
             (reg, llvm::core::LLVMBuildAlloca(b, vi1, cg.n()))
         }).collect();
         let init_bb = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, cstr("structured_mask_init").as_ptr());
         cg.structured_loop_masks = Some(StructuredLoopMasks {
             header: region.header,
-            body: region.body.iter().copied().collect(),
+            body: region.body.clone(),
             masks,
             init_bb,
             exit_bbs: BTreeMap::new(),
@@ -2005,12 +1534,7 @@ unsafe fn compile_inner(
         bbs.insert(pc, llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
     }
     if let Some(loop_masks) = cg.structured_loop_masks.as_mut() {
-        let exits: Vec<(usize, usize)> = loop_masks.body.iter().copied().flat_map(|from| {
-            succs_for_emit(&program.blocks[&from]).into_iter()
-                .filter(|to| !loop_masks.body.contains(to))
-                .map(move |to| (from, to))
-        }).collect();
-        for (from, to) in exits {
+        for &(from, to) in &plan.mask_region.as_ref().unwrap().exits {
             let name = cstr(&format!("structured_mask_exit_{from:x}_{to:x}"));
             loop_masks.exit_bbs.insert((from, to), llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
         }
@@ -2019,49 +1543,8 @@ unsafe fn compile_inner(
     // there is no resume dispatch here.
     llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
 
-    let base_pred = true;
-    // Registers the host writes on a Barrier->resume edge; the divergence and
-    // frame analyses must not read a host-written value as a uniform one.
-    let boundary_writes: BTreeMap<usize, Vec<u32>> = boundary
-        .map(|map| map.iter().map(|(&pc, io)| (pc, io.writes.vgprs().collect())).collect())
-        .unwrap_or_default();
-    // Mask elision: a VGPR write skips EXEC predication when none of its
-    // destinations is live at a CFG reconvergence point or caller-observed
-    // exit. Reconvergence-visible state stays predicated, while transient
-    // arithmetic may run mask-free; memory and compare writes remain
-    // EXEC-masked. See [super::vec_live].
-    //
-    // A packet's caller-observed exits are its boundaries, and the host reads
-    // the op's sources in EVERY lane (WMMA mixes lanes and ignores EXEC), so
-    // those registers must stay predicated. Nothing observes the register file
-    // after the kernel returns.
-    let boundary_reads: Vec<u32> = boundary
-        .map(|map| map.values().flat_map(|io| io.reads.vgprs()).collect())
-        .unwrap_or_default();
-    let elide = super::vec_live::analyze_with_exit_live(program, &boundary_reads);
-    let f64_fresh_in = super::freshness::analyze(program);
-    cg.fresh_in = f64_fresh_in.clone();
-    let div_in = if coop {
-        let mut seed = [0u128; 2];
-        seed[0] |= 1;
-        super::vec_live::divergent_entry_with_seed_and_boundary_writes(
-            program,
-            seed,
-            &boundary_writes,
-        )
-    } else {
-        super::vec_live::divergent_entry(program)
-    };
-    let frame_in = if coop {
-        super::vec_live::frame_entry_with_boundary_writes(program, &boundary_writes)
-    } else {
-        super::vec_live::frame_entry(program)
-    };
-    // Both this rule and the specialization below now apply to cooperative
-    // packets as well: a fiber's state never leaves SSA at a boundary (what
-    // the host observes there is `boundary_reads`), and EXEC stays in its
-    // alloca across the switch.
-    for (&pc, block) in &program.blocks {
+    for (&pc, block_plan) in &plan.blocks {
+        let block = block_plan.block;
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         cg.current_pc.set(pc);
         if let Some(loop_masks) = cg.structured_loop_masks.as_ref() {
@@ -2072,46 +1555,13 @@ unsafe fn compile_inner(
         // producers (predicated `st_vgpr_f64`) and global f64 loads (gathered as
         // <W×f64>) — so an analysis-fresh pair's cell holds the correct per-lane
         // value on entry. Removes the cross-block i32→f64 reconstruction.
-        cg.set_f64_fresh(f64_fresh_in[&pc]);
+        cg.set_f64_fresh(block_plan.fresh);
         // Conservatively assume every fresh-on-entry shadow pair's i32 slots are
         // stale (a predecessor may have skipped the sync); canonical pairs have
         // no live slots and are excluded so edge syncs don't write dead stores.
-        cg.stale.set({
-            let mut st = f64_fresh_in[&pc];
-            for r in 0..256u32 {
-                if super::regtype::bget(&st, r) && super::regtype::bget(&cg.f64c, r) {
-                    st[(r / 128) as usize] &= !(1u128 << (r % 128));
-                }
-            }
-            st
-        });
-        cg.div_cur.set(div_in[&pc]);
-        *cg.frame_cur.borrow_mut() = frame_in[&pc].clone();
-        let flags = &elide[&pc];
-        let normal_sqrt_ldexp = normal_sqrt_ldexp_indices(&block.body);
-        let sqrt_collapse = sqrt_collapse_sites(&block.body);
-
-        // All-lanes-active specialization. When EXEC covers the whole packet,
-        // `select(EXEC, new, old)` is the identity, so a clone of the block
-        // emitted without predication computes the same thing with fewer
-        // operations *and* without the old value's live range — and register
-        // pressure, not instruction count, is what this backend pays for. A
-        // dispatcher tests EXEC once; both clones write the same register cells
-        // and branch to the same successors, so nothing else changes.
-        //
-        // On smallpt EXEC is full for only 6-38% of executions of the hot blocks,
-        // yet this still measured -5.1% cycles: the fast clone shortens the
-        // dependency chain rather than merely removing work. The cost is a test
-        // and branch per block and ~40% more JIT compile time from the clones.
-        let predicated_writes = block
-            .body
-            .iter()
-            .enumerate()
-            .filter(|(idx, inst)| {
-                !flags[*idx] && !super::freshness::vgpr_writes(inst).is_empty()
-            })
-            .count();
-        let specialize = predicated_writes > 0;
+        cg.stale.set(block_plan.stale);
+        let specialize = block_plan.specialize;
+        // Both variants consume the same precomputed instruction choices.
         let variants: Vec<(bool, LLVMBasicBlockRef)> = if specialize {
             let fast = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, cstr(&format!("b{:x}.allactive", pc)).as_ptr());
             let slow = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, cstr(&format!("b{:x}.masked", pc)).as_ptr());
@@ -2127,8 +1577,6 @@ unsafe fn compile_inner(
         let entry_facts = (
             cg.f64_fresh.get(),
             cg.stale.get(),
-            cg.div_cur.get(),
-            cg.frame_cur.borrow().clone(),
             cg.spill.borrow().clone(),
         );
 
@@ -2139,49 +1587,36 @@ unsafe fn compile_inner(
                 llvm::core::LLVMPositionBuilderAtEnd(b, variant_bb);
                 cg.f64_fresh.set(entry_facts.0);
                 cg.stale.set(entry_facts.1);
-                cg.div_cur.set(entry_facts.2);
-                *cg.frame_cur.borrow_mut() = entry_facts.3.clone();
-                *cg.spill.borrow_mut() = entry_facts.4.clone();
+                *cg.spill.borrow_mut() = entry_facts.2.clone();
             }
-            // Instructions already emitted as part of a divergent-pointer load
-            // cluster (record load + transpose); bookkeeping below still runs.
-            let mut cluster_rest = 0usize;
             let mut sqrt_inputs: std::collections::HashMap<usize, LLVMValueRef> =
                 std::collections::HashMap::new();
-            for (idx, inst) in block.body.iter().enumerate() {
-                cg.ldexp_normal_pow2.set(normal_sqrt_ldexp[idx]);
-                if let Some(SqrtCollapse::Capture { site, src }) = sqrt_collapse[idx].clone() {
-                    sqrt_inputs.insert(site, cg.vsrc_f64(&src));
+            for (idx, instruction) in block_plan.instructions.iter().enumerate() {
+                cg.ldexp_normal_pow2.set(instruction.normal_ldexp);
+                cg.global_load.set(instruction.global_load);
+                if let Some(SqrtCollapse::Capture { site, src }) = &instruction.sqrt {
+                    sqrt_inputs.insert(*site, cg.vsrc_f64(src));
                 }
-                if cluster_rest > 0 {
-                    cluster_rest -= 1;
+                if matches!(instruction.action, InstructionAction::ClusterMember) {
+                    continue;
+                }
+                cg.predicate.set(variant_pred && !instruction.elide_predicate);
+                if let Some(SqrtCollapse::Rescale { site, vdst }) = &instruction.sqrt {
+                    let root = cg.vsqrt(sqrt_inputs[site]);
+                    cg.st_vgpr_f64(*vdst as u32, root);
+                } else if let InstructionAction::Cluster(c) = &instruction.action {
+                    let members: Vec<&VGLOBAL> = block.body[idx..idx + c.len]
+                        .iter()
+                        .map(|i| match i { InstFormat::VGLOBAL(g) => g, _ => unreachable!() })
+                        .collect();
+                    let preds: Vec<bool> = block_plan.instructions[idx..idx + c.len]
+                        .iter()
+                        .map(|member| variant_pred && !member.elide_predicate)
+                        .collect();
+                    cg.emit_vglobal_cluster(&members, c.lo, c.span, &preds);
                 } else {
-                    cg.predicate.set(variant_pred && base_pred && !flags[idx]);
-                    let cluster = super::load_cluster::analyze(
-                        &block.body[idx..], w, cg.div_cur.get(), &cg.frame_cur.borrow(),
-                    );
-                    if let Some(SqrtCollapse::Rescale { site, vdst }) = sqrt_collapse[idx].clone() {
-                        let root = cg.vsqrt(sqrt_inputs[&site]);
-                        cg.st_vgpr_f64(vdst as u32, root);
-                    } else if let Some(c) = cluster {
-                        let members: Vec<&VGLOBAL> = block.body[idx..idx + c.len]
-                            .iter()
-                            .map(|i| match i { InstFormat::VGLOBAL(g) => g, _ => unreachable!() })
-                            .collect();
-                        let preds: Vec<bool> = (0..c.len)
-                            .map(|m| variant_pred && base_pred && !flags[idx + m])
-                            .collect();
-                        cg.emit_vglobal_cluster(&members, c.lo, c.span, &preds);
-                        cluster_rest = c.len - 1;
-                    } else {
-                        cg.emit_inst(inst);
-                    }
+                    cg.emit_inst(instruction.inst);
                 }
-                // advance flow-sensitive divergence + frame-pointer tracking
-                let mut d = cg.div_cur.get();
-                super::vec_live::div_transfer(inst, &mut d);
-                cg.div_cur.set(d);
-                super::vec_live::frame_transfer(inst, &mut cg.frame_cur.borrow_mut());
             }
             cg.emit_term(&block.term, &bbs);
         }
@@ -3395,83 +2830,53 @@ impl Cg {
             }
             return;
         }
-        // Uniform-address load (address VGPR identical in all packed lanes) → one
-        // scalar load + broadcast instead of a gather. Sound: the block only runs
-        // when EXEC≠0 (some lane active), so the shared address is dereferenceable,
-        // and all lanes get the same value. `noelide`-style: must check the actual
-        // address-input regs are uniform.
-        let uniform_addr = if i.saddr != 124 {
-            self.vgpr_uniform(i.vaddr as u32) // base = uniform SGPR + uniform vaddr
-        } else {
-            self.vgpr_uniform(i.vaddr as u32) && self.vgpr_uniform(i.vaddr as u32 + 1)
-        };
-        // Coalesced affine-frame load: address = vgpr0*stride + uniform (a
-        // per-work-item record). The packed lanes' records are contiguous in
-        // *vgpr0* order, so a contiguous vector load + transpose (shufflevector)
-        // extracts each field as <W×T> — replacing `words` gathers with a few
-        // loads + shuffles. vgpr0-derived ⇒ valid (can't fault on inactive lanes).
-        //
-        // Contiguity subtlety: the records are contiguous only where consecutive
-        // lanes have consecutive vgpr0 (the packed work-item id). vgpr0 is laid
-        // out `lx | ly<<10 | lz<<20`, so it is consecutive only *within* a
-        // workgroup row (wg_x lanes). Loading one W*stride block from lane 0
-        // therefore reads past the row when W spans a row boundary (e.g. W=32 on
-        // a 16-wide workgroup: lanes 16..31 live on the next row, 1024*stride
-        // away — the old single-block load read uninitialized memory for them,
-        // giving nondeterministic output). Instead load one block PER 8-lane
-        // group from *that group's own* base address: contiguity is then only
-        // assumed within 8 lanes, which holds whenever wg_x is a multiple of 8.
-        let fstride = if i.saddr == 124 && !uniform_addr {
-            self.frame_cur.borrow().get(&(i.vaddr as u32)).copied()
-        } else { None };
-        if let Some(stride_bytes) = fstride {
-            let sp4 = stride_bytes / 4;
-            let ioff_w = (ioffset as i64) / 4;
-            if sp4 >= 1 && ioffset % 4 == 0 && ioff_w >= 0 && (ioff_w as u32 + words) <= sp4 {
-                let grp = self.w.min(8); // lanes per contiguous group (W-aligned, ≤8)
-                let nblk = self.w / grp;
-                let blkty = llvm::core::LLVMVectorType(self.i32t, grp * sp4);
-                let poison_blk = llvm::core::LLVMGetPoison(blkty);
-                // Per-group contiguous load from the group's first lane's address.
-                let blocks: Vec<LLVMValueRef> = (0..nblk)
-                    .map(|g| {
-                        let a = llvm::core::LLVMBuildExtractElement(self.b, base, self.ci32(g * grp), self.n());
-                        let p = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, self.n());
-                        let ld = llvm::core::LLVMBuildLoad2(self.b, blkty, p, self.n());
-                        llvm::core::LLVMSetAlignment(ld, 4);
-                        ld
+        let uniform_addr = self.global_load.get() == GlobalLoad::Broadcast;
+        // The plan proved the frame bounds and alignment. Emit the same grouped
+        // contiguous loads and transpose; row crossings still use groups <= 8.
+        if let GlobalLoad::Frame { stride_words: sp4, offset_words: ioff_w } = self.global_load.get() {
+            let grp = self.w.min(8); // lanes per contiguous group (W-aligned, ≤8)
+            let nblk = self.w / grp;
+            let blkty = llvm::core::LLVMVectorType(self.i32t, grp * sp4);
+            let poison_blk = llvm::core::LLVMGetPoison(blkty);
+            // Per-group contiguous load from the group's first lane's address.
+            let blocks: Vec<LLVMValueRef> = (0..nblk)
+                .map(|g| {
+                    let a = llvm::core::LLVMBuildExtractElement(self.b, base, self.ci32(g * grp), self.n());
+                    let p = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, self.n());
+                    let ld = llvm::core::LLVMBuildLoad2(self.b, blkty, p, self.n());
+                    llvm::core::LLVMSetAlignment(ld, 4);
+                    ld
+                })
+                .collect();
+            let extract = |fw: u32| -> LLVMValueRef {
+                // Transpose field `fw` out of each group, then concat groups.
+                let parts: Vec<LLVMValueRef> = blocks
+                    .iter()
+                    .map(|&blk| {
+                        let mut idx: Vec<LLVMValueRef> = (0..grp).map(|lane| self.ci32(lane * sp4 + fw)).collect();
+                        let mask = llvm::core::LLVMConstVector(idx.as_mut_ptr(), grp);
+                        llvm::core::LLVMBuildShuffleVector(self.b, blk, poison_blk, mask, self.n())
                     })
                     .collect();
-                let extract = |fw: u32| -> LLVMValueRef {
-                    // Transpose field `fw` out of each group, then concat groups.
-                    let parts: Vec<LLVMValueRef> = blocks
-                        .iter()
-                        .map(|&blk| {
-                            let mut idx: Vec<LLVMValueRef> = (0..grp).map(|lane| self.ci32(lane * sp4 + fw)).collect();
-                            let mask = llvm::core::LLVMConstVector(idx.as_mut_ptr(), grp);
-                            llvm::core::LLVMBuildShuffleVector(self.b, blk, poison_blk, mask, self.n())
-                        })
-                        .collect();
-                    self.vconcat_i32(&parts)
-                };
-                let mut k = 0u32;
-                while k < words {
-                    if k + 1 < words {
-                        let lo = extract(ioff_w as u32 + k);
-                        let hi = extract(ioff_w as u32 + k + 1);
-                        let lo64 = self.zext64v(lo);
-                        let hi64 = llvm::core::LLVMBuildShl(self.b, self.zext64v(hi), self.splat(self.ci64(32), self.vi64), self.n());
-                        let u = self.v_or(hi64, lo64);
-                        let d = llvm::core::LLVMBuildBitCast(self.b, u, self.vf64, self.n());
-                        self.st_vgpr_f64(i.vdst as u32 + k, d);
-                        k += 2;
-                    } else {
-                        self.st_vgpr32(i.vdst as u32 + k, extract(ioff_w as u32 + k));
-                        k += 1;
-                    }
+                self.vconcat_i32(&parts)
+            };
+            let mut k = 0u32;
+            while k < words {
+                if k + 1 < words {
+                    let lo = extract(ioff_w as u32 + k);
+                    let hi = extract(ioff_w as u32 + k + 1);
+                    let lo64 = self.zext64v(lo);
+                    let hi64 = llvm::core::LLVMBuildShl(self.b, self.zext64v(hi), self.splat(self.ci64(32), self.vi64), self.n());
+                    let u = self.v_or(hi64, lo64);
+                    let d = llvm::core::LLVMBuildBitCast(self.b, u, self.vf64, self.n());
+                    self.st_vgpr_f64(i.vdst as u32 + k, d);
+                    k += 2;
+                } else {
+                    self.st_vgpr32(i.vdst as u32 + k, extract(ioff_w as u32 + k));
+                    k += 1;
                 }
-                return;
             }
+            return;
         }
         let mut k = 0u32;
         while k < words {
@@ -3487,9 +2892,6 @@ impl Cg {
                 k += 1;
             }
         }
-    }
-    fn vgpr_uniform(&self, r: u32) -> bool {
-        (self.div_cur.get()[(r >> 7) as usize] >> (r & 127)) & 1 == 0
     }
     /// Concatenate equal-length <n×i32> vectors into one <sum×i32> via a balanced
     /// shuffle tree (parts.len() is a power of two on the affine-frame path, so

@@ -90,6 +90,9 @@ mod freshness;
 mod combine;
 mod ir;
 mod load_cluster;
+mod boundary;
+mod packet_plan;
+mod sqrt_idiom;
 mod mathcombine;
 mod regtype;
 mod runtime;
@@ -133,7 +136,7 @@ pub fn default_width() -> u32 {
 mod object_predicate_tests {
     use object::{Object, ObjectSegment};
 
-    use super::{build_scalar_program, emit_vec::normal_sqrt_ldexp_sites};
+    use super::{build_scalar_program, sqrt_idiom::normal_sqrt_ldexp_sites};
     use crate::{processor::decode_kernel_desc, rdna_translator::RDNAProgram};
 
     fn sites_in_object(path: &str, descriptor_symbol: &str) -> Vec<(usize, usize)> {
