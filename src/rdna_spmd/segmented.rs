@@ -8,8 +8,9 @@ use crate::rdna_instructions::{InstFormat, SourceOperand, DS, VOP3};
 use crate::rdna_translator::RDNAProgram;
 
 use super::dispatch::{setup_sgprs, GridDims};
-use super::emit::{compile_program_writeback, ScalarKernel};
-use super::ir::{build_scalar_program, Cond, ScalarBlock, ScalarProgram, Terminator};
+use super::compiler::{build_scalar_program, Compiler};
+use super::emit::ScalarKernel;
+use super::ir::{Cond, ScalarBlock, ScalarProgram, Terminator};
 
 const WAVE_SIZE: usize = 32;
 
@@ -52,7 +53,7 @@ impl SegmentedProgram {
 
         // Locate cross-lane boundaries. Each fragment between boundaries keeps
         // its *real* per-thread control flow (multi-block CFG, JIT-compiled by
-        // `compile_program_writeback`) — we never flatten branches into EXEC
+        // `Compiler::compile_writeback`) — we never flatten branches into EXEC
         // predication, so a lane that skips a guarded region via `s_cbranch_execz`
         // genuinely does not execute that region's memory ops. Only the cross-lane
         // op itself is lifted to a wavefront-wide `BoundaryOp`.
@@ -80,7 +81,7 @@ impl SegmentedProgram {
             // implementation handles one cross-lane operation in this case.
             match boundaries.len() {
                 0 => {
-                    let kernel = compile_program_writeback(&scalar, num_vgprs);
+                    let kernel = Compiler.compile_writeback(&scalar, num_vgprs);
                     vec![SegmentStep::Fragment(kernel)]
                 }
                 1 => build_single_boundary_steps(&scalar, boundaries[0], num_vgprs)?,
@@ -138,7 +139,7 @@ fn build_linear_steps(body: &[InstFormat], num_vgprs: usize) -> Vec<SegmentStep>
         let mut blocks = BTreeMap::new();
         blocks.insert(0, ScalarBlock { pc: 0, body: std::mem::take(run), term: Terminator::Return });
         let program = ScalarProgram { entry_pc: 0, blocks };
-        steps.push(SegmentStep::Fragment(compile_program_writeback(&program, num_vgprs)));
+        steps.push(SegmentStep::Fragment(Compiler.compile_writeback(&program, num_vgprs)));
     };
     for inst in body {
         if let Some(boundary) = BoundaryOp::from_inst(inst) {
@@ -223,7 +224,7 @@ fn build_single_boundary_steps(
         b.term = Terminator::Return;
     }
     let pre = ScalarProgram { entry_pc: scalar.entry_pc, blocks: pre_blocks };
-    let pre_kernel = compile_program_writeback(&pre, num_vgprs);
+    let pre_kernel = Compiler.compile_writeback(&pre, num_vgprs);
 
     // Post-fragment: the boundary block's tail, entered only when EXEC != 0.
     let tail: Vec<InstFormat> = bblock.body[k + 1..].to_vec();
@@ -237,7 +238,7 @@ fn build_single_boundary_steps(
     post_blocks.insert(p_body, ScalarBlock { pc: p_body, body: tail, term: Terminator::Return });
     post_blocks.insert(p_ret, ScalarBlock { pc: p_ret, body: vec![], term: Terminator::Return });
     let post = ScalarProgram { entry_pc: p_entry, blocks: post_blocks };
-    let post_kernel = compile_program_writeback(&post, num_vgprs);
+    let post_kernel = Compiler.compile_writeback(&post, num_vgprs);
 
     Ok(vec![
         SegmentStep::Fragment(pre_kernel),

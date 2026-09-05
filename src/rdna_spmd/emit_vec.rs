@@ -1,4 +1,4 @@
-//! Width-W SPMD codegen: lower a [`ScalarProgram`] to a native function that
+//! Width-W SPMD codegen: lower a [`ScalarProgram`](super::ir::ScalarProgram) to a native function that
 //! processes **W work-items at once** (one per SIMD lane), and JIT it with ORC.
 //!
 //! It uses the same scalar control-flow graph as the single-work-item emitter,
@@ -35,9 +35,9 @@ use crate::instructions::I;
 use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
 use super::boundary::{BoundaryIo, RegSet};
-use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction, cooperative_vgpr_count};
+use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction};
 use super::sqrt_idiom::SqrtCollapse;
-use super::ir::{Cond, ScalarProgram, Terminator};
+use super::ir::{Cond, Terminator};
 use super::load_cluster::vg_sext_ioff;
 
 const EXEC: u32 = 126;
@@ -1328,31 +1328,14 @@ impl Cg {
 //  Public entry
 // =====================================================================
 
-pub fn compile_program(program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
-    let num_vgprs = num_vgprs.max(256);
-    let plan = PacketPlan::new(program, width, None);
-    let addr = unsafe { compile_inner(&plan, num_vgprs) };
-    VecKernel { addr, num_vgprs, width }
+pub(super) fn compile_program(plan: &PacketPlan<'_>, num_vgprs: usize) -> VecKernel {
+    let addr = unsafe { compile_inner(plan, num_vgprs) };
+    VecKernel { addr, num_vgprs, width: plan.width }
 }
 
-/// Compile a width-W packet of a cross-lane program. `boundary` describes the
-/// host-applied wave-level op at each barrier's resume pc.
-///
-/// The kernel runs as a fiber: at a barrier it stores the op's read footprint,
-/// switches to the driver through `amdgpu_sim_fiber_yield`, reloads the op's
-/// write footprint, and falls through to the resume block. Everything else
-/// stays live in SSA on the fiber's stack. See [`super::fiber`].
-pub(super) fn compile_cooperative(
-    program: &ScalarProgram,
-    num_vgprs: usize,
-    width: u32,
-    boundary: &BTreeMap<usize, BoundaryIo>,
-) -> CoopVecKernel {
-    assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
-    let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary);
-    let plan = PacketPlan::new(program, width, Some(boundary));
-    let addr = unsafe { compile_inner(&plan, num_vgprs) };
-    CoopVecKernel { addr, num_vgprs, width }
+pub(super) fn compile_cooperative(plan: &PacketPlan<'_>, num_vgprs: usize) -> CoopVecKernel {
+    let addr = unsafe { compile_inner(plan, num_vgprs) };
+    CoopVecKernel { addr, num_vgprs, width: plan.width }
 }
 
 /// `boundary` selects the ABI: `Some` compiles a resumable cooperative packet

@@ -3,21 +3,19 @@
 //!
 //! For a single work-item, a wavefront program is just a control-flow graph
 //! whose branches test a 1-bit EXEC (lane active?) / VCC / SCC. This module
-//! normalizes the decoded [`RDNAProgram`] into:
+//! represents decoded instructions as:
 //!  - a per-block linear stream of [`InstFormat`] with pure scheduling no-ops
 //!    (`s_delay_alu`, `s_wait*`, `s_clause`, `s_nop`, ...) removed, and
 //!  - an explicit [`Terminator`] per block.
 //!
 //! The opcode *semantics* are produced later by `emit.rs`; this layer only
-//! decides control flow and which instructions survive.
+//! normalizes control flow and removes scheduling no-ops. Optimization order
+//! belongs to [`super::compiler::Compiler`].
 
 use std::collections::BTreeMap;
 
 use crate::instructions::I;
 use crate::rdna_instructions::InstFormat;
-use crate::rdna_translator::RDNAProgram;
-
-use super::combine::{collapse_div_expansions, combine_block};
 
 /// Branch condition recovered from a block's terminating SOPP instruction.
 /// For a single lane EXEC/VCC are 1-bit; these become ordinary scalar branches.
@@ -152,54 +150,33 @@ fn lower_terminator(last: &InstFormat, next_pcs: &[usize]) -> Terminator {
     Terminator::Jump(next_pcs[0])
 }
 
-/// Lower a decoded [`RDNAProgram`] into Scalar IR.
-pub fn build_scalar_program(program: &RDNAProgram) -> ScalarProgram {
-    let mut blocks = BTreeMap::new();
+/// Normalize one instruction block without applying optimization passes.
+/// `insts` still contains its final instruction so fallthrough blocks retain it.
+pub(super) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
+    let (last, head) = insts.split_last().expect("empty block");
 
-    for (&pc, block) in program.blocks() {
-        // The instruction combine -- the f64 square-root idiom and in-block
-        // dead code -- runs for this backend alone.
-        let mut combined = block.insts().to_vec();
-        combine_block(&mut combined);
-        let insts = &combined[..];
-        let (last, head) = insts.split_last().expect("empty block");
+    let term = lower_terminator(last, next_pcs);
 
-        let term = lower_terminator(last, block.next_pcs());
+    // Whether the last instruction is itself a control-flow terminator: if
+    // not, it is a normal instruction that must stay in the body.
+    let last_is_term = matches!(
+        last,
+        InstFormat::SOPP(i) if matches!(
+            i.op,
+            I::S_ENDPGM
+                | I::S_BRANCH
+                | I::S_CBRANCH_EXECZ
+                | I::S_CBRANCH_EXECNZ
+                | I::S_CBRANCH_VCCZ
+                | I::S_CBRANCH_VCCNZ
+                | I::S_CBRANCH_SCC0
+                | I::S_CBRANCH_SCC1
+        )
+    );
 
-        // Whether the last instruction is itself a control-flow terminator: if
-        // not, it is a normal instruction that must stay in the body.
-        let last_is_term = matches!(
-            last,
-            InstFormat::SOPP(i) if matches!(
-                i.op,
-                I::S_ENDPGM
-                    | I::S_BRANCH
-                    | I::S_CBRANCH_EXECZ
-                    | I::S_CBRANCH_EXECNZ
-                    | I::S_CBRANCH_VCCZ
-                    | I::S_CBRANCH_VCCNZ
-                    | I::S_CBRANCH_SCC0
-                    | I::S_CBRANCH_SCC1
-            )
-        );
-
-        let body_src: &[InstFormat] = if last_is_term { head } else { insts };
-        let mut body: Vec<InstFormat> = body_src.iter().filter(|i| !is_noop(i)).cloned().collect();
-        // This backend computes a V_DIV_FIXUP_F64 quotient from the original
-        // operands, which leaves the expansion feeding it dead. The other two
-        // engines apply the real fixup and keep it.
-        collapse_div_expansions(&mut body);
-
-        blocks.insert(pc, ScalarBlock { pc, body, term });
-    }
-
-    let mut prog = ScalarProgram {
-        entry_pc: program.entry_pc(),
-        blocks,
-    };
-    // Math-idiom combine: collapse rsq+Newton f64 sqrt expansions to V_SQRT_F64.
-    super::mathcombine::fold_sqrt(&mut prog);
-    prog
+    let body_src: &[InstFormat] = if last_is_term { head } else { insts };
+    let body: Vec<InstFormat> = body_src.iter().filter(|i| !is_noop(i)).cloned().collect();
+    ScalarBlock { pc, body, term }
 }
 
 /// A workgroup barrier instruction (`s_barrier_signal` / `s_barrier_wait`). The

@@ -187,7 +187,7 @@ pub fn compile_xlane_vec(
         // Build the boundary apply here, not on the dispatch's first yield.
         super::wmma::warm(width as usize);
     }
-    super::emit_vec::compile_cooperative(program, num_vgprs, width, &xlane_boundary_io(xlane))
+    super::compiler::Compiler.compile_packet_cooperative(program, num_vgprs, width, &xlane_boundary_io(xlane))
 }
 
 // ---- wave-level op application (on the 32 lanes' persisted register state) ----

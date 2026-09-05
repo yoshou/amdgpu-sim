@@ -8,7 +8,8 @@
 //!
 //! Pipeline:
 //! ```text
-//! decode -> RDNAProgram CFG -> [structurize] -> Scalar IR -> LLVM IR -> JIT
+//! Compiler: decoded CFG -> local combine -> Scalar IR -> math combine
+//!           -> scalar/packet analysis -> LLVM IR -> JIT
 //! ```
 //!
 //! It reuses the existing
@@ -89,6 +90,8 @@ mod emit_vec;
 mod freshness;
 mod combine;
 mod ir;
+mod compiler;
+mod scalar_plan;
 mod load_cluster;
 mod boundary;
 mod packet_plan;
@@ -108,9 +111,10 @@ pub use coop_xlane::{
     compile_xlane_vec, dispatch_xlane, dispatch_xlane_vec, split_at_xlane, XlaneOp,
 };
 pub use dispatch::{dispatch_parallel, dispatch_parallel_vec, GridDims};
-pub use emit::{compile_cooperative, compile_program, CoopKernel, ScalarKernel};
-pub use emit_vec::{compile_program as compile_program_vec, CoopVecKernel, VecKernel};
-pub use ir::{build_scalar_program, split_at_barriers, Cond, ScalarBlock, ScalarProgram, Terminator};
+pub use compiler::{Compiler, build_scalar_program, compile_cooperative, compile_program, compile_program_vec};
+pub use emit::{CoopKernel, ScalarKernel};
+pub use emit_vec::{CoopVecKernel, VecKernel};
+pub use ir::{split_at_barriers, Cond, ScalarBlock, ScalarProgram, Terminator};
 pub use segmented::{dispatch_segmented, SegmentedProgram};
 pub use structured::analyze_structured;
 

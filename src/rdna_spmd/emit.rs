@@ -1,4 +1,4 @@
-//! LLVM codegen: lower a [`ScalarProgram`] to a single-work-item native
+//! LLVM codegen: lower a [`ScalarProgram`](super::ir::ScalarProgram) to a single-work-item native
 //! function and JIT it with ORC.
 //!
 //! Register model: SGPR/VGPR/SCC are `alloca` slots initialized once from the
@@ -18,7 +18,8 @@ use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef
 use crate::instructions::I;
 use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, DS, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPC, VOPD, VSAMPLE, VSCRATCH};
 
-use super::ir::{Cond, ScalarProgram, Terminator};
+use super::scalar_plan::{ScalarMode, ScalarPlan};
+use super::ir::{Cond, Terminator};
 
 /// The SGPR number if `o` is a scalar register operand.
 fn sreg(o: &SourceOperand) -> Option<u32> {
@@ -595,32 +596,23 @@ impl Cg {
 //  Public entry
 // =====================================================================
 
-pub fn compile_program(program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-    unsafe { compile_inner(program, num_vgprs, false, true, false) }
+pub(super) fn compile_program(plan: &ScalarPlan<'_>, num_vgprs: usize) -> ScalarKernel {
+    unsafe { compile_inner(plan, num_vgprs) }
 }
 
-pub fn compile_program_writeback(program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-    unsafe { compile_inner(program, num_vgprs, true, false, false) }
-}
-
-/// Compile a barrier-split program for the cooperative workgroup scheduler. The
-/// input must already have gone through [`super::ir::split_at_barriers`]. The
-/// resulting function has signature
-/// `extern "C" fn(*mut u32 /*sgprs[129]*/, *mut u32 /*vgprs*/, u64 /*scratch*/,
-///                u64 /*lds*/, *mut u32 /*spill*/, u64 /*resume_pc*/) -> u64`
-/// (see [`CoopKernel`]).
-pub fn compile_cooperative(program: &ScalarProgram, num_vgprs: usize) -> CoopKernel {
-    let sk = unsafe { compile_inner(program, num_vgprs, true, false, true) };
-    CoopKernel { addr: sk.addr, num_vgprs: sk.num_vgprs, entry_pc: program.entry_pc }
+pub(super) fn compile_cooperative(plan: &ScalarPlan<'_>, num_vgprs: usize) -> CoopKernel {
+    let sk = unsafe { compile_inner(plan, num_vgprs) };
+    CoopKernel { addr: sk.addr, num_vgprs: sk.num_vgprs, entry_pc: plan.program.entry_pc }
 }
 
 unsafe fn compile_inner(
-    program: &ScalarProgram,
+    plan: &ScalarPlan<'_>,
     num_vgprs: usize,
-    writeback: bool,
-    force_exec: bool,
-    coop: bool,
 ) -> ScalarKernel {
+    let program = plan.program;
+    let writeback = plan.mode != ScalarMode::Whole;
+    let force_exec = plan.mode == ScalarMode::Whole;
+    let coop = plan.mode == ScalarMode::Cooperative;
     // VGPR slots: allocate a safe upper bound (RDNA max is 256) since the
     // granulated descriptor count can underestimate the actual max index.
     let num_vgprs = num_vgprs.max(256);
@@ -779,17 +771,12 @@ unsafe fn compile_inner(
         llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
     }
 
-    // De-SIMT lane-active analysis: where EXEC[0] is provably 1, the SIMT mask is
-    // inert, so vector writes/compares need no predication.
-    let active = super::active::analyze_states(program);
-    let f64_fresh_in = super::freshness::analyze(program);
-    let sgpr_fresh_in = super::freshness::analyze_sgpr(program);
-
     for (&pc, block) in &program.blocks {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
-        cg.set_f64_fresh(f64_fresh_in[&pc]);
-        cg.sgpr_fresh.set(sgpr_fresh_in[&pc]);
-        let states = super::active::body_active_states(block, active[&pc]);
+        let facts = &plan.blocks[&pc];
+        cg.set_f64_fresh(facts.f64_fresh);
+        cg.sgpr_fresh.set(facts.sgpr_fresh);
+        let states = &facts.active;
         cg.mask_def.borrow_mut().clear();
         for (idx, inst) in block.body.iter().enumerate() {
             // Predicate this instruction's vector writes/compares unless the lane
