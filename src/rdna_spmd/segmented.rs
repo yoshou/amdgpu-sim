@@ -4,7 +4,7 @@ use std::thread;
 
 use crate::instructions::I;
 use crate::processor::KernelDescriptor;
-use crate::rdna_instructions::{InstFormat, SourceOperand, DS, VOP3};
+use crate::rdna_instructions::{InstFormat, SourceOperand};
 use crate::rdna_translator::RDNAProgram;
 
 use super::dispatch::{setup_sgprs, GridDims};
@@ -20,11 +20,7 @@ enum SegmentStep {
 }
 
 #[derive(Clone)]
-enum BoundaryOp {
-    ReadLane(VOP3),
-    WriteLane(VOP3),
-    Bpermute(DS),
-}
+struct BoundaryOp(super::lift::wave::YieldAction, super::coop_xlane::PacketWave);
 
 pub struct SegmentedProgram {
     steps: Vec<SegmentStep>,
@@ -109,12 +105,15 @@ impl SegmentedProgram {
         for step in &self.steps {
             match step {
                 SegmentStep::Fragment(kernel) => {
-                    for lane in 0..state.active_lanes {
-                        let scratch_base = state.scratch[lane].as_mut_ptr() as u64;
+                    let count = state.active_lanes;
+                    // Check the three frame lengths once at the boundary.
+                    for ((sgprs, vgprs), scratch) in state.sgprs[..count].iter_mut()
+                        .zip(&mut state.vgprs[..count]).zip(&mut state.scratch[..count]) {
+                        let scratch_base = scratch.as_mut_ptr() as u64;
                         unsafe {
                             kernel.run(
-                                state.sgprs[lane].as_mut_ptr(),
-                                state.vgprs[lane].as_mut_ptr(),
+                                sgprs.as_mut_ptr(),
+                                vgprs.as_mut_ptr(),
                                 scratch_base,
                             );
                         }
@@ -159,7 +158,7 @@ fn successors(term: &Terminator) -> Vec<usize> {
         Terminator::Return => vec![],
         Terminator::Jump(t) => vec![*t],
         Terminator::Branch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
-        Terminator::Barrier { resume } => vec![*resume],
+        Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![*resume],
     }
 }
 
@@ -401,69 +400,50 @@ fn is_lane_local_supported(inst: &InstFormat) -> bool {
 }
 
 impl BoundaryOp {
-    fn from_inst(inst: &InstFormat) -> Option<Self> {
-        match inst {
-            InstFormat::VOP3(i) if matches!(i.op, I::V_READLANE_B32) => {
-                Some(BoundaryOp::ReadLane(i.clone()))
-            }
-            InstFormat::VOP3(i) if matches!(i.op, I::V_WRITELANE_B32) => {
-                Some(BoundaryOp::WriteLane(i.clone()))
-            }
-            InstFormat::DS(i) if matches!(i.op, I::DS_BPERMUTE_B32) => {
-                Some(BoundaryOp::Bpermute(i.clone()))
-            }
-            _ => None,
-        }
+    fn from_inst(inst: &InstFormat)->Option<Self>{
+        super::lift::wave::instruction(inst).filter(|action|action.is_wave() && action.wmma_registers().is_none())
+            .map(|action| { let lowering=super::coop_xlane::PacketWave::lower(&action); Self(action,lowering) })
     }
-
-    fn apply(&self, state: &mut WaveState) -> Result<(), String> {
-        match self {
-            BoundaryOp::ReadLane(i) => {
-                let lane = (eval_scalar_u32(state, &i.src1)? & 0x1f) as usize;
-                let value = eval_vector_u32(state, lane, &i.src0)?;
-                for sgprs in &mut state.sgprs {
-                    write_sgpr(sgprs, i.vdst as usize, value);
-                }
+    fn apply(&self,state:&mut WaveState)->Result<(),String>{
+        let valid=if state.active_lanes==32{u32::MAX}else{(1u32<<state.active_lanes)-1};
+        match &self.1 {
+            super::coop_xlane::PacketWave::ReadLane { dst, value, lane } => {
+                let lane=(super::coop_xlane::eval_uniform(&state.sgprs,lane)&31) as usize;
+                let value=if valid >> lane & 1 != 0 {eval_vector_u32(state,lane,value)?}else{0};
+                for s in state.sgprs.iter_mut().take(state.active_lanes) {write_sgpr(s,*dst as usize,value);}
+                return Ok(());
             }
-            BoundaryOp::WriteLane(i) => {
-                let value = eval_scalar_u32(state, &i.src0)?;
-                let lane = (eval_scalar_u32(state, &i.src1)? & 0x1f) as usize;
-                if lane < state.vgprs.len() {
-                    state.vgprs[lane][i.vdst as usize] = value;
-                }
+            super::coop_xlane::PacketWave::WriteLane { dst, value, lane } => {
+                let lane=(super::coop_xlane::eval_uniform(&state.sgprs,lane)&31) as usize;
+                let value=super::coop_xlane::eval_uniform(&state.sgprs,value);
+                if valid >> lane & 1 != 0 {state.vgprs[lane][*dst as usize]=value;}
+                return Ok(());
             }
-            // DS_BPERMUTE_B32: per-lane gather within the wavefront. Lane `e`
-            // pulls data0 from the lane addressed by `(v_addr[e] + offset0) >> 2`
-            // (masked to the 32-lane wave); inactive source lanes read 0. A lane
-            // participates iff its EXEC bit (sgpr126) is set, so lanes that a
-            // guard branched away hold their EXEC=0 and neither contribute nor
-            // receive. Mirrors `RDNAProcessor::ds_bpermute_b32`.
-            BoundaryOp::Bpermute(i) => {
-                let addr = i.addr as usize;
-                let data0 = i.data0 as usize;
-                let vdst = i.vdst as usize;
-                let offset0 = i.offset0 as u32;
-                let active: Vec<bool> =
-                    (0..WAVE_SIZE).map(|e| state.sgprs[e][126] & 1 != 0).collect();
-                let values: Vec<u32> =
-                    (0..WAVE_SIZE).map(|e| state.vgprs[e][data0]).collect();
-                let mut results = vec![0u32; WAVE_SIZE];
-                for e in 0..WAVE_SIZE {
-                    if !active[e] {
-                        continue;
-                    }
-                    let lane =
-                        ((state.vgprs[e][addr].wrapping_add(offset0) >> 2) & 31) as usize;
-                    results[e] = if active[lane] { values[lane] } else { 0 };
-                }
-                for e in 0..WAVE_SIZE {
-                    if active[e] {
-                        state.vgprs[e][vdst] = results[e];
-                    }
-                }
-            }
+            _=>{}
         }
-        Ok(())
+        if let Some((address, data, dest, offset, fi)) = self.0.bpermute_registers() {
+            let active: [bool; 32] = std::array::from_fn(|lane| valid >> lane & 1 != 0 && state.sgprs[lane][126] & 1 != 0);
+            let values: [u32; 32] = std::array::from_fn(|lane| if valid >> lane & 1 != 0 { state.vgprs[lane][data as usize] } else { 0 });
+            let mut results = [0; 32];
+            for lane in 0..32 {
+                if active[lane] {
+                    let source = ((state.vgprs[lane][address as usize].wrapping_add(offset) >> 2) & 31) as usize;
+                    results[lane] = if fi || active[source] { values[source] } else { 0 };
+                }
+            }
+            for lane in 0..32 { if active[lane] { state.vgprs[lane][dest as usize] = results[lane]; } }
+            return Ok(());
+        }
+        let mut read_error=None;
+        let results=self.0.evaluate(valid,|lane,source|eval_vector_u32(state,lane,source).expect("invalid wave operand"),|lane|state.sgprs[lane][126]&1!=0);
+        for (dest,result) in self.0.outputs.iter().zip(results){
+            for lane in 0..32{if self.0.writes_lane(lane,valid,state.sgprs[lane][126]&1!=0){match dest{
+                super::lift::wave::Destination::Sgpr(r)=>write_sgpr(&mut state.sgprs[lane],*r as usize,result[lane]),
+                super::lift::wave::Destination::Vgpr(r)=>state.vgprs[lane][*r as usize]=result[lane],
+                super::lift::wave::Destination::Scc=>read_error=Some("segmented wave result cannot write SCC".to_string()),
+            }}}
+        }
+        if let Some(err)=read_error{Err(err)}else{Ok(())}
     }
 }
 
@@ -474,19 +454,6 @@ fn write_sgpr(sgprs: &mut [u32; 128], idx: usize, value: u32) {
     sgprs[idx] = value;
 }
 
-fn eval_scalar_u32(state: &WaveState, op: &SourceOperand) -> Result<u32, String> {
-    match op {
-        SourceOperand::LiteralConstant(v) => Ok(*v),
-        SourceOperand::IntegerConstant(v) => Ok(*v as u32),
-        SourceOperand::FloatConstant(v) => Ok((*v as f32).to_bits()),
-        SourceOperand::ScalarRegister(r) => Ok(state.sgprs[0][*r as usize]),
-        SourceOperand::VectorRegister(r) => Err(format!(
-            "unsupported vector source v{} in scalar boundary operand",
-            r
-        )),
-        SourceOperand::PrivateBase => Err("unsupported private-base scalar boundary operand".to_string()),
-    }
-}
 
 fn eval_vector_u32(state: &WaveState, lane: usize, op: &SourceOperand) -> Result<u32, String> {
     if lane >= state.vgprs.len() {

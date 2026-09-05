@@ -4,8 +4,12 @@
 use super::ir::typed::*;
 use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
+pub(super) mod memory;
+pub(super) mod wave;
 
 pub(super) enum Lowering<'a> {
+    Memory(memory::Memory),
+    Wave(wave::YieldAction),
     TypedAlu {
         inputs: Vec<Input>,
         output: Output,
@@ -82,6 +86,8 @@ fn input(source: SourceOperand, ty: Ty) -> Input {
 }
 
 pub(super) fn instruction(inst: &InstFormat) -> Lowering<'_> {
+    if let Some(action) = wave::instruction(inst) { return Lowering::Wave(action); }
+    if let Some(memory) = memory::instruction(inst) { return Lowering::Memory(memory); }
     let (op, src, dst, abs, neg, cm) = match inst {
         InstFormat::VOP1(i) => (i.op, vec![i.src0.clone()], i.vdst, 0, 0, 0),
         InstFormat::VOP2(i) => (

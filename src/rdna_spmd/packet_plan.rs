@@ -33,6 +33,7 @@ pub(super) struct InstructionPlan<'a> {
     pub lowering: super::lift::Lowering<'a>,
     pub elide_predicate: bool,
     pub entry_exec_unchanged: bool,
+    pub nonempty_exec: bool,
     pub normal_ldexp: bool,
     pub sqrt: Option<SqrtCollapse>,
     pub global_load: GlobalLoad,
@@ -79,7 +80,9 @@ impl<'a> PacketPlan<'a> {
         let boundary_reads: Vec<u32> = boundary
             .map(|map| map.values().flat_map(|io| io.reads.vgprs()).collect())
             .unwrap_or_default();
-        let elide = super::vec_live::analyze_with_exit_live(program, &boundary_reads);
+        let exit_reads = if boundary.is_some() { (0..256).collect::<Vec<_>>() } else { boundary_reads };
+        let elide = super::vec_live::analyze_with_exit_live(program, &exit_reads);
+        let nonempty = nonempty_exec(program,width,boundary.is_none());
         let fresh_in = super::freshness::analyze(program);
         let f64_pairs = super::regtype::f64_read_pairs(program);
         let div_in = if boundary.is_some() {
@@ -122,6 +125,7 @@ impl<'a> PacketPlan<'a> {
                     lowering: super::lift::instruction(inst),
                     elide_predicate: flags[idx],
                     entry_exec_unchanged,
+                    nonempty_exec: nonempty[&pc][idx],
                     normal_ldexp: normal[idx],
                     sqrt: sqrt[idx].clone(),
                     global_load: match inst {
@@ -196,7 +200,7 @@ fn select_mask_region(program: &ScalarProgram, cooperative: bool) -> Option<Mask
             Terminator::Return => vec![],
             Terminator::Jump(target) => vec![target],
             Terminator::Branch { taken, fallthrough, .. } => vec![taken, fallthrough],
-            Terminator::Barrier { resume } => vec![resume],
+            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![resume],
         };
         let body = &body;
         successors.into_iter().filter(move |to| !body.contains(to)).map(move |to| (from, to))
@@ -372,4 +376,90 @@ mod tests {
         assert!(!observed.blocks[&1].instructions[0].elide_predicate);
         assert!(observed.blocks[&1].specialize);
     }
+}
+
+/// Only establishes existence of an active packet lane, never that every lane
+/// is active. This suffices for a uniform-address load: one active lane proves
+/// the shared pointer must be valid. All EXEC writes invalidate the fact unless
+/// a constant assignment or an OR preserving the old EXEC establishes it.
+fn nonempty_exec(program: &ScalarProgram, width: u32, initial: bool) -> BTreeMap<usize, Vec<bool>> {
+    use crate::rdna_instructions::SourceOperand;
+    let transfer = |inst: &InstFormat, old: bool| -> bool {
+        let wave_writes =
+            super::lift::wave::instruction(inst).map_or(false, |a| a.io().writes.has_sgpr(126));
+        if !super::active::writes_exec(inst) && !wave_writes {
+            return old;
+        }
+        match inst {
+            InstFormat::SOP1(i) if i.sdst == 126 && matches!(i.op, I::S_MOV_B32 | I::S_MOV_B64) => {
+                match i.ssrc0 {
+                    SourceOperand::IntegerConstant(v) => initial && v & ((1u64 << width) - 1) != 0,
+                    SourceOperand::LiteralConstant(v) => initial && v & ((1u32 << width) - 1) != 0,
+                    _ => false,
+                }
+            }
+            InstFormat::SOP2(i) if i.sdst == 126 && matches!(i.op, I::S_OR_B32 | I::S_OR_B64) => {
+                old && (matches!(i.ssrc0, SourceOperand::ScalarRegister(126))
+                    || matches!(i.ssrc1, SourceOperand::ScalarRegister(126)))
+            }
+            _ => false,
+        }
+    };
+    let mut entries: BTreeMap<_, _> = program.blocks.keys().map(|&pc| (pc, true)).collect();
+    loop {
+        let mut incoming = BTreeMap::from([(program.entry_pc, initial)]);
+        for (&pc, b) in &program.blocks {
+            let exit = b
+                .body
+                .iter()
+                .fold(entries[&pc], |st, inst| transfer(inst, st));
+            let edges = match &b.term {
+                Terminator::Return => vec![],
+                Terminator::Jump(p) => vec![(*p, exit)],
+                Terminator::Barrier { resume } => vec![(*resume, false)],
+                Terminator::Yield { resume, action } => {
+                    vec![(*resume, exit && !action.io().writes.has_sgpr(126))]
+                }
+                Terminator::Branch {
+                    cond,
+                    taken,
+                    fallthrough,
+                } => match cond {
+                    Cond::ExecZ => vec![(*taken, false), (*fallthrough, true)],
+                    Cond::ExecNz => vec![(*taken, true), (*fallthrough, false)],
+                    _ => vec![(*taken, exit), (*fallthrough, exit)],
+                },
+            };
+            for (to, st) in edges {
+                incoming.entry(to).and_modify(|v| *v &= st).or_insert(st);
+            }
+        }
+        let mut changed = false;
+        for (pc, st) in incoming {
+            if entries[&pc] != st {
+                entries.insert(pc, st);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    program
+        .blocks
+        .iter()
+        .map(|(&pc, b)| {
+            let mut st = entries[&pc];
+            let values = b
+                .body
+                .iter()
+                .map(|inst| {
+                    let before = st;
+                    st = transfer(inst, st);
+                    before
+                })
+                .collect();
+            (pc, values)
+        })
+        .collect()
 }

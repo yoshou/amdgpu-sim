@@ -45,6 +45,10 @@ impl Compiler {
         block
     }
 
+    /// Retains the existing de-SIMT register/mask adapter. Local lane-spill and
+    /// readfirstlane lowering keep that adapter's contract during migration;
+    /// general 32-lane effects must be split with `split_at_xlane` and executed
+    /// by a wave/cooperative dispatcher.
     pub fn compile_program(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
         let plan = ScalarPlan::new(program, ScalarMode::Whole);
         super::emit::compile_program(&plan, num_vgprs)
@@ -53,6 +57,13 @@ impl Compiler {
     pub fn compile_program_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
         let plan = PacketPlan::new(program, width, None);
         super::emit_vec::compile_program(&plan, num_vgprs.max(256))
+    }
+
+    pub fn compile_cooperative_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> CoopVecKernel {
+        let boundary = program.blocks.values().filter_map(|b| match &b.term {
+            super::ir::Terminator::Yield {resume,action} => Some((*resume,action.io())), _=>None,
+        }).collect();
+        self.compile_packet_cooperative(program,num_vgprs,width,&boundary)
     }
 
     /// Compile a program already split at barriers for the existing scheduler.

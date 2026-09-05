@@ -101,7 +101,7 @@ fn live_out(prog: &ScalarProgram) -> BTreeMap<usize, BTreeSet<u32>> {
                 Terminator::Return => vec![],
                 Terminator::Jump(t) => vec![*t],
                 Terminator::Branch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
-                Terminator::Barrier { resume } => vec![*resume],
+                Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![*resume],
             };
             let mut out = BTreeSet::new();
             for s in succs {
@@ -135,7 +135,7 @@ fn live_out(prog: &ScalarProgram) -> BTreeMap<usize, BTreeSet<u32>> {
             Terminator::Return => vec![],
             Terminator::Jump(t) => vec![*t],
             Terminator::Branch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
-            Terminator::Barrier { resume } => vec![*resume],
+            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![*resume],
         };
         let mut s = BTreeSet::new();
         for su in succs {

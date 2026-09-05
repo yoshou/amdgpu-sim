@@ -50,6 +50,8 @@ pub enum Terminator {
     /// the post-barrier continuation (a resume entry). Only produced by
     /// [`split_at_barriers`]; the non-cooperative backends never see it.
     Barrier { resume: usize },
+    /// A typed wave or workgroup effect, with its continuation.
+    Yield { resume: usize, action: Box<super::lift::wave::YieldAction> },
 }
 
 /// A basic block lowered for scalar execution.
@@ -181,66 +183,9 @@ pub(super) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -
     ScalarBlock { pc, body, term }
 }
 
-/// A workgroup barrier instruction (`s_barrier_signal` / `s_barrier_wait`). The
-/// split-barrier pair (signal then wait) is one synchronization point.
-pub fn is_barrier(inst: &InstFormat) -> bool {
-    match inst {
-        InstFormat::SOP1(i) => matches!(i.op, I::S_BARRIER_SIGNAL | I::S_BARRIER_SIGNAL_ISFIRST),
-        InstFormat::SOPP(i) => matches!(i.op, I::S_BARRIER_WAIT | I::S_BARRIER),
-        _ => false,
-    }
-}
-
-/// Split every block containing a barrier so each barrier becomes a block
-/// boundary carrying a [`Terminator::Barrier`]. The instructions *after* a
-/// barrier form a fresh block whose pc is a resume entry for the cooperative
-/// scheduler; the barrier instructions themselves are dropped (the yield/sync is
-/// modeled by the terminator). Blocks without a barrier pass through unchanged,
-/// so their pcs — and every existing branch target — are preserved.
+/// Split barriers into typed signal/wait yields, preserving IDs, signal-is-first
+/// results and the original instruction order. Resume entries retain the body
+/// after each effect; existing branch targets remain unchanged.
 pub fn split_at_barriers(program: &ScalarProgram) -> ScalarProgram {
-    let mut next_pc = program.blocks.keys().copied().max().unwrap_or(0) + 1;
-    let mut blocks: BTreeMap<usize, ScalarBlock> = BTreeMap::new();
-
-    for block in program.blocks.values() {
-        if !block.body.iter().any(|i| is_barrier(i)) {
-            blocks.insert(block.pc, block.clone());
-            continue;
-        }
-        // Cut the body into segments separated by maximal runs of barrier insts
-        // (a signal+wait pair is one run → one boundary).
-        let mut segments: Vec<Vec<InstFormat>> = Vec::new();
-        let mut cur: Vec<InstFormat> = Vec::new();
-        let mut in_barrier = false;
-        for inst in &block.body {
-            if is_barrier(inst) {
-                if !in_barrier {
-                    segments.push(std::mem::take(&mut cur));
-                    in_barrier = true;
-                }
-                // drop the barrier instruction itself
-            } else {
-                in_barrier = false;
-                cur.push(inst.clone());
-            }
-        }
-        segments.push(cur); // final (post-last-barrier) segment, possibly empty
-
-        let n = segments.len();
-        let mut pcs = Vec::with_capacity(n);
-        pcs.push(block.pc);
-        for _ in 1..n {
-            pcs.push(next_pc);
-            next_pc += 1;
-        }
-        for (i, seg) in segments.into_iter().enumerate() {
-            let term = if i + 1 < n {
-                Terminator::Barrier { resume: pcs[i + 1] }
-            } else {
-                block.term.clone()
-            };
-            blocks.insert(pcs[i], ScalarBlock { pc: pcs[i], body: seg, term });
-        }
-    }
-
-    ScalarProgram { entry_pc: program.entry_pc, blocks }
+    super::lift::wave::split(program, |action| !action.is_wave()).0
 }

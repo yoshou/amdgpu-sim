@@ -9,6 +9,8 @@
 //! is needed. There are no barriers in the target kernel, so the function runs
 //! to completion in one call.
 
+mod memory;
+
 use std::collections::BTreeMap;
 use std::ffi::CString;
 
@@ -16,7 +18,7 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{sext_ioffset, InstFormat, SourceOperand, DS, SMEM, SOP1, SOP2, SOPK, VFLAT, VGLOBAL, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPD, VSAMPLE, VSCRATCH};
+use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, SOPK, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPD, VSAMPLE};
 
 use super::scalar_plan::{ScalarMode, ScalarPlan};
 use super::ir::{Cond, Terminator};
@@ -72,6 +74,7 @@ impl ScalarKernel {
 /// `resume_pc` to the next barrier (or to `s_endpgm`), persisting registers/SCC
 /// into the caller's buffers so the next call resumes correctly.
 pub struct CoopKernel {
+    pub(crate) yields: BTreeMap<usize, super::lift::wave::YieldAction>,
     addr: u64,
     pub num_vgprs: usize,
     /// pc passed as `resume_pc` on the first call (the program entry block).
@@ -595,7 +598,7 @@ pub(super) fn compile_program(plan: &ScalarPlan<'_>, num_vgprs: usize) -> Scalar
 
 pub(super) fn compile_cooperative(plan: &ScalarPlan<'_>, num_vgprs: usize) -> CoopKernel {
     let sk = unsafe { compile_inner(plan, num_vgprs) };
-    CoopKernel { addr: sk.addr, num_vgprs: sk.num_vgprs, entry_pc: plan.program.entry_pc }
+    CoopKernel { addr: sk.addr, num_vgprs: sk.num_vgprs, entry_pc: plan.program.entry_pc, yields: plan.function.yields() }
 }
 
 unsafe fn compile_inner(
@@ -752,7 +755,7 @@ unsafe fn compile_inner(
         let resume = llvm::core::LLVMGetParam(func, 5);
         let mut targets: Vec<usize> = Vec::new();
         for block in program.blocks.values() {
-            if let Terminator::Barrier { resume } = block.term {
+            if let Terminator::Barrier { resume } | Terminator::Yield { resume, .. } = block.term {
                 targets.push(resume);
             }
         }
@@ -782,6 +785,11 @@ unsafe fn compile_inner(
                     ssa.emit(&plan.function, pc, idx, |input| cg.typed_input(input), |output, value| {
                         cg.typed_output(output, value);
                     });
+                }
+                super::lift::Lowering::Wave(_) => cg.emit_local_wave(&plan.function.blocks[&pc].wave[&idx]),
+                super::lift::Lowering::Memory(_) => {
+                    ssa.prepare_memory(&plan.function, pc, idx, |p, scalar| cg.memory_parameter(p, scalar));
+                    cg.emit_memory(&plan.function.blocks[&pc].memory[&idx], &ssa, |k| ssa.memory_data(&plan.function, pc, idx, k));
                 }
                 super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
             }
@@ -849,7 +857,7 @@ impl Cg {
                     llvm::core::LLVMBuildRetVoid(self.b);
                 }
             }
-            Terminator::Barrier { resume } => {
+            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => {
                 // Yield: persist full register/SCC state and return the resume pc
                 // so the scheduler re-enters here after every work-item syncs.
                 self.emit_writeback(self.writeback_vgprs);
@@ -1029,13 +1037,8 @@ impl Cg {
             InstFormat::SOP2(i) => self.emit_sop2(i),
             InstFormat::SOPK(i) => self.emit_sopk(i),
             InstFormat::SOPC(i) => self.emit_sopc(i),
-            InstFormat::SMEM(i) => self.emit_smem(i),
-            InstFormat::VGLOBAL(i) => self.emit_vglobal(i),
-            InstFormat::VFLAT(i) => self.emit_vflat(i),
             InstFormat::VIMAGE(i) => self.emit_vimage(i),
             InstFormat::VSAMPLE(i) => self.emit_vsample(i),
-            InstFormat::VSCRATCH(i) => self.emit_vscratch(i),
-            InstFormat::DS(i) => self.emit_ds(i),
             other => panic!("scalar: unsupported instruction {:?}", other),
         }
     }
@@ -1113,10 +1116,7 @@ impl Cg {
     // ---- VOP1 ------------------------------------------------------------
     unsafe fn emit_vop1(&self, i: &VOP1) {
         match i.op {
-            I::V_READFIRSTLANE_B32 => {
-                let v = self.src_u32(&i.src0);
-                self.st_sgpr32(i.vdst as u32, v);
-            }
+
             I::V_CLZ_I32_U32 => {
                 let x = self.src_u32(&i.src0);
                 let lz = self.call("llvm.ctlz.i32", self.i32t, &[self.i32t, self.i1], &[x, llvm::core::LLVMConstInt(self.i1, 0, 0)]);
@@ -1307,22 +1307,8 @@ impl Cg {
                 self.st_cmp(i.vdst as u32, c);
             }
             // ----- uniform cross-lane spill idiom (constant lane) -----
-            I::V_WRITELANE_B32 => {
-                let lane = lane_const(&i.src1)
-                    .expect("scalar: v_writelane_b32 needs a constant lane (non-uniform cross-lane unsupported)");
-                let val = self.src_u32(&i.src0);
-                let slot = self.spill_slot_ptr(i.vdst as u32, lane);
-                llvm::core::LLVMBuildStore(self.b, val, slot);
-            }
-            I::V_READLANE_B32 => {
-                let lane = lane_const(&i.src1)
-                    .expect("scalar: v_readlane_b32 needs a constant lane");
-                let src = vreg_of(&i.src0)
-                    .expect("scalar: v_readlane_b32 source must be a VGPR");
-                let slot = self.spill_slot_ptr(src, lane);
-                let v = llvm::core::LLVMBuildLoad2(self.b, self.i32t, slot, self.n());
-                self.st_sgpr32(i.vdst as u32, v);
-            }
+
+
             _ => panic!("scalar: unsupported VOP3 {:?}", i.op),
         }
     }
@@ -1803,56 +1789,7 @@ impl Cg {
     }
 
     // ---- VFLAT (flat load/store): flat addressing matches the global path.
-    unsafe fn emit_vflat(&self, i: &VFLAT) {
-        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
-        let base = if i.saddr != 124 {
-            self.b_add(self.ld_sgpr64(i.saddr as u32), self.zext64(self.ld_vgpr32(i.vaddr as u32)))
-        } else {
-            self.ld_vgpr64(i.vaddr as u32)
-        };
-        let addr = self.b_add(base, self.ci64(ioffset));
-        match i.op {
-            I::FLAT_LOAD_U8 | I::FLAT_LOAD_I8 | I::FLAT_LOAD_U16 | I::FLAT_LOAD_I16 => {
-                let (ty, signed) = match i.op {
-                    I::FLAT_LOAD_U8 => (self.i8, false),
-                    I::FLAT_LOAD_I8 => (self.i8, true),
-                    I::FLAT_LOAD_U16 => (llvm::core::LLVMInt16TypeInContext(self.ctx), false),
-                    _ => (llvm::core::LLVMInt16TypeInContext(self.ctx), true),
-                };
-                let v = llvm::core::LLVMBuildLoad2(self.b, ty, self.ptr_at(addr, 0), self.n());
-                let z = if signed { llvm::core::LLVMBuildSExt(self.b, v, self.i32t, self.n()) }
-                        else { llvm::core::LLVMBuildZExt(self.b, v, self.i32t, self.n()) };
-                self.st_vgpr32(i.vdst as u32, z);
-                return;
-            }
-            I::FLAT_STORE_B8 | I::FLAT_STORE_B16 => {
-                let ty = if matches!(i.op, I::FLAT_STORE_B8) { self.i8 } else { llvm::core::LLVMInt16TypeInContext(self.ctx) };
-                let t = llvm::core::LLVMBuildTrunc(self.b, self.ld_vgpr32(i.vsrc as u32), ty, self.n());
-                llvm::core::LLVMBuildStore(self.b, t, self.ptr_at(self.store_addr(addr), 0));
-                return;
-            }
-            _ => {}
-        }
-        let (is_store, words) = match i.op {
-            I::FLAT_LOAD_B32 => (false, 1), I::FLAT_LOAD_B64 => (false, 2),
-            I::FLAT_LOAD_B96 => (false, 3), I::FLAT_LOAD_B128 => (false, 4),
-            I::FLAT_STORE_B32 => (true, 1), I::FLAT_STORE_B64 => (true, 2),
-            I::FLAT_STORE_B96 => (true, 3), I::FLAT_STORE_B128 => (true, 4),
-            _ => panic!("scalar: unsupported VFLAT {:?}", i.op),
-        };
-        if is_store {
-            for k in 0..words {
-                let d = self.ld_vgpr32(i.vsrc as u32 + k);
-                let a = self.store_addr(self.b_add(addr, self.ci64((k as u64) * 4)));
-                llvm::core::LLVMBuildStore(self.b, d, self.ptr_at(a, 0));
-            }
-            return;
-        }
-        for k in 0..words {
-            let d = llvm::core::LLVMBuildLoad2(self.b, self.i32t, self.ptr_at(addr, (k as u64) * 4), self.n());
-            self.st_vgpr32(i.vdst as u32 + k, d);
-        }
-    }
+
 
     // ---- VIMAGE (hardware ray-tracing BVH intersect) — call the native
     // `image_bvh64_intersect_ray` helper; results land in bvh_scratch.
@@ -1940,169 +1877,16 @@ impl Cg {
     }
 
     // ---- SMEM (scalar load) ---------------------------------------------
-    unsafe fn emit_smem(&self, i: &SMEM) {
-        let words = match i.op {
-            I::S_LOAD_B32 => 1,
-            I::S_LOAD_B64 => 2,
-            I::S_LOAD_B96 => 3,
-            I::S_LOAD_B128 => 4,
-            I::S_LOAD_B256 => 8,
-            I::S_LOAD_U16 => 1,
-            _ => panic!("scalar: unsupported SMEM {:?}", i.op),
-        };
-        let base = self.ld_sgpr64(i.sbase as u32 * 2);
-        for k in 0..words {
-            let ptr = self.ptr_at(base, (i.ioffset as u64) + (k as u64) * 4);
-            let d = if matches!(i.op, I::S_LOAD_U16) {
-                let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
-                let v = llvm::core::LLVMBuildLoad2(self.b, i16t, ptr, self.n());
-                llvm::core::LLVMBuildZExt(self.b, v, self.i32t, self.n())
-            } else {
-                llvm::core::LLVMBuildLoad2(self.b, self.i32t, ptr, self.n())
-            };
-            self.st_sgpr32(i.sdata as u32 + k, d);
-        }
-    }
+
 
     // ---- VGLOBAL (global load/store) ------------------------------------
-    unsafe fn emit_vglobal(&self, i: &VGLOBAL) {
-        // Cache maintenance: coherent flat memory here, so writeback/invalidate
-        // are no-ops.
-        if matches!(i.op, I::GLOBAL_WB | I::GLOBAL_INV) {
-            return;
-        }
-        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
-        let base = if i.saddr != 124 {
-            let s = self.ld_sgpr64(i.saddr as u32);
-            let v = self.zext64(self.ld_vgpr32(i.vaddr as u32));
-            self.b_add(s, v)
-        } else {
-            self.ld_vgpr64(i.vaddr as u32)
-        };
-        let addr = self.b_add(base, self.ci64(ioffset));
 
-        // Sub-dword loads (zero/sign-extended into a 32-bit VGPR).
-        match i.op {
-            I::GLOBAL_LOAD_U8 | I::GLOBAL_LOAD_I8 | I::GLOBAL_LOAD_U16 | I::GLOBAL_LOAD_I16 => {
-                let (ty, signed, _bytes) = match i.op {
-                    I::GLOBAL_LOAD_U8 => (self.i8, false, 1u64),
-                    I::GLOBAL_LOAD_I8 => (self.i8, true, 1),
-                    I::GLOBAL_LOAD_U16 => (llvm::core::LLVMInt16TypeInContext(self.ctx), false, 2),
-                    _ => (llvm::core::LLVMInt16TypeInContext(self.ctx), true, 2),
-                };
-                let ptr = self.ptr_at(addr, 0);
-                let v = llvm::core::LLVMBuildLoad2(self.b, ty, ptr, self.n());
-                let z = if signed {
-                    llvm::core::LLVMBuildSExt(self.b, v, self.i32t, self.n())
-                } else {
-                    llvm::core::LLVMBuildZExt(self.b, v, self.i32t, self.n())
-                };
-                self.st_vgpr32(i.vdst as u32, z);
-                return;
-            }
-            I::GLOBAL_STORE_B16 => {
-                let a = self.store_addr(addr);
-                let v = llvm::core::LLVMBuildTrunc(self.b, self.ld_vgpr32(i.vsrc as u32), self.i16ty(), self.n());
-                llvm::core::LLVMBuildStore(self.b, v, self.ptr_at(a, 0));
-                return;
-            }
-            I::GLOBAL_ATOMIC_ADD_U32 => {
-                let data = self.ld_vgpr32(i.vsrc as u32);
-                let a = self.store_addr(addr);
-                let ptr = self.ptr_at(a, 0);
-                let old = llvm::core::LLVMBuildAtomicRMW(
-                    self.b,
-                    llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd,
-                    ptr,
-                    data,
-                    llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
-                    0,
-                );
-                // Table 15: TH[0] says whether the pre-op value is returned.
-                if i.th & 1 != 0 {
-                    self.st_vgpr32(i.vdst as u32, old);
-                }
-                return;
-            }
-            _ => {}
-        }
-
-        let (is_store, words) = match i.op {
-            I::GLOBAL_LOAD_B32 => (false, 1),
-            I::GLOBAL_LOAD_B64 => (false, 2),
-            I::GLOBAL_LOAD_B96 => (false, 3),
-            I::GLOBAL_LOAD_B128 => (false, 4),
-            I::GLOBAL_STORE_B32 => (true, 1),
-            I::GLOBAL_STORE_B64 => (true, 2),
-            I::GLOBAL_STORE_B96 => (true, 3),
-            I::GLOBAL_STORE_B128 => (true, 4),
-            _ => panic!("scalar: unsupported VGLOBAL {:?}", i.op),
-        };
-        if is_store {
-            for k in 0..words {
-                let d = self.ld_vgpr32(i.vsrc as u32 + k);
-                let a = self.store_addr(self.b_add(addr, self.ci64((k as u64) * 4)));
-                llvm::core::LLVMBuildStore(self.b, d, self.ptr_at(a, 0));
-            }
-            return;
-        }
-        // Load: pull aligned pairs directly as `double` into the f64 shadow (one
-        // native movsd, no i32→f64 reconstruction) and store the i32 halves for
-        // integer readers (DCE drops them when the data is only read as f64).
-        let mut k = 0u32;
-        while k < words {
-            if k + 1 < words {
-                let ptr = self.ptr_at(addr, (k as u64) * 4);
-                let d = llvm::core::LLVMBuildLoad2(self.b, self.f64t, ptr, self.n());
-                self.st_vgpr_f64(i.vdst as u32 + k, d);
-                k += 2;
-            } else {
-                let ptr = self.ptr_at(addr, (k as u64) * 4);
-                let d = llvm::core::LLVMBuildLoad2(self.b, self.i32t, ptr, self.n());
-                self.st_vgpr32(i.vdst as u32 + k, d);
-                k += 1;
-            }
-        }
-    }
 
     // ---- VSCRATCH (per-work-item private memory) -------------------------
     // The scalar path gives each work-item its own scratch buffer at
     // `scratch_base`, so — unlike the 32-lane-interleaved vector layout — the
     // address is simply `scratch_base + saddr + ioffset` (bytes).
-    unsafe fn emit_vscratch(&self, i: &VSCRATCH) {
-        let ioffset = sext_ioffset(i.ioffset) as i64 as u64;
-        let mut addr = self.b_add(self.scratch_base, self.ci64(ioffset));
-        // saddr NULL is encoded as 124 (SGPR_NULL) / 127; otherwise a byte offset.
-        // Scratch SGPR/VGPR offsets are SIGNED 32-bit byte offsets (ISA §11.2).
-        if i.saddr != 124 && i.saddr != 127 {
-            addr = self.b_add(addr, llvm::core::LLVMBuildSExt(self.b, self.ld_sgpr32(i.saddr as u32), self.i64t, self.n()));
-        }
-        if i.sve != 0 {
-            addr = self.b_add(addr, llvm::core::LLVMBuildSExt(self.b, self.ld_vgpr32(i.vaddr as u32), self.i64t, self.n()));
-        }
-        let (is_store, words) = match i.op {
-            I::SCRATCH_LOAD_B32 => (false, 1),
-            I::SCRATCH_LOAD_B64 => (false, 2),
-            I::SCRATCH_LOAD_B96 => (false, 3),
-            I::SCRATCH_LOAD_B128 => (false, 4),
-            I::SCRATCH_STORE_B32 => (true, 1),
-            I::SCRATCH_STORE_B64 => (true, 2),
-            I::SCRATCH_STORE_B96 => (true, 3),
-            I::SCRATCH_STORE_B128 => (true, 4),
-            _ => panic!("scalar: unsupported VSCRATCH {:?}", i.op),
-        };
-        for k in 0..words {
-            if is_store {
-                let d = self.ld_vgpr32(i.vsrc as u32 + k);
-                let a = self.store_addr(self.b_add(addr, self.ci64((k as u64) * 4)));
-                llvm::core::LLVMBuildStore(self.b, d, self.ptr_at(a, 0));
-            } else {
-                let ptr = self.ptr_at(addr, (k as u64) * 4);
-                let d = llvm::core::LLVMBuildLoad2(self.b, self.i32t, ptr, self.n());
-                self.st_vgpr32(i.vdst as u32 + k, d);
-            }
-        }
-    }
+
 
     // ---- VSAMPLE (texture sample) ---------------------------------------
     unsafe fn emit_vsample(&self, i: &VSAMPLE) {
@@ -2151,26 +1935,8 @@ impl Cg {
         }
     }
 
-    // ---- DS (workgroup shared LDS, cooperative path only) ----------------
-    unsafe fn emit_ds(&self, i: &DS) {
-        // Byte address into shared LDS: vgpr[addr] + offset0, from LDS base 0.
-        let off = self.b_add(self.zext64(self.ld_vgpr32(i.addr as u32)), self.ci64(i.offset0 as u64));
-        let raw = self.b_add(self.lds_base, off);
-        let ptr = llvm::core::LLVMBuildIntToPtr(self.b, raw, self.ptr, self.n());
-        match i.op {
-            I::DS_STORE_B8 => {
-                let d = self.ld_vgpr32(i.data0 as u32);
-                let byte = llvm::core::LLVMBuildTrunc(self.b, d, self.i8, self.n());
-                llvm::core::LLVMBuildStore(self.b, byte, ptr);
-            }
-            I::DS_LOAD_U8 => {
-                let byte = llvm::core::LLVMBuildLoad2(self.b, self.i8, ptr, self.n());
-                let z = llvm::core::LLVMBuildZExt(self.b, byte, self.i32t, self.n());
-                self.st_vgpr32(i.vdst as u32, z);
-            }
-            _ => panic!("scalar: unsupported DS {:?}", i.op),
-        }
-    }
+    // ---- DS (workgroup shared Lcooperative path only) ----------------
+
 
     // ---- lane-local spill (uniform writelane/readlane idiom) -------------
     // The compiler spills *uniform* SGPRs into fixed lanes of a scratch VGPR via
@@ -2249,6 +2015,39 @@ impl Cg {
             Output::Vgpr(reg, Ty::F64) => self.st_vgpr_f64(reg, result),
             Output::Compare(reg) => self.st_cmp(reg, result),
             Output::Vgpr(_, Ty::I1) => unreachable!("boolean VGPR output"),
+        }
+    }
+}
+
+impl Cg {
+    unsafe fn emit_local_wave(&self, action:&super::lift::wave::YieldAction) {
+        use super::lift::wave::{Operand,Destination};
+        use super::ir::typed::effect::{EffectOp,WaveOp};
+        let source=|index|match &action.inputs[index]{Operand::Source(s)=>s,_=>panic!("local wave operand requires register binding")};
+        let dst=match action.outputs[0]{Destination::Sgpr(r)|Destination::Vgpr(r)=>r,_=>panic!("barrier requires cooperative dispatch")};
+        let op=match action.op{EffectOp::Wave(op)=>op,_=>panic!("barrier requires cooperative dispatch")};
+        match op {
+            WaveOp::ReadFirstLane => {
+                let v = self.src_u32(source(0));
+                self.st_sgpr32(dst, v);
+                        }
+            WaveOp::WriteLane => {
+                let lane = lane_const(source(1))
+                    .expect("scalar: v_writelane_b32 needs a constant lane (non-uniform cross-lane unsupported)");
+                let val = self.src_u32(source(0));
+                let slot = self.spill_slot_ptr(dst, lane);
+                llvm::core::LLVMBuildStore(self.b, val, slot);
+                        }
+            WaveOp::ReadLane => {
+                let lane = lane_const(source(1))
+                    .expect("scalar: v_readlane_b32 needs a constant lane");
+                let src = vreg_of(source(0))
+                    .expect("scalar: v_readlane_b32 source must be a VGPR");
+                let slot = self.spill_slot_ptr(src, lane);
+                let v = llvm::core::LLVMBuildLoad2(self.b, self.i32t, slot, self.n());
+                self.st_sgpr32(dst, v);
+                        }
+            _=>panic!("wave operation requires cooperative dispatch"),
         }
     }
 }

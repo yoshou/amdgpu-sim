@@ -227,7 +227,7 @@ fn dispatch_parallel_vec_impl(
     let num_vgprs = kernel.num_vgprs.max(1);
     // Per-lane padded scratch segment (u64 units); stride in bytes spaces the W
     // per-lane segments so each work-item owns disjoint private memory.
-    let scratch_u64 = (private_segment_size as usize / 8) + 2;
+    let scratch_u64 = ((private_segment_size as usize / 8) + 2).max(kernel.min_private_bytes.div_ceil(8));
     let stride_bytes = (scratch_u64 * 8) as u64;
 
     thread::scope(|scope| {

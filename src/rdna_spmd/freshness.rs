@@ -102,6 +102,9 @@ pub fn f64_defs(inst: &InstFormat) -> Vec<u32> {
 /// All VGPR registers this instruction writes (at 32-bit granularity). Used to
 /// clear fresh bits; over-approximation is sound.
 pub fn vgpr_writes(inst: &InstFormat) -> Vec<u32> {
+    if let Some(wave)=super::lift::wave::instruction(inst){return wave.io().writes.vgprs().collect();}
+    if matches!(inst,InstFormat::VOP3(i) if matches!(i.op,I::V_S_RCP_F32)){return vec![];}
+    if let Some(memory) = super::lift::memory::instruction(inst) { return memory.writes(); }
     let memory_load_words = |op: I| match op {
         I::GLOBAL_LOAD_U8
         | I::GLOBAL_LOAD_I8
@@ -313,7 +316,7 @@ pub fn analyze_sgpr(prog: &ScalarProgram) -> BTreeMap<usize, u128> {
                 Terminator::Return => (vec![], exit),
                 Terminator::Jump(t) => (vec![*t], exit),
                 Terminator::Branch { taken, fallthrough, .. } => (vec![*taken, *fallthrough], exit),
-                Terminator::Barrier { resume } => (vec![*resume], 0),
+                Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => (vec![*resume], 0),
             };
             for t in succs {
                 let e = incoming.entry(t).or_insert(None);
@@ -356,7 +359,7 @@ pub fn analyze(prog: &ScalarProgram) -> BTreeMap<usize, RegSet> {
                 Terminator::Return => (vec![], exit),
                 Terminator::Jump(t) => (vec![*t], exit),
                 Terminator::Branch { taken, fallthrough, .. } => (vec![*taken, *fallthrough], exit),
-                Terminator::Barrier { resume } => (vec![*resume], [0; 2]),
+                Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => (vec![*resume], [0; 2]),
             };
             for t in succs {
                 let e = incoming.entry(t).or_insert(None);

@@ -241,6 +241,45 @@ pub(super) struct Values {
     values: Vec<LLVMValueRef>,
 }
 impl Values {
+    pub unsafe fn prepare_memory(
+        &mut self,
+        f: &super::lift::function::Function,
+        pc: usize,
+        index: usize,
+        mut read: impl FnMut(&super::lift::memory::Parameter, bool) -> LLVMValueRef,
+    ) {
+        use super::ir::typed::cfg::*;
+        let plan = &f.blocks[&pc].memory[&index];
+        let scalar = plan.memory.scalar();
+        for (parameter, id) in &plan.parameters {
+            if self.emitter.width.is_none() && matches!(parameter,super::lift::memory::Parameter::ScratchBase|super::lift::memory::Parameter::ScratchSize) {continue;}
+            self.values[id.0] = read(parameter, scalar);
+        }
+        let emitter = Emitter::new(self.emitter.b, if scalar { None } else { self.emitter.width });
+        for inst in &f.ir.func().blocks[&BlockId(pc)].insts[plan.core.clone()] {
+            let Inst::Core { value, ty, op } = *inst else { unreachable!() };
+            self.values[value.0] = emitter.op(ty, op, &self.values);
+        }
+        if let Some((range,_,_,_))=&plan.flat {
+            if self.emitter.width.is_some() {
+                for inst in &f.ir.func().blocks[&BlockId(pc)].insts[range.clone()] {
+                    let Inst::Core{value,ty,op}=*inst else{unreachable!()};
+                    self.values[value.0]=emitter.op(ty,op,&self.values);
+                }
+            }
+        }
+    }
+    pub fn value(&self, value: ValueId) -> LLVMValueRef {
+        let result = self.values[value.0];
+        assert!(!result.is_null(), "unmaterialized memory SSA value");
+        result
+    }
+    pub fn memory_data(&self, f: &super::lift::function::Function, pc: usize, index: usize, word: u32) -> LLVMValueRef {
+        use super::ir::typed::cfg::*;
+        let plan = &f.blocks[&pc].memory[&index];
+        let Inst::Effect { inputs, .. } = &f.ir.func().blocks[&BlockId(pc)].insts[plan.effects[word as usize]] else { unreachable!() };
+        self.value(inputs[1])
+    }
     pub unsafe fn new(
         f: &super::lift::function::Function,
         b: LLVMBuilderRef,
@@ -260,7 +299,7 @@ impl Values {
         for inst in &block.insts {
             match inst {
                 Inst::Core { value, .. } => self.values[value.0] = std::ptr::null_mut(),
-                Inst::Boundary { outputs, .. } => {
+                Inst::Boundary { outputs, .. } | Inst::Effect { outputs, .. } => {
                     for &(v, _) in outputs {
                         self.values[v.0] = std::ptr::null_mut();
                     }

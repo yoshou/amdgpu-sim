@@ -168,7 +168,7 @@ fn succs(block: &ScalarBlock) -> Vec<usize> {
         Terminator::Return => vec![],
         Terminator::Jump(t) => vec![t],
         Terminator::Branch { taken, fallthrough, .. } => vec![taken, fallthrough],
-        Terminator::Barrier { resume } => vec![resume],
+        Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![resume],
     }
 }
 
@@ -818,7 +818,7 @@ pub fn analyze_structured(prog: &ScalarProgram) -> StructuredPlan {
 
     for &pc in &reachable {
         let block = &prog.blocks[&pc];
-        if matches!(block.term, Terminator::Barrier { .. }) {
+        if matches!(block.term, Terminator::Barrier { .. } | Terminator::Yield { .. }) {
             rejects.push(StructuredReject::Barrier { pc });
         }
         if let Some(inst) = has_cross_lane(block) {

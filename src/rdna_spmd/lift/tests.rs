@@ -41,7 +41,7 @@ fn lift_keeps_reverse_operand_order_and_typed_minimum() {
                     result,
                 }
             ),
-            Lowering::Legacy(_) => panic!("expected typed ALU"),
+            _ => panic!("expected typed ALU"),
         }
     }
 }
@@ -528,7 +528,7 @@ fn typed_function_loop_carries_values_through_block_arguments() {
 }
 
 #[test]
-fn legacy_lds_load_redefines_a_typed_input() {
+fn typed_lds_load_redefines_a_typed_input() {
     use crate::rdna_instructions::DS;
     let program = ScalarProgram {
         entry_pc: 0,
@@ -575,4 +575,652 @@ fn legacy_lds_load_redefines_a_typed_input() {
         );
     }
     assert_eq!((vgprs[8], vgprs[9]), (12, 43));
+}
+
+#[test]
+fn typed_lds_barrier_rounds_and_first_wave_execute_at_all_widths() {
+    use crate::rdna_instructions::{DS, SOP2, SOPP};
+    use crate::rdna_spmd::{
+        dispatch_cooperative, dispatch_cooperative_vec, split_at_barriers, GridDims,
+    };
+    for count in [40u32, 64] {
+        let mut body = vec![];
+        let binary = |op, a, b, d| {
+            InstFormat::VOP2(VOP2 {
+                op,
+                src0: a,
+                vsrc1: b,
+                vdst: d,
+                literal_constant: None,
+            })
+        };
+        body.push(binary(
+            I::V_LSHLREV_B32,
+            SourceOperand::IntegerConstant(2),
+            0,
+            2,
+        ));
+        body.push(binary(
+            I::V_SUB_NC_U32,
+            SourceOperand::IntegerConstant((count - 1) as u64),
+            0,
+            3,
+        ));
+        body.push(binary(
+            I::V_LSHLREV_B32,
+            SourceOperand::IntegerConstant(2),
+            3,
+            3,
+        ));
+        // Two rounds reuse the same ID, and every lane reads another wave's LDS.
+        for add in [1u32, 101] {
+            body.push(binary(
+                I::V_ADD_NC_U32,
+                SourceOperand::IntegerConstant(add as u64),
+                0,
+                4,
+            ));
+            body.push(InstFormat::DS(DS {
+                op: I::DS_STORE_B32,
+                offset0: 0,
+                offset1: 0,
+                addr: 2,
+                data0: 4,
+                data1: 0,
+                vdst: 0,
+            }));
+            body.push(InstFormat::SOP1(SOP1 {
+                op: I::S_BARRIER_SIGNAL_ISFIRST,
+                ssrc0: SourceOperand::IntegerConstant(u64::MAX),
+                sdst: 124,
+            }));
+            body.push(InstFormat::SOPP(SOPP {
+                op: I::S_BARRIER_WAIT,
+                simm16: u16::MAX,
+            }));
+            body.push(InstFormat::DS(DS {
+                op: I::DS_LOAD_B32,
+                offset0: 0,
+                offset1: 0,
+                addr: 3,
+                data0: 0,
+                data1: 0,
+                vdst: 5,
+            }));
+            // Preserve the first-wave witness and store it alongside LDS data.
+            body.push(InstFormat::SOP2(SOP2 {
+                op: I::S_CSELECT_B32,
+                ssrc0: SourceOperand::IntegerConstant(1),
+                ssrc1: SourceOperand::IntegerConstant(0),
+                sdst: 8,
+            }));
+            body.push(InstFormat::VOP1(crate::rdna_instructions::VOP1 {
+                op: I::V_MOV_B32,
+                src0: SourceOperand::ScalarRegister(8),
+                vdst: 6,
+            }));
+            for (reg, offset) in [(5, 0), (6, count * 4)] {
+                body.push(InstFormat::VGLOBAL(VGLOBAL {
+                    op: I::GLOBAL_STORE_B32,
+                    saddr: 0,
+                    vaddr: 2,
+                    vsrc: reg,
+                    vdst: 0,
+                    scope: 0,
+                    th: 0,
+                    ioffset: offset,
+                    sve: 0,
+                }));
+            }
+            // Wait after the reads before overwriting LDS in the next round.
+            body.push(InstFormat::SOP1(SOP1 {
+                op: I::S_BARRIER_SIGNAL,
+                ssrc0: SourceOperand::IntegerConstant(7),
+                sdst: 124,
+            }));
+            body.push(InstFormat::SOPP(SOPP {
+                op: I::S_BARRIER_WAIT,
+                simm16: 7,
+            }));
+        }
+        let program = split_at_barriers(&ScalarProgram {
+            entry_pc: 0,
+            blocks: BTreeMap::from([(
+                0,
+                ScalarBlock {
+                    pc: 0,
+                    body,
+                    term: Terminator::Return,
+                },
+            )]),
+        });
+        let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
+        kd.enable_sgpr_kernarg_segment_ptr = true;
+        let dims = GridDims {
+            num_wg_x: 1,
+            num_wg_y: 1,
+            num_wg_z: 1,
+            wg_x: count,
+            wg_y: 1,
+            wg_z: 1,
+        };
+        for width in [0, 1, 2, 4, 8, 16] {
+            for threads in [1, 3] {
+                let mut output = vec![u32::MAX; count as usize * 2];
+                if width == 0 {
+                    let kernel = Compiler.compile_cooperative(&program, 16);
+                    dispatch_cooperative(
+                        &kernel,
+                        &kd,
+                        output.as_mut_ptr() as u64,
+                        0,
+                        dims,
+                        0,
+                        256,
+                        threads,
+                    );
+                } else {
+                    let kernel = Compiler.compile_cooperative_vec(&program, 16, width);
+                    dispatch_cooperative_vec(
+                        &kernel,
+                        &kd,
+                        output.as_mut_ptr() as u64,
+                        0,
+                        dims,
+                        0,
+                        256,
+                        threads,
+                    );
+                }
+                for lane in 0..count as usize {
+                    assert_eq!(
+                        output[lane],
+                        count - 1 - lane as u32 + 101,
+                        "width={} lane={}",
+                        width,
+                        lane
+                    );
+                    assert_eq!(
+                        output[count as usize + lane],
+                        (lane < 32) as u32,
+                        "first-wave width={} lane={}",
+                        width,
+                        lane
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn masked_memory_never_dereferences_inactive_addresses_and_keeps_old_values() {
+    use crate::rdna_spmd::fiber::{Fiber, KernelArgs, FIBER_DONE};
+    for width in [0, 1, 2, 4, 8, 16] {
+        let lanes = width.max(1) as usize;
+        let mut body = vec![InstFormat::SOP1(SOP1 {
+            op: I::S_MOV_B32,
+            sdst: 126,
+            ssrc0: SourceOperand::ScalarRegister(8),
+        })];
+        // Three adjacent pair loads exercise the transpose cluster, including
+        // a negative immediate offset and an entirely empty EXEC mask.
+        for (dst, offset) in [(4, -16i32), (8, 0), (12, 16)] {
+            body.push(InstFormat::VGLOBAL(VGLOBAL {
+                op: I::GLOBAL_LOAD_B128,
+                saddr: 124,
+                vaddr: 0,
+                vsrc: 0,
+                vdst: dst,
+                scope: 0,
+                th: 0,
+                ioffset: offset as u32 & 0xffffff,
+                sve: 0,
+            }));
+        }
+        let program = ScalarProgram {
+            entry_pc: 0,
+            blocks: BTreeMap::from([(
+                0,
+                ScalarBlock {
+                    pc: 0,
+                    body,
+                    term: Terminator::Return,
+                },
+            )]),
+        };
+        let scalar = (width == 0).then(|| Compiler.compile_writeback(&program, 32));
+        let packet = (width != 0).then(|| Compiler.compile_cooperative_vec(&program, 32, width));
+        let data: Vec<u32> = (0..lanes * 12).map(|x| x as u32 * 17 + 3).collect();
+        for mask in [0u32, 0xaaaa_aaaa, u32::MAX] {
+            let mut sgprs = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+            sgprs[8] = mask;
+            sgprs[126] = 1;
+            let mut vgprs = vec![0xdead_beefu32; 256 * lanes];
+            for lane in 0..lanes {
+                let addr = if mask >> lane & 1 != 0 {
+                    (unsafe { data.as_ptr().add(lane * 12 + 4) }) as u64
+                } else {
+                    0
+                };
+                vgprs[lane] = addr as u32;
+                vgprs[lanes + lane] = (addr >> 32) as u32;
+            }
+            if let Some(kernel) = &scalar {
+                unsafe {
+                    kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0);
+                }
+            }
+            if let Some(kernel) = &packet {
+                let mut spill = [0u32; crate::rdna_spmd::emit::COOP_SPILL_SLOTS];
+                let mut fiber = Fiber::new(32 << 10);
+                fiber.start(KernelArgs {
+                    valid_mask: u32::MAX,
+                    entry: kernel.addr(),
+                    sgprs: sgprs.as_mut_ptr(),
+                    vgprs: vgprs.as_mut_ptr(),
+                    spill: spill.as_mut_ptr(),
+                    scratch_base: 0,
+                    scratch_stride: 0,
+                    lane_base: 0,
+                    lds_base: 0,
+                });
+                assert_eq!(fiber.resume(), FIBER_DONE);
+            }
+            for lane in 0..lanes {
+                for k in 0..12 {
+                    assert_eq!(
+                        vgprs[(4 + k) * lanes + lane],
+                        if mask >> lane & 1 != 0 {
+                            data[lane * 12 + k]
+                        } else {
+                            0xdead_beef
+                        },
+                        "width={} lane={} word={}",
+                        width,
+                        lane,
+                        k
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Exercise the register adapter as well as the emitted accesses. The scalar
+/// and packet paths both expose their final register state in cooperative mode.
+fn run_memory_case(
+    program: &ScalarProgram,
+    width: u32,
+    sgprs: &mut [u32],
+    vgprs: &mut [u32],
+    scratch: u64,
+    stride: u64,
+    lds: u64,
+) {
+    use crate::rdna_spmd::fiber::{Fiber, KernelArgs, FIBER_DONE};
+    let mut spill = [0u32; crate::rdna_spmd::emit::COOP_SPILL_SLOTS];
+    if width == 0 {
+        let kernel = Compiler.compile_cooperative(program, 32);
+        assert_eq!(
+            unsafe {
+                kernel.run(
+                    sgprs.as_mut_ptr(),
+                    vgprs.as_mut_ptr(),
+                    scratch,
+                    lds,
+                    spill.as_mut_ptr(),
+                    0,
+                )
+            },
+            u64::MAX
+        );
+    } else {
+        let kernel = Compiler.compile_cooperative_vec(program, 32, width);
+        let mut fiber = Fiber::new(32 << 10);
+        fiber.start(KernelArgs {
+            valid_mask: u32::MAX,
+            entry: kernel.addr(),
+            sgprs: sgprs.as_mut_ptr(),
+            vgprs: vgprs.as_mut_ptr(),
+            spill: spill.as_mut_ptr(),
+            scratch_base: scratch,
+            scratch_stride: stride,
+            lane_base: 0,
+            lds_base: lds,
+        });
+        assert_eq!(fiber.resume(), FIBER_DONE);
+    }
+}
+
+#[test]
+fn typed_memory_subwords_flat_aperture_and_atomic_returns() {
+    use crate::rdna_instructions::{SMEM, VFLAT, VSCRATCH};
+    let make = |body| ScalarProgram {
+        entry_pc: 0,
+        blocks: BTreeMap::from([(
+            0,
+            ScalarBlock {
+                pc: 0,
+                body,
+                term: Terminator::Return,
+            },
+        )]),
+    };
+    let set_exec = || {
+        InstFormat::SOP1(SOP1 {
+            op: I::S_MOV_B32,
+            sdst: 126,
+            ssrc0: SourceOperand::ScalarRegister(8),
+        })
+    };
+    for width in [0, 1, 2, 4, 8, 16] {
+        let w = width.max(1) as usize;
+        let mut sgprs = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+        sgprs[126] = 1;
+        sgprs[8] = u32::MAX;
+        let mut vgprs = vec![0u32; 256 * w];
+        let mut private = vec![0u32; 32 * w];
+        let base = private.as_mut_ptr() as u64;
+        let global = vec![0xface_80f1u32; w];
+        for lane in 0..w {
+            private[lane * 32 + 2] = 0xbeef_91e2;
+            // Even lanes use the flat private aperture, odd lanes global memory.
+            let address = if lane % 2 == 0 {
+                base + 8
+            } else {
+                (unsafe { global.as_ptr().add(lane) }) as u64
+            };
+            vgprs[lane] = address as u32;
+            vgprs[w + lane] = (address >> 32) as u32;
+            vgprs[6 * w + lane] = 0x1234_5678;
+        }
+        let flat = |op, dst, offset| {
+            InstFormat::VFLAT(VFLAT {
+                op,
+                saddr: 124,
+                vaddr: 0,
+                vsrc: 6,
+                vdst: dst,
+                scope: 0,
+                th: 0,
+                ioffset: offset,
+                sve: 0,
+            })
+        };
+        let scratch = |op, dst, offset| {
+            InstFormat::VSCRATCH(VSCRATCH {
+                op,
+                saddr: 124,
+                vaddr: 0,
+                vsrc: 6,
+                vdst: dst,
+                scope: 0,
+                th: 0,
+                ioffset: offset,
+                sve: 0,
+            })
+        };
+        let program = make(vec![
+            set_exec(),
+            flat(I::FLAT_LOAD_I8, 2, 0),
+            flat(I::FLAT_LOAD_I16, 3, 0),
+            scratch(I::SCRATCH_STORE_B16, 0, 12),
+            scratch(I::SCRATCH_LOAD_U16, 4, 12),
+            scratch(I::SCRATCH_LOAD_I16, 5, 8),
+        ]);
+        run_memory_case(&program, width, &mut sgprs, &mut vgprs, base, 128, 0);
+        for lane in 0..w {
+            let value = if lane % 2 == 0 {
+                0xbeef_91e2u32
+            } else {
+                global[lane]
+            };
+            assert_eq!(vgprs[2 * w + lane], value as u8 as i8 as i32 as u32);
+            assert_eq!(vgprs[3 * w + lane], value as u16 as i16 as i32 as u32);
+            assert_eq!(vgprs[4 * w + lane], 0x5678);
+            assert_eq!(vgprs[5 * w + lane], 0xffff_91e2);
+            assert_eq!(private[lane * 32 + 3], 0x5678);
+        }
+        // SOFFSET is included before the signed 24-bit immediate is applied.
+        let words = [31u32, 47, 83, 101];
+        let addr = words.as_ptr() as u64;
+        sgprs[0] = addr as u32;
+        sgprs[1] = (addr >> 32) as u32;
+        sgprs[9] = 8;
+        let program = make(vec![InstFormat::SMEM(SMEM {
+            op: I::S_LOAD_B32,
+            sbase: 0,
+            sdata: 10,
+            soffset: 9,
+            ioffset: 0xfffffc,
+            scope: 0,
+            th: 0,
+        })]);
+        run_memory_case(&program, width, &mut sgprs, &mut vgprs, base, 128, 0);
+        assert_eq!(sgprs[10], 47);
+        for mask in [0u32, 0xaaaa_aaaa, u32::MAX] {
+            let mut total = 19u32;
+            let addr = &mut total as *mut u32 as u64;
+            sgprs[0] = addr as u32;
+            sgprs[1] = (addr >> 32) as u32;
+            sgprs[8] = mask;
+            for lane in 0..w {
+                vgprs[lane] = 0;
+                vgprs[2 * w + lane] = 1;
+                vgprs[3 * w + lane] = 0xdead_beef;
+            }
+            let program = make(vec![
+                set_exec(),
+                InstFormat::VGLOBAL(VGLOBAL {
+                    op: I::GLOBAL_ATOMIC_ADD_U32,
+                    saddr: 0,
+                    vaddr: 0,
+                    vsrc: 2,
+                    vdst: 3,
+                    scope: 3,
+                    th: 1,
+                    ioffset: 0,
+                    sve: 0,
+                }),
+            ]);
+            run_memory_case(&program, width, &mut sgprs, &mut vgprs, base, 128, 0);
+            let active = (0..w).filter(|&l| mask >> l & 1 != 0).count();
+            assert_eq!(total, 19 + active as u32);
+            let mut returns = vec![];
+            for lane in 0..w {
+                if mask >> lane & 1 != 0 {
+                    returns.push(vgprs[3 * w + lane]);
+                } else {
+                    assert_eq!(vgprs[3 * w + lane], 0xdead_beef);
+                }
+            }
+            returns.sort();
+            assert_eq!(returns, (19..19 + active as u32).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[test]
+fn mixed_wave_memory_yields_preserve_full_wave_values_and_partial_waves() {
+    use crate::rdna_instructions::{DS, VOP1, VOP3, VOPC};
+    use crate::rdna_spmd::{dispatch_cooperative, dispatch_cooperative_vec, GridDims};
+    let mov = |src0, vdst| {
+        InstFormat::VOP1(VOP1 {
+            op: I::V_MOV_B32,
+            src0,
+            vdst,
+        })
+    };
+    let binary = |op, src0, vsrc1, vdst| {
+        InstFormat::VOP2(VOP2 {
+            op,
+            src0,
+            vsrc1,
+            vdst,
+            literal_constant: None,
+        })
+    };
+    let lane = |op, src0, src1, vdst| {
+        InstFormat::VOP3(VOP3 {
+            op,
+            src0,
+            src1,
+            src2: SourceOperand::IntegerConstant(0),
+            vdst,
+            abs: 0,
+            neg: 0,
+            cm: 0,
+            omod: 0,
+            opsel: 0,
+        })
+    };
+    let count = 40u32;
+    let mut body = vec![
+        binary(I::V_ADD_NC_U32, SourceOperand::IntegerConstant(100), 0, 1),
+        binary(I::V_AND_B32, SourceOperand::IntegerConstant(31), 0, 6),
+        InstFormat::VOPC(VOPC {
+            op: I::V_CMPX_EQ_U32,
+            src0: SourceOperand::IntegerConstant(5),
+            vsrc1: 6,
+        }),
+        InstFormat::VOP1(VOP1 {
+            op: I::V_READFIRSTLANE_B32,
+            src0: SourceOperand::VectorRegister(1),
+            vdst: 10,
+        }),
+        InstFormat::SOP1(SOP1 {
+            op: I::S_MOV_B32,
+            ssrc0: SourceOperand::IntegerConstant(u64::MAX),
+            sdst: 126,
+        }),
+        mov(SourceOperand::ScalarRegister(10), 2),
+        lane(
+            I::V_WRITELANE_B32,
+            SourceOperand::IntegerConstant(777),
+            SourceOperand::IntegerConstant(21),
+            1,
+        ),
+        lane(
+            I::V_READLANE_B32,
+            SourceOperand::VectorRegister(1),
+            SourceOperand::IntegerConstant(21),
+            11,
+        ),
+        mov(SourceOperand::ScalarRegister(11), 3),
+        binary(I::V_SUB_NC_U32, SourceOperand::IntegerConstant(31), 6, 7),
+        binary(I::V_LSHLREV_B32, SourceOperand::IntegerConstant(2), 7, 7),
+        InstFormat::DS(DS {
+            op: I::DS_BPERMUTE_FI_B32,
+            addr: 7,
+            data0: 1,
+            data1: 0,
+            vdst: 4,
+            offset0: 0,
+            offset1: 0,
+        }),
+        binary(I::V_LSHLREV_B32, SourceOperand::IntegerConstant(2), 0, 6),
+    ];
+    for (k, reg) in [1u8, 2, 3, 4].iter().enumerate() {
+        body.push(InstFormat::VGLOBAL(VGLOBAL {
+            op: I::GLOBAL_STORE_B32,
+            saddr: 0,
+            vaddr: 6,
+            vsrc: *reg,
+            vdst: 0,
+            scope: 0,
+            th: 0,
+            ioffset: k as u32 * count * 4,
+            sve: 0,
+        }));
+    }
+    let program = super::wave::split(
+        &ScalarProgram {
+            entry_pc: 0,
+            blocks: BTreeMap::from([(
+                0,
+                ScalarBlock {
+                    pc: 0,
+                    body,
+                    term: Terminator::Return,
+                },
+            )]),
+        },
+        |_| true,
+    )
+    .0;
+    let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
+    kd.enable_sgpr_kernarg_segment_ptr = true;
+    let dims = GridDims {
+        num_wg_x: 1,
+        num_wg_y: 1,
+        num_wg_z: 1,
+        wg_x: count,
+        wg_y: 1,
+        wg_z: 1,
+    };
+    for width in [0, 1, 2, 4, 8, 16] {
+        let mut output = vec![u32::MAX; count as usize * 4];
+        if width == 0 {
+            let kernel = Compiler.compile_cooperative(&program, 16);
+            dispatch_cooperative(&kernel, &kd, output.as_mut_ptr() as u64, 0, dims, 0, 0, 2);
+        } else {
+            let kernel = Compiler.compile_cooperative_vec(&program, 16, width);
+            dispatch_cooperative_vec(&kernel, &kd, output.as_mut_ptr() as u64, 0, dims, 0, 0, 2);
+        }
+        for id in 0..count as usize {
+            let wave = id / 32;
+            let src = wave * 32 + 31 - id % 32;
+            for (k, expected) in [
+                if id == 21 { 777 } else { 100 + id as u32 },
+                105 + wave as u32 * 32,
+                if wave == 0 { 777 } else { 0 },
+                if src >= count as usize {
+                    0
+                } else if src == 21 {
+                    777
+                } else {
+                    100 + src as u32
+                },
+            ]
+            .iter()
+            .enumerate()
+            {
+                assert_eq!(
+                    output[k * count as usize + id],
+                    *expected,
+                    "width={} lane={} result={}",
+                    width,
+                    id,
+                    k
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn static_private_loads_reserve_their_cells_and_dynamic_inactive_loads_are_masked(){
+    use crate::rdna_instructions::VSCRATCH;
+    use crate::rdna_spmd::{dispatch_cooperative_vec,GridDims};
+    let scratch=|scalar,offset|InstFormat::VSCRATCH(VSCRATCH{op:I::SCRATCH_LOAD_B128,saddr:scalar,vaddr:0,vsrc:0,vdst:4,scope:0,th:0,ioffset:offset,sve:0});
+    let make=|body|ScalarProgram{entry_pc:0,blocks:BTreeMap::from([(0,ScalarBlock{pc:0,body,term:Terminator::Return})])};
+    let mut kd=crate::processor::decode_kernel_desc(&[0;64]);kd.enable_sgpr_kernarg_segment_ptr=true;
+    let dims=GridDims{num_wg_x:1,num_wg_y:1,num_wg_z:1,wg_x:40,wg_y:1,wg_z:1};
+    let program=make(vec![scratch(124,4096),InstFormat::VOP2(VOP2{op:I::V_LSHLREV_B32,src0:SourceOperand::IntegerConstant(2),vsrc1:0,vdst:2,literal_constant:None}),InstFormat::VGLOBAL(VGLOBAL{op:I::GLOBAL_STORE_B32,saddr:0,vaddr:2,vsrc:4,vdst:0,scope:0,th:0,ioffset:0,sve:0})]);
+    for width in [1,2,4,8,16] {
+        let kernel=Compiler.compile_cooperative_vec(&program,16,width);assert_eq!(kernel.min_private_bytes,4112);
+        let mut output=[u32::MAX;40];
+        // The IR's static frame requirement is honored even when the caller's
+        // descriptor reports no private segment; padding lanes are allocated too.
+        dispatch_cooperative_vec(&kernel,&kd,output.as_mut_ptr()as u64,0,dims,0,0,1);assert_eq!(output,[0;40]);
+        for (scalar,offset) in [(8,0),(124,0xfffff0)] {
+            let program=make(vec![InstFormat::SOP1(SOP1{op:I::S_MOV_B32,sdst:126,ssrc0:SourceOperand::IntegerConstant(0)}),scratch(scalar,offset)]);
+            let kernel=Compiler.compile_cooperative_vec(&program,16,width);assert_eq!(kernel.min_private_bytes,0);
+            let mut sgprs=[0u32;crate::rdna_spmd::emit::COOP_SGPR_BUF];sgprs[126]=u32::MAX;sgprs[8]=0x7fff_ffff;
+            let mut vgprs=vec![0xdead_beefu32;256*width as usize];
+            run_memory_case(&program,width,&mut sgprs,&mut vgprs,0,0,0);
+            assert!(vgprs[4*width as usize..8*width as usize].iter().all(|&v|v==0xdead_beef));
+        }
+    }
 }

@@ -3,6 +3,7 @@
 /// A set of SGPRs and VGPRs.
 #[derive(Clone, Copy, Default, PartialEq)]
 pub(super) struct RegSet {
+    pub(super) scc: bool,
     sgpr: u128,
     vgpr: [u128; 2],
 }

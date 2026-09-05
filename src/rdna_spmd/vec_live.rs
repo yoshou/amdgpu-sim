@@ -39,6 +39,7 @@ fn src_vgpr(op: &SourceOperand, out: &mut Vec<u32>) {
 
 /// All VGPRs an instruction may read (over-approximated upward — never under).
 pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
+    if let Some(memory)=super::lift::memory::instruction(inst){return memory.reads();}
     let mut r = Vec::new();
     match inst {
         InstFormat::VOP1(i) => src_vgpr(&i.src0, &mut r),
@@ -281,7 +282,7 @@ pub fn frame_entry_with_boundary_writes(
         for (&pc, block) in &prog.blocks {
             let mut m = entry[&pc].clone();
             for inst in &block.body { frame_transfer(inst, &mut m); }
-            if let Terminator::Barrier { resume } = block.term {
+            if let Terminator::Barrier { resume } | Terminator::Yield { resume, .. } = block.term {
                 if let Some(writes) = boundary_writes.get(&resume) {
                     for &w in writes {
                         m.remove(&w);
@@ -379,7 +380,7 @@ pub fn divergent_entry_with_seed_and_boundary_writes(
         for (&_pc, block) in &prog.blocks {
             let mut d = entry[&_pc];
             for inst in &block.body { div_transfer(inst, &mut d); }
-            if let Terminator::Barrier { resume } = block.term {
+            if let Terminator::Barrier { resume } | Terminator::Yield { resume, .. } = block.term {
                 if let Some(writes) = boundary_writes.get(&resume) {
                     for &w in writes {
                         d[(w >> 7) as usize] |= 1u128 << (w & 127);
@@ -407,7 +408,7 @@ fn succs(block: &ScalarBlock) -> Vec<usize> {
         Terminator::Return => vec![],
         Terminator::Jump(t) => vec![*t],
         Terminator::Branch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
-        Terminator::Barrier { resume } => vec![*resume],
+        Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![*resume],
     }
 }
 

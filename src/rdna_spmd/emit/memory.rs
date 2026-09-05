@@ -1,0 +1,141 @@
+//! Scalar physical lowering of verified memory effects.
+use super::*;
+use crate::rdna_spmd::{
+    ir::typed::effect::*,
+    lift::memory::{Address, Parameter, Plan},
+    typed_codegen::Values,
+};
+impl Cg {
+    pub(super) unsafe fn memory_parameter(&self, p: &Parameter, _: bool) -> LLVMValueRef {
+        match p {
+            Parameter::Register(input) => self.typed_input(input),
+            Parameter::Exec => llvm::core::LLVMBuildICmp(
+                self.b,
+                llvm::LLVMIntPredicate::LLVMIntNE,
+                self.b_and(self.ld_sgpr32(EXEC), self.ci32(1)),
+                self.ci32(0),
+                self.n(),
+            ),
+            Parameter::ScratchBase => self.scratch_base,
+            Parameter::ScratchSize => panic!("scalar scratch size is not yet in the ABI"),
+        }
+    }
+    pub(super) unsafe fn emit_memory(
+        &self,
+        plan: &Plan,
+        values: &Values,
+        data: impl Fn(u32) -> LLVMValueRef,
+    ) {
+        let m = &plan.memory;
+        assert!(
+            m.space() != Space::Lds || self.coop,
+            "LDS requires cooperative dispatch"
+        );
+        if m.op == MemoryOp::Fence {
+            let order = match m.semantics.ordering {
+                Ordering::Acquire => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
+                Ordering::Release => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
+                _ => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+            };
+            llvm::core::LLVMBuildFence(self.b, order, 0, self.n());
+            return;
+        }
+        let mut addr = values.value(plan.address);
+        if m.space() != Space::Global {
+            addr = self.b_add(
+                if m.space() == Space::Scratch {
+                    self.scratch_base
+                } else {
+                    self.lds_base
+                },
+                if m.space() == Space::Scratch {
+                    llvm::core::LLVMBuildSExt(self.b, addr, self.i64t, self.n())
+                } else {
+                    self.zext64(addr)
+                },
+            );
+        }
+        // A false load mask must not dereference a lane's possibly invalid pointer.
+        let load_addr = if !m.scalar() && self.predicate.get() {
+            self.store_addr(addr)
+        } else {
+            addr
+        };
+        if m.op == MemoryOp::AtomicAdd {
+            let ptr = self.ptr_at(self.store_addr(addr), 0);
+            let old = llvm::core::LLVMBuildAtomicRMW(
+                self.b,
+                llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd,
+                ptr,
+                data(0),
+                llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                0,
+            );
+            if m.returns {
+                self.st_vgpr32(m.dest, old);
+            }
+            return;
+        }
+        let elem = match m.size().bytes() {
+            1 => self.i8,
+            2 => self.i16ty(),
+            _ => self.i32t,
+        };
+        if m.stores() {
+            for k in 0..m.words {
+                let value = if m.size() == MemSize::B32 {
+                    data(k)
+                } else {
+                    llvm::core::LLVMBuildTrunc(self.b, data(k), elem, self.n())
+                };
+                let p = self.ptr_at(
+                    self.store_addr(self.b_add(addr, self.ci64(k as u64 * 4))),
+                    0,
+                );
+                let store = llvm::core::LLVMBuildStore(self.b, value, p);
+                llvm::core::LLVMSetAlignment(store, m.size().bytes());
+                llvm::core::LLVMSetVolatile(store, m.semantics.volatile as i32);
+            }
+            return;
+        }
+        let pairs = matches!(m.address, Address::Global { .. })
+            && m.size() == MemSize::B32
+            && !m.semantics.volatile;
+        let mut k = 0;
+        while k < m.words {
+            if pairs && k + 1 < m.words {
+                let value = llvm::core::LLVMBuildLoad2(
+                    self.b,
+                    self.f64t,
+                    self.ptr_at(load_addr, k as u64 * 4),
+                    self.n(),
+                );
+                llvm::core::LLVMSetAlignment(value, 4);
+                self.st_vgpr_f64(m.dest + k, value);
+                k += 2;
+            } else {
+                let load = llvm::core::LLVMBuildLoad2(
+                    self.b,
+                    elem,
+                    self.ptr_at(load_addr, k as u64 * 4),
+                    self.n(),
+                );
+                llvm::core::LLVMSetAlignment(load, m.size().bytes());
+                llvm::core::LLVMSetVolatile(load, m.semantics.volatile as i32);
+                let value = if m.size() == MemSize::B32 {
+                    load
+                } else if m.size().signed() {
+                    llvm::core::LLVMBuildSExt(self.b, load, self.i32t, self.n())
+                } else {
+                    llvm::core::LLVMBuildZExt(self.b, load, self.i32t, self.n())
+                };
+                if m.scalar() {
+                    self.st_sgpr32(m.dest + k, value);
+                } else {
+                    self.st_vgpr32(m.dest + k, value);
+                }
+                k += 1;
+            }
+        }
+    }
+}

@@ -28,6 +28,8 @@ pub struct KernelArgs {
     pub scratch_base: u64,
     pub scratch_stride: u64,
     pub lane_base: u64,
+    pub lds_base: u64,
+    pub valid_mask: u32, // allocated work items, independent of mutable EXEC
 }
 
 /// Driver/kernel shared state. `#[repr(C)]`: this is an ABI between the two
@@ -56,9 +58,10 @@ type KernelFn = unsafe extern "C" fn(
     u64,           // scratch_base
     u64,           // scratch_stride
     *mut u32,      // spill
-    u64,           // unused (the resume pc of a return-based ABI)
+    u64,           // workgroup LDS base
     u64,           // packet lane base
     *mut FiberCtx, // this context
+    u32,          // valid packet lanes
 ) -> u64;
 
 /// A packet kernel invocation with its own stack. [`Fiber::start`] arms it for
@@ -87,6 +90,8 @@ impl Fiber {
                     sgprs: std::ptr::null_mut(),
                     vgprs: std::ptr::null_mut(),
                     spill: std::ptr::null_mut(),
+                    lds_base: 0,
+                    valid_mask: u32::MAX,
                     scratch_base: 0,
                     scratch_stride: 0,
                     lane_base: 0,
@@ -168,9 +173,10 @@ extern "C" fn main(ctx: *mut FiberCtx) -> ! {
             args.scratch_base,
             args.scratch_stride,
             args.spill,
-            0,
+            args.lds_base,
             args.lane_base,
             ctx,
+            args.valid_mask,
         );
         debug_assert_eq!(done, FIBER_DONE, "packet kernel returned without finishing");
         switch(&mut (*ctx).fiber_rsp, (*ctx).driver_rsp, FIBER_DONE);
@@ -312,6 +318,7 @@ mod tests {
         _unused: u64,
         _lane_base: u64,
         ctx: *mut FiberCtx,
+        _valid_mask: u32,
     ) -> u64 {
         let mut acc = unsafe { *sgprs } as u64;
         amdgpu_sim_fiber_yield(ctx, 100 + acc, std::ptr::null_mut(), std::ptr::null_mut());
@@ -323,6 +330,8 @@ mod tests {
 
     fn args_for(sgprs: &mut [u32; 1]) -> KernelArgs {
         KernelArgs {
+            lds_base: 0,
+            valid_mask: u32::MAX,
             entry: counting_kernel as *const () as u64,
             sgprs: sgprs.as_mut_ptr(),
             vgprs: std::ptr::null_mut(),

@@ -6,12 +6,19 @@
 //! It is deliberately not a core Op or a target-dialect escape hatch. Its owner
 //! must retain the matching adapter action until memory/wave lifting replaces it.
 use super::{Op, Ty, ValueId};
+use super::effect::EffectOp;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BlockId(pub usize);
 #[derive(Clone, Debug)]
 pub(crate) enum Inst {
+    Effect {
+        provenance: u64,
+        op: EffectOp,
+        inputs: Vec<ValueId>,
+        outputs: Vec<(ValueId, Ty)>,
+    },
     Core {
         value: ValueId,
         ty: Ty,
@@ -66,6 +73,7 @@ impl Func {
             return Err("missing entry");
         }
         let mut definitions = BTreeSet::new();
+        let mut effects = BTreeSet::new();
         for block in self.blocks.values() {
             let mut local = BTreeSet::new();
             let define = |id: ValueId,
@@ -86,6 +94,12 @@ impl Func {
             }
             for inst in &block.insts {
                 match inst {
+                    Inst::Effect { provenance, op, inputs, outputs } => {
+                        if !effects.insert(*provenance) { return Err("duplicate effect provenance"); }
+                        if inputs.iter().any(|v| !local.contains(v)) { return Err("non-dominating effect input"); }
+                        op.verify(inputs, outputs, &self.types)?;
+                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut definitions)?; }
+                    }
                     Inst::Core { value, ty, op } => {
                         let mut valid = true;
                         op.map(|v| {

@@ -255,6 +255,7 @@ impl VerifiedExpr {
 }
 
 pub(crate) mod cfg;
+pub(crate) mod effect;
 
 #[cfg(test)]
 mod tests {

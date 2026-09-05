@@ -251,7 +251,7 @@ pub fn analyze_states_ex(prog: &ScalarProgram, sound_for_packing: bool) -> BTree
                     }
                     _ => vec![(*taken, exit, false), (*fallthrough, exit, false)],
                 },
-                Terminator::Barrier { resume } => vec![(*resume, exit, false)],
+                Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![(*resume, exit, false)],
             };
             for (t, st, inactive) in edges {
                 if inactive && !sound_for_packing {

@@ -21,7 +21,10 @@ pub(in crate::rdna_spmd) struct Alu {
 }
 pub(in crate::rdna_spmd) struct BlockPlan {
     pub instructions: Vec<Option<Alu>>,
+    pub memory: BTreeMap<usize, super::memory::Plan>,
+    pub wave: BTreeMap<usize,super::wave::YieldAction>,
     pub outgoing: Vec<ValueId>,
+    pub yield_action: Option<(u64, super::wave::YieldAction)>,
 }
 pub(in crate::rdna_spmd) struct Function {
     pub ir: VerifiedFunc,
@@ -42,6 +45,11 @@ impl Function {
                         .filter(|&r| r < 256),
                 );
                 regs.extend(crate::rdna_spmd::freshness::vgpr_writes(inst));
+            }
+        }
+        for block in program.blocks.values() {
+            if let Terminator::Yield { action, .. } = &block.term {
+                let io = action.io();regs.extend(io.reads.vgprs());regs.extend(io.writes.vgprs());
             }
         }
         if let Some(boundary) = boundary {
@@ -70,6 +78,7 @@ impl Function {
             );
         }
         let mut plans = BTreeMap::new();
+        let mut provenance = 0;
         for (&pc, source) in &program.blocks {
             let mut block = f.blocks.remove(&BlockId(pc)).unwrap();
             let mut words: BTreeMap<u32, ValueId> = regs
@@ -79,8 +88,22 @@ impl Function {
                 .collect();
             let mut views: BTreeMap<(u32, Ty), ValueId> = BTreeMap::new();
             let mut instructions = Vec::with_capacity(source.body.len());
+            let mut memory = BTreeMap::new();
+            let mut wave = BTreeMap::new();
             for (inst, lowering) in source.body.iter().zip(&lowerings[&pc]) {
                 let plan = match lowering {
+                    Lowering::Wave(action) => {
+                        action.lift(&mut f,&mut block,&mut words,&mut provenance);
+                        invalidate(&mut views,&action.io().writes.vgprs().collect::<Vec<_>>());
+                        wave.insert(instructions.len(),action.clone());
+                        None
+                    }
+                    Lowering::Memory(m) => {
+                        let plan=m.lift(&mut f, &mut block, &mut words, &mut provenance);
+                        memory.insert(instructions.len(),plan);
+                        invalidate(&mut views, &m.writes());
+                        None
+                    }
                     Lowering::TypedAlu {
                         inputs,
                         output,
@@ -152,8 +175,8 @@ impl Function {
                     }
                     Lowering::Legacy(_) => {
                         let writes = crate::rdna_spmd::freshness::vgpr_writes(inst);
-                        // Legacy memory and cross-lane operations keep their
-                        // original order and full adapter semantics.
+                        // Remaining register/control and target-specific adapters
+                        // retain their original order during state migration.
                         let mut deps: Vec<_> = crate::rdna_spmd::vec_live::vgpr_reads(inst)
                             .iter()
                             .filter_map(|r| words.get(r).copied())
@@ -174,6 +197,12 @@ impl Function {
                     }
                 };
                 instructions.push(plan);
+            }
+            let yield_action = if let Terminator::Yield { ref action, .. } = source.term {
+                Some((provenance,action.as_ref().clone()))
+            } else {None};
+            if let Terminator::Yield { ref action, .. } = source.term {
+                action.lift(&mut f, &mut block, &mut words, &mut provenance);
             }
             if let Terminator::Barrier { resume } = source.term {
                 if let Some(io) = boundary.and_then(|map| map.get(&resume)) {
@@ -204,7 +233,7 @@ impl Function {
             };
             block.term = match source.term {
                 Terminator::Return => Term::Ret,
-                Terminator::Jump(pc) | Terminator::Barrier { resume: pc } => Term::Br(edge(pc)),
+                Terminator::Jump(pc) | Terminator::Barrier { resume: pc } | Terminator::Yield { resume: pc, .. } => Term::Br(edge(pc)),
                 Terminator::Branch {
                     taken, fallthrough, ..
                 } => {
@@ -227,6 +256,9 @@ impl Function {
                 pc,
                 BlockPlan {
                     instructions,
+                    memory,
+                    wave,
+                    yield_action,
                     outgoing: regs.iter().map(|r| words[r]).collect(),
                 },
             );
@@ -235,6 +267,23 @@ impl Function {
             ir: f.verify().expect("invalid function SSA lift"),
             blocks: plans,
         }
+    }
+    pub fn min_private_bytes(&self) -> usize {
+        self.blocks.values().flat_map(|b|b.memory.values())
+            .filter_map(|p|p.memory.private_load_end()).max().unwrap_or(0) as usize
+    }
+    /// Bind the verified SSA effect to the scheduler's register adapter. The
+    /// opcode and resume edge come from the same IR consumed by codegen.
+    pub fn yields(&self) -> BTreeMap<usize, super::wave::YieldAction> {
+        self.blocks.iter().filter_map(|(&pc,plan)| {
+            let (id,binding)=plan.yield_action.as_ref()?;
+            let block=&self.ir.func().blocks[&BlockId(pc)];
+            let op=block.insts.iter().find_map(|inst|match inst {
+                Inst::Effect{provenance,op,..} if provenance==id=>Some(*op),_=>None,
+            }).expect("yield binding lacks verified effect");
+            let Term::Br(edge)=&block.term else {panic!("yield lacks resume edge")};
+            Some((edge.dst.0,super::wave::YieldAction::new(op,binding.inputs.clone(),binding.outputs.clone())))
+        }).collect()
     }
     /// Preserve the ABI's cooperative yield while taking targets from typed CFG.
     pub fn terminator(&self, pc: usize, source: &Terminator) -> Terminator {
@@ -251,6 +300,7 @@ impl Function {
         }
         match (term, source) {
             (Term::Ret, Terminator::Return) => Terminator::Return,
+            (Term::Br(e), Terminator::Yield { action, .. }) => Terminator::Yield { resume: e.dst.0, action: action.clone() },
             (Term::Br(e), Terminator::Barrier { .. }) => Terminator::Barrier { resume: e.dst.0 },
             (Term::Br(e), Terminator::Jump(_)) => Terminator::Jump(e.dst.0),
             (Term::CondBr { yes, no, .. }, Terminator::Branch { cond, .. }) => Terminator::Branch {

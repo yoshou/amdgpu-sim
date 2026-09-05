@@ -81,6 +81,8 @@
 //! - JIT caching, dispatch specialization, and prefetching had too little
 //!   profile contribution for the tested long-running workload.
 
+mod barrier;
+
 mod active;
 mod cooperative;
 mod coop_xlane;
@@ -108,7 +110,7 @@ mod wmma;
 
 pub mod fiber;
 
-pub use cooperative::dispatch_cooperative;
+pub use cooperative::{dispatch_cooperative, dispatch_cooperative_vec};
 pub use coop_xlane::{
     compile_xlane_vec, dispatch_xlane, dispatch_xlane_vec, split_at_xlane, XlaneOp,
 };
