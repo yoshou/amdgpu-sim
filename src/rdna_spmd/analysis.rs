@@ -1,0 +1,161 @@
+//! Width-independent facts derived from SSA definitions and CFG edges.
+//! Architectural register classes do not supply facts to this analysis.
+use super::ir::typed::{cfg::*, Cvt, IntOp, IntPred, Op, Ty, ValueId};
+use std::collections::VecDeque;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fact { Pending, Constant(u64), Dynamic }
+impl Fact {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Pending, a) | (a, Self::Pending) => a,
+            (Self::Constant(a), Self::Constant(b)) if a == b => self,
+            _ => Self::Dynamic,
+        }
+    }
+}
+enum Definition { External, Phi(Vec<ValueId>), Core(Ty, Op) }
+
+/// A conservative, monotone constant analysis. All incoming CFG edges take
+/// part, including loop backedges; an unseeded cycle proves no constant.
+pub(crate) fn constants(function: &VerifiedFunc) -> Vec<Option<u64>> {
+    let f = function.func();
+    let mut definitions: Vec<_> = (0..f.types.len()).map(|_| Definition::External).collect();
+    for (&id, block) in &f.blocks {
+        if id != f.entry {
+            for &(value, _) in &block.params { definitions[value.0] = Definition::Phi(vec![]); }
+        }
+        for inst in &block.insts {
+            if let Inst::Core { value, ty, op } = *inst {
+                definitions[value.0] = Definition::Core(ty, op);
+            }
+        }
+    }
+    for block in f.blocks.values() {
+        for edge in block.term.edges() {
+            for (&arg, &(value, _)) in edge.args.iter().zip(&f.blocks[&edge.dst].params) {
+                if let Definition::Phi(inputs) = &mut definitions[value.0] { inputs.push(arg); }
+            }
+        }
+    }
+    let mut users = vec![vec![]; definitions.len()];
+    for (id, definition) in definitions.iter().enumerate() {
+        let mut add = |value: ValueId| { users[value.0].push(id); value };
+        match definition {
+            Definition::Core(_, op) => { op.map(&mut add); }
+            Definition::Phi(inputs) => { for &value in inputs { add(value); } }
+            Definition::External => {}
+        }
+    }
+    let mut facts = vec![Fact::Pending; definitions.len()];
+    let mut queue: VecDeque<_> = (0..definitions.len()).collect();
+    let mut queued = vec![true; definitions.len()];
+    while let Some(id) = queue.pop_front() {
+        queued[id] = false;
+        let next = match &definitions[id] {
+            Definition::External => Fact::Dynamic,
+            Definition::Phi(inputs) => inputs.iter().fold(Fact::Pending, |a, b| a.join(facts[b.0])),
+            Definition::Core(ty, op) => evaluate(*ty, *op, &f.types, &facts),
+        };
+        let next = facts[id].join(next);
+        if next != facts[id] {
+            facts[id] = next;
+            for &user in &users[id] {
+                if !queued[user] { queued[user] = true; queue.push_back(user); }
+            }
+        }
+    }
+    facts.into_iter().map(|fact| match fact { Fact::Constant(v) => Some(v), _ => None }).collect()
+}
+
+fn mask(ty: Ty) -> u64 { u64::MAX >> (64 - ty.bits()) }
+fn signed(value: u64, ty: Ty) -> i64 { ((value << (64 - ty.bits())) as i64) >> (64 - ty.bits()) }
+fn evaluate(ty: Ty, op: Op, types: &[Ty], facts: &[Fact]) -> Fact {
+    use Fact::*;
+    if let Op::Const(_, value) = op { return Constant(value & mask(ty)); }
+    if let Op::Select(p, a, b) = op {
+        return match facts[p.0] {
+            Constant(0) => facts[b.0], Constant(_) => facts[a.0],
+            _ if facts[a.0] == facts[b.0] => facts[a.0],
+            Pending => Pending,
+            _ => facts[a.0].join(facts[b.0]),
+        };
+    }
+    let mut pending = false; let mut dynamic = false;
+    op.map(|v| { pending |= facts[v.0] == Pending; dynamic |= facts[v.0] == Dynamic; v });
+    if dynamic { return Dynamic; }
+    if pending { return Pending; }
+    let value = |v: ValueId| match facts[v.0] { Constant(x) => x, _ => unreachable!() };
+    let result = match op {
+        Op::Int(kind, a, b) => {
+            let (a, b) = (value(a), value(b));
+            match kind {
+                IntOp::Add => a.wrapping_add(b), IntOp::Sub => a.wrapping_sub(b), IntOp::Mul => a.wrapping_mul(b),
+                IntOp::And => a & b, IntOp::Or => a | b, IntOp::Xor => a ^ b,
+                // An oversized shift is not evidence of a defined constant.
+                IntOp::Shl | IntOp::LShr | IntOp::AShr if b >= ty.bits() as u64 => return Dynamic,
+                IntOp::Shl => a << b, IntOp::LShr => a >> b, IntOp::AShr => (signed(a, ty) >> b) as u64,
+            }
+        }
+        Op::Convert(Cvt::Bitcast | Cvt::ZExt | Cvt::Trunc, _, a) => value(a),
+        Op::Convert(Cvt::SExt, _, a) => signed(value(a), types[a.0]) as u64,
+        Op::Pack64(lo, hi) => value(lo) | (value(hi) << 32),
+        Op::UnpackLo(a) => value(a) & 0xffff_ffff, Op::UnpackHi(a) => value(a) >> 32,
+        Op::TrailingZeros(a) => (value(a).trailing_zeros()).min(ty.bits()) as u64,
+        Op::LeadingZeros(a) => (value(a).leading_zeros() - (64 - ty.bits())) as u64,
+        Op::PopulationCount(a) => value(a).count_ones() as u64,
+        Op::ReverseBits(a) => value(a).reverse_bits() >> (64 - ty.bits()),
+        Op::Cmp(kind, a, b) => {
+            let t = types[a.0]; let (a, b) = (value(a), value(b));
+            (match kind {
+                IntPred::Eq => a == b, IntPred::Ne => a != b,
+                IntPred::Ult => a < b, IntPred::Ugt => a > b, IntPred::Ule => a <= b, IntPred::Uge => a >= b,
+                IntPred::Slt => signed(a,t) < signed(b,t), IntPred::Sgt => signed(a,t) > signed(b,t),
+                IntPred::Sle => signed(a,t) <= signed(b,t), IntPred::Sge => signed(a,t) >= signed(b,t),
+            }) as u64
+        }
+        _ => return Dynamic,
+    };
+    Constant(result & mask(ty))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn loop_backedge_can_disprove_a_constant_without_losing_invariants() {
+        let mut f = Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] };
+        let initial = f.value(Ty::I32); let a = f.value(Ty::I32); let invariant = f.value(Ty::I32);
+        let one = f.value(Ty::I32); let next = f.value(Ty::I32); let condition = f.value(Ty::I1);
+        let result = f.value(Ty::I32);
+        f.blocks.insert(BlockId(0), Block { params: vec![], insts: vec![Inst::Core {
+            value: initial, ty: Ty::I32, op: Op::Const(Ty::I32,7),
+        }], term: Term::Br(Edge { dst: BlockId(1), args: vec![initial, initial] }) });
+        f.blocks.insert(BlockId(1), Block { params: vec![(a,Ty::I32),(invariant,Ty::I32)], insts: vec![
+            Inst::Core { value: one, ty: Ty::I32, op: Op::Const(Ty::I32,1) },
+            Inst::Core { value: next, ty: Ty::I32, op: Op::Int(IntOp::Add,a,one) },
+            Inst::Boundary { inputs: vec![], outputs: vec![(condition,Ty::I1)] },
+        ], term: Term::CondBr { cond: condition,
+            yes: Edge { dst: BlockId(1), args: vec![next,invariant] },
+            no: Edge { dst: BlockId(2), args: vec![invariant] },
+        } });
+        f.blocks.insert(BlockId(2), Block { params: vec![(result,Ty::I32)], insts: vec![], term: Term::Ret });
+        let facts = constants(&f.verify().unwrap());
+        assert_eq!(facts[a.0],None);
+        assert_eq!(facts[next.0],None);
+        assert_eq!(facts[invariant.0],Some(7));
+        assert_eq!(facts[result.0],Some(7));
+    }
+
+    #[test]
+    fn constant_words_keep_width_and_do_not_fold_undefined_shifts() {
+        let facts = [Fact::Constant(0x8000_0001),Fact::Constant(32),Fact::Constant(1)];
+        let types = [Ty::I32;3]; let a = ValueId(0); let b = ValueId(1); let one = ValueId(2);
+        assert!(evaluate(Ty::I32,Op::Int(IntOp::Shl,a,b),&types,&facts)==Fact::Dynamic);
+        assert!(evaluate(Ty::I32,Op::Int(IntOp::AShr,a,one),&types,&facts)==Fact::Constant(0xc000_0000));
+        assert!(evaluate(Ty::I64,Op::Convert(Cvt::SExt,Ty::I64,a),&types,&facts)==Fact::Constant(0xffff_ffff_8000_0001));
+        assert!(evaluate(Ty::I32,Op::Int(IntOp::Add,a,a),&types,&facts)==Fact::Constant(2));
+    }
+}

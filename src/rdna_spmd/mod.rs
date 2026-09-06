@@ -84,6 +84,8 @@
 mod barrier;
 
 mod active;
+mod analysis;
+mod passes;
 mod cooperative;
 mod coop_xlane;
 mod dispatch;
@@ -96,17 +98,20 @@ mod compiler;
 mod scalar_plan;
 mod lift;
 mod typed_codegen;
+mod native_state;
+mod jit;
+mod dialect;
 mod load_cluster;
 mod boundary;
 mod packet_plan;
 mod sqrt_idiom;
 mod mathcombine;
 mod regtype;
-mod runtime;
 mod segmented;
 mod structured;
 mod vec_live;
 mod wmma;
+mod yield_values;
 
 pub mod fiber;
 

@@ -121,7 +121,7 @@ impl EffectOp {
                 WaveOp::ReadLane => (vec![I32, I32], vec![I32]),
                 WaveOp::WriteLane => (vec![I32, I32, I32], vec![I32]),
                 WaveOp::Bpermute | WaveOp::BpermuteFi => (vec![I32, I32, I1], vec![I32]),
-                WaveOp::Wmma => (vec![I32; 16], vec![I32; 8]),
+                WaveOp::Wmma => ([vec![I32; 8], vec![F32; 8]].concat(), vec![F32; 8]),
             },
             Self::BarrierSignal { is_first } => {
                 (vec![I32], if is_first { vec![I1] } else { vec![] })

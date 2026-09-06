@@ -89,11 +89,11 @@ impl Cg {
                     llvm::core::LLVMBuildTrunc(self.b, data(k), elem, self.n())
                 };
                 let p = self.ptr_at(
-                    self.store_addr(self.b_add(addr, self.ci64(k as u64 * 4))),
+                    self.store_addr(self.b_add(addr, self.ci64(m.word_offset(k) as u64))),
                     0,
                 );
                 let store = llvm::core::LLVMBuildStore(self.b, value, p);
-                llvm::core::LLVMSetAlignment(store, m.size().bytes());
+                llvm::core::LLVMSetAlignment(store, if m.space() == Space::Lds { 1 } else { m.size().bytes() });
                 llvm::core::LLVMSetVolatile(store, m.semantics.volatile as i32);
             }
             return;
@@ -107,7 +107,7 @@ impl Cg {
                 let value = llvm::core::LLVMBuildLoad2(
                     self.b,
                     self.f64t,
-                    self.ptr_at(load_addr, k as u64 * 4),
+                    self.ptr_at(load_addr, m.word_offset(k) as u64),
                     self.n(),
                 );
                 llvm::core::LLVMSetAlignment(value, 4);
@@ -117,10 +117,10 @@ impl Cg {
                 let load = llvm::core::LLVMBuildLoad2(
                     self.b,
                     elem,
-                    self.ptr_at(load_addr, k as u64 * 4),
+                    self.ptr_at(load_addr, m.word_offset(k) as u64),
                     self.n(),
                 );
-                llvm::core::LLVMSetAlignment(load, m.size().bytes());
+                llvm::core::LLVMSetAlignment(load, if m.space() == Space::Lds || m.size() != MemSize::B32 { 1 } else { 4 });
                 llvm::core::LLVMSetVolatile(load, m.semantics.volatile as i32);
                 let value = if m.size() == MemSize::B32 {
                     load

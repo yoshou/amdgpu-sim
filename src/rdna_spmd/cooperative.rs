@@ -1,13 +1,9 @@
 //! Workgroup-cooperative dispatch for kernels with shared LDS + barriers.
 //!
-//! Unlike [`dispatch_parallel`](super::dispatch::dispatch_parallel), which runs
-//! every work-item independently to completion, a cooperative kernel
-//! synchronizes its work-items at `s_barrier` and communicates through shared
-//! LDS. This scheduler mirrors the masked-vector reference
-//! ([`RDNAProcessor`](crate::rdna_processor)): each work-item is a resumable
-//! coroutine ([`CoopKernel`] yields at each barrier, returning its resume pc),
-//! and one host thread drives a whole workgroup round-robin, advancing every
-//! work-item one *barrier generation* per pass over shared, zeroed LDS.
+//! Scalar and packet native code share a fiber ABI and the same scheduler.
+//! Each worker owns complete workgroups, including zeroed LDS and barrier
+//! rounds. Native SSA values survive suspension; only effect operands/results
+//! are exchanged with the scheduler.
 //!
 //! Signal and wait are separate typed effects. Barrier rounds count waves;
 //! signal-is-first reports the first wave in that round. The driver validates
@@ -18,10 +14,9 @@ use std::thread;
 use crate::processor::KernelDescriptor;
 
 use super::dispatch::{setup_sgprs, GridDims};
-use super::emit::{CoopKernel, COOP_DONE, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
+use super::emit::{CoopKernel, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 
 const EXEC: usize = 126;
-const SCC: usize = 128; // reserved sgprs slot for persisted SCC (see emit.rs)
 
 /// Run a cooperative kernel over the whole grid across `num_threads` CPU threads.
 /// Each workgroup runs entirely on one thread with its own zeroed LDS buffer of
@@ -36,142 +31,8 @@ pub fn dispatch_cooperative(
     group_segment_size: usize,
     num_threads: usize,
 ) {
-    let num_threads = num_threads.max(1);
-
-    let wg_size = dims.workgroup_size() as usize;
-    let storage_size=wg_size.div_ceil(32)*32;
-    let num_wg = (dims.num_wg_x * dims.num_wg_y * dims.num_wg_z) as u64;
-    let num_vgprs = kernel.num_vgprs.max(1);
-    let scratch_u64 = (private_segment_size as usize / 8) + 2;
-    // The kernel descriptor often reports 0 here (LDS rounded/allocated
-    // dynamically), so — like the vector RDNAProcessor, which allocates a fixed
-    // 128 KiB LDS regardless — fall back to that size.
-    let lds_bytes = group_segment_size.max(128 * 1024);
-    let entry_pc = kernel.entry_pc as u64;
-
-    thread::scope(|scope| {
-        for tid in 0..num_threads {
-            let kernel = &kernel;
-            let kd = &kd;
-            let dims = dims;
-            scope.spawn(move || {
-                // Per-work-item register/scratch state, reused across the
-                // workgroups this thread owns.
-                let mut sgprs: Vec<[u32; COOP_SGPR_BUF]> = vec![[0u32; COOP_SGPR_BUF]; storage_size];
-                // Dedicated per-work-item lane-spill buffer (NOT architectural
-                // registers) for the uniform writelane/readlane idiom; must
-                // persist across barrier yields.
-                let mut spill: Vec<[u32; COOP_SPILL_SLOTS]> = vec![[0u32; COOP_SPILL_SLOTS]; storage_size];
-                let mut vgprs: Vec<Vec<u32>> = vec![vec![0u32; num_vgprs]; storage_size];
-                let scratch: Vec<Vec<u64>> = vec![vec![0u64; scratch_u64]; storage_size];
-                let mut resume: Vec<u64> = vec![0; storage_size];
-                let mut done: Vec<bool> = vec![false; storage_size];
-                let mut lds: Vec<u8> = vec![0u8; lds_bytes];
-
-                let mut wg = tid as u64;
-                while wg < num_wg {
-                    let wg_id = (
-                        (wg % dims.num_wg_x as u64) as u32,
-                        ((wg / dims.num_wg_x as u64) % dims.num_wg_y as u64) as u32,
-                        ((wg / (dims.num_wg_x as u64 * dims.num_wg_y as u64)) % dims.num_wg_z as u64) as u32,
-                    );
-
-                    // Zero shared LDS for this workgroup.
-                    for b in lds.iter_mut() {
-                        *b = 0;
-                    }
-                    let lds_base = lds.as_mut_ptr() as u64;
-
-                    // Initialize every work-item's state.
-                    for wi in 0..wg_size {
-                        let scratch_base = scratch[wi].as_ptr() as u64;
-                        let s = setup_sgprs(
-                            kd,
-                            kernarg_ptr,
-                            aql_packet_addr,
-                            scratch_base,
-                            private_segment_size,
-                            wg_id,
-                        );
-                        sgprs[wi][..128].copy_from_slice(&s);
-                        sgprs[wi][EXEC] = 1; // single active lane
-                        sgprs[wi][SCC] = 0;
-                        // Fresh lane-spill buffer per workgroup so a reused
-                        // thread's prior workgroup does not leak spilled values.
-                        spill[wi] = [0u32; COOP_SPILL_SLOTS];
-
-                        // Local work-item id (x,y,z) packed into VGPR0.
-                        let lx = (wi as u32) % dims.wg_x;
-                        let ly = ((wi as u32) / dims.wg_x) % dims.wg_y;
-                        let lz = (wi as u32) / (dims.wg_x * dims.wg_y);
-                        for v in vgprs[wi].iter_mut() {
-                            *v = 0;
-                        }
-                        vgprs[wi][0] = lx | (ly << 10) | (lz << 20);
-
-                        resume[wi] = entry_pc;
-                        done[wi] = false;
-                    }
-
-                    let waves=wg_size.div_ceil(32);
-                    let mut barriers=super::barrier::Barriers::new(waves);
-                    let mut waiting=vec![None;waves];
-                    let mut passes=0;
-                    loop {
-                        let mut progress=false;
-                        let mut live=false;
-                        for wave in 0..waves {
-                            let range=wave*32..((wave+1)*32).min(wg_size);
-                            if range.clone().all(|wi|done[wi]){continue;}
-                            live=true;
-                            if let Some(id)=waiting[wave]{
-                                if !barriers.wait(wave,id){continue;}
-                                waiting[wave]=None;
-                            }
-                            progress=true;
-                            let mut boundary=None;
-                            for wi in range.clone(){
-                                assert!(!done[wi],"nonuniform wave termination at barrier");
-                                let r=unsafe{kernel.run(sgprs[wi].as_mut_ptr(),vgprs[wi].as_mut_ptr(),scratch[wi].as_ptr()as u64,lds_base,spill[wi].as_mut_ptr(),resume[wi])};
-                                if let Some(pc)=boundary{assert_eq!(pc,r,"nonuniform wave yield");}else{boundary=Some(r);}
-                                done[wi]=r==COOP_DONE;resume[wi]=r;
-                            }
-                            let pc=boundary.unwrap();if pc==COOP_DONE{continue;}
-                            let action=kernel.yields.get(&(pc as usize)).expect("yield lacks typed synchronization effect");
-                            if action.is_wave(){
-                                let count=range.len();let valid=if count==32{u32::MAX}else{(1u32<<count)-1};
-                                super::coop_xlane::apply_xlane(action,valid,&mut sgprs[wave*32..(wave+1)*32],&mut vgprs[wave*32..(wave+1)*32]);
-                                continue;
-                            }
-                            let read=|wi:usize,s:&crate::rdna_instructions::SourceOperand|match s{
-                                crate::rdna_instructions::SourceOperand::ScalarRegister(r)=>sgprs[wi][*r as usize],
-                                crate::rdna_instructions::SourceOperand::LiteralConstant(v)=>*v,
-                                crate::rdna_instructions::SourceOperand::IntegerConstant(v)=>*v as u32,
-                                _=>panic!("barrier ID must be uniform scalar"),
-                            };
-                            let raw_id=action.inputs[0].eval(range.start,&read,&|wi|sgprs[wi][EXEC]&1!=0);
-                            let id=raw_id & 31;
-                            for wi in range.clone(){assert_eq!(raw_id,action.inputs[0].eval(wi,&read,&|wi|sgprs[wi][EXEC]&1!=0),"nonuniform barrier ID");}
-                            use super::ir::typed::effect::EffectOp;
-                            match action.op{
-                                EffectOp::BarrierSignal{is_first}=>{
-                                    let first=barriers.signal(wave,id);
-                                    if is_first{for wi in range{sgprs[wi][SCC]=first as u32;}}
-                                },
-                                EffectOp::BarrierWait=>{waiting[wave]=Some(id);},
-                                _=>panic!("wave operation must be scheduled by the wave driver"),
-                            }
-                        }
-                        if !live{break;}
-                        assert!(progress,"workgroup barrier deadlock");
-                        passes+=1;assert!(passes<100_000,"cooperative dispatch did not converge");
-                    }
-
-                    wg += num_threads as u64;
-                }
-            });
-        }
-    });
+    dispatch_cooperative_vec(kernel, kd, kernarg_ptr, aql_packet_addr, dims,
+        private_segment_size, group_segment_size, num_threads);
 }
 
 /// The existing packet fiber ABI extended with workgroup LDS and typed barrier
@@ -189,29 +50,31 @@ pub fn dispatch_cooperative_vec(
 ) {
     use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
     use super::ir::typed::effect::EffectOp;
-    use crate::rdna_instructions::SourceOperand;
     let width = kernel.width as usize;
     let ppw = 32 / width;
     let wg_size = dims.workgroup_size() as usize;
     let waves = wg_size.div_ceil(32);
     let packets = waves * ppw;
     let num_wg = dims.num_wg_x as u64 * dims.num_wg_y as u64 * dims.num_wg_z as u64;
-    let threads = num_threads.max(1);
-    let stride = ((private_segment_size as usize + 15) & !15)
-        .max(16)
-        .max(kernel.min_private_bytes.div_ceil(16) * 16);
+    if num_wg == 0 { return; }
+    // Each worker owns whole workgroups. Do not allocate LDS and suspended
+    // stacks for workers to which no workgroup can be assigned.
+    let threads = num_threads.max(1).min(num_wg as usize);
+    let stride = (private_segment_size as usize).max(kernel.min_private_bytes).div_ceil(16) * 16;
     thread::scope(|scope| {
         for tid in 0..threads {
             scope.spawn(move || {
                 let mut sgprs = vec![[0u32; COOP_SGPR_BUF]; packets];
                 let mut vgprs = vec![vec![0u32; kernel.num_vgprs * width]; packets];
                 let mut spill = vec![vec![0u32; COOP_SPILL_SLOTS]; packets];
-                let mut fibers: Vec<_> = (0..packets).map(|_| Fiber::new(32 << 10)).collect();
+                let mut fibers = Fiber::batch(packets, 32 << 10);
                 let mut scratch =
                     aligned_vec::AVec::<u8, aligned_vec::ConstAlign<0x1_0000_0000>>::new(
                         0x1_0000_0000,
                     );
                 scratch.resize(waves * 32 * stride, 0);
+                // Existing code objects can declare zero fixed LDS while using
+                // the processor's dynamic 128 KiB aperture.
                 let mut lds = vec![0u8; group_segment_size.max(128 * 1024)];
                 let mut wg = tid as u64;
                 while wg < num_wg {
@@ -233,7 +96,7 @@ pub fn dispatch_cooperative_vec(
                         vgprs[p].fill(0);
                         spill[p].fill(0);
                         let wave = p / ppw;
-                        let sb = unsafe { scratch.as_ptr().add(wave * 32 * stride) } as u64;
+                        let sb = if stride == 0 { 0 } else { (unsafe { scratch.as_ptr().add(wave * 32 * stride) }) as u64 };
                         sgprs[p][..128].copy_from_slice(&setup_sgprs(
                             kd,
                             kernarg_ptr,
@@ -310,45 +173,15 @@ pub fn dispatch_cooperative_vec(
                                 } else {
                                     (1u32 << count) - 1
                                 };
-                                super::coop_xlane::apply_xlane_packets(
-                                    action,
-                                    width,
-                                    valid,
-                                    &mut sgprs[range.clone()],
-                                    &mut vgprs[range],
-                                );
+                                action.apply_wave(width, valid, &fibers[range]);
                             } else {
-                                let read = |lane: usize, s: &SourceOperand| match s {
-                                    SourceOperand::ScalarRegister(r) => {
-                                        sgprs[range.start + lane / width][*r as usize]
-                                    }
-                                    SourceOperand::IntegerConstant(v) => *v as u32,
-                                    SourceOperand::LiteralConstant(v) => *v,
-                                    _ => panic!("barrier ID must be scalar"),
-                                };
-                                let raw_id = action.inputs[0].eval(0, &read, &|_| true);
-                                let id = raw_id & 31;
-                                for p in range.clone() {
-                                    if p * width < wg_size {
-                                        assert_eq!(
-                                            raw_id,
-                                            action.inputs[0].eval(
-                                                (p - range.start) * width,
-                                                &read,
-                                                &|_| true
-                                            ),
-                                            "nonuniform barrier ID"
-                                        );
-                                    }
-                                }
+                                let count = wg_size.saturating_sub(wave * 32).min(32);
+                                let valid = if count == 32 { u32::MAX } else { (1u32 << count) - 1 };
+                                let id = action.uniform_id(width, valid, &fibers[range.clone()]) & 31;
                                 match action.op {
                                     EffectOp::BarrierSignal { is_first } => {
                                         let first = barriers.signal(wave, id);
-                                        if is_first {
-                                            for p in range {
-                                                sgprs[p][SCC] = first as u32;
-                                            }
-                                        }
+                                        if is_first { action.broadcast_result(width, valid, &fibers[range], first as u32); }
                                     }
                                     EffectOp::BarrierWait => waiting[wave] = Some(id),
                                     _ => unreachable!(),

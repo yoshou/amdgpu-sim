@@ -28,6 +28,7 @@ fn is_f64_op(op: I) -> bool {
 
 /// VGPR registers read by an instruction (source operands), at correct width.
 fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
+    if let Some((reads, _)) = super::lift::half::registers(inst) { return reads; }
     let mut r = Vec::new();
     match inst {
         InstFormat::VOP1(i) => {

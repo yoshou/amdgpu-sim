@@ -4,7 +4,7 @@
 //! The interpreted apply in [`super::coop_xlane`] makes three passes over the
 //! wave: gather the fragments into row-major matrices, multiply, scatter the
 //! result back. This module fuses them into one function per packet width,
-//! compiled once, reading and writing the packet register arrays directly. The
+//! compiled once, reading and writing typed effect frames directly. The
 //! fragment layout's swizzle becomes constant shuffle masks, so no matrix is
 //! materialized and no address arithmetic survives to run time.
 //!
@@ -24,17 +24,18 @@ use std::sync::OnceLock;
 
 use llvm_sys as llvm;
 
-/// `void apply(u32 **packets, u32 vdst, u32 a, u32 b, u32 c)`.
-type ApplyFn = unsafe extern "C" fn(*const *mut u32, u32, u32, u32, u32);
+/// Dense effect frames: A at 0, B at 4, C/results at 8. No ISA registers
+/// cross the wave/native boundary.
+type ApplyFn = unsafe extern "C" fn(*const *mut u32);
 
 /// One compiled function per supported width, indexed by `log2(width)`.
-static APPLY: [OnceLock<u64>; 5] =
+static APPLY: [OnceLock<super::jit::NativeCode>; 5] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
 
 fn apply_fn(width: usize) -> ApplyFn {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", width);
-    let addr =
-        *APPLY[width.trailing_zeros() as usize].get_or_init(|| unsafe { compile(width as u32) });
+    let addr = APPLY[width.trailing_zeros() as usize]
+        .get_or_init(|| unsafe { compile(width as u32) }).address();
     unsafe { std::mem::transmute::<u64, ApplyFn>(addr) }
 }
 
@@ -44,16 +45,30 @@ pub(super) fn warm(width: usize) {
     let _ = apply_fn(width);
 }
 
+/// Dense SSA frames hold A[0..4], B[4..8], C[8..16]. Results replace C
+/// after the native kernel has captured all inputs, including aliased ones.
+pub(super) unsafe fn apply_values(width: usize, packets: *const *mut u32) {
+    apply_fn(width)(packets);
+}
+
 /// Apply the op to a wave held as `32 / width` packets in register-major SoA
 /// layout (`vgprs[packet][reg * width + lane]`). WMMA ignores EXEC, so every
 /// lane is read and written.
+#[cfg(test)]
 pub(super) fn apply(vdst: u32, a: u32, b: u32, c: u32, width: usize, vgprs: &mut [Vec<u32>]) {
     assert_eq!(vgprs.len(), 32 / width, "a wave is 32 lanes");
-    let mut packets = [std::ptr::null_mut::<u32>(); 32];
-    for (slot, packet) in packets.iter_mut().zip(vgprs.iter_mut()) {
-        *slot = packet.as_mut_ptr();
+    let mut frames = vec![vec![0u32; 16 * width]; vgprs.len()];
+    for (frame, registers) in frames.iter_mut().zip(vgprs.iter()) {
+        for (slot, first, count) in [(0, a, 4), (4, b, 4), (8, c, 8)] {
+            frame[slot*width..(slot+count)*width]
+                .copy_from_slice(&registers[first as usize*width..(first as usize+count)*width]);
+        }
     }
-    unsafe { apply_fn(width)(packets.as_ptr(), vdst, a, b, c) }
+    let pointers: Vec<_> = frames.iter_mut().map(|frame| frame.as_mut_ptr()).collect();
+    unsafe { apply_values(width, pointers.as_ptr()); }
+    for (frame, registers) in frames.iter().zip(vgprs.iter_mut()) {
+        registers[vdst as usize*width..(vdst as usize+8)*width].copy_from_slice(&frame[8*width..]);
+    }
 }
 
 /// Build the width-`w` function.
@@ -63,19 +78,16 @@ pub(super) fn apply(vdst: u32, a: u32, b: u32, c: u32, width: usize, vgprs: &mut
 /// `col = e + (e / 4) * 4 + (l / 16) * 4`; B uses the same formula transposed;
 /// accumulator register `c + m` holds `C[m + 8 * (l / 16)][l % 16]`, and D is
 /// written in the same shape.
-unsafe fn compile(w: u32) -> u64 {
+unsafe fn compile(w: u32) -> super::jit::NativeCode {
     use llvm::core::*;
 
-    llvm::target::LLVM_InitializeNativeTarget();
-    llvm::target::LLVM_InitializeNativeAsmParser();
-    llvm::target::LLVM_InitializeNativeAsmPrinter();
-
-    let ctx = LLVMContextCreate();
-    // The symbol a profiler or debugger will show; each width is its own
-    // function, so name the width in it.
-    let symbol = std::ffi::CString::new(format!("wmma_apply_w{w}")).unwrap();
-    let module = LLVMModuleCreateWithNameInContext(symbol.as_ptr(), ctx);
-    let b = LLVMCreateBuilderInContext(ctx);
+    // Keep width-specific symbols visible to native profilers.
+    let name = format!("wmma_apply_w{w}");
+    let symbol = std::ffi::CString::new(name.as_str()).unwrap();
+    let native = super::jit::Module::new(&name);
+    let ctx = native.ctx;
+    let module = native.module;
+    let b = native.builder;
     let anon = b"\0".as_ptr() as *const _;
 
     let i16t = LLVMInt16TypeInContext(ctx);
@@ -90,8 +102,8 @@ unsafe fn compile(w: u32) -> u64 {
     let wave_f16 = LLVMVectorType(f16t, 32);
     let wave_f32 = LLVMVectorType(f32t, 32);
 
-    let mut params = [ptr, i32t, i32t, i32t, i32t];
-    let fty = LLVMFunctionType(void, params.as_mut_ptr(), 5, 0);
+    let mut params = [ptr];
+    let fty = LLVMFunctionType(void, params.as_mut_ptr(), 1, 0);
     let func = LLVMAddFunction(module, symbol.as_ptr(), fty);
     LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, func, anon));
 
@@ -103,8 +115,8 @@ unsafe fn compile(w: u32) -> u64 {
             LLVMBuildLoad2(b, ptr, gep, anon)
         })
         .collect();
-    // Argument `n` (a register number) offset by `k`.
-    let reg_of = |n: u32, k: u32| LLVMBuildAdd(b, LLVMGetParam(func, n), konst(k), anon);
+    // Typed frame slot offset by fragment word, fixed before native emission.
+    let reg_of = |n: u32, k: u32| konst(n + k);
 
     // One register across the whole wave as <32 x i32>: each packet holds its
     // W lanes contiguously at `packet + reg * W`, and packet order is lane
@@ -153,10 +165,10 @@ unsafe fn compile(w: u32) -> u64 {
     };
     // Read every operand before the first store: `vdst` and `c` are the same
     // registers in rocwmma's accumulate loop.
-    let a_frag = fragments(2);
-    let b_frag = fragments(3);
+    let a_frag = fragments(0);
+    let b_frag = fragments(4);
     let mut acc: Vec<llvm::prelude::LLVMValueRef> = (0..8u32)
-        .map(|m| LLVMBuildBitCast(b, load_reg(reg_of(4, m)), wave_f32, anon))
+        .map(|m| LLVMBuildBitCast(b, load_reg(reg_of(8, m)), wave_f32, anon))
         .collect();
 
     // Gather a value held by another lane: `pick(v, f)` puts lane `f(l)`'s
@@ -185,7 +197,7 @@ unsafe fn compile(w: u32) -> u64 {
 
     for m in 0..8u32 {
         let value = LLVMBuildBitCast(b, acc[m as usize], wave_i32, anon);
-        let offset = LLVMBuildMul(b, reg_of(1, m), konst(w), anon);
+        let offset = LLVMBuildMul(b, reg_of(8, m), konst(w), anon);
         for (p, &packet) in packets.iter().enumerate() {
             let mut mask: Vec<_> = (0..w).map(|lane| konst(p as u32 * w + lane)).collect();
             let mask = LLVMConstVector(mask.as_mut_ptr(), w);
@@ -195,65 +207,5 @@ unsafe fn compile(w: u32) -> u64 {
         }
     }
     LLVMBuildRetVoid(b);
-    LLVMDisposeBuilder(b);
-
-    jit(module, &symbol)
-}
-
-/// Verify, optimize, and JIT `module`; returns the address of `symbol`.
-unsafe fn jit(module: llvm::prelude::LLVMModuleRef, symbol: &std::ffi::CStr) -> u64 {
-    let mut error = std::ptr::null_mut();
-    if llvm::analysis::LLVMVerifyModule(
-        module,
-        llvm::analysis::LLVMVerifierFailureAction::LLVMPrintMessageAction,
-        &mut error,
-    ) != 0
-    {
-        let message = std::ffi::CStr::from_ptr(error).to_string_lossy().into_owned();
-        panic!("wmma: module failed verification:\n{}", message);
-    }
-
-    let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
-    let mut target = std::ptr::null_mut();
-    let mut target_error = std::ptr::null_mut();
-    llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut target_error);
-    let machine = llvm::target_machine::LLVMCreateTargetMachine(
-        target,
-        triple,
-        llvm::target_machine::LLVMGetHostCPUName(),
-        llvm::target_machine::LLVMGetHostCPUFeatures(),
-        llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-        llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-        llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
-    );
-    let options = llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
-    let passes = std::ffi::CString::new("default<O3>").unwrap();
-    let failure =
-        llvm::transforms::pass_builder::LLVMRunPasses(module, passes.as_ptr(), machine, options);
-    if !failure.is_null() {
-        let message = llvm::error::LLVMGetErrorMessage(failure);
-        let message = std::ffi::CStr::from_ptr(message).to_string_lossy().into_owned();
-        panic!("wmma: optimization failed: {}", message);
-    }
-
-    let builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
-    let target_builder = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(machine);
-    llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(builder, target_builder);
-    let mut lljit = std::ptr::null_mut();
-    if !llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut lljit, builder).is_null() {
-        panic!("wmma: creating the JIT failed");
-    }
-    let thread_safe = llvm::orc2::LLVMOrcCreateNewThreadSafeContext();
-    let thread_safe_module = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(module, thread_safe);
-    let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(lljit);
-    if !llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(lljit, dylib, thread_safe_module).is_null() {
-        panic!("wmma: adding the module failed");
-    }
-    let mut address = 0u64;
-    if !llvm::orc2::lljit::LLVMOrcLLJITLookup(lljit, &mut address, symbol.as_ptr()).is_null() {
-        panic!("wmma: symbol lookup failed: {}", symbol.to_string_lossy());
-    }
-    // The compiled code outlives this call; keep the JIT alive with it.
-    std::mem::forget(Box::new(lljit));
-    address
+    native.optimize(super::jit::Mode::Packet).compile(&name)
 }

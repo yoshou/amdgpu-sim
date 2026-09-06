@@ -61,11 +61,6 @@ pub(crate) enum FloatOp {
 pub(crate) enum FloatUnary {
     Neg,
     Abs,
-    Sqrt,
-    Floor,
-    Ceil,
-    Trunc,
-    RoundEven,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Complete predicate set, including forms not used by current ISA input.
@@ -101,8 +96,21 @@ pub(crate) enum Cvt {
     Bitcast,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Env { LaneId }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
+    Env(Env),
     Int(IntOp, ValueId, ValueId),
+    /// Integer width for zero, otherwise the number of trailing zero bits.
+    TrailingZeros(ValueId),
+    /// Integer width for zero, otherwise the number of leading zero bits.
+    LeadingZeros(ValueId),
+    PopulationCount(ValueId),
+    ReverseBits(ValueId),
+    Pack64(ValueId, ValueId),
+    UnpackLo(ValueId),
+    UnpackHi(ValueId),
     Cmp(IntPred, ValueId, ValueId),
     Float(FloatOp, ValueId, ValueId),
     Unary(FloatUnary, ValueId),
@@ -119,6 +127,13 @@ impl Op {
     pub fn map(self, mut f: impl FnMut(ValueId) -> ValueId) -> Self {
         match self {
             Self::Int(o, a, b) => Self::Int(o, f(a), f(b)),
+            Self::TrailingZeros(a) => Self::TrailingZeros(f(a)),
+            Self::LeadingZeros(a) => Self::LeadingZeros(f(a)),
+            Self::PopulationCount(a) => Self::PopulationCount(f(a)),
+            Self::ReverseBits(a) => Self::ReverseBits(f(a)),
+            Self::Pack64(a, b) => Self::Pack64(f(a), f(b)),
+            Self::UnpackLo(a) => Self::UnpackLo(f(a)),
+            Self::UnpackHi(a) => Self::UnpackHi(f(a)),
             Self::Cmp(o, a, b) => Self::Cmp(o, f(a), f(b)),
             Self::Float(o, a, b) => Self::Float(o, f(a), f(b)),
             Self::FCmp(o, a, b) => Self::FCmp(o, f(a), f(b)),
@@ -127,7 +142,7 @@ impl Op {
             Self::Fma(a, b, c) => Self::Fma(f(a), f(b), f(c)),
             Self::MulAdd(a, b, c) => Self::MulAdd(f(a), f(b), f(c)),
             Self::Select(a, b, c) => Self::Select(f(a), f(b), f(c)),
-            Self::Const(..) => self,
+            Self::Const(..) | Self::Env(..) => self,
         }
     }
     pub fn result_type(self, types: &[Ty]) -> Result<Ty, &'static str> {
@@ -146,6 +161,20 @@ impl Op {
             }
         };
         match self {
+            Self::Env(Env::LaneId) => Ok(Ty::I32),
+            Self::Pack64(a, b) => {
+                if pair(a, b)? != Ty::I32 { return Err("pack64 requires two i32 words"); }
+                Ok(Ty::I64)
+            }
+            Self::UnpackLo(a) | Self::UnpackHi(a) => {
+                if ty(a)? != Ty::I64 { return Err("unpack requires i64"); }
+                Ok(Ty::I32)
+            }
+            Self::TrailingZeros(a) | Self::LeadingZeros(a) | Self::PopulationCount(a) | Self::ReverseBits(a) => {
+                let t = ty(a)?;
+                if !matches!(t, Ty::I32 | Ty::I64) { return Err("bit count requires an integer word"); }
+                Ok(t)
+            }
             Self::Int(op, a, b) => {
                 let t = pair(a, b)?;
                 if !t.integer()
@@ -229,20 +258,42 @@ impl Op {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Expr {
     pub params: Vec<Ty>,
-    pub insts: Vec<(Ty, Op)>,
-    pub result: ValueId,
+    pub insts: Vec<ExprInst>,
+    pub results: Vec<ValueId>,
 }
 pub(crate) struct VerifiedExpr(Expr);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExprInst {
+    Core(Ty, Op),
+    Target { op: crate::rdna_spmd::dialect::TargetOp,
+        args: crate::rdna_spmd::dialect::Arguments, outputs: Vec<Ty> },
+}
+impl From<(Ty, Op)> for ExprInst { fn from((ty, op): (Ty, Op)) -> Self { Self::Core(ty, op) } }
+impl ExprInst {
+    pub fn result_types(&self) -> &[Ty] {
+        match self { Self::Core(ty, _) => std::slice::from_ref(ty), Self::Target { outputs, .. } => outputs }
+    }
+}
 impl Expr {
-    pub fn verify(self) -> Result<VerifiedExpr, &'static str> {
+    #[cfg(test)]
+    pub fn verify(self) -> Result<VerifiedExpr, &'static str> { self.verify_with(&crate::rdna_spmd::dialect::DialectRegistry::rdna4()) }
+    pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedExpr, &'static str> {
         let mut types = self.params.clone();
-        for &(declared, op) in &self.insts {
-            if op.result_type(&types)? != declared {
-                return Err("result type mismatch");
+        let mut constants = std::collections::BTreeMap::new();
+        for inst in &self.insts {
+            match inst {
+                ExprInst::Core(declared, op) => {
+                    if op.result_type(&types)? != *declared { return Err("result type mismatch"); }
+                    if let Op::Const(_, bits) = op { constants.insert(ValueId(types.len()), *bits); }
+                },
+                ExprInst::Target { op, args, outputs } => {
+                    if registry.result_types(*op, *args, &types)? != outputs { return Err("target result type mismatch"); }
+                    registry.operation(*op)?.verify_immediates(*args, |v| constants.get(&v).copied())?;
+                },
             }
-            types.push(declared);
+            types.extend_from_slice(inst.result_types());
         }
-        if self.result.0 >= types.len() {
+        if self.results.iter().any(|v| v.0 >= types.len()) {
             return Err("undefined result");
         }
         Ok(VerifiedExpr(self))
@@ -266,10 +317,10 @@ mod tests {
         Expr {
             params: vec![Ty::I32, Ty::I32],
             insts: vec![
-                (Ty::I1, Op::Cmp(IntPred::Ult, ValueId(0), ValueId(1))),
-                (Ty::I32, Op::Select(ValueId(2), ValueId(0), ValueId(1))),
+                ExprInst::Core(Ty::I1, Op::Cmp(IntPred::Ult, ValueId(0), ValueId(1))),
+                ExprInst::Core(Ty::I32, Op::Select(ValueId(2), ValueId(0), ValueId(1))),
             ],
-            result: ValueId(3),
+            results: vec![ValueId(3)],
         }
         .verify()
         .unwrap();
@@ -280,8 +331,8 @@ mod tests {
         for value in [1, 2, 99] {
             assert!(Expr {
                 params: vec![Ty::I32],
-                insts: vec![(Ty::I32, Op::Int(IntOp::Add, ValueId(0), ValueId(value))),],
-                result: ValueId(1)
+                insts: vec![ExprInst::Core(Ty::I32, Op::Int(IntOp::Add, ValueId(0), ValueId(value)))],
+                results: vec![ValueId(1)]
             }
             .verify()
             .is_err());
@@ -289,7 +340,7 @@ mod tests {
         assert!(Expr {
             params: vec![],
             insts: vec![],
-            result: ValueId(0)
+            results: vec![ValueId(0)]
         }
         .verify()
         .is_err());
@@ -306,8 +357,8 @@ mod tests {
         ] {
             assert!(Expr {
                 params: vec![Ty::I32, Ty::I1],
-                insts: vec![(ty, op)],
-                result: ValueId(2)
+                insts: vec![ExprInst::Core(ty, op)],
+                results: vec![ValueId(2)]
             }
             .verify()
             .is_err());

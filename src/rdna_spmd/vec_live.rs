@@ -39,7 +39,9 @@ fn src_vgpr(op: &SourceOperand, out: &mut Vec<u32>) {
 
 /// All VGPRs an instruction may read (over-approximated upward — never under).
 pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
+    if let Some((reads, _)) = super::lift::half::registers(inst) { return reads; }
     if let Some(memory)=super::lift::memory::instruction(inst){return memory.reads();}
+    if let Some(wave)=super::lift::wave::instruction(inst){return wave.io().reads.vgprs().collect();}
     let mut r = Vec::new();
     match inst {
         InstFormat::VOP1(i) => src_vgpr(&i.src0, &mut r),
@@ -73,44 +75,6 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
             r.push(i.vsrc1y as u32);
             r.push(i.vsrc1y as u32 + 1);
         }
-        InstFormat::VGLOBAL(i) => {
-            // address (may be a 64-bit VGPR pair) + store data words.
-            r.push(i.vaddr as u32);
-            r.push(i.vaddr as u32 + 1);
-            let store_words = match i.op {
-                I::GLOBAL_STORE_B8 | I::GLOBAL_STORE_B16 | I::GLOBAL_STORE_B32 => 1,
-                I::GLOBAL_STORE_B64 => 2,
-                I::GLOBAL_STORE_B96 => 3,
-                I::GLOBAL_STORE_B128 => 4,
-                _ => 0,
-            };
-            for k in 0..store_words {
-                r.push(i.vsrc as u32 + k);
-            }
-        }
-        InstFormat::VFLAT(i) => {
-            r.push(i.vaddr as u32);
-            r.push(i.vaddr as u32 + 1);
-            let store_words = match i.op {
-                I::FLAT_STORE_B8 | I::FLAT_STORE_B16 | I::FLAT_STORE_B32 => 1,
-                I::FLAT_STORE_B64 => 2,
-                I::FLAT_STORE_B96 => 3,
-                I::FLAT_STORE_B128 => 4,
-                _ => 0,
-            };
-            for k in 0..store_words { r.push(i.vsrc as u32 + k); }
-        }
-        InstFormat::VSCRATCH(i) => {
-            if i.sve != 0 { r.push(i.vaddr as u32); }
-            let store_words = match i.op {
-                I::SCRATCH_STORE_B32 => 1,
-                I::SCRATCH_STORE_B64 => 2,
-                I::SCRATCH_STORE_B96 => 3,
-                I::SCRATCH_STORE_B128 => 4,
-                _ => 0,
-            };
-            for k in 0..store_words { r.push(i.vsrc as u32 + k); }
-        }
         InstFormat::VIMAGE(i) => {
             for reg in [i.vaddr0, i.vaddr1, i.vaddr2, i.vaddr3, i.vaddr4] {
                 r.push(reg as u32);
@@ -122,10 +86,6 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
             r.push(i.vaddr0 as u32 + 1);
             r.push(i.vaddr1 as u32);
             r.push(i.vaddr1 as u32 + 1);
-        }
-        InstFormat::DS(i) => {
-            r.push(i.addr as u32);
-            if matches!(i.op, I::DS_STORE_B8) { r.push(i.data0 as u32); }
         }
         InstFormat::VOP3P(i) => {
             src_vgpr(&i.src0, &mut r);
@@ -154,6 +114,7 @@ fn push_src(r: &mut Vec<u32>, o: &SourceOperand, pair: bool) {
 }
 fn push_v(r: &mut Vec<u32>, idx: u8, pair: bool) { r.push(idx as u32); if pair { r.push(idx as u32 + 1); } }
 pub fn div_reads(inst: &InstFormat) -> Vec<u32> {
+    if let Some((reads, _)) = super::lift::half::registers(inst) { return reads; }
     let mut r = Vec::new();
     match inst {
         InstFormat::VOP1(i) => push_src(&mut r, &i.src0, op_is_pair(i.op)),

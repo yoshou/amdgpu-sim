@@ -11,7 +11,9 @@ use crate::instructions::I;
 use crate::rdna_instructions::{sext_ioffset, InstFormat, VGLOBAL};
 
 use super::boundary::BoundaryIo;
-use super::ir::{Cond, ScalarBlock, ScalarProgram, Terminator};
+use super::ir::{Cond, ScalarProgram, Terminator};
+#[cfg(test)]
+use super::ir::ScalarBlock;
 use super::load_cluster::{self, VgCluster};
 use super::regtype::RegSet;
 use super::sqrt_idiom::{self, SqrtCollapse};
@@ -34,14 +36,12 @@ pub(super) struct InstructionPlan<'a> {
     pub elide_predicate: bool,
     pub entry_exec_unchanged: bool,
     pub nonempty_exec: bool,
-    pub normal_ldexp: bool,
     pub sqrt: Option<SqrtCollapse>,
     pub global_load: GlobalLoad,
     pub action: InstructionAction,
 }
 
 pub(super) struct BlockPlan<'a> {
-    pub block: &'a ScalarBlock,
     pub instructions: Vec<InstructionPlan<'a>>,
     pub fresh: RegSet,
     pub stale: RegSet,
@@ -67,7 +67,12 @@ pub(super) struct PacketPlan<'a> {
 }
 
 impl<'a> PacketPlan<'a> {
-    pub fn new(
+    #[cfg(test)]
+    pub fn new(program: &'a ScalarProgram, width: u32, boundary: Option<&'a BTreeMap<usize, BoundaryIo>>) -> Self {
+        Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, width, boundary)
+    }
+    pub fn with_registry(
+        registry: std::sync::Arc<super::dialect::DialectRegistry>,
         program: &'a ScalarProgram,
         width: u32,
         boundary: Option<&'a BTreeMap<usize, BoundaryIo>>,
@@ -121,12 +126,19 @@ impl<'a> PacketPlan<'a> {
                 } else {
                     InstructionAction::Emit
                 };
+                let mut lowering = super::lift::instruction_with_registry(inst, &registry);
+                // The proof concerns the unmodified exponent. Value/output
+                // modifiers remain explicit SSA around the rewritten scale.
+                if normal[idx] && matches!(inst, InstFormat::VOP3(i) if (i.abs | i.neg) & 2 == 0) {
+                    if let super::lift::Lowering::TypedAlu { expr, .. } = &mut lowering {
+                        *expr = super::dialect::rdna4::fold_normal(expr, &registry);
+                    }
+                }
                 instructions.push(InstructionPlan {
-                    lowering: super::lift::instruction(inst),
+                    lowering,
                     elide_predicate: flags[idx],
                     entry_exec_unchanged,
                     nonempty_exec: nonempty[&pc][idx],
-                    normal_ldexp: normal[idx],
                     sqrt: sqrt[idx].clone(),
                     global_load: match inst {
                         InstFormat::VGLOBAL(g) => global_load(g, divergent, &frames),
@@ -147,10 +159,20 @@ impl<'a> PacketPlan<'a> {
             let fresh = fresh_in[&pc];
             // Canonical pairs have no live i32 slots to synchronize on edges.
             let stale = [fresh[0] & !f64_pairs[0], fresh[1] & !f64_pairs[1]];
-            (pc, BlockPlan { block, instructions, fresh, stale, specialize })
+            (pc, BlockPlan { instructions, fresh, stale, specialize })
         }).collect();
         let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().map(|i| &i.lowering).collect())).collect();
-        let function = super::lift::function::Function::new(program, &lowerings, boundary);
+        let mut function = super::lift::function::Function::new(registry, program, &lowerings, boundary);
+        for plan in function.blocks.values_mut().flat_map(|block| block.memory.values_mut()) {
+            use super::ir::typed::effect::{MemoryOp, Space};
+            // One ISA atomic instruction has no intervening per-lane effects.
+            // If no old value is observed, equal-address additions can be
+            // serialized consecutively and replaced by their wrapping sum.
+            // Volatile accesses and result-returning atomics retain every event.
+            plan.group_atomics = width >= 4 && plan.memory.space() == Space::Global
+                && plan.memory.op == MemoryOp::AtomicAdd && !plan.memory.returns
+                && !plan.memory.semantics.volatile;
+        }
         let mask_region = select_mask_region(program, boundary.is_some());
         Self { program, width, boundary, blocks, f64_pairs, fresh_in, mask_region, function }
     }

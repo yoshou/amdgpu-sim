@@ -13,6 +13,12 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct BlockId(pub usize);
 #[derive(Clone, Debug)]
 pub(crate) enum Inst {
+    Target {
+        provenance: Option<u64>,
+        op: crate::rdna_spmd::dialect::TargetOp,
+        args: crate::rdna_spmd::dialect::Arguments,
+        outputs: Vec<(ValueId, Ty)>,
+    },
     Effect {
         provenance: u64,
         op: EffectOp,
@@ -63,17 +69,20 @@ pub(crate) struct Func {
 }
 pub(crate) struct VerifiedFunc(Func);
 impl Func {
+    #[cfg(test)]
+    pub fn verify(self) -> Result<VerifiedFunc, &'static str> { self.verify_with(&crate::rdna_spmd::dialect::DialectRegistry::rdna4()) }
     pub fn value(&mut self, ty: Ty) -> ValueId {
         let v = ValueId(self.types.len());
         self.types.push(ty);
         v
     }
-    pub fn verify(self) -> Result<VerifiedFunc, &'static str> {
+    pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedFunc, &'static str> {
         if !self.blocks.contains_key(&self.entry) {
             return Err("missing entry");
         }
         let mut definitions = BTreeSet::new();
         let mut effects = BTreeSet::new();
+        let mut constants = BTreeMap::new();
         for block in self.blocks.values() {
             let mut local = BTreeSet::new();
             let define = |id: ValueId,
@@ -94,6 +103,20 @@ impl Func {
             }
             for inst in &block.insts {
                 match inst {
+                    Inst::Target { provenance, op, args, outputs } => {
+                        if args.values().iter().any(|v| !local.contains(v)) { return Err("non-dominating target input"); }
+                        let spec = registry.operation(*op)?;
+                        spec.verify_immediates(*args, |v| constants.get(&v).copied())?;
+                        if (spec.effect == crate::rdna_spmd::dialect::Effect::Pure) != provenance.is_none() {
+                            return Err("target effect provenance mismatch");
+                        }
+                        if let Some(id) = provenance { if !effects.insert(*id) { return Err("duplicate effect provenance"); } }
+                        let expected = registry.result_types(*op, *args, &self.types)?;
+                        if expected.len() != outputs.len() || outputs.iter().zip(expected).any(|((_, ty), expected)| ty != expected) {
+                            return Err("target result signature mismatch");
+                        }
+                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut definitions)?; }
+                    }
                     Inst::Effect { provenance, op, inputs, outputs } => {
                         if !effects.insert(*provenance) { return Err("duplicate effect provenance"); }
                         if inputs.iter().any(|v| !local.contains(v)) { return Err("non-dominating effect input"); }
@@ -113,6 +136,7 @@ impl Func {
                             return Err("incorrect core result type");
                         }
                         define(*value, *ty, &mut local, &mut definitions)?;
+                        if let Op::Const(_, bits) = op { constants.insert(*value, *bits); }
                     }
                     Inst::Boundary { inputs, outputs } => {
                         if inputs.iter().any(|v| !local.contains(v)) {

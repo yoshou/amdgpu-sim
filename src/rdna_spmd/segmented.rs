@@ -20,7 +20,32 @@ enum SegmentStep {
 }
 
 #[derive(Clone)]
-struct BoundaryOp(super::lift::wave::YieldAction, super::coop_xlane::PacketWave);
+struct BoundaryOp(super::lift::wave::YieldAction, LaneAccess);
+
+// The segmented scalar route still resolves uniform lane accesses while
+// preparing its fragments. Packet fibers use SSA value frames instead.
+#[derive(Clone)]
+enum LaneAccess {
+    ReadLane { dst: u32, value: SourceOperand, lane: SourceOperand },
+    WriteLane { dst: u32, value: SourceOperand, lane: SourceOperand },
+    General,
+}
+impl LaneAccess {
+    fn lower(action: &super::lift::wave::YieldAction) -> Self {
+        use super::lift::wave::{Operand, Destination};
+        use super::ir::typed::effect::{EffectOp, WaveOp};
+        if let [Operand::Source(value), Operand::Source(lane), ..] = action.inputs.as_slice() {
+            match (action.op, action.outputs.first()) {
+                (EffectOp::Wave(WaveOp::ReadLane), Some(Destination::Sgpr(dst))) if action.inputs[1].is_uniform() =>
+                    return Self::ReadLane { dst: *dst, value: value.clone(), lane: lane.clone() },
+                (EffectOp::Wave(WaveOp::WriteLane), Some(Destination::Vgpr(dst))) =>
+                    return Self::WriteLane { dst: *dst, value: value.clone(), lane: lane.clone() },
+                _ => {}
+            }
+        }
+        Self::General
+    }
+}
 
 pub struct SegmentedProgram {
     steps: Vec<SegmentStep>,
@@ -77,7 +102,7 @@ impl SegmentedProgram {
             // implementation handles one cross-lane operation in this case.
             match boundaries.len() {
                 0 => {
-                    let kernel = Compiler.compile_writeback(&scalar, num_vgprs);
+                    let kernel = Compiler::default().compile_writeback(&scalar, num_vgprs);
                     vec![SegmentStep::Fragment(kernel)]
                 }
                 1 => build_single_boundary_steps(&scalar, boundaries[0], num_vgprs)?,
@@ -138,7 +163,7 @@ fn build_linear_steps(body: &[InstFormat], num_vgprs: usize) -> Vec<SegmentStep>
         let mut blocks = BTreeMap::new();
         blocks.insert(0, ScalarBlock { pc: 0, body: std::mem::take(run), term: Terminator::Return });
         let program = ScalarProgram { entry_pc: 0, blocks };
-        steps.push(SegmentStep::Fragment(Compiler.compile_writeback(&program, num_vgprs)));
+        steps.push(SegmentStep::Fragment(Compiler::default().compile_writeback(&program, num_vgprs)));
     };
     for inst in body {
         if let Some(boundary) = BoundaryOp::from_inst(inst) {
@@ -223,7 +248,7 @@ fn build_single_boundary_steps(
         b.term = Terminator::Return;
     }
     let pre = ScalarProgram { entry_pc: scalar.entry_pc, blocks: pre_blocks };
-    let pre_kernel = Compiler.compile_writeback(&pre, num_vgprs);
+    let pre_kernel = Compiler::default().compile_writeback(&pre, num_vgprs);
 
     // Post-fragment: the boundary block's tail, entered only when EXEC != 0.
     let tail: Vec<InstFormat> = bblock.body[k + 1..].to_vec();
@@ -237,7 +262,7 @@ fn build_single_boundary_steps(
     post_blocks.insert(p_body, ScalarBlock { pc: p_body, body: tail, term: Terminator::Return });
     post_blocks.insert(p_ret, ScalarBlock { pc: p_ret, body: vec![], term: Terminator::Return });
     let post = ScalarProgram { entry_pc: p_entry, blocks: post_blocks };
-    let post_kernel = Compiler.compile_writeback(&post, num_vgprs);
+    let post_kernel = Compiler::default().compile_writeback(&post, num_vgprs);
 
     Ok(vec![
         SegmentStep::Fragment(pre_kernel),
@@ -402,18 +427,18 @@ fn is_lane_local_supported(inst: &InstFormat) -> bool {
 impl BoundaryOp {
     fn from_inst(inst: &InstFormat)->Option<Self>{
         super::lift::wave::instruction(inst).filter(|action|action.is_wave() && action.wmma_registers().is_none())
-            .map(|action| { let lowering=super::coop_xlane::PacketWave::lower(&action); Self(action,lowering) })
+            .map(|action| { let lowering=LaneAccess::lower(&action); Self(action,lowering) })
     }
     fn apply(&self,state:&mut WaveState)->Result<(),String>{
         let valid=if state.active_lanes==32{u32::MAX}else{(1u32<<state.active_lanes)-1};
         match &self.1 {
-            super::coop_xlane::PacketWave::ReadLane { dst, value, lane } => {
+            LaneAccess::ReadLane { dst, value, lane } => {
                 let lane=(super::coop_xlane::eval_uniform(&state.sgprs,lane)&31) as usize;
                 let value=if valid >> lane & 1 != 0 {eval_vector_u32(state,lane,value)?}else{0};
                 for s in state.sgprs.iter_mut().take(state.active_lanes) {write_sgpr(s,*dst as usize,value);}
                 return Ok(());
             }
-            super::coop_xlane::PacketWave::WriteLane { dst, value, lane } => {
+            LaneAccess::WriteLane { dst, value, lane } => {
                 let lane=(super::coop_xlane::eval_uniform(&state.sgprs,lane)&31) as usize;
                 let value=super::coop_xlane::eval_uniform(&state.sgprs,value);
                 if valid >> lane & 1 != 0 {state.vgprs[lane][*dst as usize]=value;}

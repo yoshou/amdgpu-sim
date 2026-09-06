@@ -1,10 +1,9 @@
 //! LLVM codegen: lower a [`ScalarProgram`](super::ir::ScalarProgram) to a single-work-item native
 //! function and JIT it with ORC.
 //!
-//! Register model: SGPR/VGPR/SCC are `alloca` slots initialized once from the
-//! incoming pointers at entry. Because their addresses never escape, `mem2reg`
-//! promotes them to SSA values, which is what lets LLVM optimize the body to
-//! native quality. Output leaves the kernel through `global_store` to absolute
+//! Register model: SGPR/VGPR/SCC are SSA definitions initialized from incoming
+//! pointers at entry, with explicit phis at native control-flow joins.
+//! Output leaves the kernel through `global_store` to absolute
 //! host addresses (loaded out of the kernarg buffer), so no register write-back
 //! is needed. There are no barriers in the target kernel, so the function runs
 //! to completion in one call.
@@ -18,10 +17,9 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, SOPK, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPD, VSAMPLE};
+use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, VIMAGE, VOP3};
 
 use super::scalar_plan::{ScalarMode, ScalarPlan};
-use super::ir::{Cond, Terminator};
 
 /// The SGPR number if `o` is a scalar register operand.
 fn sreg(o: &SourceOperand) -> Option<u32> {
@@ -46,16 +44,12 @@ enum MaskDef {
 const EXEC: u32 = 126;
 const VCC: u32 = 106;
 
-/// A JIT-compiled single-work-item kernel. The machine code lives for the
-/// process lifetime (the owning LLJIT is intentionally leaked), so the function
-/// pointer is safe to call from many threads concurrently with disjoint data.
+/// A JIT-compiled single-work-item kernel owning its executable memory.
+/// Concurrent calls borrow the kernel and use disjoint dispatch state.
 pub struct ScalarKernel {
-    addr: u64,
+    code: super::jit::NativeCode,
     pub num_vgprs: usize,
 }
-
-unsafe impl Send for ScalarKernel {}
-unsafe impl Sync for ScalarKernel {}
 
 impl ScalarKernel {
     /// Run one work-item. `sgprs` points to 128 u32 slots, `vgprs` to
@@ -64,25 +58,14 @@ impl ScalarKernel {
         let f = std::mem::transmute::<
             u64,
             extern "C" fn(*mut u32, *mut u32, u64),
-        >(self.addr);
+        >(self.code.address());
         f(sgprs, vgprs, scratch_base);
     }
 }
 
-/// A JIT-compiled cooperative work-item kernel: like [`ScalarKernel`] but the
-/// function yields at workgroup barriers. One call runs the work-item from
-/// `resume_pc` to the next barrier (or to `s_endpgm`), persisting registers/SCC
-/// into the caller's buffers so the next call resumes correctly.
-pub struct CoopKernel {
-    pub(crate) yields: BTreeMap<usize, super::lift::wave::YieldAction>,
-    addr: u64,
-    pub num_vgprs: usize,
-    /// pc passed as `resume_pc` on the first call (the program entry block).
-    pub entry_pc: usize,
-}
-
-unsafe impl Send for CoopKernel {}
-unsafe impl Sync for CoopKernel {}
+/// Scalar-shaped native code uses the same resumable kernel and fiber ABI as
+/// packet code. Width one describes its scheduler layout, not its LLVM shape.
+pub type CoopKernel = super::emit_vec::CoopVecKernel;
 
 /// Return sentinel meaning the work-item reached `s_endpgm`.
 pub const COOP_DONE: u64 = u64::MAX;
@@ -98,42 +81,23 @@ pub const COOP_SGPR_BUF: usize = 129;
 /// RDNA4 has registers it does not.
 pub const COOP_SPILL_SLOTS: usize = 256;
 
-impl CoopKernel {
-    /// Run one work-item from `resume_pc`. `sgprs` points to [`COOP_SGPR_BUF`]
-    /// u32 slots (128 SGPRs + SCC at index 128), `vgprs` to `num_vgprs` slots,
-    /// `lds` to the workgroup's shared LDS, and `spill` to this work-item's
-    /// [`COOP_SPILL_SLOTS`]-slot persistent lane-spill buffer. Returns the next
-    /// resume pc, or [`COOP_DONE`].
-    pub unsafe fn run(
-        &self,
-        sgprs: *mut u32,
-        vgprs: *mut u32,
-        scratch_base: u64,
-        lds_base: u64,
-        spill: *mut u32,
-        resume_pc: u64,
-    ) -> u64 {
-        let f = std::mem::transmute::<
-            u64,
-            extern "C" fn(*mut u32, *mut u32, u64, u64, *mut u32, u64) -> u64,
-        >(self.addr);
-        f(sgprs, vgprs, scratch_base, lds_base, spill, resume_pc)
-    }
-}
-
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap()
 }
 
+use super::native_state::{CellId, State};
+
 struct Cg {
+    state: std::cell::RefCell<State>,
     ctx: llvm::prelude::LLVMContextRef,
     module: llvm::prelude::LLVMModuleRef,
     b: LLVMBuilderRef,
     func: LLVMValueRef,
     scratch_base: LLVMValueRef,
-    sgpr: Vec<LLVMValueRef>, // 128 i32 allocas
-    vgpr: Vec<LLVMValueRef>, // num_vgprs i32 allocas
-    scc: LLVMValueRef,       // i1 alloca
+    yield_frame: LLVMValueRef,
+    sgpr: Vec<CellId>, // 128 i32 representations
+    vgpr: Vec<CellId>, // num_vgprs i32 representations
+    scc: CellId,       // i1
     // cached types
     i1: LLVMTypeRef,
     i8: LLVMTypeRef,
@@ -146,24 +110,24 @@ struct Cg {
     // inactive lane preserves the old value, matching the masked backend's
     // per-lane semantics. Disabled during the entry register init.
     predicate: std::cell::Cell<bool>,
-    // f64 register typing: a parallel `double` alloca per VGPR pair (low reg).
+    // f64 register typing: a parallel `double` representation per VGPR pair (low reg).
     // f64 ops read/write these directly so a double crosses blocks as one f64
-    // phi (mem2reg) instead of two i32 phis + reconstruction. `f64_fresh` is the
+    // phi instead of two i32 phis + reconstruction. `f64_fresh` is the
     // running bitmask (bit r = shadow[r] holds the current value of pair r:r+1),
     // seeded from the freshness analysis at each block entry and updated as
     // instructions emit.
-    vgpr_f64: Vec<LLVMValueRef>,
+    vgpr_f64: Vec<CellId>,
     f64_fresh: std::cell::Cell<super::regtype::RegSet>,
     // EXEC(126)/VCC(106) are architecturally lane masks, never data. For a single
-    // lane they carry one meaningful bit, so we keep them as i1 allocas and
+    // lane they carry one meaningful bit, so we keep them as i1 values and
     // convert at the i32 boundary (zext on read, trunc on write). This lets LLVM
     // fold the wavefront mask arithmetic (s_and/s_or/saveexec) down to i1 logic
     // instead of emitting 32-bit `andn/and/or` + AVX-512 `kmovd` per iteration.
-    exec_i1: LLVMValueRef,
-    vcc_i1: LLVMValueRef,
+    exec_i1: CellId,
+    vcc_i1: CellId,
     // i64 shadow per SGPR pair (low reg) — a loop-carried 64-bit base pointer
     // flows as one i64 phi instead of two i32 phis + per-iteration reconstruct.
-    sgpr_i64: Vec<LLVMValueRef>,
+    sgpr_i64: Vec<CellId>,
     sgpr_fresh: std::cell::Cell<u128>,
     // De-SIMT mask-select fusion: per-block record of SGPRs defined by an
     // EXEC/VCC-masked `and`/`and_not1`. At the matching `s_or` the pair
@@ -173,6 +137,7 @@ struct Cg {
     mask_def: std::cell::RefCell<BTreeMap<u32, MaskDef>>,
     writeback: bool,
     writeback_vgprs: usize,
+    writeback_words: super::boundary::RegSet,
     // Cooperative (workgroup-barrier) mode: the function has signature
     // `(sgprs, vgprs, scratch, lds, spill, resume_pc:i64) -> i64` and yields at
     // barriers.
@@ -224,18 +189,20 @@ impl Cg {
 
     // ---- register access -------------------------------------------------
     unsafe fn ld_sgpr32(&self, i: u32) -> LLVMValueRef {
+        if i == 124 { return self.ci32(0); }
         // EXEC/VCC live as i1; present them to integer consumers as 0/1.
         if i == EXEC {
-            let b = llvm::core::LLVMBuildLoad2(self.b, self.i1, self.exec_i1, self.n());
+            let b = self.state.borrow_mut().read(self.b, self.exec_i1);
             return llvm::core::LLVMBuildZExt(self.b, b, self.i32t, self.n());
         }
         if i == VCC {
-            let b = llvm::core::LLVMBuildLoad2(self.b, self.i1, self.vcc_i1, self.n());
+            let b = self.state.borrow_mut().read(self.b, self.vcc_i1);
             return llvm::core::LLVMBuildZExt(self.b, b, self.i32t, self.n());
         }
-        llvm::core::LLVMBuildLoad2(self.b, self.i32t, self.sgpr[i as usize], self.n())
+        self.state.borrow_mut().read(self.b, self.sgpr[i as usize])
     }
     unsafe fn st_sgpr32(&self, i: u32, v: LLVMValueRef) {
+        if i == 124 { return; }
         // Invalidate pending mask-select records: changing EXEC/VCC changes the
         // mask value, so drop all; any other write drops that register's record.
         {
@@ -246,7 +213,7 @@ impl Cg {
         if i == EXEC || i == VCC {
             let bit = llvm::core::LLVMBuildTrunc(self.b, v, self.i1, self.n());
             let slot = if i == EXEC { self.exec_i1 } else { self.vcc_i1 };
-            llvm::core::LLVMBuildStore(self.b, bit, slot);
+            self.state.borrow_mut().write(self.b, slot, bit);
             return;
         }
         // A 32-bit write clobbers the i64 shadow of pairs i (i:i+1) and i-1.
@@ -254,11 +221,11 @@ impl Cg {
         fr &= !(1u128 << (i & 127));
         if i > 0 { fr &= !(1u128 << ((i - 1) & 127)); }
         self.sgpr_fresh.set(fr);
-        llvm::core::LLVMBuildStore(self.b, v, self.sgpr[i as usize]);
+        self.state.borrow_mut().write(self.b, self.sgpr[i as usize], v);
     }
     unsafe fn pred_vgpr32(&self, i: u32, v: LLVMValueRef) -> LLVMValueRef {
         if self.predicate.get() {
-            let old = llvm::core::LLVMBuildLoad2(self.b, self.i32t, self.vgpr[i as usize], self.n());
+            let old = self.state.borrow_mut().read(self.b, self.vgpr[i as usize]);
             let active = llvm::core::LLVMBuildICmp(
                 self.b,
                 llvm::LLVMIntPredicate::LLVMIntNE,
@@ -272,13 +239,13 @@ impl Cg {
         }
     }
     unsafe fn ld_vgpr32(&self, i: u32) -> LLVMValueRef {
-        llvm::core::LLVMBuildLoad2(self.b, self.i32t, self.vgpr[i as usize], self.n())
+        self.state.borrow_mut().read(self.b, self.vgpr[i as usize])
     }
     unsafe fn st_vgpr32(&self, i: u32, v: LLVMValueRef) {
         self.f64_fresh_clr(i);
         if i > 0 { self.f64_fresh_clr(i - 1); }
         let v = self.pred_vgpr32(i, v);
-        llvm::core::LLVMBuildStore(self.b, v, self.vgpr[i as usize]);
+        self.state.borrow_mut().write(self.b, self.vgpr[i as usize], v);
     }
     /// Seed the running f64-fresh bitmask at a block boundary from the
     /// cross-block freshness analysis.
@@ -303,11 +270,11 @@ impl Cg {
         self.f64_fresh.set(s);
     }
     unsafe fn ld_scc(&self) -> LLVMValueRef {
-        llvm::core::LLVMBuildLoad2(self.b, self.i1, self.scc, self.n())
+        self.state.borrow_mut().read(self.b, self.scc)
     }
     unsafe fn st_scc(&self, v: LLVMValueRef) {
         // v is i1
-        llvm::core::LLVMBuildStore(self.b, v, self.scc);
+        self.state.borrow_mut().write(self.b, self.scc, v);
     }
     /// SCC = (value != 0)
     unsafe fn st_scc_nz(&self, v32: LLVMValueRef) {
@@ -320,44 +287,19 @@ impl Cg {
         llvm::core::LLVMBuildZExt(self.b, v, self.i64t, self.n())
     }
 
-    /// `x * 2^exp` computed inline as three clamped power-of-two multiplies,
-    /// matching the masked backend. `llvm.ldexp.f64.i32` lowers to a `scalbn`
-    /// libcall on x86 (measured at ~20% of total runtime), so we avoid it. The
-    /// 3 steps × [-1022,1023] cover the full i32 exponent range with correct
-    /// overflow/underflow/denormal rounding.
-    unsafe fn ldexp_inline(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        let mut result = value;
-        let mut remaining = exp;
-        for _ in 0..3 {
-            // step = clamp(remaining, -1022, 1023)
-            let hi = self.ci32(1023);
-            let lo = llvm::core::LLVMConstInt(self.i32t, (-1022i32) as u64, 1);
-            let c1 = llvm::core::LLVMBuildICmp(self.b, LLVMIntSLT, remaining, hi, self.n());
-            let step = llvm::core::LLVMBuildSelect(self.b, c1, remaining, hi, self.n());
-            let c2 = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGT, step, lo, self.n());
-            let step = llvm::core::LLVMBuildSelect(self.b, c2, step, lo, self.n());
-            remaining = llvm::core::LLVMBuildSub(self.b, remaining, step, self.n());
-            // scale = bitcast((sext(step) + 1023) << 52)
-            let step64 = llvm::core::LLVMBuildSExt(self.b, step, self.i64t, self.n());
-            let biased = self.b_add(step64, self.ci64(1023));
-            let bits = llvm::core::LLVMBuildShl(self.b, biased, self.ci64(52), self.n());
-            let scale = llvm::core::LLVMBuildBitCast(self.b, bits, self.f64t, self.n());
-            result = self.fmf(llvm::core::LLVMBuildFMul(self.b, result, scale, self.n()));
-        }
-        result
-    }
-
     unsafe fn ld_sgpr64(&self, i: u32) -> LLVMValueRef {
-        if self.sgpr_fresh.get() & (1u128 << (i & 127)) != 0 {
-            return llvm::core::LLVMBuildLoad2(self.b, self.i64t, self.sgpr_i64[i as usize], self.n());
+        let ordinary = !matches!(i, 105 | 106 | 123 | 124 | 125 | 126 | 127);
+        if ordinary && self.sgpr_fresh.get() & (1u128 << (i & 127)) != 0 {
+            return self.state.borrow_mut().read(self.b, self.sgpr_i64[i as usize]);
         }
         let lo = self.zext64(self.ld_sgpr32(i));
         let hi = self.zext64(self.ld_sgpr32(i + 1));
         let hi = llvm::core::LLVMBuildShl(self.b, hi, self.ci64(32), self.n());
         let v = llvm::core::LLVMBuildOr(self.b, hi, lo, self.n());
-        llvm::core::LLVMBuildStore(self.b, v, self.sgpr_i64[i as usize]);
-        self.sgpr_fresh.set(self.sgpr_fresh.get() | (1u128 << (i & 127)));
+        if ordinary {
+            self.state.borrow_mut().write(self.b, self.sgpr_i64[i as usize], v);
+            self.sgpr_fresh.set(self.sgpr_fresh.get() | (1u128 << (i & 127)));
+        }
         v
     }
     unsafe fn st_sgpr64(&self, i: u32, v: LLVMValueRef) {
@@ -366,8 +308,10 @@ impl Cg {
         let hi = llvm::core::LLVMBuildTrunc(self.b, hi, self.i32t, self.n());
         self.st_sgpr32(i, lo); // clears sgpr_fresh for i-1/i
         self.st_sgpr32(i + 1, hi); // clears for i/i+1
-        llvm::core::LLVMBuildStore(self.b, v, self.sgpr_i64[i as usize]);
-        self.sgpr_fresh.set(self.sgpr_fresh.get() | (1u128 << (i & 127)));
+        if !matches!(i, 105 | 106 | 123 | 124 | 125 | 126 | 127) {
+            self.state.borrow_mut().write(self.b, self.sgpr_i64[i as usize], v);
+            self.sgpr_fresh.set(self.sgpr_fresh.get() | (1u128 << (i & 127)));
+        }
     }
     unsafe fn ld_vgpr64(&self, i: u32) -> LLVMValueRef {
         let lo = self.zext64(self.ld_vgpr32(i));
@@ -378,11 +322,11 @@ impl Cg {
     unsafe fn ld_vgpr_f64(&self, i: u32) -> LLVMValueRef {
         // Freshness path: read the shadow if fresh, else reconstruct + memoize.
         if self.f64_fresh_get(i) {
-            return llvm::core::LLVMBuildLoad2(self.b, self.f64t, self.vgpr_f64[i as usize], self.n());
+            return self.state.borrow_mut().read(self.b, self.vgpr_f64[i as usize]);
         }
         let u = self.ld_vgpr64(i);
         let d = llvm::core::LLVMBuildBitCast(self.b, u, self.f64t, self.n());
-        llvm::core::LLVMBuildStore(self.b, d, self.vgpr_f64[i as usize]);
+        self.state.borrow_mut().write(self.b, self.vgpr_f64[i as usize], d);
         self.f64_fresh_setbit(i);
         d
     }
@@ -398,7 +342,7 @@ impl Cg {
         let u = llvm::core::LLVMBuildBitCast(self.b, v, self.i64t, self.n());
         self.st_vgpr64(i, u);
         if !self.predicate.get() {
-            llvm::core::LLVMBuildStore(self.b, v, self.vgpr_f64[i as usize]);
+            self.state.borrow_mut().write(self.b, self.vgpr_f64[i as usize], v);
             self.f64_fresh_setbit(i);
         }
     }
@@ -426,33 +370,10 @@ impl Cg {
             _ => llvm::core::LLVMBuildBitCast(self.b, self.src_u32(op), self.f32t, self.n()),
         }
     }
-    unsafe fn f16ty(&self) -> LLVMTypeRef { llvm::core::LLVMHalfTypeInContext(self.ctx) }
     unsafe fn i16ty(&self) -> LLVMTypeRef { llvm::core::LLVMInt16TypeInContext(self.ctx) }
     /// Low (bit 0) f16 of `op`, widened to f32.
-    unsafe fn src_f16lo_f32(&self, op: &SourceOperand) -> LLVMValueRef {
-        let b16 = llvm::core::LLVMBuildTrunc(self.b, self.src_u32(op), self.i16ty(), self.n());
-        let h = llvm::core::LLVMBuildBitCast(self.b, b16, self.f16ty(), self.n());
-        llvm::core::LLVMBuildFPExt(self.b, h, self.f32t, self.n())
-    }
     /// High (bit 16) f16 of `op`, widened to f32.
-    unsafe fn src_f16hi_f32(&self, op: &SourceOperand) -> LLVMValueRef {
-        let hi = llvm::core::LLVMBuildLShr(self.b, self.src_u32(op), self.ci32(16), self.n());
-        let b16 = llvm::core::LLVMBuildTrunc(self.b, hi, self.i16ty(), self.n());
-        let h = llvm::core::LLVMBuildBitCast(self.b, b16, self.f16ty(), self.n());
-        llvm::core::LLVMBuildFPExt(self.b, h, self.f32t, self.n())
-    }
     /// Round f32 `v` to f16, returned as i32 (f16 bits in low 16, high 0).
-    unsafe fn f32_to_f16_bits(&self, v: LLVMValueRef) -> LLVMValueRef {
-        let h = llvm::core::LLVMBuildFPTrunc(self.b, v, self.f16ty(), self.n());
-        let b16 = llvm::core::LLVMBuildBitCast(self.b, h, self.i16ty(), self.n());
-        llvm::core::LLVMBuildZExt(self.b, b16, self.i32t, self.n())
-    }
-    unsafe fn fmul_f32(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        llvm::core::LLVMBuildFMul(self.b, a, b, self.n())
-    }
-    unsafe fn fdiv_f32(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        llvm::core::LLVMBuildFDiv(self.b, a, b, self.n())
-    }
 
     // ---- source operands -------------------------------------------------
     unsafe fn src_u32(&self, op: &SourceOperand) -> LLVMValueRef {
@@ -554,23 +475,8 @@ impl Cg {
         llvm::core::LLVMBuildBitCast(self.b, select(fix, fixed, bits(quotient)), self.f64t, n)
     }
 
-    unsafe fn absneg_f32(&self, v: LLVMValueRef, abs: u8, neg: u8, idx: u32) -> LLVMValueRef {
-        let mut v = v;
-        if (abs >> idx) & 1 != 0 {
-            v = self.call("llvm.fabs.f32", self.f32t, &[self.f32t], &[v]);
-        }
-        if (neg >> idx) & 1 != 0 {
-            v = llvm::core::LLVMBuildFNeg(self.b, v, self.n());
-        }
-        v
-    }
 
     // VCC bit 0 (single lane) as i1: (vcc & 1) != 0
-    unsafe fn vcc_bit(&self) -> LLVMValueRef {
-        let vcc = self.ld_sgpr32(VCC);
-        let m = llvm::core::LLVMBuildAnd(self.b, vcc, self.ci32(1), self.n());
-        llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, m, self.ci32(0), self.n())
-    }
     // Bit 0 of any lane-mask register (EXEC/VCC live as i1; others as i32) as i1.
     unsafe fn mask_bit(&self, reg: u32) -> LLVMValueRef {
         let m = llvm::core::LLVMBuildAnd(self.b, self.ld_sgpr32(reg), self.ci32(1), self.n());
@@ -598,7 +504,12 @@ pub(super) fn compile_program(plan: &ScalarPlan<'_>, num_vgprs: usize) -> Scalar
 
 pub(super) fn compile_cooperative(plan: &ScalarPlan<'_>, num_vgprs: usize) -> CoopKernel {
     let sk = unsafe { compile_inner(plan, num_vgprs) };
-    CoopKernel { addr: sk.addr, num_vgprs: sk.num_vgprs, entry_pc: plan.program.entry_pc, yields: plan.function.yields() }
+    let yields = plan.function.value_yields();
+    if yields.values().any(|p| p.op == super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::Wmma)) {
+        super::wmma::warm(1);
+    }
+    CoopKernel { code: sk.code, num_vgprs: sk.num_vgprs, width: 1,
+        min_private_bytes: plan.function.min_private_bytes(), yields }
 }
 
 unsafe fn compile_inner(
@@ -613,13 +524,10 @@ unsafe fn compile_inner(
     // granulated descriptor count can underestimate the actual max index.
     let num_vgprs = num_vgprs.max(256);
 
-    llvm::target::LLVM_InitializeNativeTarget();
-    llvm::target::LLVM_InitializeNativeAsmParser();
-    llvm::target::LLVM_InitializeNativeAsmPrinter();
-
-    let ctx = llvm::core::LLVMContextCreate();
-    let module = llvm::core::LLVMModuleCreateWithNameInContext(b"scalar_kernel\0".as_ptr() as *const _, ctx);
-    let b = llvm::core::LLVMCreateBuilderInContext(ctx);
+    let native = super::jit::Module::new("scalar_kernel");
+    let ctx = native.ctx;
+    let module = native.module;
+    let b = native.builder;
 
     let i1 = llvm::core::LLVMInt1TypeInContext(ctx);
     let i8 = llvm::core::LLVMInt8TypeInContext(ctx);
@@ -631,11 +539,10 @@ unsafe fn compile_inner(
     let void = llvm::core::LLVMVoidTypeInContext(ctx);
 
     // Non-coop: `void kernel(u32* sgprs, u32* vgprs, u64 scratch)`.
-    // Coop:     `i64  kernel(u32* sgprs, u32* vgprs, u64 scratch, u64 lds,
-    //                        u32* spill, i64 resume)`.
+    // Coop uses the common nine-argument fiber ABI (see fiber::KernelArgs).
     let func = if coop {
-        let mut params = [ptr, ptr, i64t, i64t, ptr, i64t];
-        let fty = llvm::core::LLVMFunctionType(i64t, params.as_mut_ptr(), 6, 0);
+        let mut params = [ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t];
+        let fty = llvm::core::LLVMFunctionType(i64t, params.as_mut_ptr(), 9, 0);
         llvm::core::LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, fty)
     } else {
         let mut params = [ptr, ptr, i64t];
@@ -647,7 +554,7 @@ unsafe fn compile_inner(
     let vgprs_p = llvm::core::LLVMGetParam(func, 1);
     let scratch_base = llvm::core::LLVMGetParam(func, 2);
     let lds_base = if coop {
-        llvm::core::LLVMGetParam(func, 3)
+        llvm::core::LLVMGetParam(func, 5)
     } else {
         llvm::core::LLVMGetUndef(i64t)
     };
@@ -660,27 +567,41 @@ unsafe fn compile_inner(
     let entry = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, b"entry\0".as_ptr() as *const _);
     llvm::core::LLVMPositionBuilderAtEnd(b, entry);
 
-    // Allocate register slots and the SCC flag.
+    let scratch_base = if coop {
+        let offset = llvm::core::LLVMBuildMul(b, llvm::core::LLVMGetParam(func, 3),
+            llvm::core::LLVMGetParam(func, 6), b"\0".as_ptr().cast());
+        llvm::core::LLVMBuildAdd(b, scratch_base, offset, b"\0".as_ptr().cast())
+    } else { scratch_base };
+    let cells = plan.function.blocks.values().filter_map(|p| p.yield_values.as_ref())
+        .map(|p| p.layout.cells()).max().unwrap_or(0);
+    let yield_frame = if cells == 0 { llvm::core::LLVMConstNull(ptr) } else {
+        let frame = llvm::core::LLVMBuildAlloca(b, llvm::core::LLVMArrayType2(i32t, cells as u64), cstr("yield.values").as_ptr());
+        llvm::core::LLVMSetAlignment(frame, 64);
+        frame
+    };
+
+    // Declare typed register representations and the SCC flag.
+    let mut state = State::default();
     let mut sgpr = Vec::with_capacity(128);
     for _ in 0..128 {
-        sgpr.push(llvm::core::LLVMBuildAlloca(b, i32t, b"\0".as_ptr() as *const _));
+        sgpr.push(state.add(i32t));
     }
     let mut vgpr = Vec::with_capacity(num_vgprs);
     for _ in 0..num_vgprs {
-        vgpr.push(llvm::core::LLVMBuildAlloca(b, i32t, b"\0".as_ptr() as *const _));
+        vgpr.push(state.add(i32t));
     }
     // Parallel `double` shadow per VGPR pair (low reg). +1 so the high half of
     // the last pair has a slot.
     let mut vgpr_f64 = Vec::with_capacity(num_vgprs + 1);
     for _ in 0..num_vgprs + 1 {
-        vgpr_f64.push(llvm::core::LLVMBuildAlloca(b, f64t, b"\0".as_ptr() as *const _));
+        vgpr_f64.push(state.add(f64t));
     }
-    let scc = llvm::core::LLVMBuildAlloca(b, i1, b"\0".as_ptr() as *const _);
-    let exec_i1 = llvm::core::LLVMBuildAlloca(b, i1, b"\0".as_ptr() as *const _);
-    let vcc_i1 = llvm::core::LLVMBuildAlloca(b, i1, b"\0".as_ptr() as *const _);
+    let scc = state.add(i1);
+    let exec_i1 = state.add(i1);
+    let vcc_i1 = state.add(i1);
     let mut sgpr_i64 = Vec::with_capacity(129);
     for _ in 0..129 {
-        sgpr_i64.push(llvm::core::LLVMBuildAlloca(b, i64t, b"\0".as_ptr() as *const _));
+        sgpr_i64.push(state.add(i64t));
     }
     let bvh_scratch = llvm::core::LLVMBuildArrayAlloca(b, i32t, llvm::core::LLVMConstInt(i32t, 10, 0), b"\0".as_ptr() as *const _);
     let spill_base = if coop {
@@ -695,7 +616,9 @@ unsafe fn compile_inner(
     };
 
     let cg = Cg {
-        ctx, module, b, func, scratch_base,
+        state: std::cell::RefCell::new(state),
+        writeback_words: plan.function.written,
+        ctx, module, b, func, scratch_base, yield_frame,
         sgpr, vgpr, scc, i1, i8, i32t, i64t, f32t, f64t, ptr,
         predicate: std::cell::Cell::new(false),
         mask_def: std::cell::RefCell::new(BTreeMap::new()),
@@ -729,14 +652,13 @@ unsafe fn compile_inner(
         cg.st_sgpr32(EXEC, cg.ci32(1));
     }
     if coop {
-        // Resume-capable: reload SCC from the persisted slot (sgprs[128]); the
-        // scheduler seeds it to 0 before the first call. EXEC/VCC ride the sgprs
-        // buffer (indices 126/106) and are reloaded by the init loop above.
+        // Initial SCC arrives in the private entry slot. It subsequently
+        // survives every yield as a native SSA value.
         let gep = llvm::core::LLVMBuildGEP2(b, i32t, sgprs_p, [cg.ci32(128)].as_mut_ptr(), 1, cg.n());
         let s = llvm::core::LLVMBuildLoad2(b, i32t, gep, cg.n());
         cg.st_scc_nz(s);
     } else {
-        llvm::core::LLVMBuildStore(b, llvm::core::LLVMConstInt(i1, 0, 0), scc);
+        cg.st_scc(llvm::core::LLVMConstInt(i1, 0, 0));
     }
 
     // From here on, predicate vector writes on EXEC bit 0.
@@ -749,26 +671,10 @@ unsafe fn compile_inner(
         bbs.insert(pc, llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
     }
 
-    if coop {
-        // Resume dispatch: jump to the block named by `resume_pc`. The first call
-        // passes `entry_pc` (→ default); every barrier's post-block pc is a case.
-        let resume = llvm::core::LLVMGetParam(func, 5);
-        let mut targets: Vec<usize> = Vec::new();
-        for block in program.blocks.values() {
-            if let Terminator::Barrier { resume } | Terminator::Yield { resume, .. } = block.term {
-                targets.push(resume);
-            }
-        }
-        let sw = llvm::core::LLVMBuildSwitch(b, resume, bbs[&program.entry_pc], targets.len() as u32);
-        for pc in targets {
-            llvm::core::LLVMAddCase(sw, cg.ci64(pc as u64), bbs[&pc]);
-        }
-    } else {
-        llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
-    }
+    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
 
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, None);
-    for (&pc, block) in &program.blocks {
+    for &pc in program.blocks.keys() {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         ssa.begin_block(&plan.function, pc);
         let facts = &plan.blocks[&pc];
@@ -782,7 +688,7 @@ unsafe fn compile_inner(
             cg.predicate.set(!states[idx]);
             match instruction {
                 super::lift::Lowering::TypedAlu { .. } => {
-                    ssa.emit(&plan.function, pc, idx, |input| cg.typed_input(input), |output, value| {
+                    ssa.emit(&plan.function, pc, idx, |input, _| cg.typed_input(input), |output, value| {
                         cg.typed_output(output, value);
                     });
                 }
@@ -794,10 +700,12 @@ unsafe fn compile_inner(
                 super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
             }
         }
-        cg.emit_term(&plan.function.terminator(pc, &block.term), &bbs);
+        ssa.condition(&plan.function, pc, |input| cg.typed_input(input));
+        cg.emit_term(pc, &plan.function, &bbs, &mut ssa);
     }
 
-    finalize(ctx, module, func, num_vgprs)
+    cg.state.borrow_mut().finish(func);
+    ScalarKernel { code: native.finish(super::jit::Mode::Scalar), num_vgprs }
 }
 
 // =====================================================================
@@ -807,6 +715,8 @@ unsafe fn compile_inner(
 impl Cg {
     unsafe fn emit_writeback(&self, num_vgprs: usize) {
         for i in 0..128u32 {
+            // NULL has no architectural storage to persist across a yield.
+            if !self.writeback_words.has_sgpr(i) { continue; }
             let gep = llvm::core::LLVMBuildGEP2(
                 self.b,
                 self.i32t,
@@ -819,6 +729,7 @@ impl Cg {
             llvm::core::LLVMBuildStore(self.b, v, gep);
         }
         for i in 0..num_vgprs as u32 {
+            if !self.writeback_words.has_vgpr(i) { continue; }
             let gep = llvm::core::LLVMBuildGEP2(
                 self.b,
                 self.i32t,
@@ -842,9 +753,9 @@ impl Cg {
         llvm::core::LLVMBuildStore(self.b, z, gep);
     }
 
-    unsafe fn emit_term(&self, term: &Terminator, bbs: &BTreeMap<usize, LLVMBasicBlockRef>) {
-        match term {
-            Terminator::Return => {
+    unsafe fn emit_term(&self, pc: usize, function: &super::lift::function::Function, bbs: &BTreeMap<usize, LLVMBasicBlockRef>, values: &mut super::typed_codegen::Values) {
+        match &function.terminator(pc) {
+            super::lift::function::Control::Return => {
                 if self.coop {
                     // End of work-item: persist state, return the DONE sentinel.
                     self.emit_writeback(self.writeback_vgprs);
@@ -857,167 +768,33 @@ impl Cg {
                     llvm::core::LLVMBuildRetVoid(self.b);
                 }
             }
-            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => {
-                // Yield: persist full register/SCC state and return the resume pc
-                // so the scheduler re-enters here after every work-item syncs.
-                self.emit_writeback(self.writeback_vgprs);
-                self.emit_scc_writeback();
-                llvm::core::LLVMBuildRet(self.b, self.ci64(*resume as u64));
+            super::lift::function::Control::Yield { resume } => {
+                use super::ir::typed::effect::{EffectOp, WaveOp};
+                use super::lift::{Output, wave::Destination};
+                let plan = function.blocks[&pc].yield_values.as_ref().expect("yield lacks SSA value plan");
+                values.prepare_yield(function, pc, llvm::core::LLVMGetParam(self.func,6), |input| self.typed_input(input));
+                let predicated = matches!(plan.layout.op, EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi));
+                let previous = self.predicate.replace(predicated);
+                values.yield_values(plan, self.yield_frame, llvm::core::LLVMGetParam(self.func, 7), *resume,
+                    |destination, ty, result, bits| match destination {
+                        Destination::Vgpr(reg) => self.typed_output(Output::Vgpr(reg, ty), result),
+                        Destination::Sgpr(reg) => self.typed_output(Output::Scalar(reg, super::ir::typed::Ty::I32), bits),
+                        Destination::Scc => self.typed_output(Output::Scc, result),
+                    });
+                self.predicate.set(previous);
+                llvm::core::LLVMBuildBr(self.b, bbs[resume]);
             }
-            Terminator::Jump(t) => {
+            super::lift::function::Control::Jump(t) => {
                 llvm::core::LLVMBuildBr(self.b, bbs[t]);
             }
-            Terminator::Branch { cond, taken, fallthrough } => {
-                let taken_cond = self.taken_cond(*cond);
+            super::lift::function::Control::Branch { cond, taken, fallthrough } => {
+                let taken_cond = values.value(*cond);
                 llvm::core::LLVMBuildCondBr(self.b, taken_cond, bbs[taken], bbs[fallthrough]);
             }
         }
     }
 
-    unsafe fn taken_cond(&self, cond: Cond) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        // The kernel was compiled for a 32-lane wavefront, and its EXEC/VCC
-        // branch conditions test the whole 32-bit lane mask (including
-        // hardcoded `-1` = "all lanes"). This function executes only lane 0, so
-        // a branch must depend only on lane 0's bit. Testing `(mask & 1)` recovers
-        // scalar control flow: e.g. a wavefront reconvergence loop on
-        // `~EXEC & 0xFFFFFFFF` correctly terminates once lane 0 is active
-        // (`~EXEC & 1 == 0`), instead of spinning on the 31 nonexistent lanes.
-        match cond {
-            Cond::ExecZ => {
-                let e = self.b_and(self.ld_sgpr32(EXEC), self.ci32(1));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, e, self.ci32(0), self.n())
-            }
-            Cond::ExecNz => {
-                let e = self.b_and(self.ld_sgpr32(EXEC), self.ci32(1));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e, self.ci32(0), self.n())
-            }
-            Cond::VccZ => {
-                let e = self.b_and(self.ld_sgpr32(VCC), self.ci32(1));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, e, self.ci32(0), self.n())
-            }
-            Cond::VccNz => {
-                let e = self.b_and(self.ld_sgpr32(VCC), self.ci32(1));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e, self.ci32(0), self.n())
-            }
-            Cond::Scc1 => self.ld_scc(),
-            Cond::Scc0 => {
-                let s = self.ld_scc();
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, s, llvm::core::LLVMConstInt(self.i1, 0, 0), self.n())
-            }
-        }
-    }
-}
 
-fn finalize(
-    ctx: llvm::prelude::LLVMContextRef,
-    module: llvm::prelude::LLVMModuleRef,
-    func: LLVMValueRef,
-    num_vgprs: usize,
-) -> ScalarKernel {
-    unsafe {
-        // Verify.
-        let mut err = std::ptr::null_mut();
-        if llvm::analysis::LLVMVerifyModule(
-            module,
-            llvm::analysis::LLVMVerifierFailureAction::LLVMPrintMessageAction,
-            &mut err,
-        ) != 0
-        {
-            if !err.is_null() {
-                let s = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
-                panic!("scalar module failed verification:\n{}", s);
-            }
-        }
-
-        // Target machine.
-        let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
-        let mut target = std::ptr::null_mut();
-        let mut terr = std::ptr::null_mut();
-        llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut terr);
-        let cpu = llvm::target_machine::LLVMGetHostCPUName();
-        let feat_host = llvm::target_machine::LLVMGetHostCPUFeatures();
-        // The kernel is scalar f64, so AVX-512 brings no vector benefit but makes
-        // LLVM lower every f64 `select` (V_CNDMASK) to a `kmovd` + masked
-        // `vmovsd` (native smallpt uses cheaper `vblendvpd`/cmov). Measured ~10%
-        // faster with AVX-512 disabled, so it is always disabled here.
-        let host = std::ffi::CStr::from_ptr(feat_host).to_string_lossy();
-        let s = format!("{},-avx512f,-avx512vl,-avx512dq,-avx512bw,-avx512cd", host);
-        let feat_cstr = std::ffi::CString::new(s).unwrap();
-        let feat = feat_cstr.as_ptr();
-        // NB: Small code model + PIC makes f64 constants load RIP-relative
-        // (eliminates the `movabs $abs; vmovsd (%reg)` form, ~3% of cycles in
-        // `movabs`), but it also defeats LLVM's LICM hoist of the loop-invariant
-        // reciprocal in the sphere loop (vdivsd cycle-share 0.4% → 9.1%), a net
-        // wash-to-regression (cycles 1330.6B → 1336.9B). So keep JITDefault.
-        let tm = llvm::target_machine::LLVMCreateTargetMachine(
-            target, triple, cpu, feat,
-            llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-            llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-            llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
-        );
-
-        // Optimize: promote register slots to SSA (mem2reg) then O3 cleanup.
-        // The full module-level `default<O3>` lets LLVM apply its most aggressive
-        // cross-block reasoning (e.g. coalescing the paired i32 register phis +
-        // f64 reconstruction back toward a single value).
-        let opts = llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
-        let passes_str: std::ffi::CString = std::ffi::CString::new("default<O3>").unwrap();
-        let perr = llvm::transforms::pass_builder::LLVMRunPasses(
-            module, passes_str.as_ptr(), tm, opts,
-        );
-        let _ = func;
-        if !perr.is_null() {
-            let msg = llvm::error::LLVMGetErrorMessage(perr);
-            let s = std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned();
-            panic!("scalar passes failed: {}", s);
-        }
-        // ORC LLJIT.
-        let jit_builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
-        let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
-        llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(jit_builder, jtmb);
-        let mut jit = std::ptr::null_mut();
-        let e = llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, jit_builder);
-        if !e.is_null() {
-            panic!("create LLJIT failed");
-        }
-        let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
-        let gp = llvm::orc2::lljit::LLVMOrcLLJITGetGlobalPrefix(jit);
-
-        // Resolve process symbols (for runtime helpers like v_trig_preop_f64).
-        let mut dg = std::ptr::null_mut();
-        llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(&mut dg, gp, None, std::ptr::null_mut());
-        llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, dg);
-
-        let lib_path: &[u8] = if cfg!(debug_assertions) {
-            b"target/debug/libamdgpu_sim.so\0"
-        } else {
-            b"target/release/libamdgpu_sim.so\0"
-        };
-        let mut dg2 = std::ptr::null_mut();
-        llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
-            &mut dg2, lib_path.as_ptr() as *const _, gp, None, std::ptr::null_mut());
-        llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, dg2);
-
-        let tsctx = llvm::orc2::LLVMOrcCreateNewThreadSafeContext();
-        let tsm = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(module, tsctx);
-        let e = llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(jit, dylib, tsm);
-        if !e.is_null() {
-            panic!("add module failed");
-        }
-
-        let mut addr = 0u64;
-        let e = llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut addr, b"kernel\0".as_ptr() as *const _);
-        if !e.is_null() {
-            panic!("lookup kernel failed");
-        }
-
-        // Intentionally leak `jit` so the compiled code stays mapped.
-        std::mem::forget(Box::new(jit));
-        let _ = ctx;
-
-        ScalarKernel { addr, num_vgprs }
-    }
 }
 
 // =====================================================================
@@ -1027,18 +804,10 @@ fn finalize(
 impl Cg {
     unsafe fn emit_inst(&self, inst: &InstFormat) {
         match inst {
-            InstFormat::VOP1(i) => self.emit_vop1(i),
-            InstFormat::VOP2(i) => self.emit_vop2(i),
             InstFormat::VOP3(i) => self.emit_vop3(i),
-            InstFormat::VOP3P(i) => self.emit_vop3p(i),
-            InstFormat::VOP3SD(i) => self.emit_vop3sd(i),
-            InstFormat::VOPD(i) => self.emit_vopd(i),
             InstFormat::SOP1(i) => self.emit_sop1(i),
             InstFormat::SOP2(i) => self.emit_sop2(i),
-            InstFormat::SOPK(i) => self.emit_sopk(i),
-            InstFormat::SOPC(i) => self.emit_sopc(i),
             InstFormat::VIMAGE(i) => self.emit_vimage(i),
-            InstFormat::VSAMPLE(i) => self.emit_vsample(i),
             other => panic!("scalar: unsupported instruction {:?}", other),
         }
     }
@@ -1062,31 +831,15 @@ impl Cg {
     unsafe fn b_not(&self, a: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildNot(self.b, a, self.n())
     }
-    unsafe fn shl(&self, a: LLVMValueRef, amt: LLVMValueRef) -> LLVMValueRef {
-        let amt = self.b_and(amt, self.ci32(31));
-        llvm::core::LLVMBuildShl(self.b, a, amt, self.n())
-    }
-    unsafe fn lshr(&self, a: LLVMValueRef, amt: LLVMValueRef) -> LLVMValueRef {
-        let amt = self.b_and(amt, self.ci32(31));
-        llvm::core::LLVMBuildLShr(self.b, a, amt, self.n())
-    }
+
+
     /// FP instructions carry no fast-math flags (bit-exact with the masked
     /// backend); pass-through kept so call sites read uniformly.
     unsafe fn fmf(&self, v: LLVMValueRef) -> LLVMValueRef {
         v
     }
-    unsafe fn fmuladd(&self, a: LLVMValueRef, b: LLVMValueRef, c: LLVMValueRef) -> LLVMValueRef {
-        let v = self.call("llvm.fmuladd.f64", self.f64t, &[self.f64t, self.f64t, self.f64t], &[a, b, c]);
-        self.fmf(v)
-    }
-    unsafe fn floor(&self, a: LLVMValueRef) -> LLVMValueRef {
-        self.call("llvm.floor.f64", self.f64t, &[self.f64t], &[a])
-    }
     unsafe fn fdiv(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
         self.fmf(llvm::core::LLVMBuildFDiv(self.b, a, b, self.n()))
-    }
-    unsafe fn fmul(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        self.fmf(llvm::core::LLVMBuildFMul(self.b, a, b, self.n()))
     }
     unsafe fn ptr_at(&self, addr: LLVMValueRef, off: u64) -> LLVMValueRef {
         let a = self.b_add(addr, self.ci64(off));
@@ -1113,313 +866,22 @@ impl Cg {
         }
     }
 
-    // ---- VOP1 ------------------------------------------------------------
-    unsafe fn emit_vop1(&self, i: &VOP1) {
-        match i.op {
 
-            I::V_CLZ_I32_U32 => {
-                let x = self.src_u32(&i.src0);
-                let lz = self.call("llvm.ctlz.i32", self.i32t, &[self.i32t, self.i1], &[x, llvm::core::LLVMConstInt(self.i1, 0, 0)]);
-                let is0 = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntEQ, x, self.ci32(0), self.n());
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildSelect(self.b, is0, self.ci32(0xFFFF_FFFF), lz, self.n()));
-            }
-            I::V_FREXP_MANT_F32 => {
-                let v = self.call("scalar_frexp_mant_f32", self.f32t, &[self.f32t], &[self.src_f32(&i.src0)]);
-                self.st_vgpr32(i.vdst as u32, self.f32_bits(v));
-            }
-            I::V_FREXP_EXP_I32_F32 => {
-                let v = self.call("scalar_frexp_exp_f32", self.i32t, &[self.f32t], &[self.src_f32(&i.src0)]);
-                self.st_vgpr32(i.vdst as u32, v);
-            }
-            I::V_FRACT_F64 => {
-                let s = self.src_f64(&i.src0);
-                let f = self.floor(s);
-                let v = self.fmf(llvm::core::LLVMBuildFSub(self.b, s, f, self.n()));
-                self.st_vgpr_f64(i.vdst as u32, v);
-            }
-            _ => panic!("scalar: unsupported VOP1 {:?}", i.op),
-        }
-    }
-
-    // ---- VOP2 ------------------------------------------------------------
-    unsafe fn emit_vop2(&self, i: &VOP2) {
-        // f64 forms (no source modifiers in VOP2).
-        match i.op {
-            I::V_ADD_CO_CI_U32 => {
-                let s0 = self.zext64(self.src_u32(&i.src0));
-                let s1 = self.zext64(self.ld_vgpr32(i.vsrc1 as u32));
-                let cin = llvm::core::LLVMBuildZExt(self.b, self.vcc_bit(), self.i64t, self.n());
-                let sum = self.b_add(self.b_add(s0, s1), cin);
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildTrunc(self.b, sum, self.i32t, self.n()));
-                let cout = llvm::core::LLVMBuildLShr(self.b, sum, self.ci64(32), self.n());
-                let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.ci64(0), self.n());
-                self.st_mask(VCC, cout);
-                return;
-            }
-            I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
-                let s0 = self.zext64(self.src_u32(&i.src0));
-                let s1 = self.zext64(self.ld_vgpr32(i.vsrc1 as u32));
-                let (a, b) = if matches!(i.op, I::V_SUBREV_CO_CI_U32) { (s1, s0) } else { (s0, s1) };
-                let cin = llvm::core::LLVMBuildZExt(self.b, self.vcc_bit(), self.i64t, self.n());
-                let diff = self.b_sub(self.b_sub(a, b), cin);
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildTrunc(self.b, diff, self.i32t, self.n()));
-                let bo = llvm::core::LLVMBuildLShr(self.b, diff, self.ci64(32), self.n());
-                let bo = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bo, self.ci64(0), self.n());
-                self.st_mask(VCC, bo);
-                return;
-            }
-            _ => {}
-        }
-        let s0 = self.src_u32(&i.src0);
-        let s1 = self.ld_vgpr32(i.vsrc1 as u32);
-        let r = match i.op {
-            I::V_ADD_NC_U16 => self.b_and(self.b_add(s0, s1), self.ci32(0xffff)),
-            _ => panic!("scalar: unsupported VOP2 {:?}", i.op),
-        };
-        self.st_vgpr32(i.vdst as u32, r);
-    }
 
     // ---- VOP3 ------------------------------------------------------------
     unsafe fn emit_vop3(&self, i: &VOP3) {
         match i.op {
             // ----- integer -----
-            I::V_LDEXP_F64 => {
-                let a = self.src_f64(&i.src0);
-                let e = self.src_u32(&i.src1);
-                let r = self.ldexp_inline(a, e);
-                self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            I::V_DIV_SCALE_F64 => {
-                let a = self.absneg_f64(self.src_f64(&i.src0), i.abs, i.neg, 0);
-                let b = self.absneg_f64(self.src_f64(&i.src1), i.abs, i.neg, 1);
-                let c = self.absneg_f64(self.src_f64(&i.src2), i.abs, i.neg, 2);
-                let r = self.fdiv(self.fmul(a, c), b);
-                self.st_vgpr_f64(i.vdst as u32, r);
-                // sdst (vcc) := 0 -- VOP3SD field; left unset in this prototype.
-            }
             I::V_DIV_FIXUP_F64 => {
                 let b = self.absneg_f64(self.src_f64(&i.src1), i.abs, i.neg, 1);
                 let c = self.absneg_f64(self.src_f64(&i.src2), i.abs, i.neg, 2);
                 let r = self.div_fixup_f64(self.fdiv(c, b), b, c);
                 self.st_vgpr_f64(i.vdst as u32, r);
             }
-            I::V_DIV_FMAS_F64 => {
-                let a = self.src_f64(&i.src0);
-                let b = self.src_f64(&i.src1);
-                let c = self.src_f64(&i.src2);
-                let fma = self.fmuladd(a, b, c);
-                let scaled = self.fmul(fma, self.cf64(f64::from_bits(0x43F0000000000000)));
-                let cond = self.vcc_bit();
-                let r = llvm::core::LLVMBuildSelect(self.b, cond, scaled, fma, self.n());
-                self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            I::V_DIV_FIXUP_F32 => {
-                let a = self.absneg_f32(self.src_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.absneg_f32(self.src_f32(&i.src1), i.abs, i.neg, 1);
-                let c = self.absneg_f32(self.src_f32(&i.src2), i.abs, i.neg, 2);
-                let r = self.call("scalar_div_fixup_f32", self.f32t, &[self.f32t, self.f32t, self.f32t], &[a, b, c]);
-                self.st_vgpr32(i.vdst as u32, self.f32_bits(r));
-            }
-            I::V_DIV_FMAS_F32 => {
-                let a = self.absneg_f32(self.src_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.absneg_f32(self.src_f32(&i.src1), i.abs, i.neg, 1);
-                let c = self.absneg_f32(self.src_f32(&i.src2), i.abs, i.neg, 2);
-                let fma = self.call("llvm.fma.f32", self.f32t, &[self.f32t, self.f32t, self.f32t], &[a, b, c]);
-                // VCC: result *= 2^32. Interpreter computes 2^32 * fma; f32 mul is
-                // commutative so the rounding is identical.
-                let scaled = self.fmul_f32(llvm::core::LLVMConstBitCast(self.ci32(0x4F80_0000), self.f32t), fma);
-                let cond = self.vcc_bit();
-                let r = llvm::core::LLVMBuildSelect(self.b, cond, scaled, fma, self.n());
-                self.st_vgpr32(i.vdst as u32, self.f32_bits(r));
-            }
-            I::V_LDEXP_F32 => {
-                let a = self.absneg_f32(self.src_f32(&i.src0), i.abs, i.neg, 0);
-                let e = self.src_u32(&i.src1);
-                let r = self.call("llvm.ldexp.f32.i32", self.f32t, &[self.f32t, self.i32t], &[a, e]);
-                self.st_vgpr32(i.vdst as u32, self.f32_bits(r));
-            }
-            I::V_TRIG_PREOP_F64 => {
-                let a = self.src_f64(&i.src0);
-                let s = self.src_u32(&i.src1);
-                let r = self.call("v_trig_preop_f64", self.f64t, &[self.f64t, self.i32t], &[a, s]);
-                self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            // ----- f32 compares encoded as VOP3 (dest = vdst sgpr mask) -----
-            I::V_CMP_CLASS_F64 => {
-                let a = self.src_f64(&i.src0);
-                let s = self.src_u32(&i.src1);
-                let c = self.call("llvm.is.fpclass.f64", self.i1, &[self.f64t, self.i32t], &[a, s]);
-                self.st_cmp(i.vdst as u32, c);
-            }
-            I::V_CMP_CLASS_F32 => {
-                let a = self.src_f32(&i.src0);
-                let s = self.src_u32(&i.src1);
-                let c = self.call("llvm.is.fpclass.f32", self.i1, &[self.f32t, self.i32t], &[a, s]);
-                self.st_cmp(i.vdst as u32, c);
-            }
-            I::V_ALIGNBIT_B32 => {
-                let s0 = self.zext64(self.src_u32(&i.src0));
-                let s1 = self.zext64(self.src_u32(&i.src1));
-                let amt = self.zext64(self.b_and(self.src_u32(&i.src2), self.ci32(0x1F)));
-                // {S0,S1}: S0 is the MSBs, S1 the LSBs (ISA §V_ALIGNBIT_B32).
-                let concat = self.b_or(llvm::core::LLVMBuildShl(self.b, s0, self.ci64(32), self.n()), s1);
-                let r = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, concat, amt, self.n()), self.i32t, self.n());
-                self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_LSHLREV_B16 => {
-                let amt = self.b_and(self.src_u32(&i.src0), self.ci32(15));
-                let v = self.b_and(self.src_u32(&i.src1), self.ci32(0xffff));
-                let r = self.b_and(llvm::core::LLVMBuildShl(self.b, v, amt, self.n()), self.ci32(0xffff));
-                self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_LSHRREV_B16 => {
-                let amt = self.b_and(self.src_u32(&i.src0), self.ci32(15));
-                let v = self.b_and(self.src_u32(&i.src1), self.ci32(0xffff));
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildLShr(self.b, v, amt, self.n()));
-            }
-            I::V_ADD_NC_U16 => {
-                let a = self.src_u32(&i.src0);
-                let b = self.src_u32(&i.src1);
-                let r = self.b_and(self.b_add(a, b), self.ci32(0xffff));
-                self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_S_RCP_F32 => {
-                let s = self.absneg_f32(self.src_f32(&i.src0), i.abs, i.neg, 0);
-                let v = self.fdiv_f32(self.cf32(1.0), s);
-                self.st_sgpr32(i.vdst as u32, self.f32_bits(v));
-            }
-            I::V_CVT_F32_F16 => {
-                // RDNA4 ISA: `D0.f32 = f16_to_f32(S0.f16)`. OPSEL[0] selects src0's
-                // f16 half (1=high, 0=low). abs/neg (f16) commute with the widening.
-                let f = if i.opsel & 1 != 0 { self.src_f16hi_f32(&i.src0) } else { self.src_f16lo_f32(&i.src0) };
-                let r = self.absneg_f32(f, i.abs, i.neg, 0);
-                self.st_vgpr32(i.vdst as u32, self.f32_bits(r));
-            }
-            I::V_CMP_EQ_U16 | I::V_CMP_GT_U16 => {
-                let a = self.b_and(self.src_u32(&i.src0), self.ci32(0xffff));
-                let b = self.b_and(self.src_u32(&i.src1), self.ci32(0xffff));
-                let pred = if matches!(i.op, I::V_CMP_EQ_U16) {
-                    llvm::LLVMIntPredicate::LLVMIntEQ
-                } else {
-                    llvm::LLVMIntPredicate::LLVMIntUGT
-                };
-                let c = llvm::core::LLVMBuildICmp(self.b, pred, a, b, self.n());
-                self.st_cmp(i.vdst as u32, c);
-            }
-            // ----- uniform cross-lane spill idiom (constant lane) -----
-
-
             _ => panic!("scalar: unsupported VOP3 {:?}", i.op),
         }
     }
 
-    // ---- VOP3P (packed / mixed precision) — lane-local per-work-item ----
-    // (V_WMMA_F32_16X16X16_F16 is a cross-lane op; it is split out to a wave-level
-    // boundary before compilation, so it never reaches here.)
-    unsafe fn emit_vop3p(&self, i: &VOP3P) {
-        match i.op {
-            I::V_FMA_MIXLO_F16 => {
-                // RDNA4 ISA §V_FMA_MIXLO_F16: each source `i` is selected by
-                // {OPSEL_HI[i], OPSEL[i]} — OPSEL_HI=0 → f32; OPSEL_HI=1 & OPSEL=1 →
-                // hi f16; OPSEL_HI=1 & OPSEL=0 → lo f16. NEG_HI is an abs modifier.
-                let opsel_hi = i.opsel_hi | (i.opsel_hi2 << 2);
-                let src = |op: &SourceOperand, idx: u32| -> LLVMValueRef {
-                    let f = if (opsel_hi >> idx) & 1 == 0 {
-                        self.src_f32(op)
-                    } else if (i.opsel >> idx) & 1 != 0 {
-                        self.src_f16hi_f32(op)
-                    } else {
-                        self.src_f16lo_f32(op)
-                    };
-                    self.absneg_f32(f, i.neg_hi, i.neg, idx)
-                };
-                let a = src(&i.src0, 0);
-                let b = src(&i.src1, 1);
-                let c = src(&i.src2, 2);
-                // `D0[15:0].f16 = f32_to_f16(fma(...))`: FMA in f32, round to f16,
-                // write the low 16 bits and preserve vdst's high 16 (no clamp).
-                let r = self.call("llvm.fma.f32", self.f32t, &[self.f32t, self.f32t, self.f32t], &[a, b, c]);
-                let lo = self.f32_to_f16_bits(r); // high 16 already 0
-                let hi = self.b_and(self.ld_vgpr32(i.vdst as u32), self.ci32(0xffff_0000));
-                self.st_vgpr32(i.vdst as u32, self.b_or(hi, lo));
-            }
-            _ => panic!("scalar: unsupported VOP3P {:?}", i.op),
-        }
-    }
-
-    /// Write a carry/mask bit to `sdst`, unless it is the null register.
-    unsafe fn st_sdst_mask(&self, sdst: u8, bit_i1: LLVMValueRef) {
-        if sdst == 124 || sdst == 125 {
-            return;
-        }
-        self.st_mask(sdst as u32, bit_i1);
-    }
-
-    // ---- VOP3SD (vector op with scalar carry dest) ----------------------
-    unsafe fn emit_vop3sd(&self, i: &VOP3SD) {
-        match i.op {
-            I::V_ADD_CO_U32 => {
-                let s0 = self.zext64(self.src_u32(&i.src0));
-                let s1 = self.zext64(self.src_u32(&i.src1));
-                let sum = self.b_add(s0, s1);
-                let lo = llvm::core::LLVMBuildTrunc(self.b, sum, self.i32t, self.n());
-                self.st_vgpr32(i.vdst as u32, lo);
-                let cout = llvm::core::LLVMBuildLShr(self.b, sum, self.ci64(32), self.n());
-                let cout = llvm::core::LLVMBuildTrunc(self.b, cout, self.i32t, self.n());
-                let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.ci32(0), self.n());
-                self.st_sdst_mask(i.sdst, cout);
-            }
-            I::V_ADD_CO_CI_U32 => {
-                let s0 = self.zext64(self.src_u32(&i.src0));
-                let s1 = self.zext64(self.src_u32(&i.src1));
-                let cin = self.zext64(self.b_and(self.src_u32(&i.src2), self.ci32(1)));
-                let sum = self.b_add(self.b_add(s0, s1), cin);
-                let lo = llvm::core::LLVMBuildTrunc(self.b, sum, self.i32t, self.n());
-                self.st_vgpr32(i.vdst as u32, lo);
-                let cout = llvm::core::LLVMBuildLShr(self.b, sum, self.ci64(32), self.n());
-                let cout = llvm::core::LLVMBuildTrunc(self.b, cout, self.i32t, self.n());
-                let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.ci32(0), self.n());
-                self.st_sdst_mask(i.sdst, cout);
-            }
-            I::V_MAD_CO_U64_U32 => {
-                let s0 = self.zext64(self.src_u32(&i.src0));
-                let s1 = self.zext64(self.src_u32(&i.src1));
-                let s2 = self.src_u64(&i.src2);
-                let prod = llvm::core::LLVMBuildMul(self.b, s0, s1, self.n());
-                // 128-bit add to detect carry: use uadd.with.overflow on i64.
-                let ov = self.call(
-                    "llvm.uadd.with.overflow.i64",
-                    llvm::core::LLVMStructTypeInContext(self.ctx, [self.i64t, self.i1].as_mut_ptr(), 2, 0),
-                    &[self.i64t, self.i64t],
-                    &[prod, s2],
-                );
-                let d = llvm::core::LLVMBuildExtractValue(self.b, ov, 0, self.n());
-                let c = llvm::core::LLVMBuildExtractValue(self.b, ov, 1, self.n());
-                self.st_vgpr64(i.vdst as u32, d);
-                self.st_sdst_mask(i.sdst, c);
-            }
-            I::V_DIV_SCALE_F64 => {
-                let a = self.absneg_f64(self.src_f64(&i.src0), 0, i.neg, 0);
-                let b = self.absneg_f64(self.src_f64(&i.src1), 0, i.neg, 1);
-                let c = self.absneg_f64(self.src_f64(&i.src2), 0, i.neg, 2);
-                let r = self.fdiv(self.fmul(a, c), b);
-                self.st_vgpr_f64(i.vdst as u32, r);
-                let zero = llvm::core::LLVMConstInt(self.i1, 0, 0);
-                self.st_sdst_mask(i.sdst, zero);
-            }
-            I::V_DIV_SCALE_F32 => {
-                let a = self.absneg_f32(self.src_f32(&i.src0), 0, i.neg, 0);
-                let b = self.absneg_f32(self.src_f32(&i.src1), 0, i.neg, 1);
-                let c = self.absneg_f32(self.src_f32(&i.src2), 0, i.neg, 2);
-                let packed = self.call("scalar_div_scale_f32", self.i64t, &[self.f32t, self.f32t, self.f32t], &[a, b, c]);
-                let val = llvm::core::LLVMBuildTrunc(self.b, packed, self.i32t, self.n());
-                self.st_vgpr32(i.vdst as u32, val);
-                let flag = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, packed, self.ci64(32), self.n()), self.i1, self.n());
-                self.st_sdst_mask(i.sdst, flag);
-            }
-            _ => panic!("scalar: unsupported VOP3SD {:?}", i.op),
-        }
-    }
 
 
     // ---- VOPC ------------------------------------------------------------
@@ -1437,62 +899,12 @@ impl Cg {
         self.st_sgpr32(dest, masked);
     }
 
-    // ---- VOPD (dual issue) ----------------------------------------------
-    // VOPD executes both ops in parallel: *both* halves read their inputs
-    // before *either* writes its destination. Compute both results first, then
-    // store, so a dependency where opY reads opX's dst sees the old value.
-    unsafe fn emit_vopd(&self, i: &VOPD) {
-        // VOPD destination encoding: the X op uses vdstx directly; the Y op's
-        // real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1) (opposite parity of X).
-        let dx = i.vdstx as u32;
-        let dy = ((i.vdsty as u32) << 1) | ((dx & 1) ^ 1);
-        // Both halves read their inputs (incl. old dst for FMAC) before either writes.
-        let rx = self.eval_vopd_half(i.opx, &i.src0x, i.vsrc1x, dx, i.literal_constant);
-        let ry = self.eval_vopd_half(i.opy, &i.src0y, i.vsrc1y, dy, i.literal_constant);
-        self.st_vgpr32(dx, rx);
-        self.st_vgpr32(dy, ry);
-    }
-    unsafe fn eval_vopd_half(&self, op: I, src0: &SourceOperand, vsrc1: u8, dst: u32, lit: Option<u32>) -> LLVMValueRef {
-        let s0 = self.src_u32(src0);
-        let f32b = |cg: &Cg, r: u32| unsafe { llvm::core::LLVMBuildBitCast(cg.b, cg.ld_vgpr32(r), cg.f32t, cg.n()) };
-        let fma3 = |cg: &Cg, a, b, c| unsafe { cg.call("llvm.fma.f32", cg.f32t, &[cg.f32t, cg.f32t, cg.f32t], &[a, b, c]) };
-        match op {
-            I::V_DUAL_MOV_B32 => s0,
-            I::V_DUAL_AND_B32 => self.b_and(s0, self.ld_vgpr32(vsrc1 as u32)),
-            I::V_DUAL_ADD_NC_U32 => self.b_add(s0, self.ld_vgpr32(vsrc1 as u32)),
-            I::V_DUAL_LSHLREV_B32 => self.shl(self.ld_vgpr32(vsrc1 as u32), s0),
-            I::V_DUAL_CNDMASK_B32 => {
-                let s1 = self.ld_vgpr32(vsrc1 as u32);
-                let c = self.vcc_bit();
-                llvm::core::LLVMBuildSelect(self.b, c, s1, s0, self.n())
-            }
-            I::V_DUAL_MUL_F32 => self.f32_bits(self.fmul_f32(self.src_f32(src0), f32b(self, vsrc1 as u32))),
-            I::V_DUAL_ADD_F32 => self.f32_bits(llvm::core::LLVMBuildFAdd(self.b, self.src_f32(src0), f32b(self, vsrc1 as u32), self.n())),
-            I::V_DUAL_SUB_F32 => self.f32_bits(llvm::core::LLVMBuildFSub(self.b, self.src_f32(src0), f32b(self, vsrc1 as u32), self.n())),
-            I::V_DUAL_SUBREV_F32 => self.f32_bits(llvm::core::LLVMBuildFSub(self.b, f32b(self, vsrc1 as u32), self.src_f32(src0), self.n())),
-            I::V_DUAL_FMAC_F32 => self.f32_bits(fma3(self, self.src_f32(src0), f32b(self, vsrc1 as u32), f32b(self, dst))),
-            I::V_DUAL_FMAMK_F32 => {
-                let k = llvm::core::LLVMConstBitCast(self.ci32(lit.unwrap()), self.f32t);
-                self.f32_bits(fma3(self, self.src_f32(src0), k, f32b(self, vsrc1 as u32)))
-            }
-            I::V_DUAL_FMAAK_F32 => {
-                let k = llvm::core::LLVMConstBitCast(self.ci32(lit.unwrap()), self.f32t);
-                self.f32_bits(fma3(self, self.src_f32(src0), f32b(self, vsrc1 as u32), k))
-            }
-            _ => panic!("scalar: unsupported VOPD half {:?}", op),
-        }
-    }
-
     // ---- SOP1 ------------------------------------------------------------
     unsafe fn emit_sop1(&self, i: &SOP1) {
         match i.op {
             I::S_MOV_B32 => {
                 let v = self.src_u32(&i.ssrc0);
                 self.st_sgpr32(i.sdst as u32, v);
-            }
-            I::S_MOV_B64 => {
-                let v = self.src_u64(&i.ssrc0);
-                self.st_sgpr64(i.sdst as u32, v);
             }
             I::S_AND_SAVEEXEC_B32 => {
                 let s0 = self.src_u32(&i.ssrc0);
@@ -1518,30 +930,6 @@ impl Cg {
                 self.st_sgpr32(EXEC, ne);
                 self.st_scc_nz(ne);
             }
-            I::S_CTZ_I32_B32 => {
-                let x = self.src_u32(&i.ssrc0);
-                // cttz(x, is_zero_undef=false) yields 32 for x==0; s_ctz wants -1.
-                let tz = self.call("llvm.cttz.i32", self.i32t, &[self.i32t, self.i1], &[x, llvm::core::LLVMConstInt(self.i1, 0, 0)]);
-                let is0 = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntEQ, x, self.ci32(0), self.n());
-                let r = llvm::core::LLVMBuildSelect(self.b, is0, self.ci32(0xFFFF_FFFF), tz, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-            }
-            I::S_CVT_F32_I32 => {
-                let f = llvm::core::LLVMBuildSIToFP(self.b, self.src_u32(&i.ssrc0), self.f32t, self.n());
-                self.st_sgpr32(i.sdst as u32, self.f32_bits(f));
-            }
-            I::S_CVT_F32_U32 => {
-                let f = llvm::core::LLVMBuildUIToFP(self.b, self.src_u32(&i.ssrc0), self.f32t, self.n());
-                self.st_sgpr32(i.sdst as u32, self.f32_bits(f));
-            }
-            I::S_CVT_I32_F32 => {
-                let v = self.call("llvm.fptosi.sat.i32.f32", self.i32t, &[self.f32t], &[self.src_f32(&i.ssrc0)]);
-                self.st_sgpr32(i.sdst as u32, v);
-            }
-            I::S_CVT_U32_F32 => {
-                let v = self.call("llvm.fptoui.sat.i32.f32", self.i32t, &[self.f32t], &[self.src_f32(&i.ssrc0)]);
-                self.st_sgpr32(i.sdst as u32, v);
-            }
             _ => panic!("scalar: unsupported SOP1 {:?}", i.op),
         }
     }
@@ -1549,52 +937,6 @@ impl Cg {
     // ---- SOP2 ------------------------------------------------------------
     unsafe fn emit_sop2(&self, i: &SOP2) {
         match i.op {
-            I::S_ADD_U32 => {
-                // Unsigned add: SCC = carry-out (ISA §S_ADD_U32).
-                let a = self.zext64(self.src_u32(&i.ssrc0));
-                let b = self.zext64(self.src_u32(&i.ssrc1));
-                let sum = self.b_add(a, b);
-                let lo = llvm::core::LLVMBuildTrunc(self.b, sum, self.i32t, self.n());
-                self.st_sgpr32(i.sdst as u32, lo);
-                let cout = llvm::core::LLVMBuildLShr(self.b, sum, self.ci64(32), self.n());
-                let cout = llvm::core::LLVMBuildTrunc(self.b, cout, self.i32t, self.n());
-                self.st_scc_nz(cout);
-            }
-            I::S_ADD_CO_I32 | I::S_ADD_I32 => {
-                // Signed add: SCC = signed OVERFLOW (ISA §S_ADD_CO_I32), not carry.
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let ov = self.call(
-                    "llvm.sadd.with.overflow.i32",
-                    llvm::core::LLVMStructTypeInContext(self.ctx, [self.i32t, self.i1].as_mut_ptr(), 2, 0),
-                    &[self.i32t, self.i32t],
-                    &[a, b],
-                );
-                let r = llvm::core::LLVMBuildExtractValue(self.b, ov, 0, self.n());
-                let c = llvm::core::LLVMBuildExtractValue(self.b, ov, 1, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(c);
-            }
-            I::S_SUB_CO_I32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let ov = self.call(
-                    "llvm.ssub.with.overflow.i32",
-                    llvm::core::LLVMStructTypeInContext(self.ctx, [self.i32t, self.i1].as_mut_ptr(), 2, 0),
-                    &[self.i32t, self.i32t],
-                    &[a, b],
-                );
-                let r = llvm::core::LLVMBuildExtractValue(self.b, ov, 0, self.n());
-                let c = llvm::core::LLVMBuildExtractValue(self.b, ov, 1, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(c);
-            }
-            I::S_ADD_NC_U64 => {
-                let a = self.src_u64(&i.ssrc0);
-                let b = self.src_u64(&i.ssrc1);
-                let r = self.b_add(a, b);
-                self.st_sgpr64(i.sdst as u32, r);
-            }
             I::S_AND_B32 => {
                 let a = self.src_u32(&i.ssrc0);
                 let b = self.src_u32(&i.ssrc1);
@@ -1661,75 +1003,6 @@ impl Cg {
                 }
             }
             I::S_OR_NOT1_B32 => self.sop2_logic(i, |c, a, b| c.b_or(a, c.b_not(b))),
-            I::S_LSHR_B32 => self.sop2_logic(i, |c, a, b| c.lshr(a, b)),
-            I::S_LSHL_B32 => self.sop2_logic(i, |c, a, b| c.shl(a, b)),
-            I::S_BFM_B32 => {
-                let width = self.b_and(self.src_u32(&i.ssrc0), self.ci32(31));
-                let offset = self.b_and(self.src_u32(&i.ssrc1), self.ci32(31));
-                let ones = llvm::core::LLVMBuildSub(
-                    self.b,
-                    llvm::core::LLVMBuildShl(self.b, self.ci32(1), width, self.n()),
-                    self.ci32(1),
-                    self.n(),
-                );
-                let r = llvm::core::LLVMBuildShl(self.b, ones, offset, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-            }
-            I::S_BFE_U32 => {
-                let data = self.src_u32(&i.ssrc0);
-                let control = self.src_u32(&i.ssrc1);
-                let offset = self.b_and(control, self.ci32(0x1f));
-                let width = self.b_and(
-                    llvm::core::LLVMBuildLShr(self.b, control, self.ci32(16), self.n()),
-                    self.ci32(0x7f),
-                );
-                let shifted = llvm::core::LLVMBuildLShr(self.b, data, offset, self.n());
-                let mask = llvm::core::LLVMBuildSub(
-                    self.b,
-                    llvm::core::LLVMBuildShl(self.b, self.ci32(1), width, self.n()),
-                    self.ci32(1),
-                    self.n(),
-                );
-                let r = self.b_and(shifted, mask);
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc_nz(r);
-            }
-            I::S_CSELECT_B32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let c = self.ld_scc();
-                let r = llvm::core::LLVMBuildSelect(self.b, c, a, b, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-            }
-            I::S_MUL_I32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let r = llvm::core::LLVMBuildMul(self.b, a, b, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-            }
-            I::S_MUL_HI_U32 => {
-                let a = self.zext64(self.src_u32(&i.ssrc0));
-                let b = self.zext64(self.src_u32(&i.ssrc1));
-                let prod = llvm::core::LLVMBuildMul(self.b, a, b, self.n());
-                let hi = llvm::core::LLVMBuildLShr(self.b, prod, self.ci64(32), self.n());
-                self.st_sgpr32(i.sdst as u32, llvm::core::LLVMBuildTrunc(self.b, hi, self.i32t, self.n()));
-            }
-            I::S_LSHL_B64 => {
-                let a = self.src_u64(&i.ssrc0);
-                let amt = llvm::core::LLVMBuildAnd(self.b, self.src_u64(&i.ssrc1), self.ci64(63), self.n());
-                let r = llvm::core::LLVMBuildShl(self.b, a, amt, self.n());
-                self.st_sgpr64(i.sdst as u32, r);
-                let nz = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, r, self.ci64(0), self.n());
-                self.st_scc(nz);
-            }
-            I::S_MAX_U32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntUGT, a, b, self.n());
-                let r = llvm::core::LLVMBuildSelect(self.b, c, a, b, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(c);
-            }
             _ => panic!("scalar: unsupported SOP2 {:?}", i.op),
         }
     }
@@ -1741,52 +1014,6 @@ impl Cg {
         self.st_scc_nz(r);
     }
 
-    // ---- SOPK ------------------------------------------------------------
-    unsafe fn emit_sopk(&self, i: &SOPK) {
-        use llvm::LLVMIntPredicate::*;
-        let imm = self.ci32(i.simm16 as i16 as i32 as u32);
-        match i.op {
-            I::S_MOVK_I32 => self.st_sgpr32(i.sdst as u32, imm),
-            I::S_CMOVK_I32 => {
-                let scc = self.ld_scc();
-                let old = self.ld_sgpr32(i.sdst as u32);
-                let nv = llvm::core::LLVMBuildSelect(self.b, scc, imm, old, self.n());
-                self.st_sgpr32(i.sdst as u32, nv);
-            }
-            I::S_ADDK_I32 => {
-                let a = self.ld_sgpr32(i.sdst as u32);
-                let sum = self.call(
-                    "llvm.sadd.with.overflow.i32",
-                    llvm::core::LLVMStructTypeInContext(self.ctx, [self.i32t, self.i1].as_ptr() as *mut _, 2, 0),
-                    &[self.i32t, self.i32t], &[a, imm],
-                );
-                let r = llvm::core::LLVMBuildExtractValue(self.b, sum, 0, self.n());
-                let ov = llvm::core::LLVMBuildExtractValue(self.b, sum, 1, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(ov);
-            }
-            I::S_MULK_I32 => {
-                let a = self.ld_sgpr32(i.sdst as u32);
-                self.st_sgpr32(i.sdst as u32, llvm::core::LLVMBuildMul(self.b, a, imm, self.n()));
-            }
-            I::S_CMPK_EQ_I32 | I::S_CMPK_LG_I32 | I::S_CMPK_GT_I32 | I::S_CMPK_GE_I32
-            | I::S_CMPK_LT_I32 | I::S_CMPK_LE_I32 | I::S_CMPK_EQ_U32 | I::S_CMPK_LG_U32
-            | I::S_CMPK_GT_U32 | I::S_CMPK_GE_U32 | I::S_CMPK_LT_U32 | I::S_CMPK_LE_U32 => {
-                let a = self.ld_sgpr32(i.sdst as u32);
-                let p = match i.op {
-                    I::S_CMPK_EQ_I32 => LLVMIntEQ, I::S_CMPK_LG_I32 => LLVMIntNE,
-                    I::S_CMPK_GT_I32 => LLVMIntSGT, I::S_CMPK_GE_I32 => LLVMIntSGE,
-                    I::S_CMPK_LT_I32 => LLVMIntSLT, I::S_CMPK_LE_I32 => LLVMIntSLE,
-                    I::S_CMPK_EQ_U32 => LLVMIntEQ, I::S_CMPK_LG_U32 => LLVMIntNE,
-                    I::S_CMPK_GT_U32 => LLVMIntUGT, I::S_CMPK_GE_U32 => LLVMIntUGE,
-                    I::S_CMPK_LT_U32 => LLVMIntULT, _ => LLVMIntULE,
-                };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, imm, self.n());
-                self.st_scc(c);
-            }
-            _ => panic!("scalar: unsupported SOPK {:?}", i.op),
-        }
-    }
 
     // ---- VFLAT (flat load/store): flat addressing matches the global path.
 
@@ -1829,52 +1056,6 @@ impl Cg {
         }
     }
 
-    // ---- SOPC (scalar compare -> SCC) -----------------------------------
-    unsafe fn emit_sopc(&self, i: &crate::rdna_instructions::SOPC) {
-        use llvm::LLVMIntPredicate::*;
-        match i.op {
-            I::S_CMP_EQ_U32 | I::S_CMP_LG_U32 | I::S_CMP_GT_U32 | I::S_CMP_LT_U32
-            | I::S_CMP_GE_U32 | I::S_CMP_LE_U32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let p = match i.op {
-                    I::S_CMP_EQ_U32 => LLVMIntEQ,
-                    I::S_CMP_LG_U32 => LLVMIntNE,
-                    I::S_CMP_GT_U32 => LLVMIntUGT,
-                    I::S_CMP_LT_U32 => LLVMIntULT,
-                    I::S_CMP_GE_U32 => LLVMIntUGE,
-                    I::S_CMP_LE_U32 => LLVMIntULE,
-                    _ => unreachable!(),
-                };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, b, self.n());
-                self.st_scc(c);
-            }
-            I::S_CMP_LT_I32 | I::S_CMP_GT_I32 | I::S_CMP_GE_I32 | I::S_CMP_LE_I32
-            | I::S_CMP_EQ_I32 | I::S_CMP_LG_I32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let p = match i.op {
-                    I::S_CMP_LT_I32 => LLVMIntSLT,
-                    I::S_CMP_GT_I32 => LLVMIntSGT,
-                    I::S_CMP_GE_I32 => LLVMIntSGE,
-                    I::S_CMP_LE_I32 => LLVMIntSLE,
-                    I::S_CMP_EQ_I32 => LLVMIntEQ,
-                    I::S_CMP_LG_I32 => LLVMIntNE,
-                    _ => unreachable!(),
-                };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, b, self.n());
-                self.st_scc(c);
-            }
-            I::S_CMP_EQ_U64 | I::S_CMP_LG_U64 => {
-                let a = self.src_u64(&i.ssrc0);
-                let b = self.src_u64(&i.ssrc1);
-                let p = if matches!(i.op, I::S_CMP_EQ_U64) { LLVMIntEQ } else { LLVMIntNE };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, b, self.n());
-                self.st_scc(c);
-            }
-            _ => panic!("scalar: unsupported SOPC {:?}", i.op),
-        }
-    }
 
     // ---- SMEM (scalar load) ---------------------------------------------
 
@@ -1888,52 +1069,7 @@ impl Cg {
     // address is simply `scratch_base + saddr + ioffset` (bytes).
 
 
-    // ---- VSAMPLE (texture sample) ---------------------------------------
-    unsafe fn emit_vsample(&self, i: &VSAMPLE) {
-        match i.op {
-            I::IMAGE_SAMPLE_LZ => {
-                let bits_to_f32 = |r: u32| -> LLVMValueRef {
-                    llvm::core::LLVMBuildBitCast(self.b, self.ld_vgpr32(r), self.f32t, self.n())
-                };
-                let params = [
-                    self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.i32t, self.i32t, self.f32t, self.f32t,
-                ];
-                // The helper answers for one component of the fetch, and the
-                // components the DMASK asks for go to consecutive registers.
-                let mut vdata = i.vdata as u32;
-                for component in 0..4 {
-                    if i.dmask & (1 << component) == 0 {
-                        continue;
-                    }
-                    let args = [
-                        self.ld_sgpr32(i.rsrc as u32),
-                        self.ld_sgpr32(i.rsrc as u32 + 1),
-                        self.ld_sgpr32(i.rsrc as u32 + 2),
-                        self.ld_sgpr32(i.rsrc as u32 + 3),
-                        self.ld_sgpr32(i.rsrc as u32 + 4),
-                        self.ld_sgpr32(i.rsrc as u32 + 5),
-                        self.ld_sgpr32(i.rsrc as u32 + 6),
-                        self.ld_sgpr32(i.rsrc as u32 + 7),
-                        self.ld_sgpr32(i.samp as u32),
-                        self.ld_sgpr32(i.samp as u32 + 1),
-                        self.ld_sgpr32(i.samp as u32 + 2),
-                        self.ld_sgpr32(i.samp as u32 + 3),
-                        self.ci32(component as u32),
-                        self.ci32(i.unrm as u32),
-                        bits_to_f32(i.vaddr0 as u32),
-                        bits_to_f32(i.vaddr1 as u32),
-                    ];
-                    let data = self.call("image_sample_lz", self.i32t, &params, &args);
-                    self.st_vgpr32(vdata, data);
-                    vdata += 1;
-                }
-            }
-            _ => panic!("scalar: unsupported VSAMPLE {:?}", i.op),
-        }
-    }
+
 
     // ---- DS (workgroup shared Lcooperative path only) ----------------
 
@@ -1997,12 +1133,17 @@ fn vreg_of(op: &SourceOperand) -> Option<u32> {
 impl Cg {
     unsafe fn typed_input(&self, input: &super::lift::Input) -> LLVMValueRef {
         use super::ir::typed::Ty;
+        if let super::lift::InputSource::PacketMaskAny(reg) = input.source {
+            let word = self.b_and(self.ld_sgpr32(reg), self.ci32(1));
+            return llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, word, self.ci32(0), self.n());
+        }
+        if matches!(input.source, super::lift::InputSource::Scc) { return self.ld_scc(); }
         match input.ty {
-            Ty::I1 => llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, self.b_and(self.src_u32(&input.source), self.ci32(1)), self.ci32(0), self.n()),
-            Ty::I32 => self.src_u32(&input.source),
-            Ty::I64 => self.src_u64(&input.source),
-            Ty::F32 => self.src_f32(&input.source),
-            Ty::F64 => self.src_f64(&input.source),
+            Ty::I1 => llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, self.b_and(self.src_u32(input.source.operand()), self.ci32(1)), self.ci32(0), self.n()),
+            Ty::I32 => self.src_u32(input.source.operand()),
+            Ty::I64 => self.src_u64(input.source.operand()),
+            Ty::F32 => self.src_f32(input.source.operand()),
+            Ty::F64 => self.src_f64(input.source.operand()),
         }
     }
     unsafe fn typed_output(&self, output: super::lift::Output, result: LLVMValueRef) {
@@ -2014,6 +1155,13 @@ impl Cg {
             Output::Vgpr(reg, Ty::F32) => self.st_vgpr32(reg, self.f32_bits(result)),
             Output::Vgpr(reg, Ty::F64) => self.st_vgpr_f64(reg, result),
             Output::Compare(reg) => self.st_cmp(reg, result),
+            Output::Mask(reg) => self.st_mask(reg, result),
+            Output::Scalar(reg, Ty::I32) => self.st_sgpr32(reg, result),
+            Output::Scalar(reg, Ty::I64) => self.st_sgpr64(reg, result),
+            Output::Scalar(reg, Ty::F32) => self.st_sgpr32(reg, self.f32_bits(result)),
+            Output::Scalar(reg, Ty::F64) => self.st_sgpr64(reg, llvm::core::LLVMBuildBitCast(self.b, result, self.i64t, self.n())),
+            Output::Scc => self.st_scc(result),
+            Output::Scalar(_, Ty::I1) => unreachable!("boolean SGPR output"),
             Output::Vgpr(_, Ty::I1) => unreachable!("boolean VGPR output"),
         }
     }

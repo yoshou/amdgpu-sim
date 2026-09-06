@@ -20,13 +20,14 @@
 use std::collections::BTreeMap;
 use std::thread;
 
+#[cfg(test)]
 use half::f16;
 
 use crate::processor::KernelDescriptor;
 use crate::rdna_instructions::SourceOperand;
 
 use super::dispatch::{setup_sgprs, GridDims};
-use super::emit::{CoopKernel, COOP_DONE, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
+use super::emit::{CoopKernel, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 #[cfg(test)]
 use super::boundary::RegSet;
 use super::emit_vec::CoopVecKernel;
@@ -35,57 +36,14 @@ use super::ir::ScalarProgram;
 
 const WAVE: usize = 32;
 const EXEC: usize = 126;
-const SCC: usize = 128; // persisted-SCC slot (see emit.rs COOP_SGPR_BUF)
 
 pub use super::lift::wave::YieldAction as XlaneOp;
+#[cfg(test)]
 use super::lift::wave::Destination;
+#[cfg(test)]
 use super::lift::wave::Operand;
+#[cfg(test)]
 use super::ir::typed::effect::{EffectOp, WaveOp};
-
-/// Compact host lowering of verified wave effects. Resolve operand bindings
-/// once when compiling; the hot scheduler need not walk SSA adapter vectors.
-#[derive(Clone)]
-pub(crate) enum PacketWave {
-    ReadLane { dst: u32, value: SourceOperand, lane: SourceOperand },
-    WriteLane { dst: u32, value: SourceOperand, lane: SourceOperand },
-    Wmma { d: u32, a: u32, b: u32, c: u32 },
-    General(Box<XlaneOp>),
-}
-
-impl PacketWave {
-    pub(crate) fn lower(action: &XlaneOp) -> Self {
-        if let Some((d,a,b,c)) = action.wmma_registers() { return Self::Wmma { d,a,b,c }; }
-        if let [Operand::Source(value), Operand::Source(lane), ..] = action.inputs.as_slice() {
-            match (action.op, action.outputs.first()) {
-                (EffectOp::Wave(WaveOp::ReadLane), Some(Destination::Sgpr(dst))) if action.inputs[1].is_uniform() =>
-                    return Self::ReadLane { dst: *dst, value: value.clone(), lane: lane.clone() },
-                (EffectOp::Wave(WaveOp::WriteLane), Some(Destination::Vgpr(dst))) =>
-                    return Self::WriteLane { dst: *dst, value: value.clone(), lane: lane.clone() },
-                _ => {}
-            }
-        }
-        Self::General(Box::new(action.clone()))
-    }
-
-    fn apply(&self, width: usize, valid: u32, sgprs: &mut [[u32; COOP_SGPR_BUF]], vgprs: &mut [Vec<u32>]) {
-        match self {
-            Self::ReadLane { dst, value, lane } => {
-                // Dispatch validity is a nonempty prefix of the wave. Uniform
-                // operands belong to packet zero, independently of width.
-                let lane = (eval_uniform(sgprs,lane) & 31) as usize;
-                let value = if valid >> lane & 1 != 0 { eval_vector_packets(sgprs,vgprs,width,lane,value) } else { 0 };
-                for s in sgprs { write_sgpr(s,*dst as usize,value); }
-            }
-            Self::WriteLane { dst, value, lane } => {
-                let lane = (eval_uniform(sgprs,lane) & 31) as usize;
-                let value = eval_uniform(sgprs,value);
-                if valid >> lane & 1 != 0 { set_packet_vgpr(vgprs,width,lane,*dst as usize,value); }
-            }
-            Self::Wmma { d,a,b,c } => wmma_apply_packets(*d as usize,*a as usize,*b as usize,*c as usize,width,vgprs),
-            Self::General(action) => apply_xlane_packets(action,width,valid,sgprs,vgprs),
-        }
-    }
-}
 
 pub(super) fn eval_uniform<const N: usize>(sgprs: &[[u32; N]], source: &SourceOperand) -> u32 {
     match source {
@@ -105,180 +63,11 @@ pub fn split_at_xlane(program: &ScalarProgram) -> (ScalarProgram, BTreeMap<usize
 /// the boundary IO derived from the program's typed yields.
 pub fn compile_xlane_vec(
     program: &ScalarProgram,
-    xlane: &BTreeMap<usize, XlaneOp>,
+    _xlane: &BTreeMap<usize, XlaneOp>,
     num_vgprs: usize,
     width: u32,
 ) -> CoopVecKernel {
-    if xlane.values().any(|op| op.wmma_registers().is_some()) {
-        // Build the boundary apply here, not on the dispatch's first yield.
-        super::wmma::warm(width as usize);
-    }
-    super::compiler::Compiler.compile_cooperative_vec(program, num_vgprs, width)
-}
-
-// ---- wave-level op application (on the 32 lanes' persisted register state) ----
-
-fn write_sgpr(sgprs: &mut [u32; COOP_SGPR_BUF], idx: usize, value: u32) {
-    if idx == 124 || idx == 125 {
-        return; // null / m0 conventions — never a real destination
-    }
-    sgprs[idx] = value;
-}
-
-
-fn eval_vector(sgprs: &[[u32; COOP_SGPR_BUF]], vgprs: &[Vec<u32>], lane: usize, op: &SourceOperand) -> u32 {
-    match op {
-        SourceOperand::LiteralConstant(v) => *v,
-        SourceOperand::IntegerConstant(v) => *v as u32,
-        SourceOperand::FloatConstant(v) => (*v as f32).to_bits(),
-        SourceOperand::ScalarRegister(r) => sgprs[lane][*r as usize],
-        SourceOperand::VectorRegister(r) => vgprs[lane][*r as usize],
-        SourceOperand::PrivateBase => panic!("vector boundary operand reads private base"),
-    }
-}
-
-/// `v_wmma_f32_16x16x16_f16`: bit-layout port of the masked interpreter's
-/// `RDNAProcessor::v_wmma_f32_16x16x16_f16`, over the 32 lanes' VGPR state. The
-/// interpreter ignores EXEC here, so all lanes are read and written.
-fn wmma_apply(vdst: usize, a: usize, b: usize, c: usize, vgprs: &mut [Vec<u32>]) {
-    let lanes = vgprs.len().min(WAVE);
-    let frag_f16 = |lane: usize, base: usize, m: usize| -> f32 {
-        let word = vgprs[lane][base + m / 2];
-        let bits = if m % 2 == 0 { (word & 0xffff) as u16 } else { (word >> 16) as u16 };
-        f16::from_bits(bits).to_f32()
-    };
-
-    let mut mat_a = [0f32; 256];
-    let mut mat_b = [0f32; 256];
-    let mut mat_c = [0f32; 256];
-    for e in 0..lanes {
-        for i in 0..2 {
-            for j in 0..2 {
-                for k in 0..2 {
-                    let elem = k + j * 2 + i * 4;
-                    let col = (k + j * 2 + i * 8) + (e / 16) * 4;
-                    let row = e % 16;
-                    mat_a[row * 16 + col] = frag_f16(e, a, elem);
-                    let row_b = (k + j * 2 + i * 8) + (e / 16) * 4;
-                    let col_b = e % 16;
-                    mat_b[row_b * 16 + col_b] = frag_f16(e, b, elem);
-                }
-            }
-        }
-        for m in 0..8 {
-            let row = m + (e / 16) * 8;
-            let col = e % 16;
-            mat_c[row * 16 + col] = f32::from_bits(vgprs[e][c + m]);
-        }
-    }
-
-    let mut mat_d = [0f32; 256];
-    for i in 0..16 {
-        for j in 0..16 {
-            let mut acc = mat_c[i * 16 + j];
-            for k in 0..16 {
-                acc += mat_a[i * 16 + k] * mat_b[k * 16 + j];
-            }
-            mat_d[i * 16 + j] = acc;
-        }
-    }
-
-    for e in 0..lanes {
-        for m in 0..8 {
-            let row = m + (e / 16) * 8;
-            let col = e % 16;
-            vgprs[e][vdst + m] = mat_d[row * 16 + col].to_bits();
-        }
-    }
-}
-
-pub(super) fn apply_xlane(op: &XlaneOp, valid: u32, sgprs: &mut [[u32; COOP_SGPR_BUF]], vgprs: &mut [Vec<u32>]) {
-    if let Some((d,a,b,c)) = op.wmma_registers() { wmma_apply(d as usize,a as usize,b as usize,c as usize,vgprs);return; }
-    if let Some((dest, lane, value)) = op.uniform_lane_access(valid, |lane,s|eval_vector(sgprs,vgprs,lane,s)) {
-        match dest {
-            Destination::Sgpr(r) => for lane in 0..32 { if valid >> lane & 1 != 0 { write_sgpr(&mut sgprs[lane],r as usize,value); } },
-            Destination::Vgpr(r) => if valid >> lane & 1 != 0 { vgprs[lane][r as usize]=value; },
-            Destination::Scc => unreachable!(),
-        }
-        return;
-    }
-    let results=op.evaluate(valid, |lane,s|eval_vector(sgprs,vgprs,lane,s), |lane|sgprs[lane][EXEC]&1!=0);
-    for (dest,result) in op.outputs.iter().zip(results) {
-        for lane in 0..32 {if op.writes_lane(lane,valid,sgprs[lane][EXEC]&1!=0){match dest{
-            Destination::Vgpr(r)=>vgprs[lane][*r as usize]=result[lane],
-            Destination::Sgpr(r)=>write_sgpr(&mut sgprs[lane],*r as usize,result[lane]),
-            Destination::Scc=>sgprs[lane][SCC]=result[lane],
-        }}}
-    }
-}
-
-fn packet_vgpr(vgprs: &[Vec<u32>], width: usize, lane: usize, reg: usize) -> u32 {
-    let packet = lane / width;
-    let packet_lane = lane % width;
-    vgprs[packet][reg * width + packet_lane]
-}
-
-fn set_packet_vgpr(
-    vgprs: &mut [Vec<u32>],
-    width: usize,
-    lane: usize,
-    reg: usize,
-    value: u32,
-) {
-    let packet = lane / width;
-    let packet_lane = lane % width;
-    vgprs[packet][reg * width + packet_lane] = value;
-}
-
-fn eval_vector_packets(
-    sgprs: &[[u32; COOP_SGPR_BUF]],
-    vgprs: &[Vec<u32>],
-    width: usize,
-    lane: usize,
-    op: &SourceOperand,
-) -> u32 {
-    match op {
-        SourceOperand::LiteralConstant(v) => *v,
-        SourceOperand::IntegerConstant(v) => *v as u32,
-        SourceOperand::FloatConstant(v) => (*v as f32).to_bits(),
-        SourceOperand::ScalarRegister(r) => sgprs[lane / width][*r as usize],
-        SourceOperand::VectorRegister(r) => packet_vgpr(vgprs, width, lane, *r as usize),
-        SourceOperand::PrivateBase => panic!("vector boundary operand reads private base"),
-    }
-}
-
-fn wmma_apply_packets(
-    vdst: usize,
-    a: usize,
-    b: usize,
-    c: usize,
-    width: usize,
-    vgprs: &mut [Vec<u32>],
-) {
-    // One fused JIT pass over the packet arrays (see [`super::wmma`]). It
-    // performs the same float operations in the same order as `wmma_apply`
-    // above, which the layout test below checks bit for bit.
-    super::wmma::apply(vdst as u32, a as u32, b as u32, c as u32, width, vgprs);
-}
-
-pub(super) fn apply_xlane_packets(op: &XlaneOp, width: usize, valid: u32, sgprs: &mut [[u32; COOP_SGPR_BUF]], vgprs: &mut [Vec<u32>]) {
-    if let Some((d,a,b,c))=op.wmma_registers(){wmma_apply_packets(d as usize,a as usize,b as usize,c as usize,width,vgprs);return;}
-    if let Some((dest, lane, value)) = op.uniform_lane_access(valid, |lane,s|eval_vector_packets(sgprs,vgprs,width,lane,s)) {
-        match dest {
-            Destination::Sgpr(r) => for (packet,s) in sgprs.iter_mut().enumerate() { if valid >> (packet*width) & ((1u64<<width)-1) as u32 != 0 { write_sgpr(s,r as usize,value); } },
-            Destination::Vgpr(r) => if valid >> lane & 1 != 0 { set_packet_vgpr(vgprs,width,lane,r as usize,value); },
-            Destination::Scc => unreachable!(),
-        }
-        return;
-    }
-    let results=op.evaluate(valid,|lane,s|eval_vector_packets(sgprs,vgprs,width,lane,s),|lane|sgprs[lane/width][EXEC]>>(lane%width)&1!=0);
-    for (dest,result) in op.outputs.iter().zip(results){
-        for lane in 0..32 {if op.writes_lane(lane,valid,sgprs[lane/width][EXEC]>>(lane%width)&1!=0){match dest{
-            Destination::Vgpr(r)=>set_packet_vgpr(vgprs,width,lane,*r as usize,result[lane]),
-            Destination::Sgpr(r)=>{if lane%width==0{write_sgpr(&mut sgprs[lane/width],*r as usize,result[lane]);}},
-            Destination::Scc=>sgprs[lane/width][SCC]=result[lane],
-        }}}
-    }
+    super::compiler::Compiler::default().compile_cooperative_vec(program, num_vgprs, width)
 }
 
 /// Run a cross-lane cooperative kernel over the whole grid, one 32-lane wavefront
@@ -294,141 +83,13 @@ pub fn dispatch_xlane(
     private_segment_size: u32,
     num_threads: usize,
 ) {
-    let num_threads = num_threads.max(1);
-
-    let wg_size = dims.workgroup_size() as usize;
-    let waves_per_wg = (wg_size + WAVE - 1) / WAVE;
-    let num_wg = (dims.num_wg_x * dims.num_wg_y * dims.num_wg_z) as u64;
-    let total_waves = num_wg * waves_per_wg as u64;
-    let num_vgprs = kernel.num_vgprs.max(1);
-    let scratch_u64 = (private_segment_size as usize / 8) + 2;
-    let entry_pc = kernel.entry_pc as u64;
-
-    thread::scope(|scope| {
-        for tid in 0..num_threads {
-            let kernel = &kernel;
-            let kd = &kd;
-            let dims = dims;
-            scope.spawn(move || {
-                let mut sgprs: Vec<[u32; COOP_SGPR_BUF]> = vec![[0u32; COOP_SGPR_BUF]; WAVE];
-                let mut vgprs: Vec<Vec<u32>> = vec![vec![0u32; num_vgprs]; WAVE];
-                let mut scratch: Vec<Vec<u64>> = vec![vec![0u64; scratch_u64]; WAVE];
-                let mut spill: Vec<[u32; COOP_SPILL_SLOTS]> = vec![[0u32; COOP_SPILL_SLOTS]; WAVE];
-                let mut resume: Vec<u64> = vec![0; WAVE];
-                let mut done: Vec<bool> = vec![true; WAVE];
-                // This backend targets kernels without LDS; a zeroed dummy buffer
-                // satisfies the CoopKernel signature's `lds` parameter.
-                let lds = [0u8; 16];
-                let lds_base = lds.as_ptr() as u64;
-
-                let mut wave = tid as u64;
-                while wave < total_waves {
-                    let wg = wave / waves_per_wg as u64;
-                    let wave_in_wg = (wave % waves_per_wg as u64) as usize;
-                    let local_base = wave_in_wg * WAVE;
-                    let wg_id = (
-                        (wg % dims.num_wg_x as u64) as u32,
-                        ((wg / dims.num_wg_x as u64) % dims.num_wg_y as u64) as u32,
-                        ((wg / (dims.num_wg_x as u64 * dims.num_wg_y as u64)) % dims.num_wg_z as u64) as u32,
-                    );
-
-                    for lane in 0..WAVE {
-                        for v in vgprs[lane].iter_mut() {
-                            *v = 0;
-                        }
-                        for s in scratch[lane].iter_mut() {
-                            *s = 0;
-                        }
-                        spill[lane] = [0u32; COOP_SPILL_SLOTS];
-                        let local = local_base + lane;
-                        if local >= wg_size {
-                            done[lane] = true; // inactive tail lane of a partial wave
-                            continue;
-                        }
-                        let scratch_base = scratch[lane].as_ptr() as u64;
-                        let s = setup_sgprs(kd, kernarg_ptr, aql_packet_addr, scratch_base, private_segment_size, wg_id);
-                        sgprs[lane][..128].copy_from_slice(&s);
-                        sgprs[lane][EXEC] = 1;
-                        sgprs[lane][SCC] = 0;
-                        let lx = (local as u32) % dims.wg_x;
-                        let ly = ((local as u32) / dims.wg_x) % dims.wg_y;
-                        let lz = (local as u32) / (dims.wg_x * dims.wg_y);
-                        vgprs[lane][0] = lx | (ly << 10) | (lz << 20);
-                        resume[lane] = entry_pc;
-                        done[lane] = false;
-                    }
-
-                    // Round-robin: each pass advances every live lane to its next
-                    // yield (cross-lane boundary) or to s_endpgm; then the wave-level
-                    // op is applied before the next pass resumes them past it.
-                    let mut pass = 0u64;
-                    loop {
-                        let mut any = false;
-                        for lane in 0..WAVE {
-                            if done[lane] {
-                                continue;
-                            }
-                            any = true;
-                            let scratch_base = scratch[lane].as_ptr() as u64;
-                            let r = unsafe {
-                                kernel.run(
-                                    sgprs[lane].as_mut_ptr(),
-                                    vgprs[lane].as_mut_ptr(),
-                                    scratch_base,
-                                    lds_base,
-                                    spill[lane].as_mut_ptr(),
-                                    resume[lane],
-                                )
-                            };
-                            if r == COOP_DONE {
-                                done[lane] = true;
-                            } else {
-                                resume[lane] = r;
-                            }
-                        }
-                        if !any {
-                            break;
-                        }
-                        // All lanes still live yielded at a boundary this pass. For a
-                        // uniform boundary they share one resume pc; apply its op once.
-                        let mut yield_pc: Option<u64> = None;
-                        for lane in 0..WAVE {
-                            if done[lane] {
-                                continue;
-                            }
-                            match yield_pc {
-                                None => yield_pc = Some(resume[lane]),
-                                Some(p) if p != resume[lane] => panic!(
-                                    "dispatch_xlane: non-uniform cross-lane boundary (lane {} at {:#x}, others at {:#x})",
-                                    lane, resume[lane], p
-                                ),
-                                _ => {}
-                            }
-                        }
-                        if let Some(p) = yield_pc {
-                            let op = xlane.get(&(p as usize)).unwrap_or_else(|| {
-                                panic!("dispatch_xlane: yield at {:#x} has no cross-lane op", p)
-                            });
-                            let count=wg_size.saturating_sub(local_base).min(32);
-                            let valid=if count==32{u32::MAX}else{(1u32<<count)-1};
-                            apply_xlane(op, valid, &mut sgprs, &mut vgprs);
-                        }
-                        pass += 1;
-                        if pass > 1_000_000 {
-                            panic!("dispatch_xlane: wave {} did not converge ({} passes)", wave, pass);
-                        }
-                    }
-
-                    wave += num_threads as u64;
-                }
-            });
-        }
-    });
+    dispatch_xlane_vec(kernel, xlane, kd, kernarg_ptr, aql_packet_addr, dims,
+        private_segment_size, num_threads);
 }
 
 /// Packed counterpart of [`dispatch_xlane`]. Each CPU worker owns complete
 /// 32-lane waves; it advances all `32 / W` packets to a lifted cross-lane
-/// boundary, applies the operation once to their persisted SoA register state,
+/// boundary, applies the operation once to their typed argument/result frames,
 /// and resumes the packets. No packet of a wave is scheduled on another thread.
 pub fn dispatch_xlane_vec(
     kernel: &CoopVecKernel,
@@ -443,10 +104,10 @@ pub fn dispatch_xlane_vec(
     let width = kernel.width as usize;
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
     let wg_size = dims.workgroup_size() as usize;
-    let scratch_u64 = ((private_segment_size as usize / 8) + 2).max(kernel.min_private_bytes.div_ceil(8));
+    let scratch_u64 = (private_segment_size as usize).max(kernel.min_private_bytes).div_ceil(8);
     let dispatch = VecDispatch {
         kernel,
-        xlane: &kernel.packet_wave,
+        xlane: &kernel.yields,
         kd,
         kernarg_ptr,
         aql_packet_addr,
@@ -481,7 +142,7 @@ pub fn dispatch_xlane_vec(
 /// The wave-invariant half of [`dispatch_xlane_vec`].
 struct VecDispatch<'a> {
     kernel: &'a CoopVecKernel,
-    xlane: &'a BTreeMap<usize, PacketWave>,
+    xlane: &'a BTreeMap<usize, super::yield_values::YieldValues>,
     kd: &'a KernelDescriptor,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
@@ -524,7 +185,7 @@ impl VecDispatch<'_> {
             sgprs: vec![[0u32; COOP_SGPR_BUF]; packets],
             vgprs: (0..packets).map(|_| vec![0u32; self.kernel.num_vgprs * self.width]).collect(),
             spill: (0..packets).map(|_| vec![0u32; COOP_SPILL_SLOTS]).collect(),
-            fibers: (0..packets).map(|_| Fiber::new(FIBER_STACK_BYTES)).collect(),
+            fibers: Fiber::batch(packets, FIBER_STACK_BYTES),
             resume: vec![0; packets],
             done: vec![true; packets],
             scratch,
@@ -543,7 +204,7 @@ impl VecDispatch<'_> {
         );
 
         bufs.scratch.fill(0);
-        let scratch_base = bufs.scratch.as_ptr() as u64;
+        let scratch_base = if bufs.scratch.is_empty() { 0 } else { bufs.scratch.as_ptr() as u64 };
         let initial_sgprs = setup_sgprs(
             self.kd,
             self.kernarg_ptr,
@@ -615,7 +276,7 @@ impl VecDispatch<'_> {
                 });
                 let count=self.wg_size.saturating_sub((wave % self.waves_per_wg as u64) as usize*32).min(32);
                 let valid=if count==32{u32::MAX}else{(1u32<<count)-1};
-                op.apply(self.width, valid, &mut bufs.sgprs, &mut bufs.vgprs);
+                op.apply_wave(self.width, valid, &bufs.fibers);
             }
         }
     }
@@ -646,47 +307,78 @@ impl VecDispatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn wmma_apply(vdst: usize, a: usize, b: usize, c: usize, vgprs: &mut [Vec<u32>]) {
+        let lanes = vgprs.len().min(WAVE);
+        let frag_f16 = |lane: usize, base: usize, m: usize| -> f32 {
+            let word = vgprs[lane][base + m / 2];
+            let bits = if m % 2 == 0 { (word & 0xffff) as u16 } else { (word >> 16) as u16 };
+            f16::from_bits(bits).to_f32()
+        };
 
-    #[test]
-    fn prepared_lane_effects_match_wave_semantics_with_padding_and_overlap() {
-        for width in [1, 2, 4, 8, 16] {
-            for count in [23, 32] {
-                let valid = (u32::MAX as u64 >> (32-count)) as u32;
-                for selector in [0, 21, 31, 53] {
-                    let actions = [
-                        XlaneOp::new(EffectOp::Wave(WaveOp::ReadLane),
-                            vec![Operand::Source(SourceOperand::VectorRegister(1)), Operand::Source(SourceOperand::ScalarRegister(6))],
-                            vec![Destination::Sgpr(6)]),
-                        XlaneOp::new(EffectOp::Wave(WaveOp::WriteLane),
-                            vec![Operand::Source(SourceOperand::ScalarRegister(5)), Operand::Source(SourceOperand::ScalarRegister(6)), Operand::Source(SourceOperand::VectorRegister(1))],
-                            vec![Destination::Vgpr(1)]),
-                    ];
-                    for action in actions {
-                        let mut sgprs = vec![[0; COOP_SGPR_BUF]; 32/width];
-                        let mut vgprs = vec![vec![0; 4*width]; 32/width];
-                        for s in &mut sgprs { s[5]=777; s[6]=selector; }
-                        // Inactive but allocated lanes retain visible old values;
-                        // padding contains poison-like data to detect stray reads.
-                        for lane in 0..32 { set_packet_vgpr(&mut vgprs,width,lane,1,100+lane as u32); }
-                        let mut expected_s = sgprs.clone();
-                        let mut expected_v = vgprs.clone();
-                        let result = action.evaluate(valid,
-                            |lane,s|eval_vector_packets(&sgprs,&vgprs,width,lane,s), |_|false)[0];
-                        for lane in 0..count {
-                            match action.outputs[0] {
-                                Destination::Sgpr(r) => expected_s[lane/width][r as usize]=result[lane],
-                                Destination::Vgpr(r) => set_packet_vgpr(&mut expected_v,width,lane,r as usize,result[lane]),
-                                _ => unreachable!(),
-                            }
-                        }
-                        PacketWave::lower(&action).apply(width,valid,&mut sgprs,&mut vgprs);
-                        assert_eq!(vgprs,expected_v);
-                        for p in 0..count.div_ceil(width) { assert_eq!(sgprs[p],expected_s[p]); }
+        let mut mat_a = [0f32; 256];
+        let mut mat_b = [0f32; 256];
+        let mut mat_c = [0f32; 256];
+        for e in 0..lanes {
+            for i in 0..2 {
+                for j in 0..2 {
+                    for k in 0..2 {
+                        let elem = k + j * 2 + i * 4;
+                        let col = (k + j * 2 + i * 8) + (e / 16) * 4;
+                        let row = e % 16;
+                        mat_a[row * 16 + col] = frag_f16(e, a, elem);
+                        let row_b = (k + j * 2 + i * 8) + (e / 16) * 4;
+                        let col_b = e % 16;
+                        mat_b[row_b * 16 + col_b] = frag_f16(e, b, elem);
                     }
                 }
             }
+            for m in 0..8 {
+                let row = m + (e / 16) * 8;
+                let col = e % 16;
+                mat_c[row * 16 + col] = f32::from_bits(vgprs[e][c + m]);
+            }
+        }
+
+        let mut mat_d = [0f32; 256];
+        for i in 0..16 {
+            for j in 0..16 {
+                let mut acc = mat_c[i * 16 + j];
+                for k in 0..16 {
+                    acc += mat_a[i * 16 + k] * mat_b[k * 16 + j];
+                }
+                mat_d[i * 16 + j] = acc;
+            }
+        }
+
+        for e in 0..lanes {
+            for m in 0..8 {
+                let row = m + (e / 16) * 8;
+                let col = e % 16;
+                vgprs[e][vdst + m] = mat_d[row * 16 + col].to_bits();
+            }
         }
     }
+
+
+
+    fn packet_vgpr(vgprs: &[Vec<u32>], width: usize, lane: usize, reg: usize) -> u32 {
+        let packet = lane / width;
+        let packet_lane = lane % width;
+        vgprs[packet][reg * width + packet_lane]
+    }
+
+    fn set_packet_vgpr(
+        vgprs: &mut [Vec<u32>],
+        width: usize,
+        lane: usize,
+        reg: usize,
+        value: u32,
+    ) {
+        let packet = lane / width;
+        let packet_lane = lane % width;
+        vgprs[packet][reg * width + packet_lane] = value;
+    }
+
 
     #[test]
     fn packet_wmma_matches_scalar_lane_layout_at_every_supported_width() {
@@ -727,7 +419,7 @@ mod tests {
                         set_packet_vgpr(&mut packets, width, lane, reg, state[lane][reg]);
                     }
                 }
-                wmma_apply_packets(VDST, A, B, C, width, &mut packets);
+                crate::rdna_spmd::wmma::apply(VDST as u32, A as u32, B as u32, C as u32, width, &mut packets);
                 for lane in 0..WAVE {
                     for reg in VDST..VDST + 8 {
                         let actual = packet_vgpr(&packets, width, lane, reg);

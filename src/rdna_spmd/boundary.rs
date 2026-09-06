@@ -31,6 +31,9 @@ impl RegSet {
     pub(super) fn vgprs(&self) -> impl Iterator<Item = u32> + '_ {
         (0..256u32).filter(move |&reg| self.has_vgpr(reg))
     }
+    pub(super) fn sgprs(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..128u32).filter(move |&reg| self.has_sgpr(reg))
+    }
 }
 
 /// What the host-applied wave-level op at a boundary touches: the registers it

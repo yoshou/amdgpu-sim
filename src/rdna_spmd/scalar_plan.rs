@@ -28,20 +28,22 @@ pub(super) struct ScalarPlan<'a> {
 }
 
 impl<'a> ScalarPlan<'a> {
-    pub fn new(program: &'a ScalarProgram, mode: ScalarMode) -> Self {
+    #[cfg(test)]
+    pub fn new(program: &'a ScalarProgram, mode: ScalarMode) -> Self { Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, mode) }
+    pub fn with_registry(registry: std::sync::Arc<super::dialect::DialectRegistry>, program: &'a ScalarProgram, mode: ScalarMode) -> Self {
         let active = super::active::analyze_states(program);
         let f64_fresh = super::freshness::analyze(program);
         let sgpr_fresh = super::freshness::analyze_sgpr(program);
         let blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             (pc, ScalarBlockPlan {
-                instructions: block.body.iter().map(super::lift::instruction).collect(),
+                instructions: block.body.iter().map(|inst| super::lift::instruction_with_registry(inst, &registry)).collect(),
                 active: super::active::body_active_states(block, active[&pc]),
                 f64_fresh: f64_fresh[&pc],
                 sgpr_fresh: sgpr_fresh[&pc],
             })
         }).collect();
         let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().collect())).collect();
-        let function = super::lift::function::Function::new(program, &lowerings, None);
+        let function = super::lift::function::Function::new(registry, program, &lowerings, None);
         Self { program, mode, blocks, function }
     }
 }

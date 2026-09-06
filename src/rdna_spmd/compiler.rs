@@ -18,8 +18,10 @@ use super::packet_plan::{cooperative_vgpr_count, PacketPlan};
 use super::scalar_plan::{ScalarMode, ScalarPlan};
 
 /// Coordinates the existing SPMD compilation stages.
-#[derive(Default)]
-pub struct Compiler;
+pub struct Compiler { registry: std::sync::Arc<super::dialect::DialectRegistry> }
+impl Default for Compiler {
+    fn default() -> Self { Self { registry: std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()) } }
+}
 
 impl Compiler {
     /// Prepare the current register IR from the decoded CFG.
@@ -50,12 +52,12 @@ impl Compiler {
     /// general 32-lane effects must be split with `split_at_xlane` and executed
     /// by a wave/cooperative dispatcher.
     pub fn compile_program(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-        let plan = ScalarPlan::new(program, ScalarMode::Whole);
+        let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Whole);
         super::emit::compile_program(&plan, num_vgprs)
     }
 
     pub fn compile_program_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
-        let plan = PacketPlan::new(program, width, None);
+        let plan = PacketPlan::with_registry(self.registry.clone(), program, width, None);
         super::emit_vec::compile_program(&plan, num_vgprs.max(256))
     }
 
@@ -68,12 +70,12 @@ impl Compiler {
 
     /// Compile a program already split at barriers for the existing scheduler.
     pub fn compile_cooperative(&self, program: &ScalarProgram, num_vgprs: usize) -> CoopKernel {
-        let plan = ScalarPlan::new(program, ScalarMode::Cooperative);
+        let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Cooperative);
         super::emit::compile_cooperative(&plan, num_vgprs)
     }
 
     pub(super) fn compile_writeback(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-        let plan = ScalarPlan::new(program, ScalarMode::Writeback);
+        let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Writeback);
         super::emit::compile_program(&plan, num_vgprs)
     }
 
@@ -86,26 +88,26 @@ impl Compiler {
     ) -> CoopVecKernel {
         assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
         let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary);
-        let plan = PacketPlan::new(program, width, Some(boundary));
+        let plan = PacketPlan::with_registry(self.registry.clone(), program, width, Some(boundary));
         super::emit_vec::compile_cooperative(&plan, num_vgprs)
     }
 }
 
 /// Prepare the current optimized Scalar IR; preserves the existing API.
 pub fn build_scalar_program(program: &RDNAProgram) -> ScalarProgram {
-    Compiler.build_scalar_program(program)
+    Compiler::default().build_scalar_program(program)
 }
 
 pub fn compile_program(program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-    Compiler.compile_program(program, num_vgprs)
+    Compiler::default().compile_program(program, num_vgprs)
 }
 
 pub fn compile_program_vec(program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
-    Compiler.compile_program_vec(program, num_vgprs, width)
+    Compiler::default().compile_program_vec(program, num_vgprs, width)
 }
 
 pub fn compile_cooperative(program: &ScalarProgram, num_vgprs: usize) -> CoopKernel {
-    Compiler.compile_cooperative(program, num_vgprs)
+    Compiler::default().compile_cooperative(program, num_vgprs)
 }
 
 #[cfg(test)]
@@ -131,7 +133,7 @@ mod tests {
         let raw = ir::lower_block(4, &insts, &[]);
         assert_eq!(raw.body.len(), 2);
         assert!(matches!(raw.term, Terminator::Return));
-        let prepared = Compiler.prepare_block(4, insts, &[]);
+        let prepared = Compiler::default().prepare_block(4, insts, &[]);
         assert_eq!(prepared.body.len(), 1);
         assert!(matches!(&prepared.body[0], InstFormat::VOP1(i)
             if matches!(i.src0, SourceOperand::LiteralConstant(2))));
@@ -140,10 +142,10 @@ mod tests {
 
     #[test]
     fn preparation_preserves_fallthrough_instruction_and_branch_successors() {
-        let fallthrough = Compiler.prepare_block(4, vec![mov(1), mov(2)], &[8]);
+        let fallthrough = Compiler::default().prepare_block(4, vec![mov(1), mov(2)], &[8]);
         assert_eq!(fallthrough.body.len(), 1);
         assert!(matches!(fallthrough.term, Terminator::Jump(8)));
-        let branch = Compiler.prepare_block(4, vec![mov(2), control(I::S_CBRANCH_EXECZ)], &[8, 12]);
+        let branch = Compiler::default().prepare_block(4, vec![mov(2), control(I::S_CBRANCH_EXECZ)], &[8, 12]);
         assert_eq!(branch.body.len(), 1);
         assert!(matches!(branch.term, Terminator::Branch {
             cond: Cond::ExecZ, taken: 12, fallthrough: 8,

@@ -42,8 +42,30 @@ pub(in crate::rdna_spmd) struct Memory {
     pub data: u32,
     pub returns: bool,
     pub semantics: MemorySemantics,
+    pair: Option<LdsPair>,
+}
+#[derive(Clone, Debug)]
+struct LdsPair {
+    offsets: [u32; 2],
+    second_data: u32,
 }
 impl Memory {
+    /// Byte displacement of one word, including noncontiguous LDS addresses.
+    pub fn word_offset(&self, word: u32) -> u32 {
+        match &self.pair {
+            Some(pair) => {
+                let n = self.words / 2;
+                pair.offsets[(word / n) as usize] + (word % n) * 4
+            }
+            None => word * 4,
+        }
+    }
+    pub fn data_register(&self, word: u32) -> u32 {
+        match &self.pair {
+            Some(pair) if word >= self.words / 2 => pair.second_data + word - self.words / 2,
+            _ => self.data + word,
+        }
+    }
     /// Static private cells can be read speculatively once the dispatcher has
     /// allocated this many bytes for every packet lane. Dynamic addresses keep
     /// their EXEC mask; they do not participate in this allocation guarantee.
@@ -71,7 +93,7 @@ impl Memory {
             _ => {}
         }
         if self.stores() || self.op == MemoryOp::AtomicAdd {
-            regs.extend(self.data..self.data + self.words);
+            regs.extend((0..self.words).map(|k| self.data_register(k)));
         }
         regs
     }
@@ -166,7 +188,7 @@ fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
 }
 
 pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
-    let (opcode, address, dest, data, scope, th) = match inst {
+    let (opcode, mut address, dest, data, scope, th) = match inst {
         InstFormat::SMEM(i) => (
             i.op,
             Address::Scalar {
@@ -240,11 +262,11 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         | I::FLAT_LOAD_U16
         | I::SCRATCH_LOAD_U16
         | I::DS_LOAD_U16 => (Load(U16), 1),
-        I::GLOBAL_LOAD_I16 | I::FLAT_LOAD_I16 | I::SCRATCH_LOAD_I16 | I::DS_LOAD_I16 => {
+        I::S_LOAD_I16 | I::GLOBAL_LOAD_I16 | I::FLAT_LOAD_I16 | I::SCRATCH_LOAD_I16 | I::DS_LOAD_I16 => {
             (Load(I16), 1)
         }
-        I::GLOBAL_LOAD_U8 | I::FLAT_LOAD_U8 | I::SCRATCH_LOAD_U8 | I::DS_LOAD_U8 => (Load(U8), 1),
-        I::GLOBAL_LOAD_I8 | I::FLAT_LOAD_I8 | I::SCRATCH_LOAD_I8 | I::DS_LOAD_I8 => (Load(I8), 1),
+        I::S_LOAD_U8 | I::GLOBAL_LOAD_U8 | I::FLAT_LOAD_U8 | I::SCRATCH_LOAD_U8 | I::DS_LOAD_U8 => (Load(U8), 1),
+        I::S_LOAD_I8 | I::GLOBAL_LOAD_I8 | I::FLAT_LOAD_I8 | I::SCRATCH_LOAD_I8 | I::DS_LOAD_I8 => (Load(I8), 1),
         I::S_LOAD_B32
         | I::GLOBAL_LOAD_B32
         | I::FLAT_LOAD_B32
@@ -255,13 +277,18 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         | I::FLAT_LOAD_B64
         | I::SCRATCH_LOAD_B64
         | I::DS_LOAD_B64 => (Load(B32), 2),
-        I::S_LOAD_B96 | I::GLOBAL_LOAD_B96 | I::FLAT_LOAD_B96 | I::SCRATCH_LOAD_B96 => {
+        I::S_LOAD_B96 | I::GLOBAL_LOAD_B96 | I::FLAT_LOAD_B96 | I::SCRATCH_LOAD_B96 | I::DS_LOAD_B96 => {
             (Load(B32), 3)
         }
-        I::S_LOAD_B128 | I::GLOBAL_LOAD_B128 | I::FLAT_LOAD_B128 | I::SCRATCH_LOAD_B128 => {
+        I::S_LOAD_B128 | I::GLOBAL_LOAD_B128 | I::FLAT_LOAD_B128 | I::SCRATCH_LOAD_B128 | I::DS_LOAD_B128 => {
             (Load(B32), 4)
         }
         I::S_LOAD_B256 => (Load(B32), 8),
+        I::S_LOAD_B512 => (Load(B32), 16),
+        I::DS_LOAD_2ADDR_B32 | I::DS_LOAD_2ADDR_STRIDE64_B32 => (Load(B32), 2),
+        I::DS_LOAD_2ADDR_B64 | I::DS_LOAD_2ADDR_STRIDE64_B64 => (Load(B32), 4),
+        I::DS_STORE_2ADDR_B32 | I::DS_STORE_2ADDR_STRIDE64_B32 => (Store(B32), 2),
+        I::DS_STORE_2ADDR_B64 | I::DS_STORE_2ADDR_STRIDE64_B64 => (Store(B32), 4),
         I::GLOBAL_STORE_B8 | I::FLAT_STORE_B8 | I::SCRATCH_STORE_B8 | I::DS_STORE_B8 => {
             (Store(U8), 1)
         }
@@ -274,12 +301,25 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         I::GLOBAL_STORE_B64 | I::FLAT_STORE_B64 | I::SCRATCH_STORE_B64 | I::DS_STORE_B64 => {
             (Store(B32), 2)
         }
-        I::GLOBAL_STORE_B96 | I::FLAT_STORE_B96 | I::SCRATCH_STORE_B96 => (Store(B32), 3),
-        I::GLOBAL_STORE_B128 | I::FLAT_STORE_B128 | I::SCRATCH_STORE_B128 => (Store(B32), 4),
+        I::GLOBAL_STORE_B96 | I::FLAT_STORE_B96 | I::SCRATCH_STORE_B96 | I::DS_STORE_B96 => (Store(B32), 3),
+        I::GLOBAL_STORE_B128 | I::FLAT_STORE_B128 | I::SCRATCH_STORE_B128 | I::DS_STORE_B128 => (Store(B32), 4),
         I::GLOBAL_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => (AtomicAdd, 1),
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
         _ => panic!("unsupported memory lift {:?}", opcode),
     };
+    // RDNA4 ISA §16.15 DS_LOAD/STORE_2ADDR: each offset counts elements
+    // (4 or 8 bytes); STRIDE64 multiplies that element stride by 64. DATA1
+    // supplies the second store's source independently of DATA0.
+    // https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content
+    let pair = if matches!(opcode, I::DS_LOAD_2ADDR_B32 | I::DS_LOAD_2ADDR_B64 |
+        I::DS_STORE_2ADDR_B32 | I::DS_STORE_2ADDR_B64 | I::DS_LOAD_2ADDR_STRIDE64_B32 |
+        I::DS_LOAD_2ADDR_STRIDE64_B64 | I::DS_STORE_2ADDR_STRIDE64_B32 | I::DS_STORE_2ADDR_STRIDE64_B64) {
+        let InstFormat::DS(i) = inst else { unreachable!() };
+        let stride = words / 2 * 4 * if matches!(opcode, I::DS_LOAD_2ADDR_STRIDE64_B32 |
+            I::DS_LOAD_2ADDR_STRIDE64_B64 | I::DS_STORE_2ADDR_STRIDE64_B32 | I::DS_STORE_2ADDR_STRIDE64_B64) { 64 } else { 1 };
+        address = Address::Lds { vector: i.addr as u32, offset: 0 };
+        Some(LdsPair { offsets: [i.offset0 as u32 * stride, i.offset1 as u32 * stride], second_data: i.data1 as u32 })
+    } else { None };
     let returns = matches!(op, Load(_))
         || op == AtomicAdd && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
     let mut semantics = semantics(scope, th, op, matches!(address, Address::Scalar { .. }));
@@ -304,6 +344,7 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         data: data as u32,
         returns,
         semantics,
+        pair,
     })
 }
 
@@ -318,8 +359,10 @@ pub(in crate::rdna_spmd) enum Parameter {
 /// The original contiguous groups are retained for pairs/transpose selection.
 pub(in crate::rdna_spmd) struct Plan {
     pub memory: Memory,
+    pub group_atomics: bool,
     pub parameters: Vec<(Parameter, ValueId)>,
     pub core: std::ops::Range<usize>,
+    pub pairs: Vec<(ValueId, ValueId)>,
     pub base: ValueId,
     pub address: ValueId,
     pub mask: ValueId,
@@ -327,32 +370,19 @@ pub(in crate::rdna_spmd) struct Plan {
     pub flat: Option<(std::ops::Range<usize>, ValueId, ValueId, ValueId)>,
 }
 impl Memory {
-    pub fn lift(
+    pub(super) fn lift(
         &self,
         f: &mut cfg::Func,
         block: &mut cfg::Block,
-        words: &mut std::collections::BTreeMap<u32, ValueId>,
+        words: &mut super::state::Words,
+        views: &mut super::state::Views,
         provenance: &mut u64,
     ) -> Plan {
         use cfg::Inst;
-        let mut parameters = vec![];
-        let mut core = vec![];
-        let mut reg = |source: SourceOperand, ty| {
-            let id = f.value(ty);
-            let deps = if let SourceOperand::VectorRegister(r) = source {
-                (0..ty.bits().div_ceil(32))
-                    .filter_map(|k| words.get(&(r as u32 + k)).copied())
-                    .collect()
-            } else {
-                vec![]
-            };
-            block.insts.push(Inst::Boundary {
-                inputs: deps,
-                outputs: vec![(id, ty)],
-            });
-            parameters.push((Parameter::Register(input(source, ty)), id));
-            id
-        };
+        let mut operands = super::state::Operands::default();
+        let mut reg = |source: SourceOperand, ty| operands.read(
+            &input(source, ty), self.scalar(), None, f, block, words, views,
+        );
         // Collect register operands first, preserving their ISA widths.
         let (s, v, offset, ty) = match self.address {
             Address::Global {
@@ -404,7 +434,7 @@ impl Memory {
             (0..self.words)
                 .map(|k| {
                     reg(
-                        SourceOperand::VectorRegister((self.data + k) as u8),
+                        SourceOperand::VectorRegister(self.data_register(k) as u8),
                         Ty::I32,
                     )
                 })
@@ -412,6 +442,9 @@ impl Memory {
         } else {
             vec![]
         };
+        let mut parameters: Vec<_> = operands.bindings.into_iter()
+            .map(|(input, id)| (Parameter::Register(input), id)).collect();
+        let mut core = operands.core;
         let mask = f.value(Ty::I1);
         if self.scalar() {
             core.push(Inst::Core {
@@ -507,14 +540,14 @@ impl Memory {
             *provenance += 1;
         }
         for k in 0..self.words {
-            let a = if k == 0 {
+            let a = if self.word_offset(k) == 0 {
                 address
             } else {
                 let off = f.value(ty);
                 block.insts.push(Inst::Core {
                     value: off,
                     ty,
-                    op: Op::Const(ty, k as u64 * 4),
+                    op: Op::Const(ty, self.word_offset(k) as u64),
                 });
                 let a = f.value(ty);
                 block.insts.push(Inst::Core {
@@ -598,26 +631,29 @@ impl Memory {
             }
             if self.returns {
                 let result = result.unwrap();
-                let mut deps = vec![result, mask];
-                if !self.scalar() {
-                    if let Some(old) = words.get(&(self.dest + k)) {
-                        deps.push(*old);
-                    }
-                }
-                let stored = f.value(Ty::I32);
-                block.insts.push(Inst::Boundary {
-                    inputs: deps,
-                    outputs: vec![(stored, Ty::I32)],
-                });
-                if !self.scalar() {
-                    words.insert(self.dest + k, stored);
+                let word = if self.scalar() { super::state::Word::scalar(self.dest + k) }
+                    else { Some(super::state::Word::Vgpr(self.dest + k)) };
+                if let Some(word) = word {
+                    let stored = if self.scalar() { result } else {
+                        let stored = f.value(Ty::I32);
+                        block.insts.push(Inst::Core { value: stored, ty: Ty::I32,
+                            op: Op::Select(mask, result, words[&word]) });
+                        stored
+                    };
+                    words.insert(word, stored);
+                } else if self.dest + k != 124 {
+                    // Special mask destinations need the paired word-to-mask
+                    // migration. NULL discards its result without a definition.
+                    block.insts.push(Inst::Boundary { inputs: vec![result], outputs: vec![] });
                 }
             }
         }
         Plan {
+            group_atomics: false,
             memory: self.clone(),
             parameters,
             core: start..end,
+            pairs: operands.pairs,
             base,
             address,
             mask,

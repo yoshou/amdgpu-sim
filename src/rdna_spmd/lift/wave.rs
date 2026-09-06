@@ -115,29 +115,6 @@ impl YieldAction {
             _ => None,
         }
     }
-    /// Scalar lane selectors are wave-uniform in the register adapter. Capture
-    /// the selected value before writing anything, and leave untouched lanes in
-    /// their existing cells instead of materializing an entire wave result.
-    #[inline]
-    pub(crate) fn uniform_lane_access(
-        &self,
-        valid: u32,
-        read: impl Fn(usize, &SourceOperand) -> u32,
-    ) -> Option<(Destination, usize, u32)> {
-        let first = valid.trailing_zeros() as usize;
-        match self.op {
-            EffectOp::Wave(WaveOp::ReadLane)
-                if self.inputs[1].is_uniform() && matches!(self.outputs[0], Destination::Sgpr(_)) => {
-                let lane = (self.inputs[1].eval(first, &read, &|_| false) & 31) as usize;
-                Some((self.outputs[0], lane, if valid >> lane & 1 != 0 { self.inputs[0].eval(lane, &read, &|_| false) } else { 0 }))
-            }
-            EffectOp::Wave(WaveOp::WriteLane) => {
-                let lane = (self.inputs[1].eval(first, &read, &|_| false) & 31) as usize;
-                Some((self.outputs[0], lane, self.inputs[0].eval(first, &read, &|_| false)))
-            }
-            _ => None,
-        }
-    }
     #[inline]
     pub(crate) fn wmma_registers(&self) -> Option<(u32, u32, u32, u32)> {
         if self.op != EffectOp::Wave(WaveOp::Wmma) {
@@ -162,57 +139,15 @@ impl YieldAction {
         exec: impl Fn(usize) -> bool,
     ) -> [[u32; 32]; 1] {
         assert!(self.inputs.len() <= 3 && self.outputs.len() == 1);
-        let arg = |index: usize, lane: usize| {
-            if valid >> lane & 1 != 0 {
-                self.inputs[index].eval(lane, &read, &exec)
-            } else {
-                0
-            }
-        };
         let op = match self.op {
             EffectOp::Wave(op) => op,
             _ => panic!("workgroup barrier requires round state"),
         };
-        // Capture just the values used by this effect. The result is complete
-        // before the caller writes any destination, including overlapping ones.
-        let mut out = [[0; 32]; 1];
-        match op {
-            WaveOp::Any => out[0].fill((0..32).any(|lane| arg(0, lane) != 0) as u32),
-            WaveOp::Ballot => {
-                let mask = (0..32).fold(0, |mask, lane| mask | ((arg(0, lane) != 0) as u32) << lane);
-                out[0].fill(mask);
-            }
-            WaveOp::ReadFirstLane => {
-                let lane = (0..32).find(|&lane| arg(1, lane) != 0).unwrap_or(0);
-                out[0].fill(arg(0, lane));
-            }
-            WaveOp::ReadLane => {
-                out[0] = std::array::from_fn(|lane| arg(0, (arg(1, lane) & 31) as usize));
-            }
-            WaveOp::WriteLane => {
-                let first = valid.trailing_zeros() as usize;
-                assert!(first < 32, "empty wave");
-                let value = arg(0, first);
-                let selector = arg(1, first);
-                out[0] = std::array::from_fn(|lane| {
-                    if valid >> lane & 1 != 0 {
-                        assert_eq!(arg(0, lane), value, "nonuniform writelane value");
-                        assert_eq!(arg(1, lane), selector, "nonuniform writelane lane");
-                    }
-                    arg(2, lane)
-                });
-                out[0][(selector & 31) as usize] = value;
-            }
-            WaveOp::Bpermute | WaveOp::BpermuteFi => {
-                out[0] = std::array::from_fn(|lane| {
-                    let src = ((arg(0, lane) >> 2) & 31) as usize;
-                    if op == WaveOp::BpermuteFi || arg(2, src) != 0 { arg(1, src) } else { 0 }
-                });
-            }
-            WaveOp::Wmma => panic!("WMMA uses the existing fragment lowering"),
-        }
-        out
+        [crate::rdna_spmd::yield_values::evaluate(op, valid, |index, lane| {
+            self.inputs[index].eval(lane, &read, &exec)
+        })]
     }
+
     pub(crate) fn writes_lane(&self, lane: usize, valid: u32, exec: bool) -> bool {
         valid >> lane & 1 != 0
             && (!matches!(
@@ -365,24 +300,37 @@ pub(crate) fn split(
     )
 }
 
+/// SSA operands/results of one ordered wave or barrier effect.
+pub(in crate::rdna_spmd) struct Plan {
+    pub local: bool,
+    pub parameters: Vec<(super::Input, super::ValueId)>,
+    pub core: std::ops::Range<usize>,
+    pub arguments: Vec<super::ValueId>,
+    pub results: Vec<(super::ValueId, Ty)>,
+    pub definitions: Vec<(Destination, super::ValueId)>,
+    pub destinations: Vec<Destination>,
+    pub layout: crate::rdna_spmd::yield_values::YieldValues,
+}
+
 impl YieldAction {
-    pub(crate) fn lift(
+    pub(super) fn lift(
         &self,
         f: &mut super::super::ir::typed::cfg::Func,
         block: &mut super::super::ir::typed::cfg::Block,
-        words: &mut std::collections::BTreeMap<u32, super::super::ir::typed::ValueId>,
+        words: &mut super::state::Words,
         provenance: &mut u64,
-    ) {
+    ) -> Plan {
         use super::super::ir::typed::{cfg::Inst, IntOp, Op, ValueId};
         fn operand(
             arg: &Operand,
             ty: Ty,
             f: &mut super::super::ir::typed::cfg::Func,
             block: &mut super::super::ir::typed::cfg::Block,
-            words: &std::collections::BTreeMap<u32, ValueId>,
+            words: &super::state::Words,
+            parameters: &mut Vec<(super::Input, ValueId)>,
         ) -> ValueId {
             if let Operand::Add(a, k) = arg {
-                let a = operand(a, ty, f, block, words);
+                let a = operand(a, ty, f, block, words, parameters);
                 let b = f.value(ty);
                 block.insts.push(Inst::Core {
                     value: b,
@@ -397,48 +345,86 @@ impl YieldAction {
                 });
                 return value;
             }
-            let deps = match arg {
-                Operand::Source(SourceOperand::VectorRegister(r)) => {
-                    words.get(&(*r as u32)).copied().into_iter().collect()
-                }
-                _ => vec![],
+            let source = match arg {
+                Operand::Source(source) => source.clone(),
+                Operand::Exec => SourceOperand::ScalarRegister(126),
+                Operand::Add(..) => unreachable!(),
             };
-            let value = f.value(ty);
-            block.insts.push(Inst::Boundary {
-                inputs: deps,
-                outputs: vec![(value, ty)],
-            });
+            let mut operands = super::state::Operands::default();
+            let value = operands.read(&super::input(source, ty), false, None,
+                f, block, words, &mut super::state::Views::new());
+            block.insts.extend(operands.core);
+            parameters.extend(operands.bindings);
             value
         }
+        let start = block.insts.len();
+        let mut parameters = vec![];
         let (args, results) = self.op.signature();
-        let inputs = self
+        let inputs: Vec<_> = self
             .inputs
             .iter()
             .zip(args)
-            .map(|(a, t)| operand(a, t, f, block, words))
+            .map(|(a, t)| operand(a, t, f, block, words, &mut parameters))
             .collect();
         let outputs: Vec<_> = results.into_iter().map(|t| (f.value(t), t)).collect();
+        let predicate = matches!(self.op, EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi))
+            .then(|| inputs[2]);
+        let end = block.insts.len();
         block.insts.push(Inst::Effect {
             provenance: *provenance,
             op: self.op,
-            inputs,
+            inputs: inputs.clone(),
             outputs: outputs.clone(),
         });
         *provenance += 1;
+        let mut definitions = Vec::new();
         for (&(v, t), dest) in outputs.iter().zip(&self.outputs) {
-            let stored = f.value(t);
-            let mut deps = vec![v];
-            if let Destination::Vgpr(r) = dest {
-                if let Some(old) = words.get(r) {
-                    deps.push(*old);
-                }
-                words.insert(*r, stored);
+            let word = match *dest {
+                Destination::Vgpr(r) => Some(super::state::Word::Vgpr(r)),
+                Destination::Sgpr(r) => super::state::Word::scalar(r),
+                Destination::Scc => None,
+            };
+            let mut stored = v;
+            if let Some(mask) = predicate {
+                let old = words[&word.expect("predicated wave destination must be a word")];
+                stored = f.value(t);
+                block.insts.push(Inst::Core { value: stored, ty: t, op: Op::Select(mask, v, old) });
             }
-            block.insts.push(Inst::Boundary {
-                inputs: deps,
-                outputs: vec![(stored, t)],
-            });
+            if matches!(dest, Destination::Sgpr(_)) && t == Ty::I1 {
+                let value = f.value(Ty::I32);
+                block.insts.push(Inst::Core { value, ty: Ty::I32,
+                    op: Op::Convert(super::super::ir::typed::Cvt::ZExt, Ty::I32, stored) });
+                stored = value;
+            }
+            if t == Ty::F32 && word.is_some() {
+                let value = f.value(Ty::I32);
+                block.insts.push(Inst::Core { value, ty: Ty::I32,
+                    op: Op::Convert(super::super::ir::typed::Cvt::Bitcast, Ty::I32, stored) });
+                stored = value;
+            }
+            if let Some(word) = word {
+                words.insert(word, stored);
+            } else if matches!(dest, Destination::Sgpr(r) if *r != 124) {
+                block.insts.push(Inst::Boundary { inputs: vec![stored], outputs: vec![] });
+            }
+            definitions.push((*dest, stored));
         }
+        let layout = {
+                use crate::rdna_spmd::yield_values::Argument;
+                let mut layout = crate::rdna_spmd::yield_values::YieldValues::new(self.op);
+                layout.uniform_selector = self.op == EffectOp::Wave(WaveOp::ReadLane) && self.inputs[1].is_uniform();
+                for index in 0..inputs.len() {
+                    // WMMA has a dense native fragment ABI; WriteLane's old
+                    // value aliases its varying result and must be materialized.
+                    if self.op == EffectOp::Wave(WaveOp::Wmma)
+                        || self.op == EffectOp::Wave(WaveOp::WriteLane) && index == 2 { continue; }
+                    layout.arguments[index] = if self.inputs[index].is_uniform() { Argument::Uniform }
+                        else { Argument::Lane };
+                }
+                layout
+            };
+        Plan { local: false, parameters, core: start..end, arguments: inputs, results: outputs,
+            definitions, destinations: self.outputs.clone(), layout }
     }
 }
 

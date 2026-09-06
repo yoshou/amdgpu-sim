@@ -9,10 +9,8 @@
 //! there across the boundary, and only the operands of the host op itself move
 //! through memory.
 //!
-//! Two copies of this crate take part: the driver calls [`Fiber::resume`] from
-//! the statically linked copy, while the JIT resolves `amdgpu_sim_fiber_yield`
-//! against the `dylib` copy. They share no statics or thread-locals, so all
-//! shared state lives in the [`FiberCtx`] the driver hands to the kernel.
+//! The JIT binds its yield entrypoints to the driver's crate instance. The
+//! explicit context carries all state; no thread-local scheduler is required.
 //!
 //! Implemented for x86-64 SysV and AArch64 AAPCS64. The switch saves that
 //! ABI's callee-saved registers and the stack pointer; every other register is
@@ -32,13 +30,14 @@ pub struct KernelArgs {
     pub valid_mask: u32, // allocated work items, independent of mutable EXEC
 }
 
-/// Driver/kernel shared state. `#[repr(C)]`: this is an ABI between the two
-/// crate copies and the assembly trampoline, not an ordinary Rust struct.
+/// Driver/kernel shared state. The first two fields have fixed offsets for
+/// the assembly context switch.
 #[repr(C)]
 pub struct FiberCtx {
     driver_rsp: usize,
     fiber_rsp: usize,
     args: KernelArgs,
+    values: *mut u32,
 }
 
 /// Deepest bytes of a stack, which no kernel should ever reach. They are
@@ -71,20 +70,41 @@ pub struct Fiber {
     // Boxed: the trampoline keeps this address on the fiber stack, so the
     // context must not move once armed.
     ctx: Box<FiberCtx>,
-    stack: Vec<u8>,
+    stack: std::rc::Rc<std::cell::UnsafeCell<Vec<std::mem::MaybeUninit<u8>>>>,
+    stack_offset: usize,
+    stack_bytes: usize,
 }
 
 impl Fiber {
     /// Allocate a fiber with a `stack_bytes` stack. A packet kernel does not
-    /// recurse and holds its registers in allocas, so its frame is bounded;
+    /// recurse, so its native frame is bounded;
     /// the guard region catches a kernel whose frame exceeds what the caller
     /// allowed for.
     pub fn new(stack_bytes: usize) -> Self {
+        Self::batch(1, stack_bytes).pop().unwrap()
+    }
+
+    /// Allocate a worker's stacks together. Each fiber owns a disjoint range;
+    /// the shared allocation stays alive until the last fiber is dropped.
+    /// Keeping this ownership local also avoids an allocator call per lane.
+    pub(crate) fn batch(count: usize, stack_bytes: usize) -> Vec<Self> {
         assert!(stack_bytes > STACK_GUARD_BYTES, "fiber stack too small");
-        Self {
+        let stack_bytes = stack_bytes.checked_add(15).unwrap() & !15;
+        let total = count.checked_mul(stack_bytes).expect("fiber stack allocation overflow");
+        let mut storage = Vec::<std::mem::MaybeUninit<u8>>::with_capacity(total);
+        // Native code initializes saved slots before reading them. Only the
+        // overflow guards need initialization by the driver.
+        unsafe { storage.set_len(total); }
+        for index in 0..count {
+            storage[index * stack_bytes..index * stack_bytes + STACK_GUARD_BYTES]
+                .fill(std::mem::MaybeUninit::new(STACK_POISON));
+        }
+        let stack = std::rc::Rc::new(std::cell::UnsafeCell::new(storage));
+        (0..count).map(|index| Self {
             ctx: Box::new(FiberCtx {
                 driver_rsp: 0,
                 fiber_rsp: 0,
+                values: std::ptr::null_mut(),
                 args: KernelArgs {
                     entry: 0,
                     sgprs: std::ptr::null_mut(),
@@ -97,12 +117,8 @@ impl Fiber {
                     lane_base: 0,
                 },
             }),
-            stack: {
-                let mut stack = vec![0u8; stack_bytes];
-                stack[..STACK_GUARD_BYTES].fill(STACK_POISON);
-                stack
-            },
-        }
+            stack: stack.clone(), stack_offset: index * stack_bytes, stack_bytes,
+        }).collect()
     }
 
     /// Arm the fiber to run `args` from the top of its stack, discarding any
@@ -110,13 +126,17 @@ impl Fiber {
     /// restores, so the first resume lands in [`trampoline`] with the context
     /// pointer in the register that shim expects.
     pub fn start(&mut self, args: KernelArgs) {
+        // No Rust reference to a stack range is kept across native execution.
+        // The allocation never moves or resizes, and ranges never overlap.
+        let base = unsafe { (*self.stack.get()).as_mut_ptr().add(self.stack_offset) };
         assert!(
-            self.stack[..STACK_GUARD_BYTES].iter().all(|&b| b == STACK_POISON),
+            (0..STACK_GUARD_BYTES).all(|i| unsafe { (*base.add(i)).assume_init() == STACK_POISON }),
             "fiber stack overflowed: the kernel reached the deepest bytes"
         );
         self.ctx.args = args;
         self.ctx.driver_rsp = 0;
-        let top = (self.stack.as_mut_ptr() as usize + self.stack.len()) & !0xF;
+        self.ctx.values = std::ptr::null_mut();
+        let top = (base as usize + self.stack_bytes) & !0xF;
         let ctx = &mut *self.ctx as *mut FiberCtx;
         self.ctx.fiber_rsp = unsafe { initial_frame(top, ctx) };
     }
@@ -125,7 +145,13 @@ impl Fiber {
     /// or [`FIBER_DONE`] if the kernel finished.
     pub fn resume(&mut self) -> u64 {
         let ctx = &mut *self.ctx;
+        ctx.values = std::ptr::null_mut();
         unsafe { switch(&mut ctx.driver_rsp, ctx.fiber_rsp, 0) }
+    }
+
+    pub(crate) fn yield_values(&self) -> *mut u32 {
+        assert!(!self.ctx.values.is_null(), "fiber has no pending SSA values");
+        self.ctx.values
     }
 }
 
@@ -184,18 +210,13 @@ extern "C" fn main(ctx: *mut FiberCtx) -> ! {
     }
 }
 
-/// Called by the JIT kernel at a cross-lane boundary. `sgprs`/`vgprs` are
-/// unused, but passing them makes the call visibly alias the packet memory the
-/// host op mutates while the kernel is suspended.
+/// Suspend with a dense, typed effect frame owned by the JIT invocation.
+/// The scheduler may access the frame only until it resumes this fiber.
 #[unsafe(no_mangle)]
-pub extern "C" fn amdgpu_sim_fiber_yield(
-    ctx: *mut FiberCtx,
-    resume_pc: u64,
-    _sgprs: *mut u32,
-    _vgprs: *mut u32,
-) {
+pub extern "C" fn amdgpu_sim_fiber_yield_values(ctx: *mut FiberCtx, id: u64, values: *mut u32) {
     unsafe {
-        switch(&mut (*ctx).fiber_rsp, (*ctx).driver_rsp, resume_pc);
+        (*ctx).values = values;
+        switch(&mut (*ctx).fiber_rsp, (*ctx).driver_rsp, id);
     }
 }
 
@@ -321,9 +342,9 @@ mod tests {
         _valid_mask: u32,
     ) -> u64 {
         let mut acc = unsafe { *sgprs } as u64;
-        amdgpu_sim_fiber_yield(ctx, 100 + acc, std::ptr::null_mut(), std::ptr::null_mut());
+        amdgpu_sim_fiber_yield_values(ctx, 100 + acc, sgprs);
         acc += 1;
-        amdgpu_sim_fiber_yield(ctx, 100 + acc, std::ptr::null_mut(), std::ptr::null_mut());
+        amdgpu_sim_fiber_yield_values(ctx, 100 + acc, sgprs);
         unsafe { *sgprs = (acc + 1) as u32 };
         FIBER_DONE
     }
@@ -362,6 +383,25 @@ mod tests {
             assert_eq!(fiber.resume(), 100 + start as u64);
             while fiber.resume() != FIBER_DONE {}
             assert_eq!(sgprs[0], start + 2);
+        }
+    }
+
+    #[test]
+    fn batch_stacks_survive_interleaving_and_sibling_destruction() {
+        let mut fibers = Fiber::batch(32, 32 * 1024);
+        let mut values: Vec<_> = (0..32).map(|i| [i]).collect();
+        for (fiber, value) in fibers.iter_mut().zip(&mut values) {
+            fiber.start(args_for(value));
+        }
+        for (i, fiber) in fibers.iter_mut().enumerate() {
+            assert_eq!(fiber.resume(), 100 + i as u64);
+        }
+        // The remaining frames retain the allocation after siblings drop.
+        fibers.truncate(17);
+        for (i, fiber) in fibers.iter_mut().enumerate().rev() {
+            assert_eq!(fiber.resume(), 101 + i as u64);
+            assert_eq!(fiber.resume(), FIBER_DONE);
+            assert_eq!(values[i][0], i as u32 + 2);
         }
     }
 }

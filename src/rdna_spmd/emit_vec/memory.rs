@@ -6,14 +6,49 @@ use crate::rdna_spmd::{
     typed_codegen::Values,
 };
 impl Cg {
+    /// Serialize each equal-address group of an unused-result atomic once.
+    /// The pending mask contains only active lanes, so neither the selected
+    /// pointer nor any gathered addend can come from an inactive lane.
+    unsafe fn emit_grouped_atomic_add(&self, addresses: LLVMValueRef, values: LLVMValueRef, exec: LLVMValueRef) {
+        use llvm::core::*;
+        let b = self.b; let n = self.n();
+        // Inactive pointer lanes may be poison. Comparing then packing them
+        // before the active-mask AND would otherwise poison the whole mask.
+        let addresses = LLVMBuildFreeze(b, addresses, n);
+        let entry = LLVMGetInsertBlock(b); let function = LLVMGetBasicBlockParent(entry);
+        let header = LLVMAppendBasicBlockInContext(self.ctx, function, cstr("atomic.groups").as_ptr());
+        let body = LLVMAppendBasicBlockInContext(self.ctx, function, cstr("atomic.group").as_ptr());
+        let done = LLVMAppendBasicBlockInContext(self.ctx, function, cstr("atomic.done").as_ptr());
+        let initial = self.vec_to_mask(exec);
+        LLVMBuildBr(b, header); LLVMPositionBuilderAtEnd(b, header);
+        let pending = LLVMBuildPhi(b, self.i32t, n);
+        LLVMAddIncoming(pending, [initial].as_mut_ptr(), [entry].as_mut_ptr(), 1);
+        let nonempty = LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntNE, pending, self.ci32(0), n);
+        LLVMBuildCondBr(b, nonempty, body, done); LLVMPositionBuilderAtEnd(b, body);
+        let lane = self.call("llvm.cttz.i32", self.i32t, &[self.i32t, self.i1],
+            &[pending, LLVMConstInt(self.i1, 1, 0)]);
+        let address = LLVMBuildExtractElement(b, addresses, lane, n);
+        let equal = LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntEQ, addresses, self.splat(address, self.vi64), n);
+        let members = LLVMBuildAnd(b, self.vec_to_mask(equal), pending, n);
+        let mask = self.mask_to_vec(members);
+        let addends = LLVMBuildSelect(b, mask, values, LLVMConstNull(self.vi32), n);
+        let sum = self.call(&format!("llvm.vector.reduce.add.v{}i32", self.w), self.i32t, &[self.vi32], &[addends]);
+        let pointer = LLVMBuildIntToPtr(b, address, self.ptr, n);
+        LLVMBuildAtomicRMW(b, llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd,
+            pointer, sum, llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent, 0);
+        let remaining = LLVMBuildAnd(b, pending, LLVMBuildNot(b, members, n), n);
+        let backedge = LLVMGetInsertBlock(b);
+        LLVMBuildBr(b, header); LLVMAddIncoming(pending, [remaining].as_mut_ptr(), [backedge].as_mut_ptr(), 1);
+        LLVMPositionBuilderAtEnd(b, done);
+    }
     pub(super) unsafe fn memory_parameter(&self, p: &Parameter, scalar: bool) -> LLVMValueRef {
         match p {
             Parameter::Register(input) if scalar => match input.ty {
-                Ty::I64 => self.ssrc_u64(&input.source),
-                Ty::I32 => self.ssrc_u32(&input.source),
+                Ty::I64 => self.ssrc_u64(input.source.operand()),
+                Ty::I32 => self.ssrc_u32(input.source.operand()),
                 _ => unreachable!(),
             },
-            Parameter::Register(input) => self.typed_input(input),
+            Parameter::Register(input) => self.typed_input(input, false),
             Parameter::Exec => self.exec_vec(),
             Parameter::ScratchBase => self.splat(self.scratch_base_scalar, self.vi64),
             Parameter::ScratchSize => self.splat(self.scratch_stride, self.vi64),
@@ -49,12 +84,14 @@ impl Cg {
         };
         if m.scalar() {
             for k in 0..m.words {
-                let a = llvm::core::LLVMBuildAdd(self.b, addr, self.ci64(k as u64 * 4), self.n());
+                let a = llvm::core::LLVMBuildAdd(self.b, addr, self.ci64(m.word_offset(k) as u64), self.n());
                 let ptr = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, self.n());
                 let ld = llvm::core::LLVMBuildLoad2(self.b, elem, ptr, self.n());
-                llvm::core::LLVMSetAlignment(ld, m.size().bytes());
+                llvm::core::LLVMSetAlignment(ld, if m.size() == MemSize::B32 { 4 } else { 1 });
                 let value = if m.size() == MemSize::B32 {
                     ld
+                } else if m.size().signed() {
+                    llvm::core::LLVMBuildSExt(self.b, ld, self.i32t, self.n())
                 } else {
                     llvm::core::LLVMBuildZExt(self.b, ld, self.i32t, self.n())
                 };
@@ -89,6 +126,10 @@ impl Cg {
             );
         }
         if m.op == MemoryOp::AtomicAdd {
+            if plan.group_atomics {
+                self.emit_grouped_atomic_add(addr, data(0), exec);
+                return;
+            }
             // Atomics scalarize by lane. Pack the typed I1 mask once, retaining
             // the existing scalar bit tests instead of expanding a vector mask.
             let packed_exec = self.vec_to_mask(exec);
@@ -125,7 +166,7 @@ impl Cg {
         let affine = matches!(m.address, Address::Scratch { vector: None, .. });
         if m.stores() {
             for k in 0..m.words {
-                let ptrs = self.ptr_at_vec(addr, k as u64 * 4);
+                let ptrs = self.ptr_at_vec(addr, m.word_offset(k) as u64);
                 let value = data(k);
                 if m.size() != MemSize::B32 {
                     let value = llvm::core::LLVMBuildTrunc(
@@ -135,6 +176,8 @@ impl Cg {
                         self.n(),
                     );
                     self.masked_scatter_ty(value, ptrs, exec, elem);
+                } else if m.space() == Space::Lds {
+                    self.masked_scatter_ty(value, ptrs, exec, self.i32t);
                 } else if affine {
                     self.affine_store(value, ptrs, exec);
                 } else {
@@ -250,7 +293,7 @@ impl Cg {
         let mut k = 0u32;
         while k < words {
             if global && k + 1 < words {
-                let ptrs = self.ptr_at_vec(addr, (k as u64) * 4);
+                let ptrs = self.ptr_at_vec(addr, m.word_offset(k) as u64);
                 let d = if uniform_addr {
                     self.bcast_load_f64(ptrs)
                 } else {
@@ -259,9 +302,11 @@ impl Cg {
                 self.st_vgpr_f64(m.dest + k, d);
                 k += 2;
             } else {
-                let ptrs = self.ptr_at_vec(addr, (k as u64) * 4);
+                let ptrs = self.ptr_at_vec(addr, m.word_offset(k) as u64);
                 let d = if uniform_addr {
                     self.bcast_load_i32(ptrs)
+                } else if m.space() == Space::Lds {
+                    self.masked_gather_ty(ptrs, exec, self.i32t)
                 } else if affine {
                     self.affine_load(ptrs,m.private_load_end().is_some())
                 } else {

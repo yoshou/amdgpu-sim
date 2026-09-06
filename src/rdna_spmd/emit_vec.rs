@@ -34,15 +34,13 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, SOPK, VIMAGE, VOP1, VOP2, VOP3, VOP3P, VOP3SD, VOPD, VSAMPLE};
+use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, VIMAGE, VOP3};
 
-use super::boundary::{BoundaryIo, RegSet};
+use super::boundary::RegSet;
 use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction};
 use super::sqrt_idiom::SqrtCollapse;
-use super::ir::{Cond, Terminator};
 
 const EXEC: u32 = 126;
-const VCC: u32 = 106;
 
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap()
@@ -50,15 +48,12 @@ fn cstr(s: &str) -> CString {
 
 /// A JIT-compiled width-W kernel. Processes W work-items per `run` call.
 pub struct VecKernel {
-    addr: u64,
+    code: super::jit::NativeCode,
     pub num_vgprs: usize,
     pub width: u32,
     /// Per-lane allocation required by statically addressed private loads.
     pub min_private_bytes: usize,
 }
-unsafe impl Send for VecKernel {}
-unsafe impl Sync for VecKernel {}
-
 impl VecKernel {
     /// Run W work-items. `sgprs` -> 128 u32 (shared/uniform); `vgprs` ->
     /// `num_vgprs * W` u32 in SoA layout (register r, lanes 0..W at `r*W`);
@@ -66,26 +61,22 @@ impl VecKernel {
     /// `scratch_stride` bytes each, at least `min_private_bytes`. All W segments
     /// must be allocated even if EXEC disables a lane.
     pub unsafe fn run(&self, sgprs: *mut u32, vgprs: *mut u32, scratch_base: u64, scratch_stride: u64) {
-        let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(self.addr);
+        let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(self.code.address());
         f(sgprs, vgprs, scratch_base, scratch_stride);
     }
 }
 
 /// A resumable width-W packet used by the wave-owned cross-lane scheduler.
-/// One call advances W adjacent lanes of one GPU wave to the next lifted
-/// cross-lane boundary (or `s_endpgm`) and writes the packet state back.
+/// One invocation carries W lanes through SSA values, suspending at wave
+/// boundaries to exchange typed operands and results with the scheduler.
 pub struct CoopVecKernel {
-    pub(crate) yields: BTreeMap<usize,super::lift::wave::YieldAction>,
-    pub(crate) packet_wave: BTreeMap<usize,super::coop_xlane::PacketWave>,
-    addr: u64,
+    pub(crate) yields: BTreeMap<usize, super::yield_values::YieldValues>,
+    pub(super) code: super::jit::NativeCode,
     pub num_vgprs: usize,
     pub width: u32,
     /// Per-lane allocation required by statically addressed private loads.
     pub min_private_bytes: usize,
 }
-
-unsafe impl Send for CoopVecKernel {}
-unsafe impl Sync for CoopVecKernel {}
 
 impl CoopVecKernel {
     /// Entry address of the compiled packet kernel. It is not callable
@@ -93,15 +84,19 @@ impl CoopVecKernel {
     /// started on a fiber ([`super::fiber::FiberCtx`] documents its
     /// arguments).
     pub fn addr(&self) -> u64 {
-        self.addr
+        self.code.address()
     }
 }
 
+use super::native_state::{CellId, State};
+
 struct Cg {
+    state: std::cell::RefCell<State>,
     ctx: llvm::prelude::LLVMContextRef,
     module: llvm::prelude::LLVMModuleRef,
     func: LLVMValueRef,
     b: LLVMBuilderRef,
+    yield_frame: LLVMValueRef,
     w: u32,
     coop: bool,
     num_vgprs: usize,
@@ -117,14 +112,14 @@ struct Cg {
     // per-lane scratch segment stride in bytes (i64 scalar). The private aperture
     // for a lane is [scratch_base, scratch_base+stride).
     scratch_stride: LLVMValueRef,
-    sgpr: Vec<LLVMValueRef>, // 128 scalar i32 allocas (incl. EXEC/VCC mask regs)
-    vgpr: Vec<LLVMValueRef>, // num_vgprs <W×i32> allocas
+    sgpr: Vec<CellId>, // 128 scalar i32 representations (incl. EXEC/VCC mask regs)
+    vgpr: Vec<CellId>, // num_vgprs <W×i32> representations
     // Parallel <W×f64> storage for each VGPR pair whose low register is r. This
     // lets an f64 value remain one vector across instructions instead of being
     // repeatedly rebuilt from two <W×i32> halves. `f64_fresh` bit r means that
     // this f64 storage contains the current value of r:r+1. Predicated writes
     // update it with a per-lane select, so it remains valid for inactive lanes.
-    vgpr_f64: Vec<LLVMValueRef>,
+    vgpr_f64: Vec<CellId>,
     // 256-bit RegSet, not u128: VGPRs number up to 256 and `& 127` indexing
     // aliases pair p with p+128 (a v153:v154 write would falsely mark v25:v26).
     f64_fresh: std::cell::Cell<super::regtype::RegSet>,
@@ -148,7 +143,7 @@ struct Cg {
     global_load: std::cell::Cell<GlobalLoad>,
     nonempty_exec: std::cell::Cell<bool>,
     valid_mask: LLVMValueRef, // immutable allocated lanes, independent of EXEC
-    scc: LLVMValueRef,       // scalar i1 alloca
+    scc: CellId,       // scalar i1
     // scalar types
     i1: LLVMTypeRef,
     i32t: LLVMTypeRef,
@@ -180,14 +175,8 @@ struct Cg {
     // Preserve inactive lanes on vector writes unless liveness proves that the
     // destination is not observed after reconvergence.
     predicate: std::cell::Cell<bool>,
-    // The current V_LDEXP exponent is object-proven to produce a normal f64
-    // power of two, so exact multiplication can replace the generic lowering.
-    ldexp_normal_pow2: std::cell::Cell<bool>,
     structured_loop_masks: Option<StructuredLoopMasks>,
     current_pc: std::cell::Cell<usize>,
-    /// Cooperative kernels: what the host op at each resume pc touches. A
-    /// barrier stores its reads, yields, and reloads its writes.
-    boundary: BTreeMap<usize, BoundaryIo>,
 }
 
 /// Lane-mask storage used inside one conservatively selected leaf loop. EXEC,
@@ -202,7 +191,7 @@ struct Cg {
 struct StructuredLoopMasks {
     header: usize,
     body: std::collections::BTreeSet<usize>,
-    masks: BTreeMap<u32, LLVMValueRef>,
+    masks: BTreeMap<u32, CellId>,
     init_bb: LLVMBasicBlockRef,
     exit_bbs: BTreeMap<(usize, usize), LLVMBasicBlockRef>,
     active: std::cell::Cell<bool>,
@@ -296,13 +285,13 @@ impl Cg {
         let loop_masks = self.structured_loop_masks.as_ref()?;
         if !loop_masks.active.get() { return None; }
         let cell = *loop_masks.masks.get(&reg)?;
-        Some(llvm::core::LLVMBuildLoad2(self.b, self.vi1, cell, self.n()))
+        Some(self.state.borrow_mut().read(self.b, cell))
     }
     unsafe fn store_structured_mask(&self, reg: u32, value: LLVMValueRef) -> bool {
         let Some(loop_masks) = self.structured_loop_masks.as_ref() else { return false; };
         if !loop_masks.active.get() { return false; }
         let Some(&cell) = loop_masks.masks.get(&reg) else { return false; };
-        llvm::core::LLVMBuildStore(self.b, value, cell);
+        self.state.borrow_mut().write(self.b, cell, value);
         true
     }
     fn has_structured_mask(&self, reg: u32) -> bool {
@@ -329,7 +318,7 @@ impl Cg {
     unsafe fn sync_structured_masks_to_sgpr(&self) {
         let Some(loop_masks) = self.structured_loop_masks.as_ref() else { return; };
         for (&reg, &cell) in &loop_masks.masks {
-            let value = llvm::core::LLVMBuildLoad2(self.b, self.vi1, cell, self.n());
+            let value = self.state.borrow_mut().read(self.b, cell);
             self.st_sgpr32_raw(reg, self.vec_to_mask(value));
         }
     }
@@ -362,10 +351,12 @@ impl Cg {
         self.st_sgpr32_raw(i, v);
     }
     unsafe fn ld_sgpr32_raw(&self, i: u32) -> LLVMValueRef {
-        llvm::core::LLVMBuildLoad2(self.b, self.i32t, self.sgpr[i as usize], self.n())
+        if i == 124 { return self.ci32(0); }
+        self.state.borrow_mut().read(self.b, self.sgpr[i as usize])
     }
     unsafe fn st_sgpr32_raw(&self, i: u32, v: LLVMValueRef) {
-        llvm::core::LLVMBuildStore(self.b, v, self.sgpr[i as usize]);
+        if i == 124 { return; }
+        self.state.borrow_mut().write(self.b, self.sgpr[i as usize], v);
     }
     unsafe fn ld_sgpr64(&self, i: u32) -> LLVMValueRef {
         let lo = self.zext64s(self.ld_sgpr32(i));
@@ -383,8 +374,8 @@ impl Cg {
     unsafe fn zext64s(&self, v: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildZExt(self.b, v, self.i64t, self.n())
     }
-    unsafe fn ld_scc(&self) -> LLVMValueRef { llvm::core::LLVMBuildLoad2(self.b, self.i1, self.scc, self.n()) }
-    unsafe fn st_scc(&self, v: LLVMValueRef) { llvm::core::LLVMBuildStore(self.b, v, self.scc); }
+    unsafe fn ld_scc(&self) -> LLVMValueRef { self.state.borrow_mut().read(self.b, self.scc) }
+    unsafe fn st_scc(&self, v: LLVMValueRef) { self.state.borrow_mut().write(self.b, self.scc, v); }
     unsafe fn st_scc_nz(&self, v32: LLVMValueRef) {
         let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, v32, self.ci32(0), self.n());
         self.st_scc(c);
@@ -428,7 +419,7 @@ impl Cg {
             return;
         }
         let v = self.cell_half(p, i);
-        llvm::core::LLVMBuildStore(self.b, v, self.vgpr[i as usize]);
+        self.state.borrow_mut().write(self.b, self.vgpr[i as usize], v);
     }
     /// At a block's out-edges: materialize the i32 slots of every lazily-stale
     /// pair that is not must-fresh in ALL successors (their emitters would read
@@ -463,7 +454,7 @@ impl Cg {
         else { None }
     }
     unsafe fn ld_pair_f64(&self, p: u32) -> LLVMValueRef {
-        llvm::core::LLVMBuildLoad2(self.b, self.vf64, self.vgpr_f64[p as usize], self.n())
+        self.state.borrow_mut().read(self.b, self.vgpr_f64[p as usize])
     }
     // i64-bits view of a canonical pair's cell (raw 64-bit shifts — NOT v_lshr,
     // which masks the count to 31).
@@ -479,7 +470,7 @@ impl Cg {
         if let Some(p) = self.fresh_low(i) {
             return self.cell_half(p, i);
         }
-        llvm::core::LLVMBuildLoad2(self.b, self.vi32, self.vgpr[i as usize], self.n())
+        self.state.borrow_mut().read(self.b, self.vgpr[i as usize])
     }
     /// Per-lane predicate: inactive lanes keep their old value (read from the
     /// canonical cell when applicable, else the i32 slot).
@@ -504,7 +495,7 @@ impl Cg {
                 self.v_or(self.v_and(old, self.splat(self.ci64(0x0000_0000_FFFF_FFFF), self.vi64)), zhi)
             };
             let d = llvm::core::LLVMBuildBitCast(self.b, nb, self.vf64, self.n());
-            llvm::core::LLVMBuildStore(self.b, d, self.vgpr_f64[p as usize]);
+            self.state.borrow_mut().write(self.b, self.vgpr_f64[p as usize], d);
             return;
         }
         // Lazily-synced fresh pairs containing reg i lose freshness below, so
@@ -521,7 +512,7 @@ impl Cg {
         // A 32-bit write invalidates the (shadow) f64 cell of pairs i and i-1.
         self.set_fresh(i, false);
         if i > 0 { self.set_fresh(i - 1, false); }
-        llvm::core::LLVMBuildStore(self.b, v, self.vgpr[i as usize]);
+        self.state.borrow_mut().write(self.b, self.vgpr[i as usize], v);
     }
     unsafe fn set_f64_fresh(&self, fresh: super::regtype::RegSet) { self.f64_fresh.set(fresh); }
     unsafe fn ld_vgpr64(&self, i: u32) -> LLVMValueRef {
@@ -544,7 +535,7 @@ impl Cg {
         if self.fresh(i) { return self.ld_pair_f64(i); }
         let u = self.ld_vgpr64(i);
         let d = llvm::core::LLVMBuildBitCast(self.b, u, self.vf64, self.n());
-        llvm::core::LLVMBuildStore(self.b, d, self.vgpr_f64[i as usize]);
+        self.state.borrow_mut().write(self.b, self.vgpr_f64[i as usize], d);
         self.set_fresh(i, true);
         self.set_stale(i, false); // memoized from the slots — they are current
         d
@@ -556,7 +547,7 @@ impl Cg {
             let vp = if self.predicate.get() {
                 llvm::core::LLVMBuildSelect(self.b, self.exec_vec(), v, self.ld_pair_f64(i), self.n())
             } else { v };
-            llvm::core::LLVMBuildStore(self.b, vp, self.vgpr_f64[i as usize]);
+            self.state.borrow_mut().write(self.b, self.vgpr_f64[i as usize], vp);
             return;
         }
         // Non-canonical: predicated value written to both the shadow cell and the
@@ -577,7 +568,7 @@ impl Cg {
             self.sync_half(i + 1, i + 2);
         }
         // The i32 slots are synced lazily (see `stale`): store only the cell.
-        llvm::core::LLVMBuildStore(self.b, vp, self.vgpr_f64[i as usize]);
+        self.state.borrow_mut().write(self.b, self.vgpr_f64[i as usize], vp);
         if i > 0 { self.set_fresh(i - 1, false); }
         self.set_fresh(i + 1, false);
         self.set_fresh(i, true);
@@ -651,25 +642,12 @@ impl Cg {
     unsafe fn v_or(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef { llvm::core::LLVMBuildOr(self.b, a, b, self.n()) }
     unsafe fn v_xor(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef { llvm::core::LLVMBuildXor(self.b, a, b, self.n()) }
     unsafe fn v_add(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef { llvm::core::LLVMBuildAdd(self.b, a, b, self.n()) }
-    unsafe fn v_shl(&self, a: LLVMValueRef, amt: LLVMValueRef) -> LLVMValueRef {
-        let amt = self.v_and(amt, self.vci32(31));
-        llvm::core::LLVMBuildShl(self.b, a, amt, self.n())
-    }
-    unsafe fn v_lshr(&self, a: LLVMValueRef, amt: LLVMValueRef) -> LLVMValueRef {
-        let amt = self.v_and(amt, self.vci32(31));
-        llvm::core::LLVMBuildLShr(self.b, a, amt, self.n())
-    }
+
+
     /// Mangled vector-f64 intrinsic name, e.g. `llvm.sqrt.v8f64`.
     fn vfn(&self, name: &str) -> String { format!("llvm.{}.v{}f64", name, self.w) }
-    unsafe fn vfmuladd(&self, a: LLVMValueRef, b: LLVMValueRef, c: LLVMValueRef) -> LLVMValueRef {
-        let vfty = self.vf64;
-        self.call(&self.vfn("fmuladd"), vfty, &[vfty, vfty, vfty], &[a, b, c])
-    }
     unsafe fn vsqrt(&self, a: LLVMValueRef) -> LLVMValueRef {
         self.call(&self.vfn("sqrt"), self.vf64, &[self.vf64], &[a])
-    }
-    unsafe fn vfloor(&self, a: LLVMValueRef) -> LLVMValueRef {
-        self.call(&self.vfn("floor"), self.vf64, &[self.vf64], &[a])
     }
     unsafe fn vfdiv(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef { llvm::core::LLVMBuildFDiv(self.b, a, b, self.n()) }
     unsafe fn vfmul(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef { llvm::core::LLVMBuildFMul(self.b, a, b, self.n()) }
@@ -687,7 +665,6 @@ impl Cg {
     }
 
     // ---- f32 vector helpers ----------------------------------------------
-    fn vfn32(&self, name: &str) -> String { format!("llvm.{}.v{}f32", name, self.w) }
     unsafe fn vcf32(&self, v: f32) -> LLVMValueRef {
         self.splat(llvm::core::LLVMConstReal(self.f32t, v as f64), self.vf32)
     }
@@ -711,133 +688,6 @@ impl Cg {
 
     unsafe fn vfsub(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildFSub(self.b, a, b, self.n())
-    }
-    unsafe fn vcf32_bits(&self, bits: u32) -> LLVMValueRef {
-        self.splat(llvm::core::LLVMConstBitCast(self.ci32(bits), self.f32t), self.vf32)
-    }
-    unsafe fn vfrexp_f32(&self, x: LLVMValueRef) -> (LLVMValueRef, LLVMValueRef) {
-        use llvm::LLVMIntPredicate::*;
-        let n = self.n();
-        let bits = self.vf32_bits(x);
-        let sign = self.v_and(bits, self.vci32(0x8000_0000));
-        let frac = self.v_and(bits, self.vci32(0x007f_ffff));
-        let exp = self.v_and(
-            llvm::core::LLVMBuildLShr(self.b, bits, self.vci32(23), n),
-            self.vci32(0xff),
-        );
-        let exp_nonzero = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, exp, self.vci32(0), n);
-        let exp_finite = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, exp, self.vci32(0xff), n);
-        let normal = llvm::core::LLVMBuildAnd(self.b, exp_nonzero, exp_finite, n);
-        let frac_nonzero = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, frac, self.vci32(0), n);
-        let subnormal = llvm::core::LLVMBuildAnd(
-            self.b,
-            llvm::core::LLVMBuildNot(self.b, exp_nonzero, n),
-            frac_nonzero,
-            n,
-        );
-
-        let normal_mant = self.v_or(self.v_or(sign, frac), self.vci32(0x3f00_0000));
-        let lz = self.call(
-            &format!("llvm.ctlz.v{}i32", self.w),
-            self.vi32,
-            &[self.vi32, self.i1],
-            &[frac, llvm::core::LLVMConstInt(self.i1, 0, 0)],
-        );
-        let shift = llvm::core::LLVMBuildSub(self.b, lz, self.vci32(8), n);
-        let sub_frac = self.v_and(
-            llvm::core::LLVMBuildShl(self.b, frac, shift, n),
-            self.vci32(0x007f_ffff),
-        );
-        let sub_mant = self.v_or(self.v_or(sign, sub_frac), self.vci32(0x3f00_0000));
-        let mant_bits = llvm::core::LLVMBuildSelect(
-            self.b,
-            normal,
-            normal_mant,
-            llvm::core::LLVMBuildSelect(self.b, subnormal, sub_mant, bits, n),
-            n,
-        );
-
-        let normal_exp = llvm::core::LLVMBuildSub(self.b, exp, self.vci32(126), n);
-        let sub_exp = llvm::core::LLVMBuildSub(
-            self.b,
-            self.splat(self.ci32((-117i32) as u32), self.vi32),
-            lz,
-            n,
-        );
-        let out_exp = llvm::core::LLVMBuildSelect(
-            self.b,
-            normal,
-            normal_exp,
-            llvm::core::LLVMBuildSelect(self.b, subnormal, sub_exp, self.vci32(0), n),
-            n,
-        );
-        (self.vf32_of(mant_bits), out_exp)
-    }
-
-    unsafe fn vdiv_fixup_f32(
-        &self,
-        approx: LLVMValueRef,
-        numerator: LLVMValueRef,
-        denominator: LLVMValueRef,
-    ) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        let n = self.n();
-        let a = self.vf32_bits(approx);
-        let b = self.vf32_bits(numerator);
-        let c = self.vf32_bits(denominator);
-        let abs_b = self.v_and(b, self.vci32(0x7fff_ffff));
-        let abs_c = self.v_and(c, self.vci32(0x7fff_ffff));
-        let sign = self.v_and(self.v_xor(b, c), self.vci32(0x8000_0000));
-        let exp_b = self.v_and(llvm::core::LLVMBuildLShr(self.b, b, self.vci32(23), n), self.vci32(0xff));
-        let exp_c = self.v_and(llvm::core::LLVMBuildLShr(self.b, c, self.vci32(23), n), self.vci32(0xff));
-        let frac_b = self.v_and(b, self.vci32(0x007f_ffff));
-        let frac_c = self.v_and(c, self.vci32(0x007f_ffff));
-        let b_exp_ff = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, exp_b, self.vci32(0xff), n);
-        let c_exp_ff = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, exp_c, self.vci32(0xff), n);
-        let b_frac_nz = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, frac_b, self.vci32(0), n);
-        let c_frac_nz = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, frac_c, self.vci32(0), n);
-        let b_nan = llvm::core::LLVMBuildAnd(self.b, b_exp_ff, b_frac_nz, n);
-        let c_nan = llvm::core::LLVMBuildAnd(self.b, c_exp_ff, c_frac_nz, n);
-        let b_inf = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_b, self.vci32(0x7f80_0000), n);
-        let c_inf = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_c, self.vci32(0x7f80_0000), n);
-        let b_zero = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_b, self.vci32(0), n);
-        let c_zero = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs_c, self.vci32(0), n);
-        let exp_delta = llvm::core::LLVMBuildSub(self.b, exp_c, exp_b, n);
-        let underflow = llvm::core::LLVMBuildICmp(
-            self.b,
-            LLVMIntSLT,
-            exp_delta,
-            self.splat(self.ci32((-150i32) as u32), self.vi32),
-            n,
-        );
-
-        let signed_zero = sign;
-        let signed_inf = self.v_or(sign, self.vci32(0x7f80_0000));
-        let signed_approx = self.v_or(self.v_and(a, self.vci32(0x7fff_ffff)), sign);
-        let mut out = signed_approx;
-        out = llvm::core::LLVMBuildSelect(self.b, b_exp_ff, signed_inf, out, n);
-        out = llvm::core::LLVMBuildSelect(self.b, underflow, signed_zero, out, n);
-        out = llvm::core::LLVMBuildSelect(
-            self.b,
-            llvm::core::LLVMBuildOr(self.b, b_inf, c_zero, n),
-            signed_zero,
-            out,
-            n,
-        );
-        out = llvm::core::LLVMBuildSelect(
-            self.b,
-            llvm::core::LLVMBuildOr(self.b, b_zero, c_inf, n),
-            signed_inf,
-            out,
-            n,
-        );
-        let both_inf = llvm::core::LLVMBuildAnd(self.b, b_inf, c_inf, n);
-        out = llvm::core::LLVMBuildSelect(self.b, both_inf, self.vci32(0xffc0_0000), out, n);
-        let both_zero = llvm::core::LLVMBuildAnd(self.b, b_zero, c_zero, n);
-        out = llvm::core::LLVMBuildSelect(self.b, both_zero, self.vci32(0xffc0_0000), out, n);
-        out = llvm::core::LLVMBuildSelect(self.b, b_nan, b, out, n);
-        out = llvm::core::LLVMBuildSelect(self.b, c_nan, c, out, n);
-        self.vf32_of(out)
     }
 
     /// The fixup the ISA applies to a division's quotient, as the interpreter's
@@ -894,385 +744,13 @@ impl Cg {
         llvm::core::LLVMBuildBitCast(self.b, select(fix, fixed, bits(quotient)), self.vf64, n)
     }
 
-    unsafe fn vdiv_scale_f32(
-        &self,
-        s0: LLVMValueRef,
-        s1: LLVMValueRef,
-        s2: LLVMValueRef,
-    ) -> (LLVMValueRef, LLVMValueRef) {
-        use llvm::LLVMIntPredicate::*;
-        use llvm::LLVMRealPredicate::LLVMRealOEQ;
-        let n = self.n();
-        let b1 = self.vf32_bits(s1);
-        let b2 = self.vf32_bits(s2);
-        let abs1 = self.v_and(b1, self.vci32(0x7fff_ffff));
-        let abs2 = self.v_and(b2, self.vci32(0x7fff_ffff));
-        let e1 = self.v_and(llvm::core::LLVMBuildLShr(self.b, b1, self.vci32(23), n), self.vci32(0xff));
-        let e2 = self.v_and(llvm::core::LLVMBuildLShr(self.b, b2, self.vci32(23), n), self.vci32(0xff));
-        let zero1 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs1, self.vci32(0), n);
-        let zero2 = llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, abs2, self.vci32(0), n);
-        let either_zero = llvm::core::LLVMBuildOr(self.b, zero1, zero2, n);
-        let exp_delta = llvm::core::LLVMBuildSub(self.b, e2, e1, n);
-        let huge_delta = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGE, exp_delta, self.vci32(96), n);
-        let e1_nonzero = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e1, self.vci32(0), n);
-        let e1_finite = llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e1, self.vci32(0xff), n);
-        let s1_normal = llvm::core::LLVMBuildAnd(self.b, e1_nonzero, e1_finite, n);
-
-        let initial = self.vfdiv(self.vfmul(s0, s2), s1);
-        let inv = self.vfdiv(self.vcf32(1.0), s1);
-        let ratio = self.vfdiv(s2, s1);
-        let inv_bits = self.vf32_bits(inv);
-        let ratio_bits = self.vf32_bits(ratio);
-        let inv_exp = self.v_and(llvm::core::LLVMBuildLShr(self.b, inv_bits, self.vci32(23), n), self.vci32(0xff));
-        let ratio_exp = self.v_and(llvm::core::LLVMBuildLShr(self.b, ratio_bits, self.vci32(23), n), self.vci32(0xff));
-        let inv_normal = llvm::core::LLVMBuildAnd(
-            self.b,
-            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, inv_exp, self.vci32(0), n),
-            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, inv_exp, self.vci32(0xff), n),
-            n,
-        );
-        let ratio_normal = llvm::core::LLVMBuildAnd(
-            self.b,
-            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, ratio_exp, self.vci32(0), n),
-            llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, ratio_exp, self.vci32(0xff), n),
-            n,
-        );
-        let inv_abnormal = llvm::core::LLVMBuildNot(self.b, inv_normal, n);
-        let ratio_abnormal = llvm::core::LLVMBuildNot(self.b, ratio_normal, n);
-        let both_abnormal = llvm::core::LLVMBuildAnd(self.b, inv_abnormal, ratio_abnormal, n);
-        let eq01 = llvm::core::LLVMBuildFCmp(self.b, LLVMRealOEQ, s0, s1, n);
-        let eq02 = llvm::core::LLVMBuildFCmp(self.b, LLVMRealOEQ, s0, s2, n);
-        let up = self.vfmul(s0, self.vcf32_bits(0x5f80_0000));
-        let down = self.vfmul(s0, self.vcf32_bits(0x1f80_0000));
-        let branch_huge = llvm::core::LLVMBuildSelect(self.b, eq01, up, initial, n);
-        let branch_both = llvm::core::LLVMBuildSelect(self.b, eq01, up, initial, n);
-        let branch_ratio = llvm::core::LLVMBuildSelect(self.b, eq02, up, initial, n);
-        let low_exp = llvm::core::LLVMBuildICmp(self.b, LLVMIntSLE, e2, self.vci32(23), n);
-
-        let mut out = llvm::core::LLVMBuildSelect(self.b, low_exp, up, initial, n);
-        let mut flag = llvm::core::LLVMConstNull(self.vi1);
-        out = llvm::core::LLVMBuildSelect(self.b, ratio_abnormal, branch_ratio, out, n);
-        flag = llvm::core::LLVMBuildSelect(self.b, ratio_abnormal, llvm::core::LLVMConstAllOnes(self.vi1), flag, n);
-        out = llvm::core::LLVMBuildSelect(self.b, inv_abnormal, down, out, n);
-        flag = llvm::core::LLVMBuildSelect(self.b, inv_abnormal, llvm::core::LLVMConstNull(self.vi1), flag, n);
-        out = llvm::core::LLVMBuildSelect(self.b, both_abnormal, branch_both, out, n);
-        flag = llvm::core::LLVMBuildSelect(self.b, both_abnormal, llvm::core::LLVMConstAllOnes(self.vi1), flag, n);
-        out = llvm::core::LLVMBuildSelect(self.b, llvm::core::LLVMBuildNot(self.b, s1_normal, n), up, out, n);
-        flag = llvm::core::LLVMBuildSelect(self.b, llvm::core::LLVMBuildNot(self.b, s1_normal, n), llvm::core::LLVMConstNull(self.vi1), flag, n);
-        out = llvm::core::LLVMBuildSelect(self.b, huge_delta, branch_huge, out, n);
-        flag = llvm::core::LLVMBuildSelect(self.b, huge_delta, llvm::core::LLVMConstAllOnes(self.vi1), flag, n);
-        out = llvm::core::LLVMBuildSelect(self.b, either_zero, self.vcf32_bits(f32::NAN.to_bits()), out, n);
-        flag = llvm::core::LLVMBuildSelect(self.b, either_zero, llvm::core::LLVMConstNull(self.vi1), flag, n);
-        (out, flag)
-    }
-    /// Lane-mask register presented as <W×i32> 0/1 per lane.
-    unsafe fn mask_to_u32(&self, reg: u32) -> LLVMValueRef {
-        llvm::core::LLVMBuildZExt(self.b, self.mask_to_vec(self.ld_sgpr32(reg)), self.vi32, self.n())
-    }
     unsafe fn vsrc_f32(&self, op: &SourceOperand) -> LLVMValueRef {
         match op {
             SourceOperand::FloatConstant(v) => self.vcf32(*v as f32),
             _ => llvm::core::LLVMBuildBitCast(self.b, self.vsrc_u32(op), self.vf32, self.n()),
         }
     }
-    unsafe fn vsrc_f16_f32(&self, op: &SourceOperand, high: bool) -> LLVMValueRef {
-        let mut bits = self.vsrc_u32(op);
-        if high {
-            bits = llvm::core::LLVMBuildLShr(self.b, bits, self.vci32(16), self.n());
-        }
-        let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
-        let vi16 = llvm::core::LLVMVectorType(i16t, self.w);
-        let vf16 = llvm::core::LLVMVectorType(llvm::core::LLVMHalfTypeInContext(self.ctx), self.w);
-        let bits = llvm::core::LLVMBuildTrunc(self.b, bits, vi16, self.n());
-        let half = llvm::core::LLVMBuildBitCast(self.b, bits, vf16, self.n());
-        llvm::core::LLVMBuildFPExt(self.b, half, self.vf32, self.n())
-    }
-    unsafe fn vf32_to_f16_bits(&self, value: LLVMValueRef) -> LLVMValueRef {
-        let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
-        let vi16 = llvm::core::LLVMVectorType(i16t, self.w);
-        let vf16 = llvm::core::LLVMVectorType(llvm::core::LLVMHalfTypeInContext(self.ctx), self.w);
-        let half = llvm::core::LLVMBuildFPTrunc(self.b, value, vf16, self.n());
-        let bits = llvm::core::LLVMBuildBitCast(self.b, half, vi16, self.n());
-        llvm::core::LLVMBuildZExt(self.b, bits, self.vi32, self.n())
-    }
-    unsafe fn vabsneg_f32(&self, v: LLVMValueRef, abs: u8, neg: u8, idx: u32) -> LLVMValueRef {
-        let mut v = v;
-        if (abs >> idx) & 1 != 0 {
-            v = self.call(&self.vfn32("fabs"), self.vf32, &[self.vf32], &[v]);
-        }
-        if (neg >> idx) & 1 != 0 {
-            v = llvm::core::LLVMBuildFNeg(self.b, v, self.n());
-        }
-        v
-    }
-    unsafe fn vfma32(&self, a: LLVMValueRef, b: LLVMValueRef, c: LLVMValueRef) -> LLVMValueRef {
-        self.call(&self.vfn32("fma"), self.vf32, &[self.vf32, self.vf32, self.vf32], &[a, b, c])
-    }
-    /// Per-lane runtime call for f32 ops with no vector intrinsic (bit-exact
-    /// with the scalar path's helper), gathering results into a <W×?> vector.
-    unsafe fn per_lane(&self, name: &str, rty: LLVMTypeRef, in_vecs: &[LLVMValueRef], in_scalar_tys: &[LLVMTypeRef], out_vty: LLVMTypeRef) -> LLVMValueRef {
-        let mut res = llvm::core::LLVMGetPoison(out_vty);
-        for k in 0..self.w {
-            let args: Vec<LLVMValueRef> = in_vecs.iter().map(|v| llvm::core::LLVMBuildExtractElement(self.b, *v, self.ci32(k), self.n())).collect();
-            let rk = self.call(name, rty, in_scalar_tys, &args);
-            res = llvm::core::LLVMBuildInsertElement(self.b, res, rk, self.ci32(k), self.n());
-        }
-        res
-    }
-
-    /// `x * 2^exp` per lane. On AVX-512 hosts this is `vscalefpd` (hardware
-    /// scalbn: x·2^⌊y⌋, single IEEE rounding, denormal/inf-correct — the exact
-    /// semantics of the clamped-multiply chain below), 5 ops per 16 lanes
-    /// instead of ~45; otherwise the clamped-multiply chain.
-    unsafe fn vldexp(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if self.w == 4
-                && std::arch::is_x86_feature_detected!("avx512f")
-                && std::arch::is_x86_feature_detected!("avx512vl")
-            {
-                return self.vldexp_scalef_256(value, exp);
-            }
-            if self.w % 8 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
-                return self.vldexp_scalef(value, exp);
-            }
-        }
-        self.vldexp_chain(value, exp)
-    }
-
-    /// Exact `x * 2^exp` lowering when object analysis proves that the
-    /// constructed power of two is a normal f64 value.
-    unsafe fn vldexp_normal_pow2(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        let exp64 = llvm::core::LLVMBuildSExt(self.b, exp, self.vi64, self.n());
-        let biased = self.v_add(exp64, self.splat(self.ci64(1023), self.vi64));
-        let bits = llvm::core::LLVMBuildShl(
-            self.b,
-            biased,
-            self.splat(self.ci64(52), self.vi64),
-            self.n(),
-        );
-        let scale = llvm::core::LLVMBuildBitCast(self.b, bits, self.vf64, self.n());
-        self.vfmul(value, scale)
-    }
-
-    /// ldexp via `vscalefpd` for a 4-lane YMM vector (AVX-512VL form).
-    unsafe fn vldexp_scalef_256(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        let i8t = llvm::core::LLVMInt8TypeInContext(self.ctx);
-        let ef = llvm::core::LLVMBuildSIToFP(self.b, exp, self.vf64, self.n());
-        self.call(
-            "llvm.x86.avx512.mask.scalef.pd.256",
-            self.vf64,
-            &[self.vf64, self.vf64, self.vf64, i8t],
-            &[
-                value,
-                ef,
-                value,
-                llvm::core::LLVMConstInt(i8t, 0x0F, 0),
-            ],
-        )
-    }
-
-    /// ldexp via `vscalefpd` in 8-lane chunks (the 512-bit intrinsic width).
-    unsafe fn vldexp_scalef(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        let n = self.n();
-        let i8t = llvm::core::LLVMInt8TypeInContext(self.ctx);
-        let v8f64 = llvm::core::LLVMVectorType(self.f64t, 8);
-        let v8i32 = llvm::core::LLVMVectorType(self.i32t, 8);
-        let chunks = (self.w / 8) as usize;
-        let mut parts: Vec<LLVMValueRef> = Vec::with_capacity(chunks);
-        for c in 0..chunks {
-            let (xc, ec) = if chunks == 1 {
-                (value, exp)
-            } else {
-                let mut mask: Vec<LLVMValueRef> =
-                    (0..8).map(|k| self.ci32((c * 8 + k) as u32)).collect();
-                let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), 8);
-                let poison_f = llvm::core::LLVMGetPoison(self.vf64);
-                let poison_i = llvm::core::LLVMGetPoison(self.vi32);
-                (
-                    llvm::core::LLVMBuildShuffleVector(self.b, value, poison_f, m, n),
-                    llvm::core::LLVMBuildShuffleVector(self.b, exp, poison_i, m, n),
-                )
-            };
-            let ef = llvm::core::LLVMBuildSIToFP(self.b, ec, v8f64, n);
-            let _ = v8i32;
-            let r = self.call(
-                "llvm.x86.avx512.mask.scalef.pd.512",
-                v8f64,
-                &[v8f64, v8f64, v8f64, i8t, self.i32t],
-                &[xc, ef, xc, llvm::core::LLVMConstInt(i8t, 0xFF, 0), self.ci32(4)],
-            );
-            parts.push(r);
-        }
-        // Concatenate the 8-lane parts back to <W×f64> (pairwise shuffle tree).
-        let mut width = 8u32;
-        let mut vals = parts;
-        while vals.len() > 1 {
-            let mut next = Vec::with_capacity(vals.len() / 2);
-            for p in vals.chunks(2) {
-                let mut mask: Vec<LLVMValueRef> =
-                    (0..width * 2).map(|k| self.ci32(k)).collect();
-                let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), width * 2);
-                next.push(llvm::core::LLVMBuildShuffleVector(self.b, p[0], p[1], m, n));
-            }
-            width *= 2;
-            vals = next;
-        }
-        vals[0]
-    }
-
-    /// `x * 2^exp` per lane for f32. `llvm.ldexp.vNf32` has no vector lowering,
-    /// so LLVM scalarizes it into one libc `scalbnf` call per lane; on AVX-512
-    /// hosts `vscalefps` is the same operation in one instruction per 16 lanes.
-    unsafe fn vldexp_f32(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        let n = self.n();
-        #[cfg(target_arch = "x86_64")]
-        {
-            if self.w % 16 == 0 && std::arch::is_x86_feature_detected!("avx512f") {
-                let i16t = llvm::core::LLVMIntTypeInContext(self.ctx, 16);
-                let v16f32 = llvm::core::LLVMVectorType(self.f32t, 16);
-                let chunks = (self.w / 16) as usize;
-                let mut parts: Vec<LLVMValueRef> = Vec::with_capacity(chunks);
-                for c in 0..chunks {
-                    let (xc, ec) = if chunks == 1 {
-                        (value, exp)
-                    } else {
-                        let mut mask: Vec<LLVMValueRef> =
-                            (0..16).map(|k| self.ci32((c * 16 + k) as u32)).collect();
-                        let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), 16);
-                        let poison_f = llvm::core::LLVMGetPoison(self.vf32);
-                        let poison_i = llvm::core::LLVMGetPoison(self.vi32);
-                        (
-                            llvm::core::LLVMBuildShuffleVector(self.b, value, poison_f, m, n),
-                            llvm::core::LLVMBuildShuffleVector(self.b, exp, poison_i, m, n),
-                        )
-                    };
-                    let ef = llvm::core::LLVMBuildSIToFP(self.b, ec, v16f32, n);
-                    parts.push(self.call(
-                        "llvm.x86.avx512.mask.scalef.ps.512",
-                        v16f32,
-                        &[v16f32, v16f32, v16f32, i16t, self.i32t],
-                        &[xc, ef, xc, llvm::core::LLVMConstInt(i16t, 0xFFFF, 0), self.ci32(4)],
-                    ));
-                }
-                let mut width = 16u32;
-                let mut vals = parts;
-                while vals.len() > 1 {
-                    let mut next = Vec::with_capacity(vals.len() / 2);
-                    for p in vals.chunks(2) {
-                        let mut mask: Vec<LLVMValueRef> =
-                            (0..width * 2).map(|k| self.ci32(k)).collect();
-                        let m = llvm::core::LLVMConstVector(mask.as_mut_ptr(), width * 2);
-                        next.push(llvm::core::LLVMBuildShuffleVector(self.b, p[0], p[1], m, n));
-                    }
-                    width *= 2;
-                    vals = next;
-                }
-                return vals[0];
-            }
-        }
-        self.call(
-            &format!("llvm.ldexp.v{}f32.v{}i32", self.w, self.w),
-            self.vf32,
-            &[self.vf32, self.vi32],
-            &[value, exp],
-        )
-    }
-
-    /// Portable fallback: 3 clamped power-of-two multiplies (avoids scalbn).
-    unsafe fn vldexp_chain(&self, value: LLVMValueRef, exp: LLVMValueRef) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        let mut result = value;
-        let mut remaining = exp;
-        for _ in 0..3 {
-            let hi = self.vci32(1023);
-            let lo = self.splat(llvm::core::LLVMConstInt(self.i32t, (-1022i32) as u64, 1), self.vi32);
-            let c1 = llvm::core::LLVMBuildICmp(self.b, LLVMIntSLT, remaining, hi, self.n());
-            let step = llvm::core::LLVMBuildSelect(self.b, c1, remaining, hi, self.n());
-            let c2 = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGT, step, lo, self.n());
-            let step = llvm::core::LLVMBuildSelect(self.b, c2, step, lo, self.n());
-            remaining = llvm::core::LLVMBuildSub(self.b, remaining, step, self.n());
-            let step64 = llvm::core::LLVMBuildSExt(self.b, step, self.vi64, self.n());
-            let biased = self.v_add(step64, self.splat(self.ci64(1023), self.vi64));
-            let bits = llvm::core::LLVMBuildShl(self.b, biased, self.splat(self.ci64(52), self.vi64), self.n());
-            let scale = llvm::core::LLVMBuildBitCast(self.b, bits, self.vf64, self.n());
-            result = self.vfmul(result, scale);
-        }
-        result
-    }
-
-    /// The 1280-bit 2/π fraction table as a private module-level constant
-    /// (same words as [super::runtime::TWO_OVER_PI_FRACTION]).
-    unsafe fn trig_table(&self) -> LLVMValueRef {
-        let name = b"two_over_pi_fraction\0";
-        let g = llvm::core::LLVMGetNamedGlobal(self.module, name.as_ptr() as *const _);
-        if !g.is_null() { return g; }
-        let words = super::runtime::TWO_OVER_PI_FRACTION;
-        let aty = llvm::core::LLVMArrayType2(self.i64t, words.len() as u64);
-        let g = llvm::core::LLVMAddGlobal(self.module, aty, name.as_ptr() as *const _);
-        let vals: Vec<LLVMValueRef> = words.iter().map(|&v| self.ci64(v)).collect();
-        let init = llvm::core::LLVMConstArray2(self.i64t, vals.as_ptr() as *mut _, vals.len() as u64);
-        llvm::core::LLVMSetInitializer(g, init);
-        llvm::core::LLVMSetGlobalConstant(g, 1);
-        llvm::core::LLVMSetLinkage(g, llvm::LLVMLinkage::LLVMPrivateLinkage);
-        g
-    }
-
-    /// Vectorized `V_TRIG_PREOP_F64` (Payne–Hanek segment extraction), bit-exact
-    /// with the scalar runtime helper: the 53-bit table extraction is integer-only
-    /// (gather + funnel shift), and [Self::vldexp] rounds once at the final
-    /// multiply exactly like `libm::ldexp`.
-    unsafe fn v_trig_preop(&self, a: LLVMValueRef, s: LLVMValueRef) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        let n = self.n();
-        // exp = biased exponent of |a|; shift = (s & 31)*53 + max(exp - 1077, 0)
-        let abits = llvm::core::LLVMBuildBitCast(self.b, a, self.vi64, n);
-        let e64 = llvm::core::LLVMBuildLShr(self.b, abits, self.splat(self.ci64(52), self.vi64), n);
-        let e64 = llvm::core::LLVMBuildAnd(self.b, e64, self.splat(self.ci64(0x7ff), self.vi64), n);
-        let exp = llvm::core::LLVMBuildTrunc(self.b, e64, self.vi32, n);
-        let seg = llvm::core::LLVMBuildAnd(self.b, s, self.vci32(31), n);
-        let seg = llvm::core::LLVMBuildMul(self.b, seg, self.vci32(53), n);
-        let over = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGT, exp, self.vci32(1077), n);
-        let extra = llvm::core::LLVMBuildSub(self.b, exp, self.vci32(1077), n);
-        let extra = llvm::core::LLVMBuildSelect(self.b, over, extra, self.vci32(0), n);
-        let shift = llvm::core::LLVMBuildAdd(self.b, seg, extra, n);
-        // bit_offset = 1201 - 53 - shift; out of table (< 0) ⇒ result 0.
-        let bit_offset = llvm::core::LLVMBuildSub(self.b, self.vci32(1201 - 53), shift, n);
-        let valid = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGE, bit_offset, self.vci32(0), n);
-        // scale = -53 - shift (+128 if exp >= 1968)
-        let hiexp = llvm::core::LLVMBuildICmp(self.b, LLVMIntSGE, exp, self.vci32(1968), n);
-        let base = llvm::core::LLVMBuildSelect(
-            self.b, hiexp, self.vci32((-53i32 + 128) as u32), self.vci32((-53i32) as u32), n);
-        let scale = llvm::core::LLVMBuildSub(self.b, base, shift, n);
-        // 64-bit window [table[word+1] : table[word]] >> bit, masked to 53 bits.
-        // Invalid lanes are masked out of the gathers (their word index is wild).
-        let word = llvm::core::LLVMBuildAShr(self.b, bit_offset, self.vci32(6), n);
-        let bit = llvm::core::LLVMBuildAnd(self.b, bit_offset, self.vci32(63), n);
-        let tbl = self.trig_table();
-        let vptr = llvm::core::LLVMVectorType(self.ptr, self.w);
-        let zero64 = llvm::core::LLVMConstNull(self.vi64);
-        let mut idx = [word];
-        let ptrs_lo = llvm::core::LLVMBuildGEP2(self.b, self.i64t, tbl, idx.as_mut_ptr(), 1, n);
-        let lo = self.masked_call("llvm.masked.gather.", &[self.vi64, vptr],
-                                  &[ptrs_lo, valid, zero64], 0, 8);
-        let word1 = llvm::core::LLVMBuildAdd(self.b, word, self.vci32(1), n);
-        let mut idx = [word1];
-        let ptrs_hi = llvm::core::LLVMBuildGEP2(self.b, self.i64t, tbl, idx.as_mut_ptr(), 1, n);
-        let hi = self.masked_call("llvm.masked.gather.", &[self.vi64, vptr],
-                                  &[ptrs_hi, valid, zero64], 0, 8);
-        let bit64 = llvm::core::LLVMBuildZExt(self.b, bit, self.vi64, n);
-        let ext = self.call(&format!("llvm.fshr.v{}i64", self.w), self.vi64,
-                            &[self.vi64, self.vi64, self.vi64], &[hi, lo, bit64]);
-        let frac = llvm::core::LLVMBuildAnd(self.b, ext, self.splat(self.ci64((1u64 << 53) - 1), self.vi64), n);
-        let rf = llvm::core::LLVMBuildUIToFP(self.b, frac, self.vf64, n);
-        let scaled = self.vldexp(rf, scale);
-        llvm::core::LLVMBuildSelect(self.b, valid, scaled, llvm::core::LLVMConstNull(self.vf64), n)
-    }
-
     // Per-lane mask bit (i1 vector) of a lane-mask register's low W bits.
-    unsafe fn vcc_vec(&self) -> LLVMValueRef {
-        self.structured_mask(VCC).unwrap_or_else(|| self.mask_to_vec(self.ld_sgpr32(VCC)))
-    }
 
     // ---- compares -> lane mask ------------------------------------------
     /// Write a <W×i1> compare into a lane-mask register's low W bits. Inactive
@@ -1316,10 +794,6 @@ impl Cg {
         let masked = self.v_and(z, self.ld_sgpr32(EXEC));
         self.st_sgpr32(reg, masked);
     }
-    unsafe fn st_sdst_mask(&self, sdst: u8, v: LLVMValueRef) {
-        if sdst == 124 || sdst == 125 { return; }
-        self.st_mask(sdst as u32, v);
-    }
 
     unsafe fn ptr_at_vec(&self, addr: LLVMValueRef, off: u64) -> LLVMValueRef {
         // addr: <W×i64>; returns <W×ptr> (inttoptr).
@@ -1334,16 +808,17 @@ impl Cg {
 // =====================================================================
 
 pub(super) fn compile_program(plan: &PacketPlan<'_>, num_vgprs: usize) -> VecKernel {
-    let addr = unsafe { compile_inner(plan, num_vgprs) };
-    VecKernel { addr, num_vgprs, min_private_bytes: plan.function.min_private_bytes(), width: plan.width }
+    let code = unsafe { compile_inner(plan, num_vgprs) };
+    VecKernel { code, num_vgprs, min_private_bytes: plan.function.min_private_bytes(), width: plan.width }
 }
 
 pub(super) fn compile_cooperative(plan: &PacketPlan<'_>, num_vgprs: usize) -> CoopVecKernel {
-    let addr = unsafe { compile_inner(plan, num_vgprs) };
-    let yields = plan.function.yields();
-    let packet_wave = yields.iter().filter(|(_,action)|action.is_wave())
-        .map(|(&pc,action)|(pc,super::coop_xlane::PacketWave::lower(action))).collect();
-    CoopVecKernel { addr, num_vgprs, min_private_bytes: plan.function.min_private_bytes(), width: plan.width, yields, packet_wave }
+    let code = unsafe { compile_inner(plan, num_vgprs) };
+    let yields = plan.function.value_yields();
+    if yields.values().any(|value| value.op == super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::Wmma)) {
+        super::wmma::warm(plan.width as usize);
+    }
+    CoopVecKernel { code, num_vgprs, min_private_bytes: plan.function.min_private_bytes(), width: plan.width, yields }
 }
 
 /// `boundary` selects the ABI: `Some` compiles a resumable cooperative packet
@@ -1351,19 +826,16 @@ pub(super) fn compile_cooperative(plan: &PacketPlan<'_>, num_vgprs: usize) -> Co
 unsafe fn compile_inner(
     plan: &PacketPlan<'_>,
     num_vgprs: usize,
-) -> u64 {
+) -> super::jit::NativeCode {
     let program = plan.program;
     let boundary = plan.boundary;
     let w = plan.width;
     let coop = boundary.is_some();
 
-    llvm::target::LLVM_InitializeNativeTarget();
-    llvm::target::LLVM_InitializeNativeAsmParser();
-    llvm::target::LLVM_InitializeNativeAsmPrinter();
-
-    let ctx = llvm::core::LLVMContextCreate();
-    let module = llvm::core::LLVMModuleCreateWithNameInContext(b"vec_kernel\0".as_ptr() as *const _, ctx);
-    let b = llvm::core::LLVMCreateBuilderInContext(ctx);
+    let native = super::jit::Module::new("vec_kernel");
+    let ctx = native.ctx;
+    let module = native.module;
+    let b = native.builder;
 
     let i1 = llvm::core::LLVMInt1TypeInContext(ctx);
     let i32t = llvm::core::LLVMInt32TypeInContext(ctx);
@@ -1412,13 +884,14 @@ unsafe fn compile_inner(
     let lane_idx_i64 = llvm::core::LLVMConstVector(lane_consts.as_mut_ptr(), w);
 
     // per-lane scratch base = broadcast(base) + lane*stride
+    let mut state = State::default();
     let mut sgpr = Vec::with_capacity(128);
-    for _ in 0..128 { sgpr.push(llvm::core::LLVMBuildAlloca(b, i32t, b"\0".as_ptr() as *const _)); }
+    for _ in 0..128 { sgpr.push(state.add(i32t)); }
     let mut vgpr = Vec::with_capacity(num_vgprs);
-    for _ in 0..num_vgprs { vgpr.push(llvm::core::LLVMBuildAlloca(b, vi32, b"\0".as_ptr() as *const _)); }
+    for _ in 0..num_vgprs { vgpr.push(state.add(vi32)); }
     let mut vgpr_f64 = Vec::with_capacity(num_vgprs + 1);
-    for _ in 0..num_vgprs + 1 { vgpr_f64.push(llvm::core::LLVMBuildAlloca(b, vf64, b"\0".as_ptr() as *const _)); }
-    let scc = llvm::core::LLVMBuildAlloca(b, i1, b"\0".as_ptr() as *const _);
+    for _ in 0..num_vgprs + 1 { vgpr_f64.push(state.add(vf64)); }
+    let scc = state.add(i1);
     let bvh_scratch = llvm::core::LLVMBuildArrayAlloca(b, i32t, llvm::core::LLVMConstInt(i32t, 10, 0), b"\0".as_ptr() as *const _);
     let packet_i64 = llvm::core::LLVMArrayType2(i64t, 16);
     let packet_f32 = llvm::core::LLVMArrayType2(f32t, 16);
@@ -1445,7 +918,16 @@ unsafe fn compile_inner(
         )
     };
 
+    let yield_cells = plan.function.blocks.values().filter_map(|block| block.yield_values.as_ref())
+        .map(|plan| plan.layout.cells()).max().unwrap_or(0);
+    let yield_frame = if yield_cells == 0 { llvm::core::LLVMConstNull(ptr) } else {
+        let frame = llvm::core::LLVMBuildAlloca(b, llvm::core::LLVMArrayType2(i32t, yield_cells as u64 * w as u64), cstr("yield.values").as_ptr());
+        llvm::core::LLVMSetAlignment(frame, 64);
+        frame
+    };
     let mut cg = Cg {
+        yield_frame,
+        state: std::cell::RefCell::new(state),
         ctx, module, func, b, w, coop, num_vgprs,
         scratch_vec: scratch_base, // placeholder, set below
         store_sink: std::cell::Cell::new(std::ptr::null_mut()),
@@ -1466,16 +948,14 @@ unsafe fn compile_inner(
         spill_base,
         spill: std::cell::RefCell::new(BTreeMap::new()),
         predicate: std::cell::Cell::new(false),
-        ldexp_normal_pow2: std::cell::Cell::new(false),
         structured_loop_masks: None,
         current_pc: std::cell::Cell::new(usize::MAX),
-        boundary: boundary.cloned().unwrap_or_default(),
     };
 
     if let Some(region) = plan.mask_region.as_ref() {
         let mask_regs = &region.registers;
         let masks = mask_regs.iter().copied().map(|reg| {
-            (reg, llvm::core::LLVMBuildAlloca(b, vi1, cg.n()))
+            (reg, cg.state.borrow_mut().add(vi1))
         }).collect();
         let init_bb = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, cstr("structured_mask_init").as_ptr());
         cg.structured_loop_masks = Some(StructuredLoopMasks {
@@ -1498,8 +978,8 @@ unsafe fn compile_inner(
     cg.scratch_vec = cg.v_add(base_v, off);
     cg.store_sink.set(llvm::core::LLVMBuildAlloca(b, i64t, cstr("store_sink").as_ptr()));
 
-    // Load the packet's incoming register state; from here it lives in the
-    // allocas, and across a boundary in SSA on the fiber's stack.
+    // Load the packet's incoming register state into SSA definitions. Values
+    // live across a fiber call are preserved by the native calling convention.
     cg.emit_load(None);
     if coop {
         // SCC is persisted in the packet-local extension slot sgprs[128].
@@ -1517,7 +997,7 @@ unsafe fn compile_inner(
         // Whole-program entry starts with all packed lanes active.
         let init_exec = if w >= 32 { 0xFFFF_FFFFu32 } else { (1u32 << w) - 1 };
         cg.st_sgpr32(EXEC, cg.ci32(init_exec));
-        llvm::core::LLVMBuildStore(b, llvm::core::LLVMConstInt(i1, 0, 0), scc);
+        cg.st_scc(llvm::core::LLVMConstInt(i1, 0, 0));
     }
 
     cg.predicate.set(true);
@@ -1539,7 +1019,6 @@ unsafe fn compile_inner(
 
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, Some(plan.width));
     for (&pc, block_plan) in &plan.blocks {
-        let block = block_plan.block;
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         cg.current_pc.set(pc);
         if let Some(loop_masks) = cg.structured_loop_masks.as_ref() {
@@ -1588,7 +1067,6 @@ unsafe fn compile_inner(
             let mut sqrt_inputs: std::collections::HashMap<usize, LLVMValueRef> =
                 std::collections::HashMap::new();
             for (idx, instruction) in block_plan.instructions.iter().enumerate() {
-                cg.ldexp_normal_pow2.set(instruction.normal_ldexp);
                 cg.global_load.set(instruction.global_load);
                 cg.nonempty_exec.set(instruction.nonempty_exec || (!variant_pred && instruction.entry_exec_unchanged));
                 if let Some(SqrtCollapse::Capture { site, src }) = &instruction.sqrt {
@@ -1613,7 +1091,7 @@ unsafe fn compile_inner(
                 } else {
                     match &instruction.lowering {
                         super::lift::Lowering::TypedAlu { .. } => {
-                            ssa.emit(&plan.function, pc, idx, |input| cg.typed_input(input), |output, value| {
+                            ssa.emit(&plan.function, pc, idx, |input, scalar| cg.typed_input(input, scalar), |output, value| {
                                 cg.typed_output(output, value);
                             });
                         }
@@ -1626,7 +1104,8 @@ unsafe fn compile_inner(
                     }
                 }
             }
-            cg.emit_term(&plan.function.terminator(pc, &block.term), &bbs);
+            ssa.condition(&plan.function, pc, |input| cg.typed_input(input, true));
+            cg.emit_term(&plan.function.terminator(pc), &bbs, &mut ssa, &plan.function);
         }
     }
 
@@ -1635,7 +1114,7 @@ unsafe fn compile_inner(
         llvm::core::LLVMPositionBuilderAtEnd(b, loop_masks.init_bb);
         for (&reg, &cell) in &loop_masks.masks {
             let scalar = cg.ld_sgpr32(reg);
-            llvm::core::LLVMBuildStore(b, cg.mask_to_vec(scalar), cell);
+            cg.state.borrow_mut().write(b, cell, cg.mask_to_vec(scalar));
         }
         llvm::core::LLVMBuildBr(b, bbs[&loop_masks.header]);
         for (&(_, to), &exit_bb) in &loop_masks.exit_bbs {
@@ -1645,12 +1124,13 @@ unsafe fn compile_inner(
         }
     }
 
-    finalize(ctx, module, func)
+    cg.state.borrow_mut().finish(func);
+    native.finish(super::jit::Mode::Packet)
 }
 
 impl Cg {
-    /// Load registers from the caller's packet buffers into the packed
-    /// allocas. `set` selects which (`None` = the whole register file, which
+    /// Load registers from the caller's packet buffers into packed SSA
+    /// definitions. `set` selects which (`None` = the whole register file, which
     /// is what kernel entry needs).
     unsafe fn emit_load(&self, set: Option<&RegSet>) {
         let sgprs_p = llvm::core::LLVMGetParam(self.func, 0);
@@ -1681,23 +1161,23 @@ impl Cg {
             let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, vgprs_p, [self.ci32(reg * self.w)].as_mut_ptr(), 1, self.n());
             let load = llvm::core::LLVMBuildLoad2(self.b, self.vi32, gep, self.n());
             llvm::core::LLVMSetAlignment(load, 4);
-            llvm::core::LLVMBuildStore(self.b, load, self.vgpr[reg as usize]);
+            self.state.borrow_mut().write(self.b, self.vgpr[reg as usize], load);
         }
         if set.map_or(true, |s| s.scc) {
             let p=llvm::core::LLVMBuildGEP2(self.b,self.i32t,sgprs_p,[self.ci32(128)].as_mut_ptr(),1,self.n());
             let value=llvm::core::LLVMBuildLoad2(self.b,self.i32t,p,self.n());
             let bit=llvm::core::LLVMBuildICmp(self.b,llvm::LLVMIntPredicate::LLVMIntNE,value,self.ci32(0),self.n());
-            llvm::core::LLVMBuildStore(self.b,bit,self.scc);
+            self.state.borrow_mut().write(self.b, self.scc, bit);
         }
         // Seed each selected f64-canonical pair's cell from its two i32 halves
         // (the cell is its sole storage; the i32 slots stay unused).
         for pair in 0..num_vgprs {
             if super::regtype::bget(&self.f64c, pair) && (pair + 1) < num_vgprs && want_vgpr(pair) {
-                let lo = self.zext64v(llvm::core::LLVMBuildLoad2(self.b, self.vi32, self.vgpr[pair as usize], self.n()));
-                let hi = self.zext64v(llvm::core::LLVMBuildLoad2(self.b, self.vi32, self.vgpr[pair as usize + 1], self.n()));
+                let lo = self.zext64v(self.state.borrow_mut().read(self.b, self.vgpr[pair as usize]));
+                let hi = self.zext64v(self.state.borrow_mut().read(self.b, self.vgpr[pair as usize + 1]));
                 let hi = llvm::core::LLVMBuildShl(self.b, hi, self.splat(self.ci64(32), self.vi64), self.n());
                 let value = llvm::core::LLVMBuildBitCast(self.b, self.v_or(hi, lo), self.vf64, self.n());
-                llvm::core::LLVMBuildStore(self.b, value, self.vgpr_f64[pair as usize]);
+                self.state.borrow_mut().write(self.b, self.vgpr_f64[pair as usize], value);
             }
         }
     }
@@ -1710,6 +1190,9 @@ impl Cg {
         let sgprs_p = llvm::core::LLVMGetParam(self.func, 0);
         let vgprs_p = llvm::core::LLVMGetParam(self.func, 1);
         for reg in 0..128u32 {
+            // NULL reads are constant and writes are discarded; its buffer
+            // slot is not part of the state transferred to the scheduler.
+            if reg == 124 { continue; }
             if set.map_or(false, |s| !s.has_sgpr(reg)) {
                 continue;
             }
@@ -1732,9 +1215,31 @@ impl Cg {
         }
     }
 
-    unsafe fn emit_term(&self, term: &Terminator, bbs: &BTreeMap<usize, LLVMBasicBlockRef>) {
+    unsafe fn emit_value_yield(&self, resume: usize, plan: &super::lift::wave::Plan, values: &mut super::typed_codegen::Values) {
+        use llvm::core::*;
+        use super::ir::typed::{Ty, effect::{EffectOp, WaveOp}};
+        use super::lift::{Output, wave::Destination};
+        let predicated = matches!(plan.layout.op, EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi));
+        let old_predicate = self.predicate.replace(predicated);
+        values.yield_values(plan, self.yield_frame, LLVMGetParam(self.func, 7), resume, |destination, ty, result, bits| {
+            match destination {
+                Destination::Vgpr(reg) => self.typed_output(Output::Vgpr(reg, ty), result),
+                Destination::Sgpr(reg) => {
+                    let result = LLVMBuildExtractElement(self.b, bits, self.ci32(0), self.n());
+                    self.typed_output(Output::Scalar(reg, Ty::I32), result);
+                }
+                Destination::Scc => {
+                    let result = LLVMBuildExtractElement(self.b, result, self.ci32(0), self.n());
+                    self.typed_output(Output::Scc, result);
+                }
+            }
+        });
+        self.predicate.set(old_predicate);
+    }
+
+    unsafe fn emit_term(&self, term: &super::lift::function::Control, bbs: &BTreeMap<usize, LLVMBasicBlockRef>, values: &mut super::typed_codegen::Values, function: &super::lift::function::Function) {
         match term {
-            Terminator::Return => {
+            super::lift::function::Control::Return => {
                 if self.coop {
                     // A finished packet materializes its whole register file:
                     // a sibling packet of the same wave may still reach a
@@ -1745,12 +1250,12 @@ impl Cg {
                     llvm::core::LLVMBuildRetVoid(self.b);
                 }
             }
-            Terminator::Jump(t) => {
+            super::lift::function::Control::Jump(t) => {
                 self.sync_stale_for(&[*t]);
                 llvm::core::LLVMBuildBr(self.b, self.structured_mask_target(self.current_pc.get(), *t, bbs));
             }
-            Terminator::Branch { cond, taken, fallthrough } => {
-                let c = self.taken_cond(*cond);
+            super::lift::function::Control::Branch { cond, taken, fallthrough } => {
+                let c = values.value(*cond);
                 self.sync_stale_for(&[*taken, *fallthrough]);
                 llvm::core::LLVMBuildCondBr(
                     self.b,
@@ -1759,153 +1264,18 @@ impl Cg {
                     self.structured_mask_target(self.current_pc.get(), *fallthrough, bbs),
                 );
             }
-            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => {
-                let io = self.boundary.get(resume).unwrap_or_else(|| {
-                    panic!("cross-lane boundary at {:#x} has no host op", resume)
-                });
-                // Hand the host op its operands, switch to the driver, take
-                // back what it wrote, and fall through to the resume block.
-                // The rest of the packet state never leaves SSA.
-                self.emit_store(Some(&io.reads));
-                // The resume block is entered with nothing f64-fresh (the
-                // analyses treat barrier edges as carrying nothing), so
-                // materialize the stale slots before the switch.
+            super::lift::function::Control::Yield { resume } => {
+                let pc = self.current_pc.get();
+                let plan = function.blocks[&pc].yield_values.as_ref().expect("yield lacks SSA value plan");
+                values.prepare_yield(function, pc, llvm::core::LLVMGetParam(self.func,6), |input| self.typed_input(input, false));
                 self.sync_stale_for(&[*resume]);
-                let void = llvm::core::LLVMVoidTypeInContext(self.ctx);
-                self.call(
-                    "amdgpu_sim_fiber_yield",
-                    void,
-                    &[self.ptr, self.i64t, self.ptr, self.ptr],
-                    &[
-                        llvm::core::LLVMGetParam(self.func, 7),
-                        self.ci64(*resume as u64),
-                        llvm::core::LLVMGetParam(self.func, 0),
-                        llvm::core::LLVMGetParam(self.func, 1),
-                    ],
-                );
-                self.emit_load(Some(&io.writes));
+                self.emit_value_yield(*resume, plan, values);
                 llvm::core::LLVMBuildBr(self.b, bbs[resume]);
             }
         }
     }
 
-    /// Branch conditions test the **packed lanes** (low W bits): an `execz` arm
-    /// is taken iff no packed work-item is active.
-    unsafe fn taken_cond(&self, cond: Cond) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        let lanes = if self.w >= 32 { 0xFFFF_FFFFu32 } else { (1u32 << self.w) - 1 };
-        match cond {
-            Cond::ExecZ => {
-                if self.has_structured_mask(EXEC) {
-                    return llvm::core::LLVMBuildICmp(
-                        self.b,
-                        LLVMIntEQ,
-                        self.vec_to_mask(self.exec_vec()),
-                        self.ci32(0),
-                        self.n(),
-                    );
-                }
-                let e = self.v_and(self.ld_sgpr32(EXEC), self.ci32(lanes));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, e, self.ci32(0), self.n())
-            }
-            Cond::ExecNz => {
-                if self.has_structured_mask(EXEC) {
-                    return llvm::core::LLVMBuildICmp(
-                        self.b,
-                        LLVMIntNE,
-                        self.vec_to_mask(self.exec_vec()),
-                        self.ci32(0),
-                        self.n(),
-                    );
-                }
-                let e = self.v_and(self.ld_sgpr32(EXEC), self.ci32(lanes));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e, self.ci32(0), self.n())
-            }
-            Cond::VccZ => {
-                let e = self.v_and(self.ld_sgpr32(VCC), self.ci32(lanes));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, e, self.ci32(0), self.n())
-            }
-            Cond::VccNz => {
-                let e = self.v_and(self.ld_sgpr32(VCC), self.ci32(lanes));
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntNE, e, self.ci32(0), self.n())
-            }
-            Cond::Scc1 => self.ld_scc(),
-            Cond::Scc0 => {
-                let s = self.ld_scc();
-                llvm::core::LLVMBuildICmp(self.b, LLVMIntEQ, s, llvm::core::LLVMConstInt(self.i1, 0, 0), self.n())
-            }
-        }
-    }
-}
 
-fn finalize(
-    ctx: llvm::prelude::LLVMContextRef,
-    module: llvm::prelude::LLVMModuleRef,
-    func: LLVMValueRef,
-) -> u64 {
-    unsafe {
-        let mut err = std::ptr::null_mut();
-        if llvm::analysis::LLVMVerifyModule(
-            module,
-            llvm::analysis::LLVMVerifierFailureAction::LLVMPrintMessageAction,
-            &mut err,
-        ) != 0 {
-            if !err.is_null() {
-                let s = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
-                panic!("vec module failed verification:\n{}", s);
-            }
-        }
-        let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
-        let mut target = std::ptr::null_mut();
-        let mut terr = std::ptr::null_mut();
-        llvm::target_machine::LLVMGetTargetFromTriple(triple, &mut target, &mut terr);
-        let cpu = llvm::target_machine::LLVMGetHostCPUName();
-        let feat = llvm::target_machine::LLVMGetHostCPUFeatures();
-        let tm = llvm::target_machine::LLVMCreateTargetMachine(
-            target, triple, cpu, feat,
-            llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
-            llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
-            llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
-        );
-        let opts = llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
-        let passes_str: std::ffi::CString = std::ffi::CString::new("default<O3>").unwrap();
-        let perr = llvm::transforms::pass_builder::LLVMRunPasses(module, passes_str.as_ptr(), tm, opts);
-        if !perr.is_null() {
-            let msg = llvm::error::LLVMGetErrorMessage(perr);
-            let s = std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned();
-            panic!("vec passes failed: {}", s);
-        }
-        let _ = func;
-        let jit_builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
-        let jtmb = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(tm);
-        llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(jit_builder, jtmb);
-        let mut jit = std::ptr::null_mut();
-        let e = llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, jit_builder);
-        if !e.is_null() { panic!("create LLJIT failed"); }
-        let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
-        let gp = llvm::orc2::lljit::LLVMOrcLLJITGetGlobalPrefix(jit);
-        let mut dg = std::ptr::null_mut();
-        llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(&mut dg, gp, None, std::ptr::null_mut());
-        llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, dg);
-        let lib_path: &[u8] = if cfg!(debug_assertions) {
-            b"target/debug/libamdgpu_sim.so\0"
-        } else {
-            b"target/release/libamdgpu_sim.so\0"
-        };
-        let mut dg2 = std::ptr::null_mut();
-        llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(&mut dg2, lib_path.as_ptr() as *const _, gp, None, std::ptr::null_mut());
-        llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, dg2);
-        let tsctx = llvm::orc2::LLVMOrcCreateNewThreadSafeContext();
-        let tsm = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(module, tsctx);
-        let e = llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(jit, dylib, tsm);
-        if !e.is_null() { panic!("add module failed"); }
-        let mut addr = 0u64;
-        let e = llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut addr, b"kernel\0".as_ptr() as *const _);
-        if !e.is_null() { panic!("lookup kernel failed"); }
-        std::mem::forget(Box::new(jit));
-        let _ = ctx;
-        addr
-    }
 }
 
 // =====================================================================
@@ -1915,207 +1285,28 @@ fn finalize(
 impl Cg {
     unsafe fn emit_inst(&self, inst: &InstFormat) {
         match inst {
-            InstFormat::VOP1(i) => self.emit_vop1(i),
-            InstFormat::VOP2(i) => self.emit_vop2(i),
             InstFormat::VOP3(i) => self.emit_vop3(i),
-            InstFormat::VOP3P(i) => self.emit_vop3p(i),
-            InstFormat::VOP3SD(i) => self.emit_vop3sd(i),
-            InstFormat::VOPD(i) => self.emit_vopd(i),
             InstFormat::SOP1(i) => self.emit_sop1(i),
             InstFormat::SOP2(i) => self.emit_sop2(i),
-            InstFormat::SOPC(i) => self.emit_sopc(i),
-            InstFormat::SOPK(i) => self.emit_sopk(i),
             InstFormat::VIMAGE(i) => self.emit_vimage(i),
-            InstFormat::VSAMPLE(i) => self.emit_vsample(i),
             other => panic!("vec: unsupported instruction {:?}", other),
         }
     }
 
-    unsafe fn emit_vop1(&self, i: &VOP1) {
-        match i.op {
-            I::V_FRACT_F64 => { let s = self.vsrc_f64(&i.src0); let f = self.vfloor(s); let v = self.vfadd(s, llvm::core::LLVMBuildFNeg(self.b, f, self.n())); self.st_vgpr_f64(i.vdst as u32, v); }
-            I::V_CLZ_I32_U32 => {
-                let x = self.vsrc_u32(&i.src0);
-                let lz = self.call(&format!("llvm.ctlz.v{}i32", self.w), self.vi32, &[self.vi32, self.i1], &[x, llvm::core::LLVMConstInt(self.i1, 0, 0)]);
-                let is0 = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntEQ, x, self.vci32(0), self.n());
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildSelect(self.b, is0, self.vci32(0xFFFF_FFFF), lz, self.n()));
-            }
-            I::V_FREXP_MANT_F32 => { let (v, _) = self.vfrexp_f32(self.vsrc_f32(&i.src0)); self.st_vgpr32(i.vdst as u32, self.vf32_bits(v)); }
-            I::V_FREXP_EXP_I32_F32 => { let (_, v) = self.vfrexp_f32(self.vsrc_f32(&i.src0)); self.st_vgpr32(i.vdst as u32, v); }
 
-            _ => panic!("vec: unsupported VOP1 {:?}", i.op),
-        }
-    }
-
-    unsafe fn emit_vop2(&self, i: &VOP2) {
-        match i.op {
-            I::V_ADD_CO_CI_U32 => {
-                let s0 = self.zext64v(self.vsrc_u32(&i.src0));
-                let s1 = self.zext64v(self.ld_vgpr32(i.vsrc1 as u32));
-                let cin = self.zext64v(self.v_and(self.mask_to_u32(VCC), self.vci32(1)));
-                let sum = self.v_add(self.v_add(s0, s1), cin);
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildTrunc(self.b, sum, self.vi32, self.n()));
-                let cout = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, sum, self.splat(self.ci64(32), self.vi64), self.n()), self.vi32, self.n());
-                let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.vci32(0), self.n());
-                self.st_mask(VCC, cout); return;
-            }
-            I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 => {
-                let s0 = self.zext64v(self.vsrc_u32(&i.src0));
-                let s1 = self.zext64v(self.ld_vgpr32(i.vsrc1 as u32));
-                let (a, b) = if matches!(i.op, I::V_SUBREV_CO_CI_U32) { (s1, s0) } else { (s0, s1) };
-                let cin = self.zext64v(self.v_and(self.mask_to_u32(VCC), self.vci32(1)));
-                let diff = llvm::core::LLVMBuildSub(self.b, llvm::core::LLVMBuildSub(self.b, a, b, self.n()), cin, self.n());
-                self.st_vgpr32(i.vdst as u32, llvm::core::LLVMBuildTrunc(self.b, diff, self.vi32, self.n()));
-                let bo = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, diff, self.splat(self.ci64(32), self.vi64), self.n()), self.vi32, self.n());
-                let bo = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bo, self.vci32(0), self.n());
-                self.st_mask(VCC, bo); return;
-            }
-            _ => {}
-        }
-        panic!("vec: unsupported VOP2 {:?}", i.op);
-    }
 
     unsafe fn emit_vop3(&self, i: &VOP3) {
         match i.op {
-            I::V_ALIGNBIT_B32 => {
-                let s0 = self.zext64v(self.vsrc_u32(&i.src0));
-                let s1 = self.zext64v(self.vsrc_u32(&i.src1));
-                let amt = self.zext64v(self.v_and(self.vsrc_u32(&i.src2), self.vci32(0x1F)));
-                // {S0,S1}: S0 is the MSBs, S1 the LSBs (ISA §V_ALIGNBIT_B32).
-                let concat = self.v_or(llvm::core::LLVMBuildShl(self.b, s0, self.splat(self.ci64(32), self.vi64), self.n()), s1);
-                let r = llvm::core::LLVMBuildTrunc(self.b, llvm::core::LLVMBuildLShr(self.b, concat, amt, self.n()), self.vi32, self.n());
-                self.st_vgpr32(i.vdst as u32, r);
-            }
-            I::V_LSHLREV_B16 => { let amt = self.v_and(self.vsrc_u32(&i.src0), self.vci32(15)); let v = self.v_and(self.vsrc_u32(&i.src1), self.vci32(0xffff)); self.st_vgpr32(i.vdst as u32, self.v_and(self.v_shl(v, amt), self.vci32(0xffff))); }
-            I::V_LSHRREV_B16 => { let amt = self.v_and(self.vsrc_u32(&i.src0), self.vci32(15)); let v = self.v_and(self.vsrc_u32(&i.src1), self.vci32(0xffff)); self.st_vgpr32(i.vdst as u32, self.v_lshr(v, amt)); }
-            I::V_S_RCP_F32 => {
-                // Scalar reciprocal: uniform SGPR source and SGPR destination.
-                let s = llvm::core::LLVMBuildBitCast(self.b, self.ssrc_u32(&i.src0), self.f32t, self.n());
-                let one = llvm::core::LLVMConstReal(self.f32t, 1.0);
-                let v = llvm::core::LLVMBuildFDiv(self.b, one, s, self.n());
-                self.st_sgpr32(i.vdst as u32, llvm::core::LLVMBuildBitCast(self.b, v, self.i32t, self.n()));
-            }
-            I::V_DIV_FIXUP_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let c = self.vabsneg_f32(self.vsrc_f32(&i.src2), i.abs, i.neg, 2);
-                let r = self.vdiv_fixup_f32(a, b, c);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
-            }
-            I::V_DIV_FMAS_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), i.abs, i.neg, 1);
-                let c = self.vabsneg_f32(self.vsrc_f32(&i.src2), i.abs, i.neg, 2);
-                let fma = self.vfma32(a, b, c);
-                let scaled = self.vfmul(self.vcf32_bits(0x4F80_0000), fma);
-                let cond = self.vcc_vec();
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(llvm::core::LLVMBuildSelect(self.b, cond, scaled, fma, self.n())));
-            }
-            I::V_LDEXP_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), i.abs, i.neg, 0);
-                let e = self.vsrc_u32(&i.src1);
-                let r = self.vldexp_f32(a, e);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
-            }
-            I::V_CMP_CLASS_F32 => {
-                let a = self.vsrc_f32(&i.src0);
-                let s = match &i.src1 {
-                    SourceOperand::LiteralConstant(v) => self.ci32(*v),
-                    SourceOperand::IntegerConstant(v) => self.ci32(*v as u32),
-                    SourceOperand::ScalarRegister(r) => self.ld_sgpr32(*r as u32),
-                    _ => llvm::core::LLVMBuildExtractElement(self.b, self.vsrc_u32(&i.src1), self.ci32(0), self.n()),
-                };
-                let c = self.call(&format!("llvm.is.fpclass.v{}f32", self.w), self.vi1, &[self.vf32, self.i32t], &[a, s]);
-                self.st_cmp(i.vdst as u32, c);
-            }
-            I::V_CVT_F32_F16 => {
-                // OPSEL[0] chooses the high/low half of each packed source lane.
-                let mut bits = self.vsrc_u32(&i.src0);
-                if i.opsel & 1 != 0 {
-                    bits = llvm::core::LLVMBuildLShr(self.b, bits, self.vci32(16), self.n());
-                }
-                let i16t = llvm::core::LLVMInt16TypeInContext(self.ctx);
-                let vi16 = llvm::core::LLVMVectorType(i16t, self.w);
-                let vf16 = llvm::core::LLVMVectorType(llvm::core::LLVMHalfTypeInContext(self.ctx), self.w);
-                let bits = llvm::core::LLVMBuildTrunc(self.b, bits, vi16, self.n());
-                let half = llvm::core::LLVMBuildBitCast(self.b, bits, vf16, self.n());
-                let wide = llvm::core::LLVMBuildFPExt(self.b, half, self.vf32, self.n());
-                let r = self.vabsneg_f32(wide, i.abs, i.neg, 0);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(r));
-            }
-            I::V_LDEXP_F64 => {
-                let a = self.vsrc_f64(&i.src0);
-                let e = self.vsrc_u32(&i.src1);
-                let r = if self.ldexp_normal_pow2.get() {
-                    self.vldexp_normal_pow2(a, e)
-                } else {
-                    self.vldexp(a, e)
-                };
-                self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            I::V_DIV_SCALE_F64 => { let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), i.abs, i.neg, 0); let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1); let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2); let r = self.vfdiv(self.vfmul(a, c), b); self.st_vgpr_f64(i.vdst as u32, r); }
             I::V_DIV_FIXUP_F64 => {
                 let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), i.abs, i.neg, 1);
                 let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), i.abs, i.neg, 2);
                 let r = self.vdiv_fixup_f64(self.vfdiv(c, b), b, c);
                 self.st_vgpr_f64(i.vdst as u32, r);
             }
-            I::V_DIV_FMAS_F64 => {
-                let a = self.vsrc_f64(&i.src0); let b = self.vsrc_f64(&i.src1); let c = self.vsrc_f64(&i.src2);
-                let fma = self.vfmuladd(a, b, c);
-                let scaled = self.vfmul(fma, self.vcf64(f64::from_bits(0x43F0000000000000)));
-                let cond = self.vcc_vec();
-                let r = llvm::core::LLVMBuildSelect(self.b, cond, scaled, fma, self.n()); self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            I::V_TRIG_PREOP_F64 => {
-                // Hot in trig-heavy kernels (smallpt: ~15% of W=16 samples as the
-                // per-lane runtime call). Default: fully vectorized in IR — the
-                // Payne–Hanek segment extraction is pure integer bit manipulation
-                // plus a final scalbn, so lane results stay bit-exact with the
-                // scalar helper.
-                let a = self.vsrc_f64(&i.src0); let s = self.vsrc_u32(&i.src1);
-                let r = self.v_trig_preop(a, s);
-                self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            I::V_CMP_CLASS_F64 => {
-                // llvm.is.fpclass's test mask is a scalar i32 immarg (uniform).
-                let a = self.vsrc_f64(&i.src0);
-                let s = match &i.src1 {
-                    SourceOperand::LiteralConstant(v) => self.ci32(*v),
-                    SourceOperand::IntegerConstant(v) => self.ci32(*v as u32),
-                    SourceOperand::ScalarRegister(r) => self.ld_sgpr32(*r as u32),
-                    _ => llvm::core::LLVMBuildExtractElement(self.b, self.vsrc_u32(&i.src1), self.ci32(0), self.n()),
-                };
-                let name = format!("llvm.is.fpclass.v{}f64", self.w);
-                let c = self.call(&name, self.vi1, &[self.vf64, self.i32t], &[a, s]);
-                self.st_cmp(i.vdst as u32, c);
-            }
-
-
             _ => panic!("vec: unsupported VOP3 {:?}", i.op),
         }
     }
 
-    unsafe fn emit_vop3p(&self, i: &VOP3P) {
-        match i.op {
-            I::V_FMA_MIXLO_F16 => {
-                let opsel_hi = i.opsel_hi | (i.opsel_hi2 << 2);
-                let src = |op: &SourceOperand, idx: u32| -> LLVMValueRef {
-                    let value = if (opsel_hi >> idx) & 1 == 0 {
-                        self.vsrc_f32(op)
-                    } else {
-                        self.vsrc_f16_f32(op, (i.opsel >> idx) & 1 != 0)
-                    };
-                    self.vabsneg_f32(value, i.neg_hi, i.neg, idx)
-                };
-                let value = self.vfma32(src(&i.src0, 0), src(&i.src1, 1), src(&i.src2, 2));
-                let lo = self.vf32_to_f16_bits(value);
-                let hi = self.v_and(self.ld_vgpr32(i.vdst as u32), self.vci32(0xffff_0000));
-                self.st_vgpr32(i.vdst as u32, self.v_or(hi, lo));
-            }
-            _ => panic!("vec: unsupported VOP3P {:?}", i.op),
-        }
-    }
 
     // ---- lane-local spill (uniform writelane/readlane idiom) -------------
     // See the `spill_base`/`spill` field docs. Keyed by (spill VGPR, constant
@@ -2145,96 +1336,7 @@ impl Cg {
         self.mask_to_vec(m)
     }
 
-    unsafe fn emit_vop3sd(&self, i: &VOP3SD) {
-        match i.op {
-            I::V_ADD_CO_U32 => {
-                let s0 = self.zext64v(self.vsrc_u32(&i.src0));
-                let s1 = self.zext64v(self.vsrc_u32(&i.src1));
-                let sum = self.v_add(s0, s1);
-                let lo = llvm::core::LLVMBuildTrunc(self.b, sum, self.vi32, self.n());
-                self.st_vgpr32(i.vdst as u32, lo);
-                let cout = llvm::core::LLVMBuildLShr(self.b, sum, self.splat(self.ci64(32), self.vi64), self.n());
-                let cout = llvm::core::LLVMBuildTrunc(self.b, cout, self.vi32, self.n());
-                let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.vci32(0), self.n());
-                self.st_sdst_mask(i.sdst, cout);
-            }
-            I::V_ADD_CO_CI_U32 => {
-                let s0 = self.zext64v(self.vsrc_u32(&i.src0));
-                let s1 = self.zext64v(self.vsrc_u32(&i.src1));
-                let cin = self.zext64v(self.v_and(self.src_mask_as_u32(&i.src2), self.vci32(1)));
-                let sum = self.v_add(self.v_add(s0, s1), cin);
-                let lo = llvm::core::LLVMBuildTrunc(self.b, sum, self.vi32, self.n());
-                self.st_vgpr32(i.vdst as u32, lo);
-                let cout = llvm::core::LLVMBuildLShr(self.b, sum, self.splat(self.ci64(32), self.vi64), self.n());
-                let cout = llvm::core::LLVMBuildTrunc(self.b, cout, self.vi32, self.n());
-                let cout = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, cout, self.vci32(0), self.n());
-                self.st_sdst_mask(i.sdst, cout);
-            }
-            I::V_MAD_CO_U64_U32 => {
-                let s0 = self.zext64v(self.vsrc_u32(&i.src0));
-                let s1 = self.zext64v(self.vsrc_u32(&i.src1));
-                let s2 = self.vsrc_u64(&i.src2);
-                let prod = llvm::core::LLVMBuildMul(self.b, s0, s1, self.n());
-                let d = self.v_add(prod, s2);
-                // carry = d < prod (unsigned wrap)
-                let c = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntULT, d, prod, self.n());
-                self.st_vgpr64(i.vdst as u32, d);
-                self.st_sdst_mask(i.sdst, c);
-            }
-            I::V_DIV_SCALE_F64 => {
-                let a = self.vabsneg_f64(self.vsrc_f64(&i.src0), 0, i.neg, 0);
-                let b = self.vabsneg_f64(self.vsrc_f64(&i.src1), 0, i.neg, 1);
-                let c = self.vabsneg_f64(self.vsrc_f64(&i.src2), 0, i.neg, 2);
-                let r = self.vfdiv(self.vfmul(a, c), b);
-                self.st_vgpr_f64(i.vdst as u32, r);
-                let zero = llvm::core::LLVMConstNull(self.vi1);
-                self.st_sdst_mask(i.sdst, zero);
-            }
-            I::V_DIV_SCALE_F32 => {
-                let a = self.vabsneg_f32(self.vsrc_f32(&i.src0), 0, i.neg, 0);
-                let b = self.vabsneg_f32(self.vsrc_f32(&i.src1), 0, i.neg, 1);
-                let c = self.vabsneg_f32(self.vsrc_f32(&i.src2), 0, i.neg, 2);
-                let (value, flag) = self.vdiv_scale_f32(a, b, c);
-                self.st_vgpr32(i.vdst as u32, self.vf32_bits(value));
-                self.st_sdst_mask(i.sdst, flag);
-            }
-            _ => panic!("vec: unsupported VOP3SD {:?}", i.op),
-        }
-    }
-    unsafe fn src_mask_as_u32(&self, op: &SourceOperand) -> LLVMValueRef {
-        // a lane-mask SGPR source presented as <W×i32> (0/1 per lane from its bits)
-        let v = self.src_mask_vec(op);
-        llvm::core::LLVMBuildZExt(self.b, v, self.vi32, self.n())
-    }
 
-
-    unsafe fn emit_vopd(&self, i: &VOPD) {
-        let dx = i.vdstx as u32;
-        let dy = ((i.vdsty as u32) << 1) | ((dx & 1) ^ 1);
-        let rx = self.eval_vopd_half(i.opx, &i.src0x, i.vsrc1x, dx, i.literal_constant);
-        let ry = self.eval_vopd_half(i.opy, &i.src0y, i.vsrc1y, dy, i.literal_constant);
-        self.st_vgpr32(dx, rx);
-        self.st_vgpr32(dy, ry);
-    }
-    unsafe fn eval_vopd_half(&self, op: I, src0: &SourceOperand, vsrc1: u8, dst: u32, lit: Option<u32>) -> LLVMValueRef {
-        let s0 = self.vsrc_u32(src0);
-        let f = |cg: &Cg, r: u32| unsafe { cg.vf32_of(cg.ld_vgpr32(r)) };
-        match op {
-            I::V_DUAL_MOV_B32 => s0,
-            I::V_DUAL_AND_B32 => self.v_and(s0, self.ld_vgpr32(vsrc1 as u32)),
-            I::V_DUAL_ADD_NC_U32 => self.v_add(s0, self.ld_vgpr32(vsrc1 as u32)),
-            I::V_DUAL_LSHLREV_B32 => self.v_shl(self.ld_vgpr32(vsrc1 as u32), s0),
-            I::V_DUAL_CNDMASK_B32 => { let s1 = self.ld_vgpr32(vsrc1 as u32); let c = self.vcc_vec(); llvm::core::LLVMBuildSelect(self.b, c, s1, s0, self.n()) }
-            I::V_DUAL_MUL_F32 => self.vf32_bits(self.vfmul(self.vsrc_f32(src0), f(self, vsrc1 as u32))),
-            I::V_DUAL_ADD_F32 => self.vf32_bits(self.vfadd(self.vsrc_f32(src0), f(self, vsrc1 as u32))),
-            I::V_DUAL_SUB_F32 => self.vf32_bits(self.vfsub(self.vsrc_f32(src0), f(self, vsrc1 as u32))),
-            I::V_DUAL_SUBREV_F32 => self.vf32_bits(self.vfsub(f(self, vsrc1 as u32), self.vsrc_f32(src0))),
-            I::V_DUAL_FMAC_F32 => self.vf32_bits(self.vfma32(self.vsrc_f32(src0), f(self, vsrc1 as u32), f(self, dst))),
-            I::V_DUAL_FMAMK_F32 => { let k = self.vcf32_bits(lit.unwrap()); self.vf32_bits(self.vfma32(self.vsrc_f32(src0), k, f(self, vsrc1 as u32))) }
-            I::V_DUAL_FMAAK_F32 => { let k = self.vcf32_bits(lit.unwrap()); self.vf32_bits(self.vfma32(self.vsrc_f32(src0), f(self, vsrc1 as u32), k)) }
-            _ => panic!("vec: unsupported VOPD half {:?}", op),
-        }
-    }
 
     // ---- SALU (scalar, uniform) -----------------------------------------
     unsafe fn emit_sop1(&self, i: &SOP1) {
@@ -2266,7 +1368,6 @@ impl Cg {
                 let v = self.ssrc_u32(&i.ssrc0);
                 self.st_sgpr32(i.sdst as u32, v);
             }
-            I::S_MOV_B64 => { let v = self.ssrc_u64(&i.ssrc0); self.st_sgpr64(i.sdst as u32, v); }
             I::S_AND_SAVEEXEC_B32 => {
                 let s0 = self.ssrc_u32(&i.ssrc0); let old = self.ld_sgpr32(EXEC);
                 self.st_sgpr32(i.sdst as u32, old);
@@ -2285,17 +1386,6 @@ impl Cg {
                 let ne = llvm::core::LLVMBuildOr(self.b, s0, old, self.n());
                 self.st_sgpr32(EXEC, ne); self.st_scc_nz(ne);
             }
-            I::S_CTZ_I32_B32 => {
-                let x = self.ssrc_u32(&i.ssrc0);
-                let tz = self.call("llvm.cttz.i32", self.i32t, &[self.i32t, self.i1], &[x, llvm::core::LLVMConstInt(self.i1, 0, 0)]);
-                let is0 = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntEQ, x, self.ci32(0), self.n());
-                let r = llvm::core::LLVMBuildSelect(self.b, is0, self.ci32(0xFFFF_FFFF), tz, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-            }
-            I::S_CVT_F32_I32 => { let f = llvm::core::LLVMBuildSIToFP(self.b, self.ssrc_u32(&i.ssrc0), self.f32t, self.n()); self.st_sgpr32(i.sdst as u32, llvm::core::LLVMBuildBitCast(self.b, f, self.i32t, self.n())); }
-            I::S_CVT_F32_U32 => { let f = llvm::core::LLVMBuildUIToFP(self.b, self.ssrc_u32(&i.ssrc0), self.f32t, self.n()); self.st_sgpr32(i.sdst as u32, llvm::core::LLVMBuildBitCast(self.b, f, self.i32t, self.n())); }
-            I::S_CVT_I32_F32 => { let f = llvm::core::LLVMBuildBitCast(self.b, self.ssrc_u32(&i.ssrc0), self.f32t, self.n()); self.st_sgpr32(i.sdst as u32, self.call("llvm.fptosi.sat.i32.f32", self.i32t, &[self.f32t], &[f])); }
-            I::S_CVT_U32_F32 => { let f = llvm::core::LLVMBuildBitCast(self.b, self.ssrc_u32(&i.ssrc0), self.f32t, self.n()); self.st_sgpr32(i.sdst as u32, self.call("llvm.fptoui.sat.i32.f32", self.i32t, &[self.f32t], &[f])); }
             _ => panic!("vec: unsupported SOP1 {:?}", i.op),
         }
     }
@@ -2319,140 +1409,19 @@ impl Cg {
             return;
         }
         match i.op {
-            I::S_ADD_U32 => {
-                // Unsigned add: SCC = carry-out (ISA §S_ADD_U32).
-                let a = self.zext64s(self.ssrc_u32(&i.ssrc0)); let b = self.zext64s(self.ssrc_u32(&i.ssrc1));
-                let sum = LLVMBuildAdd(self.b, a, b, self.n());
-                let lo = LLVMBuildTrunc(self.b, sum, self.i32t, self.n());
-                self.st_sgpr32(i.sdst as u32, lo);
-                let cout = LLVMBuildTrunc(self.b, LLVMBuildLShr(self.b, sum, self.ci64(32), self.n()), self.i32t, self.n());
-                self.st_scc_nz(cout);
-            }
-            I::S_ADD_CO_I32 | I::S_ADD_I32 => {
-                // Signed add: SCC = signed OVERFLOW (ISA §S_ADD_CO_I32), not carry.
-                let a = self.ssrc_u32(&i.ssrc0); let b = self.ssrc_u32(&i.ssrc1);
-                let ov = self.call("llvm.sadd.with.overflow.i32",
-                    LLVMStructTypeInContext(self.ctx, [self.i32t, self.i1].as_ptr() as *mut _, 2, 0),
-                    &[self.i32t, self.i32t], &[a, b]);
-                let r = LLVMBuildExtractValue(self.b, ov, 0, self.n());
-                let o = LLVMBuildExtractValue(self.b, ov, 1, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(o);
-            }
-            I::S_ADD_NC_U64 => { let a = self.ssrc_u64(&i.ssrc0); let b = self.ssrc_u64(&i.ssrc1); let r = LLVMBuildAdd(self.b, a, b, self.n()); self.st_sgpr64(i.sdst as u32, r); }
             I::S_AND_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildAnd(c.b, a, b, c.n())),
             I::S_OR_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildOr(c.b, a, b, c.n())),
             I::S_XOR_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildXor(c.b, a, b, c.n())),
             I::S_AND_NOT1_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildAnd(c.b, a, LLVMBuildNot(c.b, b, c.n()), c.n())),
             I::S_OR_NOT1_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildOr(c.b, a, LLVMBuildNot(c.b, b, c.n()), c.n())),
-            I::S_LSHR_B32 => self.sop2_logic(i, |c, a, b| { let amt = LLVMBuildAnd(c.b, b, c.ci32(31), c.n()); LLVMBuildLShr(c.b, a, amt, c.n()) }),
-            I::S_LSHL_B32 => self.sop2_logic(i, |c, a, b| { let amt = LLVMBuildAnd(c.b, b, c.ci32(31), c.n()); LLVMBuildShl(c.b, a, amt, c.n()) }),
-            I::S_CSELECT_B32 => { let a = self.ssrc_u32(&i.ssrc0); let b = self.ssrc_u32(&i.ssrc1); let c = self.ld_scc(); let r = LLVMBuildSelect(self.b, c, a, b, self.n()); self.st_sgpr32(i.sdst as u32, r); }
-            I::S_SUB_CO_I32 => {
-                // Signed sub: SCC = signed overflow (ISA §S_SUB_CO_I32).
-                let a = self.ssrc_u32(&i.ssrc0); let b = self.ssrc_u32(&i.ssrc1);
-                let ov = self.call("llvm.ssub.with.overflow.i32",
-                    LLVMStructTypeInContext(self.ctx, [self.i32t, self.i1].as_ptr() as *mut _, 2, 0),
-                    &[self.i32t, self.i32t], &[a, b]);
-                let r = LLVMBuildExtractValue(self.b, ov, 0, self.n());
-                let o = LLVMBuildExtractValue(self.b, ov, 1, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(o);
-            }
-            I::S_MUL_I32 => {
-                let r = LLVMBuildMul(self.b, self.ssrc_u32(&i.ssrc0), self.ssrc_u32(&i.ssrc1), self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-            }
-            I::S_MUL_HI_U32 => {
-                let a = self.zext64s(self.ssrc_u32(&i.ssrc0)); let b = self.zext64s(self.ssrc_u32(&i.ssrc1));
-                let hi = LLVMBuildLShr(self.b, LLVMBuildMul(self.b, a, b, self.n()), self.ci64(32), self.n());
-                self.st_sgpr32(i.sdst as u32, LLVMBuildTrunc(self.b, hi, self.i32t, self.n()));
-            }
-            I::S_LSHL_B64 => {
-                let a = self.ssrc_u64(&i.ssrc0);
-                let amt = LLVMBuildAnd(self.b, self.ssrc_u64(&i.ssrc1), self.ci64(63), self.n());
-                let r = LLVMBuildShl(self.b, a, amt, self.n());
-                self.st_sgpr64(i.sdst as u32, r);
-                self.st_scc(LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, r, self.ci64(0), self.n()));
-            }
-            I::S_BFE_U32 => {
-                let data = self.ssrc_u32(&i.ssrc0); let control = self.ssrc_u32(&i.ssrc1);
-                let offset = LLVMBuildAnd(self.b, control, self.ci32(0x1f), self.n());
-                let width = LLVMBuildAnd(self.b, LLVMBuildLShr(self.b, control, self.ci32(16), self.n()), self.ci32(0x7f), self.n());
-                let shifted = LLVMBuildLShr(self.b, data, offset, self.n());
-                let mask = LLVMBuildSub(self.b, LLVMBuildShl(self.b, self.ci32(1), width, self.n()), self.ci32(1), self.n());
-                let r = LLVMBuildAnd(self.b, shifted, mask, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc_nz(r);
-            }
             _ => panic!("vec: unsupported SOP2 {:?}", i.op),
         }
     }
-    unsafe fn emit_sopk(&self, i: &SOPK) {
-        use llvm::LLVMIntPredicate::*;
-        let imm = self.ci32(i.simm16 as i16 as i32 as u32);
-        match i.op {
-            I::S_MOVK_I32 => self.st_sgpr32(i.sdst as u32, imm),
-            I::S_CMOVK_I32 => {
-                let scc = self.ld_scc();
-                let old = self.ld_sgpr32(i.sdst as u32);
-                let nv = llvm::core::LLVMBuildSelect(self.b, scc, imm, old, self.n());
-                self.st_sgpr32(i.sdst as u32, nv);
-            }
-            I::S_ADDK_I32 => {
-                let a = self.ld_sgpr32(i.sdst as u32);
-                let sum = self.call(
-                    "llvm.sadd.with.overflow.i32",
-                    llvm::core::LLVMStructTypeInContext(self.ctx, [self.i32t, self.i1].as_ptr() as *mut _, 2, 0),
-                    &[self.i32t, self.i32t], &[a, imm],
-                );
-                let r = llvm::core::LLVMBuildExtractValue(self.b, sum, 0, self.n());
-                let ov = llvm::core::LLVMBuildExtractValue(self.b, sum, 1, self.n());
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc(ov);
-            }
-            I::S_MULK_I32 => {
-                let a = self.ld_sgpr32(i.sdst as u32);
-                self.st_sgpr32(i.sdst as u32, llvm::core::LLVMBuildMul(self.b, a, imm, self.n()));
-            }
-            I::S_CMPK_EQ_I32 | I::S_CMPK_LG_I32 | I::S_CMPK_GT_I32 | I::S_CMPK_GE_I32
-            | I::S_CMPK_LT_I32 | I::S_CMPK_LE_I32 | I::S_CMPK_EQ_U32 | I::S_CMPK_LG_U32
-            | I::S_CMPK_GT_U32 | I::S_CMPK_GE_U32 | I::S_CMPK_LT_U32 | I::S_CMPK_LE_U32 => {
-                let a = self.ld_sgpr32(i.sdst as u32);
-                let p = match i.op {
-                    I::S_CMPK_EQ_I32 => LLVMIntEQ, I::S_CMPK_LG_I32 => LLVMIntNE,
-                    I::S_CMPK_GT_I32 => LLVMIntSGT, I::S_CMPK_GE_I32 => LLVMIntSGE,
-                    I::S_CMPK_LT_I32 => LLVMIntSLT, I::S_CMPK_LE_I32 => LLVMIntSLE,
-                    I::S_CMPK_EQ_U32 => LLVMIntEQ, I::S_CMPK_LG_U32 => LLVMIntNE,
-                    I::S_CMPK_GT_U32 => LLVMIntUGT, I::S_CMPK_GE_U32 => LLVMIntUGE,
-                    I::S_CMPK_LT_U32 => LLVMIntULT, _ => LLVMIntULE,
-                };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, imm, self.n());
-                self.st_scc(c);
-            }
-            _ => panic!("vec: unsupported SOPK {:?}", i.op),
-        }
-    }
+
     unsafe fn sop2_logic<F: Fn(&Cg, LLVMValueRef, LLVMValueRef) -> LLVMValueRef>(&self, i: &SOP2, f: F) {
         let a = self.ssrc_u32(&i.ssrc0); let b = self.ssrc_u32(&i.ssrc1);
         let r = f(self, a, b);
         self.st_sgpr32(i.sdst as u32, r); self.st_scc_nz(r);
-    }
-    unsafe fn emit_sopc(&self, i: &crate::rdna_instructions::SOPC) {
-        use llvm::LLVMIntPredicate::*;
-        match i.op {
-            I::S_CMP_EQ_U32 | I::S_CMP_LG_U32 | I::S_CMP_GT_U32 | I::S_CMP_LT_U32 | I::S_CMP_GE_U32 | I::S_CMP_LE_U32 => {
-                let a = self.ssrc_u32(&i.ssrc0); let b = self.ssrc_u32(&i.ssrc1);
-                let p = match i.op { I::S_CMP_EQ_U32 => LLVMIntEQ, I::S_CMP_LG_U32 => LLVMIntNE, I::S_CMP_GT_U32 => LLVMIntUGT, I::S_CMP_LT_U32 => LLVMIntULT, I::S_CMP_GE_U32 => LLVMIntUGE, I::S_CMP_LE_U32 => LLVMIntULE, _ => unreachable!() };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, b, self.n()); self.st_scc(c);
-            }
-            I::S_CMP_EQ_U64 | I::S_CMP_LG_U64 => {
-                let a = self.ssrc_u64(&i.ssrc0); let b = self.ssrc_u64(&i.ssrc1);
-                let p = if matches!(i.op, I::S_CMP_EQ_U64) { LLVMIntEQ } else { LLVMIntNE };
-                let c = llvm::core::LLVMBuildICmp(self.b, p, a, b, self.n()); self.st_scc(c);
-            }
-            _ => panic!("vec: unsupported SOPC {:?}", i.op),
-        }
     }
 
 
@@ -2701,7 +1670,6 @@ impl Cg {
     /// Per ISA §11.2/11.3 the aperture test uses ONLY the base address (the VGPR
     /// pair), before IOFFSET is added; the offset is added afterward. So `base` is
     /// the pre-IOFFSET address for the test and `addr` = base + ioffset.
-
 
 
     // ---- VSCRATCH (per-lane private scratch) — each lane addresses its own
@@ -3202,47 +2170,7 @@ impl Cg {
         }
     }
 
-    // ---- VSAMPLE (texture sample) ---------------------------------------
-    // The runtime sampler `image_sample_lz` is scalar (bit-exact with the scalar
-    // path's helper), so call it once per lane: the descriptor (rsrc) is uniform
-    // and broadcast, the coordinates are per-lane f32. It bounds-checks the
-    // texel index, so inactive lanes (undef coords) are harmless and their
-    // result is dropped by the predicated destination write.
-    unsafe fn emit_vsample(&self, i: &VSAMPLE) {
-        match i.op {
-            I::IMAGE_SAMPLE_LZ => {
-                let in_tys = [
-                    self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.i32t, self.i32t, self.i32t, self.i32t,
-                    self.i32t, self.i32t, self.f32t, self.f32t,
-                ];
-                // The helper answers for one component of the fetch, and the
-                // components the DMASK asks for go to consecutive registers.
-                let mut vdata = i.vdata as u32;
-                for component in 0..4 {
-                    if i.dmask & (1 << component) == 0 {
-                        continue;
-                    }
-                    let mut in_vecs: Vec<LLVMValueRef> = (0..8)
-                        .map(|k| self.splat(self.ld_sgpr32(i.rsrc as u32 + k), self.vi32))
-                        .collect();
-                    in_vecs.extend(
-                        (0..4).map(|k| self.splat(self.ld_sgpr32(i.samp as u32 + k), self.vi32)),
-                    );
-                    in_vecs.push(self.splat(self.ci32(component as u32), self.vi32));
-                    in_vecs.push(self.splat(self.ci32(i.unrm as u32), self.vi32));
-                    in_vecs.push(self.vf32_of(self.ld_vgpr32(i.vaddr0 as u32)));
-                    in_vecs.push(self.vf32_of(self.ld_vgpr32(i.vaddr1 as u32)));
-                    let data =
-                        self.per_lane("image_sample_lz", self.i32t, &in_vecs, &in_tys, self.vi32);
-                    self.st_vgpr32(vdata, data);
-                    vdata += 1;
-                }
-            }
-            _ => panic!("vec: unsupported VSAMPLE {:?}", i.op),
-        }
-    }
+
 }
 
 /// Match a transpose tile to the host's native f64 SIMD width. The LLVM JIT is
@@ -3351,14 +2279,35 @@ fn vreg_of(op: &SourceOperand) -> Option<u32> {
 }
 
 impl Cg {
-    unsafe fn typed_input(&self, input: &super::lift::Input) -> LLVMValueRef {
+    unsafe fn typed_input(&self, input: &super::lift::Input, scalar: bool) -> LLVMValueRef {
         use super::ir::typed::Ty;
+        if let super::lift::InputSource::PacketMaskAny(reg) = input.source {
+            let word = if reg == EXEC && self.has_structured_mask(EXEC) {
+                self.vec_to_mask(self.exec_vec())
+            } else {
+                self.v_and(self.ld_sgpr32(reg), self.ci32((1u32 << self.w) - 1))
+            };
+            return llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, word, self.ci32(0), self.n());
+        }
+        if matches!(input.source, super::lift::InputSource::Scc) {
+            let flag = self.ld_scc();
+            return if scalar { flag } else { self.splat(flag, self.vi1) };
+        }
+        if scalar {
+            return match input.ty {
+                Ty::I32 => self.ssrc_u32(input.source.operand()),
+                Ty::I64 => self.ssrc_u64(input.source.operand()),
+                Ty::F32 => llvm::core::LLVMBuildBitCast(self.b, self.ssrc_u32(input.source.operand()), self.f32t, self.n()),
+                Ty::F64 => llvm::core::LLVMBuildBitCast(self.b, self.ssrc_u64(input.source.operand()), self.f64t, self.n()),
+                Ty::I1 => unreachable!("scalar boolean input requires SCC binding"),
+            };
+        }
         match input.ty {
-            Ty::I1 => self.src_mask_vec(&input.source),
-            Ty::I32 => self.vsrc_u32(&input.source),
-            Ty::I64 => self.vsrc_u64(&input.source),
-            Ty::F32 => self.vsrc_f32(&input.source),
-            Ty::F64 => self.vsrc_f64(&input.source),
+            Ty::I1 => self.src_mask_vec(input.source.operand()),
+            Ty::I32 => self.vsrc_u32(input.source.operand()),
+            Ty::I64 => self.vsrc_u64(input.source.operand()),
+            Ty::F32 => self.vsrc_f32(input.source.operand()),
+            Ty::F64 => self.vsrc_f64(input.source.operand()),
         }
     }
     unsafe fn typed_output(&self, output: super::lift::Output, result: LLVMValueRef) {
@@ -3370,6 +2319,13 @@ impl Cg {
             Output::Vgpr(reg, Ty::F32) => self.st_vgpr32(reg, self.vf32_bits(result)),
             Output::Vgpr(reg, Ty::F64) => self.st_vgpr_f64(reg, result),
             Output::Compare(reg) => self.st_cmp(reg, result),
+            Output::Mask(reg) => self.st_mask(reg, result),
+            Output::Scalar(reg, Ty::I32) => self.st_sgpr32(reg, result),
+            Output::Scalar(reg, Ty::I64) => self.st_sgpr64(reg, result),
+            Output::Scalar(reg, Ty::F32) => self.st_sgpr32(reg, llvm::core::LLVMBuildBitCast(self.b, result, self.i32t, self.n())),
+            Output::Scalar(reg, Ty::F64) => self.st_sgpr64(reg, llvm::core::LLVMBuildBitCast(self.b, result, self.i64t, self.n())),
+            Output::Scc => self.st_scc(result),
+            Output::Scalar(_, Ty::I1) => unreachable!("boolean SGPR output"),
             Output::Vgpr(_, Ty::I1) => unreachable!("boolean VGPR output"),
         }
     }
