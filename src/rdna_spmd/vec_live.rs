@@ -411,6 +411,9 @@ pub fn analyze_with_exit_live(
         let mut changed = false;
         for (&pc, block) in &prog.blocks {
             let mut lo = if matches!(block.term, Terminator::Return) { external } else { Set::empty() };
+            if let Terminator::Yield {action,..}=&block.term {
+                for reg in action.io().reads.vgprs() {lo.set(reg);}
+            }
             for s in succs(block) {
                 // live-in[succ] = (live-out[succ] \ def[succ]) ∪ use[succ]
                 if let Some(&succ_lo) = live_out.get(&s) {

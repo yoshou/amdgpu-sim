@@ -367,6 +367,7 @@ pub(in crate::rdna_spmd) struct Plan {
     pub address: ValueId,
     pub mask: ValueId,
     pub effects: Vec<usize>,
+    pub scalar_results: Vec<(ValueId,ValueId)>,
     pub flat: Option<(std::ops::Range<usize>, ValueId, ValueId, ValueId)>,
 }
 impl Memory {
@@ -445,20 +446,14 @@ impl Memory {
         let mut parameters: Vec<_> = operands.bindings.into_iter()
             .map(|(input, id)| (Parameter::Register(input), id)).collect();
         let mut core = operands.core;
-        let mask = f.value(Ty::I1);
-        if self.scalar() {
-            core.push(Inst::Core {
-                value: mask,
-                ty: Ty::I1,
-                op: Op::Const(Ty::I1, 1),
-            });
+        let mask = if self.scalar() {
+            super::state::core(f,&mut core,Ty::I1,Op::Const(Ty::I1,1))
         } else {
-            block.insts.push(Inst::Boundary {
-                inputs: vec![],
-                outputs: vec![(mask, Ty::I1)],
-            });
-            parameters.push((Parameter::Exec, mask));
-        }
+            let exec=words[&super::state::Word::Mask(126)];
+            let mask=super::state::core(f,&mut core,Ty::I1,Op::Convert(Cvt::Bitcast,Ty::I1,exec));
+            parameters.push((Parameter::Exec,mask));
+            mask
+        };
         let mut push = |t, op| {
             let value = f.value(t);
             core.push(Inst::Core { value, ty: t, op });
@@ -525,6 +520,7 @@ impl Memory {
             None
         };
         let mut effects = vec![];
+        let mut scalar_results = vec![];
         if self.op == MemoryOp::Fence {
             effects.push(block.insts.len());
             block.insts.push(Inst::Effect {
@@ -631,21 +627,27 @@ impl Memory {
             }
             if self.returns {
                 let result = result.unwrap();
+                let mut architectural=result;
                 let word = if self.scalar() { super::state::Word::scalar(self.dest + k) }
                     else { Some(super::state::Word::Vgpr(self.dest + k)) };
                 if let Some(word) = word {
-                    let stored = if self.scalar() { result } else {
+                    let stored = if matches!(word,super::state::Word::Mask(_)) {
+                        super::state::project(f,&mut block.insts,result)
+                    } else if self.scalar() { result } else {
                         let stored = f.value(Ty::I32);
                         block.insts.push(Inst::Core { value: stored, ty: Ty::I32,
                             op: Op::Select(mask, result, words[&word]) });
                         stored
                     };
+                    let stored=if word==super::state::Word::Mask(126) {super::state::valid_exec(f,&mut block.insts,stored)} else {stored};
+                    architectural=stored;
                     words.insert(word, stored);
                 } else if self.dest + k != 124 {
                     // Special mask destinations need the paired word-to-mask
                     // migration. NULL discards its result without a definition.
                     block.insts.push(Inst::Boundary { inputs: vec![result], outputs: vec![] });
                 }
+                if self.scalar() {scalar_results.push((result,architectural));}
             }
         }
         Plan {
@@ -658,6 +660,7 @@ impl Memory {
             address,
             mask,
             effects,
+            scalar_results,
             flat: flat.map(|(range, inside, private, _)| (range, inside, private, mask)),
         }
     }

@@ -34,7 +34,7 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, VIMAGE, VOP3};
+use crate::rdna_instructions::{InstFormat, SourceOperand, VIMAGE, VOP3};
 
 use super::boundary::RegSet;
 use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction};
@@ -339,7 +339,7 @@ impl Cg {
         bbs[&to]
     }
     unsafe fn exec_vec(&self) -> LLVMValueRef {
-        self.structured_mask(EXEC).unwrap_or_else(|| self.mask_to_vec(self.ld_sgpr32(EXEC)))
+        self.structured_mask(EXEC).unwrap_or_else(||self.mask_to_vec(self.ld_sgpr32_raw(EXEC)))
     }
 
     // ---- scalar register access (SGPR/SCC) -------------------------------
@@ -347,12 +347,12 @@ impl Cg {
         self.ld_sgpr32_raw(i)
     }
     unsafe fn st_sgpr32(&self, i: u32, v: LLVMValueRef) {
-        let v = if i == EXEC && self.coop { llvm::core::LLVMBuildAnd(self.b,v,self.valid_mask,self.n()) } else {v};
+        assert!(!matches!(i,126|106),"mask state requires a typed I1 definition");
         self.st_sgpr32_raw(i, v);
     }
     unsafe fn ld_sgpr32_raw(&self, i: u32) -> LLVMValueRef {
         if i == 124 { return self.ci32(0); }
-        self.state.borrow_mut().read(self.b, self.sgpr[i as usize])
+        self.state.borrow_mut().read(self.b,self.sgpr[i as usize])
     }
     unsafe fn st_sgpr32_raw(&self, i: u32, v: LLVMValueRef) {
         if i == 124 { return; }
@@ -588,7 +588,7 @@ impl Cg {
             SourceOperand::FloatConstant(v) => self.vci32((*v as f32).to_bits()),
             SourceOperand::ScalarRegister(r) => self.splat(self.ld_sgpr32(*r as u32), self.vi32),
             SourceOperand::VectorRegister(r) => self.ld_vgpr32(*r as u32),
-            SourceOperand::PrivateBase => llvm::core::LLVMBuildTrunc(self.b, self.scratch_vec, self.vi32, self.n()),
+            SourceOperand::PrivateBase => self.splat(llvm::core::LLVMBuildTrunc(self.b, self.scratch_base_scalar, self.i32t, self.n()),self.vi32),
         }
     }
     unsafe fn vsrc_u64(&self, op: &SourceOperand) -> LLVMValueRef {
@@ -598,7 +598,7 @@ impl Cg {
             SourceOperand::FloatConstant(v) => self.splat(self.ci64(v.to_bits()), self.vi64),
             SourceOperand::ScalarRegister(r) => self.splat(self.ld_sgpr64(*r as u32), self.vi64),
             SourceOperand::VectorRegister(r) => self.ld_vgpr64(*r as u32),
-            SourceOperand::PrivateBase => self.scratch_vec,
+            SourceOperand::PrivateBase => self.splat(self.scratch_base_scalar,self.vi64),
         }
     }
     unsafe fn vsrc_f64(&self, op: &SourceOperand) -> LLVMValueRef {
@@ -918,8 +918,7 @@ unsafe fn compile_inner(
         )
     };
 
-    let yield_cells = plan.function.blocks.values().filter_map(|block| block.yield_values.as_ref())
-        .map(|plan| plan.layout.cells()).max().unwrap_or(0);
+    let yield_cells = plan.function.value_yields().values().map(|p| p.cells()).max().unwrap_or(0);
     let yield_frame = if yield_cells == 0 { llvm::core::LLVMConstNull(ptr) } else {
         let frame = llvm::core::LLVMBuildAlloca(b, llvm::core::LLVMArrayType2(i32t, yield_cells as u64 * w as u64), cstr("yield.values").as_ptr());
         llvm::core::LLVMSetAlignment(frame, 64);
@@ -931,7 +930,12 @@ unsafe fn compile_inner(
         ctx, module, func, b, w, coop, num_vgprs,
         scratch_vec: scratch_base, // placeholder, set below
         store_sink: std::cell::Cell::new(std::ptr::null_mut()),
-        scratch_base_scalar: scratch_base,
+        scratch_base_scalar: if coop {
+            let n=b"\0".as_ptr().cast();
+            let aperture=llvm::core::LLVMBuildAnd(b,scratch_base,llvm::core::LLVMConstInt(i64t,0xffff_ffff_0000_0000,0),n);
+            let sized=llvm::core::LLVMBuildICmp(b,llvm::LLVMIntPredicate::LLVMIntNE,scratch_stride,llvm::core::LLVMConstInt(i64t,0,0),n);
+            llvm::core::LLVMBuildSelect(b,sized,aperture,scratch_base,n)
+        } else {scratch_base},
         lds_base: if coop {llvm::core::LLVMGetParam(func,5)}else{llvm::core::LLVMConstInt(i64t,0,0)},
         scratch_stride,
         valid_mask: if coop {llvm::core::LLVMGetParam(func,8)}else{llvm::core::LLVMConstInt(i32t,(1u64<<w)-1,0)},
@@ -996,7 +1000,7 @@ unsafe fn compile_inner(
     } else {
         // Whole-program entry starts with all packed lanes active.
         let init_exec = if w >= 32 { 0xFFFF_FFFFu32 } else { (1u32 << w) - 1 };
-        cg.st_sgpr32(EXEC, cg.ci32(init_exec));
+        cg.st_sgpr32_raw(EXEC, cg.ci32(init_exec));
         cg.st_scc(llvm::core::LLVMConstInt(i1, 0, 0));
     }
 
@@ -1015,9 +1019,8 @@ unsafe fn compile_inner(
     }
     // A fiber enters the kernel once and suspends in place at a boundary, so
     // there is no resume dispatch here.
-    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
-
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, Some(plan.width));
+    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
     for (&pc, block_plan) in &plan.blocks {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         cg.current_pc.set(pc);
@@ -1043,9 +1046,9 @@ unsafe fn compile_inner(
             let all = llvm::core::LLVMConstInt(cg.iw, u64::MAX, 0);
             let full = llvm::core::LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntEQ, mask, all, cg.n());
             llvm::core::LLVMBuildCondBr(b, full, fast, slow);
-            vec![(false, fast), (true, slow)]
+            vec![(false,fast),(true,slow)]
         } else {
-            vec![(true, bbs[&pc])]
+            vec![(true,bbs[&pc])]
         };
         // Both clones start from the block's entry facts.
         let entry_facts = (
@@ -1091,11 +1094,26 @@ unsafe fn compile_inner(
                 } else {
                     match &instruction.lowering {
                         super::lift::Lowering::TypedAlu { .. } => {
-                            ssa.emit(&plan.function, pc, idx, |input, scalar| cg.typed_input(input, scalar), |output, value| {
-                                cg.typed_output(output, value);
+                            ssa.emit(&plan.function, pc, idx, !cg.predicate.get(), |reg|!cg.has_structured_mask(reg),
+                                |reg|cg.ld_sgpr32_raw(reg),
+                                |input, scalar| cg.typed_input(input, scalar), |output, value, word| {
+                                // Typed results already include their EXEC select.
+                                let predicate=cg.predicate.replace(false);
+                                if let (super::lift::Output::MaskBit(reg),Some(word))=(output,word) {
+                                    if !cg.store_structured_mask(reg,value) {cg.st_sgpr32_raw(reg,word);}
+                                } else {cg.typed_output(output, value);}
+                                cg.predicate.set(predicate);
                             });
                         }
-                        super::lift::Lowering::Wave(_) => cg.emit_local_wave(&plan.function.blocks[&pc].wave[&idx]),
+                        super::lift::Lowering::Wave(_) => {
+                    let (action,wave)=&plan.function.blocks[&pc].wave[&idx];
+                    cg.emit_local_wave(action,|reg,raw| {
+                        let (ty,value)=ssa.effect_result(wave.results[0].0,wave.definitions[0].1,raw);
+                        let output=if ty==super::ir::typed::Ty::I1 {super::lift::Output::MaskBit(reg)}
+                            else {super::lift::Output::Scalar(reg,ty)};
+                        cg.typed_output(output,value);
+                    });
+                },
                 super::lift::Lowering::Memory(_) => {
                     ssa.prepare_memory(&plan.function,pc,idx,|p,scalar|cg.memory_parameter(p,scalar));
                             cg.emit_memory(&plan.function.blocks[&pc].memory[&idx],&ssa,|k|ssa.memory_data(&plan.function,pc,idx,k));
@@ -1104,7 +1122,7 @@ unsafe fn compile_inner(
                     }
                 }
             }
-            ssa.condition(&plan.function, pc, |input| cg.typed_input(input, true));
+            ssa.condition(&plan.function, pc, |reg|cg.structured_mask(reg).map_or_else(||cg.ld_sgpr32_raw(reg),|mask|cg.vec_to_mask(mask)), |input| cg.typed_input(input, true));
             cg.emit_term(&plan.function.terminator(pc), &bbs, &mut ssa, &plan.function);
         }
     }
@@ -1151,7 +1169,8 @@ impl Cg {
             }
             let gep = llvm::core::LLVMBuildGEP2(self.b, self.i32t, sgprs_p, [self.ci32(reg)].as_mut_ptr(), 1, self.n());
             let value = llvm::core::LLVMBuildLoad2(self.b, self.i32t, gep, self.n());
-            self.st_sgpr32(reg, value);
+            let value=if reg==EXEC&&self.coop {self.v_and(value,self.valid_mask)} else {value};
+            self.st_sgpr32_raw(reg, value);
         }
         for reg in 0..num_vgprs {
             if !want_vgpr(reg) {
@@ -1225,8 +1244,10 @@ impl Cg {
             match destination {
                 Destination::Vgpr(reg) => self.typed_output(Output::Vgpr(reg, ty), result),
                 Destination::Sgpr(reg) => {
-                    let result = LLVMBuildExtractElement(self.b, bits, self.ci32(0), self.n());
-                    self.typed_output(Output::Scalar(reg, Ty::I32), result);
+                    if ty==Ty::I1 {self.typed_output(Output::MaskBit(reg),result);} else {
+                        let result = LLVMBuildExtractElement(self.b, bits, self.ci32(0), self.n());
+                        self.typed_output(Output::Scalar(reg, Ty::I32), result);
+                    }
                 }
                 Destination::Scc => {
                     let result = LLVMBuildExtractElement(self.b, result, self.ci32(0), self.n());
@@ -1241,10 +1262,9 @@ impl Cg {
         match term {
             super::lift::function::Control::Return => {
                 if self.coop {
-                    // A finished packet materializes its whole register file:
-                    // a sibling packet of the same wave may still reach a
-                    // wave-level boundary, and those ops read all 32 lanes.
-                    self.emit_store(None);
+                    // The direct cooperative API observes returned registers;
+                    // normal grid dispatch observes only kernel memory effects.
+                    if function.observable_return { self.emit_store(None); }
                     llvm::core::LLVMBuildRet(self.b, self.ci64(super::emit::COOP_DONE));
                 } else {
                     llvm::core::LLVMBuildRetVoid(self.b);
@@ -1286,8 +1306,6 @@ impl Cg {
     unsafe fn emit_inst(&self, inst: &InstFormat) {
         match inst {
             InstFormat::VOP3(i) => self.emit_vop3(i),
-            InstFormat::SOP1(i) => self.emit_sop1(i),
-            InstFormat::SOP2(i) => self.emit_sop2(i),
             InstFormat::VIMAGE(i) => self.emit_vimage(i),
             other => panic!("vec: unsupported instruction {:?}", other),
         }
@@ -1339,90 +1357,10 @@ impl Cg {
 
 
     // ---- SALU (scalar, uniform) -----------------------------------------
-    unsafe fn emit_sop1(&self, i: &SOP1) {
-        if self.has_structured_mask(i.sdst as u32) {
-            match i.op {
-                I::S_MOV_B32 => {
-                    if self.store_structured_mask(i.sdst as u32, self.mask_src(&i.ssrc0)) { return; }
-                }
-                I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 | I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32 => {
-                    let old = self.exec_vec();
-                    self.store_structured_mask(i.sdst as u32, old);
-                    let rhs = self.mask_src(&i.ssrc0);
-                    let next = match i.op {
-                        I::S_AND_SAVEEXEC_B32 => llvm::core::LLVMBuildAnd(self.b, rhs, old, self.n()),
-                        I::S_AND_NOT1_SAVEEXEC_B32 => llvm::core::LLVMBuildAnd(self.b, rhs, llvm::core::LLVMBuildNot(self.b, old, self.n()), self.n()),
-                        I::S_OR_SAVEEXEC_B32 => llvm::core::LLVMBuildOr(self.b, rhs, old, self.n()),
-                        I::S_XOR_SAVEEXEC_B32 => llvm::core::LLVMBuildXor(self.b, rhs, old, self.n()),
-                        _ => unreachable!(),
-                    };
-                    self.store_structured_mask(EXEC, next);
-                    self.st_scc(self.mask_any(next));
-                    return;
-                }
-                _ => {}
-            }
-        }
-        match i.op {
-            I::S_MOV_B32 => {
-                let v = self.ssrc_u32(&i.ssrc0);
-                self.st_sgpr32(i.sdst as u32, v);
-            }
-            I::S_AND_SAVEEXEC_B32 => {
-                let s0 = self.ssrc_u32(&i.ssrc0); let old = self.ld_sgpr32(EXEC);
-                self.st_sgpr32(i.sdst as u32, old);
-                let ne = llvm::core::LLVMBuildAnd(self.b, s0, old, self.n());
-                self.st_sgpr32(EXEC, ne); self.st_scc_nz(ne);
-            }
-            I::S_AND_NOT1_SAVEEXEC_B32 => {
-                let s0 = self.ssrc_u32(&i.ssrc0); let old = self.ld_sgpr32(EXEC);
-                self.st_sgpr32(i.sdst as u32, old);
-                let ne = llvm::core::LLVMBuildAnd(self.b, s0, llvm::core::LLVMBuildNot(self.b, old, self.n()), self.n());
-                self.st_sgpr32(EXEC, ne); self.st_scc_nz(ne);
-            }
-            I::S_OR_SAVEEXEC_B32 => {
-                let s0 = self.ssrc_u32(&i.ssrc0); let old = self.ld_sgpr32(EXEC);
-                self.st_sgpr32(i.sdst as u32, old);
-                let ne = llvm::core::LLVMBuildOr(self.b, s0, old, self.n());
-                self.st_sgpr32(EXEC, ne); self.st_scc_nz(ne);
-            }
-            _ => panic!("vec: unsupported SOP1 {:?}", i.op),
-        }
-    }
-    unsafe fn emit_sop2(&self, i: &SOP2) {
-        use llvm::core::*;
-        if self.has_structured_mask(i.sdst as u32)
-            && matches!(i.op, I::S_AND_B32 | I::S_OR_B32 | I::S_XOR_B32 | I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32)
-        {
-            let a = self.mask_src(&i.ssrc0);
-            let b = self.mask_src(&i.ssrc1);
-            let value = match i.op {
-                I::S_AND_B32 => LLVMBuildAnd(self.b, a, b, self.n()),
-                I::S_OR_B32 => LLVMBuildOr(self.b, a, b, self.n()),
-                I::S_XOR_B32 => LLVMBuildXor(self.b, a, b, self.n()),
-                I::S_AND_NOT1_B32 => LLVMBuildAnd(self.b, a, LLVMBuildNot(self.b, b, self.n()), self.n()),
-                I::S_OR_NOT1_B32 => LLVMBuildOr(self.b, a, LLVMBuildNot(self.b, b, self.n()), self.n()),
-                _ => unreachable!(),
-            };
-            self.store_structured_mask(i.sdst as u32, value);
-            self.st_scc(self.mask_any(value));
-            return;
-        }
-        match i.op {
-            I::S_AND_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildAnd(c.b, a, b, c.n())),
-            I::S_OR_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildOr(c.b, a, b, c.n())),
-            I::S_XOR_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildXor(c.b, a, b, c.n())),
-            I::S_AND_NOT1_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildAnd(c.b, a, LLVMBuildNot(c.b, b, c.n()), c.n())),
-            I::S_OR_NOT1_B32 => self.sop2_logic(i, |c, a, b| LLVMBuildOr(c.b, a, LLVMBuildNot(c.b, b, c.n()), c.n())),
-            _ => panic!("vec: unsupported SOP2 {:?}", i.op),
-        }
-    }
 
-    unsafe fn sop2_logic<F: Fn(&Cg, LLVMValueRef, LLVMValueRef) -> LLVMValueRef>(&self, i: &SOP2, f: F) {
-        let a = self.ssrc_u32(&i.ssrc0); let b = self.ssrc_u32(&i.ssrc1);
-        let r = f(self, a, b);
-        self.st_sgpr32(i.sdst as u32, r); self.st_scc_nz(r);
-    }
+
+
+
 
 
     // ---- VGLOBAL (per-lane gather/scatter) ------------------------------
@@ -2281,13 +2219,9 @@ fn vreg_of(op: &SourceOperand) -> Option<u32> {
 impl Cg {
     unsafe fn typed_input(&self, input: &super::lift::Input, scalar: bool) -> LLVMValueRef {
         use super::ir::typed::Ty;
-        if let super::lift::InputSource::PacketMaskAny(reg) = input.source {
-            let word = if reg == EXEC && self.has_structured_mask(EXEC) {
-                self.vec_to_mask(self.exec_vec())
-            } else {
-                self.v_and(self.ld_sgpr32(reg), self.ci32((1u32 << self.w) - 1))
-            };
-            return llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, word, self.ci32(0), self.n());
+        if matches!(input.source,super::lift::InputSource::ExecPredicate) {return self.exec_vec();}
+        if let super::lift::InputSource::MaskBit(reg) = input.source {
+            return self.structured_mask(reg).unwrap_or_else(||self.mask_to_vec(self.ld_sgpr32_raw(reg)));
         }
         if matches!(input.source, super::lift::InputSource::Scc) {
             let flag = self.ld_scc();
@@ -2320,6 +2254,9 @@ impl Cg {
             Output::Vgpr(reg, Ty::F64) => self.st_vgpr_f64(reg, result),
             Output::Compare(reg) => self.st_cmp(reg, result),
             Output::Mask(reg) => self.st_mask(reg, result),
+            Output::MaskBit(reg) => {
+                if !self.store_structured_mask(reg,result) {self.st_sgpr32_raw(reg,self.vec_to_mask(result));}
+            },
             Output::Scalar(reg, Ty::I32) => self.st_sgpr32(reg, result),
             Output::Scalar(reg, Ty::I64) => self.st_sgpr64(reg, result),
             Output::Scalar(reg, Ty::F32) => self.st_sgpr32(reg, llvm::core::LLVMBuildBitCast(self.b, result, self.i32t, self.n())),
@@ -2332,7 +2269,7 @@ impl Cg {
 }
 
 impl Cg {
-    unsafe fn emit_local_wave(&self, action:&super::lift::wave::YieldAction) {
+    unsafe fn emit_local_wave(&self, action:&super::lift::wave::YieldAction,mut write:impl FnMut(u32,LLVMValueRef)) {
         use super::lift::wave::{Operand,Destination};
         use super::ir::typed::effect::{EffectOp,WaveOp};
         let source=|index|match &action.inputs[index]{Operand::Source(s)=>s,_=>panic!("local wave operand requires register binding")};
@@ -2350,7 +2287,7 @@ impl Cg {
                 let over = llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntUGE, tz, self.ci32(self.w), self.n());
                 let idx = llvm::core::LLVMBuildSelect(self.b, over, self.ci32(0), tz, self.n());
                 let v = llvm::core::LLVMBuildExtractElement(self.b, src, idx, self.n());
-                self.st_sgpr32(dst, v);
+                write(dst,v);
                         }
             WaveOp::WriteLane => {
                 let lane = lane_const(source(1))
@@ -2366,7 +2303,7 @@ impl Cg {
                     .expect("vec: v_readlane_b32 source must be a VGPR");
                 let slot = self.spill_slot_ptr(src, lane);
                 let v = llvm::core::LLVMBuildLoad2(self.b, self.i32t, slot, self.n());
-                self.st_sgpr32(dst, v);
+                write(dst,v);
                         }
             _=>panic!("wave operation requires cooperative dispatch"),
         }

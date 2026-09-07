@@ -403,6 +403,12 @@ impl YieldAction {
                 stored = value;
             }
             if let Some(word) = word {
+                if matches!(word,super::state::Word::Mask(_)) {
+                    stored = super::state::project(f,&mut block.insts,stored);
+                }
+                if word==super::state::Word::Mask(126) {
+                    stored=super::state::valid_exec(f,&mut block.insts,stored);
+                }
                 words.insert(word, stored);
             } else if matches!(dest, Destination::Sgpr(r) if *r != 124) {
                 block.insts.push(Inst::Boundary { inputs: vec![stored], outputs: vec![] });

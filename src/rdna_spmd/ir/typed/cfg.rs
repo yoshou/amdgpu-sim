@@ -11,8 +11,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BlockId(pub usize);
+/// Pure mask reductions within the current packet. These are compiler IR
+/// operations, not variants of the runtime's wave-effect protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PacketOp { Any, Ballot }
+impl PacketOp {
+    pub fn result_type(self) -> Ty { match self { Self::Any=>Ty::I1,Self::Ballot=>Ty::I32 } }
+}
 #[derive(Clone, Debug)]
 pub(crate) enum Inst {
+    Packet {
+        op: PacketOp,
+        input: ValueId,
+        output: ValueId,
+    },
     Target {
         provenance: Option<u64>,
         op: crate::rdna_spmd::dialect::TargetOp,
@@ -103,6 +115,11 @@ impl Func {
             }
             for inst in &block.insts {
                 match inst {
+                    Inst::Packet {op,input,output}=>{
+                        if !local.contains(input) {return Err("non-dominating packet input");}
+                        if self.types[input.0]!=Ty::I1 {return Err("packet query requires a predicate");}
+                        define(*output,op.result_type(),&mut local,&mut definitions)?;
+                    },
                     Inst::Target { provenance, op, args, outputs } => {
                         if args.values().iter().any(|v| !local.contains(v)) { return Err("non-dominating target input"); }
                         let spec = registry.operation(*op)?;

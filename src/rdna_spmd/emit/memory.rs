@@ -16,8 +16,8 @@ impl Cg {
                 self.ci32(0),
                 self.n(),
             ),
-            Parameter::ScratchBase => self.scratch_base,
-            Parameter::ScratchSize => panic!("scalar scratch size is not yet in the ABI"),
+            Parameter::ScratchBase => self.private_base,
+            Parameter::ScratchSize => self.private_size,
         }
     }
     pub(super) unsafe fn emit_memory(
@@ -41,6 +41,11 @@ impl Cg {
             return;
         }
         let mut addr = values.value(plan.address);
+        if let Some((_,inside,..))=&plan.flat {
+            let offset=llvm::core::LLVMBuildSub(self.b,self.scratch_base,self.private_base,self.n());
+            let physical=self.b_add(addr,offset);
+            addr=llvm::core::LLVMBuildSelect(self.b,values.value(*inside),physical,addr,self.n());
+        }
         if m.space() != Space::Global {
             addr = self.b_add(
                 if m.space() == Space::Scratch {
@@ -130,7 +135,10 @@ impl Cg {
                     llvm::core::LLVMBuildZExt(self.b, load, self.i32t, self.n())
                 };
                 if m.scalar() {
-                    self.st_sgpr32(m.dest + k, value);
+                    let (raw,result)=plan.scalar_results[k as usize];
+                    let (ty,value)=values.effect_result(raw,result,value);
+                    self.typed_output(if ty==super::super::ir::typed::Ty::I1 {super::super::lift::Output::MaskBit(m.dest+k)}
+                        else {super::super::lift::Output::Scalar(m.dest+k,ty)},value);
                 } else {
                     self.st_vgpr32(m.dest + k, value);
                 }

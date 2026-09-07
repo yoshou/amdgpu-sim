@@ -45,6 +45,8 @@ impl YieldValues {
     }
     pub fn is_wave(&self) -> bool { matches!(self.op, EffectOp::Wave(_)) }
 
+    // Keep the argument loads in the wave handler, as in the pre-SSA native code.
+    #[inline]
     fn argument(&self, index: usize, lane: usize, width: usize, fibers: &[Fiber]) -> u32 {
         let offset = match self.arguments[index] {
             Argument::Constant(value) => return value,
@@ -191,6 +193,10 @@ mod tests {
     // entry/return, never used to apply the yielded effect.
     fn run(program: &ScalarProgram, width: usize, count: usize,
            sgprs: &mut [[u32; 129]], vgprs: &mut [Vec<u32>]) {
+        run_private(program,width,count,sgprs,vgprs,0,0);
+    }
+    fn run_private(program: &ScalarProgram, width: usize, count: usize,
+           sgprs: &mut [[u32; 129]], vgprs: &mut [Vec<u32>],scratch_base:u64,scratch_stride:u64) {
         let kernel = if width == 0 { Compiler::default().compile_cooperative(program, 24) }
             else { Compiler::default().compile_cooperative_vec(program, 24, width as u32) };
         let width = width.max(1);
@@ -201,7 +207,7 @@ mod tests {
             fibers[packet].start(KernelArgs {
                 entry: kernel.addr(), sgprs: sgprs[packet].as_mut_ptr(),
                 vgprs: vgprs[packet].as_mut_ptr(), spill: spill[packet].as_mut_ptr(),
-                scratch_base: 0, scratch_stride: 0, lane_base: (packet*width) as u64,
+                scratch_base, scratch_stride, lane_base: (packet*width) as u64,
                 lds_base: 0, valid_mask: (valid >> (packet*width)) & ((1 << width)-1),
             });
         }
@@ -221,6 +227,170 @@ mod tests {
         }
         blocks.insert(n, ScalarBlock { pc: n, body: vec![], term: Terminator::Return });
         ScalarProgram { entry_pc: 0, blocks }
+    }
+    #[test]
+    fn private_pointer_broadcast_keeps_storage_private_to_each_lane() {
+        use crate::instructions::I;
+        use crate::rdna_instructions::{InstFormat,SOP1,SOP2,VOP1,VFLAT};
+        let read=|source,destination|YieldAction {op:EffectOp::Wave(WaveOp::ReadFirstLane),
+            inputs:vec![Operand::Source(SourceOperand::VectorRegister(source)),Operand::Exec],
+            outputs:vec![Destination::Sgpr(destination)]};
+        let vcopy=|vdst,src|InstFormat::VOP1(VOP1 {op:I::V_MOV_B32,vdst,src0:SourceOperand::ScalarRegister(src)});
+        let p=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([
+            (0,ScalarBlock {pc:0,body:vec![
+                InstFormat::SOP1(SOP1 {op:I::S_MOV_B64,sdst:4,ssrc0:SourceOperand::PrivateBase}),
+                InstFormat::SOP2(SOP2 {op:I::S_LSHR_B64,sdst:4,ssrc0:SourceOperand::ScalarRegister(4),ssrc1:SourceOperand::IntegerConstant(32)}),
+                InstFormat::SOP2(SOP2 {op:I::S_LSHL_B64,sdst:4,ssrc0:SourceOperand::ScalarRegister(4),ssrc1:SourceOperand::IntegerConstant(32)}),
+                vcopy(0,4),vcopy(1,5),
+                InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst:126,ssrc0:SourceOperand::LiteralConstant(1<<21)}),
+            ],term:Terminator::Yield {resume:1,action:Box::new(read(0,10))}}),
+            (1,ScalarBlock {pc:1,body:vec![],term:Terminator::Yield {resume:2,action:Box::new(read(1,11))}}),
+            (2,ScalarBlock {pc:2,body:vec![
+                InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst:126,ssrc0:SourceOperand::LiteralConstant(u32::MAX)}),
+                vcopy(4,10),vcopy(5,11),
+                InstFormat::VFLAT(VFLAT {op:I::FLAT_STORE_B32,vaddr:4,vsrc:2,vdst:0,saddr:124,ioffset:4,scope:0,th:0,sve:0}),
+            ],term:Terminator::Return}),
+        ])};
+        for code_width in [0usize,1,2,4,8,16] {
+            let width=code_width.max(1);
+            for (count,base) in [(23usize,0usize),(32,32*16)] {
+                let mut s=vec![[0;129];32/width];
+                let mut v=vec![vec![0;24*width];32/width];
+                let mut scratch=vec![0xdeadbeef;64*16];
+                for lane in 0..count {s[lane/width][126]|=1<<(lane%width);v[lane/width][2*width+lane%width]=100+lane as u32;}
+                run_private(&p,code_width,count,&mut s,&mut v,unsafe {scratch.as_mut_ptr().add(base)} as u64,64);
+                for lane in 0usize..64 {for word in 0..16 {
+                    let local=lane.wrapping_sub(base/16);
+                    let expected=if local<count && word==1 {100+local as u32} else {0xdeadbeef};
+                    assert_eq!(scratch[lane*16+word],expected,"width={code_width} lane={lane} word={word}");
+                }}
+            }
+        }
+    }
+    #[test]
+    fn memory_and_wave_results_use_packet_mask_projection_before_saveexec() {
+        use crate::instructions::I;
+        use crate::rdna_instructions::{InstFormat,SMEM,SOP1};
+        let mov=|sdst,ssrc0|InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst,ssrc0});
+        let p=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([
+            (0,ScalarBlock {pc:0,body:vec![
+                InstFormat::SMEM(SMEM {op:I::S_LOAD_B32,sbase:2,sdata:126,soffset:124,ioffset:0,scope:0,th:0}),
+                mov(10,SourceOperand::ScalarRegister(126)),
+            ],term:Terminator::Yield {resume:1,action:Box::new(YieldAction {
+                op:EffectOp::Wave(WaveOp::ReadLane),
+                inputs:vec![Operand::Source(SourceOperand::VectorRegister(2)),Operand::Source(SourceOperand::IntegerConstant(21))],
+                outputs:vec![Destination::Sgpr(106)],
+            })}}),
+            (1,ScalarBlock {pc:1,body:vec![
+                mov(11,SourceOperand::ScalarRegister(106)),
+                InstFormat::SOP1(SOP1 {op:I::S_AND_SAVEEXEC_B32,ssrc0:SourceOperand::ScalarRegister(106),sdst:20}),
+                mov(12,SourceOperand::ScalarRegister(126)),
+            ],term:Terminator::Return}),
+        ])};
+        for code_width in [0usize,1,2,4,8,16] {
+            let width=code_width.max(1);
+            for count in [1usize,23,32] {
+                let valid=(u32::MAX as u64 >> (32-count)) as u32;
+                let word=0x80a02005u32;
+                let ptr=&word as *const u32 as u64;
+                let chosen=0x80200004u32;
+                let ballot=if count>21 {chosen & ((1<<width)-1)} else {0};
+                let mut s=vec![[0;129];32/width];
+                let mut v=vec![vec![0;24*width];32/width];
+                for packet in 0..count.div_ceil(width) {
+                    s[packet][4]=ptr as u32;s[packet][5]=(ptr>>32) as u32;
+                    s[packet][126]=(valid>>(packet*width)) & ((1<<width)-1);
+                    for lane in 0..width {v[packet][2*width+lane]=chosen;}
+                }
+                run(&p,code_width,count,&mut s,&mut v);
+                for packet in 0..count.div_ceil(width) {
+                    let packet_valid=(valid>>(packet*width))&((1<<width)-1);
+                    assert_eq!(s[packet][10],word&packet_valid,"width={code_width} count={count} packet={packet}");
+                    assert_eq!(s[packet][11],ballot,"width={code_width} count={count} packet={packet}");
+                    assert_eq!(s[packet][20],word&packet_valid);
+                    assert_eq!(s[packet][12],word&ballot&packet_valid);
+                    assert_eq!(s[packet][128],(word&ballot&packet_valid!=0) as u32);
+                }
+            }
+        }
+    }
+    #[test]
+    fn architectural_mask_words_and_branches_use_packet_bits() {
+        use crate::instructions::I;
+        use crate::rdna_instructions::{InstFormat,SOP1};
+        use crate::rdna_spmd::ir::Cond;
+        let mov = |sdst,ssrc0| InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst,ssrc0});
+        let p = ScalarProgram {entry_pc:0,blocks:BTreeMap::from([
+            (0,ScalarBlock {pc:0,body:vec![
+                mov(10,SourceOperand::ScalarRegister(126)),
+                mov(126,SourceOperand::LiteralConstant(0x80000001)),
+                mov(11,SourceOperand::ScalarRegister(126)),
+                mov(126,SourceOperand::ScalarRegister(10)),
+            ],term:Terminator::Branch {cond:Cond::ExecNz,taken:1,fallthrough:2}}),
+            (1,ScalarBlock {pc:1,body:vec![mov(12,SourceOperand::IntegerConstant(1))],term:Terminator::Jump(3)}),
+            (2,ScalarBlock {pc:2,body:vec![mov(12,SourceOperand::IntegerConstant(0))],term:Terminator::Jump(3)}),
+            (3,ScalarBlock {pc:3,body:vec![],term:Terminator::Return}),
+        ])};
+        for code_width in [0,1,2,4,8,16] {
+            let width=code_width.max(1);
+            for count in [1usize,23,32] {
+                let valid=(u32::MAX as u64 >> (32-count)) as u32;
+                for mask in [0,1<<21,0xaaaaaaaa,u32::MAX] {
+                    let mut s=vec![[0;129];32/width];
+                    let mut v=vec![vec![0;256*width];32/width];
+                    for (packet,regs) in s.iter_mut().enumerate() {
+                        regs[126]=(mask >> (packet*width)) & ((1<<width)-1);
+                    }
+                    run(&p,code_width,count,&mut s,&mut v);
+                    for (packet,regs) in s[..count.div_ceil(width)].iter().enumerate() {
+                        let packet_mask=((mask&valid)>>(packet*width))&((1<<width)-1);
+                        let packet_valid=(valid>>(packet*width))&((1<<width)-1);
+                        assert_eq!(regs[10],packet_mask,"saved packet mask after entry validity clipping");
+                        assert_eq!(regs[11],0x80000001&packet_valid,"packet lane projection");
+                        assert_eq!(regs[12],(packet_mask!=0) as u32,"packet branch width={code_width} packet={packet}");
+                        assert_eq!(regs[126],((mask&valid)>>(packet*width))&((1<<width)-1));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn exec_vcc_and_scc_branches_reduce_within_each_packet() {
+        use crate::instructions::I;
+        use crate::rdna_instructions::{InstFormat,SOP1};
+        use crate::rdna_spmd::ir::Cond;
+        let mov=|value|InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst:12,
+            ssrc0:SourceOperand::IntegerConstant(value)});
+        for cond in [Cond::ExecZ,Cond::ExecNz,Cond::VccZ,Cond::VccNz,Cond::Scc0,Cond::Scc1] {
+            let program=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([
+                (0,ScalarBlock {pc:0,body:vec![],term:Terminator::Branch {cond,taken:1,fallthrough:2}}),
+                (1,ScalarBlock {pc:1,body:vec![mov(1)],term:Terminator::Return}),
+                (2,ScalarBlock {pc:2,body:vec![mov(0)],term:Terminator::Return}),
+            ])};
+            for code_width in [0usize,1,2,4,8,16] {for count in [1usize,23,32] {
+                let width=code_width.max(1);
+                let mut s=vec![[0u32;129];32/width];
+                let mut v=vec![vec![0u32;24*width];32/width];
+                for (packet,regs) in s.iter_mut().enumerate() {
+                    regs[126]=((1u32<<21)>>(packet*width))&((1<<width)-1);
+                    regs[106]=((1u32<<3)>>(packet*width))&((1<<width)-1);
+                    regs[128]=(packet%2) as u32;
+                }
+                run(&program,code_width,count,&mut s,&mut v);
+                for (packet,regs) in s[..count.div_ceil(width)].iter().enumerate() {
+                    // The existing branch ABI observes the packet word, even
+                    // when a caller supplied bits for padding lanes.
+                    let nonzero=match cond {
+                        Cond::ExecZ|Cond::ExecNz=>regs[126]!=0,
+                        Cond::VccZ|Cond::VccNz=>regs[106]!=0,
+                        Cond::Scc0|Cond::Scc1=>regs[128]!=0,
+                    };
+                    let inverted=matches!(cond,Cond::ExecZ|Cond::VccZ|Cond::Scc0);
+                    assert_eq!(regs[12],(nonzero^inverted) as u32,
+                        "{cond:?} width={code_width} count={count} packet={packet}");
+                }
+            }}
+        }
     }
     #[test]
     fn local_writelane_uses_global_lane_id_and_ignores_exec() {

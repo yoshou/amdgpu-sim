@@ -53,12 +53,12 @@ impl Compiler {
     /// by a wave/cooperative dispatcher.
     pub fn compile_program(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
         let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Whole);
-        super::emit::compile_program(&plan, num_vgprs)
+        super::emit::compile_program(&plan,num_vgprs)
     }
 
     pub fn compile_program_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
-        let plan = PacketPlan::with_registry(self.registry.clone(), program, width, None);
-        super::emit_vec::compile_program(&plan, num_vgprs.max(256))
+        let plan = PacketPlan::with_return_state(self.registry.clone(), program, width, None,false);
+        super::emit_vec::compile_program(&plan,num_vgprs.max(256))
     }
 
     pub fn compile_cooperative_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> CoopVecKernel {

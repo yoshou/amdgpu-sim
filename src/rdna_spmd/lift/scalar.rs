@@ -131,6 +131,7 @@ fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'st
 fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
     let InstFormat::SOP1(i) = inst else { return None; };
     let (from, to, cvt) = match i.op {
+        I::S_MOV_B32 => (Ty::I32, Ty::I32, None),
         I::S_MOV_B64 => (Ty::I64, Ty::I64, None),
         I::S_CTZ_I32_B32 | I::S_SEXT_I32_I16 => (Ty::I32, Ty::I32, None),
         I::S_CVT_F32_I32 => (Ty::I32, Ty::F32, Some(Cvt::SignedToFloatRte)),
@@ -199,5 +200,44 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'
 }
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
-    arithmetic(inst, registry).or_else(|| compare(inst, registry)).or_else(|| unary(inst, registry)).or_else(|| immediate(inst, registry))
+    masks(inst, registry).or_else(|| arithmetic(inst, registry)).or_else(|| compare(inst, registry)).or_else(|| unary(inst, registry)).or_else(|| immediate(inst, registry))
+}
+
+fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+    if let InstFormat::SOP1(i) = inst {
+        let op = match i.op {
+            I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 => IntOp::And,
+            I::S_OR_SAVEEXEC_B32 => IntOp::Or,
+            I::S_XOR_SAVEEXEC_B32 => IntOp::Xor,
+            _ => return None,
+        };
+        let mut b = Builder::new(registry,vec![input(i.ssrc0,Ty::I32),
+            input(SourceOperand::ScalarRegister(126),Ty::I32)]);
+        let old = ValueId(1);
+        let rhs = if matches!(i.op,I::S_AND_NOT1_SAVEEXEC_B32) {
+            let all = b.k(Ty::I32,u32::MAX as u64);
+            b.push(Ty::I32,Op::Int(IntOp::Xor,old,all))
+        } else { old };
+        let next = b.push(Ty::I32,Op::Int(op,ValueId(0),rhs));
+        let zero=b.k(Ty::I32,0);
+        let flag=b.push(Ty::I1,Op::Cmp(IntPred::Ne,next,zero));
+        return Some(b.finish_many(true,vec![(Output::Scalar(i.sdst as u32,Ty::I32),old),
+            (Output::Scalar(126,Ty::I32),next),(Output::Scc,flag)]));
+    }
+    let InstFormat::SOP2(i) = inst else { return None; };
+    let op = match i.op {
+        I::S_AND_B32 | I::S_AND_NOT1_B32 => IntOp::And,
+        I::S_OR_B32 | I::S_OR_NOT1_B32 => IntOp::Or,
+        I::S_XOR_B32 => IntOp::Xor,
+        _ => return None,
+    };
+    let mut b = Builder::new(registry,vec![input(i.ssrc0,Ty::I32),input(i.ssrc1,Ty::I32)]);
+    let rhs = if matches!(i.op,I::S_AND_NOT1_B32|I::S_OR_NOT1_B32) {
+        let all = b.k(Ty::I32,u32::MAX as u64);
+        b.int(IntOp::Xor,ValueId(1),all)
+    } else { ValueId(1) };
+    let value = b.int(op,ValueId(0),rhs);
+    let zero = b.k(Ty::I32,0);
+    let flag = b.push(Ty::I1,Op::Cmp(IntPred::Ne,value,zero));
+    Some(b.finish_many(true,vec![(Output::Scalar(i.sdst as u32,Ty::I32),value),(Output::Scc,flag)]))
 }

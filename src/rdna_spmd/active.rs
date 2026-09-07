@@ -81,6 +81,8 @@ fn scalar_dests(inst: &InstFormat) -> u128 {
             (0..words).fold(0u128, |m, k| m | bit(i.sdata as u32 + k))
         }
         InstFormat::VOP3SD(i) => bit(i.sdst as u32),
+        InstFormat::VOP1(i) if matches!(i.op,I::V_READFIRSTLANE_B32) => bit(i.vdst as u32),
+        InstFormat::VOP3(i) if matches!(i.op,I::V_READLANE_B32) => bit(i.vdst as u32),
         // VOPC / VOP3 compares write a lane mask (VCC or, for V_CMPX, EXEC).
         InstFormat::VOPC(i) => {
             if format!("{:?}", i.op).starts_with("V_CMPX") { bit(EXEC) } else { bit(106) }

@@ -1,7 +1,7 @@
 //! Width-independent facts derived from SSA definitions and CFG edges.
 //! Architectural register classes do not supply facts to this analysis.
 use super::ir::typed::{cfg::*, Cvt, IntOp, IntPred, Op, Ty, ValueId};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap,VecDeque};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact { Pending, Constant(u64), Dynamic }
@@ -18,8 +18,15 @@ enum Definition { External, Phi(Vec<ValueId>), Core(Ty, Op) }
 
 /// A conservative, monotone constant analysis. All incoming CFG edges take
 /// part, including loop backedges; an unseeded cycle proves no constant.
-pub(crate) fn constants(function: &VerifiedFunc) -> Vec<Option<u64>> {
-    let f = function.func();
+pub(crate) fn constants(function: &Func) -> Vec<Option<u64>> {
+    constant_facts(function,&[],false)
+}
+/// Facts valid on allocated work items. Use these only to fold queries which
+/// explicitly ignore padding; they must not replace ordinary EXEC/memory masks.
+pub(crate) fn valid_predicate_constants(f:&Func,entry_true:&[ValueId])->Vec<Option<u64>> {
+    constant_facts(f,entry_true,true)
+}
+fn constant_facts(f:&Func,entry_true:&[ValueId],valid_queries:bool)->Vec<Option<u64>> {
     let mut definitions: Vec<_> = (0..f.types.len()).map(|_| Definition::External).collect();
     for (&id, block) in &f.blocks {
         if id != f.entry {
@@ -27,7 +34,17 @@ pub(crate) fn constants(function: &VerifiedFunc) -> Vec<Option<u64>> {
         }
         for inst in &block.insts {
             if let Inst::Core { value, ty, op } = *inst {
+                let op=if valid_queries&&matches!(op,Op::Env(super::ir::typed::Env::ValidLane)) {Op::Const(Ty::I1,1)} else {op};
                 definitions[value.0] = Definition::Core(ty, op);
+            } else if valid_queries {
+                let query=match inst {
+                    Inst::Packet {op:PacketOp::Any,input,output}=>Some((*input,*output)),
+                    Inst::Effect {op:super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::Any),inputs,outputs,..}=>Some((inputs[0],outputs[0].0)),
+                    _=>None,
+                };
+                if let Some((input,output))=query {
+                    definitions[output.0]=Definition::Core(Ty::I1,Op::Int(IntOp::Or,input,input));
+                }
             }
         }
     }
@@ -38,6 +55,7 @@ pub(crate) fn constants(function: &VerifiedFunc) -> Vec<Option<u64>> {
             }
         }
     }
+    for &id in entry_true {definitions[id.0]=Definition::Core(Ty::I1,Op::Const(Ty::I1,1));}
     let mut users = vec![vec![]; definitions.len()];
     for (id, definition) in definitions.iter().enumerate() {
         let mut add = |value: ValueId| { users[value.0].push(id); value };
@@ -142,11 +160,28 @@ mod tests {
             no: Edge { dst: BlockId(2), args: vec![invariant] },
         } });
         f.blocks.insert(BlockId(2), Block { params: vec![(result,Ty::I32)], insts: vec![], term: Term::Ret });
-        let facts = constants(&f.verify().unwrap());
+        let facts = constants(f.verify().unwrap().func());
         assert_eq!(facts[a.0],None);
         assert_eq!(facts[next.0],None);
         assert_eq!(facts[invariant.0],Some(7));
         assert_eq!(facts[result.0],Some(7));
+    }
+
+    #[test]
+    fn packet_divergence_does_not_make_distinct_uniform_inputs_a_uniform_phi() {
+        let mut f=Func {entry:BlockId(0),blocks:BTreeMap::new(),types:vec![]};
+        let cond=f.value(Ty::I1); let a=f.value(Ty::I32); let b=f.value(Ty::I32);
+        let result=f.value(Ty::I32); let unchanged=f.value(Ty::I32);
+        f.blocks.insert(BlockId(0),Block {params:vec![(cond,Ty::I1)],insts:vec![
+            Inst::Core {value:a,ty:Ty::I32,op:Op::Const(Ty::I32,0)},
+            Inst::Core {value:b,ty:Ty::I32,op:Op::Const(Ty::I32,1)},
+        ],term:Term::CondBr {cond,yes:Edge {dst:BlockId(3),args:vec![a,a]},no:Edge {dst:BlockId(3),args:vec![b,a]}}});
+        f.blocks.insert(BlockId(3),Block {params:vec![(result,Ty::I32),(unchanged,Ty::I32)],insts:vec![],term:Term::Ret});
+        let verified=f.verify().unwrap();
+        let facts=uniformity(verified.func(),&[]);
+        assert!(!facts[result.0]);
+        assert!(facts[unchanged.0]);
+        assert!(uniformity(verified.func(),&[cond])[result.0]);
     }
 
     #[test]
@@ -158,4 +193,103 @@ mod tests {
         assert!(evaluate(Ty::I64,Op::Convert(Cvt::SExt,Ty::I64,a),&types,&facts)==Fact::Constant(0xffff_ffff_8000_0001));
         assert!(evaluate(Ty::I32,Op::Int(IntOp::Add,a,a),&types,&facts)==Fact::Constant(2));
     }
+}
+
+/// Wave uniformity from explicit entry bindings, SSA operands, and CFG edges.
+/// Entry facts describe the invocation ABI; register numbers are not queried.
+pub(crate) fn uniformity(f: &Func, uniform_entry: &[ValueId]) -> Vec<bool> {
+    use super::ir::typed::effect::{EffectOp,WaveOp,MemoryOp};
+    // The CFG is immutable during this analysis. Index its edges once rather
+    // than scanning and allocating every terminator for every phi parameter.
+    let successors:BTreeMap<_,_>=f.blocks.iter().map(|(&pc,b)|(pc,b.term.edges())).collect();
+    let mut predecessors:BTreeMap<BlockId,Vec<&Edge>>=f.blocks.keys().map(|&pc|(pc,Vec::new())).collect();
+    for edges in successors.values() {for &edge in edges {predecessors.get_mut(&edge.dst).unwrap().push(edge);}}
+    let mut uniform=vec![true;f.types.len()];
+    for &(id,_) in &f.blocks[&f.entry].params {uniform[id.0]=uniform_entry.contains(&id);}
+    loop {
+        let mut changed=false;
+        // Packet-local branches can select different incoming constants in
+        // different packets. Uniform operands alone do not prove a uniform phi.
+        let mut divergent=std::collections::BTreeSet::new();
+        let mut pending=Vec::new();
+        for (&pc,block) in &f.blocks {
+            if let Term::CondBr {cond,..}=&block.term {
+                if !uniform[cond.0] {pending.extend(successors[&pc].iter().map(|e|e.dst));}
+            }
+        }
+        while let Some(pc)=pending.pop() {
+            if divergent.insert(pc) {pending.extend(successors[&pc].iter().map(|e|e.dst));}
+        }
+        for (&pc,block) in &f.blocks {
+            if pc!=f.entry {
+                for (index,&(id,_)) in block.params.iter().enumerate() {
+                    let incoming=&predecessors[&pc];
+                    let same=incoming.first().is_some_and(|first|incoming.iter().all(|e|e.args[index]==first.args[index]));
+                    let proof=(!divergent.contains(&pc)||same)&&incoming.iter().all(|e|uniform[e.args[index].0]);
+                    if uniform[id.0] && !proof {uniform[id.0]=false;changed=true;}
+                }
+            }
+            for inst in &block.insts {
+                let (outputs,proof) = match inst {
+                    Inst::Packet {output,..}=>(vec![*output],false),
+                    Inst::Core {value,op,..} => {
+                        let mut proof=!matches!(op,Op::Env(_));
+                        op.map(|v|{proof &= uniform[v.0];v});
+                        (vec![*value],proof)
+                    }
+                    Inst::Target {args,outputs,..} => (outputs.iter().map(|v|v.0).collect(),args.values().iter().all(|v|uniform[v.0])),
+                    Inst::Boundary {outputs,..} => (outputs.iter().map(|v|v.0).collect(),false),
+                    Inst::Effect {op,inputs,outputs,..} => {
+                        let proof=match op {
+                            EffectOp::Wave(WaveOp::Any|WaveOp::Ballot|WaveOp::ReadFirstLane) => true,
+                            EffectOp::Wave(WaveOp::ReadLane) => uniform[inputs[1].0],
+                            EffectOp::Memory {op:MemoryOp::Load(_),..} => inputs.iter().all(|v|uniform[v.0]),
+                            EffectOp::BarrierSignal {..} => true,
+                            _ => false,
+                        };
+                        (outputs.iter().map(|v|v.0).collect(),proof)
+                    }
+                };
+                if !proof { for id in outputs {if uniform[id.0] {uniform[id.0]=false;changed=true;}} }
+            }
+        }
+        if !changed {return uniform;}
+    }
+}
+
+/// Backward SSA reachability, including block arguments and loop backedges.
+/// Non-query effects retain their inputs regardless of whether results escape.
+pub(crate) fn live_values(f: &Func, roots: impl IntoIterator<Item=ValueId>) -> Vec<bool> {
+    use super::ir::typed::effect::{EffectOp,WaveOp};
+    let mut deps=vec![Vec::new();f.types.len()];
+    let mut pending:Vec<_>=roots.into_iter().collect();
+    for block in f.blocks.values() {
+        for edge in block.term.edges() {
+            for (&arg,&(param,_)) in edge.args.iter().zip(&f.blocks[&edge.dst].params) {deps[param.0].push(arg);}
+        }
+        if let super::ir::typed::cfg::Term::CondBr {cond,..}=block.term {pending.push(cond);}
+        for inst in &block.insts {
+            match inst {
+                Inst::Packet {input,output,..}=>{deps[output.0].push(*input);},
+                Inst::Core {value,op,..} => {op.map(|v|{deps[value.0].push(v);v});}
+                Inst::Effect {op,inputs,outputs,..} => {
+                    for &(id,_) in outputs {deps[id.0].extend(inputs);}
+                    if !matches!(op,EffectOp::Wave(WaveOp::Any|WaveOp::Ballot)) {pending.extend(inputs);}
+                }
+                Inst::Target {provenance,args,outputs,..} => {
+                    for &(id,_) in outputs {deps[id.0].extend(args.values());}
+                    if provenance.is_some() {pending.extend(args.values());}
+                }
+                Inst::Boundary {inputs,outputs} => {
+                    pending.extend(inputs);
+                    for &(id,_) in outputs {deps[id.0].extend(inputs);}
+                }
+            }
+        }
+    }
+    let mut live=vec![false;f.types.len()];
+    while let Some(id)=pending.pop() {
+        if !live[id.0] {live[id.0]=true;pending.extend(&deps[id.0]);}
+    }
+    live
 }

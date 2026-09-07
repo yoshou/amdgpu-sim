@@ -77,15 +77,29 @@ impl<'a> PacketPlan<'a> {
         width: u32,
         boundary: Option<&'a BTreeMap<usize, BoundaryIo>>,
     ) -> Self {
+        Self::with_return_state(registry,program,width,boundary,true)
+    }
+    pub fn with_return_state(
+        registry: std::sync::Arc<super::dialect::DialectRegistry>,
+        program: &'a ScalarProgram,
+        width: u32,
+        boundary: Option<&'a BTreeMap<usize,BoundaryIo>>,
+        observe_return: bool,
+    ) -> Self {
         // Host-written values on resume must not retain uniform/frame facts.
         let boundary_writes = boundary
             .map(|map| map.iter().map(|(&pc, io)| (pc, io.writes.vgprs().collect())).collect())
             .unwrap_or_default();
-        // Boundary operations can read every lane, even an EXEC-inactive lane.
+        // ReadFirstLane selects an EXEC-active lane. Its ordinary liveness is
+        // tracked at the terminator; it does not observe every inactive value.
+        let active_reads: BTreeSet<_>=program.blocks.values().filter_map(|b|match &b.term {
+            Terminator::Yield {resume,action} if action.op==super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::ReadFirstLane)=>Some(*resume),
+            _=>None,
+        }).collect();
         let boundary_reads: Vec<u32> = boundary
-            .map(|map| map.values().flat_map(|io| io.reads.vgprs()).collect())
+            .map(|map| map.iter().filter(|(pc,_)|!active_reads.contains(pc)).flat_map(|(_,io)| io.reads.vgprs()).collect())
             .unwrap_or_default();
-        let exit_reads = if boundary.is_some() { (0..256).collect::<Vec<_>>() } else { boundary_reads };
+        let exit_reads = if boundary.is_some() && observe_return { (0..256).collect::<Vec<_>>() } else { boundary_reads };
         let elide = super::vec_live::analyze_with_exit_live(program, &exit_reads);
         let nonempty = nonempty_exec(program,width,boundary.is_none());
         let fresh_in = super::freshness::analyze(program);
@@ -162,7 +176,12 @@ impl<'a> PacketPlan<'a> {
             (pc, BlockPlan { instructions, fresh, stale, specialize })
         }).collect();
         let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().map(|i| &i.lowering).collect())).collect();
-        let mut function = super::lift::function::Function::new(registry, program, &lowerings, boundary);
+        let preparation=super::lift::function::Preparation::Packet {
+            inactive:blocks.iter().flat_map(|(&pc,b)|b.instructions.iter().enumerate()
+                .filter_map(move |(index,i)|i.elide_predicate.then_some((pc,index)))).collect(),
+            observe_return,
+        };
+        let mut function=super::lift::function::Function::new(registry,program,&lowerings,boundary,preparation);
         for plan in function.blocks.values_mut().flat_map(|block| block.memory.values_mut()) {
             use super::ir::typed::effect::{MemoryOp, Space};
             // One ISA atomic instruction has no intervening per-lane effects.

@@ -52,9 +52,11 @@ impl Input {
 pub(super) enum InputSource {
     Operand(SourceOperand),
     Scc,
-    /// Existing de-SIMT control binding; replaced by full-wave reduction when
-    /// control reconvergence is transferred to the wave execution engine.
-    PacketMaskAny(u32),
+    /// Architectural per-work-item state; never a wave reduction.
+    MaskBit(u32),
+    /// EXEC used by an architectural write, in the existing native predicate
+    /// representation rather than an ISA numeric source view.
+    ExecPredicate,
 }
 impl InputSource {
     pub fn operand(&self) -> &SourceOperand {
@@ -66,6 +68,8 @@ pub(super) enum Output {
     Vgpr(u32, Ty),
     Compare(u32),
     Mask(u32),
+    /// A fully lifted per-lane mask assignment (predication is already in SSA).
+    MaskBit(u32),
     Scalar(u32, Ty),
     Scc,
 }
@@ -73,7 +77,7 @@ impl Output {
     pub fn ty(self) -> Ty {
         match self {
             Self::Vgpr(_, t) | Self::Scalar(_, t) => t,
-            Self::Compare(_) | Self::Mask(_) | Self::Scc => Ty::I1,
+            Self::Compare(_) | Self::Mask(_) | Self::MaskBit(_) | Self::Scc => Ty::I1,
         }
     }
 }

@@ -96,7 +96,7 @@ pub(crate) enum Cvt {
     Bitcast,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Env { LaneId }
+pub(crate) enum Env { LaneId, PacketLaneId, ValidLane }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -161,7 +161,8 @@ impl Op {
             }
         };
         match self {
-            Self::Env(Env::LaneId) => Ok(Ty::I32),
+            Self::Env(Env::LaneId | Env::PacketLaneId) => Ok(Ty::I32),
+            Self::Env(Env::ValidLane) => Ok(Ty::I1),
             Self::Pack64(a, b) => {
                 if pair(a, b)? != Ty::I32 { return Err("pack64 requires two i32 words"); }
                 Ok(Ty::I64)

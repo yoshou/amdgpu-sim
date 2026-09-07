@@ -17,29 +17,9 @@ use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
 use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, SOP2, VIMAGE, VOP3};
+use crate::rdna_instructions::{InstFormat, SourceOperand, VIMAGE, VOP3};
 
 use super::scalar_plan::{ScalarMode, ScalarPlan};
-
-/// The SGPR number if `o` is a scalar register operand.
-fn sreg(o: &SourceOperand) -> Option<u32> {
-    match o {
-        SourceOperand::ScalarRegister(r) => Some(*r as u32),
-        _ => None,
-    }
-}
-
-/// One side of a recognized `(A & !mask) | (B & mask)` expression. It is
-/// recorded when an SGPR is defined by an EXEC/VCC-masked `and` and consumed at
-/// the matching `s_or` to emit a `select` (→ cmov) instead of the 32-bit
-/// `(B&M)|(A&~M)` blend.
-#[derive(Clone, Copy)]
-enum MaskDef {
-    /// `dst = A & ~M` (S_AND_NOT1): `a` is A's value, `m` the mask SGPR.
-    AndNot1 { a: LLVMValueRef, m: u32 },
-    /// `dst = B & M` (S_AND): `b` is B's value, `cond` = M's bit0 as i1.
-    And { b: LLVMValueRef, cond: LLVMValueRef, m: u32 },
-}
 
 const EXEC: u32 = 126;
 const VCC: u32 = 106;
@@ -94,6 +74,8 @@ struct Cg {
     b: LLVMBuilderRef,
     func: LLVMValueRef,
     scratch_base: LLVMValueRef,
+    private_base: LLVMValueRef,
+    private_size: LLVMValueRef,
     yield_frame: LLVMValueRef,
     sgpr: Vec<CellId>, // 128 i32 representations
     vgpr: Vec<CellId>, // num_vgprs i32 representations
@@ -134,7 +116,6 @@ struct Cg {
     // `(B&M)|(A&~M)` is emitted as `select(M, B, A)` (→ cmov, as native), and the
     // dead `and/andn` DCE away. Cleared at block start; invalidated per write
     // (all entries when EXEC/VCC change).
-    mask_def: std::cell::RefCell<BTreeMap<u32, MaskDef>>,
     writeback: bool,
     writeback_vgprs: usize,
     writeback_words: super::boundary::RegSet,
@@ -203,19 +184,7 @@ impl Cg {
     }
     unsafe fn st_sgpr32(&self, i: u32, v: LLVMValueRef) {
         if i == 124 { return; }
-        // Invalidate pending mask-select records: changing EXEC/VCC changes the
-        // mask value, so drop all; any other write drops that register's record.
-        {
-            let mut md = self.mask_def.borrow_mut();
-            if i == EXEC || i == VCC { md.clear(); } else { md.remove(&i); }
-        }
-        // EXEC/VCC: keep only the single meaningful lane bit (bit 0) as i1.
-        if i == EXEC || i == VCC {
-            let bit = llvm::core::LLVMBuildTrunc(self.b, v, self.i1, self.n());
-            let slot = if i == EXEC { self.exec_i1 } else { self.vcc_i1 };
-            self.state.borrow_mut().write(self.b, slot, bit);
-            return;
-        }
+        assert!(!matches!(i,EXEC|VCC),"mask state requires a typed I1 definition");
         // A 32-bit write clobbers the i64 shadow of pairs i (i:i+1) and i-1.
         let mut fr = self.sgpr_fresh.get();
         fr &= !(1u128 << (i & 127));
@@ -383,7 +352,7 @@ impl Cg {
             SourceOperand::ScalarRegister(r) => self.ld_sgpr32(*r as u32),
             SourceOperand::VectorRegister(r) => self.ld_vgpr32(*r as u32),
             SourceOperand::FloatConstant(v) => self.ci32((*v as f32).to_bits()),
-            SourceOperand::PrivateBase => llvm::core::LLVMBuildTrunc(self.b, self.scratch_base, self.i32t, self.n()),
+            SourceOperand::PrivateBase => llvm::core::LLVMBuildTrunc(self.b, self.private_base, self.i32t, self.n()),
         }
     }
     unsafe fn src_u64(&self, op: &SourceOperand) -> LLVMValueRef {
@@ -392,7 +361,7 @@ impl Cg {
             SourceOperand::IntegerConstant(v) => self.ci64(*v),
             SourceOperand::ScalarRegister(r) => self.ld_sgpr64(*r as u32),
             SourceOperand::VectorRegister(r) => self.ld_vgpr64(*r as u32),
-            SourceOperand::PrivateBase => self.scratch_base,
+            SourceOperand::PrivateBase => self.private_base,
             SourceOperand::FloatConstant(v) => self.ci64(v.to_bits()),
         }
     }
@@ -517,7 +486,7 @@ unsafe fn compile_inner(
     num_vgprs: usize,
 ) -> ScalarKernel {
     let program = plan.program;
-    let writeback = plan.mode != ScalarMode::Whole;
+    let writeback = plan.mode != ScalarMode::Whole && plan.function.observable_return;
     let force_exec = plan.mode == ScalarMode::Whole;
     let coop = plan.mode == ScalarMode::Cooperative;
     // VGPR slots: allocate a safe upper bound (RDNA max is 256) since the
@@ -553,6 +522,7 @@ unsafe fn compile_inner(
     let sgprs_p = llvm::core::LLVMGetParam(func, 0);
     let vgprs_p = llvm::core::LLVMGetParam(func, 1);
     let scratch_base = llvm::core::LLVMGetParam(func, 2);
+    let private_size=if coop {llvm::core::LLVMGetParam(func,3)} else {llvm::core::LLVMConstInt(i64t,0,0)};
     let lds_base = if coop {
         llvm::core::LLVMGetParam(func, 5)
     } else {
@@ -567,13 +537,18 @@ unsafe fn compile_inner(
     let entry = llvm::core::LLVMAppendBasicBlockInContext(ctx, func, b"entry\0".as_ptr() as *const _);
     llvm::core::LLVMPositionBuilderAtEnd(b, entry);
 
+    // SH_MEM_BASES exposes the aperture's high word. Its virtual base must
+    // therefore stay fixed when the scheduler advances to another wave.
+    let aperture=llvm::core::LLVMBuildAnd(b,scratch_base,llvm::core::LLVMConstInt(i64t,0xffff_ffff_0000_0000,0),b"\0".as_ptr().cast());
+    let sized=llvm::core::LLVMBuildICmp(b,llvm::LLVMIntPredicate::LLVMIntNE,private_size,llvm::core::LLVMConstInt(i64t,0,0),b"\0".as_ptr().cast());
+    let private_base=llvm::core::LLVMBuildSelect(b,sized,aperture,scratch_base,b"\0".as_ptr().cast());
+
     let scratch_base = if coop {
         let offset = llvm::core::LLVMBuildMul(b, llvm::core::LLVMGetParam(func, 3),
             llvm::core::LLVMGetParam(func, 6), b"\0".as_ptr().cast());
         llvm::core::LLVMBuildAdd(b, scratch_base, offset, b"\0".as_ptr().cast())
     } else { scratch_base };
-    let cells = plan.function.blocks.values().filter_map(|p| p.yield_values.as_ref())
-        .map(|p| p.layout.cells()).max().unwrap_or(0);
+    let cells = plan.function.value_yields().values().map(|p| p.cells()).max().unwrap_or(0);
     let yield_frame = if cells == 0 { llvm::core::LLVMConstNull(ptr) } else {
         let frame = llvm::core::LLVMBuildAlloca(b, llvm::core::LLVMArrayType2(i32t, cells as u64), cstr("yield.values").as_ptr());
         llvm::core::LLVMSetAlignment(frame, 64);
@@ -618,10 +593,9 @@ unsafe fn compile_inner(
     let cg = Cg {
         state: std::cell::RefCell::new(state),
         writeback_words: plan.function.written,
-        ctx, module, b, func, scratch_base, yield_frame,
+        ctx, module, b, func, scratch_base, private_base, private_size, yield_frame,
         sgpr, vgpr, scc, i1, i8, i32t, i64t, f32t, f64t, ptr,
         predicate: std::cell::Cell::new(false),
-        mask_def: std::cell::RefCell::new(BTreeMap::new()),
         vgpr_f64,
         f64_fresh: std::cell::Cell::new([0; 2]),
         exec_i1,
@@ -641,7 +615,10 @@ unsafe fn compile_inner(
     for i in 0..128u32 {
         let gep = llvm::core::LLVMBuildGEP2(b, i32t, sgprs_p, [cg.ci32(i)].as_mut_ptr(), 1, cg.n());
         let v = llvm::core::LLVMBuildLoad2(b, i32t, gep, cg.n());
-        cg.st_sgpr32(i, v);
+        if matches!(i,106|126) {
+            let bit=llvm::core::LLVMBuildTrunc(b,v,i1,cg.n());
+            cg.typed_output(super::lift::Output::MaskBit(i),bit);
+        } else {cg.st_sgpr32(i,v);}
     }
     for i in 0..num_vgprs as u32 {
         let gep = llvm::core::LLVMBuildGEP2(b, i32t, vgprs_p, [cg.ci32(i)].as_mut_ptr(), 1, cg.n());
@@ -649,7 +626,7 @@ unsafe fn compile_inner(
         cg.st_vgpr32(i, v);
     }
     if force_exec {
-        cg.st_sgpr32(EXEC, cg.ci32(1));
+        cg.typed_output(super::lift::Output::MaskBit(EXEC),llvm::core::LLVMConstInt(i1,1,0));
     }
     if coop {
         // Initial SCC arrives in the private entry slot. It subsequently
@@ -671,9 +648,8 @@ unsafe fn compile_inner(
         bbs.insert(pc, llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
     }
 
-    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
-
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, None);
+    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
     for &pc in program.blocks.keys() {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         ssa.begin_block(&plan.function, pc);
@@ -681,18 +657,29 @@ unsafe fn compile_inner(
         cg.set_f64_fresh(facts.f64_fresh);
         cg.sgpr_fresh.set(facts.sgpr_fresh);
         let states = &facts.active;
-        cg.mask_def.borrow_mut().clear();
         for (idx, instruction) in facts.instructions.iter().enumerate() {
             // Predicate this instruction's vector writes/compares unless the lane
             // is provably active here (then the mask is a no-op and we drop it).
             cg.predicate.set(!states[idx]);
             match instruction {
                 super::lift::Lowering::TypedAlu { .. } => {
-                    ssa.emit(&plan.function, pc, idx, |input, _| cg.typed_input(input), |output, value| {
+                    ssa.emit(&plan.function, pc, idx, false, |_|true,
+                        |reg|if matches!(reg,106|126) {cg.typed_input(&super::lift::Input {source:super::lift::InputSource::MaskBit(reg),ty:super::ir::typed::Ty::I1})} else {cg.ld_sgpr32(reg)},
+                        |input, _| cg.typed_input(input), |output, value, _| {
+                        let predicate=cg.predicate.replace(false);
                         cg.typed_output(output, value);
+                        cg.predicate.set(predicate);
                     });
                 }
-                super::lift::Lowering::Wave(_) => cg.emit_local_wave(&plan.function.blocks[&pc].wave[&idx]),
+                super::lift::Lowering::Wave(_) => {
+                    let (action,wave)=&plan.function.blocks[&pc].wave[&idx];
+                    cg.emit_local_wave(action,|reg,raw| {
+                        let (ty,value)=ssa.effect_result(wave.results[0].0,wave.definitions[0].1,raw);
+                        let output=if ty==super::ir::typed::Ty::I1 {super::lift::Output::MaskBit(reg)}
+                            else {super::lift::Output::Scalar(reg,ty)};
+                        cg.typed_output(output,value);
+                    });
+                },
                 super::lift::Lowering::Memory(_) => {
                     ssa.prepare_memory(&plan.function, pc, idx, |p, scalar| cg.memory_parameter(p, scalar));
                     cg.emit_memory(&plan.function.blocks[&pc].memory[&idx], &ssa, |k| ssa.memory_data(&plan.function, pc, idx, k));
@@ -700,7 +687,7 @@ unsafe fn compile_inner(
                 super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
             }
         }
-        ssa.condition(&plan.function, pc, |input| cg.typed_input(input));
+        ssa.condition(&plan.function, pc, |reg|cg.ld_sgpr32(reg), |input| cg.typed_input(input));
         cg.emit_term(pc, &plan.function, &bbs, &mut ssa);
     }
 
@@ -758,8 +745,10 @@ impl Cg {
             super::lift::function::Control::Return => {
                 if self.coop {
                     // End of work-item: persist state, return the DONE sentinel.
-                    self.emit_writeback(self.writeback_vgprs);
-                    self.emit_scc_writeback();
+                    if self.writeback {
+                        self.emit_writeback(self.writeback_vgprs);
+                        self.emit_scc_writeback();
+                    }
                     llvm::core::LLVMBuildRet(self.b, self.ci64(u64::MAX));
                 } else {
                     if self.writeback {
@@ -778,7 +767,7 @@ impl Cg {
                 values.yield_values(plan, self.yield_frame, llvm::core::LLVMGetParam(self.func, 7), *resume,
                     |destination, ty, result, bits| match destination {
                         Destination::Vgpr(reg) => self.typed_output(Output::Vgpr(reg, ty), result),
-                        Destination::Sgpr(reg) => self.typed_output(Output::Scalar(reg, super::ir::typed::Ty::I32), bits),
+                        Destination::Sgpr(reg) => if ty==super::ir::typed::Ty::I1 {self.typed_output(Output::MaskBit(reg),result)} else {self.typed_output(Output::Scalar(reg, super::ir::typed::Ty::I32), bits)},
                         Destination::Scc => self.typed_output(Output::Scc, result),
                     });
                 self.predicate.set(previous);
@@ -805,8 +794,6 @@ impl Cg {
     unsafe fn emit_inst(&self, inst: &InstFormat) {
         match inst {
             InstFormat::VOP3(i) => self.emit_vop3(i),
-            InstFormat::SOP1(i) => self.emit_sop1(i),
-            InstFormat::SOP2(i) => self.emit_sop2(i),
             InstFormat::VIMAGE(i) => self.emit_vimage(i),
             other => panic!("scalar: unsupported instruction {:?}", other),
         }
@@ -900,119 +887,11 @@ impl Cg {
     }
 
     // ---- SOP1 ------------------------------------------------------------
-    unsafe fn emit_sop1(&self, i: &SOP1) {
-        match i.op {
-            I::S_MOV_B32 => {
-                let v = self.src_u32(&i.ssrc0);
-                self.st_sgpr32(i.sdst as u32, v);
-            }
-            I::S_AND_SAVEEXEC_B32 => {
-                let s0 = self.src_u32(&i.ssrc0);
-                let old = self.ld_sgpr32(EXEC);
-                self.st_sgpr32(i.sdst as u32, old);
-                let ne = self.b_and(s0, old);
-                self.st_sgpr32(EXEC, ne);
-                self.st_scc_nz(ne);
-            }
-            I::S_AND_NOT1_SAVEEXEC_B32 => {
-                let s0 = self.src_u32(&i.ssrc0);
-                let old = self.ld_sgpr32(EXEC);
-                self.st_sgpr32(i.sdst as u32, old);
-                let ne = self.b_and(s0, self.b_not(old));
-                self.st_sgpr32(EXEC, ne);
-                self.st_scc_nz(ne);
-            }
-            I::S_OR_SAVEEXEC_B32 => {
-                let s0 = self.src_u32(&i.ssrc0);
-                let old = self.ld_sgpr32(EXEC);
-                self.st_sgpr32(i.sdst as u32, old);
-                let ne = self.b_or(s0, old);
-                self.st_sgpr32(EXEC, ne);
-                self.st_scc_nz(ne);
-            }
-            _ => panic!("scalar: unsupported SOP1 {:?}", i.op),
-        }
-    }
+
 
     // ---- SOP2 ------------------------------------------------------------
-    unsafe fn emit_sop2(&self, i: &SOP2) {
-        match i.op {
-            I::S_AND_B32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let r = self.b_and(a, b);
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc_nz(r);
-                // Record `dst = B & M` for the mask-select idiom (M = EXEC/VCC).
-                if i.sdst as u32 != EXEC && i.sdst as u32 != VCC {
-                    let rec = if sreg(&i.ssrc1).map_or(false, |m| m == EXEC || m == VCC) {
-                        Some((sreg(&i.ssrc1).unwrap(), a)) // M=ssrc1, B=ssrc0(=a)
-                    } else if sreg(&i.ssrc0).map_or(false, |m| m == EXEC || m == VCC) {
-                        Some((sreg(&i.ssrc0).unwrap(), b)) // M=ssrc0, B=ssrc1(=b)
-                    } else {
-                        None
-                    };
-                    if let Some((m, bval)) = rec {
-                        let cond = self.mask_bit(m);
-                        self.mask_def
-                            .borrow_mut()
-                            .insert(i.sdst as u32, MaskDef::And { b: bval, cond, m });
-                    }
-                }
-            }
-            I::S_OR_B32 => {
-                // Consume the mask-select idiom: `Dr = (A&~M) | (B&M)` → select.
-                if let (Some(d0), Some(d1)) = (sreg(&i.ssrc0), sreg(&i.ssrc1)) {
-                    let pick = {
-                        let md = self.mask_def.borrow();
-                        match (md.get(&d0).copied(), md.get(&d1).copied()) {
-                            (Some(MaskDef::AndNot1 { a, m: ma }), Some(MaskDef::And { b, cond, m: mb }))
-                            | (Some(MaskDef::And { b, cond, m: mb }), Some(MaskDef::AndNot1 { a, m: ma }))
-                                if ma == mb =>
-                            {
-                                Some((a, b, cond))
-                            }
-                            _ => None,
-                        }
-                    };
-                    if let Some((a, b, cond)) = pick {
-                        let r = llvm::core::LLVMBuildSelect(self.b, cond, b, a, self.n());
-                        self.st_sgpr32(i.sdst as u32, r);
-                        self.st_scc_nz(r);
-                        return;
-                    }
-                }
-                self.sop2_logic(i, |c, a, b| c.b_or(a, b));
-            }
-            I::S_XOR_B32 => self.sop2_logic(i, |c, a, b| c.b_xor(a, b)),
-            I::S_AND_NOT1_B32 => {
-                let a = self.src_u32(&i.ssrc0);
-                let b = self.src_u32(&i.ssrc1);
-                let r = self.b_and(a, self.b_not(b));
-                self.st_sgpr32(i.sdst as u32, r);
-                self.st_scc_nz(r);
-                // Record `dst = A & ~M` for the mask-select idiom (M = ssrc1).
-                if i.sdst as u32 != EXEC && i.sdst as u32 != VCC {
-                    if let Some(m) = sreg(&i.ssrc1) {
-                        if m == EXEC || m == VCC {
-                            self.mask_def
-                                .borrow_mut()
-                                .insert(i.sdst as u32, MaskDef::AndNot1 { a, m });
-                        }
-                    }
-                }
-            }
-            I::S_OR_NOT1_B32 => self.sop2_logic(i, |c, a, b| c.b_or(a, c.b_not(b))),
-            _ => panic!("scalar: unsupported SOP2 {:?}", i.op),
-        }
-    }
-    unsafe fn sop2_logic<F: Fn(&Cg, LLVMValueRef, LLVMValueRef) -> LLVMValueRef>(&self, i: &SOP2, f: F) {
-        let a = self.src_u32(&i.ssrc0);
-        let b = self.src_u32(&i.ssrc1);
-        let r = f(self, a, b);
-        self.st_sgpr32(i.sdst as u32, r);
-        self.st_scc_nz(r);
-    }
+
+
 
 
     // ---- VFLAT (flat load/store): flat addressing matches the global path.
@@ -1133,9 +1012,12 @@ fn vreg_of(op: &SourceOperand) -> Option<u32> {
 impl Cg {
     unsafe fn typed_input(&self, input: &super::lift::Input) -> LLVMValueRef {
         use super::ir::typed::Ty;
-        if let super::lift::InputSource::PacketMaskAny(reg) = input.source {
-            let word = self.b_and(self.ld_sgpr32(reg), self.ci32(1));
-            return llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, word, self.ci32(0), self.n());
+        if matches!(input.source,super::lift::InputSource::ExecPredicate) {
+            return self.typed_input(&super::lift::Input {source:super::lift::InputSource::Operand(SourceOperand::ScalarRegister(126)),ty:Ty::I1});
+        }
+        if let super::lift::InputSource::MaskBit(reg) = input.source {
+            let cell=if reg==EXEC {self.exec_i1} else {assert_eq!(reg,VCC);self.vcc_i1};
+            return self.state.borrow_mut().read(self.b,cell);
         }
         if matches!(input.source, super::lift::InputSource::Scc) { return self.ld_scc(); }
         match input.ty {
@@ -1156,6 +1038,10 @@ impl Cg {
             Output::Vgpr(reg, Ty::F64) => self.st_vgpr_f64(reg, result),
             Output::Compare(reg) => self.st_cmp(reg, result),
             Output::Mask(reg) => self.st_mask(reg, result),
+            Output::MaskBit(reg) => {
+                let cell = if reg == EXEC { self.exec_i1 } else { assert_eq!(reg,VCC);self.vcc_i1 };
+                self.state.borrow_mut().write(self.b,cell,result);
+            },
             Output::Scalar(reg, Ty::I32) => self.st_sgpr32(reg, result),
             Output::Scalar(reg, Ty::I64) => self.st_sgpr64(reg, result),
             Output::Scalar(reg, Ty::F32) => self.st_sgpr32(reg, self.f32_bits(result)),
@@ -1168,7 +1054,7 @@ impl Cg {
 }
 
 impl Cg {
-    unsafe fn emit_local_wave(&self, action:&super::lift::wave::YieldAction) {
+    unsafe fn emit_local_wave(&self, action:&super::lift::wave::YieldAction,mut write:impl FnMut(u32,LLVMValueRef)) {
         use super::lift::wave::{Operand,Destination};
         use super::ir::typed::effect::{EffectOp,WaveOp};
         let source=|index|match &action.inputs[index]{Operand::Source(s)=>s,_=>panic!("local wave operand requires register binding")};
@@ -1177,7 +1063,7 @@ impl Cg {
         match op {
             WaveOp::ReadFirstLane => {
                 let v = self.src_u32(source(0));
-                self.st_sgpr32(dst, v);
+                write(dst,v);
                         }
             WaveOp::WriteLane => {
                 let lane = lane_const(source(1))
@@ -1193,7 +1079,7 @@ impl Cg {
                     .expect("scalar: v_readlane_b32 source must be a VGPR");
                 let slot = self.spill_slot_ptr(src, lane);
                 let v = llvm::core::LLVMBuildLoad2(self.b, self.i32t, slot, self.n());
-                self.st_sgpr32(dst, v);
+                write(dst,v);
                         }
             _=>panic!("wave operation requires cooperative dispatch"),
         }

@@ -31,19 +31,29 @@ impl<'a> ScalarPlan<'a> {
     #[cfg(test)]
     pub fn new(program: &'a ScalarProgram, mode: ScalarMode) -> Self { Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, mode) }
     pub fn with_registry(registry: std::sync::Arc<super::dialect::DialectRegistry>, program: &'a ScalarProgram, mode: ScalarMode) -> Self {
-        let active = super::active::analyze_states(program);
         let f64_fresh = super::freshness::analyze(program);
         let sgpr_fresh = super::freshness::analyze_sgpr(program);
-        let blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
+        let mut blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             (pc, ScalarBlockPlan {
                 instructions: block.body.iter().map(|inst| super::lift::instruction_with_registry(inst, &registry)).collect(),
-                active: super::active::body_active_states(block, active[&pc]),
+                active: vec![false;block.body.len()],
                 f64_fresh: f64_fresh[&pc],
                 sgpr_fresh: sgpr_fresh[&pc],
             })
         }).collect();
+        {
+            let active=super::active::analyze_states(program);
+            for (&pc,block) in &mut blocks {
+                block.active=super::active::body_active_states(&program.blocks[&pc],active[&pc]);
+            }
+        }
         let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().collect())).collect();
-        let function = super::lift::function::Function::new(registry, program, &lowerings, None);
+        let preparation=super::lift::function::Preparation::Scalar {
+            active:blocks.iter().flat_map(|(&pc,b)|b.active.iter().enumerate()
+                .filter_map(move |(index,&active)|active.then_some((pc,index)))).collect(),
+            dispatch:mode==ScalarMode::Whole,
+        };
+        let function=super::lift::function::Function::new(registry,program,&lowerings,None,preparation);
         Self { program, mode, blocks, function }
     }
 }
@@ -56,7 +66,32 @@ mod tests {
     use super::super::ir::{ScalarBlock, Terminator};
 
     #[test]
-    fn instruction_activity_is_sampled_before_exec_writes() {
+    fn scalar_mask_blend_preserves_existing_whole_value_selection() {
+        use crate::rdna_instructions::SOP2;
+        use super::super::Compiler;
+        let reg=SourceOperand::ScalarRegister;
+        for change_mask in [false,true] {
+            let mut body=vec![InstFormat::SOP2(SOP2 {op:I::S_AND_NOT1_B32,ssrc0:reg(2),ssrc1:reg(106),sdst:10})];
+            if change_mask {body.push(InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,ssrc0:SourceOperand::IntegerConstant(0),sdst:106}));}
+            body.extend([
+                InstFormat::SOP2(SOP2 {op:I::S_AND_B32,ssrc0:reg(3),ssrc1:reg(106),sdst:11}),
+                InstFormat::SOP2(SOP2 {op:I::S_OR_B32,ssrc0:reg(10),ssrc1:reg(11),sdst:12}),
+            ]);
+            let program=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([(0,ScalarBlock {pc:0,body,term:Terminator::Return})])};
+            let kernel=Compiler::default().compile_writeback(&program,256);
+            for bit in [0,1] {
+                let mut s=[0u32;128];let mut v=[0u32;256];
+                s[2]=0x12345678;s[3]=0x87654321;s[106]=bit;s[126]=1;
+                unsafe {kernel.run(s.as_mut_ptr(),v.as_mut_ptr(),0);}
+                assert_eq!(s[10],0x12345678 & !bit);
+                assert_eq!(s[11],if change_mask {0} else {0x87654321 & bit});
+                assert_eq!(s[12],if change_mask||bit==0 {0x12345678} else {0x87654321});
+            }
+        }
+    }
+
+    #[test]
+    fn existing_instruction_activity_is_applied_to_ssa_in_all_modes() {
         let program = ScalarProgram {
             entry_pc: 1,
             blocks: BTreeMap::from([(1, ScalarBlock {

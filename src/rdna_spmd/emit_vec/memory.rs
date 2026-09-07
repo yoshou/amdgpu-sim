@@ -43,12 +43,7 @@ impl Cg {
     }
     pub(super) unsafe fn memory_parameter(&self, p: &Parameter, scalar: bool) -> LLVMValueRef {
         match p {
-            Parameter::Register(input) if scalar => match input.ty {
-                Ty::I64 => self.ssrc_u64(input.source.operand()),
-                Ty::I32 => self.ssrc_u32(input.source.operand()),
-                _ => unreachable!(),
-            },
-            Parameter::Register(input) => self.typed_input(input, false),
+            Parameter::Register(input) => self.typed_input(input, scalar),
             Parameter::Exec => self.exec_vec(),
             Parameter::ScratchBase => self.splat(self.scratch_base_scalar, self.vi64),
             Parameter::ScratchSize => self.splat(self.scratch_stride, self.vi64),
@@ -95,7 +90,10 @@ impl Cg {
                 } else {
                     llvm::core::LLVMBuildZExt(self.b, ld, self.i32t, self.n())
                 };
-                self.st_sgpr32(m.dest + k, value);
+                let (raw,result)=plan.scalar_results[k as usize];
+                let (ty,value)=values.effect_result(raw,result,value);
+                self.typed_output(if ty==Ty::I1 {super::super::lift::Output::MaskBit(m.dest+k)}
+                    else {super::super::lift::Output::Scalar(m.dest+k,ty)},value);
             }
             return;
         }

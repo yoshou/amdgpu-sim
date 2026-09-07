@@ -5,13 +5,38 @@ use crate::rdna_spmd::boundary::{BoundaryIo, RegSet};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Word { Vgpr(u32), Sgpr(u32) }
+pub(super) enum Word { Vgpr(u32), Sgpr(u32), Mask(u32) }
 pub(super) type Words = BTreeMap<Word, ValueId>;
+
+pub(super) fn core(f: &mut cfg::Func, insts: &mut Vec<cfg::Inst>, ty: Ty, op: Op) -> ValueId {
+    let value = f.value(ty);
+    insts.push(cfg::Inst::Core { value, ty, op });
+    value
+}
+pub(super) fn query(f: &mut cfg::Func, insts: &mut Vec<cfg::Inst>, op: effect::WaveOp, bit: ValueId) -> ValueId {
+    let ty = if op == effect::WaveOp::Any { Ty::I1 } else { Ty::I32 };
+    let value = f.value(ty);
+    insts.push(cfg::Inst::Effect { provenance: (1u64 << 63) | value.0 as u64,
+        op: effect::EffectOp::Wave(op), inputs: vec![bit], outputs: vec![(value,ty)] });
+    value
+}
+/// E1/E5: extract the lane's bit in the existing packet-local mask word.
+pub(super) fn project(f: &mut cfg::Func, insts: &mut Vec<cfg::Inst>, word: ValueId) -> ValueId {
+    let lane = core(f,insts,Ty::I32,Op::Env(Env::PacketLaneId));
+    let shifted = core(f,insts,Ty::I32,Op::Int(IntOp::LShr,word,lane));
+    core(f,insts,Ty::I1,Op::Convert(Cvt::Trunc,Ty::I1,shifted))
+}
+pub(super) fn valid_exec(f: &mut cfg::Func, insts: &mut Vec<cfg::Inst>, bit: ValueId) -> ValueId {
+    let valid=core(f,insts,Ty::I1,Op::Env(Env::ValidLane));
+    core(f,insts,Ty::I1,Op::Int(IntOp::And,bit,valid))
+}
 
 impl Word {
     pub fn scalar(r: u32) -> Option<Self> {
-        (r < 128 && !matches!(r, 106 | 124 | 126)).then_some(Self::Sgpr(r))
+        if matches!(r, 106 | 126) { Some(Self::Mask(r)) }
+        else { (r < 128 && r != 124).then_some(Self::Sgpr(r)) }
     }
+    pub fn ty(self) -> Ty { if matches!(self, Self::Mask(_)) { Ty::I1 } else { Ty::I32 } }
     pub fn source(source: &SourceOperand) -> Option<Self> {
         match *source {
             SourceOperand::VectorRegister(r) => Some(Self::Vgpr(r as u32)),
@@ -22,11 +47,11 @@ impl Word {
     pub fn offset(self, offset: u32) -> Option<Self> {
         match self {
             Self::Vgpr(r) => (r + offset < 256).then_some(Self::Vgpr(r + offset)),
-            Self::Sgpr(r) => Self::scalar(r + offset),
+            Self::Sgpr(r) | Self::Mask(r) => Self::scalar(r + offset),
         }
     }
     pub fn ordinary_span(self, ty: Ty) -> bool {
-        (0..ty.bits().div_ceil(32)).all(|k| self.offset(k).is_some())
+        (0..ty.bits().div_ceil(32)).all(|k| self.offset(k).is_some_and(|r| r.ty() == Ty::I32))
     }
 }
 pub(super) fn words(set: &RegSet) -> impl Iterator<Item = Word> + '_ {
@@ -63,7 +88,54 @@ impl Operands {
         if matches!(input.source, InputSource::Scc) {
             let value = scc.expect("SCC operand without its SSA definition");
             self.bindings.push((input.clone(), value));
+            return query(f, &mut self.core, effect::WaveOp::Any, value);
+        }
+        if let InputSource::MaskBit(r) = input.source {
+            let value = words[&Word::Mask(r)];
+            self.bindings.push((input.clone(), value));
             return value;
+        }
+        if let InputSource::Operand(source) = &input.source {
+            if input.ty == Ty::I1 {
+                if let SourceOperand::ScalarRegister(r @ (106 | 126)) = *source {
+                    let bit=words[&Word::Mask(r as u32)];
+                    let value=core(f,&mut self.core,Ty::I1,Op::Convert(Cvt::Bitcast,Ty::I1,bit));
+                    self.bindings.push((input.clone(),value));
+                    return value;
+                }
+                let key=Word::source(source).map(|word|(word,Ty::I1,scalar));
+                if let Some(value)=key.and_then(|key|views.get(&key).copied()) {
+                    self.bindings.push((input.clone(),value));
+                    return value;
+                }
+                let word = self.read(&super::input(source.clone(), Ty::I32), scalar, scc, f, block, words, views);
+                let bit=project(f, &mut self.core, word);
+                if let Some(key)=key {views.insert(key,bit);}
+                self.bindings.push((input.clone(),bit));
+                return bit;
+            }
+            if let SourceOperand::ScalarRegister(r) = *source {
+                let count = input.ty.bits().div_ceil(32);
+                if (0..count).any(|k| matches!(r as u32 + k,106|126)) {
+                    let mut parts = vec![];
+                    for k in 0..count {
+                        let reg = r as u32 + k;
+                        if matches!(reg,106|126) {
+                            let bit = words[&Word::Mask(reg)];
+                            self.bindings.push((Input { source: InputSource::MaskBit(reg), ty: Ty::I1 },bit));
+                            parts.push(query(f,&mut self.core,effect::WaveOp::Ballot,bit));
+                        } else {
+                            parts.push(self.read(&super::input(SourceOperand::ScalarRegister(reg as u8),Ty::I32),scalar,scc,f,block,words,views));
+                        }
+                    }
+                    let raw = if count == 1 { parts[0] } else {
+                        core(f,&mut self.core,Ty::I64,Op::Pack64(parts[0],parts[1]))
+                    };
+                    return if input.ty.integer() { raw } else {
+                        core(f,&mut self.core,input.ty,Op::Convert(Cvt::Bitcast,input.ty,raw))
+                    };
+                }
+            }
         }
         let word = match &input.source {
             InputSource::Operand(source) => Word::source(source).filter(|r| r.ordinary_span(input.ty)),
@@ -131,14 +203,15 @@ pub(super) fn footprint(lowering: &Lowering<'_>) -> BoundaryIo {
                 match &input.source {
                     InputSource::Operand(s) => source(&mut io.reads, s, input.ty.bits().div_ceil(32)),
                     InputSource::Scc => io.reads.scc = true,
-                    InputSource::PacketMaskAny(r) => io.reads.add_sgpr(*r),
+                    InputSource::MaskBit(r) => io.reads.add_sgpr(*r),
+                    InputSource::ExecPredicate => io.reads.add_sgpr(126),
                 }
             }
             for output in outputs {
                 match *output {
                     Output::Vgpr(r, t) => for k in 0..t.bits().div_ceil(32) { io.writes.add_vgpr(r + k); },
                     Output::Scalar(r, t) => for k in 0..t.bits().div_ceil(32) { io.writes.add_sgpr(r + k); },
-                    Output::Compare(r) | Output::Mask(r) => io.writes.add_sgpr(r),
+                    Output::Compare(r) | Output::Mask(r) | Output::MaskBit(r) => io.writes.add_sgpr(r),
                     Output::Scc => io.writes.scc = true,
                 }
             }
@@ -165,9 +238,18 @@ pub(super) fn footprint(lowering: &Lowering<'_>) -> BoundaryIo {
         }
         Lowering::Wave(action) => return action.io(),
         Lowering::Legacy(inst) => {
+            // Native vector effects observe EXEC even when no following typed
+            // instruction reads that definition before the next mask write.
+            if matches!(inst,InstFormat::VOP3(_)|InstFormat::VIMAGE(_)) {io.reads.add_sgpr(126);}
             // Only the remaining adapter instructions enter here. Wide source
             // reads are conservative; destinations must describe actual writes.
             for r in crate::rdna_spmd::vec_live::vgpr_reads(inst) { io.reads.add_vgpr(r); }
+            if let InstFormat::VIMAGE(i)=inst {
+                let counts=if matches!(i.op,I::IMAGE_BVH8_INTERSECT_RAY) {[2,2,3,3,1]} else {[2,1,3,3,3]};
+                for (reg,count) in [i.vaddr0,i.vaddr1,i.vaddr2,i.vaddr3,i.vaddr4].iter().copied().zip(counts) {
+                    for r in reg as u32..reg as u32+count {io.reads.add_vgpr(r);}
+                }
+            }
             for r in crate::rdna_spmd::freshness::vgpr_writes(inst) { io.writes.add_vgpr(r); }
             match inst {
                 InstFormat::SOP1(i) => {

@@ -60,6 +60,40 @@ fn carry_operations_have_value_and_flag_ssa_results() {
 }
 
 #[test]
+fn normal_readfirstlane_mask_destinations_follow_ssa_updates() {
+    use crate::rdna_instructions::VOP1;
+    let read=|dst|InstFormat::VOP1(VOP1 {op:I::V_READFIRSTLANE_B32,
+        src0:SourceOperand::VectorRegister(2),vdst:dst});
+    let copy=|dst,src0|InstFormat::VOP1(VOP1 {op:I::V_MOV_B32,src0,vdst:dst});
+    let store=|vsrc,ioffset|InstFormat::VGLOBAL(VGLOBAL {op:I::GLOBAL_STORE_B32,
+        vaddr:0,vsrc,vdst:0,scope:0,th:0,ioffset,saddr:0,sve:0});
+    let program=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([(0,ScalarBlock {pc:0,
+        body:vec![read(106),copy(4,SourceOperand::ScalarRegister(106)),read(126),
+            copy(3,SourceOperand::IntegerConstant(77)),
+            InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst:126,ssrc0:SourceOperand::LiteralConstant(u32::MAX)}),
+            store(3,0),store(4,4)],term:Terminator::Return})])};
+    for width in [0,1,2,4,8,16] {
+        let scalar=(width==0).then(||Compiler::default().compile_program(&program,256));
+        let packet=(width!=0).then(||Compiler::default().compile_program_vec(&program,256,width));
+        let w=width.max(1) as usize;let bits=(1u32<<w)-1;
+        for mask in [0u32,0xa5,u32::MAX,1<<21] {
+            let mut output=vec![0u32;w*2];let ptr=output.as_mut_ptr() as u64;
+            let mut s=[0u32;128];s[0]=ptr as u32;s[1]=(ptr>>32) as u32;
+            let mut v=vec![0u32;w*256];
+            for lane in 0..w {v[lane]=(lane*8) as u32;v[2*w+lane]=mask;v[3*w+lane]=99;}
+            unsafe {
+                if let Some(k)=&scalar {k.run(s.as_mut_ptr(),v.as_mut_ptr(),0);}
+                if let Some(k)=&packet {k.run(s.as_mut_ptr(),v.as_mut_ptr(),0,0);}
+            }
+            for lane in 0..w {
+                assert_eq!(output[lane*2],if mask>>lane&1!=0 {77} else {99},"EXEC width={width} lane={lane}");
+                assert_eq!(output[lane*2+1],mask&bits,"VCC width={width} lane={lane}");
+            }
+        }
+    }
+}
+
+#[test]
 fn scalar_comparison_drives_ssa_branch_and_merge_in_all_widths() {
     use crate::rdna_instructions::{SOPC, VOP1};
     let value = |v| InstFormat::VOP1(VOP1 { op: I::V_MOV_B32,
