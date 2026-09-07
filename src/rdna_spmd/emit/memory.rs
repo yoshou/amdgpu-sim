@@ -2,7 +2,8 @@
 use super::*;
 use crate::rdna_spmd::{
     ir::typed::effect::*,
-    lift::memory::{Address, Parameter, Plan},
+    lift::memory::{Parameter, Plan},
+    memory_shape::ScalarShape,
     typed_codegen::Values,
 };
 impl Cg {
@@ -23,6 +24,7 @@ impl Cg {
     pub(super) unsafe fn emit_memory(
         &self,
         plan: &Plan,
+        shape: ScalarShape,
         values: &Values,
         data: impl Fn(u32) -> LLVMValueRef,
     ) {
@@ -31,7 +33,7 @@ impl Cg {
             m.space() != Space::Lds || self.coop,
             "LDS requires cooperative dispatch"
         );
-        if m.op == MemoryOp::Fence {
+        if shape == ScalarShape::Fence {
             let order = match m.semantics.ordering {
                 Ordering::Acquire => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
                 Ordering::Release => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
@@ -66,7 +68,7 @@ impl Cg {
         } else {
             addr
         };
-        if m.op == MemoryOp::AtomicAdd {
+        if shape == ScalarShape::AtomicAdd {
             let ptr = self.ptr_at(self.store_addr(addr), 0);
             let old = llvm::core::LLVMBuildAtomicRMW(
                 self.b,
@@ -86,7 +88,7 @@ impl Cg {
             2 => self.i16ty(),
             _ => self.i32t,
         };
-        if m.stores() {
+        if shape == ScalarShape::Store {
             for k in 0..m.words {
                 let value = if m.size() == MemSize::B32 {
                     data(k)
@@ -103,9 +105,7 @@ impl Cg {
             }
             return;
         }
-        let pairs = matches!(m.address, Address::Global { .. })
-            && m.size() == MemSize::B32
-            && !m.semantics.volatile;
+        let ScalarShape::Words { pairs } = shape else { unreachable!() };
         let mut k = 0;
         while k < m.words {
             if pairs && k + 1 < m.words {

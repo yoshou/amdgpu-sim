@@ -2,7 +2,7 @@
 use super::*;
 use crate::rdna_spmd::{
     ir::typed::{effect::*, Ty},
-    lift::memory::{Address, Parameter, Plan},
+    lift::memory::{Parameter, Plan},
     typed_codegen::Values,
 };
 impl Cg {
@@ -52,6 +52,7 @@ impl Cg {
     pub(super) unsafe fn emit_memory(
         &self,
         plan: &Plan,
+        shape: PacketShape,
         values: &Values,
         data: impl Fn(u32) -> LLVMValueRef,
     ) {
@@ -60,7 +61,7 @@ impl Cg {
             m.space() != Space::Lds || self.coop,
             "LDS requires cooperative dispatch"
         );
-        if m.op == MemoryOp::Fence {
+        if shape == PacketShape::Fence {
             let order = match m.semantics.ordering {
                 Ordering::Acquire => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
                 Ordering::Release => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
@@ -77,7 +78,7 @@ impl Cg {
             2 => llvm::core::LLVMInt16TypeInContext(self.ctx),
             _ => self.i32t,
         };
-        if m.scalar() {
+        if shape == PacketShape::ScalarWords {
             for k in 0..m.words {
                 let a = llvm::core::LLVMBuildAdd(self.b, addr, self.ci64(m.word_offset(k) as u64), self.n());
                 let ptr = llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, self.n());
@@ -123,8 +124,8 @@ impl Cg {
                 self.n(),
             );
         }
-        if m.op == MemoryOp::AtomicAdd {
-            if plan.group_atomics {
+        if let PacketShape::AtomicAdd { grouped } = shape {
+            if grouped {
                 self.emit_grouped_atomic_add(addr, data(0), exec);
                 return;
             }
@@ -161,30 +162,28 @@ impl Cg {
             }
             return;
         }
-        let affine = matches!(m.address, Address::Scratch { vector: None, .. });
-        if m.stores() {
+        if let PacketShape::Store(kind) = shape {
             for k in 0..m.words {
                 let ptrs = self.ptr_at_vec(addr, m.word_offset(k) as u64);
                 let value = data(k);
-                if m.size() != MemSize::B32 {
-                    let value = llvm::core::LLVMBuildTrunc(
-                        self.b,
-                        value,
-                        llvm::core::LLVMVectorType(elem, self.w),
-                        self.n(),
-                    );
-                    self.masked_scatter_ty(value, ptrs, exec, elem);
-                } else if m.space() == Space::Lds {
-                    self.masked_scatter_ty(value, ptrs, exec, self.i32t);
-                } else if affine {
-                    self.affine_store(value, ptrs, exec);
-                } else {
-                    self.masked_scatter(value, ptrs, exec);
+                match kind {
+                    StoreShape::Narrow => {
+                        let value = llvm::core::LLVMBuildTrunc(
+                            self.b,
+                            value,
+                            llvm::core::LLVMVectorType(elem, self.w),
+                            self.n(),
+                        );
+                        self.masked_scatter_ty(value, ptrs, exec, elem);
+                    }
+                    StoreShape::Lds => self.masked_scatter_ty(value, ptrs, exec, self.i32t),
+                    StoreShape::Affine => self.affine_store(value, ptrs, exec),
+                    StoreShape::Scatter => self.masked_scatter(value, ptrs, exec),
                 }
             }
             return;
         }
-        if m.size() != MemSize::B32 {
+        if shape == PacketShape::NarrowLoad {
             let value = self.masked_gather_ty(self.ptr_at_vec(addr, 0), exec, elem);
             let value = if m.size().signed() {
                 llvm::core::LLVMBuildSExt(self.b, value, self.vi32, self.n())
@@ -194,14 +193,7 @@ impl Cg {
             self.st_vgpr32(m.dest, value);
             return;
         }
-        if m.private_load_end().is_some() && m.words >= 2 {
-            let tile = if self.w % 4 == 0 {
-                4
-            } else if self.w % 2 == 0 {
-                2
-            } else {
-                1
-            };
+        if let PacketShape::PrivateTile { tile } = shape {
             let rowty = llvm::core::LLVMVectorType(self.i32t, m.words);
             let rows: Vec<_> = (0..self.w)
                 .map(|l| {
@@ -220,20 +212,8 @@ impl Cg {
             }
             return;
         }
-        let global = matches!(m.address, Address::Global { .. });
         let words = m.words;
-        let uniform_addr = global && self.global_load.get() == GlobalLoad::Broadcast;
-        // The plan proved the frame bounds and alignment. Emit the same grouped
-        // contiguous loads and transpose; row crossings still use groups <= 8.
-        if let (
-            true,
-            GlobalLoad::Frame {
-                stride_words: sp4,
-                offset_words: ioff_w,
-            },
-        ) = (global, self.global_load.get())
-        {
-            let grp = self.w.min(8); // lanes per contiguous group (W-aligned, ≤8)
+        if let PacketShape::Frame { stride_words: sp4, offset_words: ioff_w, group: grp } = shape {
             let nblk = self.w / grp;
             let blkty = llvm::core::LLVMVectorType(self.i32t, grp * sp4);
             let poison_blk = llvm::core::LLVMGetPoison(blkty);
@@ -288,27 +268,24 @@ impl Cg {
             }
             return;
         }
+        let PacketShape::Words { lanes, pairs } = shape else { unreachable!() };
         let mut k = 0u32;
         while k < words {
-            if global && k + 1 < words {
+            if pairs && k + 1 < words {
                 let ptrs = self.ptr_at_vec(addr, m.word_offset(k) as u64);
-                let d = if uniform_addr {
-                    self.bcast_load_f64(ptrs)
-                } else {
-                    self.masked_gather_f64(ptrs, exec)
+                let d = match lanes {
+                    Lanes::Broadcast => self.bcast_load_f64(ptrs),
+                    _ => self.masked_gather_f64(ptrs, exec),
                 };
                 self.st_vgpr_f64(m.dest + k, d);
                 k += 2;
             } else {
                 let ptrs = self.ptr_at_vec(addr, m.word_offset(k) as u64);
-                let d = if uniform_addr {
-                    self.bcast_load_i32(ptrs)
-                } else if m.space() == Space::Lds {
-                    self.masked_gather_ty(ptrs, exec, self.i32t)
-                } else if affine {
-                    self.affine_load(ptrs,m.private_load_end().is_some())
-                } else {
-                    self.masked_gather(ptrs, exec)
+                let d = match lanes {
+                    Lanes::Broadcast => self.bcast_load_i32(ptrs),
+                    Lanes::Lds => self.masked_gather_ty(ptrs, exec, self.i32t),
+                    Lanes::Affine { allocated } => self.affine_load(ptrs, allocated),
+                    Lanes::Gather => self.masked_gather(ptrs, exec),
                 };
                 self.st_vgpr32(m.dest + k, d);
                 k += 1;

@@ -18,6 +18,23 @@ pub(super) struct VgCluster {
     pub(super) vaddr: u32, // shared per-lane pointer pair
     pub(super) lo: i64,    // lowest sign-extended ioffset (span start, bytes)
     pub(super) span: u32,  // span length in f64 fields
+    pub(super) tile: u32,
+}
+
+pub(super) fn transpose_tile(width: u32) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let native = if std::arch::is_x86_feature_detected!("avx512f") {
+        8
+    } else if std::arch::is_x86_feature_detected!("avx2") {
+        4
+    } else {
+        2
+    };
+    #[cfg(target_arch = "aarch64")]
+    let native = 2;
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    let native = 1;
+    width.min(native)
 }
 
 #[cfg(test)]
@@ -70,7 +87,7 @@ mod tests {
         for width in [1, 2, 4, 8, 16] {
             assert_eq!(
                 select(&signed_record(), width, [1 << 10, 0], &HashMap::new()),
-                Some(VgCluster { len: 3, vaddr: 10, lo: -8, span: 4 }),
+                Some(VgCluster { len: 3, vaddr: 10, lo: -8, span: 4, tile: transpose_tile(width) }),
             );
         }
         for width in [0, 3] {
@@ -109,10 +126,20 @@ mod tests {
         ];
         assert_eq!(
             select(&body, 16, [1 << 10, 0], &HashMap::new()),
-            Some(VgCluster { len: 3, vaddr: 10, lo: 0, span: 6 }),
+            Some(VgCluster { len: 3, vaddr: 10, lo: 0, span: 6, tile: transpose_tile(16) }),
         );
         body[1] = load(I::GLOBAL_LOAD_B128, 9, 16);
         assert!(select(&body, 16, [1 << 10, 0], &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn transpose_tile_partitions_every_supported_packet_width() {
+        for width in [1u32, 2, 4, 8, 16] {
+            let tile = transpose_tile(width);
+            assert!(tile.is_power_of_two());
+            assert!(tile <= width);
+            assert_eq!(width % tile, 0);
+        }
     }
 
     #[test]
@@ -161,5 +188,5 @@ pub(super) fn analyze(
     }
     if ranges.iter().any(|&(a, _)| (a-lo) % 8 != 0) || (hi-lo) % 8 != 0 { return None; }
     let span = ((hi-lo) / 8) as u32;
-    (span >= 4).then_some(VgCluster { len, vaddr, lo, span })
+    (span >= 4).then_some(VgCluster { len, vaddr, lo, span, tile: transpose_tile(width) })
 }

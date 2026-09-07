@@ -360,7 +360,6 @@ pub(in crate::rdna_spmd) enum Parameter {
 #[derive(Clone)]
 pub(in crate::rdna_spmd) struct Plan {
     pub memory: Memory,
-    pub group_atomics: bool,
     pub parameters: Vec<(Parameter, ValueId)>,
     pub core: std::ops::Range<usize>,
     pub end: usize,
@@ -650,7 +649,6 @@ impl Memory {
             }
         }
         Plan {
-            group_atomics: false,
             memory: self.clone(),
             parameters,
             core: start..end,

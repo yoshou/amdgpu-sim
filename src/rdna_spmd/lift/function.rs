@@ -63,7 +63,8 @@ pub(in crate::rdna_spmd) struct Function {
     pub written: crate::rdna_spmd::boundary::RegSet,
     pub ir: VerifiedFunc,
     pub blocks: BTreeMap<usize, BlockPlan>,
-    pub live: Vec<bool>,
+    pub native_live: Vec<bool>,
+    pub retained: Vec<bool>,
     pub observable_return: bool,
 }
 /// Typed SSA before native representation and predication decisions are applied.
@@ -75,6 +76,7 @@ pub(in crate::rdna_spmd) struct LiftedFunction {
     pub blocks: BTreeMap<usize, BlockPlan>,
     pub parameter_inputs: Vec<Input>,
     pub state: crate::rdna_spmd::analysis::state::StateGraph,
+    pub revision: u64,
 }
 impl Function {
     #[cfg(test)]
@@ -337,11 +339,11 @@ impl Function {
             Word::Sgpr(r)=>InputSource::Operand(SourceOperand::ScalarRegister(r as u8)),
             Word::Mask(r)=>InputSource::MaskBit(r),
         }}).chain(std::iter::once(Input {ty:Ty::I1,source:InputSource::Scc})).collect();
-        LiftedFunction { registry, written, ir: f, blocks: plans, parameter_inputs, state }
+        LiftedFunction { registry, written, ir: f, blocks: plans, parameter_inputs, state, revision: 0 }
     }
     /// Apply the plan's proof that these temporary destinations cannot be
     /// observed by a reactivated lane or an unpredicated wave consumer.
-    fn elide_inactive_updates(blocks:&BTreeMap<usize,BlockPlan>,f:&mut Func,sites:impl IntoIterator<Item=(usize,usize)>) {
+    pub(in crate::rdna_spmd) fn elide_inactive_updates(blocks:&BTreeMap<usize,BlockPlan>,f:&mut Func,sites:impl IntoIterator<Item=(usize,usize)>) {
         for (pc,index) in sites {
             let Some(alu)=&blocks[&pc].instructions[index] else {continue};
             for (output,id) in &alu.outputs {
@@ -359,7 +361,7 @@ impl Function {
     /// Transfer the existing scalar plan's active-lane facts to the explicit
     /// SSA updates, including comparison masks. The native emitter must not
     /// silently change architectural SSA values when dropping predication.
-    fn elide_active_updates(blocks:&BTreeMap<usize,BlockPlan>,f:&mut Func,sites:impl IntoIterator<Item=(usize,usize)>) {
+    pub(in crate::rdna_spmd) fn elide_active_updates(blocks:&BTreeMap<usize,BlockPlan>,f:&mut Func,sites:impl IntoIterator<Item=(usize,usize)>) {
         let active:std::collections::BTreeSet<_>=sites.into_iter().collect();
         for (&pc,plan) in blocks {for (index,alu) in plan.instructions.iter().enumerate() {
             let Some(alu)=alu else {continue};
@@ -377,18 +379,20 @@ impl Function {
     }
     /// The ordinary dispatch/run ABI seeds EXEC from immutable lane validity.
     /// Cooperative callers may supply arbitrary EXEC and do not use this proof.
-    fn assume_dispatch_exec(parameter_inputs:&[Input],f:&mut Func) {
+    pub(in crate::rdna_spmd) fn assume_dispatch_exec(parameter_inputs:&[Input],f:&mut Func) {
         let index=parameter_inputs.iter().position(|p|matches!(p.source,InputSource::MaskBit(126))).unwrap();
         let exec=f.blocks[&f.entry].params[index].0;
         crate::rdna_spmd::passes::constant_queries(f,&[exec]);
     }
     /// Ordinary dispatch exposes memory effects, not the final register bank.
     #[cfg(test)]
-    pub fn discard_return_state(&mut self) {
+    pub fn discard_return_state(&mut self) -> Vec<bool> {
         self.observable_return = false;
         let roots = self.blocks.values().filter_map(|b| b.yield_values.as_ref())
             .flat_map(|p| p.results.iter().map(|r| r.0));
-        self.live = crate::rdna_spmd::analysis::live_values(self.ir.func(), roots);
+        let live = crate::rdna_spmd::analysis::live_values(self.ir.func(), roots);
+        self.native_live = crate::rdna_spmd::analysis::native_live(self.ir.func(), &self.blocks, &live);
+        live
     }
     pub fn min_private_bytes(&self) -> usize {
         self.blocks.values().flat_map(|b|b.memory.values())
@@ -396,7 +400,7 @@ impl Function {
     }
     /// The existing whole-program ABI keeps mask words within one packet.
     /// Explicit cross-lane instructions retain their separately selected scope.
-    fn packet_state(f:&mut Func) {
+    pub(in crate::rdna_spmd) fn packet_state(f:&mut Func) {
         for block in f.blocks.values_mut() {for inst in &mut block.insts {
             if let Inst::Effect {provenance,op,inputs,outputs}=inst {
                 if *provenance & (1u64<<63)!=0 {
@@ -414,7 +418,7 @@ impl Function {
     /// two masked SGPR definitions represent whole scalar values, and their
     /// final OR selects a value using the single simulated lane's mask bit.
     /// This is specific to the ordinary scalar ABI, not a wave-word identity.
-    fn scalar_mask_selects(blocks:&BTreeMap<usize,BlockPlan>,f:&mut Func) {
+    pub(in crate::rdna_spmd) fn scalar_mask_selects(blocks:&BTreeMap<usize,BlockPlan>,f:&mut Func) {
         for (&pc,plan) in blocks {
             let block=f.blocks.get_mut(&BlockId(pc)).unwrap();
             let mut definitions=BTreeMap::new();
@@ -549,11 +553,11 @@ mod tests {
         let lowerings:Vec<_>=program.blocks[&0].body.iter().map(super::super::instruction).collect();
         let mut f=Function::new(std::sync::Arc::new(DialectRegistry::rdna4()),&program,
             &BTreeMap::from([(0,lowerings.iter().collect())]),Preparation::Inspect);
-        f.discard_return_state();
+        let live=f.discard_return_state();
         for index in [0usize,1,2,4] {
-            assert!(f.blocks[&0].instructions[index].as_ref().unwrap().outputs.iter().all(|p|f.live[p.1.0]));
+            assert!(f.blocks[&0].instructions[index].as_ref().unwrap().outputs.iter().all(|p|live[p.1.0]));
         }
-        assert!(f.blocks[&0].instructions[3].as_ref().unwrap().outputs.iter().all(|p|!f.live[p.1.0]));
+        assert!(f.blocks[&0].instructions[3].as_ref().unwrap().outputs.iter().all(|p|!live[p.1.0]));
     }
 
 
@@ -587,6 +591,13 @@ mod tests {
     }
 }
 
+impl crate::rdna_spmd::passes::Program for LiftedFunction {
+    type Snapshot = (Func, Vec<usize>);
+    fn snapshot(&self) -> Self::Snapshot { (self.ir.clone(), self.state.sites.values().map(|s| s.len()).collect()) }
+    fn ir(&self) -> &Func { &self.ir }
+    fn registry(&self) -> &DialectRegistry { &self.registry }
+    fn touch(&mut self) { self.revision += 1; }
+}
 impl LiftedFunction {
     pub(in crate::rdna_spmd) fn prepare_queries(&mut self) {
         // Removed sites no longer assign scheduler state. Derive the writeback
@@ -607,36 +618,7 @@ impl LiftedFunction {
             }
         }
         self.written=written;
-
-        for (&pc, block) in &mut self.blocks {
-            if let Some(plan) = &mut block.yield_values {
-                if let Some(end) = crate::rdna_spmd::passes::local_write_lane(&mut self.ir,BlockId(pc),plan.core.end) {
-                    plan.core.end = end;
-                    plan.local = true;
-                }
-            }
-        }
-        // The invocation ABI supplies one scalar register bank per wave;
-        // per-lane VGPR and mask bindings carry no uniformity assumption.
-        let entry = &self.ir.blocks[&self.ir.entry];
-        let uniform_entry: Vec<_> = self.parameter_inputs.iter().zip(&entry.params).filter_map(|(input, parameter)|
-            matches!(input.source, InputSource::Operand(SourceOperand::ScalarRegister(_)) | InputSource::Scc)
-                .then_some(parameter.0)).collect();
-        crate::rdna_spmd::passes::constant_queries(&mut self.ir,&[]);
-        crate::rdna_spmd::passes::uniform_queries(&mut self.ir,&uniform_entry);
-        let constants = crate::rdna_spmd::analysis::constants(&self.ir);
-        for block in self.blocks.values_mut() {
-            if let Some(plan) = &mut block.yield_values {
-                for (index, id) in plan.arguments.iter().enumerate() {
-                    use crate::rdna_spmd::ir::typed::effect::{EffectOp, WaveOp};
-                    if plan.layout.op == EffectOp::Wave(WaveOp::Wmma)
-                        || plan.layout.op == EffectOp::Wave(WaveOp::WriteLane) && index == 2 { continue; }
-                    if let Some(bits) = constants[id.0] {
-                        plan.layout.arguments[index] = crate::rdna_spmd::yield_values::Argument::Constant(bits as u32);
-                    }
-                }
-            }
-        }
+        crate::rdna_spmd::compiler::query_passes(self);
     }
 
     /// Expand proven normal scales in place, preserving every SSA result ID.
@@ -665,6 +647,7 @@ impl LiftedFunction {
     }
 
     pub(in crate::rdna_spmd) fn remap_positions(&mut self, pc: usize, positions: &[usize]) {
+        self.revision += 1;
         let range = |r: &mut Range<usize>| { *r = positions[r.start]..positions[r.end]; };
         let block = self.blocks.get_mut(&pc).unwrap();
         for alu in block.instructions.iter_mut().flatten() {
@@ -680,33 +663,9 @@ impl LiftedFunction {
         if let Some(condition) = &mut block.condition { range(&mut condition.core); }
     }
 
-    pub fn prepare(self, preparation: Preparation) -> Function {
-        let Self { registry, written, ir: mut f, blocks: plans, parameter_inputs, state: _ } = self;
-        // Finish all plan rewrites while the graph is owned by construction.
-        // Only the final graph crosses the verified code-generation boundary.
-        let mut scalar_live=None;
-        let observable_return=match preparation {
-            Preparation::Packet {inactive,observe_return}=>{
-                Function::packet_state(&mut f);
-                if !observe_return {
-                    Function::elide_inactive_updates(&plans,&mut f,inactive);
-                    Function::assume_dispatch_exec(&parameter_inputs,&mut f);
-                }
-                observe_return
-            },
-            Preparation::Scalar {active,dispatch}=>{
-                Function::packet_state(&mut f);
-                Function::scalar_mask_selects(&plans,&mut f);
-                if !dispatch {
-                    scalar_live=Some(crate::rdna_spmd::analysis::live_values(&f,plans.values().flat_map(|b|&b.outgoing).copied()));
-                }
-                Function::elide_active_updates(&plans,&mut f,active);
-                if dispatch {Function::assume_dispatch_exec(&parameter_inputs,&mut f);}
-                !dispatch
-            },
-            #[cfg(test)]
-            Preparation::Inspect=>true,
-        };
+    pub fn prepare(mut self, preparation: Preparation) -> Function {
+        let (observable_return,scalar_live)=crate::rdna_spmd::compiler::preparation_passes(&mut self,preparation);
+        let Self { registry, written, ir: f, blocks: plans, parameter_inputs: _, state: _, revision: _ } = self;
         let live=scalar_live.unwrap_or_else(||{
             let mut roots=vec![];
             for (&pc,plan) in &plans {
@@ -716,9 +675,12 @@ impl LiftedFunction {
             crate::rdna_spmd::analysis::live_values(&f,roots)
         });
         let ir=f.verify_with(&registry).expect("invalid prepared function SSA");
+        let native_live=crate::rdna_spmd::analysis::native_live(ir.func(),&plans,&live);
+        let retained=crate::rdna_spmd::analysis::retained(ir.func(),&plans);
         Function {
             ir,
-            live,
+            native_live,
+            retained,
             observable_return,
             registry,
             written,

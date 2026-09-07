@@ -1,6 +1,41 @@
 //! Semantic rewrites of typed SSA, independent of ISA operands and width.
 use super::ir::typed::{cfg::*, effect::*, Cvt, Env, IntOp, IntPred, Op, Ty, ValueId};
 
+pub(super) trait Program {
+    type Snapshot: PartialEq;
+    fn snapshot(&self) -> Self::Snapshot;
+    fn ir(&self) -> &Func;
+    fn registry(&self) -> &super::dialect::DialectRegistry;
+    fn touch(&mut self);
+}
+
+pub(super) struct Driver { trace: bool }
+
+impl Driver {
+    pub fn new() -> Self { Self { trace: std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() } }
+    pub fn run<P: Program>(&self, program: &mut P, name: &str, pass: impl FnOnce(&mut P)) -> Result<(), String> {
+        pass(program);
+        program.touch();
+        self.check(program, name)
+    }
+    pub fn fixpoint<P: Program>(&self, program: &mut P, name: &str, limit: usize, mut pass: impl FnMut(&mut P)) -> Result<(), String> {
+        if limit == 0 { return Err(format!("{name}: fixpoint group requires a nonzero iteration limit")); }
+        for _ in 0..limit {
+            let before = program.snapshot();
+            pass(program);
+            program.touch();
+            self.check(program, name)?;
+            if program.snapshot() == before { return Ok(()); }
+        }
+        Err(format!("{name}: no fixed point within {limit} iterations"))
+    }
+    fn check<P: Program>(&self, program: &P, name: &str) -> Result<(), String> {
+        program.ir().clone().verify_with(program.registry()).map_err(|e| format!("{name}: {e}"))?;
+        if self.trace { eprintln!("; after {name}\n{:#?}", program.ir()); }
+        Ok(())
+    }
+}
+
 /// WriteLane requires wave-uniform value and selector. Consequently lane i's
 /// result is exactly `i == (selector & 31) ? value : old[i]`: no value needs
 /// to cross a packet boundary. This removes the rendezvous, retaining the

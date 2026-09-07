@@ -594,36 +594,13 @@ impl Values {
         for block in f.ir.func().blocks.values() {
             for inst in &block.insts {if let cfg::Inst::Core {value,op,..}=inst {definitions[value.0]=Some(*op);}}
         }
-        let mut retained=vec![false;f.ir.func().types.len()];
-        // Value IDs are dense. Reuse membership storage across instruction
-        // plans instead of allocating tree nodes for every temporary view.
-        let mut local=vec![0usize;f.ir.func().types.len()];
-        let mut bound=vec![0usize;f.ir.func().types.len()];
-        let mut generation=0;
-        for (&pc,plan) in &f.blocks {for alu in plan.instructions.iter().flatten() {
-            generation+=1;
-            let insts=&f.ir.func().blocks[&cfg::BlockId(pc)].insts[alu.core.clone()];
-            for inst in insts {match inst {
-                cfg::Inst::Core {value,..}|cfg::Inst::Packet {output:value,..}=>{local[value.0]=generation;},
-                cfg::Inst::Target {outputs,..}|cfg::Inst::Effect {outputs,..}=>{for &(id,_) in outputs {local[id.0]=generation;}},
-            }}
-            for (_,id) in &alu.inputs {local[id.0]=generation;bound[id.0]=generation;}
-            for &(id,_) in &alu.pairs {bound[id.0]=generation;}
-            for inst in insts {if let cfg::Inst::Core {value,op,..}=inst {
-                if bound[value.0]==generation {continue;}
-                op.map(|id|{if local[id.0]!=generation {retained[id.0]=true;} id});
-            }}
-        }}
 
         Self {
             emitter,
             lane_base,
             valid_mask,
-            live: super::analysis::live_values(f.ir.func(),
-                f.live.iter().enumerate().filter_map(|(id,&live)|live.then_some(ValueId(id)))
-                    .chain(f.blocks.values().flat_map(|block|block.instructions.iter().flatten())
-                        .flat_map(|alu|alu.outputs.iter().map(|&(_,id)|id)))),
-            retained,
+            live: f.native_live.clone(),
+            retained: f.retained.clone(),
             types: f.ir.func().types.clone(),
             definitions,
             cooperative,

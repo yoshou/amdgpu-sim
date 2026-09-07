@@ -12,7 +12,7 @@ pub(crate) enum PacketOp { Any, Ballot }
 impl PacketOp {
     pub fn result_type(self) -> Ty { match self { Self::Any=>Ty::I1,Self::Ballot=>Ty::I32 } }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Inst {
     Packet {
         op: PacketOp,
@@ -37,12 +37,12 @@ pub(crate) enum Inst {
         op: Op,
     },
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Edge {
     pub dst: BlockId,
     pub args: Vec<ValueId>,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Term {
     Br(Edge),
     CondBr { cond: ValueId, yes: Edge, no: Edge },
@@ -57,13 +57,13 @@ impl Term {
         }
     }
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Block {
     pub params: Vec<(ValueId, Ty)>,
     pub insts: Vec<Inst>,
     pub term: Term,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Func {
     pub entry: BlockId,
     pub blocks: BTreeMap<BlockId, Block>,

@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use super::ir::ScalarProgram;
 use super::regtype::RegSet;
+use super::memory_shape::{self, ScalarShape};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarMode {
@@ -16,6 +17,7 @@ pub(super) enum ScalarMode {
 
 pub(super) struct ScalarBlockPlan {
     pub active: Vec<bool>,
+    pub memory: BTreeMap<usize, ScalarShape>,
     pub f64_fresh: RegSet,
     pub sgpr_fresh: u128,
 }
@@ -39,14 +41,15 @@ impl ScalarPlan {
         lifted_function.prepare_queries();
         let mut blocks: BTreeMap<_, _> = lifted_function.blocks.iter().map(|(&pc, block)| (pc,ScalarBlockPlan {
             active:vec![false;block.instructions.len()],f64_fresh:[0;2],sgpr_fresh:0,
+            memory:block.memory.iter().map(|(&index,plan)|(index,memory_shape::scalar(&plan.memory))).collect(),
         })).collect();
-        let f64_fresh = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, false);
-        let sgpr_fresh = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, true);
-        let active = super::analysis::state::active(&lifted_function.ir, &lifted_function.state, false);
+        let f64_fresh = lifted_function.analyze(|f| super::analysis::state::native_pairs(&f.ir, &f.state, false));
+        let sgpr_fresh = lifted_function.analyze(|f| super::analysis::state::native_pairs(&f.ir, &f.state, true));
+        let active = lifted_function.analyze(|f| super::analysis::state::active(&f.ir, &f.state, false));
         for (&pc, block) in &mut blocks {
-            block.f64_fresh = f64_fresh[&pc];
-            block.sgpr_fresh = sgpr_fresh[&pc][0];
-            block.active = active[&pc].clone();
+            block.f64_fresh = f64_fresh.get(&lifted_function)[&pc];
+            block.sgpr_fresh = sgpr_fresh.get(&lifted_function)[&pc][0];
+            block.active = active.get(&lifted_function)[&pc].clone();
         }
         let preparation=super::lift::function::Preparation::Scalar {
             active:blocks.iter().flat_map(|(&pc,b)|b.active.iter().enumerate()

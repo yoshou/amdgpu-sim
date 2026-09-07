@@ -12,6 +12,7 @@ fn wave(p: &mut super::wave::Plan, m: &impl Fn(ValueId) -> ValueId) {
 }
 impl LiftedFunction {
     pub(in crate::rdna_spmd) fn map_values(&mut self, m: impl Fn(ValueId) -> ValueId, definitions: bool) {
+        self.revision += 1;
         for b in self.ir.blocks.values_mut() {
             if definitions { for (v, _) in &mut b.params { *v = m(*v); } }
             for i in &mut b.insts {

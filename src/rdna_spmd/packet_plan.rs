@@ -19,15 +19,11 @@ use super::ir::{ScalarProgram, Terminator};
 #[cfg(test)]
 use super::ir::ScalarBlock;
 use super::load_cluster::{self, VgCluster};
+use super::memory_shape::{self, GlobalLoad, PacketShape};
+#[cfg(test)]
+use super::memory_shape::Lanes;
 use super::regtype::RegSet;
 use super::sqrt_idiom::{self, SqrtCollapse};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GlobalLoad {
-    Gather,
-    Broadcast,
-    Frame { stride_words: u32, offset_words: u32 },
-}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum InstructionAction {
@@ -41,7 +37,7 @@ pub(super) struct InstructionPlan {
     pub entry_exec_unchanged: bool,
     pub nonempty_exec: bool,
     pub sqrt: Option<SqrtCollapse>,
-    pub global_load: GlobalLoad,
+    pub memory: Option<PacketShape>,
     pub action: InstructionAction,
 }
 
@@ -52,6 +48,7 @@ pub(super) struct BlockPlan {
     pub specialize: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct MaskRegion {
     pub header: usize,
     pub body: BTreeSet<usize>,
@@ -109,25 +106,28 @@ impl<'a> PacketPlan<'a> {
         let mut blocks: BTreeMap<_,_> = lifted_function.blocks.iter().map(|(&pc,b)|(pc,BlockPlan {
             instructions:(0..b.instructions.len()).map(|_|InstructionPlan {
                 elide_predicate:false,entry_exec_unchanged:false,nonempty_exec:false,sqrt:None,
-                global_load:GlobalLoad::Gather,action:InstructionAction::Emit,
+                memory:None,action:InstructionAction::Emit,
             }).collect(),fresh:[0;2],stale:[0;2],specialize:false,
         })).collect();
+        super::compiler::packet_passes(&mut lifted_function);
+        let sqrt = lifted_function.analyze(|f| f.state.sites.iter().map(|(&pc, sites)| (pc, sqrt_idiom::analyze(sites).1)).collect::<BTreeMap<_, _>>());
+        let fresh_in = lifted_function.analyze(|f| super::analysis::state::native_pairs(&f.ir, &f.state, false));
+        let f64_pairs = lifted_function.analyze(|f| super::analysis::state::f64_cells(&f.state));
+        let ssa_elide = lifted_function.analyze(|f| super::analysis::state::predication(&f.ir, &f.state, &exit_reads));
+        let ssa_nonempty = lifted_function.analyze(|f| super::analysis::state::nonempty(&f.ir, &f.state, width, boundary.is_none()));
+        let varying = lifted_function.analyze(|f| super::analysis::state::varying(&f.ir, &f.state, &boundary_writes));
+        let frame_values = lifted_function.analyze(|f| super::analysis::state::frames(&f.ir, &f.state, &boundary_writes));
+        let mask_region = lifted_function.analyze(|f| select_mask_region(f, boundary.is_some()));
+        let sqrt = sqrt.get(&lifted_function);
+        let f64_pairs = *f64_pairs.get(&lifted_function);
+        let (ssa_elide, ssa_nonempty) = (ssa_elide.get(&lifted_function), ssa_nonempty.get(&lifted_function));
+        let (varying, frame_values) = (varying.get(&lifted_function), frame_values.get(&lifted_function));
         for (&pc, block) in &mut blocks {
-            let (normal, sqrt) = sqrt_idiom::analyze(&lifted_function.state.sites[&pc]);
-            for (index, instruction) in block.instructions.iter_mut().enumerate() { instruction.sqrt = sqrt[index].clone(); }
-            lifted_function.fold_normal_scales(pc, &normal);
-        }
-        let fresh_in = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, false);
-        let f64_pairs = super::analysis::state::f64_cells(&lifted_function.state);
-        let ssa_elide = super::analysis::state::predication(&lifted_function.ir, &lifted_function.state, &exit_reads);
-        let ssa_nonempty = super::analysis::state::nonempty(&lifted_function.ir, &lifted_function.state, width, boundary.is_none());
-        let varying = super::analysis::state::varying(&lifted_function.ir, &lifted_function.state, &boundary_writes);
-        let frame_values = super::analysis::state::frames(&lifted_function.ir, &lifted_function.state, &boundary_writes);
-        for (&pc, block) in &mut blocks {
-            block.fresh = fresh_in[&pc];
+            block.fresh = fresh_in.get(&lifted_function)[&pc];
             block.stale = [block.fresh[0] & !f64_pairs[0], block.fresh[1] & !f64_pairs[1]];
             let sites = &lifted_function.state.sites[&pc];
             let memory = &lifted_function.blocks[&pc].memory;
+            for (index, instruction) in block.instructions.iter_mut().enumerate() { instruction.sqrt = sqrt[&pc][index].clone(); }
             let mut cluster_rest = 0;
             let mut entry_exec_unchanged = true;
             for (index, instruction) in block.instructions.iter_mut().enumerate() {
@@ -135,13 +135,13 @@ impl<'a> PacketPlan<'a> {
                 instruction.nonempty_exec = ssa_nonempty[&pc][index];
                 instruction.entry_exec_unchanged = entry_exec_unchanged;
                 entry_exec_unchanged &= !sites[index].exec.writes;
-                let load = global_load_ssa(memory.get(&index).map(|p| &p.memory), &sites[index].address, &varying, &frame_values);
-                instruction.global_load = load;
+                let load = global_load_ssa(memory.get(&index).map(|p| &p.memory), &sites[index].address, varying, frame_values);
+                instruction.memory = memory.get(&index).map(|p| memory_shape::packet(&p.memory, width, load));
                 let action = if cluster_rest > 0 {
                     cluster_rest -= 1; InstructionAction::ClusterMember
                 } else if matches!(instruction.sqrt, Some(SqrtCollapse::Rescale { .. })) {
                     InstructionAction::Emit
-                } else if let Some(cluster) = load_cluster::analyze(memory, sites, index, width, &varying, &frame_values) {
+                } else if let Some(cluster) = load_cluster::analyze(memory, sites, index, width, varying, frame_values) {
                     cluster_rest = cluster.len - 1; InstructionAction::Cluster(cluster)
                 } else { InstructionAction::Emit };
                 instruction.action = action;
@@ -154,18 +154,8 @@ impl<'a> PacketPlan<'a> {
                 .filter_map(move |(index,i)|i.elide_predicate.then_some((pc,index)))).collect(),
             observe_return,
         };
-        let mask_region = select_mask_region(&lifted_function, boundary.is_some());
-        let mut function = lifted_function.prepare(preparation);
-        for plan in function.blocks.values_mut().flat_map(|block| block.memory.values_mut()) {
-            use super::ir::typed::effect::{MemoryOp, Space};
-            // One ISA atomic instruction has no intervening per-lane effects.
-            // If no old value is observed, equal-address additions can be
-            // serialized consecutively and replaced by their wrapping sum.
-            // Volatile accesses and result-returning atomics retain every event.
-            plan.group_atomics = width >= 4 && plan.memory.space() == Space::Global
-                && plan.memory.op == MemoryOp::AtomicAdd && !plan.memory.returns
-                && !plan.memory.semantics.volatile;
-        }
+        let mask_region = mask_region.get(&lifted_function).clone();
+        let function = lifted_function.prepare(preparation);
         Self { width, boundary, blocks, f64_pairs, mask_region, function }
     }
 }
@@ -279,8 +269,8 @@ mod tests {
             assert!(matches!(instructions[2].action, InstructionAction::ClusterMember));
             assert!(matches!(instructions[3].action, InstructionAction::ClusterMember));
             assert!(matches!(instructions[4].action, InstructionAction::Emit));
-            assert_eq!(instructions[4].global_load, GlobalLoad::Gather);
-            assert_eq!(instructions[7].global_load, GlobalLoad::Broadcast);
+            assert_eq!(instructions[4].memory, Some(PacketShape::Words { lanes: Lanes::Gather, pairs: true }));
+            assert_eq!(instructions[7].memory, Some(PacketShape::Words { lanes: Lanes::Broadcast, pairs: true }));
         }
     }
 
@@ -292,9 +282,9 @@ mod tests {
         ]);
         let plan = PacketPlan::new(&program, 16, None);
         let instructions = &plan.blocks[&1].instructions;
-        assert_eq!(instructions[1].global_load, GlobalLoad::Frame { stride_words: 8, offset_words: 4 });
+        assert_eq!(instructions[1].memory, Some(PacketShape::Frame { stride_words: 8, offset_words: 4, group: 8 }));
         for index in [2, 3, 4, 6] {
-            assert_eq!(instructions[index].global_load, GlobalLoad::Gather);
+            assert_eq!(instructions[index].memory, Some(PacketShape::Words { lanes: Lanes::Gather, pairs: true }));
         }
     }
 
@@ -308,9 +298,9 @@ mod tests {
         let boundary = BTreeMap::from([(2, io)]);
         let no_writes = BTreeMap::new();
         let before = PacketPlan::new(&program, 16, Some(&no_writes));
-        assert!(matches!(before.blocks[&2].instructions[0].global_load, GlobalLoad::Frame { .. }));
+        assert!(matches!(before.blocks[&2].instructions[0].memory, Some(PacketShape::Frame { .. })));
         let after = PacketPlan::new(&program, 16, Some(&boundary));
-        assert_eq!(after.blocks[&2].instructions[0].global_load, GlobalLoad::Gather);
+        assert_eq!(after.blocks[&2].instructions[0].memory, Some(PacketShape::Words { lanes: Lanes::Gather, pairs: true }));
         drop((before, after));
 
         program.blocks.get_mut(&1).unwrap().body = vec![
@@ -318,9 +308,9 @@ mod tests {
             mov(11, SourceOperand::IntegerConstant(0)),
         ];
         let before = PacketPlan::new(&program, 16, Some(&no_writes));
-        assert_eq!(before.blocks[&2].instructions[0].global_load, GlobalLoad::Broadcast);
+        assert_eq!(before.blocks[&2].instructions[0].memory, Some(PacketShape::Words { lanes: Lanes::Broadcast, pairs: true }));
         let after = PacketPlan::new(&program, 16, Some(&boundary));
-        assert_eq!(after.blocks[&2].instructions[0].global_load, GlobalLoad::Gather);
+        assert_eq!(after.blocks[&2].instructions[0].memory, Some(PacketShape::Words { lanes: Lanes::Gather, pairs: true }));
     }
 
     #[test]

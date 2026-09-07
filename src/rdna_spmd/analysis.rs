@@ -293,3 +293,44 @@ pub(crate) fn live_values(f: &Func, roots: impl IntoIterator<Item=ValueId>) -> V
 }
 
 pub(in crate::rdna_spmd) mod rewrite;
+
+pub(crate) struct Analysis<T> { revision: u64, value: T }
+impl<T> Analysis<T> {
+    pub fn get(&self, f: &super::lift::function::LiftedFunction) -> &T {
+        assert_eq!(self.revision, f.revision, "analysis result predates an SSA edit");
+        &self.value
+    }
+}
+impl super::lift::function::LiftedFunction {
+    pub(crate) fn analyze<T>(&self, compute: impl FnOnce(&Self) -> T) -> Analysis<T> {
+        Analysis { revision: self.revision, value: compute(self) }
+    }
+}
+
+pub(crate) fn retained(f: &Func, blocks: &BTreeMap<usize, super::lift::function::BlockPlan>) -> Vec<bool> {
+    let mut retained=vec![false;f.types.len()];
+    let mut local=vec![0usize;f.types.len()];
+    let mut bound=vec![0usize;f.types.len()];
+    let mut generation=0;
+    for (&pc,plan) in blocks {for alu in plan.instructions.iter().flatten() {
+        generation+=1;
+        let insts=&f.blocks[&BlockId(pc)].insts[alu.core.clone()];
+        for inst in insts {match inst {
+            Inst::Core {value,..}|Inst::Packet {output:value,..}=>{local[value.0]=generation;},
+            Inst::Target {outputs,..}|Inst::Effect {outputs,..}=>{for &(id,_) in outputs {local[id.0]=generation;}},
+        }}
+        for (_,id) in &alu.inputs {local[id.0]=generation;bound[id.0]=generation;}
+        for &(id,_) in &alu.pairs {bound[id.0]=generation;}
+        for inst in insts {if let Inst::Core {value,op,..}=inst {
+            if bound[value.0]==generation {continue;}
+            op.map(|id|{if local[id.0]!=generation {retained[id.0]=true;} id});
+        }}
+    }}
+    retained
+}
+
+pub(crate) fn native_live(f: &Func, blocks: &BTreeMap<usize, super::lift::function::BlockPlan>, live: &[bool]) -> Vec<bool> {
+    live_values(f, live.iter().enumerate().filter_map(|(id,&live)|live.then_some(ValueId(id)))
+        .chain(blocks.values().flat_map(|block|block.instructions.iter().flatten())
+            .flat_map(|alu|alu.outputs.iter().map(|&(_,id)|id))))
+}

@@ -102,35 +102,35 @@ impl LiftedFunction {
 #[derive(Clone)]
 pub(in crate::rdna_spmd) enum Position { Instruction(usize), Control(Observation) }
 impl LiftedFunction {
-    pub(in crate::rdna_spmd) fn optimize(&mut self, mut positions: BTreeMap<usize, Vec<Position>>) {
-        for pc in self.blocks.keys().copied().collect::<Vec<_>>() {
-            let order = positions.get_mut(&pc).unwrap();
-            let observations = |this: &Self, order: &[Position]| order.iter().map(|p|match p {
-                Position::Instruction(i) => this.state.sites[&pc][*i].rewrite.clone(),
-                Position::Control(o) => o.clone(),
-            }).collect::<Vec<_>>();
-            let (remove, edits) = crate::rdna_spmd::combine::square_roots(&observations(self,order));
-            for (at,dst,input) in edits {
-                let Position::Instruction(index) = order[at] else { unreachable!() };
-                self.replace_sqrt(pc,index,dst,input);
-            }
-            self.remove_positions(pc,order,&remove);
-            loop {
-                let remove = crate::rdna_spmd::combine::dead(&observations(self,order));
-                if !remove.iter().any(|&v|v) {break;}
-                self.remove_positions(pc,order,&remove);
-            }
-            let observations = self.state.sites[&pc].iter().map(|s|s.rewrite.clone()).collect::<Vec<_>>();
-            let remove = crate::rdna_spmd::combine::divisions(&observations);
-            self.remove_sites(pc,&remove);
+    pub(in crate::rdna_spmd) fn observations(&self, pc: usize, order: &[Position]) -> Vec<Observation> {
+        order.iter().map(|p|match p {
+            Position::Instruction(i) => self.state.sites[&pc][*i].rewrite.clone(),
+            Position::Control(o) => o.clone(),
+        }).collect()
+    }
+    pub(in crate::rdna_spmd) fn local_square_roots(&mut self, pc: usize, order: &mut Vec<Position>) {
+        let (remove, edits) = crate::rdna_spmd::combine::square_roots(&self.observations(pc,order));
+        for (at,dst,input) in edits {
+            let Position::Instruction(index) = order[at] else { unreachable!() };
+            self.replace_sqrt(pc,index,dst,input);
         }
+        self.remove_positions(pc,order,&remove);
+    }
+    pub(in crate::rdna_spmd) fn local_dead(&mut self, pc: usize, order: &mut Vec<Position>) {
+        let remove = crate::rdna_spmd::combine::dead(&self.observations(pc,order));
+        self.remove_positions(pc,order,&remove);
+    }
+    pub(in crate::rdna_spmd) fn local_divisions(&mut self, pc: usize) {
+        let observations = self.state.sites[&pc].iter().map(|s|s.rewrite.clone()).collect::<Vec<_>>();
+        let remove = crate::rdna_spmd::combine::divisions(&observations);
+        self.remove_sites(pc,&remove);
+    }
+    pub(in crate::rdna_spmd) fn cross_block_square_roots(&mut self) {
         let edits = crate::rdna_spmd::mathcombine::analyze(self);
         for (pc,(removed,rewrites)) in edits {
             for (index,dst,input) in rewrites { self.replace_sqrt(pc,index,dst,input); }
             self.remove_sites(pc,&(0..self.state.sites[&pc].len()).map(|i|removed.contains(&i)).collect::<Vec<_>>());
         }
-        self.compact();
-        self.ir.clone().verify_with(&self.registry).expect("invalid SSA after preparation passes");
     }
     fn remove_positions(&mut self, pc: usize, order: &mut Vec<Position>, remove: &[bool]) {
         let mut body_remove = vec![false;self.state.sites[&pc].len()];

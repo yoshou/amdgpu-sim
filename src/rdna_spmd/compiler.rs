@@ -16,6 +16,93 @@ use super::program::{Program, CompilationInput};
 use super::packet_plan::PacketPlan;
 use super::scalar_plan::{ScalarMode, ScalarPlan};
 
+use super::lift::function::{Function, LiftedFunction, Preparation};
+use super::lift::optimize::Position;
+use super::passes::Driver;
+use super::ir::typed::cfg::BlockId;
+
+pub(super) fn input_passes(f: &mut LiftedFunction, mut positions: BTreeMap<usize, Vec<Position>>) {
+    let driver = Driver::new();
+    let pcs: Vec<usize> = f.blocks.keys().copied().collect();
+    driver.run(f, "local_square_roots", |f| for &pc in &pcs { f.local_square_roots(pc, positions.get_mut(&pc).unwrap()); }).unwrap();
+    let limit = 1 + f.state.sites.values().map(|s| s.len()).sum::<usize>();
+    driver.fixpoint(f, "local_dead", limit, |f| for &pc in &pcs { f.local_dead(pc, positions.get_mut(&pc).unwrap()); }).unwrap();
+    driver.run(f, "local_divisions", |f| for &pc in &pcs { f.local_divisions(pc); }).unwrap();
+    driver.run(f, "cross_block_square_roots", |f| f.cross_block_square_roots()).unwrap();
+    driver.run(f, "compact", |f| f.compact()).unwrap();
+}
+
+pub(super) fn query_passes(f: &mut LiftedFunction) {
+    use super::lift::InputSource;
+    use crate::rdna_instructions::SourceOperand;
+    let driver = Driver::new();
+    driver.run(f, "local_write_lane", |f| {
+        for (&pc, block) in &mut f.blocks {
+            if let Some(plan) = &mut block.yield_values {
+                if let Some(end) = super::passes::local_write_lane(&mut f.ir, BlockId(pc), plan.core.end) {
+                    plan.core.end = end;
+                    plan.local = true;
+                }
+            }
+        }
+    }).unwrap();
+    let entry = &f.ir.blocks[&f.ir.entry];
+    let uniform_entry: Vec<_> = f.parameter_inputs.iter().zip(&entry.params).filter_map(|(input, parameter)|
+        matches!(input.source, InputSource::Operand(SourceOperand::ScalarRegister(_)) | InputSource::Scc)
+            .then_some(parameter.0)).collect();
+    driver.run(f, "constant_queries", |f| super::passes::constant_queries(&mut f.ir, &[])).unwrap();
+    driver.run(f, "uniform_queries", |f| super::passes::uniform_queries(&mut f.ir, &uniform_entry)).unwrap();
+    driver.run(f, "constant_yield_arguments", |f| {
+        use super::ir::typed::effect::{EffectOp, WaveOp};
+        let constants = super::analysis::constants(&f.ir);
+        for block in f.blocks.values_mut() {
+            if let Some(plan) = &mut block.yield_values {
+                for (index, id) in plan.arguments.iter().enumerate() {
+                    if plan.layout.op == EffectOp::Wave(WaveOp::Wmma)
+                        || plan.layout.op == EffectOp::Wave(WaveOp::WriteLane) && index == 2 { continue; }
+                    if let Some(bits) = constants[id.0] {
+                        plan.layout.arguments[index] = super::yield_values::Argument::Constant(bits as u32);
+                    }
+                }
+            }
+        }
+    }).unwrap();
+}
+
+pub(super) fn packet_passes(f: &mut LiftedFunction) {
+    let driver = Driver::new();
+    let normal: BTreeMap<usize, Vec<bool>> = f.state.sites.iter().map(|(&pc, sites)| (pc, super::sqrt_idiom::analyze(sites).0)).collect();
+    driver.run(f, "fold_normal_scales", |f| for (pc, normal) in &normal { f.fold_normal_scales(*pc, normal); }).unwrap();
+}
+
+pub(super) fn preparation_passes(f: &mut LiftedFunction, preparation: Preparation) -> (bool, Option<Vec<bool>>) {
+    let driver = Driver::new();
+    let mut scalar_live = None;
+    let observable_return = match preparation {
+        Preparation::Packet { inactive, observe_return } => {
+            driver.run(f, "packet_state", |f| Function::packet_state(&mut f.ir)).unwrap();
+            if !observe_return {
+                driver.run(f, "elide_inactive_updates", |f| Function::elide_inactive_updates(&f.blocks, &mut f.ir, inactive)).unwrap();
+                driver.run(f, "assume_dispatch_exec", |f| Function::assume_dispatch_exec(&f.parameter_inputs, &mut f.ir)).unwrap();
+            }
+            observe_return
+        }
+        Preparation::Scalar { active, dispatch } => {
+            driver.run(f, "packet_state", |f| Function::packet_state(&mut f.ir)).unwrap();
+            driver.run(f, "scalar_mask_selects", |f| Function::scalar_mask_selects(&f.blocks, &mut f.ir)).unwrap();
+            if !dispatch {
+                scalar_live = Some(super::analysis::live_values(&f.ir, f.blocks.values().flat_map(|b| &b.outgoing).copied()));
+            }
+            driver.run(f, "elide_active_updates", |f| Function::elide_active_updates(&f.blocks, &mut f.ir, active)).unwrap();
+            if dispatch { driver.run(f, "assume_dispatch_exec", |f| Function::assume_dispatch_exec(&f.parameter_inputs, &mut f.ir)).unwrap(); }
+            !dispatch
+        }
+        #[cfg(test)]
+        Preparation::Inspect => true,
+    };
+    (observable_return, scalar_live)
+}
+
 /// Coordinates the existing SPMD compilation stages.
 pub struct Compiler { registry: std::sync::Arc<super::dialect::DialectRegistry> }
 impl Default for Compiler {
@@ -122,7 +209,7 @@ mod tests {
         }
         let mut positions=BTreeMap::from([(4,positions)]);
         for &pc in next {positions.entry(pc).or_default();}
-        program.function.optimize(positions);program.function.compact();
+        input_passes(&mut program.function,positions);
         program.function.ir.clone().verify_with(&program.function.registry).unwrap();
         assert_eq!(source.blocks[&4].body.len(),insts.iter().filter(|i|!matches!(i,InstFormat::SOPP(_))).count());
         program

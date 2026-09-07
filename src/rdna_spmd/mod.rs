@@ -102,6 +102,7 @@ mod native_state;
 mod jit;
 mod dialect;
 mod load_cluster;
+mod memory_shape;
 mod boundary;
 mod packet_plan;
 mod sqrt_idiom;

@@ -73,7 +73,7 @@ impl Program {
             }
             (pc,order)
         }).collect();
-        program.function.optimize(positions);
+        super::compiler::input_passes(&mut program.function,positions);
         program
     }
 }
@@ -101,6 +101,7 @@ impl Program {
     pub(super) fn rename_block(&mut self, old:usize, new:usize) {
         use super::ir::typed::cfg::BlockId;
         let f=&mut self.function;
+        f.revision+=1;
         let block=f.ir.blocks.remove(&BlockId(old)).unwrap();f.ir.blocks.insert(BlockId(new),block);
         let plan=f.blocks.remove(&old).unwrap();f.blocks.insert(new,plan);
         if f.ir.entry.0==old {f.ir.entry=BlockId(new);}
@@ -119,6 +120,7 @@ impl Program {
         let old=self.function.ir.entry.0;
         self.rename_block(old,1);
         let f=&mut self.function;
+        f.revision+=1;
         for pc in [0,2] {
             let params:Vec<_>=f.parameter_inputs.clone().iter().map(|i|(f.ir.value(i.ty),i.ty)).collect();
             let outgoing=params.iter().map(|p|p.0).collect::<Vec<_>>();

@@ -36,7 +36,8 @@ use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef
 use crate::rdna_instructions::SourceOperand;
 
 use super::boundary::RegSet;
-use super::packet_plan::{PacketPlan, GlobalLoad, InstructionAction};
+use super::packet_plan::{PacketPlan, InstructionAction};
+use super::memory_shape::{Lanes, PacketShape, StoreShape};
 use super::sqrt_idiom::SqrtCollapse;
 
 const EXEC: u32 = 126;
@@ -138,8 +139,6 @@ struct Cg {
     // <W×f64> cell; a 32-bit access extracts or replaces the requested half.
     // `f64c` contains the low registers of those pairs.
     f64c: super::regtype::RegSet,
-    // Memory lowering selected by the immutable plan for this instruction.
-    global_load: std::cell::Cell<GlobalLoad>,
     nonempty_exec: std::cell::Cell<bool>,
     valid_mask: LLVMValueRef, // immutable allocated lanes, independent of EXEC
     scc: CellId,       // scalar i1
@@ -855,7 +854,6 @@ unsafe fn compile_inner(
         stale: std::cell::Cell::new([0; 2]),
         fresh_in: plan.blocks.iter().map(|(&pc, block)| (pc, block.fresh)).collect(),
         f64c: plan.f64_pairs,
-        global_load: std::cell::Cell::new(GlobalLoad::Gather),
         nonempty_exec: std::cell::Cell::new(false),
         i1, i32t, i64t, f32t, f64t, iw, ptr,
         vi1, vi32, vi64, vf32, vf64,
@@ -983,7 +981,6 @@ unsafe fn compile_inner(
             let mut sqrt_inputs: std::collections::HashMap<usize, LLVMValueRef> =
                 std::collections::HashMap::new();
             for (idx, instruction) in block_plan.instructions.iter().enumerate() {
-                cg.global_load.set(instruction.global_load);
                 cg.nonempty_exec.set(instruction.nonempty_exec || (!variant_pred && instruction.entry_exec_unchanged));
                 if let Some(SqrtCollapse::Capture { site, src }) = &instruction.sqrt {
                     sqrt_inputs.insert(*site, cg.typed_input(src, false));
@@ -1003,7 +1000,7 @@ unsafe fn compile_inner(
                         .iter()
                         .map(|member| (variant_pred || !member.entry_exec_unchanged) && !member.elide_predicate)
                         .collect();
-                    cg.emit_memory_cluster(&members, ssa.value(members[0].base), c.lo, c.span, &preds);
+                    cg.emit_memory_cluster(&members, ssa.value(members[0].base), c.lo, c.span, c.tile, &preds);
                 } else {
                     match &plan.function.blocks[&pc].instructions[idx] {
                         Some(_) => {
@@ -1029,7 +1026,7 @@ unsafe fn compile_inner(
                 },
                 None => {
                     ssa.prepare_memory(&plan.function,pc,idx,|p,scalar|cg.memory_parameter(p,scalar));
-                            cg.emit_memory(&plan.function.blocks[&pc].memory[&idx],&ssa,|k|ssa.memory_data(&plan.function,pc,idx,k));
+                            cg.emit_memory(&plan.function.blocks[&pc].memory[&idx],instruction.memory.unwrap(),&ssa,|k|ssa.memory_data(&plan.function,pc,idx,k));
                         }
                     }
                 }
@@ -1293,7 +1290,7 @@ impl Cg {
     /// dereferenceable over the whole span (contiguity checked in detection),
     /// and inactive lanes' loaded values are merged away by the predicated
     /// stores (or dead, when the elide analysis dropped the predicate).
-    unsafe fn emit_memory_cluster(&self, members: &[&super::lift::memory::Plan], addr: LLVMValueRef, lo: i64, span: u32, preds: &[bool]) {
+    unsafe fn emit_memory_cluster(&self, members: &[&super::lift::memory::Plan], addr: LLVMValueRef, lo: i64, span: u32, tile: u32, preds: &[bool]) {
         let exec = self.exec_vec();
         let zero = llvm::core::LLVMConstNull(self.vi64);
         let masked = llvm::core::LLVMBuildSelect(self.b, exec, addr, zero, self.n());
@@ -1314,7 +1311,7 @@ impl Cg {
                 ld
             })
             .collect();
-        let cols = self.transpose_rows(&rows, span, preferred_f64_transpose_tile(self.w));
+        let cols = self.transpose_rows(&rows, span, tile);
         for (m, g) in members.iter().enumerate() {
             self.predicate.set(preds[m]);
             let pairs = g.memory.words / 2;
@@ -1495,25 +1492,6 @@ impl Cg {
 
 }
 
-/// Match a transpose tile to the host's native f64 SIMD width. The LLVM JIT is
-/// also configured for the host CPU, so this keeps each column vector native:
-/// SSE2/NEON=2 lanes, AVX2=4, AVX-512=8. Wider SPMD packets concatenate tiles.
-fn preferred_f64_transpose_tile(width: u32) -> u32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    let native = if std::arch::is_x86_feature_detected!("avx512f") {
-        8
-    } else if std::arch::is_x86_feature_detected!("avx2") {
-        4
-    } else {
-        2
-    };
-    #[cfg(target_arch = "aarch64")]
-    let native = 2;
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-    let native = 1;
-    width.min(native)
-}
-
 /// Shuffle masks for one butterfly stage of a square power-of-two transpose.
 /// `step` selects the row/column index bit exchanged at this stage.
 fn transpose_pair_masks(tile: u32, step: u32) -> (Vec<u32>, Vec<u32>) {
@@ -1533,17 +1511,7 @@ fn transpose_pair_masks(tile: u32, step: u32) -> (Vec<u32>, Vec<u32>) {
 
 #[cfg(test)]
 mod transpose_mask_tests {
-    use super::{preferred_f64_transpose_tile, transpose_pair_masks};
-
-    #[test]
-    fn preferred_tile_partitions_every_supported_packet_width() {
-        for width in [1u32, 2, 4, 8, 16] {
-            let tile = preferred_f64_transpose_tile(width);
-            assert!(tile.is_power_of_two());
-            assert!(tile <= width);
-            assert_eq!(width % tile, 0);
-        }
-    }
+    use super::transpose_pair_masks;
 
     #[test]
     fn power_of_two_butterfly_masks_transpose_square_tiles() {

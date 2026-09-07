@@ -591,7 +591,7 @@ unsafe fn compile_inner(
                 },
                 None => {
                     ssa.prepare_memory(&plan.function, pc, idx, |p, scalar| cg.memory_parameter(p, scalar));
-                    cg.emit_memory(&plan.function.blocks[&pc].memory[&idx], &ssa, |k| ssa.memory_data(&plan.function, pc, idx, k));
+                    cg.emit_memory(&plan.function.blocks[&pc].memory[&idx], facts.memory[&idx], &ssa, |k| ssa.memory_data(&plan.function, pc, idx, k));
                 }
             }
         }
