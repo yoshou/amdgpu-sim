@@ -10,6 +10,7 @@ mod scale;
 mod reduction;
 mod division;
 mod image;
+pub(in crate::rdna_spmd) mod bvh;
 pub(in crate::rdna_spmd) use scale::fold_normal;
 #[cfg(test)]
 pub(in crate::rdna_spmd) use reduction::reference as reference_reduction;
@@ -58,11 +59,13 @@ pub(super) fn register(registry: &mut DialectRegistry) -> Result<(), &'static st
     registry.register(ID, 7, Operation { effect: Effect::Pure, immediates: &[], name: "ldexp.f32", inputs: &[Ty::F32, Ty::I32], outputs: vec![Ty::F32], lower: Implementation::Single(scale::f32) })?;
     registry.register(ID, 8, Operation { effect: Effect::Pure, immediates: &[], name: "ldexp.f64", inputs: &[Ty::F64, Ty::I32], outputs: vec![Ty::F64], lower: Implementation::Single(scale::f64) })?;
     registry.register(ID, 13, Operation { effect: Effect::Pure, immediates: &[], name: "trig_preop.f64", inputs: &[Ty::F64, Ty::I32], outputs: vec![Ty::F64], lower: Implementation::Single(reduction::lower) })?;
+    registry.register(ID, 17, Operation { effect: Effect::Pure, immediates: &[], name: "div_fixup.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64], outputs: vec![Ty::F64], lower: Implementation::Single(division::fixup_f64) })?;
     registry.register(ID, 16, Operation { effect: Effect::Pure, immediates: &[], name: "div_fixup.f32", inputs: &[Ty::F32, Ty::F32, Ty::F32], outputs: vec![Ty::F32], lower: Implementation::Single(division::fixup_f32) })?;
     registry.register(ID, 18, Operation { effect: Effect::Pure, immediates: &[], name: "div_fmas.f32", inputs: &[Ty::F32, Ty::F32, Ty::F32, Ty::I1], outputs: vec![Ty::F32], lower: Implementation::Single(division::fmas_f32) })?;
     registry.register(ID, 19, Operation { effect: Effect::Pure, immediates: &[], name: "div_fmas.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64, Ty::I1], outputs: vec![Ty::F64], lower: Implementation::Single(division::fmas_f64) })?;
     registry.register(ID, 14, Operation { effect: Effect::Pure, immediates: &[], name: "div_scale.f32", inputs: &[Ty::F32, Ty::F32, Ty::F32], outputs: vec![Ty::F32, Ty::I1], lower: Implementation::Multiple(division::scale_f32) })?;
     registry.register(ID, 15, Operation { effect: Effect::Pure, immediates: &[], name: "div_scale.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64], outputs: vec![Ty::F64, Ty::I1], lower: Implementation::Multiple(division::scale_f64) })?;
+    registry.register(ID, 37, Operation { effect: Effect::ReadGlobal, immediates: &[], name: "image_bvh64_intersect_ray", inputs: &[Ty::I32,Ty::I32,Ty::I64,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I1,Ty::I32], outputs: vec![Ty::I32;4], lower: Implementation::Multiple(bvh::lower) })?;
     Ok(())
 }
 
@@ -137,7 +140,7 @@ pub(in crate::rdna_spmd) fn binary(registry: &DialectRegistry, op: I) -> Option<
 }
 
 pub(in crate::rdna_spmd) fn division(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
-    let name = match op { I::V_DIV_FIXUP_F32 => "div_fixup.f32",
+    let name = match op { I::V_DIV_FIXUP_F32 => "div_fixup.f32", I::V_DIV_FIXUP_F64 => "div_fixup.f64",
         I::V_DIV_SCALE_F32 => "div_scale.f32", I::V_DIV_SCALE_F64 => "div_scale.f64",
         I::V_DIV_FMAS_F32 => "div_fmas.f32", I::V_DIV_FMAS_F64 => "div_fmas.f64", _ => return None };
     Some(registry.lookup(ID, name).expect("missing RDNA4 provider"))
@@ -358,3 +361,5 @@ pub(in crate::rdna_spmd) fn reference(op: I, bits: u64) -> u64 {
         _ => unreachable!(),
     }
 }
+
+pub(in crate::rdna_spmd) fn bvh(registry:&DialectRegistry)->TargetOp {registry.lookup(ID,"image_bvh64_intersect_ray").expect("missing BVH provider")}

@@ -17,6 +17,16 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         return Some(b.finish_many(false, outputs));
     }
     let InstFormat::VOP3(i) = inst else { return None; };
+    if matches!(i.op, I::V_DIV_FIXUP_F64) {
+        let target=crate::rdna_spmd::dialect::rdna4::division(registry,i.op).unwrap();
+        let mut b=Builder::new(registry,vec![input(i.src1,Ty::F64),input(i.src2,Ty::F64)]);
+        let denominator=b.float_mod(Ty::F64,ValueId(0),i.abs,i.neg,1);
+        let numerator=b.float_mod(Ty::F64,ValueId(1),i.abs,i.neg,2);
+        let quotient=b.push(Ty::F64,Op::Float(FloatOp::Div,numerator,denominator));
+        let value=b.target_one(target,Arguments::Ternary([quotient,denominator,numerator]));
+        // The existing SPMD expansion does not apply CM/OMOD here.
+        return Some(b.finish(Output::Vgpr(i.vdst as u32,Ty::F64),value));
+    }
     let target = crate::rdna_spmd::dialect::rdna4::division(registry, i.op)?;
     let spec = registry.operation(target).unwrap();
     let ty = spec.inputs[0];

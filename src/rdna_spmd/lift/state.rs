@@ -95,6 +95,12 @@ impl Operands {
             self.bindings.push((input.clone(), value));
             return value;
         }
+        if matches!(input.source, InputSource::ExecPredicate) {
+            let value = core(f, &mut self.core, Ty::I1,
+                Op::Convert(Cvt::Bitcast, Ty::I1, words[&Word::Mask(126)]));
+            self.bindings.push((input.clone(), value));
+            return value;
+        }
         if let InputSource::Operand(source) = &input.source {
             if input.ty == Ty::I1 {
                 if let SourceOperand::ScalarRegister(r @ (106 | 126)) = *source {

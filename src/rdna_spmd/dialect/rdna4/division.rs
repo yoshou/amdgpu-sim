@@ -126,3 +126,49 @@ unsafe fn fixup(e: &Emitter, ty: Ty, a: &[LLVMValueRef]) -> LLVMValueRef {
     result = LLVMBuildSelect(e.b, class(a[2], 3), quiet(2), result, n);
     LLVMBuildBitCast(e.b, result, e.ty(ty), n)
 }
+
+/// Preserve the existing SPMD division expansion; its quotient is formed from
+/// the original denominator and numerator before applying the fixup.
+pub(super) unsafe fn fixup_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
+    let [quotient,denominator,numerator]=[a[0],a[1],a[2]];
+    use llvm_sys::LLVMIntPredicate::*;
+    const INFINITY: u64 = 0x7FF0_0000_0000_0000;
+    let n = b"\0".as_ptr().cast();
+    let k = |v: u64| e.constant(Ty::I64,v);
+    let bits = |v: LLVMValueRef| LLVMBuildBitCast(e.b, v, e.ty(Ty::I64), n);
+    let icmp = |p, x, y| LLVMBuildICmp(e.b, p, x, y, n);
+    let or = |x, y| LLVMBuildOr(e.b, x, y, n);
+    let and = |x, y| LLVMBuildAnd(e.b, x, y, n);
+    let select = |c, t, f| LLVMBuildSelect(e.b, c, t, f, n);
+
+    let b = bits(denominator);
+    let c = bits(numerator);
+    let abs_b = LLVMBuildAnd(e.b,b, k(0x7FFF_FFFF_FFFF_FFFF), n);
+    let abs_c = LLVMBuildAnd(e.b,c, k(0x7FFF_FFFF_FFFF_FFFF), n);
+    let b_nan = icmp(LLVMIntUGT, abs_b, k(INFINITY));
+    let c_nan = icmp(LLVMIntUGT, abs_c, k(INFINITY));
+    let both_zero = and(icmp(LLVMIntEQ, abs_b, k(0)), icmp(LLVMIntEQ, abs_c, k(0)));
+    let both_infinite = and(
+        icmp(LLVMIntEQ, abs_b, k(INFINITY)),
+        icmp(LLVMIntEQ, abs_c, k(INFINITY)),
+    );
+    let exponent =
+        |v: LLVMValueRef| LLVMBuildAnd(e.b,LLVMBuildLShr(e.b, v, k(52), n), k(0x7FF), n);
+    let underflow = icmp(
+        LLVMIntSLT,
+        LLVMBuildSub(e.b,exponent(c), exponent(b), n),
+        k((-1075i64) as u64),
+    );
+
+    // The answer for those cases, chosen in reverse so that the earlier
+    // ones of the ISA's order win. It is made of the operands alone, so
+    // only the last select sits on the quotient's dependency chain.
+    let quiet = |v: LLVMValueRef| LLVMBuildOr(e.b,v, k(0x0008_0000_0000_0000), n);
+    let signed_zero = LLVMBuildAnd(e.b,LLVMBuildXor(e.b,b, c, n), k(0x8000_0000_0000_0000), n);
+    let mut fixed = signed_zero;
+    fixed = select(or(both_zero, both_infinite), k(0xFFF8_0000_0000_0000), fixed);
+    fixed = select(b_nan, quiet(b), fixed);
+    fixed = select(c_nan, quiet(c), fixed);
+    let fix = or(or(underflow, or(both_zero, both_infinite)), or(b_nan, c_nan));
+    LLVMBuildBitCast(e.b, select(fix, fixed, bits(quotient)), e.ty(Ty::F64), n)
+}

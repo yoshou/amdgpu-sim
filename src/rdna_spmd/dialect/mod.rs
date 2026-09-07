@@ -16,18 +16,19 @@ pub(crate) enum Arguments {
     Ternary([ValueId; 3]),
     Quaternary([ValueId; 4]),
     Sixteen([ValueId; 16]),
+    Fifteen([ValueId; 15]),
 }
 impl Arguments {
     pub fn map(self, mut f: impl FnMut(ValueId) -> ValueId) -> Self {
         match self {
             Self::Unary(a) => Self::Unary(f(a)), Self::Binary(a) => Self::Binary(a.map(f)),
             Self::Ternary(a) => Self::Ternary(a.map(f)), Self::Quaternary(a) => Self::Quaternary(a.map(f)),
-            Self::Sixteen(a) => Self::Sixteen(a.map(f)),
+            Self::Sixteen(a) => Self::Sixteen(a.map(f)), Self::Fifteen(a) => Self::Fifteen(a.map(f)),
         }
     }
     pub fn values(&self) -> &[ValueId] {
         match self { Self::Unary(a) => std::slice::from_ref(a), Self::Binary(a) => a,
-            Self::Ternary(a) => a, Self::Quaternary(a) => a, Self::Sixteen(a) => a }
+            Self::Ternary(a) => a, Self::Quaternary(a) => a, Self::Sixteen(a) => a, Self::Fifteen(a) => a }
     }
 }
 

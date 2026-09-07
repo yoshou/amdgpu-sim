@@ -16,8 +16,7 @@ use std::ffi::CString;
 use llvm_sys as llvm;
 use llvm::prelude::{LLVMBasicBlockRef, LLVMBuilderRef, LLVMTypeRef, LLVMValueRef};
 
-use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, VIMAGE, VOP3};
+use crate::rdna_instructions::SourceOperand;
 
 use super::scalar_plan::{ScalarMode, ScalarPlan};
 
@@ -70,7 +69,6 @@ use super::native_state::{CellId, State};
 struct Cg {
     state: std::cell::RefCell<State>,
     ctx: llvm::prelude::LLVMContextRef,
-    module: llvm::prelude::LLVMModuleRef,
     b: LLVMBuilderRef,
     func: LLVMValueRef,
     scratch_base: LLVMValueRef,
@@ -141,32 +139,9 @@ impl Cg {
     }
 
     // ---- intrinsic / external function declaration -----------------------
-    unsafe fn get_func(&self, name: &str, ret: LLVMTypeRef, params: &[LLVMTypeRef]) -> (LLVMValueRef, LLVMTypeRef) {
-        let cname = cstr(name);
-        let mut f = llvm::core::LLVMGetNamedFunction(self.module, cname.as_ptr());
-        let fty = llvm::core::LLVMFunctionType(
-            ret,
-            params.as_ptr() as *mut _,
-            params.len() as u32,
-            0,
-        );
-        if f.is_null() {
-            f = llvm::core::LLVMAddFunction(self.module, cname.as_ptr(), fty);
-        }
-        (f, fty)
-    }
 
-    unsafe fn call(&self, name: &str, ret: LLVMTypeRef, params: &[LLVMTypeRef], args: &[LLVMValueRef]) -> LLVMValueRef {
-        let (f, fty) = self.get_func(name, ret, params);
-        llvm::core::LLVMBuildCall2(
-            self.b,
-            fty,
-            f,
-            args.as_ptr() as *mut _,
-            args.len() as u32,
-            self.n(),
-        )
-    }
+
+
 
     // ---- register access -------------------------------------------------
     unsafe fn ld_sgpr32(&self, i: u32) -> LLVMValueRef {
@@ -379,70 +354,9 @@ impl Cg {
         }
     }
 
-    unsafe fn absneg_f64(&self, v: LLVMValueRef, abs: u8, neg: u8, idx: u32) -> LLVMValueRef {
-        let mut v = v;
-        if (abs >> idx) & 1 != 0 {
-            // fabs via llvm.fabs.f64
-            v = self.call("llvm.fabs.f64", self.f64t, &[self.f64t], &[v]);
-        }
-        if (neg >> idx) & 1 != 0 {
-            v = llvm::core::LLVMBuildFNeg(self.b, v, self.n());
-        }
-        v
-    }
-    /// The fixup the ISA applies to a division's quotient, as the interpreter's
-    /// `div_fixup_f64` and the JIT's `emit_div_fixup_f64` do. This backend has
-    /// no quotient of its own to fix up -- the expansion feeding S0 is
-    /// collapsed away -- so it divides the original operands and answers for
-    /// the cases a division does not answer the ISA's way: a NaN operand, 0/0
-    /// and inf/inf, and a quotient too small to reach the smallest subnormal.
-    unsafe fn div_fixup_f64(
-        &self,
-        quotient: LLVMValueRef,
-        denominator: LLVMValueRef,
-        numerator: LLVMValueRef,
-    ) -> LLVMValueRef {
-        use llvm::LLVMIntPredicate::*;
-        const INFINITY: u64 = 0x7FF0_0000_0000_0000;
-        let n = self.n();
-        let k = |v: u64| self.ci64(v);
-        let bits = |v: LLVMValueRef| llvm::core::LLVMBuildBitCast(self.b, v, self.i64t, n);
-        let icmp = |p, x, y| llvm::core::LLVMBuildICmp(self.b, p, x, y, n);
-        let or = |x, y| llvm::core::LLVMBuildOr(self.b, x, y, n);
-        let and = |x, y| llvm::core::LLVMBuildAnd(self.b, x, y, n);
-        let select = |c, t, f| llvm::core::LLVMBuildSelect(self.b, c, t, f, n);
 
-        let b = bits(denominator);
-        let c = bits(numerator);
-        let abs_b = self.b_and(b, k(0x7FFF_FFFF_FFFF_FFFF));
-        let abs_c = self.b_and(c, k(0x7FFF_FFFF_FFFF_FFFF));
-        let b_nan = icmp(LLVMIntUGT, abs_b, k(INFINITY));
-        let c_nan = icmp(LLVMIntUGT, abs_c, k(INFINITY));
-        let both_zero = and(icmp(LLVMIntEQ, abs_b, k(0)), icmp(LLVMIntEQ, abs_c, k(0)));
-        let both_infinite = and(
-            icmp(LLVMIntEQ, abs_b, k(INFINITY)),
-            icmp(LLVMIntEQ, abs_c, k(INFINITY)),
-        );
-        let exponent =
-            |v: LLVMValueRef| self.b_and(llvm::core::LLVMBuildLShr(self.b, v, k(52), n), k(0x7FF));
-        let underflow = icmp(
-            LLVMIntSLT,
-            self.b_sub(exponent(c), exponent(b)),
-            k((-1075i64) as u64),
-        );
 
-        // The answer for those cases, chosen in reverse so that the earlier
-        // ones of the ISA's order win. It is made of the operands alone, so
-        // only the last select sits on the quotient's dependency chain.
-        let quiet = |v: LLVMValueRef| self.b_or(v, k(0x0008_0000_0000_0000));
-        let signed_zero = self.b_and(self.b_xor(b, c), k(0x8000_0000_0000_0000));
-        let mut fixed = signed_zero;
-        fixed = select(or(both_zero, both_infinite), k(0xFFF8_0000_0000_0000), fixed);
-        fixed = select(b_nan, quiet(b), fixed);
-        fixed = select(c_nan, quiet(c), fixed);
-        let fix = or(or(underflow, or(both_zero, both_infinite)), or(b_nan, c_nan));
-        llvm::core::LLVMBuildBitCast(self.b, select(fix, fixed, bits(quotient)), self.f64t, n)
-    }
+
 
 
     // VCC bit 0 (single lane) as i1: (vcc & 1) != 0
@@ -593,7 +507,7 @@ unsafe fn compile_inner(
     let cg = Cg {
         state: std::cell::RefCell::new(state),
         writeback_words: plan.function.written,
-        ctx, module, b, func, scratch_base, private_base, private_size, yield_frame,
+        ctx, b, func, scratch_base, private_base, private_size, yield_frame,
         sgpr, vgpr, scc, i1, i8, i32t, i64t, f32t, f64t, ptr,
         predicate: std::cell::Cell::new(false),
         vgpr_f64,
@@ -649,6 +563,7 @@ unsafe fn compile_inner(
     }
 
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, None);
+    ssa.set_bvh_storage(super::dialect::rdna4::bvh::Storage {scratch: cg.bvh_scratch, packet: std::ptr::null_mut(), packet_ty: std::ptr::null_mut()});
     llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
     for &pc in program.blocks.keys() {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
@@ -684,7 +599,7 @@ unsafe fn compile_inner(
                     ssa.prepare_memory(&plan.function, pc, idx, |p, scalar| cg.memory_parameter(p, scalar));
                     cg.emit_memory(&plan.function.blocks[&pc].memory[&idx], &ssa, |k| ssa.memory_data(&plan.function, pc, idx, k));
                 }
-                super::lift::Lowering::Legacy(inst) => cg.emit_inst(inst),
+                super::lift::Lowering::Legacy(inst) => panic!("instruction has no typed IR lowering: {:?}",inst),
             }
         }
         ssa.condition(&plan.function, pc, |reg|cg.ld_sgpr32(reg), |input| cg.typed_input(input));
@@ -791,43 +706,25 @@ impl Cg {
 // =====================================================================
 
 impl Cg {
-    unsafe fn emit_inst(&self, inst: &InstFormat) {
-        match inst {
-            InstFormat::VOP3(i) => self.emit_vop3(i),
-            InstFormat::VIMAGE(i) => self.emit_vimage(i),
-            other => panic!("scalar: unsupported instruction {:?}", other),
-        }
-    }
+
 
     // ---- helpers ---------------------------------------------------------
     unsafe fn b_and(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildAnd(self.b, a, b, self.n())
     }
-    unsafe fn b_or(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        llvm::core::LLVMBuildOr(self.b, a, b, self.n())
-    }
-    unsafe fn b_xor(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        llvm::core::LLVMBuildXor(self.b, a, b, self.n())
-    }
+
+
     unsafe fn b_add(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildAdd(self.b, a, b, self.n())
     }
-    unsafe fn b_sub(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        llvm::core::LLVMBuildSub(self.b, a, b, self.n())
-    }
+
     unsafe fn b_not(&self, a: LLVMValueRef) -> LLVMValueRef {
         llvm::core::LLVMBuildNot(self.b, a, self.n())
     }
 
 
-    /// FP instructions carry no fast-math flags (bit-exact with the masked
-    /// backend); pass-through kept so call sites read uniformly.
-    unsafe fn fmf(&self, v: LLVMValueRef) -> LLVMValueRef {
-        v
-    }
-    unsafe fn fdiv(&self, a: LLVMValueRef, b: LLVMValueRef) -> LLVMValueRef {
-        self.fmf(llvm::core::LLVMBuildFDiv(self.b, a, b, self.n()))
-    }
+
+
     unsafe fn ptr_at(&self, addr: LLVMValueRef, off: u64) -> LLVMValueRef {
         let a = self.b_add(addr, self.ci64(off));
         llvm::core::LLVMBuildIntToPtr(self.b, a, self.ptr, self.n())
@@ -856,18 +753,7 @@ impl Cg {
 
 
     // ---- VOP3 ------------------------------------------------------------
-    unsafe fn emit_vop3(&self, i: &VOP3) {
-        match i.op {
-            // ----- integer -----
-            I::V_DIV_FIXUP_F64 => {
-                let b = self.absneg_f64(self.src_f64(&i.src1), i.abs, i.neg, 1);
-                let c = self.absneg_f64(self.src_f64(&i.src2), i.abs, i.neg, 2);
-                let r = self.div_fixup_f64(self.fdiv(c, b), b, c);
-                self.st_vgpr_f64(i.vdst as u32, r);
-            }
-            _ => panic!("scalar: unsupported VOP3 {:?}", i.op),
-        }
-    }
+
 
 
 
@@ -899,41 +785,7 @@ impl Cg {
 
     // ---- VIMAGE (hardware ray-tracing BVH intersect) — call the native
     // `image_bvh64_intersect_ray` helper; results land in bvh_scratch.
-    unsafe fn emit_vimage(&self, i: &VIMAGE) {
-        let bits_to_f32 = |r: u32| -> LLVMValueRef {
-            llvm::core::LLVMBuildBitCast(self.b, self.ld_vgpr32(r), self.f32t, self.n())
-        };
-        let scratch_ptr = |k: u32| -> LLVMValueRef {
-            llvm::core::LLVMBuildGEP2(self.b, self.i32t, self.bvh_scratch, [self.ci32(k)].as_mut_ptr(), 1, self.n())
-        };
-        match i.op {
-            I::IMAGE_BVH64_INTERSECT_RAY => {
-                let node_addr = self.ld_vgpr64(i.vaddr0 as u32);
-                let params = [
-                    self.ptr, self.ptr, self.ptr, self.ptr, self.i32t, self.i32t, self.i64t,
-                    self.f32t, self.f32t, self.f32t, self.f32t,
-                    self.f32t, self.f32t, self.f32t, self.f32t, self.f32t, self.f32t,
-                ];
-                let args = [
-                    scratch_ptr(0), scratch_ptr(1), scratch_ptr(2), scratch_ptr(3),
-                    // The resource, which names where the BVH is and how its
-                    // children are sorted.
-                    self.ld_sgpr32(i.rsrc as u32), self.ld_sgpr32(i.rsrc as u32 + 1),
-                    node_addr,
-                    bits_to_f32(i.vaddr1 as u32),
-                    bits_to_f32(i.vaddr2 as u32), bits_to_f32(i.vaddr2 as u32 + 1), bits_to_f32(i.vaddr2 as u32 + 2),
-                    bits_to_f32(i.vaddr3 as u32), bits_to_f32(i.vaddr3 as u32 + 1), bits_to_f32(i.vaddr3 as u32 + 2),
-                    bits_to_f32(i.vaddr4 as u32), bits_to_f32(i.vaddr4 as u32 + 1), bits_to_f32(i.vaddr4 as u32 + 2),
-                ];
-                self.call("image_bvh64_intersect_ray", llvm::core::LLVMVoidTypeInContext(self.ctx), &params, &args);
-                for k in 0..4u32 {
-                    let v = llvm::core::LLVMBuildLoad2(self.b, self.i32t, scratch_ptr(k), self.n());
-                    self.st_vgpr32(i.vdata as u32 + k, v);
-                }
-            }
-            _ => panic!("scalar: unsupported VIMAGE {:?}", i.op),
-        }
-    }
+
 
 
     // ---- SMEM (scalar load) ---------------------------------------------

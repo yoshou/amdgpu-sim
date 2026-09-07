@@ -6,6 +6,7 @@ use llvm::prelude::*;
 use llvm_sys as llvm;
 
 pub(super) struct Emitter {
+    pub(super) bvh: Option<super::dialect::rdna4::bvh::Storage>,
     registry: std::sync::Arc<super::dialect::DialectRegistry>,
     pub b: LLVMBuilderRef,
     module: LLVMModuleRef,
@@ -30,6 +31,7 @@ impl Emitter {
         let module = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(b)));
         Self {
             registry,
+            bvh: None,
             b,
             module,
             ctx: LLVMGetModuleContext(module),
@@ -430,6 +432,9 @@ impl Values {
             Inst::Effect {..}=>unreachable!("effects require their native action plan"),
             Inst::Boundary { .. } => unreachable!("architectural state must be explicit SSA"),
         }
+    }
+    pub unsafe fn set_bvh_storage(&mut self,storage:super::dialect::rdna4::bvh::Storage) {
+        self.emitter.bvh=Some(storage);self.scalar_emitter.bvh=Some(storage);
     }
     pub unsafe fn prepare_memory(
         &mut self,

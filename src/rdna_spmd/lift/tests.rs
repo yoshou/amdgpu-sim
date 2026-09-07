@@ -2327,3 +2327,5 @@ fn cooperative_ssa_values_survive_yield_and_accept_only_explicit_results() {
         assert_eq!((s[16],s[124]),(0x13572468,0xfeedbeef));
     }
 }
+
+mod remaining;
