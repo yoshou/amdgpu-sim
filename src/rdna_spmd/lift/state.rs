@@ -5,8 +5,8 @@ use crate::rdna_spmd::boundary::{BoundaryIo, RegSet};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Word { Vgpr(u32), Sgpr(u32), Mask(u32) }
-pub(super) type Words = BTreeMap<Word, ValueId>;
+pub(in crate::rdna_spmd) enum Word { Vgpr(u32), Sgpr(u32), Mask(u32) }
+pub(in crate::rdna_spmd) type Words = BTreeMap<Word, ValueId>;
 
 pub(super) fn core(f: &mut cfg::Func, insts: &mut Vec<cfg::Inst>, ty: Ty, op: Op) -> ValueId {
     let value = f.value(ty);
@@ -32,7 +32,7 @@ pub(super) fn valid_exec(f: &mut cfg::Func, insts: &mut Vec<cfg::Inst>, bit: Val
 }
 
 impl Word {
-    pub fn scalar(r: u32) -> Option<Self> {
+    pub(in crate::rdna_spmd) fn scalar(r: u32) -> Option<Self> {
         if matches!(r, 106 | 126) { Some(Self::Mask(r)) }
         else { (r < 128 && r != 124).then_some(Self::Sgpr(r)) }
     }

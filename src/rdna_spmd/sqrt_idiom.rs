@@ -3,6 +3,7 @@ use super::ir::typed::ValueId;
 use super::lift::Input;
 use super::analysis::state::Site;
 
+#[derive(Clone)]
 pub(super) enum Shape {
     Other,
     Exponent(ValueId),
@@ -11,6 +12,7 @@ pub(super) enum Shape {
     Sqrt { input: [ValueId; 2], output: [ValueId; 2] },
     Class([ValueId; 2]),
 }
+#[derive(Clone)]
 pub(super) struct Policy {
     pub shape: Shape,
     pub steppable: bool,
@@ -77,9 +79,9 @@ fn normal_sqrt_ldexp_indices(body: &[crate::rdna_instructions::InstFormat]) -> V
     analyze(&f.state.sites[&0]).0
 }
 #[cfg(test)]
-pub(super) fn normal_sqrt_ldexp_sites(program: &super::ir::ScalarProgram) -> Vec<(usize, usize)> {
-    program.blocks.iter().flat_map(|(&pc, block)| normal_sqrt_ldexp_indices(&block.body)
-        .into_iter().enumerate().filter_map(move |(index, yes)| yes.then_some((pc, index)))).collect()
+pub(super) fn normal_sqrt_ldexp_sites(program: &impl super::CompilationInput) -> Vec<(usize, usize)> {
+    program.to_ssa().function.state.sites.iter().flat_map(|(&pc,sites)|analyze(sites).0
+        .into_iter().enumerate().filter_map(move |(index,yes)|yes.then_some((pc,index)))).collect()
 }
 
 #[cfg(test)]

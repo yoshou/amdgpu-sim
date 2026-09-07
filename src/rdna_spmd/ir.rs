@@ -1,5 +1,5 @@
-//! Scalar IR: the LLVM-independent representation of one work-item's control
-//! flow and instructions.
+//! Decoded register CFG accepted at the SPMD input boundary.
+//! Preparation and compilation retain the typed SSA in `Program`.
 //!
 //! For a single work-item, a wavefront program is just a control-flow graph
 //! whose branches test a 1-bit EXEC (lane active?) / VCC / SCC. This module
@@ -186,6 +186,6 @@ pub(super) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -
 /// Split barriers into typed signal/wait yields, preserving IDs, signal-is-first
 /// results and the original instruction order. Resume entries retain the body
 /// after each effect; existing branch targets remain unchanged.
-pub fn split_at_barriers(program: &ScalarProgram) -> ScalarProgram {
-    super::lift::wave::split(program, |action| !action.is_wave()).0
+pub fn split_at_barriers(program: &impl super::CompilationInput) -> super::Program {
+    program.to_ssa().split(|action|!action.is_wave()).0
 }

@@ -229,82 +229,12 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     })
 }
 
-pub(crate) fn split(
-    program: &super::super::ir::ScalarProgram,
-    accept: impl Fn(&YieldAction) -> bool,
-) -> (
-    super::super::ir::ScalarProgram,
-    std::collections::BTreeMap<usize, YieldAction>,
-) {
-    use super::super::ir::{ScalarBlock, ScalarProgram, Terminator};
-    let mut next = program.blocks.keys().max().copied().unwrap_or(0) + 1;
-    let mut blocks = std::collections::BTreeMap::new();
-    let mut yields = std::collections::BTreeMap::new();
-    for block in program.blocks.values() {
-        let mut pc = block.pc;
-        let mut body = vec![];
-        for inst in &block.body {
-            let ops = if matches!(inst,InstFormat::SOPP(i) if matches!(i.op,I::S_BARRIER)) {
-                vec![
-                    YieldAction::new(
-                        EffectOp::BarrierSignal { is_first: false },
-                        vec![src(SourceOperand::LiteralConstant(u32::MAX))],
-                        vec![],
-                    ),
-                    YieldAction::new(
-                        EffectOp::BarrierWait,
-                        vec![src(SourceOperand::LiteralConstant(u32::MAX))],
-                        vec![],
-                    ),
-                ]
-            } else {
-                instruction(inst).into_iter().collect()
-            };
-            if !ops.is_empty() && ops.iter().all(&accept) {
-                for action in ops {
-                    let resume = next;
-                    next += 1;
-                    blocks.insert(
-                        pc,
-                        ScalarBlock {
-                            pc,
-                            body: std::mem::take(&mut body),
-                            term: Terminator::Yield {
-                                resume,
-                                action: Box::new(action.clone()),
-                            },
-                        },
-                    );
-                    yields.insert(resume, action);
-                    pc = resume;
-                }
-            } else {
-                body.push(inst.clone());
-            }
-        }
-        blocks.insert(
-            pc,
-            ScalarBlock {
-                pc,
-                body,
-                term: block.term.clone(),
-            },
-        );
-    }
-    (
-        ScalarProgram {
-            entry_pc: program.entry_pc,
-            blocks,
-        },
-        yields,
-    )
-}
-
-/// SSA operands/results of one ordered wave or barrier effect.
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct Plan {
     pub local: bool,
     pub parameters: Vec<(super::Input, super::ValueId)>,
     pub core: std::ops::Range<usize>,
+    pub end: usize,
     pub arguments: Vec<super::ValueId>,
     pub results: Vec<(super::ValueId, Ty)>,
     pub definitions: Vec<(Destination, super::ValueId)>,
@@ -429,7 +359,7 @@ impl YieldAction {
                 }
                 layout
             };
-        Plan { local: false, parameters, core: start..end, arguments: inputs, results: outputs,
+        Plan { local: false, parameters, core: start..end, end: block.insts.len(), arguments: inputs, results: outputs,
             definitions, destinations: self.outputs.clone(), layout }
     }
 }

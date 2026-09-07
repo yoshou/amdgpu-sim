@@ -8,7 +8,7 @@
 //!
 //! Pipeline:
 //! ```text
-//! Compiler: decoded CFG -> local combine -> Scalar IR -> math combine
+//! Compiler: decoded CFG -> lift -> typed SSA preparation -> SSA CFG splits
 //!           -> scalar/packet analysis -> LLVM IR -> JIT
 //! ```
 //!
@@ -93,6 +93,8 @@ mod emit_vec;
 mod combine;
 mod ir;
 mod compiler;
+mod program;
+pub use program::{Program, CompilationInput};
 mod scalar_plan;
 mod lift;
 mod typed_codegen;

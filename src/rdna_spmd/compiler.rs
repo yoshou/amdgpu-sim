@@ -1,21 +1,19 @@
-//! Order the existing IR preparation, optimizations, analyses and emitters.
-//!
-//! The public free functions remain compatibility entrypoints. Constructed or
-//! boundary-split ScalarPrograms go straight to analysis when compiled; passes
-//! run during preparation only, retaining the existing invocation count/order.
-//! Source preparation retains its public register-CFG input/output API; rewrite
-//! decisions and compilation analyses use typed SSA.
+//! Decode/lift once, prepare typed SSA, then select native representation and
+//! emit LLVM. Prepared programs and CFG fragments retain their SSA graph.
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use crate::rdna_instructions::InstFormat;
 use crate::rdna_translator::RDNAProgram;
 
 use super::boundary::BoundaryIo;
 use super::emit::{CoopKernel, ScalarKernel};
 use super::emit_vec::{CoopVecKernel, VecKernel};
+#[cfg(test)]
 use super::ir::{self, ScalarBlock, ScalarProgram};
-use super::packet_plan::{cooperative_vgpr_count, PacketPlan};
+use super::program::{Program, CompilationInput};
+use super::packet_plan::PacketPlan;
 use super::scalar_plan::{ScalarMode, ScalarPlan};
 
 /// Coordinates the existing SPMD compilation stages.
@@ -25,87 +23,69 @@ impl Default for Compiler {
 }
 
 impl Compiler {
-    /// Prepare the current register IR from the decoded CFG.
-    pub fn build_scalar_program(&self, program: &RDNAProgram) -> ScalarProgram {
-        let mut blocks = BTreeMap::new();
-        for (&pc, block) in program.blocks() {
-            blocks.insert(pc, self.prepare_block(pc, block.insts().to_vec(), block.next_pcs()));
-        }
-        let mut program = ScalarProgram { entry_pc: program.entry_pc(), blocks };
-        // Cross-block sqrt recognition requires the complete normalized CFG.
-        super::lift::rewrite::fold_sqrt(&mut program);
-        program
-    }
-
-    fn prepare_block(&self, pc: usize, mut insts: Vec<InstFormat>, next_pcs: &[usize]) -> ScalarBlock {
-        // The existing local sqrt/DCE pass treats the last instruction as live.
-        // It must run before terminator extraction and scheduling-no-op removal.
-        super::lift::rewrite::combine_block(&mut insts);
-        let mut block = ir::lower_block(pc, &insts, next_pcs);
-        // The current emitter computes DIV_FIXUP's quotient from its original
-        // operands. Preserve this backend-specific optimization at this stage.
-        super::lift::rewrite::collapse_div_expansions(&mut block.body);
-        block
+    /// Lift decoded input and run preparation passes entirely in typed SSA.
+    pub fn build_scalar_program(&self, program: &RDNAProgram) -> Program {
+        Program::decoded(program,self.registry.clone())
     }
 
     /// Compile lane-local execution. General 32-lane effects are split with
     /// `split_at_xlane` and executed by a wave/cooperative dispatcher.
-    pub fn compile_program(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-        let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Whole);
+    pub fn compile_program(&self, program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel {
+        let plan = ScalarPlan::from_ssa(program.to_ssa().function, ScalarMode::Whole);
         super::emit::compile_program(&plan,num_vgprs)
     }
 
-    pub fn compile_program_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
-        let plan = PacketPlan::with_return_state(self.registry.clone(), program, width, None,false);
+    pub fn compile_program_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> VecKernel {
+        let plan = PacketPlan::from_ssa(program.to_ssa().function, width, None,false);
         super::emit_vec::compile_program(&plan,num_vgprs.max(256))
     }
 
-    pub fn compile_cooperative_vec(&self, program: &ScalarProgram, num_vgprs: usize, width: u32) -> CoopVecKernel {
-        let boundary = program.blocks.values().filter_map(|b| match &b.term {
-            super::ir::Terminator::Yield {resume,action} => Some((*resume,action.io())), _=>None,
-        }).collect();
-        self.compile_packet_cooperative(program,num_vgprs,width,&boundary)
+    pub fn compile_cooperative_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> CoopVecKernel {
+        let program=program.to_ssa();
+        let boundary=program.boundary_io();
+        self.compile_packet_cooperative(&program,num_vgprs,width,&boundary)
     }
 
     /// Compile a program already split at barriers for the existing scheduler.
-    pub fn compile_cooperative(&self, program: &ScalarProgram, num_vgprs: usize) -> CoopKernel {
-        let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Cooperative);
+    pub fn compile_cooperative(&self, program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel {
+        let plan = ScalarPlan::from_ssa(program.to_ssa().function, ScalarMode::Cooperative);
         super::emit::compile_cooperative(&plan, num_vgprs)
     }
 
-    pub(super) fn compile_writeback(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
-        let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Writeback);
+    pub(super) fn compile_writeback(&self, program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel {
+        let plan = ScalarPlan::from_ssa(program.to_ssa().function, ScalarMode::Writeback);
         super::emit::compile_program(&plan, num_vgprs)
     }
 
     pub(super) fn compile_packet_cooperative(
         &self,
-        program: &ScalarProgram,
+        program: &impl CompilationInput,
         num_vgprs: usize,
         width: u32,
         boundary: &BTreeMap<usize, BoundaryIo>,
     ) -> CoopVecKernel {
         assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
-        let num_vgprs = cooperative_vgpr_count(program, num_vgprs, boundary);
-        let plan = PacketPlan::with_registry(self.registry.clone(), program, width, Some(boundary));
+        let program=program.to_ssa();
+        let num_vgprs = program.vgpr_count(num_vgprs,boundary);
+        let plan = PacketPlan::from_ssa(program.function, width, Some(boundary), true);
         super::emit_vec::compile_cooperative(&plan, num_vgprs)
     }
 }
 
-/// Prepare the current optimized Scalar IR; preserves the existing API.
-pub fn build_scalar_program(program: &RDNAProgram) -> ScalarProgram {
+/// Prepare an owned typed SSA program from the decoded CFG.
+pub fn build_scalar_program(program: &RDNAProgram) -> Program {
     Compiler::default().build_scalar_program(program)
 }
 
-pub fn compile_program(program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
+pub fn compile_program(program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel {
     Compiler::default().compile_program(program, num_vgprs)
 }
 
-pub fn compile_program_vec(program: &ScalarProgram, num_vgprs: usize, width: u32) -> VecKernel {
+pub fn compile_program_vec(program: &impl CompilationInput, num_vgprs: usize, width: u32) -> VecKernel {
     Compiler::default().compile_program_vec(program, num_vgprs, width)
 }
 
-pub fn compile_cooperative(program: &ScalarProgram, num_vgprs: usize) -> CoopKernel {
+pub fn compile_cooperative(program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel {
     Compiler::default().compile_cooperative(program, num_vgprs)
 }
 
@@ -126,28 +106,44 @@ mod tests {
         InstFormat::SOPP(SOPP { simm16: 0, op })
     }
 
+    fn prepared(insts:Vec<InstFormat>,next:&[usize])->Program {
+        use super::super::lift::optimize::Position;
+        let source=ir::lower_block(4,&insts,next);
+        let mut blocks=BTreeMap::from([(4,source)]);
+        for &pc in next {blocks.entry(pc).or_insert(ScalarBlock {pc,body:vec![],term:Terminator::Return});}
+        let source=ScalarProgram {entry_pc:4,blocks};
+        let mut program=source.to_ssa();
+        let mut index=0;let mut positions=Vec::new();
+        for inst in &insts {
+            if matches!(inst,InstFormat::SOPP(_)) {
+                let words=program.function.words_before(4,index);
+                positions.push(Position::Control(super::super::lift::rewrite::observation(inst,&words,&words)));
+            }else{positions.push(Position::Instruction(index));index+=1;}
+        }
+        let mut positions=BTreeMap::from([(4,positions)]);
+        for &pc in next {positions.entry(pc).or_default();}
+        program.function.optimize(positions);program.function.compact();
+        program.function.ir.clone().verify_with(&program.function.registry).unwrap();
+        assert_eq!(source.blocks[&4].body.len(),insts.iter().filter(|i|!matches!(i,InstFormat::SOPP(_))).count());
+        program
+    }
     #[test]
     fn normalization_preserves_writes_and_compiler_applies_dce() {
-        let insts = vec![mov(1), mov(2), control(I::S_NOP), control(I::S_ENDPGM)];
-        let raw = ir::lower_block(4, &insts, &[]);
-        assert_eq!(raw.body.len(), 2);
-        assert!(matches!(raw.term, Terminator::Return));
-        let prepared = Compiler::default().prepare_block(4, insts, &[]);
-        assert_eq!(prepared.body.len(), 1);
-        assert!(matches!(&prepared.body[0], InstFormat::VOP1(i)
-            if matches!(i.src0, SourceOperand::LiteralConstant(2))));
-        assert!(matches!(prepared.term, Terminator::Return));
+        let insts=vec![mov(1),mov(2),control(I::S_NOP),control(I::S_ENDPGM)];
+        assert_eq!(ir::lower_block(4,&insts,&[]).body.len(),2);
+        let p=prepared(insts,&[]);
+        assert_eq!(p.function.blocks[&4].instructions.len(),1);
+        assert!(matches!(p.function.ir.blocks[&super::super::ir::typed::cfg::BlockId(4)].term,super::super::ir::typed::cfg::Term::Ret));
     }
-
     #[test]
     fn preparation_preserves_fallthrough_instruction_and_branch_successors() {
-        let fallthrough = Compiler::default().prepare_block(4, vec![mov(1), mov(2)], &[8]);
-        assert_eq!(fallthrough.body.len(), 1);
-        assert!(matches!(fallthrough.term, Terminator::Jump(8)));
-        let branch = Compiler::default().prepare_block(4, vec![mov(2), control(I::S_CBRANCH_EXECZ)], &[8, 12]);
-        assert_eq!(branch.body.len(), 1);
-        assert!(matches!(branch.term, Terminator::Branch {
-            cond: Cond::ExecZ, taken: 12, fallthrough: 8,
-        }));
+        use super::super::ir::typed::cfg::{BlockId,Term};
+        let p=prepared(vec![mov(1),mov(2)],&[8]);
+        assert_eq!(p.function.blocks[&4].instructions.len(),1);
+        assert!(matches!(&p.function.ir.blocks[&BlockId(4)].term,Term::Br(e) if e.dst==BlockId(8)));
+        let p=prepared(vec![mov(2),control(I::S_CBRANCH_EXECZ)],&[8,12]);
+        assert_eq!(p.function.blocks[&4].instructions.len(),1);
+        assert_eq!(p.function.state.conditions[&4],Cond::ExecZ);
+        assert!(matches!(&p.function.ir.blocks[&BlockId(4)].term,Term::CondBr {yes,no,..} if yes.dst==BlockId(12)&&no.dst==BlockId(8)));
     }
 }

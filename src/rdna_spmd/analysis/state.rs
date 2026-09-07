@@ -2,12 +2,14 @@
 //! the existing conservative predication policy; data flow follows SSA edges.
 use super::*;
 
+#[derive(Clone)]
 pub(in crate::rdna_spmd) enum Activation {
     Unknown,
     Copy(ValueId),
     Constant(bool),
     Or { exec: Option<ValueId>, saved: Option<ValueId> },
 }
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct ExecPolicy {
     pub before: ValueId,
     pub after: ValueId,
@@ -19,10 +21,11 @@ pub(in crate::rdna_spmd) struct ExecPolicy {
     pub writes: bool,
     pub resets_nonempty: bool,
 }
+#[derive(Clone)]
 pub(in crate::rdna_spmd) enum MaskEvent {
     Save(u32), Copy(u32), Logic { restore: bool, sources: Vec<u32> }, Compare,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::rdna_spmd) struct MaskPolicy {
     pub closure: Vec<u32>,
     pub seed: Vec<u32>,
@@ -31,6 +34,7 @@ pub(in crate::rdna_spmd) struct MaskPolicy {
     pub event: Option<MaskEvent>,
     pub cross_lane: bool,
 }
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct Site {
     pub rewrite: super::rewrite::Observation,
     pub math_reads: Vec<(u32, ValueId)>,
@@ -48,7 +52,7 @@ pub(in crate::rdna_spmd) struct Site {
     pub writes: Vec<(u32, ValueId)>,
     pub reactivation: Vec<(u32, ValueId)>,
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::rdna_spmd) struct StateGraph {
     pub vector_parameters: Vec<(u32, usize)>,
     pub scalar_parameters: Vec<(u32, usize)>,

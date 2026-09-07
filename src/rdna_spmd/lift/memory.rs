@@ -357,11 +357,13 @@ pub(in crate::rdna_spmd) enum Parameter {
 }
 /// Address expressions and word accesses share the function's value namespace.
 /// The original contiguous groups are retained for pairs/transpose selection.
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct Plan {
     pub memory: Memory,
     pub group_atomics: bool,
     pub parameters: Vec<(Parameter, ValueId)>,
     pub core: std::ops::Range<usize>,
+    pub end: usize,
     pub pairs: Vec<(ValueId, ValueId)>,
     pub base: ValueId,
     pub address: ValueId,
@@ -652,6 +654,7 @@ impl Memory {
             memory: self.clone(),
             parameters,
             core: start..end,
+            end: block.insts.len(),
             pairs: operands.pairs,
             base,
             address,

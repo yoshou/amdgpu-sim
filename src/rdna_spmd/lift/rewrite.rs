@@ -468,7 +468,7 @@ fn math(inst: &InstFormat, before: &Words) -> Option<crate::rdna_spmd::analysis:
 pub(super) fn word(slot: u32) -> Option<Word> {
     if slot >= VGPR_BASE { Some(Word::Vgpr(slot-VGPR_BASE)) } else { Word::scalar(slot) }
 }
-pub(super) fn observation(inst: &InstFormat, before: &Words, after: &Words) -> crate::rdna_spmd::analysis::rewrite::Observation {
+pub(in crate::rdna_spmd) fn observation(inst: &InstFormat, before: &Words, after: &Words) -> crate::rdna_spmd::analysis::rewrite::Observation {
     let effects = effects_of(inst);
     crate::rdna_spmd::analysis::rewrite::Observation {
         reads: effects.reads.iter().filter_map(|&r| word(r).and_then(|w| before.get(&w).copied())).collect(),
@@ -481,91 +481,6 @@ pub(super) fn observation(inst: &InstFormat, before: &Words, after: &Words) -> c
         replaced: effects.kills.iter().filter_map(|&r| word(r).and_then(|w| before.get(&w).copied())).collect(),
         known: effects.known, removable: effects.removable, math: math(inst, before),
     }
-}
-
-/// Input-only lifting for the pre-normalization local passes. Scheduling and
-/// control instructions retain their original positions as proof barriers or
-/// explicit observations; executable instructions use the same typed lifter.
-pub(in crate::rdna_spmd) fn block(insts: &[InstFormat]) -> Vec<crate::rdna_spmd::analysis::rewrite::Observation> {
-    use std::collections::BTreeMap;
-    use crate::rdna_spmd::ir::{ScalarProgram, ScalarBlock, Terminator};
-    let body: Vec<_> = insts.iter().filter(|i| !matches!(i, InstFormat::SOPP(_))).cloned().collect();
-    let registry = std::sync::Arc::new(DialectRegistry::rdna4());
-    let instructions: Vec<_> = body.iter().map(|i| instruction_with_registry(i, &registry)).collect();
-    let program = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([(0, ScalarBlock { pc: 0, body, term: Terminator::Return })]) };
-    let f = function::Function::lift_raw(registry, &program, &BTreeMap::from([(0, instructions.iter().collect())]));
-    let mut index = 0;
-    let mut current: Words = f.state.scalar_parameters.iter().map(|&(slot, index)|
-        (Word::scalar(slot).unwrap(), f.ir.blocks[&cfg::BlockId(0)].params[index].0)).collect();
-    let mut out = Vec::new();
-    for inst in insts {
-        if matches!(inst, InstFormat::SOPP(_)) { out.push(observation(inst, &current, &current)); }
-        else {
-            let site = &f.state.sites[&0][index];
-            out.push(site.rewrite.clone());
-            // Only control observations need the current scalar word bindings.
-            for &(slot, value) in &site.rewrite.defined_words {
-                if slot < VGPR_BASE { current.insert(Word::scalar(slot).unwrap(), value); }
-            }
-            index += 1;
-        }
-    }
-    out
-}
-
-fn retain(insts: &mut Vec<InstFormat>, remove: Vec<bool>) -> usize {
-    let removed = remove.iter().filter(|&&yes| yes).count();
-    let mut flags = remove.into_iter();
-    insts.retain(|_| !flags.next().unwrap());
-    removed
-}
-pub(in crate::rdna_spmd) fn combine_block(insts: &mut Vec<InstFormat>) -> usize {
-    let mut observations = block(insts);
-    let (remove, rewrites) = crate::rdna_spmd::combine::square_roots(&observations);
-    let changed = !rewrites.is_empty();
-    for (index, destination, input) in rewrites {
-        insts[index] = InstFormat::VOP1(crate::rdna_instructions::VOP1 {
-            op: I::V_SQRT_F64, vdst: destination as u8, src0: SourceOperand::VectorRegister(input as u8),
-        });
-    }
-    let mut removed = retain(insts, remove);
-    if changed { observations = block(insts); }
-    loop {
-        let remove = crate::rdna_spmd::combine::dead(&observations);
-        crate::rdna_spmd::analysis::rewrite::remove_dead(&mut observations, &remove);
-        let n = retain(insts, remove);
-        if n == 0 { return removed; }
-        removed += n;
-    }
-}
-pub(in crate::rdna_spmd) fn collapse_div_expansions(insts: &mut Vec<InstFormat>) -> usize {
-    if !insts.iter().any(|i| matches!(i, InstFormat::VOP3(i) if matches!(i.op, I::V_DIV_FIXUP_F64))) { return 0; }
-    retain(insts, crate::rdna_spmd::combine::divisions(&block(insts)))
-}
-
-pub(in crate::rdna_spmd) fn fold_sqrt(program: &mut crate::rdna_spmd::ir::ScalarProgram) -> usize {
-    use std::collections::BTreeMap;
-    if !program.blocks.values().flat_map(|b| &b.body).any(|i|
-        matches!(i, InstFormat::VOP1(i) if matches!(i.op, I::V_RSQ_F64))) { return 0; }
-    let registry = std::sync::Arc::new(DialectRegistry::rdna4());
-    let instructions: BTreeMap<_, Vec<_>> = program.blocks.iter().map(|(&pc, block)|
-        (pc, block.body.iter().map(|i| instruction_with_registry(i, &registry)).collect())).collect();
-    let refs = instructions.iter().map(|(&pc, body)| (pc, body.iter().collect())).collect();
-    let f = function::Function::lift_raw(registry, program, &refs);
-    let edits = crate::rdna_spmd::mathcombine::analyze(&f);
-    let mut count = 0;
-    for (pc, (removed, rewrites)) in edits {
-        count += rewrites.len();
-        let body = &mut program.blocks.get_mut(&pc).unwrap().body;
-        for (index, destination, input) in rewrites {
-            body[index] = InstFormat::VOP1(crate::rdna_instructions::VOP1 {
-                op: I::V_SQRT_F64, vdst: destination as u8, src0: SourceOperand::VectorRegister(input as u8),
-            });
-        }
-        let mut index = 0;
-        body.retain(|_| { let keep = !removed.contains(&index); index += 1; keep });
-    }
-    count
 }
 
 #[cfg(test)]
@@ -587,7 +502,7 @@ mod tests {
         // Two independent refinements are interleaved. Only the second one
         // reaches a fixup here. Its first scheduling point is numerator scaling,
         // which does not itself read the already-scaled denominator v2:v3.
-        let mut body = vec![
+        let body = vec![
             scale(16,124,v(14),v(14),one), scale(2,124,v(22),v(22),v(0)),
             scale(10,106,v(0),v(22),v(0)), rcp(18,16), rcp(6,2),
             alu(I::V_FMA_F64,32,v(16),v(18),one,1), alu(I::V_FMA_F64,8,v(2),v(6),one,1),
@@ -597,8 +512,17 @@ mod tests {
             alu(I::V_FMA_F64,2,v(2),v(8),v(10),1), alu(I::V_DIV_FMAS_F64,2,v(2),v(6),v(8),0),
             alu(I::V_DIV_FIXUP_F64,24,v(2),v(22),v(0),0),
         ];
-        let expected: Vec<_> = [0,3,5,7,14].map(|index| format!("{:?}",body[index])).into();
-        assert_eq!(collapse_div_expansions(&mut body), 10);
-        assert_eq!(body.iter().map(|i| format!("{i:?}")).collect::<Vec<_>>(), expected);
+        use crate::rdna_spmd::{CompilationInput,ScalarProgram,ScalarBlock,Terminator};
+        use std::collections::BTreeMap;
+        let program=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([(0,ScalarBlock {pc:0,body,term:Terminator::Return})])};
+        let mut f=program.to_ssa().function;
+        let observations:Vec<_>=f.state.sites[&0].iter().map(|s|s.rewrite.clone()).collect();
+        let expected:Vec<_>=[0,3,5,7,14].map(|i|observations[i].math.as_ref().map(|m|(m.kind,m.destination))).into();
+        let remove=crate::rdna_spmd::combine::divisions(&observations);
+        assert_eq!(remove.iter().filter(|&&v|v).count(),10);
+        f.remove_sites(0,&remove);
+        assert_eq!(f.state.sites[&0].iter().map(|s|s.rewrite.math.as_ref().map(|m|(m.kind,m.destination))).collect::<Vec<_>>(),expected);
+        f.compact();
+        f.ir.verify_with(&f.registry).unwrap();
     }
 }

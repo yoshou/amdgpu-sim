@@ -78,29 +78,3 @@ impl Definitions {
         (index < before && body[index+1..before].iter().all(|s| s.known)).then_some(index)
     }
 }
-
-/// Remove a proven-dead instruction round without lifting the remaining source
-/// again. A deleted definition is bypassed to its previous word on subsequent
-/// overwrite observations; no retained semantic use may depend on it.
-pub(in crate::rdna_spmd) fn remove_dead(body: &mut Vec<Observation>, remove: &[bool]) {
-    let mut bypass = BTreeMap::new();
-    for (site, &removed) in body.iter().zip(remove) {
-        if removed {
-            for (&(_, value), &previous) in site.definitions.iter().zip(&site.replaced) {
-                if value != previous { bypass.insert(value, previous); }
-            }
-        }
-    }
-    let resolve = |mut value| {
-        while let Some(&previous) = bypass.get(&value) { value = previous; }
-        value
-    };
-    let mut flags = remove.iter();
-    body.retain(|_| !flags.next().unwrap());
-    for site in body {
-        for value in site.reads.iter_mut().chain(&mut site.replaced) { *value = resolve(*value); }
-        if let Some(math) = &mut site.math {
-            for input in &mut math.inputs { for value in input.words.iter_mut().flatten() { *value = resolve(*value); } }
-        }
-    }
-}

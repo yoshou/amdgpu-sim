@@ -13,7 +13,9 @@ use crate::rdna_instructions::InstFormat;
 use crate::rdna_instructions::VGLOBAL;
 
 use super::boundary::BoundaryIo;
-use super::ir::{Cond, ScalarProgram, Terminator};
+use super::ir::Cond;
+#[cfg(test)]
+use super::ir::{ScalarProgram, Terminator};
 #[cfg(test)]
 use super::ir::ScalarBlock;
 use super::load_cluster::{self, VgCluster};
@@ -71,6 +73,7 @@ impl<'a> PacketPlan<'a> {
     pub fn new(program: &ScalarProgram, width: u32, boundary: Option<&'a BTreeMap<usize, BoundaryIo>>) -> Self {
         Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, width, boundary)
     }
+    #[cfg(test)]
     pub fn with_registry(
         registry: std::sync::Arc<super::dialect::DialectRegistry>,
         program: &ScalarProgram,
@@ -79,6 +82,7 @@ impl<'a> PacketPlan<'a> {
     ) -> Self {
         Self::with_return_state(registry,program,width,boundary,true)
     }
+    #[cfg(test)]
     pub fn with_return_state(
         registry: std::sync::Arc<super::dialect::DialectRegistry>,
         program: &ScalarProgram,
@@ -86,46 +90,28 @@ impl<'a> PacketPlan<'a> {
         boundary: Option<&'a BTreeMap<usize,BoundaryIo>>,
         observe_return: bool,
     ) -> Self {
-        // Host-written values on resume must not retain uniform/frame facts.
-        let boundary_writes = boundary
-            .map(|map| map.iter().map(|(&pc, io)| (pc, io.writes.vgprs().collect())).collect())
-            .unwrap_or_default();
-        // ReadFirstLane selects an EXEC-active lane. Its ordinary liveness is
-        // tracked at the terminator; it does not observe every inactive value.
-        let active_reads: BTreeSet<_>=program.blocks.values().filter_map(|b|match &b.term {
-            Terminator::Yield {resume,action} if action.op==super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::ReadFirstLane)=>Some(*resume),
-            _=>None,
+        Self::from_ssa(super::program::Program::lift(program,registry).function,width,boundary,observe_return)
+    }
+    pub fn from_ssa(
+        mut lifted_function: super::lift::function::LiftedFunction, width: u32,
+        boundary: Option<&'a BTreeMap<usize,BoundaryIo>>, observe_return: bool,
+    ) -> Self {
+        lifted_function.prepare_queries();
+        let boundary_writes = boundary.map(|map|map.iter().map(|(&pc,io)|(pc,io.writes.vgprs().collect())).collect()).unwrap_or_default();
+        let active_reads: BTreeSet<_> = lifted_function.blocks.iter().filter_map(|(&pc,b)| {
+            let p=b.yield_values.as_ref()?;
+            (p.layout.op==super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::ReadFirstLane))
+                .then(||lifted_function.ir.blocks[&super::ir::typed::cfg::BlockId(pc)].term.edges()[0].dst.0)
         }).collect();
-        let boundary_reads: Vec<u32> = boundary
-            .map(|map| map.iter().filter(|(pc,_)|!active_reads.contains(pc)).flat_map(|(_,io)| io.reads.vgprs()).collect())
-            .unwrap_or_default();
-        let exit_reads = if boundary.is_some() && observe_return { (0..256).collect::<Vec<_>>() } else { boundary_reads };
-
-        let mut lifted = BTreeMap::new();
-        let mut blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
-            let mut instructions = Vec::with_capacity(block.body.len());
-            let mut semantics = Vec::with_capacity(block.body.len());
-            for inst in &block.body {
-                let lowering = super::lift::instruction_with_registry(inst, &registry);
-                semantics.push(lowering);
-                instructions.push(InstructionPlan {
-                    elide_predicate: false,
-                    entry_exec_unchanged: false,
-                    nonempty_exec: false,
-                    sqrt: None,
-                    global_load: GlobalLoad::Gather,
-                    action: InstructionAction::Emit,
-                });
-            }
-            let specialize = false;
-            let fresh = [0; 2];
-            // Canonical pairs have no live i32 slots to synchronize on edges.
-            let stale = [0; 2];
-            lifted.insert(pc, semantics);
-            (pc, BlockPlan { instructions, fresh, stale, specialize })
-        }).collect();
-        let lowerings = lifted.iter().map(|(&pc, block)| (pc, block.iter().collect())).collect();
-        let mut lifted_function = super::lift::function::Function::lift(registry, program, &lowerings);
+        let boundary_reads: Vec<u32> = boundary.map(|map|map.iter().filter(|(pc,_)|!active_reads.contains(pc))
+            .flat_map(|(_,io)|io.reads.vgprs()).collect()).unwrap_or_default();
+        let exit_reads=if boundary.is_some()&&observe_return {(0..256).collect::<Vec<_>>()}else{boundary_reads};
+        let mut blocks: BTreeMap<_,_> = lifted_function.blocks.iter().map(|(&pc,b)|(pc,BlockPlan {
+            instructions:(0..b.instructions.len()).map(|_|InstructionPlan {
+                elide_predicate:false,entry_exec_unchanged:false,nonempty_exec:false,sqrt:None,
+                global_load:GlobalLoad::Gather,action:InstructionAction::Emit,
+            }).collect(),fresh:[0;2],stale:[0;2],specialize:false,
+        })).collect();
         for (&pc, block) in &mut blocks {
             let (normal, sqrt) = sqrt_idiom::analyze(&lifted_function.state.sites[&pc]);
             for (index, instruction) in block.instructions.iter_mut().enumerate() { instruction.sqrt = sqrt[index].clone(); }
@@ -205,30 +191,6 @@ fn select_mask_region(function: &super::lift::function::LiftedFunction, cooperat
     Some(MaskRegion { header: region.header, body, registers: region.mask_stack.mask_sgprs, exits })
 }
 
-pub(super) fn cooperative_vgpr_count(
-    program: &ScalarProgram,
-    declared_vgprs: usize,
-    boundary: &BTreeMap<usize, BoundaryIo>,
-) -> usize {
-    // Some gfx1200 callers still decode the descriptor with the older 4-VGPR
-    // granularity, so retain every register the IR or a lifted boundary can
-    // observe. Unlike the former 256-register floor, this avoids copying 8 KiB
-    // of dead packet state on every coroutine yield in small kernels.
-    let required_vgprs = program
-        .blocks
-        .values()
-        .flat_map(|block| block.body.iter())
-        .flat_map(|inst| {
-            let mut regs = super::lift::access::vgpr_reads(inst);
-            regs.extend(super::lift::access::vgpr_writes(inst));
-            regs
-        })
-        .chain(boundary.values().flat_map(|io| io.writes.vgprs()))
-        .max()
-        .map_or(1, |reg| reg as usize + 1);
-    declared_vgprs.max(required_vgprs)
-}
-
 #[cfg(test)]
 mod cooperative_vgpr_tests {
     use super::*;
@@ -255,14 +217,14 @@ use crate::instructions::I;
             )]),
         };
 
-        assert_eq!(cooperative_vgpr_count(&program, 16, &BTreeMap::new()), 28);
+        assert_eq!(super::super::CompilationInput::to_ssa(&program).vgpr_count(16, &BTreeMap::new()), 28);
         let mut boundary = BoundaryIo::default();
         boundary.writes.add_vgpr(31);
         assert_eq!(
-            cooperative_vgpr_count(&program, 16, &BTreeMap::from([(2, boundary)])),
+            super::super::CompilationInput::to_ssa(&program).vgpr_count(16, &BTreeMap::from([(2, boundary)])),
             32
         );
-        assert_eq!(cooperative_vgpr_count(&program, 64, &BTreeMap::new()), 64);
+        assert_eq!(super::super::CompilationInput::to_ssa(&program).vgpr_count(64, &BTreeMap::new()), 64);
     }
 }
 

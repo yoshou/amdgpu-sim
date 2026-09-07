@@ -1829,7 +1829,7 @@ fn mixed_wave_memory_yields_preserve_full_wave_values_and_partial_waves() {
             sve: 0,
         }));
     }
-    let program = super::wave::split(
+    let program = crate::rdna_spmd::CompilationInput::to_ssa(
         &ScalarProgram {
             entry_pc: 0,
             blocks: BTreeMap::from([(
@@ -1841,9 +1841,7 @@ fn mixed_wave_memory_yields_preserve_full_wave_values_and_partial_waves() {
                 },
             )]),
         },
-        |_| true,
-    )
-    .0;
+    ).split(|_| true).0;
     let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
     kd.enable_sgpr_kernarg_segment_ptr = true;
     let dims = GridDims {

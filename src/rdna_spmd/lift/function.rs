@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use super::state::{Word, Words, footprint, words as register_words};
 
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct Alu {
     pub inputs: Vec<(Input, ValueId)>,
     pub source_inputs: usize,
@@ -26,6 +27,7 @@ pub(in crate::rdna_spmd) struct Alu {
     /// together. This is representation coalescing, not another SSA definition.
     pub pairs: Vec<(ValueId, ValueId)>,
 }
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct BlockPlan {
     pub instructions: Vec<Option<Alu>>,
     pub memory: BTreeMap<usize, super::memory::Plan>,
@@ -33,8 +35,10 @@ pub(in crate::rdna_spmd) struct BlockPlan {
     pub outgoing: Vec<ValueId>,
     pub yield_values: Option<super::wave::Plan>,
     pub condition: Option<Condition>,
-    yielding: bool,
+    pub(in crate::rdna_spmd) yielding: bool,
+    pub(in crate::rdna_spmd) yield_action: Option<super::wave::YieldAction>,
 }
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct Condition {
     pub input: Input,
     pub input_value: ValueId,
@@ -63,6 +67,7 @@ pub(in crate::rdna_spmd) struct Function {
     pub observable_return: bool,
 }
 /// Typed SSA before native representation and predication decisions are applied.
+#[derive(Clone)]
 pub(in crate::rdna_spmd) struct LiftedFunction {
     pub registry: std::sync::Arc<DialectRegistry>,
     pub written: crate::rdna_spmd::boundary::RegSet,
@@ -176,7 +181,6 @@ impl Function {
             for (index, lowering) in lowerings[&pc].iter().enumerate() {
                 let source_inst = &source.body[index];
                 let previous_words = words.clone();
-                let first_value = f.types.len();
                 let reads = super::access::vgpr_reads(source_inst).iter()
                     .map(|&r| words[&Word::Vgpr(r)]).collect();
                 let varying_inputs = super::access::div_reads(source_inst).iter()
@@ -215,200 +219,8 @@ impl Function {
                         scalar,
                         expr,
                     } => {
-                        let mut operands = super::state::Operands::default();
-                        let args: Vec<_> = inputs.iter().map(|input| operands.read(
-                            input, *scalar, Some(scc), &mut f, &mut block, &words, &mut views,
-                        )).collect();
-                        let source_inputs=operands.bindings.len();
-                        let previous_start=operands.core.len();
-                        // A destination's old value is an update dependency,
-                        // not a source view available to later instructions.
-                        let mut previous_views=views.clone();
-                        let previous:Vec<_>=outputs.iter().map(|output|match *output {
-                            Output::Vgpr(reg,ty)=>{
-                                let input=Input {source:InputSource::Operand(SourceOperand::VectorRegister(reg as u8)),ty};
-                                let value=operands.read(&input,*scalar,Some(scc),&mut f,&mut block,&words,&mut previous_views);
-                                if !operands.bindings.iter().any(|(_,id)|*id==value) {operands.bindings.push((input,value));}
-                                Some(value)
-                            },
-                            _=>None,
-                        }).collect();
-                        let previous_end=operands.core.len();
-                        // Predicated destinations and mask writes read the previous
-                        // architectural definitions before any result is assigned.
-                        for &word in writes.iter().chain(std::iter::once(&Word::Mask(126))) {
-                            let source = match word {
-                                Word::Vgpr(r) => InputSource::Operand(SourceOperand::VectorRegister(r as u8)),
-                                Word::Sgpr(r) => InputSource::Operand(SourceOperand::ScalarRegister(r as u8)),
-                                Word::Mask(r) => InputSource::MaskBit(r),
-                            };
-                            operands.bindings.push((Input { source, ty: word.ty() },words[&word]));
-                        }
-                        let mut values = args;
-                        let start = block.insts.len();
-                        block.insts.extend(operands.core);
-                        for inst in &expr.expr().insts {
-                            match inst {
-                                ExprInst::Core(ty, op) => {
-                                    let op = op.map(|v| values[v.0]);
-                                    let value = f.value(*ty);
-                                    block.insts.push(Inst::Core { value, ty: *ty, op });
-                                    values.push(value);
-                                }
-                                ExprInst::Target { op, args, outputs } => {
-                                    let args = args.map(|v| values[v.0]);
-                                    let outputs = outputs.iter().map(|&ty| (f.value(ty), ty)).collect::<Vec<_>>();
-                                    values.extend(outputs.iter().map(|&(id, _)| id));
-                                    let effect = registry.operation(*op).unwrap().effect;
-                                    let id = if effect == crate::rdna_spmd::dialect::Effect::Pure { None }
-                                        else { let id = provenance; provenance += 1; Some(id) };
-                                    block.insts.push(Inst::Target { provenance: id, op: *op, args, outputs });
-                                }
-                            }
-                        }
-                        let updates_start=block.insts.len();
-                        let results: Vec<_> = outputs.iter().copied()
-                            .zip(expr.expr().results.iter().map(|id| values[id.0])).collect();
-                        for &(output, value) in &results {
-                            if matches!(output, Output::Scc) { scc = if *scalar { value } else {
-                                super::state::query(&mut f,&mut block.insts,effect::WaveOp::Any,value)
-                            }; }
-                        }
-                        let exec=super::state::core(&mut f,&mut block.insts,Ty::I1,
-                            Op::Convert(Cvt::Bitcast,Ty::I1,words[&Word::Mask(126)]));
-                        operands.bindings.push((Input {source:InputSource::ExecPredicate,ty:Ty::I1},exec));
-                        let exec=Some(exec);
-                        let mut stored = Vec::new();
-                        let mut predicated=Vec::new();
-                        let mut packet_elidable=Vec::new();
-                        let mut scalar_unmasked=Vec::new();
-                        let mut mask_updates=Vec::new();
-                        let mut word_defs = BTreeMap::new();
-                        for (output_index,&(output, result)) in results.iter().enumerate() {
-                            let ty = output.ty();
-                            let value = match output {
-                                Output::Vgpr(_, _) => {
-                                    let old=previous[output_index].unwrap();
-                                    let value = f.value(ty);
-                                    block.insts.push(Inst::Core { value, ty,
-                                        op: Op::Select(exec.unwrap(), result, old) });
-                                    value
-                                }
-                                Output::Scalar(..) | Output::Scc => result,
-                                Output::Compare(_) | Output::Mask(_) => {
-                                    super::state::core(&mut f,&mut block.insts,Ty::I1,
-                                        Op::Int(IntOp::And,result,exec.unwrap()))
-                                }
-                                Output::MaskBit(_) => result,
-                            };
-                            if matches!(output,Output::Vgpr(..)|Output::Compare(_)|Output::Mask(_)) {
-                                predicated.push((value,result));
-                            }
-                            if matches!(output,Output::Vgpr(..)) || matches!(output,Output::Compare(r) if r!=126) {
-                                packet_elidable.push(value);
-                            }
-                            if matches!(output,Output::Mask(_)) {scalar_unmasked.push(value);}
-                            if let Output::Mask(r)|Output::Compare(r)|Output::MaskBit(r)=output {mask_updates.push((value,r));}
-                            stored.push((value, ty));
-                            if let Output::Compare(reg) | Output::Mask(reg) | Output::MaskBit(reg) = output {
-                                if let Some(word) = Word::scalar(reg) {
-                                    let raw = if matches!(word,Word::Mask(_)) { value }
-                                        else { super::state::query(&mut f,&mut block.insts,effect::WaveOp::Ballot,value) };
-                                    let raw=if word==Word::Mask(126) {super::state::valid_exec(&mut f,&mut block.insts,raw)} else {raw};
-                                    if matches!(word,Word::Mask(_)) && raw!=value {mask_updates.push((raw,reg));}
-                                    word_defs.insert(word,raw);
-                                }
-                                continue;
-                            }
-                            let (reg, scalar) = match output {
-                                Output::Vgpr(r, _) => (r,false),
-                                Output::Scalar(r, _) => (r,true),
-                                Output::Scc => continue,
-                                _ => unreachable!(),
-                            };
-                            let bits = if matches!(ty,Ty::F32|Ty::F64) {
-                                let int_ty = if ty == Ty::F32 { Ty::I32 } else { Ty::I64 };
-                                super::state::core(&mut f,&mut block.insts,int_ty,Op::Convert(Cvt::Bitcast,int_ty,value))
-                            } else { value };
-                            for k in 0..ty.bits().div_ceil(32) {
-                                let word = if scalar { Word::scalar(reg+k) } else { Some(Word::Vgpr(reg+k)) };
-                                if let Some(word) = word {
-                                    let raw = if ty.bits() == 32 { bits } else {
-                                        super::state::core(&mut f,&mut block.insts,Ty::I32,
-                                            if k==0 { Op::UnpackLo(bits) } else { Op::UnpackHi(bits) })
-                                    };
-                                    let raw = if matches!(word,Word::Mask(_)) {
-                                        super::state::project(&mut f,&mut block.insts,raw)
-                                    } else { raw };
-                                    let raw=if word==Word::Mask(126) {super::state::valid_exec(&mut f,&mut block.insts,raw)} else {raw};
-                                    if let Word::Mask(reg)=word {mask_updates.push((raw,reg));}
-                                    word_defs.insert(word,raw);
-                                }
-                            }
-                        }
-                        // Preserve a distinct architectural definition for a
-                        // scalar copy. Native lowering coalesces the identity;
-                        // definition-scoped proof restrictions remain explicit.
-                        for (word, raw) in &mut word_defs {
-                            if matches!(word, Word::Sgpr(_)) && raw.0 < first_value {
-                                *raw = super::state::core(&mut f, &mut block.insts, Ty::I32,
-                                    Op::Convert(Cvt::Bitcast, Ty::I32, *raw));
-                            }
-                        }
-                        for &r in &writes {
-                            words.insert(r,*word_defs.get(&r).expect("typed output lacks its architectural SSA definition"));
-                        }
-                        let end = block.insts.len();
-                        let mut emitted = Vec::new();
-                        for (output_index,&(output,result)) in results.iter().enumerate() {
-                            match output {
-                                Output::Compare(r) | Output::Mask(r) | Output::MaskBit(r) => {
-                                    if let Some(word) = Word::scalar(r) {
-                                        emitted.push((if matches!(word,Word::Mask(_)) { Output::MaskBit(r) }
-                                            else { Output::Scalar(r,Ty::I32) },word_defs[&word]));
-                                    }
-                                }
-                                Output::Scalar(r,ty) if !Word::scalar(r).is_some_and(|w| w.ordinary_span(ty)) => {
-                                    for k in 0..ty.bits().div_ceil(32) {
-                                        if let Some(word) = Word::scalar(r+k) {
-                                            emitted.push((if matches!(word,Word::Mask(_)) { Output::MaskBit(r+k) }
-                                                else { Output::Scalar(r+k,Ty::I32) },word_defs[&word]));
-                                        }
-                                    }
-                                }
-                                Output::Scc => emitted.push((output,scc)),
-                                Output::Vgpr(..) => emitted.push((output,stored[output_index].0)),
-                                _ => emitted.push((output,result)),
-                            }
-                        }
-                        invalidate(&mut views, &writes);
-                        for (&output, &(stored, _)) in outputs.iter().zip(&stored) {
-                            match output {
-                                Output::Vgpr(reg, ty) => { views.insert((Word::Vgpr(reg), ty, false), stored); }
-                                Output::Scalar(reg, ty) => if let Some(reg) = Word::scalar(reg).filter(|r| r.ordinary_span(ty)) {
-                                    views.insert((reg, ty, true), stored);
-                                },
-                                _ => {}
-                            }
-                        }
-                        Some(Alu {
-                            inputs: operands.bindings,
-                            source_inputs,
-                            previous_core:(start+previous_start)..(start+previous_end),
-                            updates_start,
-                            core: start..end,
-                            outputs: emitted,
-                            scalar: *scalar,
-                            mask_logic:*scalar&&inputs.iter().all(|i|i.ty==Ty::I32)
-                                &&outputs.iter().all(|o|matches!(o,Output::Scalar(_,Ty::I32)|Output::Scc))
-                                &&expr.expr().insts.iter().all(|i|matches!(i,ExprInst::Core(_,Op::Const(..)|Op::Int(IntOp::And|IntOp::Or|IntOp::Xor,_,_)|Op::Cmp(IntPred::Ne,_,_)))),
-                            predicated,
-                            packet_elidable,
-                            scalar_unmasked,
-                            mask_updates,
-                            vector_words: word_defs.iter().filter_map(|(word,&id)|matches!(word,Word::Vgpr(_)).then_some(id)).collect(),
-                            pairs: operands.pairs,
-                        })
+                        Some(alu(&registry, &mut f, &mut block, &mut words, &mut views, &mut scc,
+                            &mut provenance, inputs, outputs, scalar, expr, &writes))
                     }
 
                 };
@@ -514,6 +326,7 @@ impl Function {
                     wave,
                     yield_values,
                     condition,
+                    yield_action: if let Terminator::Yield { action, .. } = &source.term { Some(*action.clone()) } else { None },
                     yielding: matches!(source.term, Terminator::Yield { .. } | Terminator::Barrier { .. }),
                     outgoing: regs.iter().map(|r| words[r]).chain(std::iter::once(scc)).collect(),
                 },
@@ -775,7 +588,26 @@ mod tests {
 }
 
 impl LiftedFunction {
-    fn prepare_queries(&mut self) {
+    pub(in crate::rdna_spmd) fn prepare_queries(&mut self) {
+        // Removed sites no longer assign scheduler state. Derive the writeback
+        // footprint from the surviving SSA definitions and effect results.
+        let mut written=crate::rdna_spmd::boundary::RegSet::default();
+        for site in self.state.sites.values().flatten() {
+            for &(slot,_) in &site.rewrite.defined_words {
+                if slot>=512 {written.add_vgpr(slot-512);}else if slot!=124 {written.add_sgpr(slot);}
+            }
+        }
+        for b in self.blocks.values() {
+            written.scc|=b.instructions.iter().flatten().any(|a|a.outputs.iter().any(|p|matches!(p.0,Output::Scc)));
+            for action in b.wave.values().map(|p|&p.0).chain(b.yield_action.iter()) {
+                let io=action.io();
+                for r in io.writes.sgprs() {if r!=124 {written.add_sgpr(r);}}
+                for r in io.writes.vgprs() {written.add_vgpr(r);}
+                written.scc|=io.writes.scc;
+            }
+        }
+        self.written=written;
+
         for (&pc, block) in &mut self.blocks {
             if let Some(plan) = &mut block.yield_values {
                 if let Some(end) = crate::rdna_spmd::passes::local_write_lane(&mut self.ir,BlockId(pc),plan.core.end) {
@@ -829,18 +661,22 @@ impl LiftedFunction {
         }
         positions.push(insts.len());
         self.ir.blocks.get_mut(&BlockId(pc)).unwrap().insts = insts;
+        self.remap_positions(pc, &positions);
+    }
+
+    pub(in crate::rdna_spmd) fn remap_positions(&mut self, pc: usize, positions: &[usize]) {
         let range = |r: &mut Range<usize>| { *r = positions[r.start]..positions[r.end]; };
         let block = self.blocks.get_mut(&pc).unwrap();
         for alu in block.instructions.iter_mut().flatten() {
             range(&mut alu.core); range(&mut alu.previous_core); alu.updates_start = positions[alu.updates_start];
         }
         for memory in block.memory.values_mut() {
-            range(&mut memory.core);
+            range(&mut memory.core); memory.end = positions[memory.end];
             for effect in &mut memory.effects { *effect = positions[*effect]; }
             if let Some((ref mut r, ..)) = memory.flat { range(r); }
         }
-        for (_, wave) in block.wave.values_mut() { range(&mut wave.core); }
-        if let Some(wave) = &mut block.yield_values { range(&mut wave.core); }
+        for (_, wave) in block.wave.values_mut() { range(&mut wave.core); wave.end = positions[wave.end]; }
+        if let Some(wave) = &mut block.yield_values { range(&mut wave.core); wave.end = positions[wave.end]; }
         if let Some(condition) = &mut block.condition { range(&mut condition.core); }
     }
 
@@ -889,4 +725,209 @@ impl LiftedFunction {
             blocks: plans,
         }
     }
+}
+
+/// Instantiate a replacement ALU expression in an existing SSA value namespace.
+/// Used by both initial lifting and typed instruction rewrites.
+pub(super) fn alu(
+    registry: &DialectRegistry, f: &mut Func, block: &mut Block,
+    words: &mut Words, views: &mut super::state::Views, scc: &mut ValueId,
+    provenance: &mut u64, inputs: &[Input], outputs: &[Output], scalar: &bool,
+    expr: &VerifiedExpr, writes: &[Word],
+) -> Alu {
+    let first_value = f.types.len();
+                        let mut operands = super::state::Operands::default();
+                        let args: Vec<_> = inputs.iter().map(|input| operands.read(
+                            input, *scalar, Some(*scc), f, block, words, views,
+                        )).collect();
+                        let source_inputs=operands.bindings.len();
+                        let previous_start=operands.core.len();
+                        // A destination's old value is an update dependency,
+                        // not a source view available to later instructions.
+                        let mut previous_views=views.clone();
+                        let previous:Vec<_>=outputs.iter().map(|output|match *output {
+                            Output::Vgpr(reg,ty)=>{
+                                let input=Input {source:InputSource::Operand(SourceOperand::VectorRegister(reg as u8)),ty};
+                                let value=operands.read(&input,*scalar,Some(*scc),f,block,words,&mut previous_views);
+                                if !operands.bindings.iter().any(|(_,id)|*id==value) {operands.bindings.push((input,value));}
+                                Some(value)
+                            },
+                            _=>None,
+                        }).collect();
+                        let previous_end=operands.core.len();
+                        // Predicated destinations and mask writes read the previous
+                        // architectural definitions before any result is assigned.
+                        for &word in writes.iter().chain(std::iter::once(&Word::Mask(126))) {
+                            let source = match word {
+                                Word::Vgpr(r) => InputSource::Operand(SourceOperand::VectorRegister(r as u8)),
+                                Word::Sgpr(r) => InputSource::Operand(SourceOperand::ScalarRegister(r as u8)),
+                                Word::Mask(r) => InputSource::MaskBit(r),
+                            };
+                            operands.bindings.push((Input { source, ty: word.ty() },words[&word]));
+                        }
+                        let mut values = args;
+                        let start = block.insts.len();
+                        block.insts.extend(operands.core);
+                        for inst in &expr.expr().insts {
+                            match inst {
+                                ExprInst::Core(ty, op) => {
+                                    let op = op.map(|v| values[v.0]);
+                                    let value = f.value(*ty);
+                                    block.insts.push(Inst::Core { value, ty: *ty, op });
+                                    values.push(value);
+                                }
+                                ExprInst::Target { op, args, outputs } => {
+                                    let args = args.map(|v| values[v.0]);
+                                    let outputs = outputs.iter().map(|&ty| (f.value(ty), ty)).collect::<Vec<_>>();
+                                    values.extend(outputs.iter().map(|&(id, _)| id));
+                                    let effect = registry.operation(*op).unwrap().effect;
+                                    let id = if effect == crate::rdna_spmd::dialect::Effect::Pure { None }
+                                        else { let id = *provenance; *provenance += 1; Some(id) };
+                                    block.insts.push(Inst::Target { provenance: id, op: *op, args, outputs });
+                                }
+                            }
+                        }
+                        let updates_start=block.insts.len();
+                        let results: Vec<_> = outputs.iter().copied()
+                            .zip(expr.expr().results.iter().map(|id| values[id.0])).collect();
+                        for &(output, value) in &results {
+                            if matches!(output, Output::Scc) { *scc = if *scalar { value } else {
+                                super::state::query(f,&mut block.insts,effect::WaveOp::Any,value)
+                            }; }
+                        }
+                        let exec=super::state::core(f,&mut block.insts,Ty::I1,
+                            Op::Convert(Cvt::Bitcast,Ty::I1,words[&Word::Mask(126)]));
+                        operands.bindings.push((Input {source:InputSource::ExecPredicate,ty:Ty::I1},exec));
+                        let exec=Some(exec);
+                        let mut stored = Vec::new();
+                        let mut predicated=Vec::new();
+                        let mut packet_elidable=Vec::new();
+                        let mut scalar_unmasked=Vec::new();
+                        let mut mask_updates=Vec::new();
+                        let mut word_defs = BTreeMap::new();
+                        for (output_index,&(output, result)) in results.iter().enumerate() {
+                            let ty = output.ty();
+                            let value = match output {
+                                Output::Vgpr(_, _) => {
+                                    let old=previous[output_index].unwrap();
+                                    let value = f.value(ty);
+                                    block.insts.push(Inst::Core { value, ty,
+                                        op: Op::Select(exec.unwrap(), result, old) });
+                                    value
+                                }
+                                Output::Scalar(..) | Output::Scc => result,
+                                Output::Compare(_) | Output::Mask(_) => {
+                                    super::state::core(f,&mut block.insts,Ty::I1,
+                                        Op::Int(IntOp::And,result,exec.unwrap()))
+                                }
+                                Output::MaskBit(_) => result,
+                            };
+                            if matches!(output,Output::Vgpr(..)|Output::Compare(_)|Output::Mask(_)) {
+                                predicated.push((value,result));
+                            }
+                            if matches!(output,Output::Vgpr(..)) || matches!(output,Output::Compare(r) if r!=126) {
+                                packet_elidable.push(value);
+                            }
+                            if matches!(output,Output::Mask(_)) {scalar_unmasked.push(value);}
+                            if let Output::Mask(r)|Output::Compare(r)|Output::MaskBit(r)=output {mask_updates.push((value,r));}
+                            stored.push((value, ty));
+                            if let Output::Compare(reg) | Output::Mask(reg) | Output::MaskBit(reg) = output {
+                                if let Some(word) = Word::scalar(reg) {
+                                    let raw = if matches!(word,Word::Mask(_)) { value }
+                                        else { super::state::query(f,&mut block.insts,effect::WaveOp::Ballot,value) };
+                                    let raw=if word==Word::Mask(126) {super::state::valid_exec(f,&mut block.insts,raw)} else {raw};
+                                    if matches!(word,Word::Mask(_)) && raw!=value {mask_updates.push((raw,reg));}
+                                    word_defs.insert(word,raw);
+                                }
+                                continue;
+                            }
+                            let (reg, scalar) = match output {
+                                Output::Vgpr(r, _) => (r,false),
+                                Output::Scalar(r, _) => (r,true),
+                                Output::Scc => continue,
+                                _ => unreachable!(),
+                            };
+                            let bits = if matches!(ty,Ty::F32|Ty::F64) {
+                                let int_ty = if ty == Ty::F32 { Ty::I32 } else { Ty::I64 };
+                                super::state::core(f,&mut block.insts,int_ty,Op::Convert(Cvt::Bitcast,int_ty,value))
+                            } else { value };
+                            for k in 0..ty.bits().div_ceil(32) {
+                                let word = if scalar { Word::scalar(reg+k) } else { Some(Word::Vgpr(reg+k)) };
+                                if let Some(word) = word {
+                                    let raw = if ty.bits() == 32 { bits } else {
+                                        super::state::core(f,&mut block.insts,Ty::I32,
+                                            if k==0 { Op::UnpackLo(bits) } else { Op::UnpackHi(bits) })
+                                    };
+                                    let raw = if matches!(word,Word::Mask(_)) {
+                                        super::state::project(f,&mut block.insts,raw)
+                                    } else { raw };
+                                    let raw=if word==Word::Mask(126) {super::state::valid_exec(f,&mut block.insts,raw)} else {raw};
+                                    if let Word::Mask(reg)=word {mask_updates.push((raw,reg));}
+                                    word_defs.insert(word,raw);
+                                }
+                            }
+                        }
+                        // Preserve a distinct architectural definition for a
+                        // scalar copy. Native lowering coalesces the identity;
+                        // definition-scoped proof restrictions remain explicit.
+                        for (word, raw) in &mut word_defs {
+                            if matches!(word, Word::Sgpr(_)) && raw.0 < first_value {
+                                *raw = super::state::core(f, &mut block.insts, Ty::I32,
+                                    Op::Convert(Cvt::Bitcast, Ty::I32, *raw));
+                            }
+                        }
+                        for &r in writes {
+                            words.insert(r,*word_defs.get(&r).expect("typed output lacks its architectural SSA definition"));
+                        }
+                        let end = block.insts.len();
+                        let mut emitted = Vec::new();
+                        for (output_index,&(output,result)) in results.iter().enumerate() {
+                            match output {
+                                Output::Compare(r) | Output::Mask(r) | Output::MaskBit(r) => {
+                                    if let Some(word) = Word::scalar(r) {
+                                        emitted.push((if matches!(word,Word::Mask(_)) { Output::MaskBit(r) }
+                                            else { Output::Scalar(r,Ty::I32) },word_defs[&word]));
+                                    }
+                                }
+                                Output::Scalar(r,ty) if !Word::scalar(r).is_some_and(|w| w.ordinary_span(ty)) => {
+                                    for k in 0..ty.bits().div_ceil(32) {
+                                        if let Some(word) = Word::scalar(r+k) {
+                                            emitted.push((if matches!(word,Word::Mask(_)) { Output::MaskBit(r+k) }
+                                                else { Output::Scalar(r+k,Ty::I32) },word_defs[&word]));
+                                        }
+                                    }
+                                }
+                                Output::Scc => emitted.push((output,*scc)),
+                                Output::Vgpr(..) => emitted.push((output,stored[output_index].0)),
+                                _ => emitted.push((output,result)),
+                            }
+                        }
+                        invalidate(views, &writes);
+                        for (&output, &(stored, _)) in outputs.iter().zip(&stored) {
+                            match output {
+                                Output::Vgpr(reg, ty) => { views.insert((Word::Vgpr(reg), ty, false), stored); }
+                                Output::Scalar(reg, ty) => if let Some(reg) = Word::scalar(reg).filter(|r| r.ordinary_span(ty)) {
+                                    views.insert((reg, ty, true), stored);
+                                },
+                                _ => {}
+                            }
+                        }
+                        Alu {
+                            inputs: operands.bindings,
+                            source_inputs,
+                            previous_core:(start+previous_start)..(start+previous_end),
+                            updates_start,
+                            core: start..end,
+                            outputs: emitted,
+                            scalar: *scalar,
+                            mask_logic:*scalar&&inputs.iter().all(|i|i.ty==Ty::I32)
+                                &&outputs.iter().all(|o|matches!(o,Output::Scalar(_,Ty::I32)|Output::Scc))
+                                &&expr.expr().insts.iter().all(|i|matches!(i,ExprInst::Core(_,Op::Const(..)|Op::Int(IntOp::And|IntOp::Or|IntOp::Xor,_,_)|Op::Cmp(IntPred::Ne,_,_)))),
+                            predicated,
+                            packet_elidable,
+                            scalar_unmasked,
+                            mask_updates,
+                            vector_words: word_defs.iter().filter_map(|(word,&id)|matches!(word,Word::Vgpr(_)).then_some(id)).collect(),
+                            pairs: operands.pairs,
+                        }
 }

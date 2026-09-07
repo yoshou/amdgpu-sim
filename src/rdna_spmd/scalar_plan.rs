@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use super::ir::ScalarProgram;
 use super::regtype::RegSet;
 
@@ -28,19 +29,17 @@ pub(super) struct ScalarPlan {
 impl ScalarPlan {
     #[cfg(test)]
     pub fn new(program: &ScalarProgram, mode: ScalarMode) -> Self { Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, mode) }
+    #[cfg(test)]
     pub fn with_registry(registry: std::sync::Arc<super::dialect::DialectRegistry>, program: &ScalarProgram, mode: ScalarMode) -> Self {
 
-        let lifted: BTreeMap<_, Vec<_>> = program.blocks.iter().map(|(&pc, block)|
-            (pc, block.body.iter().map(|inst| super::lift::instruction_with_registry(inst, &registry)).collect())).collect();
-        let mut blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
-            (pc, ScalarBlockPlan {
-                active: vec![false;block.body.len()],
-                f64_fresh: [0; 2],
-                sgpr_fresh: 0,
-            })
-        }).collect();
-        let lowerings = lifted.iter().map(|(&pc, block)| (pc, block.iter().collect())).collect();
-        let lifted_function = super::lift::function::Function::lift(registry, program, &lowerings);
+        let lifted_function = super::program::Program::lift(program,registry).function;
+        Self::from_ssa(lifted_function,mode)
+    }
+    pub fn from_ssa(mut lifted_function: super::lift::function::LiftedFunction, mode: ScalarMode) -> Self {
+        lifted_function.prepare_queries();
+        let mut blocks: BTreeMap<_, _> = lifted_function.blocks.iter().map(|(&pc, block)| (pc,ScalarBlockPlan {
+            active:vec![false;block.instructions.len()],f64_fresh:[0;2],sgpr_fresh:0,
+        })).collect();
         let f64_fresh = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, false);
         let sgpr_fresh = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, true);
         let active = super::analysis::state::active(&lifted_function.ir, &lifted_function.state, false);

@@ -32,7 +32,6 @@ use super::emit::{CoopKernel, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 use super::boundary::RegSet;
 use super::emit_vec::CoopVecKernel;
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
-use super::ir::ScalarProgram;
 
 const WAVE: usize = 32;
 const EXEC: usize = 126;
@@ -55,14 +54,14 @@ pub(super) fn eval_uniform<const N: usize>(sgprs: &[[u32; N]], source: &SourceOp
     }
 }
 
-pub fn split_at_xlane(program: &ScalarProgram) -> (ScalarProgram, BTreeMap<usize, XlaneOp>) {
-    super::lift::wave::split(program, |action| action.is_wave())
+pub fn split_at_xlane(program: &impl super::CompilationInput) -> (super::Program, BTreeMap<usize, XlaneOp>) {
+    program.to_ssa().split(|action| action.is_wave())
 }
 
 /// Compile a split cross-lane program into a width-W packet kernel, passing
 /// the boundary IO derived from the program's typed yields.
 pub fn compile_xlane_vec(
-    program: &ScalarProgram,
+    program: &impl super::CompilationInput,
     _xlane: &BTreeMap<usize, XlaneOp>,
     num_vgprs: usize,
     width: u32,

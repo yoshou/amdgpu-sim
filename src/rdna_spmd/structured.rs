@@ -661,12 +661,8 @@ pub(super) fn analyze(function: &super::lift::function::LiftedFunction) -> Struc
     }
 }
 
-pub fn analyze_structured(program: &super::ir::ScalarProgram) -> StructuredPlan {
-    let registry = std::sync::Arc::new(super::dialect::DialectRegistry::rdna4());
-    let instructions: BTreeMap<_, Vec<_>> = program.blocks.iter().map(|(&pc, block)|
-        (pc, block.body.iter().map(|i| super::lift::instruction_with_registry(i, &registry)).collect())).collect();
-    let refs = instructions.iter().map(|(&pc, body)| (pc, body.iter().collect())).collect();
-    analyze(&super::lift::function::Function::lift(registry, program, &refs))
+pub fn analyze_structured(program: &impl super::CompilationInput) -> StructuredPlan {
+    analyze(&program.to_ssa().function)
 }
 
 #[cfg(test)]
