@@ -13,6 +13,9 @@ mod division;
 mod image;
 pub(super) mod half;
 mod state;
+mod control;
+pub(super) mod access;
+pub(super) mod rewrite;
 
 pub(super) enum Lowering {
     Memory(memory::Memory),

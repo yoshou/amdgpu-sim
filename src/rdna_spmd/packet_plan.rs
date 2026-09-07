@@ -1,14 +1,16 @@
 //! Prepare the existing packet optimizations before LLVM emission.
 //!
-//! Plans borrow the exact program they describe, preventing mutation while its
-//! facts are consumed. Flow facts are transferred once per source instruction,
-//! including members of a clustered load. Only the selected lowering is kept;
-//! per-instruction copies of the scratch-frame maps are unnecessary.
+//! Owns the typed SSA function and its representation decisions. Analyses run
+//! on that function before native emission, including every clustered member.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use crate::instructions::I;
-use crate::rdna_instructions::{sext_ioffset, InstFormat, VGLOBAL};
+#[cfg(test)]
+use crate::rdna_instructions::InstFormat;
+#[cfg(test)]
+use crate::rdna_instructions::VGLOBAL;
 
 use super::boundary::BoundaryIo;
 use super::ir::{Cond, ScalarProgram, Terminator};
@@ -25,6 +27,7 @@ pub(super) enum GlobalLoad {
     Frame { stride_words: u32, offset_words: u32 },
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum InstructionAction {
     Emit,
     Cluster(VgCluster),
@@ -55,24 +58,22 @@ pub(super) struct MaskRegion {
 }
 
 pub(super) struct PacketPlan<'a> {
-    pub program: &'a ScalarProgram,
     pub width: u32,
     pub function: super::lift::function::Function,
     pub boundary: Option<&'a BTreeMap<usize, BoundaryIo>>,
     pub blocks: BTreeMap<usize, BlockPlan>,
     pub f64_pairs: RegSet,
-    pub fresh_in: BTreeMap<usize, RegSet>,
     pub mask_region: Option<MaskRegion>,
 }
 
 impl<'a> PacketPlan<'a> {
     #[cfg(test)]
-    pub fn new(program: &'a ScalarProgram, width: u32, boundary: Option<&'a BTreeMap<usize, BoundaryIo>>) -> Self {
+    pub fn new(program: &ScalarProgram, width: u32, boundary: Option<&'a BTreeMap<usize, BoundaryIo>>) -> Self {
         Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, width, boundary)
     }
     pub fn with_registry(
         registry: std::sync::Arc<super::dialect::DialectRegistry>,
-        program: &'a ScalarProgram,
+        program: &ScalarProgram,
         width: u32,
         boundary: Option<&'a BTreeMap<usize, BoundaryIo>>,
     ) -> Self {
@@ -80,7 +81,7 @@ impl<'a> PacketPlan<'a> {
     }
     pub fn with_return_state(
         registry: std::sync::Arc<super::dialect::DialectRegistry>,
-        program: &'a ScalarProgram,
+        program: &ScalarProgram,
         width: u32,
         boundary: Option<&'a BTreeMap<usize,BoundaryIo>>,
         observe_return: bool,
@@ -99,91 +100,76 @@ impl<'a> PacketPlan<'a> {
             .map(|map| map.iter().filter(|(pc,_)|!active_reads.contains(pc)).flat_map(|(_,io)| io.reads.vgprs()).collect())
             .unwrap_or_default();
         let exit_reads = if boundary.is_some() && observe_return { (0..256).collect::<Vec<_>>() } else { boundary_reads };
-        let elide = super::vec_live::analyze_with_exit_live(program, &exit_reads);
-        let nonempty = nonempty_exec(program,width,boundary.is_none());
-        let fresh_in = super::freshness::analyze(program);
-        let f64_pairs = super::regtype::f64_read_pairs(program);
-        let div_in = if boundary.is_some() {
-            super::vec_live::divergent_entry_with_seed_and_boundary_writes(
-                program, [1, 0], &boundary_writes,
-            )
-        } else {
-            super::vec_live::divergent_entry(program)
-        };
-        let frame_in = if boundary.is_some() {
-            super::vec_live::frame_entry_with_boundary_writes(program, &boundary_writes)
-        } else {
-            super::vec_live::frame_entry(program)
-        };
+
         let mut lifted = BTreeMap::new();
-        let blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
-            let flags = &elide[&pc];
-            let normal = sqrt_idiom::normal_sqrt_ldexp_indices(&block.body);
-            let sqrt = sqrt_idiom::sqrt_collapse_sites(&block.body);
-            let mut divergent = div_in[&pc];
-            let mut frames = frame_in[&pc].clone();
-            let mut cluster_rest = 0;
+        let mut blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             let mut instructions = Vec::with_capacity(block.body.len());
             let mut semantics = Vec::with_capacity(block.body.len());
-            let mut entry_exec_unchanged = true;
-            for (idx, inst) in block.body.iter().enumerate() {
-                let action = if cluster_rest > 0 {
-                    cluster_rest -= 1;
-                    InstructionAction::ClusterMember
-                } else if matches!(sqrt[idx], Some(SqrtCollapse::Rescale { .. })) {
-                    // Rescale substitution has priority over load clustering.
-                    InstructionAction::Emit
-                } else if let Some(cluster) = load_cluster::analyze(
-                    &block.body[idx..], width, divergent, &frames,
-                ) {
-                    cluster_rest = cluster.len - 1;
-                    InstructionAction::Cluster(cluster)
-                } else {
-                    InstructionAction::Emit
-                };
-                let mut lowering = super::lift::instruction_with_registry(inst, &registry);
-                // The proof concerns the unmodified exponent. Value/output
-                // modifiers remain explicit SSA around the rewritten scale.
-                if normal[idx] && matches!(inst, InstFormat::VOP3(i) if (i.abs | i.neg) & 2 == 0) {
-                    if let super::lift::Lowering::TypedAlu { expr, .. } = &mut lowering {
-                        *expr = super::dialect::rdna4::fold_normal(expr, &registry);
-                    }
-                }
+            for inst in &block.body {
+                let lowering = super::lift::instruction_with_registry(inst, &registry);
                 semantics.push(lowering);
                 instructions.push(InstructionPlan {
-                    elide_predicate: flags[idx],
-                    entry_exec_unchanged,
-                    nonempty_exec: nonempty[&pc][idx],
-                    sqrt: sqrt[idx].clone(),
-                    global_load: match inst {
-                        InstFormat::VGLOBAL(g) => global_load(g, divergent, &frames),
-                        _ => GlobalLoad::Gather,
-                    },
-                    action,
+                    elide_predicate: false,
+                    entry_exec_unchanged: false,
+                    nonempty_exec: false,
+                    sqrt: None,
+                    global_load: GlobalLoad::Gather,
+                    action: InstructionAction::Emit,
                 });
-                entry_exec_unchanged &= !super::active::writes_exec(inst);
-                super::vec_live::div_transfer(inst, &mut divergent);
-                super::vec_live::frame_transfer(inst, &mut frames);
             }
-            // A full-EXEC clone avoids preserving the old value of a predicated
-            // destination. Keep the existing profitability condition exactly.
-            let specialize = block.body.iter().enumerate().any(|(idx, inst)| {
-                instructions[idx].entry_exec_unchanged && !flags[idx]
-                    && !super::freshness::vgpr_writes(inst).is_empty()
-            });
-            let fresh = fresh_in[&pc];
+            let specialize = false;
+            let fresh = [0; 2];
             // Canonical pairs have no live i32 slots to synchronize on edges.
-            let stale = [fresh[0] & !f64_pairs[0], fresh[1] & !f64_pairs[1]];
+            let stale = [0; 2];
             lifted.insert(pc, semantics);
             (pc, BlockPlan { instructions, fresh, stale, specialize })
         }).collect();
         let lowerings = lifted.iter().map(|(&pc, block)| (pc, block.iter().collect())).collect();
+        let mut lifted_function = super::lift::function::Function::lift(registry, program, &lowerings);
+        for (&pc, block) in &mut blocks {
+            let (normal, sqrt) = sqrt_idiom::analyze(&lifted_function.state.sites[&pc]);
+            for (index, instruction) in block.instructions.iter_mut().enumerate() { instruction.sqrt = sqrt[index].clone(); }
+            lifted_function.fold_normal_scales(pc, &normal);
+        }
+        let fresh_in = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, false);
+        let f64_pairs = super::analysis::state::f64_cells(&lifted_function.state);
+        let ssa_elide = super::analysis::state::predication(&lifted_function.ir, &lifted_function.state, &exit_reads);
+        let ssa_nonempty = super::analysis::state::nonempty(&lifted_function.ir, &lifted_function.state, width, boundary.is_none());
+        let varying = super::analysis::state::varying(&lifted_function.ir, &lifted_function.state, &boundary_writes);
+        let frame_values = super::analysis::state::frames(&lifted_function.ir, &lifted_function.state, &boundary_writes);
+        for (&pc, block) in &mut blocks {
+            block.fresh = fresh_in[&pc];
+            block.stale = [block.fresh[0] & !f64_pairs[0], block.fresh[1] & !f64_pairs[1]];
+            let sites = &lifted_function.state.sites[&pc];
+            let memory = &lifted_function.blocks[&pc].memory;
+            let mut cluster_rest = 0;
+            let mut entry_exec_unchanged = true;
+            for (index, instruction) in block.instructions.iter_mut().enumerate() {
+                instruction.elide_predicate = ssa_elide[&pc][index];
+                instruction.nonempty_exec = ssa_nonempty[&pc][index];
+                instruction.entry_exec_unchanged = entry_exec_unchanged;
+                entry_exec_unchanged &= !sites[index].exec.writes;
+                let load = global_load_ssa(memory.get(&index).map(|p| &p.memory), &sites[index].address, &varying, &frame_values);
+                instruction.global_load = load;
+                let action = if cluster_rest > 0 {
+                    cluster_rest -= 1; InstructionAction::ClusterMember
+                } else if matches!(instruction.sqrt, Some(SqrtCollapse::Rescale { .. })) {
+                    InstructionAction::Emit
+                } else if let Some(cluster) = load_cluster::analyze(memory, sites, index, width, &varying, &frame_values) {
+                    cluster_rest = cluster.len - 1; InstructionAction::Cluster(cluster)
+                } else { InstructionAction::Emit };
+                instruction.action = action;
+            }
+            block.specialize = block.instructions.iter().enumerate().any(|(index, instruction)|
+                instruction.entry_exec_unchanged && !instruction.elide_predicate && !sites[index].writes.is_empty());
+        }
         let preparation=super::lift::function::Preparation::Packet {
             inactive:blocks.iter().flat_map(|(&pc,b)|b.instructions.iter().enumerate()
                 .filter_map(move |(index,i)|i.elide_predicate.then_some((pc,index)))).collect(),
             observe_return,
         };
-        let mut function=super::lift::function::Function::new(registry,program,&lowerings,preparation);
+        let mask_region = select_mask_region(&lifted_function, boundary.is_some());
+        let mut function = lifted_function.prepare(preparation);
         for plan in function.blocks.values_mut().flat_map(|block| block.memory.values_mut()) {
             use super::ir::typed::effect::{MemoryOp, Space};
             // One ISA atomic instruction has no intervening per-lane effects.
@@ -194,42 +180,14 @@ impl<'a> PacketPlan<'a> {
                 && plan.memory.op == MemoryOp::AtomicAdd && !plan.memory.returns
                 && !plan.memory.semantics.volatile;
         }
-        let mask_region = select_mask_region(program, boundary.is_some());
-        Self { program, width, boundary, blocks, f64_pairs, fresh_in, mask_region, function }
+        Self { width, boundary, blocks, f64_pairs, mask_region, function }
     }
 }
 
-fn global_load(g: &VGLOBAL, divergent: [u128; 2], frames: &HashMap<u32, u32>) -> GlobalLoad {
-    let words = match g.op {
-        I::GLOBAL_LOAD_B32 => 1,
-        I::GLOBAL_LOAD_B64 => 2,
-        I::GLOBAL_LOAD_B96 => 3,
-        I::GLOBAL_LOAD_B128 => 4,
-        _ => return GlobalLoad::Gather,
-    };
-    let uniform = |r: u32| (divergent[(r >> 7) as usize] >> (r & 127)) & 1 == 0;
-    let uniform_addr = uniform(g.vaddr as u32)
-        && (g.saddr != 124 || uniform(g.vaddr as u32 + 1));
-    if uniform_addr {
-        return GlobalLoad::Broadcast;
-    }
-    if g.saddr == 124 {
-        if let Some(&stride_bytes) = frames.get(&(g.vaddr as u32)) {
-            let sp4 = stride_bytes / 4;
-            let ioffset = sext_ioffset(g.ioffset) as i64 as u64;
-            let ioff_w = (ioffset as i64) / 4;
-            if sp4 >= 1 && ioffset % 4 == 0 && ioff_w >= 0 && (ioff_w as u32 + words) <= sp4 {
-                return GlobalLoad::Frame { stride_words: sp4, offset_words: ioff_w as u32 };
-            }
-        }
-    }
-    GlobalLoad::Gather
-}
-
-fn select_mask_region(program: &ScalarProgram, cooperative: bool) -> Option<MaskRegion> {
+fn select_mask_region(function: &super::lift::function::LiftedFunction, cooperative: bool) -> Option<MaskRegion> {
     // Retain the existing single leaf-loop selection and its mask ownership
     // proof. Other blocks continue to use packed SGPR masks.
-    let region = (!cooperative).then(|| super::analyze_structured(program))?
+    let region = (!cooperative).then(|| super::structured::analyze(function))?
         .loops.into_iter().find(|region| {
             region.children.is_empty()
                 && !region.mask_stack.local_scopes.is_empty()
@@ -239,12 +197,8 @@ fn select_mask_region(program: &ScalarProgram, cooperative: bool) -> Option<Mask
         })?;
     let body: BTreeSet<_> = region.body.into_iter().collect();
     let exits = body.iter().copied().flat_map(|from| {
-        let successors = match program.blocks[&from].term {
-            Terminator::Return => vec![],
-            Terminator::Jump(target) => vec![target],
-            Terminator::Branch { taken, fallthrough, .. } => vec![taken, fallthrough],
-            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![resume],
-        };
+        let successors: Vec<_> = function.ir.blocks[&super::ir::typed::cfg::BlockId(from)]
+            .term.edges().into_iter().map(|e| e.dst.0).collect();
         let body = &body;
         successors.into_iter().filter(move |to| !body.contains(to)).map(move |to| (from, to))
     }).collect();
@@ -265,8 +219,8 @@ pub(super) fn cooperative_vgpr_count(
         .values()
         .flat_map(|block| block.body.iter())
         .flat_map(|inst| {
-            let mut regs = super::vec_live::vgpr_reads(inst);
-            regs.extend(super::freshness::vgpr_writes(inst));
+            let mut regs = super::lift::access::vgpr_reads(inst);
+            regs.extend(super::lift::access::vgpr_writes(inst));
             regs
         })
         .chain(boundary.values().flat_map(|io| io.writes.vgprs()))
@@ -278,7 +232,8 @@ pub(super) fn cooperative_vgpr_count(
 #[cfg(test)]
 mod cooperative_vgpr_tests {
     use super::*;
-    use crate::instructions::I;
+    #[cfg(test)]
+use crate::instructions::I;
     use crate::rdna_instructions::{InstFormat, SourceOperand, VOP1};
     use super::super::ir::ScalarBlock;
 
@@ -421,88 +376,25 @@ mod tests {
     }
 }
 
-/// Only establishes existence of an active packet lane, never that every lane
-/// is active. This suffices for a uniform-address load: one active lane proves
-/// the shared pointer must be valid. All EXEC writes invalidate the fact unless
-/// a constant assignment or an OR preserving the old EXEC establishes it.
-fn nonempty_exec(program: &ScalarProgram, width: u32, initial: bool) -> BTreeMap<usize, Vec<bool>> {
-    use crate::rdna_instructions::SourceOperand;
-    let transfer = |inst: &InstFormat, old: bool| -> bool {
-        let wave_writes =
-            super::lift::wave::instruction(inst).map_or(false, |a| a.io().writes.has_sgpr(126));
-        if !super::active::writes_exec(inst) && !wave_writes {
-            return old;
-        }
-        match inst {
-            InstFormat::SOP1(i) if i.sdst == 126 && matches!(i.op, I::S_MOV_B32 | I::S_MOV_B64) => {
-                match i.ssrc0 {
-                    SourceOperand::IntegerConstant(v) => initial && v & ((1u64 << width) - 1) != 0,
-                    SourceOperand::LiteralConstant(v) => initial && v & ((1u32 << width) - 1) != 0,
-                    _ => false,
-                }
+fn global_load_ssa(
+    memory: Option<&super::lift::memory::Memory>,
+    address: &[super::ir::typed::ValueId], varying: &[bool],
+    frames: &BTreeMap<(super::ir::typed::ValueId, super::ir::typed::ValueId), u32>,
+) -> GlobalLoad {
+    use super::lift::memory::Address;
+    use super::ir::typed::effect::{MemoryOp, MemSize};
+    let Some(memory) = memory else { return GlobalLoad::Gather; };
+    let Address::Global { scalar, offset, .. } = memory.address else { return GlobalLoad::Gather; };
+    if memory.op != MemoryOp::Load(MemSize::B32) || !(1..=4).contains(&memory.words) { return GlobalLoad::Gather; }
+    if address.iter().all(|v| !varying[v.0]) { return GlobalLoad::Broadcast; }
+    if scalar.is_none() {
+        if let Some(&stride) = frames.get(&(address[0], address[1])) {
+            let words = stride / 4;
+            let offset_word = offset / 4;
+            if words >= 1 && offset % 4 == 0 && offset_word >= 0 && offset_word as u32 + memory.words <= words {
+                return GlobalLoad::Frame { stride_words: words, offset_words: offset_word as u32 };
             }
-            InstFormat::SOP2(i) if i.sdst == 126 && matches!(i.op, I::S_OR_B32 | I::S_OR_B64) => {
-                old && (matches!(i.ssrc0, SourceOperand::ScalarRegister(126))
-                    || matches!(i.ssrc1, SourceOperand::ScalarRegister(126)))
-            }
-            _ => false,
-        }
-    };
-    let mut entries: BTreeMap<_, _> = program.blocks.keys().map(|&pc| (pc, true)).collect();
-    loop {
-        let mut incoming = BTreeMap::from([(program.entry_pc, initial)]);
-        for (&pc, b) in &program.blocks {
-            let exit = b
-                .body
-                .iter()
-                .fold(entries[&pc], |st, inst| transfer(inst, st));
-            let edges = match &b.term {
-                Terminator::Return => vec![],
-                Terminator::Jump(p) => vec![(*p, exit)],
-                Terminator::Barrier { resume } => vec![(*resume, false)],
-                Terminator::Yield { resume, action } => {
-                    vec![(*resume, exit && !action.io().writes.has_sgpr(126))]
-                }
-                Terminator::Branch {
-                    cond,
-                    taken,
-                    fallthrough,
-                } => match cond {
-                    Cond::ExecZ => vec![(*taken, false), (*fallthrough, true)],
-                    Cond::ExecNz => vec![(*taken, true), (*fallthrough, false)],
-                    _ => vec![(*taken, exit), (*fallthrough, exit)],
-                },
-            };
-            for (to, st) in edges {
-                incoming.entry(to).and_modify(|v| *v &= st).or_insert(st);
-            }
-        }
-        let mut changed = false;
-        for (pc, st) in incoming {
-            if entries[&pc] != st {
-                entries.insert(pc, st);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
         }
     }
-    program
-        .blocks
-        .iter()
-        .map(|(&pc, b)| {
-            let mut st = entries[&pc];
-            let values = b
-                .body
-                .iter()
-                .map(|inst| {
-                    let before = st;
-                    st = transfer(inst, st);
-                    before
-                })
-                .collect();
-            (pc, values)
-        })
-        .collect()
+    GlobalLoad::Gather
 }

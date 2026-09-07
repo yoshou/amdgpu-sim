@@ -83,7 +83,6 @@
 
 mod barrier;
 
-mod active;
 mod analysis;
 mod passes;
 mod cooperative;
@@ -91,7 +90,6 @@ mod coop_xlane;
 mod dispatch;
 mod emit;
 mod emit_vec;
-mod freshness;
 mod combine;
 mod ir;
 mod compiler;
@@ -109,7 +107,6 @@ mod mathcombine;
 mod regtype;
 mod segmented;
 mod structured;
-mod vec_live;
 mod wmma;
 mod yield_values;
 

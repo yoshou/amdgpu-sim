@@ -7,39 +7,27 @@ use llvm_sys::{LLVMIntPredicate::*, LLVMTypeKind};
 
 /// Apply the existing normal-power proof before native code generation.
 /// The replacement is ordinary typed SSA; no emitter mode flag is needed.
-pub(in crate::rdna_spmd) fn fold_normal(expr: &crate::rdna_spmd::ir::typed::VerifiedExpr, registry: &DialectRegistry)
-    -> crate::rdna_spmd::ir::typed::VerifiedExpr {
-    use crate::rdna_spmd::ir::typed::*;
+pub(in crate::rdna_spmd) fn fold_normal(
+    f: &mut crate::rdna_spmd::ir::typed::cfg::Func,
+    inst: crate::rdna_spmd::ir::typed::cfg::Inst,
+    registry: &DialectRegistry,
+) -> Vec<crate::rdna_spmd::ir::typed::cfg::Inst> {
+    use crate::rdna_spmd::ir::typed::{cfg::Inst, *};
     use crate::rdna_spmd::dialect::Arguments;
-    let old = expr.expr();
     let target = registry.lookup(ID, "ldexp.f64").unwrap();
-    let mut new = Expr { params: old.params.clone(), insts: Vec::new(), results: Vec::new() };
-    let mut values = (0..old.params.len()).map(ValueId).collect::<Vec<_>>();
-    let mut next = old.params.len();
-    for inst in &old.insts {
-        let mut push = |ty, op| { let id = ValueId(next); next += 1; new.insts.push(ExprInst::Core(ty, op)); id };
-        match inst {
-            ExprInst::Core(ty, op) => { let value = push(*ty, op.map(|id| values[id.0])); values.push(value); }
-            ExprInst::Target { op, args: Arguments::Binary([x, exp]), .. } if *op == target => {
-                let x = values[x.0]; let exp = values[exp.0];
-                let exp = push(Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, exp));
-                let bias = push(Ty::I64, Op::Const(Ty::I64, 1023));
-                let exp = push(Ty::I64, Op::Int(IntOp::Add, exp, bias));
-                let shift = push(Ty::I64, Op::Const(Ty::I64, 52));
-                let bits = push(Ty::I64, Op::Int(IntOp::Shl, exp, shift));
-                let power = push(Ty::F64, Op::Convert(Cvt::Bitcast, Ty::F64, bits));
-                let result = push(Ty::F64, Op::Float(FloatOp::Mul, x, power));
-                values.push(result);
-            }
-            ExprInst::Target { op, args, outputs } => {
-                let args = args.map(|id| values[id.0]);
-                values.extend((next..next + outputs.len()).map(ValueId)); next += outputs.len();
-                new.insts.push(ExprInst::Target { op: *op, args, outputs: outputs.clone() });
-            }
-        }
-    }
-    new.results = old.results.iter().map(|id| values[id.0]).collect();
-    new.verify_with(registry).expect("invalid normal ldexp rewrite")
+    let Inst::Target { op, args: Arguments::Binary([x, exp]), ref outputs, .. } = inst else { return vec![inst]; };
+    if op != target { return vec![inst]; }
+    let result = outputs[0].0;
+    let mut out = Vec::new();
+    let mut push = |ty, op| { let value = f.value(ty); out.push(Inst::Core { value, ty, op }); value };
+    let exp = push(Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, exp));
+    let bias = push(Ty::I64, Op::Const(Ty::I64, 1023));
+    let exp = push(Ty::I64, Op::Int(IntOp::Add, exp, bias));
+    let shift = push(Ty::I64, Op::Const(Ty::I64, 52));
+    let bits = push(Ty::I64, Op::Int(IntOp::Shl, exp, shift));
+    let power = push(Ty::F64, Op::Convert(Cvt::Bitcast, Ty::F64, bits));
+    out.push(Inst::Core { value: result, ty: Ty::F64, op: Op::Float(FloatOp::Mul, x, power) });
+    out
 }
 
 pub(super) unsafe fn f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { scale(e, Ty::F32, a[0], a[1]) }

@@ -1,5 +1,5 @@
 //! Analysis input for scalar whole-kernel, writeback and cooperative emission.
-//! Borrows the source IR so its instruction-indexed facts cannot outlive edits.
+//! Owns the typed SSA function and its native representation decisions.
 
 use std::collections::BTreeMap;
 
@@ -19,42 +19,43 @@ pub(super) struct ScalarBlockPlan {
     pub sgpr_fresh: u128,
 }
 
-pub(super) struct ScalarPlan<'a> {
-    pub program: &'a ScalarProgram,
+pub(super) struct ScalarPlan {
     pub mode: ScalarMode,
     pub function: super::lift::function::Function,
     pub blocks: BTreeMap<usize, ScalarBlockPlan>,
 }
 
-impl<'a> ScalarPlan<'a> {
+impl ScalarPlan {
     #[cfg(test)]
-    pub fn new(program: &'a ScalarProgram, mode: ScalarMode) -> Self { Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, mode) }
-    pub fn with_registry(registry: std::sync::Arc<super::dialect::DialectRegistry>, program: &'a ScalarProgram, mode: ScalarMode) -> Self {
-        let f64_fresh = super::freshness::analyze(program);
-        let sgpr_fresh = super::freshness::analyze_sgpr(program);
+    pub fn new(program: &ScalarProgram, mode: ScalarMode) -> Self { Self::with_registry(std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()), program, mode) }
+    pub fn with_registry(registry: std::sync::Arc<super::dialect::DialectRegistry>, program: &ScalarProgram, mode: ScalarMode) -> Self {
+
         let lifted: BTreeMap<_, Vec<_>> = program.blocks.iter().map(|(&pc, block)|
             (pc, block.body.iter().map(|inst| super::lift::instruction_with_registry(inst, &registry)).collect())).collect();
         let mut blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             (pc, ScalarBlockPlan {
                 active: vec![false;block.body.len()],
-                f64_fresh: f64_fresh[&pc],
-                sgpr_fresh: sgpr_fresh[&pc],
+                f64_fresh: [0; 2],
+                sgpr_fresh: 0,
             })
         }).collect();
-        {
-            let active=super::active::analyze_states(program);
-            for (&pc,block) in &mut blocks {
-                block.active=super::active::body_active_states(&program.blocks[&pc],active[&pc]);
-            }
-        }
         let lowerings = lifted.iter().map(|(&pc, block)| (pc, block.iter().collect())).collect();
+        let lifted_function = super::lift::function::Function::lift(registry, program, &lowerings);
+        let f64_fresh = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, false);
+        let sgpr_fresh = super::analysis::state::native_pairs(&lifted_function.ir, &lifted_function.state, true);
+        let active = super::analysis::state::active(&lifted_function.ir, &lifted_function.state, false);
+        for (&pc, block) in &mut blocks {
+            block.f64_fresh = f64_fresh[&pc];
+            block.sgpr_fresh = sgpr_fresh[&pc][0];
+            block.active = active[&pc].clone();
+        }
         let preparation=super::lift::function::Preparation::Scalar {
             active:blocks.iter().flat_map(|(&pc,b)|b.active.iter().enumerate()
                 .filter_map(move |(index,&active)|active.then_some((pc,index)))).collect(),
             dispatch:mode==ScalarMode::Whole,
         };
-        let function=super::lift::function::Function::new(registry,program,&lowerings,preparation);
-        Self { program, mode, blocks, function }
+        let function = lifted_function.prepare(preparation);
+        Self { mode, blocks, function }
     }
 }
 

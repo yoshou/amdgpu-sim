@@ -3,7 +3,8 @@
 //! The public free functions remain compatibility entrypoints. Constructed or
 //! boundary-split ScalarPrograms go straight to analysis when compiled; passes
 //! run during preparation only, retaining the existing invocation count/order.
-//! This still uses the current register IR and execution engines.
+//! Source preparation retains its public register-CFG input/output API; rewrite
+//! decisions and compilation analyses use typed SSA.
 
 use std::collections::BTreeMap;
 
@@ -32,18 +33,18 @@ impl Compiler {
         }
         let mut program = ScalarProgram { entry_pc: program.entry_pc(), blocks };
         // Cross-block sqrt recognition requires the complete normalized CFG.
-        super::mathcombine::fold_sqrt(&mut program);
+        super::lift::rewrite::fold_sqrt(&mut program);
         program
     }
 
     fn prepare_block(&self, pc: usize, mut insts: Vec<InstFormat>, next_pcs: &[usize]) -> ScalarBlock {
         // The existing local sqrt/DCE pass treats the last instruction as live.
         // It must run before terminator extraction and scheduling-no-op removal.
-        super::combine::combine_block(&mut insts);
+        super::lift::rewrite::combine_block(&mut insts);
         let mut block = ir::lower_block(pc, &insts, next_pcs);
         // The current emitter computes DIV_FIXUP's quotient from its original
         // operands. Preserve this backend-specific optimization at this stage.
-        super::combine::collapse_div_expansions(&mut block.body);
+        super::lift::rewrite::collapse_div_expansions(&mut block.body);
         block
     }
 

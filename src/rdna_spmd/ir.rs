@@ -8,7 +8,7 @@
 //!    (`s_delay_alu`, `s_wait*`, `s_clause`, `s_nop`, ...) removed, and
 //!  - an explicit [`Terminator`] per block.
 //!
-//! The opcode *semantics* are produced later by `emit.rs`; this layer only
+//! `lift` produces typed SSA semantics for analysis and code generation; this layer only
 //! normalizes control flow and removes scheduling no-ops. Optimization order
 //! belongs to [`super::compiler::Compiler`].
 

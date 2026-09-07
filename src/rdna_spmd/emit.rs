@@ -1,4 +1,4 @@
-//! LLVM codegen: lower a [`ScalarProgram`](super::ir::ScalarProgram) to a single-work-item native
+//! LLVM codegen: lower a typed SSA function to a single-work-item native
 //! function and JIT it with ORC.
 //!
 //! Register model: SGPR/VGPR/SCC are SSA definitions initialized from incoming
@@ -375,11 +375,11 @@ impl Cg {
 //  Public entry
 // =====================================================================
 
-pub(super) fn compile_program(plan: &ScalarPlan<'_>, num_vgprs: usize) -> ScalarKernel {
+pub(super) fn compile_program(plan: &ScalarPlan, num_vgprs: usize) -> ScalarKernel {
     unsafe { compile_inner(plan, num_vgprs) }
 }
 
-pub(super) fn compile_cooperative(plan: &ScalarPlan<'_>, num_vgprs: usize) -> CoopKernel {
+pub(super) fn compile_cooperative(plan: &ScalarPlan, num_vgprs: usize) -> CoopKernel {
     let sk = unsafe { compile_inner(plan, num_vgprs) };
     let yields = plan.function.value_yields();
     if yields.values().any(|p| p.op == super::ir::typed::effect::EffectOp::Wave(super::ir::typed::effect::WaveOp::Wmma)) {
@@ -390,10 +390,9 @@ pub(super) fn compile_cooperative(plan: &ScalarPlan<'_>, num_vgprs: usize) -> Co
 }
 
 unsafe fn compile_inner(
-    plan: &ScalarPlan<'_>,
+    plan: &ScalarPlan,
     num_vgprs: usize,
 ) -> ScalarKernel {
-    let program = plan.program;
     let writeback = plan.mode != ScalarMode::Whole && plan.function.observable_return;
     let force_exec = plan.mode == ScalarMode::Whole;
     let coop = plan.mode == ScalarMode::Cooperative;
@@ -551,7 +550,7 @@ unsafe fn compile_inner(
 
     // Create a basic block per scalar block.
     let mut bbs: BTreeMap<usize, LLVMBasicBlockRef> = BTreeMap::new();
-    for (&pc, _) in &program.blocks {
+    for &pc in plan.function.blocks.keys() {
         let name = cstr(&format!("b{:x}", pc));
         bbs.insert(pc, llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
     }
@@ -559,8 +558,8 @@ unsafe fn compile_inner(
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, None);
     ssa.set_scratch_environment(cg.private_base, cg.private_size);
     ssa.set_bvh_storage(super::dialect::rdna4::bvh::Storage {scratch: cg.bvh_scratch, packet: std::ptr::null_mut(), packet_ty: std::ptr::null_mut()});
-    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
-    for &pc in program.blocks.keys() {
+    llvm::core::LLVMBuildBr(b, bbs[&plan.function.ir.func().entry.0]);
+    for &pc in plan.function.blocks.keys() {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         ssa.begin_block(&plan.function, pc);
         let facts = &plan.blocks[&pc];

@@ -62,13 +62,41 @@ pub(in crate::rdna_spmd) struct Function {
     pub live: Vec<bool>,
     pub observable_return: bool,
 }
+/// Typed SSA before native representation and predication decisions are applied.
+pub(in crate::rdna_spmd) struct LiftedFunction {
+    pub registry: std::sync::Arc<DialectRegistry>,
+    pub written: crate::rdna_spmd::boundary::RegSet,
+    pub ir: Func,
+    pub blocks: BTreeMap<usize, BlockPlan>,
+    pub parameter_inputs: Vec<Input>,
+    pub state: crate::rdna_spmd::analysis::state::StateGraph,
+}
 impl Function {
+    #[cfg(test)]
     pub fn new(
         registry: std::sync::Arc<DialectRegistry>,
         program: &ScalarProgram,
         lowerings: &BTreeMap<usize, Vec<&Lowering>>,
         preparation: Preparation,
     ) -> Self {
+        Self::lift(registry, program, lowerings).prepare(preparation)
+    }
+    pub fn lift(
+        registry: std::sync::Arc<DialectRegistry>,
+        program: &ScalarProgram,
+        lowerings: &BTreeMap<usize, Vec<&Lowering>>,
+    ) -> LiftedFunction {
+        let mut lifted = Self::lift_raw(registry, program, lowerings);
+        lifted.prepare_queries();
+        lifted
+    }
+    /// Input rewrites need the original SSA definitions only. Native query and
+    /// scheduler-layout preparation is performed once by `lift` for compilation.
+    pub fn lift_raw(
+        registry: std::sync::Arc<DialectRegistry>,
+        program: &ScalarProgram,
+        lowerings: &BTreeMap<usize, Vec<&Lowering>>,
+    ) -> LiftedFunction {
         let mut regs = BTreeSet::new();
         let mut written = crate::rdna_spmd::boundary::RegSet::default();
         for block in lowerings.values() {
@@ -91,8 +119,26 @@ impl Function {
                 regs.extend(register_words(&io.writes));
             }
         }
+        // Preserve the source use envelope while expressing each observation
+        // as the current SSA definition, including conservative adjacent words.
+        for block in program.blocks.values() {
+            for inst in &block.body {
+                let rewrite = super::rewrite::effects_of(inst);
+                regs.extend(rewrite.reads.into_iter().chain(rewrite.kills).filter_map(super::rewrite::word));
+                regs.extend(super::access::math_reads(inst).into_iter().map(Word::Vgpr));
+                regs.extend(super::control::mask_scalar_reads(inst).into_iter().filter_map(Word::scalar));
+                regs.extend(super::access::f64_pairs(inst).into_iter().flat_map(|r| [Word::Vgpr(r), Word::Vgpr(r+1)]));
+                regs.extend(super::access::sgpr_u64_defs(inst).into_iter().flat_map(|r| [r, r+1]).filter_map(Word::scalar));
+                regs.extend(super::access::vgpr_reads(inst).into_iter().chain(super::access::div_reads(inst)).map(Word::Vgpr));
+            }
+        }
         regs.extend([Word::Mask(106), Word::Mask(126)]);
         let regs: Vec<_> = regs.into_iter().collect();
+        let mut state = crate::rdna_spmd::analysis::state::StateGraph::default();
+        state.vector_parameters = regs.iter().enumerate().filter_map(|(index, word)|
+            if let Word::Vgpr(slot) = word { Some((*slot, index)) } else { None }).collect();
+        state.scalar_parameters = regs.iter().enumerate().filter_map(|(index, word)|
+            match word { Word::Sgpr(r) | Word::Mask(r) => Some((*r, index)), _ => None }).collect();
         let mut f = Func {
             entry: BlockId(program.entry_pc),
             blocks: BTreeMap::new(),
@@ -126,7 +172,25 @@ impl Function {
             let mut instructions = Vec::with_capacity(source.body.len());
             let mut memory = BTreeMap::new();
             let mut wave = BTreeMap::new();
-            for lowering in &lowerings[&pc] {
+            let mut sites = Vec::new();
+            for (index, lowering) in lowerings[&pc].iter().enumerate() {
+                let source_inst = &source.body[index];
+                let previous_words = words.clone();
+                let first_value = f.types.len();
+                let reads = super::access::vgpr_reads(source_inst).iter()
+                    .map(|&r| words[&Word::Vgpr(r)]).collect();
+                let varying_inputs = super::access::div_reads(source_inst).iter()
+                    .map(|&r| words[&Word::Vgpr(r)]).collect();
+                let address = if let Lowering::Memory(memory) = lowering {
+                    match memory.address {
+                        super::memory::Address::Global { vector, scalar, .. } => {
+                            let mut values = vec![words[&Word::Vgpr(vector)]];
+                            if scalar.is_none() { values.push(words[&Word::Vgpr(vector+1)]); }
+                            values
+                        },
+                        _ => Vec::new(),
+                    }
+                } else { Vec::new() };
                 let io = footprint(lowering);
                 let writes: Vec<_> = register_words(&io.writes).collect();
                 let plan = match lowering {
@@ -282,6 +346,15 @@ impl Function {
                                 }
                             }
                         }
+                        // Preserve a distinct architectural definition for a
+                        // scalar copy. Native lowering coalesces the identity;
+                        // definition-scoped proof restrictions remain explicit.
+                        for (word, raw) in &mut word_defs {
+                            if matches!(word, Word::Sgpr(_)) && raw.0 < first_value {
+                                *raw = super::state::core(&mut f, &mut block.insts, Ty::I32,
+                                    Op::Convert(Cvt::Bitcast, Ty::I32, *raw));
+                            }
+                        }
                         for &r in &writes {
                             words.insert(r,*word_defs.get(&r).expect("typed output lacks its architectural SSA definition"));
                         }
@@ -339,10 +412,53 @@ impl Function {
                     }
 
                 };
+                sites.push(crate::rdna_spmd::analysis::state::Site {
+                    rewrite: super::rewrite::observation(source_inst, &previous_words, &words),
+                    math_reads: super::access::math_reads(source_inst).into_iter().map(|r| (r, previous_words[&Word::Vgpr(r)])).collect(),
+                    sqrt: super::access::sqrt_policy(source_inst, &previous_words, &words),
+                    masks: super::control::mask_policy(source_inst, &previous_words, &words),
+                    f64_definitions: super::access::f64_defs(source_inst).into_iter().filter_map(|r|
+                        Some((*words.get(&Word::Vgpr(r))?, *words.get(&Word::Vgpr(r+1))?))).collect(),
+                    u64_definitions: super::access::sgpr_u64_defs(source_inst).into_iter().filter_map(|r|
+                        Some((*words.get(&Word::scalar(r)?)?, *words.get(&Word::scalar(r+1)?)?))).collect(),
+                    f64_uses: super::access::f64_pairs(source_inst).into_iter().map(|r|
+                        (r, words[&Word::Vgpr(r)], words[&Word::Vgpr(r+1)])).collect(),
+                    exec: super::control::policy(source_inst, &previous_words, &words),
+                    reads,
+                    varying_inputs,
+                    intrinsically_varying: super::access::uses_private(source_inst),
+                    address,
+                    frame: super::access::frame_def(source_inst).map(|(r, stride)|
+                        (r, words[&Word::Vgpr(r)], words[&Word::Vgpr(r+1)], stride)),
+                    writes: writes.iter().filter_map(|word| if let Word::Vgpr(r) = word { Some((*r, words[word])) } else { None }).collect(),
+                    reactivation: if super::control::may_enable_lanes(source_inst) {
+                        words.iter().filter_map(|(word, &value)| if let Word::Vgpr(r) = word {Some((*r, value))} else {None}).collect()
+                    } else { Vec::new() },
+                });
                 instructions.push(plan);
             }
+            if matches!(source.term, Terminator::Barrier { .. }) { state.barriers.insert(pc); }
+            state.sites.insert(pc, sites);
+            state.scalar_outgoing.insert(pc, words.iter().filter_map(|(word, &value)|
+                match word { Word::Sgpr(r) | Word::Mask(r) => Some((*r, value)), _ => None }).collect());
+            if let Terminator::Branch { cond, taken, fallthrough } = source.term {
+                state.conditions.insert(pc, cond);
+                use crate::rdna_spmd::ir::Cond;
+                if matches!(cond, Cond::ExecZ | Cond::ExecNz) {
+                    state.exec_edges.insert((pc, taken), cond == Cond::ExecNz);
+                    state.exec_edges.insert((pc, fallthrough), cond == Cond::ExecZ);
+                }
+            }
+            state.outgoing.insert(pc, words.iter().filter_map(|(word, &value)|
+                if let Word::Vgpr(r) = word { Some((*r, value)) } else { None }).collect());
+            if matches!(source.term, Terminator::Yield { .. } | Terminator::Barrier { .. }) { state.yielding.insert(pc); }
             let yield_values = if let Terminator::Yield { ref action, .. } = source.term {
+                let io = action.io();
+                if io.writes.has_sgpr(126) { state.yield_exec_writes.insert(pc); }
+                state.wave_reads.extend(io.reads.vgprs().map(|r| words[&Word::Vgpr(r)]));
+                let previous: Vec<_> = io.writes.vgprs().map(|r| (r, words[&Word::Vgpr(r)])).collect();
                 let plan = action.lift(&mut f, &mut block, &mut words, &mut provenance);
+                for (r, old) in previous { state.resume_observations.push((words[&Word::Vgpr(r)], old)); }
                 for &(dest, value) in &plan.definitions {
                     if matches!(dest, super::wave::Destination::Scc) { scc = value; }
                 }
@@ -360,7 +476,8 @@ impl Function {
                 Terminator::Branch {
                     cond, taken, fallthrough,
                 } => {
-                    use crate::rdna_spmd::ir::Cond;
+                    state.conditions.insert(pc, cond);
+                use crate::rdna_spmd::ir::Cond;
                     let (input_source, input_value) = match cond {
                         Cond::Scc0 | Cond::Scc1 => (InputSource::Scc,scc),
                         Cond::ExecZ | Cond::ExecNz => (InputSource::MaskBit(126),words[&Word::Mask(126)]),
@@ -402,82 +519,12 @@ impl Function {
                 },
             );
         }
-        for (&pc, block) in &mut plans {
-            if let Some(plan) = &mut block.yield_values {
-                if let Some(end) = crate::rdna_spmd::passes::local_write_lane(&mut f,BlockId(pc),plan.core.end) {
-                    plan.core.end = end;
-                    plan.local = true;
-                }
-            }
-        }
-        // The invocation ABI supplies one scalar register bank per wave;
-        // per-lane VGPR and mask bindings carry no uniformity assumption.
-        let entry=&f.blocks[&f.entry];
-        let uniform_entry: Vec<_>=regs.iter().zip(&entry.params)
-            .filter_map(|(r,p)|matches!(r,Word::Sgpr(_)).then_some(p.0))
-            .chain(std::iter::once(entry.params[regs.len()].0)).collect();
-        crate::rdna_spmd::passes::constant_queries(&mut f,&[]);
-        crate::rdna_spmd::passes::uniform_queries(&mut f,&uniform_entry);
-        let constants = crate::rdna_spmd::analysis::constants(&f);
-        for block in plans.values_mut() {
-            if let Some(plan) = &mut block.yield_values {
-                for (index, id) in plan.arguments.iter().enumerate() {
-                    use crate::rdna_spmd::ir::typed::effect::{EffectOp, WaveOp};
-                    if plan.layout.op == EffectOp::Wave(WaveOp::Wmma)
-                        || plan.layout.op == EffectOp::Wave(WaveOp::WriteLane) && index == 2 { continue; }
-                    if let Some(bits) = constants[id.0] {
-                        plan.layout.arguments[index] = crate::rdna_spmd::yield_values::Argument::Constant(bits as u32);
-                    }
-                }
-            }
-        }
         let parameter_inputs:Vec<_>=regs.iter().map(|word|Input {ty:word.ty(),source:match *word {
             Word::Vgpr(r)=>InputSource::Operand(SourceOperand::VectorRegister(r as u8)),
             Word::Sgpr(r)=>InputSource::Operand(SourceOperand::ScalarRegister(r as u8)),
             Word::Mask(r)=>InputSource::MaskBit(r),
         }}).chain(std::iter::once(Input {ty:Ty::I1,source:InputSource::Scc})).collect();
-        // Finish all plan rewrites while the graph is owned by construction.
-        // Only the final graph crosses the verified code-generation boundary.
-        let mut scalar_live=None;
-        let observable_return=match preparation {
-            Preparation::Packet {inactive,observe_return}=>{
-                Self::packet_state(&mut f);
-                if !observe_return {
-                    Self::elide_inactive_updates(&plans,&mut f,inactive);
-                    Self::assume_dispatch_exec(&parameter_inputs,&mut f);
-                }
-                observe_return
-            },
-            Preparation::Scalar {active,dispatch}=>{
-                Self::packet_state(&mut f);
-                Self::scalar_mask_selects(&plans,&mut f);
-                if !dispatch {
-                    scalar_live=Some(crate::rdna_spmd::analysis::live_values(&f,plans.values().flat_map(|b|&b.outgoing).copied()));
-                }
-                Self::elide_active_updates(&plans,&mut f,active);
-                if dispatch {Self::assume_dispatch_exec(&parameter_inputs,&mut f);}
-                !dispatch
-            },
-            #[cfg(test)]
-            Preparation::Inspect=>true,
-        };
-        let live=scalar_live.unwrap_or_else(||{
-            let mut roots=vec![];
-            for (&pc,plan) in &plans {
-                if let Some(yielding)=&plan.yield_values {roots.extend(yielding.results.iter().map(|p|p.0));}
-                if observable_return&&matches!(f.blocks[&BlockId(pc)].term,Term::Ret) {roots.extend(&plan.outgoing);}
-            }
-            crate::rdna_spmd::analysis::live_values(&f,roots)
-        });
-        let ir=f.verify_with(&registry).expect("invalid prepared function SSA");
-        Self {
-            ir,
-            live,
-            observable_return,
-            registry,
-            written,
-            blocks: plans,
-        }
+        LiftedFunction { registry, written, ir: f, blocks: plans, parameter_inputs, state }
     }
     /// Apply the plan's proof that these temporary destinations cannot be
     /// observed by a reactivated lane or an unpredicated wave consumer.
@@ -723,6 +770,123 @@ mod tests {
             let slot = edge.args.iter().position(|&value| value == definition).expect("yield definition must reach resume");
             assert_ne!(edge.args[slot], block.params[slot].0);
             assert!(block.insts.iter().any(|inst| matches!(inst, Inst::Effect { outputs, .. } if outputs == &plan.results)));
+        }
+    }
+}
+
+impl LiftedFunction {
+    fn prepare_queries(&mut self) {
+        for (&pc, block) in &mut self.blocks {
+            if let Some(plan) = &mut block.yield_values {
+                if let Some(end) = crate::rdna_spmd::passes::local_write_lane(&mut self.ir,BlockId(pc),plan.core.end) {
+                    plan.core.end = end;
+                    plan.local = true;
+                }
+            }
+        }
+        // The invocation ABI supplies one scalar register bank per wave;
+        // per-lane VGPR and mask bindings carry no uniformity assumption.
+        let entry = &self.ir.blocks[&self.ir.entry];
+        let uniform_entry: Vec<_> = self.parameter_inputs.iter().zip(&entry.params).filter_map(|(input, parameter)|
+            matches!(input.source, InputSource::Operand(SourceOperand::ScalarRegister(_)) | InputSource::Scc)
+                .then_some(parameter.0)).collect();
+        crate::rdna_spmd::passes::constant_queries(&mut self.ir,&[]);
+        crate::rdna_spmd::passes::uniform_queries(&mut self.ir,&uniform_entry);
+        let constants = crate::rdna_spmd::analysis::constants(&self.ir);
+        for block in self.blocks.values_mut() {
+            if let Some(plan) = &mut block.yield_values {
+                for (index, id) in plan.arguments.iter().enumerate() {
+                    use crate::rdna_spmd::ir::typed::effect::{EffectOp, WaveOp};
+                    if plan.layout.op == EffectOp::Wave(WaveOp::Wmma)
+                        || plan.layout.op == EffectOp::Wave(WaveOp::WriteLane) && index == 2 { continue; }
+                    if let Some(bits) = constants[id.0] {
+                        plan.layout.arguments[index] = crate::rdna_spmd::yield_values::Argument::Constant(bits as u32);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expand proven normal scales in place, preserving every SSA result ID.
+    /// Instruction intervals are remapped together with their native bindings.
+    pub fn fold_normal_scales(&mut self, pc: usize, normal: &[bool]) {
+        let block = self.ir.blocks.get_mut(&BlockId(pc)).unwrap();
+        let mut selected = vec![false; block.insts.len()];
+        for (index, alu) in self.blocks[&pc].instructions.iter().enumerate() {
+            if normal[index] && matches!(self.state.sites[&pc][index].sqrt.shape,
+                crate::rdna_spmd::sqrt_idiom::Shape::Scale { exponent_unmodified: true, .. }) {
+                if let Some(alu) = alu { selected[alu.core.clone()].fill(true); }
+            }
+        }
+        if !selected.iter().any(|&yes| yes) { return; }
+        let old = std::mem::take(&mut block.insts);
+        let mut positions = Vec::with_capacity(old.len()+1);
+        let mut insts = Vec::new();
+        for (index, inst) in old.into_iter().enumerate() {
+            positions.push(insts.len());
+            if selected[index] { insts.extend(crate::rdna_spmd::dialect::rdna4::fold_normal(&mut self.ir, inst, &self.registry)); }
+            else { insts.push(inst); }
+        }
+        positions.push(insts.len());
+        self.ir.blocks.get_mut(&BlockId(pc)).unwrap().insts = insts;
+        let range = |r: &mut Range<usize>| { *r = positions[r.start]..positions[r.end]; };
+        let block = self.blocks.get_mut(&pc).unwrap();
+        for alu in block.instructions.iter_mut().flatten() {
+            range(&mut alu.core); range(&mut alu.previous_core); alu.updates_start = positions[alu.updates_start];
+        }
+        for memory in block.memory.values_mut() {
+            range(&mut memory.core);
+            for effect in &mut memory.effects { *effect = positions[*effect]; }
+            if let Some((ref mut r, ..)) = memory.flat { range(r); }
+        }
+        for (_, wave) in block.wave.values_mut() { range(&mut wave.core); }
+        if let Some(wave) = &mut block.yield_values { range(&mut wave.core); }
+        if let Some(condition) = &mut block.condition { range(&mut condition.core); }
+    }
+
+    pub fn prepare(self, preparation: Preparation) -> Function {
+        let Self { registry, written, ir: mut f, blocks: plans, parameter_inputs, state: _ } = self;
+        // Finish all plan rewrites while the graph is owned by construction.
+        // Only the final graph crosses the verified code-generation boundary.
+        let mut scalar_live=None;
+        let observable_return=match preparation {
+            Preparation::Packet {inactive,observe_return}=>{
+                Function::packet_state(&mut f);
+                if !observe_return {
+                    Function::elide_inactive_updates(&plans,&mut f,inactive);
+                    Function::assume_dispatch_exec(&parameter_inputs,&mut f);
+                }
+                observe_return
+            },
+            Preparation::Scalar {active,dispatch}=>{
+                Function::packet_state(&mut f);
+                Function::scalar_mask_selects(&plans,&mut f);
+                if !dispatch {
+                    scalar_live=Some(crate::rdna_spmd::analysis::live_values(&f,plans.values().flat_map(|b|&b.outgoing).copied()));
+                }
+                Function::elide_active_updates(&plans,&mut f,active);
+                if dispatch {Function::assume_dispatch_exec(&parameter_inputs,&mut f);}
+                !dispatch
+            },
+            #[cfg(test)]
+            Preparation::Inspect=>true,
+        };
+        let live=scalar_live.unwrap_or_else(||{
+            let mut roots=vec![];
+            for (&pc,plan) in &plans {
+                if let Some(yielding)=&plan.yield_values {roots.extend(yielding.results.iter().map(|p|p.0));}
+                if observable_return&&matches!(f.blocks[&BlockId(pc)].term,Term::Ret) {roots.extend(&plan.outgoing);}
+            }
+            crate::rdna_spmd::analysis::live_values(&f,roots)
+        });
+        let ir=f.verify_with(&registry).expect("invalid prepared function SSA");
+        Function {
+            ir,
+            live,
+            observable_return,
+            registry,
+            written,
+            blocks: plans,
         }
     }
 }

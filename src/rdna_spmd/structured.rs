@@ -1,20 +1,20 @@
 //! Conservative natural-loop and lane-mask analysis for vector code generation.
 //!
-//! This module does not rewrite [`ScalarProgram`]. It describes natural loops,
-//! values carried across their boundaries, and EXEC/VCC save-and-restore
-//! patterns found in the decoded instructions. The vector emitter currently
-//! uses a conservative subset of this result to keep lane masks in vector form
-//! inside one eligible leaf loop. Other loops continue through the ordinary
-//! packed-work-item code-generation path.
+//! Natural loops, carried values and saved-mask scopes are computed from the
+//! typed CFG and SSA definitions. Native mask-cell eligibility retains the
+//! existing conservative slot closure and single leaf-loop selection.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use crate::instructions::I;
+#[cfg(test)]
 use crate::rdna_instructions::{InstFormat, SourceOperand};
 
-use super::freshness::vgpr_writes;
-use super::ir::{ScalarBlock, ScalarProgram, Terminator};
-use super::vec_live::vgpr_reads;
+#[cfg(test)]
+use super::ir::{ScalarProgram, Terminator};
+use super::analysis::state::{StateGraph, Site, MaskEvent};
+use super::ir::typed::cfg::{Func, Block};
 
 /// A control-flow feature that prevents the structured-loop optimization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,16 +163,23 @@ impl StructuredPlan {
     pub fn supported(&self) -> bool { self.rejects.is_empty() }
 }
 
-fn succs(block: &ScalarBlock) -> Vec<usize> {
-    match block.term {
-        Terminator::Return => vec![],
-        Terminator::Jump(t) => vec![t],
-        Terminator::Branch { taken, fallthrough, .. } => vec![taken, fallthrough],
-        Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![resume],
-    }
+struct RegionBlock<'a> {
+    ssa: &'a Block,
+    body: &'a [Site],
+    yielding: bool,
+    condition: Option<super::ir::Cond>,
+}
+struct RegionGraph<'a> {
+    entry_pc: usize,
+    blocks: BTreeMap<usize, RegionBlock<'a>>,
+    ir: &'a Func,
+    state: &'a StateGraph,
+}
+fn succs(block: &RegionBlock<'_>) -> Vec<usize> {
+    block.ssa.term.edges().iter().map(|edge| edge.dst.0).collect()
 }
 
-fn predecessors(prog: &ScalarProgram, reachable: &BTreeSet<usize>) -> BTreeMap<usize, BTreeSet<usize>> {
+fn predecessors(prog: &RegionGraph<'_>, reachable: &BTreeSet<usize>) -> BTreeMap<usize, BTreeSet<usize>> {
     let mut out: BTreeMap<usize, BTreeSet<usize>> = reachable.iter()
         .map(|&pc| (pc, BTreeSet::new())).collect();
     for &pc in reachable {
@@ -183,7 +190,7 @@ fn predecessors(prog: &ScalarProgram, reachable: &BTreeSet<usize>) -> BTreeMap<u
     out
 }
 
-fn reachable(prog: &ScalarProgram) -> BTreeSet<usize> {
+fn reachable(prog: &RegionGraph<'_>) -> BTreeSet<usize> {
     let mut seen = BTreeSet::new();
     let mut todo = vec![prog.entry_pc];
     while let Some(pc) = todo.pop() {
@@ -196,7 +203,7 @@ fn reachable(prog: &ScalarProgram) -> BTreeSet<usize> {
 }
 
 fn dominators(
-    prog: &ScalarProgram,
+    prog: &RegionGraph<'_>,
     reachable: &BTreeSet<usize>,
     preds: &BTreeMap<usize, BTreeSet<usize>>,
 ) -> BTreeMap<usize, BTreeSet<usize>> {
@@ -242,10 +249,10 @@ fn natural_loop(
     body
 }
 
-fn region_rpo(prog: &ScalarProgram, header: usize, body: &BTreeSet<usize>) -> Vec<usize> {
+fn region_rpo(prog: &RegionGraph<'_>, header: usize, body: &BTreeSet<usize>) -> Vec<usize> {
     fn visit(
         pc: usize,
-        prog: &ScalarProgram,
+        prog: &RegionGraph<'_>,
         body: &BTreeSet<usize>,
         seen: &mut BTreeSet<usize>,
         postorder: &mut Vec<usize>,
@@ -270,324 +277,91 @@ fn region_rpo(prog: &ScalarProgram, header: usize, body: &BTreeSet<usize>) -> Ve
     postorder
 }
 
-fn live_in(prog: &ScalarProgram, reachable: &BTreeSet<usize>) -> BTreeMap<usize, BTreeSet<u32>> {
-    let mut live: BTreeMap<usize, BTreeSet<u32>> = reachable.iter()
-        .map(|&pc| (pc, BTreeSet::new())).collect();
-    loop {
-        let mut changed = false;
-        for &pc in reachable {
-            let mut cur = BTreeSet::new();
-            for s in succs(&prog.blocks[&pc]) {
-                if let Some(v) = live.get(&s) { cur.extend(v.iter().copied()); }
+fn live_in(prog: &RegionGraph<'_>, reachable: &BTreeSet<usize>) -> BTreeMap<usize, BTreeSet<u32>> {
+    let mut dependencies = vec![Vec::new(); prog.ir.types.len()];
+    let mut pending = Vec::new();
+    for &pc in reachable {
+        pending.extend(prog.blocks[&pc].body.iter().flat_map(|site| site.reads.iter().copied()));
+        for edge in prog.blocks[&pc].ssa.term.edges() {
+            if !reachable.contains(&edge.dst.0) { continue; }
+            for &(slot, index) in &prog.state.vector_parameters {
+                let parameter = prog.ir.blocks[&edge.dst].params[index].0;
+                dependencies[parameter.0].push(prog.state.outgoing[&pc][&slot]);
             }
-            for inst in prog.blocks[&pc].body.iter().rev() {
-                for w in vgpr_writes(inst) { cur.remove(&w); }
-                cur.extend(vgpr_reads(inst));
-            }
-            if cur != live[&pc] { live.insert(pc, cur); changed = true; }
         }
-        if !changed { return live; }
     }
-}
-
-fn has_cross_lane(block: &ScalarBlock) -> Option<usize> {
-    block.body.iter().position(|inst| match inst {
-        crate::rdna_instructions::InstFormat::VOP3(i) =>
-            matches!(i.op, I::V_READLANE_B32 | I::V_WRITELANE_B32),
-        crate::rdna_instructions::InstFormat::VOP3P(i) =>
-            matches!(i.op, I::V_WMMA_F32_16X16X16_F16),
-        crate::rdna_instructions::InstFormat::DS(i) =>
-            matches!(i.op, I::DS_BPERMUTE_B32 | I::DS_BPERMUTE_FI_B32),
-        _ => false,
-    })
-}
-
-fn scalar_reg(op: &SourceOperand) -> Option<u32> {
-    match op {
-        SourceOperand::ScalarRegister(reg) => Some(*reg as u32),
-        _ => None,
+    let mut live = vec![false; prog.ir.types.len()];
+    while let Some(value) = pending.pop() {
+        if !live[value.0] { live[value.0] = true; pending.extend(&dependencies[value.0]); }
     }
+    reachable.iter().map(|&pc| (pc, prog.state.vector_parameters.iter().filter_map(|&(slot, index)|
+        live[prog.blocks[&pc].ssa.params[index].0.0].then_some(slot)).collect())).collect()
 }
 
-fn is_saveexec(inst: &InstFormat, reg: u32) -> bool {
-    matches!(inst, InstFormat::SOP1(i)
-        if i.sdst as u32 == reg && matches!(i.op,
-            I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 |
-            I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32))
-}
-
-fn is_copyexec(inst: &InstFormat, reg: u32) -> bool {
-    matches!(inst, InstFormat::SOP1(i)
-        if i.sdst as u32 == reg && matches!(i.op, I::S_MOV_B32)
-            && scalar_reg(&i.ssrc0) == Some(126))
-}
-
-fn restores_exec(inst: &InstFormat, reg: u32) -> bool {
-    matches!(inst, InstFormat::SOP2(i)
-        if i.sdst as u32 == 126 && matches!(i.op, I::S_OR_B32)
-            && (scalar_reg(&i.ssrc0) == Some(reg) || scalar_reg(&i.ssrc1) == Some(reg)))
-}
-
-fn mask_logic_op(op: I) -> bool {
-    matches!(op,
-        I::S_AND_B32 | I::S_OR_B32 | I::S_XOR_B32 |
-        I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32)
-}
-
-fn saveexec_op(op: I) -> bool {
-    matches!(op,
-        I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 |
-        I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32)
-}
-
-/// The same mask-value closure a direct emitter would need, expressed only in
-/// terms of decoded ISA.  It deliberately admits a scalar operand of a B32
-/// logic operation: bitwise operations on packed lane masks remain valid for
-/// any 32-bit input, but a later non-mask use of that operand is reported by
-/// [`scalar_mask_alias_sites`].
-fn mask_value_sgprs(
-    prog: &ScalarProgram,
-    body: &BTreeSet<usize>,
-    saved: &BTreeSet<u32>,
-) -> BTreeSet<u32> {
-    const EXEC: u32 = 126;
-    const VCC: u32 = 106;
-    let mut masks = BTreeSet::from([EXEC, VCC]);
+fn mask_value_sgprs(prog: &RegionGraph<'_>, body: &BTreeSet<usize>, saved: &BTreeSet<u32>) -> BTreeSet<u32> {
+    let mut masks = BTreeSet::from([106, 126]);
     masks.extend(saved);
     loop {
         let before = masks.len();
         for &pc in body {
-            for inst in &prog.blocks[&pc].body {
-                match inst {
-                    InstFormat::SOP1(i) if matches!(i.op, I::S_MOV_B32) => {
-                        let dst = i.sdst as u32;
-                        let src = scalar_reg(&i.ssrc0);
-                        if masks.contains(&dst) || src.is_some_and(|r| masks.contains(&r)) {
-                            masks.insert(dst);
-                            if let Some(src) = src { masks.insert(src); }
-                        }
-                    }
-                    InstFormat::SOP1(i) if saveexec_op(i.op) => {
-                        masks.insert(i.sdst as u32);
-                        if let Some(src) = scalar_reg(&i.ssrc0) { masks.insert(src); }
-                    }
-                    InstFormat::SOP2(i) if mask_logic_op(i.op) => {
-                        let srcs = [scalar_reg(&i.ssrc0), scalar_reg(&i.ssrc1)];
-                        if masks.contains(&(i.sdst as u32))
-                            || srcs.iter().flatten().any(|r| masks.contains(r))
-                        {
-                            masks.insert(i.sdst as u32);
-                            masks.extend(srcs.iter().flatten().copied());
-                        }
-                    }
-                    InstFormat::VOPC(i) if format!("{:?}", i.op).starts_with("V_CMP") => {
-                        masks.insert(if format!("{:?}", i.op).starts_with("V_CMPX") { EXEC } else { VCC });
-                    }
-                    InstFormat::VOP3(i)
-                        if format!("{:?}", i.op).starts_with("V_CMP") =>
-                    {
-                        masks.insert(if format!("{:?}", i.op).starts_with("V_CMPX") { EXEC } else { VCC });
-                    }
-                    _ => {}
-                }
+            for site in prog.blocks[&pc].body {
+                masks.extend(&site.masks.seed);
+                if site.masks.closure.iter().any(|r| masks.contains(r)) { masks.extend(&site.masks.closure); }
             }
         }
-        if masks.len() == before { return masks; }
-    }
-}
-
-fn operand_is_reg(op: &SourceOperand, reg: u32) -> bool {
-    scalar_reg(op) == Some(reg)
-}
-
-fn range_contains(first: u32, words: u32, reg: u32) -> bool {
-    (first..first.saturating_add(words)).contains(&reg)
-}
-
-/// Whether `inst` reads `reg` as an ordinary scalar value rather than as a
-/// packed lane mask. Destinations are deliberately absent: a scalar
-/// redefinition after the mask value is dead is harmless, and the reaching
-/// definition transfer below kills it before a later read.
-fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
-    match inst {
-        InstFormat::SOP1(i) => !(matches!(i.op, I::S_MOV_B32) || saveexec_op(i.op))
-            && operand_is_reg(&i.ssrc0, reg),
-        InstFormat::SOP2(i) => !mask_logic_op(i.op)
-            && (operand_is_reg(&i.ssrc0, reg) || operand_is_reg(&i.ssrc1, reg)),
-        InstFormat::SOPK(_) => false,
-        InstFormat::SOPC(i) => operand_is_reg(&i.ssrc0, reg) || operand_is_reg(&i.ssrc1, reg),
-        InstFormat::SOPP(_) => false,
-        InstFormat::SMEM(i) => {
-            range_contains(i.sbase as u32, 2, reg)
-                || i.soffset as u32 == reg
-        }
-        InstFormat::VOP1(i) => operand_is_reg(&i.src0, reg),
-        InstFormat::VOP2(i) => operand_is_reg(&i.src0, reg),
-        InstFormat::VOP3(i) => {
-            // V_CMP writes EXEC/VCC implicitly; its vector operands do not
-            // alias an SGPR unless one is explicitly encoded as a source.
-            operand_is_reg(&i.src0, reg) || operand_is_reg(&i.src1, reg) || operand_is_reg(&i.src2, reg)
-        }
-        InstFormat::VOP3SD(i) => operand_is_reg(&i.src0, reg)
-            || operand_is_reg(&i.src1, reg) || operand_is_reg(&i.src2, reg),
-        InstFormat::VOP3P(i) => operand_is_reg(&i.src0, reg)
-            || operand_is_reg(&i.src1, reg) || operand_is_reg(&i.src2, reg),
-        InstFormat::VOPC(i) => operand_is_reg(&i.src0, reg),
-        InstFormat::VOPD(i) => operand_is_reg(&i.src0x, reg) || operand_is_reg(&i.src0y, reg),
-        InstFormat::VFLAT(i) => {
-            i.saddr != 124 && i.saddr != 127 && range_contains(i.saddr as u32, 2, reg)
-        }
-        InstFormat::VGLOBAL(i) => {
-            i.saddr != 124 && i.saddr != 127 && range_contains(i.saddr as u32, 2, reg)
-        }
-        InstFormat::VSCRATCH(i) => {
-            i.saddr != 124 && i.saddr != 127 && range_contains(i.saddr as u32, 2, reg)
-        }
-        InstFormat::VIMAGE(i) => range_contains(i.rsrc as u32, 4, reg),
-        InstFormat::VSAMPLE(i) => range_contains(i.rsrc as u32, 4, reg) || range_contains(i.samp as u32, 4, reg),
-        InstFormat::DS(_) => false,
-    }
-}
-
-pub(super) fn scalar_write_regs(inst: &InstFormat) -> Vec<u32> {
-    let pair = |reg: u8| vec![reg as u32, reg as u32 + 1];
-    let one = |reg: u8| vec![reg as u32];
-    match inst {
-        InstFormat::SOP1(i) => if matches!(i.op, I::S_MOV_B64) { pair(i.sdst) } else { one(i.sdst) },
-        InstFormat::SOP2(i) if matches!(i.op,
-            I::S_ADD_NC_U64 | I::S_MUL_U64 | I::S_LSHL_B64 | I::S_LSHR_B64 |
-            I::S_ASHR_I64 | I::S_AND_B64 | I::S_OR_B64 | I::S_XOR_B64 | I::S_CSELECT_B64) => pair(i.sdst),
-        InstFormat::SOP2(i) => one(i.sdst),
-        InstFormat::SOPK(i) => one(i.sdst),
-        InstFormat::VOP3SD(i) => one(i.sdst),
-        InstFormat::SMEM(i) => {
-            let words = match i.op {
-                I::S_LOAD_B32 | I::S_LOAD_U16 => 1,
-                I::S_LOAD_B64 => 2,
-                I::S_LOAD_B96 => 3,
-                I::S_LOAD_B128 => 4,
-                I::S_LOAD_B256 => 8,
-                I::S_LOAD_B512 => 16,
-                _ => 1,
-            };
-            (0..words).map(|offset| i.sdata as u32 + offset).collect()
-        }
-        _ => vec![],
-    }
-}
-
-fn update_mask_definition(
-    masks: &mut BTreeSet<u32>,
-    candidates: &BTreeSet<u32>,
-    reg: u32,
-    is_mask: bool,
-) {
-    if !candidates.contains(&reg) { return; }
-    if is_mask { masks.insert(reg); } else { masks.remove(&reg); }
-}
-
-/// Transfer the may-reaching set of packed-mask values through one decoded
-/// instruction. A union at CFG joins is required: if any path reaches an
-/// ordinary scalar read with a mask-derived value, the SGPR cannot be replaced
-/// solely by a vector of lane booleans.
-fn transfer_reaching_masks(
-    inst: &InstFormat,
-    masks: &mut BTreeSet<u32>,
-    candidates: &BTreeSet<u32>,
-) {
-    const EXEC: u32 = 126;
-    const VCC: u32 = 106;
-    let source_mask = |op: &SourceOperand, masks: &BTreeSet<u32>| {
-        scalar_reg(op).is_some_and(|reg| masks.contains(&reg))
-    };
-    match inst {
-        InstFormat::SOP1(i) if saveexec_op(i.op) => {
-            update_mask_definition(masks, candidates, i.sdst as u32, true);
-            masks.insert(EXEC);
-        }
-        InstFormat::SOP1(i) if matches!(i.op, I::S_MOV_B32) => {
-            let is_mask = source_mask(&i.ssrc0, masks);
-            update_mask_definition(masks, candidates, i.sdst as u32, is_mask);
-        }
-        InstFormat::SOP2(i) if mask_logic_op(i.op) => {
-            let is_mask = source_mask(&i.ssrc0, masks) || source_mask(&i.ssrc1, masks);
-            update_mask_definition(masks, candidates, i.sdst as u32, is_mask);
-        }
-        InstFormat::VOPC(i) if format!("{:?}", i.op).starts_with("V_CMP") => {
-            masks.insert(if format!("{:?}", i.op).starts_with("V_CMPX") { EXEC } else { VCC });
-        }
-        InstFormat::VOP3(i) if format!("{:?}", i.op).starts_with("V_CMP") => {
-            masks.insert(if format!("{:?}", i.op).starts_with("V_CMPX") { EXEC } else { VCC });
-        }
-        InstFormat::VOP3SD(i) => {
-            // The scalar destination is the per-lane carry/borrow mask.
-            update_mask_definition(masks, candidates, i.sdst as u32, true);
-        }
-        _ => {
-            for reg in scalar_write_regs(inst) {
-                // EXEC and VCC are architecturally packed lane masks even
-                // when an unusual SALU instruction writes them.
-                update_mask_definition(masks, candidates, reg, reg == EXEC || reg == VCC);
-            }
-        }
-    }
-}
-
-fn reaching_mask_entry(
-    prog: &ScalarProgram,
-    body: &BTreeSet<usize>,
-    header: usize,
-    candidates: &BTreeSet<u32>,
-) -> BTreeMap<usize, BTreeSet<u32>> {
-    const EXEC: u32 = 126;
-    const VCC: u32 = 106;
-    let mut entry: BTreeMap<usize, BTreeSet<u32>> = body.iter()
-        .map(|&pc| (pc, BTreeSet::new())).collect();
-    entry.insert(header, BTreeSet::from([EXEC, VCC]));
-    loop {
-        let mut incoming: BTreeMap<usize, BTreeSet<u32>> = body.iter()
-            .map(|&pc| (pc, if pc == header { BTreeSet::from([EXEC, VCC]) } else { BTreeSet::new() }))
-            .collect();
-        for &from in body {
-            let mut out = entry[&from].clone();
-            for inst in &prog.blocks[&from].body {
-                transfer_reaching_masks(inst, &mut out, candidates);
-            }
-            for to in succs(&prog.blocks[&from]) {
-                if body.contains(&to) { incoming.get_mut(&to).unwrap().extend(out.iter().copied()); }
-            }
-        }
-        if incoming == entry { return entry; }
-        entry = incoming;
+        if before == masks.len() { return masks; }
     }
 }
 
 fn scalar_mask_alias_sites(
-    prog: &ScalarProgram,
-    body: &BTreeSet<usize>,
-    header: usize,
-    masks: &BTreeSet<u32>,
+    prog: &RegionGraph<'_>, body: &BTreeSet<usize>, header: usize, masks: &BTreeSet<u32>,
 ) -> Vec<StructuredScalarMaskAlias> {
-    let entry = reaching_mask_entry(prog, body, header, masks);
-    let mut sites = Vec::new();
-    for &pc in body {
-        let mut reaching = entry[&pc].clone();
-        for (instruction, inst) in prog.blocks[&pc].body.iter().enumerate() {
-            for &sgpr in &reaching {
-                if scalar_mask_read(inst, sgpr) {
-                    sites.push(StructuredScalarMaskAlias { sgpr, pc, instruction });
+    let mut facts = vec![false; prog.ir.types.len()];
+    let seeds: Vec<_> = prog.state.scalar_parameters.iter().filter_map(|&(slot, index)|
+        matches!(slot, 106 | 126).then_some(prog.blocks[&header].ssa.params[index].0)).collect();
+    loop {
+        let previous = facts.clone();
+        for &value in &seeds { facts[value.0] = true; }
+        for &pc in body {
+            for site in prog.blocks[&pc].body {
+                for (value, inputs, fixed) in &site.masks.definitions {
+                    facts[value.0] = *fixed || inputs.iter().any(|v| facts[v.0]);
                 }
             }
-            transfer_reaching_masks(inst, &mut reaching, masks);
+        }
+        for &pc in body {
+            for edge in prog.blocks[&pc].ssa.term.edges() {
+                if !body.contains(&edge.dst.0) { continue; }
+                for &(slot, index) in &prog.state.scalar_parameters {
+                    if masks.contains(&slot) {
+                        let parameter = prog.ir.blocks[&edge.dst].params[index].0;
+                        facts[parameter.0] |= facts[prog.state.scalar_outgoing[&pc][&slot].0];
+                    }
+                }
+            }
+        }
+        if facts == previous { break; }
+    }
+    let mut result = Vec::new();
+    for &pc in body {
+        for (instruction, site) in prog.blocks[&pc].body.iter().enumerate() {
+            for &(sgpr, value) in &site.masks.reads {
+                if masks.contains(&sgpr) && facts[value.0] { result.push(StructuredScalarMaskAlias { sgpr, pc, instruction }); }
+            }
         }
     }
-    sites
+    result
 }
 
-/// May-analysis of one saved mask through the loop CFG.  `true` means a save
-/// performed in this loop may not yet have been restored on that path.
+fn saves(site: &Site, slot: u32) -> bool {
+    matches!(site.masks.event, Some(MaskEvent::Save(r) | MaskEvent::Copy(r)) if r == slot)
+}
+fn restores(site: &Site, slot: u32) -> bool {
+    matches!(&site.masks.event, Some(MaskEvent::Logic { restore: true, sources }) if sources.contains(&slot))
+}
+
 fn saved_mask_reaches_boundary(
-    prog: &ScalarProgram,
+    prog: &RegionGraph<'_>,
     header: usize,
     body: &BTreeSet<usize>,
     latches: &BTreeSet<usize>,
@@ -599,10 +373,10 @@ fn saved_mask_reaches_boundary(
         let mut changed = false;
         for &pc in body {
             let mut live = entry[&pc];
-            for inst in &prog.blocks[&pc].body {
-                if is_saveexec(inst, reg) || is_copyexec(inst, reg) {
+            for inst in prog.blocks[&pc].body {
+                if saves(inst, reg) {
                     live = true;
-                } else if restores_exec(inst, reg) {
+                } else if restores(inst, reg) {
                     live = false;
                 }
             }
@@ -618,10 +392,10 @@ fn saved_mask_reaches_boundary(
 
     for &pc in body {
         let mut live = entry[&pc];
-        for inst in &prog.blocks[&pc].body {
-            if is_saveexec(inst, reg) || is_copyexec(inst, reg) {
+        for inst in prog.blocks[&pc].body {
+            if saves(inst, reg) {
                 live = true;
-            } else if restores_exec(inst, reg) {
+            } else if restores(inst, reg) {
                 live = false;
             }
         }
@@ -634,107 +408,33 @@ fn saved_mask_reaches_boundary(
 }
 
 fn mask_stack(
-    prog: &ScalarProgram,
+    prog: &RegionGraph<'_>,
     header: usize,
     body: &BTreeSet<usize>,
     latches: &BTreeSet<usize>,
     exits: &BTreeSet<(usize, usize)>,
     rpo_body: &[usize],
 ) -> StructuredMaskStack {
-    const EXEC: u32 = 126;
-    let mut saved = BTreeSet::new();
-    for &pc in rpo_body {
-        for inst in &prog.blocks[&pc].body {
-            match inst {
-                InstFormat::SOP1(i)
-                    if matches!(
-                        i.op,
-                        I::S_AND_SAVEEXEC_B32
-                            | I::S_AND_NOT1_SAVEEXEC_B32
-                            | I::S_OR_SAVEEXEC_B32
-                            | I::S_XOR_SAVEEXEC_B32
-                    ) =>
-                {
-                    saved.insert(i.sdst as u32);
-                }
-                InstFormat::SOP1(i)
-                    if matches!(i.op, I::S_MOV_B32)
-                        && scalar_reg(&i.ssrc0) == Some(EXEC) =>
-                {
-                    saved.insert(i.sdst as u32);
-                }
-                _ => {}
-            }
-        }
-    }
-
+    let saved: BTreeSet<_> = rpo_body.iter().flat_map(|pc| prog.blocks[pc].body).filter_map(|site|
+        match site.masks.event { Some(MaskEvent::Save(r) | MaskEvent::Copy(r)) => Some(r), _ => None }).collect();
     let mut operations = Vec::new();
     let mut restored = BTreeSet::new();
     for &pc in rpo_body {
-        for (instruction, inst) in prog.blocks[&pc].body.iter().enumerate() {
-            match inst {
-                InstFormat::SOP1(i)
-                    if matches!(
-                        i.op,
-                        I::S_AND_SAVEEXEC_B32
-                            | I::S_AND_NOT1_SAVEEXEC_B32
-                            | I::S_OR_SAVEEXEC_B32
-                            | I::S_XOR_SAVEEXEC_B32
-                    ) =>
-                {
-                    operations.push(StructuredMaskOp {
-                        pc,
-                        instruction,
-                        kind: StructuredMaskOpKind::SaveExec,
-                        saved_sgpr: Some(i.sdst as u32),
-                    });
-                }
-                InstFormat::SOP1(i)
-                    if matches!(i.op, I::S_MOV_B32)
-                        && scalar_reg(&i.ssrc0) == Some(EXEC) =>
-                {
-                    operations.push(StructuredMaskOp {
-                        pc,
-                        instruction,
-                        kind: StructuredMaskOpKind::CopyExec,
-                        saved_sgpr: Some(i.sdst as u32),
-                    });
-                }
-                InstFormat::SOP2(i) if i.sdst as u32 == EXEC => {
-                    let saved_sgpr = [scalar_reg(&i.ssrc0), scalar_reg(&i.ssrc1)]
-                        .iter()
-                        .flatten()
-                        .copied()
-                        .find(|reg| saved.contains(reg));
-                    let kind = if matches!(i.op, I::S_OR_B32) && saved_sgpr.is_some() {
-                        restored.insert(saved_sgpr.unwrap());
-                        StructuredMaskOpKind::RestoreExec
-                    } else {
-                        StructuredMaskOpKind::ExecLogic
-                    };
-                    operations.push(StructuredMaskOp { pc, instruction, kind, saved_sgpr });
-                }
-                InstFormat::VOPC(i) if format!("{:?}", i.op).starts_with("V_CMPX") => {
-                    operations.push(StructuredMaskOp {
-                        pc,
-                        instruction,
-                        kind: StructuredMaskOpKind::CmpxNarrowExec,
-                        saved_sgpr: None,
-                    });
-                }
-                InstFormat::VOP3(i)
-                    if format!("{:?}", i.op).starts_with("V_CMPX")
-                        && i.vdst as u32 == EXEC =>
-                {
-                    operations.push(StructuredMaskOp {
-                        pc,
-                        instruction,
-                        kind: StructuredMaskOpKind::CmpxNarrowExec,
-                        saved_sgpr: None,
-                    });
-                }
-                _ => {}
-            }
+        for (instruction, site) in prog.blocks[&pc].body.iter().enumerate() {
+            let (kind, saved_sgpr) = match &site.masks.event {
+                Some(MaskEvent::Save(r)) => (StructuredMaskOpKind::SaveExec, Some(*r)),
+                Some(MaskEvent::Copy(r)) => (StructuredMaskOpKind::CopyExec, Some(*r)),
+                Some(MaskEvent::Logic { restore, sources }) => {
+                    let selected = sources.iter().copied().find(|r| saved.contains(r));
+                    let kind = if *restore && selected.is_some() {
+                        restored.insert(selected.unwrap()); StructuredMaskOpKind::RestoreExec
+                    } else { StructuredMaskOpKind::ExecLogic };
+                    (kind, selected)
+                },
+                Some(MaskEvent::Compare) => (StructuredMaskOpKind::CmpxNarrowExec, None),
+                None => continue,
+            };
+            operations.push(StructuredMaskOp { pc, instruction, kind, saved_sgpr });
         }
     }
     let boundary_live_saved: Vec<u32> = saved.iter().copied()
@@ -775,7 +475,7 @@ fn mask_stack(
     }
 }
 
-fn finish_order(pc: usize, prog: &ScalarProgram, reachable: &BTreeSet<usize>, seen: &mut BTreeSet<usize>, out: &mut Vec<usize>) {
+fn finish_order(pc: usize, prog: &RegionGraph<'_>, reachable: &BTreeSet<usize>, seen: &mut BTreeSet<usize>, out: &mut Vec<usize>) {
     if !seen.insert(pc) { return; }
     for s in succs(&prog.blocks[&pc]) {
         if reachable.contains(&s) { finish_order(s, prog, reachable, seen, out); }
@@ -784,7 +484,7 @@ fn finish_order(pc: usize, prog: &ScalarProgram, reachable: &BTreeSet<usize>, se
 }
 
 fn reverse_sccs(
-    prog: &ScalarProgram,
+    prog: &RegionGraph<'_>,
     reachable: &BTreeSet<usize>,
     preds: &BTreeMap<usize, BTreeSet<usize>>,
 ) -> Vec<BTreeSet<usize>> {
@@ -809,7 +509,16 @@ fn reverse_sccs(
 
 /// Analyze natural loops, live VGPRs, branch conditions, and lane-mask state
 /// without rewriting the program.
-pub fn analyze_structured(prog: &ScalarProgram) -> StructuredPlan {
+pub(super) fn analyze(function: &super::lift::function::LiftedFunction) -> StructuredPlan {
+    let graph = RegionGraph {
+        entry_pc: function.ir.entry.0,
+        blocks: function.ir.blocks.iter().map(|(&pc, block)| (pc.0, RegionBlock {
+            ssa: block, body: &function.state.sites[&pc.0],
+            yielding: function.state.yielding.contains(&pc.0), condition: function.state.conditions.get(&pc.0).copied(),
+        })).collect(),
+        ir: &function.ir, state: &function.state,
+    };
+    let prog = &graph;
     let reachable = reachable(prog);
     let preds = predecessors(prog, &reachable);
     let dom = dominators(prog, &reachable, &preds);
@@ -818,10 +527,10 @@ pub fn analyze_structured(prog: &ScalarProgram) -> StructuredPlan {
 
     for &pc in &reachable {
         let block = &prog.blocks[&pc];
-        if matches!(block.term, Terminator::Barrier { .. } | Terminator::Yield { .. }) {
+        if block.yielding {
             rejects.push(StructuredReject::Barrier { pc });
         }
-        if let Some(inst) = has_cross_lane(block) {
+        if let Some(inst) = block.body.iter().position(|s| s.masks.cross_lane) {
             rejects.push(StructuredReject::CrossLane { pc, inst });
         }
     }
@@ -865,7 +574,7 @@ pub fn analyze_structured(prog: &ScalarProgram) -> StructuredPlan {
             }
         }
         let writes: BTreeSet<u32> = body.iter().flat_map(|pc| {
-            prog.blocks[pc].body.iter().flat_map(vgpr_writes)
+            prog.blocks[pc].body.iter().flat_map(|s| s.writes.iter().map(|&(slot, _)| slot))
         }).collect();
         let entry_vgprs: Vec<u32> = live[&header].iter().copied().collect();
         let carried: BTreeSet<u32> = live[&header].intersection(&writes).copied().collect();
@@ -879,8 +588,8 @@ pub fn analyze_structured(prog: &ScalarProgram) -> StructuredPlan {
         let mut branch_conditions = BTreeSet::new();
         let mut conditional_blocks = Vec::new();
         for &pc in &body {
-            if let Terminator::Branch { cond, .. } = &prog.blocks[&pc].term {
-                branch_conditions.insert(*cond);
+            if let Some(cond) = prog.blocks[&pc].condition {
+                branch_conditions.insert(cond);
                 conditional_blocks.push(pc);
             }
         }
@@ -950,6 +659,14 @@ pub fn analyze_structured(prog: &ScalarProgram) -> StructuredPlan {
         loops,
         rejects,
     }
+}
+
+pub fn analyze_structured(program: &super::ir::ScalarProgram) -> StructuredPlan {
+    let registry = std::sync::Arc::new(super::dialect::DialectRegistry::rdna4());
+    let instructions: BTreeMap<_, Vec<_>> = program.blocks.iter().map(|(&pc, block)|
+        (pc, block.body.iter().map(|i| super::lift::instruction_with_registry(i, &registry)).collect())).collect();
+    let refs = instructions.iter().map(|(&pc, body)| (pc, body.iter().collect())).collect();
+    analyze(&super::lift::function::Function::lift(registry, program, &refs))
 }
 
 #[cfg(test)]

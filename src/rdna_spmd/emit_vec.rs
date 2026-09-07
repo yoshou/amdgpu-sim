@@ -1,4 +1,4 @@
-//! Width-W SPMD codegen: lower a [`ScalarProgram`](super::ir::ScalarProgram) to a native function that
+//! Width-W SPMD codegen: lower a typed SSA function to a native function that
 //! processes **W work-items at once** (one per SIMD lane), and JIT it with ORC.
 //!
 //! It uses the same scalar control-flow graph as the single-work-item emitter,
@@ -131,7 +131,7 @@ struct Cg {
     // emit_term). This removes the per-f64-write trunc/lshr/store×2
     // write-through that showed as vpmovqd/vpsrlq/vinserti in the profile.
     stale: std::cell::Cell<super::regtype::RegSet>,
-    // Cross-block must-freshness in-sets (freshness::analyze), used by
+    // Native SSA pair availability at block entry, used by
     // emit_term to decide which stale pairs must be synced on an out-edge.
     fresh_in: std::collections::BTreeMap<usize, super::regtype::RegSet>,
     // VGPR pairs used consistently as f64 values are stored only in their
@@ -739,7 +739,6 @@ unsafe fn compile_inner(
     plan: &PacketPlan<'_>,
     num_vgprs: usize,
 ) -> super::jit::NativeCode {
-    let program = plan.program;
     let boundary = plan.boundary;
     let w = plan.width;
     let coop = boundary.is_some();
@@ -854,7 +853,7 @@ unsafe fn compile_inner(
         sgpr, vgpr, vgpr_f64, scc,
         f64_fresh: std::cell::Cell::new([0; 2]),
         stale: std::cell::Cell::new([0; 2]),
-        fresh_in: plan.fresh_in.clone(),
+        fresh_in: plan.blocks.iter().map(|(&pc, block)| (pc, block.fresh)).collect(),
         f64c: plan.f64_pairs,
         global_load: std::cell::Cell::new(GlobalLoad::Gather),
         nonempty_exec: std::cell::Cell::new(false),
@@ -919,7 +918,7 @@ unsafe fn compile_inner(
     cg.predicate.set(true);
 
     let mut bbs: BTreeMap<usize, LLVMBasicBlockRef> = BTreeMap::new();
-    for (&pc, _) in &program.blocks {
+    for &pc in plan.function.blocks.keys() {
         let name = cstr(&format!("b{:x}", pc));
         bbs.insert(pc, llvm::core::LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
     }
@@ -934,7 +933,7 @@ unsafe fn compile_inner(
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, Some(plan.width));
     ssa.set_scratch_environment(cg.scratch_base_scalar, cg.scratch_stride);
     ssa.set_bvh_storage(super::dialect::rdna4::bvh::Storage {scratch: cg.bvh_scratch, packet: cg.bvh_packet, packet_ty: cg.bvh_packet_ty});
-    llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
+    llvm::core::LLVMBuildBr(b, bbs[&plan.function.ir.func().entry.0]);
     for (&pc, block_plan) in &plan.blocks {
         llvm::core::LLVMPositionBuilderAtEnd(b, bbs[&pc]);
         cg.current_pc.set(pc);
@@ -987,7 +986,7 @@ unsafe fn compile_inner(
                 cg.global_load.set(instruction.global_load);
                 cg.nonempty_exec.set(instruction.nonempty_exec || (!variant_pred && instruction.entry_exec_unchanged));
                 if let Some(SqrtCollapse::Capture { site, src }) = &instruction.sqrt {
-                    sqrt_inputs.insert(*site, cg.vsrc_f64(src));
+                    sqrt_inputs.insert(*site, cg.typed_input(src, false));
                 }
                 if matches!(instruction.action, InstructionAction::ClusterMember) {
                     continue;

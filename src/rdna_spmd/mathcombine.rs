@@ -1,193 +1,55 @@
-//! Scalar-only math-idiom combine: collapse the f64 `rsq + Newton-Raphson`
-//! square-root expansion to a single `V_SQRT_F64`.
-//!
-//! The shared `rdna_translator::combine` recognizes the same chain but rejects
-//! it when a Newton temporary is live at the block end (a conservative
-//! single-block liveness check). Our scalar emit lowers `V_SQRT_F64` to the
-//! exact `llvm.sqrt`, and the chain's temporaries are in fact dead downstream,
-//! so with a real cross-block liveness analysis the whole Newton chain (~8 FMAs
-//! per sqrt) can be deleted. Measured: ~366 such chains, ~20% of dynamic f64
-//! arithmetic.
-
+//! Cross-block sqrt expansion recognition using typed SSA liveness.
 use std::collections::{BTreeMap, BTreeSet};
+use super::analysis::{state::Site, rewrite::{Operand, Kind}};
+use super::lift::function::LiftedFunction;
 
-use crate::instructions::I;
-use crate::rdna_instructions::{InstFormat, SourceOperand, VOP1};
-
-use super::freshness::vgpr_writes;
-use super::ir::{ScalarProgram, Terminator};
-
-fn is_f64_op(op: I) -> bool {
-    // Ops whose vector source operands are read as f64 *pairs* (r, r+1). i32 ops
-    // (V_CNDMASK/V_MOV/V_AND/...) read a single register. Over-including a pair
-    // for an f64 op's occasional i32 sub-operand (e.g. V_LDEXP src1) is safe;
-    // under-counting an i32 op's single read as a pair was the bug.
-    let s = format!("{:?}", op);
-    s.contains("F64") && !matches!(op, I::V_CVT_F64_U32 | I::V_CVT_F64_I32)
-}
-
-/// VGPR registers read by an instruction (source operands), at correct width.
-fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
-    if let Some((reads, _)) = super::lift::half::registers(inst) { return reads; }
-    let mut r = Vec::new();
-    match inst {
-        InstFormat::VOP1(i) => {
-            if let SourceOperand::VectorRegister(x) = i.src0 {
-                r.push(x as u32);
-                if is_f64_op(i.op) { r.push(x as u32 + 1); }
+fn live_out(f: &LiftedFunction) -> BTreeMap<usize, BTreeSet<u32>> {
+    let mut dependencies = vec![Vec::new(); f.ir.types.len()];
+    for (&pc, block) in &f.ir.blocks {
+        for edge in block.term.edges() {
+            for &(slot, index) in &f.state.vector_parameters {
+                let parameter = f.ir.blocks[&edge.dst].params[index].0;
+                dependencies[parameter.0].push(f.state.outgoing[&pc.0][&slot]);
             }
-        }
-        InstFormat::VOP2(i) => {
-            let pair = is_f64_op(i.op);
-            if let SourceOperand::VectorRegister(x) = i.src0 { r.push(x as u32); if pair { r.push(x as u32 + 1); } }
-            r.push(i.vsrc1 as u32);
-            if pair { r.push(i.vsrc1 as u32 + 1); }
-        }
-        InstFormat::VOP3(i) => {
-            let pair = is_f64_op(i.op);
-            for o in [&i.src0, &i.src1, &i.src2] {
-                if let SourceOperand::VectorRegister(x) = o { r.push(*x as u32); if pair { r.push(*x as u32 + 1); } }
-            }
-        }
-        InstFormat::VOP3SD(i) => {
-            let pair = is_f64_op(i.op);
-            for o in [&i.src0, &i.src1, &i.src2] {
-                if let SourceOperand::VectorRegister(x) = o { r.push(*x as u32); if pair { r.push(*x as u32 + 1); } }
-            }
-        }
-        InstFormat::VOP3P(i) => {
-            // Mirror the VOP3P write side in `freshness::vgpr_writes`. Reads are the
-            // base VGPR of each source (V_FMA_MIXLO_F16; the wave-wide WMMA is lifted
-            // out before this runs, so its multi-register spans never reach here).
-            for o in [&i.src0, &i.src1, &i.src2] {
-                if let SourceOperand::VectorRegister(x) = o { r.push(*x as u32); }
-            }
-        }
-        InstFormat::VOPC(i) => {
-            let pair = is_f64_op(i.op);
-            if let SourceOperand::VectorRegister(x) = i.src0 { r.push(x as u32); if pair { r.push(x as u32 + 1); } }
-            r.push(i.vsrc1 as u32);
-            if pair { r.push(i.vsrc1 as u32 + 1); }
-        }
-        InstFormat::VOPD(i) => {
-            // VOPD packs two 32-bit ops; sources are single registers.
-            if let SourceOperand::VectorRegister(x) = i.src0x { r.push(x as u32); }
-            if let SourceOperand::VectorRegister(x) = i.src0y { r.push(x as u32); }
-            r.push(i.vsrc1x as u32);
-            r.push(i.vsrc1y as u32);
-        }
-        InstFormat::VGLOBAL(i) => {
-            r.push(i.vaddr as u32);
-            r.push(i.vaddr as u32 + 1); // 64-bit address
-            for k in 0..4 { r.push(i.vsrc as u32 + k); } // store data (up to B128)
-        }
-        _ => {}
-    }
-    r
-}
-
-/// Backward liveness: VGPRs live on exit from each block.
-fn live_out(prog: &ScalarProgram) -> BTreeMap<usize, BTreeSet<u32>> {
-    // Register accesses do not change during this fixpoint. Compute them
-    // once rather than decoding and allocating them on every iteration.
-    let accesses: BTreeMap<_, Vec<_>> = prog.blocks.iter().map(|(&pc, block)| {
-        (pc, block.body.iter().map(|inst| (vgpr_writes(inst), vgpr_reads(inst))).collect())
-    }).collect();
-    let mut live_in: BTreeMap<usize, BTreeSet<u32>> =
-        prog.blocks.keys().map(|&pc| (pc, BTreeSet::new())).collect();
-    loop {
-        let mut changed = false;
-        for (&pc, block) in &prog.blocks {
-            let succs: Vec<usize> = match &block.term {
-                Terminator::Return => vec![],
-                Terminator::Jump(t) => vec![*t],
-                Terminator::Branch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
-                Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![*resume],
-            };
-            let mut out = BTreeSet::new();
-            for s in succs {
-                if let Some(li) = live_in.get(&s) {
-                    out.extend(li.iter().copied());
-                }
-            }
-            // Transfer backward through the body.
-            let mut cur = out;
-            for (writes, reads) in accesses[&pc].iter().rev() {
-                for w in writes {
-                    cur.remove(w);
-                }
-                for &rd in reads {
-                    cur.insert(rd);
-                }
-            }
-            if live_in[&pc] != cur {
-                live_in.insert(pc, cur);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
         }
     }
-    // live_out[B] = union of live_in[successors]
-    let mut out = BTreeMap::new();
-    for (&pc, block) in &prog.blocks {
-        let succs: Vec<usize> = match &block.term {
-            Terminator::Return => vec![],
-            Terminator::Jump(t) => vec![*t],
-            Terminator::Branch { taken, fallthrough, .. } => vec![*taken, *fallthrough],
-            Terminator::Barrier { resume } | Terminator::Yield { resume, .. } => vec![*resume],
-        };
-        let mut s = BTreeSet::new();
-        for su in succs {
-            if let Some(li) = live_in.get(&su) {
-                s.extend(li.iter().copied());
+    let mut pending: Vec<_> = f.state.sites.values().flatten().flat_map(|s| s.math_reads.iter().map(|&(_, v)| v)).collect();
+    let mut live = vec![false; f.ir.types.len()];
+    while let Some(value) = pending.pop() {
+        if !live[value.0] { live[value.0] = true; pending.extend(&dependencies[value.0]); }
+    }
+    f.ir.blocks.iter().map(|(&pc, block)| {
+        let mut slots = BTreeSet::new();
+        for edge in block.term.edges() {
+            for &(slot, index) in &f.state.vector_parameters {
+                if live[f.ir.blocks[&edge.dst].params[index].0.0] { slots.insert(slot); }
             }
         }
-        out.insert(pc, s);
-    }
-    out
+        (pc.0, slots)
+    }).collect()
 }
-
-fn vpair(o: &SourceOperand) -> Option<u32> {
-    if let SourceOperand::VectorRegister(r) = o { Some(*r as u32) } else { None }
+fn vpair(op: &Operand) -> Option<u32> { op.vector() }
+fn as_fma(site: &Site) -> Option<(u32, &Operand, &Operand, &Operand, u8)> {
+    let m = site.rewrite.math.as_ref()?;
+    (m.kind == Kind::Fma && m.cross_sqrt).then_some((m.destination, &m.inputs[0], &m.inputs[1], &m.inputs[2], m.neg))
 }
-
-/// (dst, src0, src1, src2, neg) for a V_FMA_F64.
-fn as_fma(inst: &InstFormat) -> Option<(u32, &SourceOperand, &SourceOperand, &SourceOperand, u8)> {
-    if let InstFormat::VOP3(i) = inst {
-        if matches!(i.op, I::V_FMA_F64) {
-            return Some((i.vdst as u32, &i.src0, &i.src1, &i.src2, i.neg));
-        }
-    }
-    None
-}
-
-fn is_const_half(o: &SourceOperand) -> bool {
-    matches!(o, SourceOperand::FloatConstant(v) if v.to_bits() == 0.5f64.to_bits())
-}
-
+fn is_const_half(op: &Operand) -> bool { op.float(0.5) }
 /// Match the rsq+Newton sqrt expansion starting at body index `a` (a V_RSQ_F64).
 /// Returns (final_fma_idx, [indices to remove], rd, x) if it matches and all
 /// temporaries are dead by `live`.
-fn match_sqrt(body: &[InstFormat], a: usize, live_out: &BTreeSet<u32>) -> Option<(usize, Vec<usize>, u32, u32)> {
-    let (rd, x) = match &body[a] {
-        InstFormat::VOP1(VOP1 { op: I::V_RSQ_F64, vdst, src0 }) => (*vdst as u32, vpair(src0)?),
-        _ => return None,
-    };
-    // The chain is the contiguous run after the anchor; require the exact ops.
-    let g = |k: usize| body.get(a + k);
-    // i1: A = X * rD  (VOP2 mul)
-    let (i1, anf) = match g(1)? {
-        InstFormat::VOP2(i) if matches!(i.op, I::V_MUL_F64) && vpair(&i.src0) == Some(x) && i.vsrc1 as u32 == rd => (a + 1, i.vdst as u32),
-        _ => return None,
-    };
+fn match_sqrt(body: &[Site], a: usize, live_out: &BTreeSet<u32>) -> Option<(usize, Vec<usize>, u32, u32)> {
+    let m = body[a].rewrite.math.as_ref()?;
+    if m.kind != Kind::Rsq || !m.cross_sqrt { return None; }
+    let (rd, x) = (m.destination, m.inputs[0].vector()?);
+    let g = |k: usize| body.get(a+k);
+    let m = g(1)?.rewrite.math.as_ref()?;
+    if m.kind != Kind::Mul || !m.cross_sqrt || m.inputs[0].vector() != Some(x) || m.inputs[1].vector() != Some(rd) { return None; }
+    let (i1, anf) = (a+1, m.destination);
     let av = anf;
     // i2: rD = 0.5 * rD
-    match g(2)? {
-        InstFormat::VOP2(i) if matches!(i.op, I::V_MUL_F64) && is_const_half(&i.src0) && i.vsrc1 as u32 == rd && i.vdst as u32 == rd => {}
-        _ => return None,
-    }
+    let m = g(2)?.rewrite.math.as_ref()?;
+    if m.kind != Kind::Mul || !m.cross_sqrt || !m.inputs[0].float(0.5)
+        || m.inputs[1].vector() != Some(rd) || m.destination != rd { return None; }
     let i2 = a + 2;
     // i3: B = fma(-rD, A, 0.5)
     let (i3, b) = match as_fma(g(3)?) {
@@ -212,7 +74,7 @@ fn match_sqrt(body: &[InstFormat], a: usize, live_out: &BTreeSet<u32>) -> Option
 
     // X must not be written between the anchor and the final FMA.
     for j in (a + 1)..i9 {
-        if vgpr_writes(&body[j]).iter().any(|&w| w == x || w == x + 1) {
+        if body[j].writes.iter().any(|&(w, _)| w == x || w == x+1) {
             return None;
         }
     }
@@ -226,10 +88,10 @@ fn match_sqrt(body: &[InstFormat], a: usize, live_out: &BTreeSet<u32>) -> Option
         // not read after i9 before being overwritten
         let mut k = i9 + 1;
         while k < body.len() {
-            if vgpr_reads(&body[k]).iter().any(|&r| r == t || r == t + 1) {
+            if body[k].math_reads.iter().any(|&(r, _)| r == t || r == t+1) {
                 return None;
             }
-            if vgpr_writes(&body[k]).iter().any(|&w| w == t) {
+            if body[k].writes.iter().any(|&(w, _)| w == t) {
                 break; // overwritten -> dead from here
             }
             k += 1;
@@ -238,52 +100,20 @@ fn match_sqrt(body: &[InstFormat], a: usize, live_out: &BTreeSet<u32>) -> Option
     Some((i9, removed, rd, x))
 }
 
-/// Rewrite the program in place, collapsing matched sqrt chains.
-pub fn fold_sqrt(prog: &mut ScalarProgram) -> usize {
-    let live = live_out(prog);
-    let mut folded = 0;
-    let pcs: Vec<usize> = prog.blocks.keys().copied().collect();
-    for pc in pcs {
-        let lo = live.get(&pc).cloned().unwrap_or_default();
-        let body = &prog.blocks.get(&pc).unwrap().body;
-        let mut rewrites: Vec<(usize, u32, u32)> = Vec::new(); // (final_idx, rd, x)
-        let mut to_remove: BTreeSet<usize> = BTreeSet::new();
-        let mut a = 0;
-        while a < body.len() {
-            if matches!(&body[a], InstFormat::VOP1(VOP1 { op: I::V_RSQ_F64, .. })) {
-                if let Some((fin, removed, rd, x)) = match_sqrt(body, a, &lo) {
-                    rewrites.push((fin, rd, x));
-                    for r in &removed {
-                        to_remove.insert(*r);
-                    }
-                    a = fin + 1;
-                    folded += 1;
-                    continue;
-                }
-            }
-            a += 1;
+
+pub(super) fn analyze(f: &LiftedFunction) -> BTreeMap<usize, (BTreeSet<usize>, Vec<(usize, u32, u32)>)> {
+    let live = live_out(f);
+    let mut edits = BTreeMap::new();
+    for (&pc, body) in &f.state.sites {
+        let mut removed = BTreeSet::new();
+        let mut rewrites = Vec::new();
+        let mut index = 0;
+        while index < body.len() {
+            if let Some((last, delete, destination, input)) = match_sqrt(body, index, &live[&pc]) {
+                removed.extend(delete); rewrites.push((last, destination, input)); index = last+1;
+            } else { index += 1; }
         }
-        if rewrites.is_empty() {
-            continue;
-        }
-        // Apply: replace each final FMA with V_SQRT_F64(rd, X); drop removed.
-        let block = prog.blocks.get_mut(&pc).unwrap();
-        let mut new_body = Vec::with_capacity(block.body.len());
-        for (idx, inst) in block.body.iter().enumerate() {
-            if to_remove.contains(&idx) {
-                continue;
-            }
-            if let Some(&(_, rd, x)) = rewrites.iter().find(|(f, _, _)| *f == idx) {
-                new_body.push(InstFormat::VOP1(VOP1 {
-                    op: I::V_SQRT_F64,
-                    vdst: rd as u8,
-                    src0: SourceOperand::VectorRegister(x as u8),
-                }));
-            } else {
-                new_body.push(inst.clone());
-            }
-        }
-        block.body = new_body;
+        if !rewrites.is_empty() { edits.insert(pc, (removed, rewrites)); }
     }
-    folded
+    edits
 }

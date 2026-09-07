@@ -1,5 +1,7 @@
 //! Width-independent facts derived from SSA definitions and CFG edges.
 //! Architectural register classes do not supply facts to this analysis.
+pub(in crate::rdna_spmd) mod state;
+
 use super::ir::typed::{cfg::*, Cvt, IntOp, IntPred, Op, Ty, ValueId};
 use std::collections::{BTreeMap,VecDeque};
 
@@ -289,3 +291,5 @@ pub(crate) fn live_values(f: &Func, roots: impl IntoIterator<Item=ValueId>) -> V
     }
     live
 }
+
+pub(in crate::rdna_spmd) mod rewrite;
