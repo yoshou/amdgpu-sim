@@ -34,7 +34,7 @@ fn constant_facts(f:&Func,entry_true:&[ValueId],valid_queries:bool)->Vec<Option<
         }
         for inst in &block.insts {
             if let Inst::Core { value, ty, op } = *inst {
-                let op=if valid_queries&&matches!(op,Op::Env(super::ir::typed::Env::ValidLane)) {Op::Const(Ty::I1,1)} else {op};
+                let op=if valid_queries&&matches!(op,Op::Env(crate::rdna_spmd::ir::typed::Env::ValidLane)) {Op::Const(Ty::I1,1)} else {op};
                 definitions[value.0] = Definition::Core(ty, op);
             } else if valid_queries {
                 let query=match inst {
@@ -154,7 +154,7 @@ mod tests {
         f.blocks.insert(BlockId(1), Block { params: vec![(a,Ty::I32),(invariant,Ty::I32)], insts: vec![
             Inst::Core { value: one, ty: Ty::I32, op: Op::Const(Ty::I32,1) },
             Inst::Core { value: next, ty: Ty::I32, op: Op::Int(IntOp::Add,a,one) },
-            Inst::Boundary { inputs: vec![], outputs: vec![(condition,Ty::I1)] },
+            Inst::Core { value: condition, ty: Ty::I1, op: Op::Env(crate::rdna_spmd::ir::typed::Env::ValidLane) },
         ], term: Term::CondBr { cond: condition,
             yes: Edge { dst: BlockId(1), args: vec![next,invariant] },
             no: Edge { dst: BlockId(2), args: vec![invariant] },
@@ -238,7 +238,6 @@ pub(crate) fn uniformity(f: &Func, uniform_entry: &[ValueId]) -> Vec<bool> {
                         (vec![*value],proof)
                     }
                     Inst::Target {args,outputs,..} => (outputs.iter().map(|v|v.0).collect(),args.values().iter().all(|v|uniform[v.0])),
-                    Inst::Boundary {outputs,..} => (outputs.iter().map(|v|v.0).collect(),false),
                     Inst::Effect {op,inputs,outputs,..} => {
                         let proof=match op {
                             EffectOp::Wave(WaveOp::Any|WaveOp::Ballot|WaveOp::ReadFirstLane) => true,
@@ -280,10 +279,7 @@ pub(crate) fn live_values(f: &Func, roots: impl IntoIterator<Item=ValueId>) -> V
                     for &(id,_) in outputs {deps[id.0].extend(args.values());}
                     if provenance.is_some() {pending.extend(args.values());}
                 }
-                Inst::Boundary {inputs,outputs} => {
-                    pending.extend(inputs);
-                    for &(id,_) in outputs {deps[id.0].extend(inputs);}
-                }
+
             }
         }
     }

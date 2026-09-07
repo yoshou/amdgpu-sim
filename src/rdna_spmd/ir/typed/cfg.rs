@@ -1,10 +1,4 @@
 //! Function SSA with explicit block arguments, including loop backedges.
-//!
-//! During incremental lifting, a Boundary records the typed inputs/outputs of
-//! one adapter action (register view, predicated register update, or legacy
-//! instruction). It is ordered and cannot be speculated, removed or reordered.
-//! It is deliberately not a core Op or a target-dialect escape hatch. Its owner
-//! must retain the matching adapter action until memory/wave lifting replaces it.
 use super::{Op, Ty, ValueId};
 use super::effect::EffectOp;
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,10 +35,6 @@ pub(crate) enum Inst {
         value: ValueId,
         ty: Ty,
         op: Op,
-    },
-    Boundary {
-        inputs: Vec<ValueId>,
-        outputs: Vec<(ValueId, Ty)>,
     },
 }
 #[derive(Clone, Debug)]
@@ -155,14 +145,7 @@ impl Func {
                         define(*value, *ty, &mut local, &mut definitions)?;
                         if let Op::Const(_, bits) = op { constants.insert(*value, *bits); }
                     }
-                    Inst::Boundary { inputs, outputs } => {
-                        if inputs.iter().any(|v| !local.contains(v)) {
-                            return Err("non-dominating boundary input");
-                        }
-                        for &(id, ty) in outputs {
-                            define(id, ty, &mut local, &mut definitions)?;
-                        }
-                    }
+
                 }
             }
             if let Term::CondBr { cond, .. } = block.term {

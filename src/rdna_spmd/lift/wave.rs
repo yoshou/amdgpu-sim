@@ -52,7 +52,7 @@ pub(crate) enum Destination {
     Vgpr(u32),
     Scc,
 }
-/// A verified effect with its register adapter bindings. The scheduler consumes
+/// A verified effect with its ISA operand and destination bindings. The scheduler consumes
 /// the same signature that function SSA and boundary IO use.
 #[derive(Clone, Debug)]
 pub struct YieldAction {
@@ -411,7 +411,7 @@ impl YieldAction {
                 }
                 words.insert(word, stored);
             } else if matches!(dest, Destination::Sgpr(r) if *r != 124) {
-                block.insts.push(Inst::Boundary { inputs: vec![stored], outputs: vec![] });
+                panic!("invalid scalar wave destination: {:?}", dest);
             }
             definitions.push((*dest, stored));
         }

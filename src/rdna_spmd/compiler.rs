@@ -47,10 +47,8 @@ impl Compiler {
         block
     }
 
-    /// Retains the existing de-SIMT register/mask adapter. Local lane-spill and
-    /// readfirstlane lowering keep that adapter's contract during migration;
-    /// general 32-lane effects must be split with `split_at_xlane` and executed
-    /// by a wave/cooperative dispatcher.
+    /// Compile lane-local execution. General 32-lane effects are split with
+    /// `split_at_xlane` and executed by a wave/cooperative dispatcher.
     pub fn compile_program(&self, program: &ScalarProgram, num_vgprs: usize) -> ScalarKernel {
         let plan = ScalarPlan::with_registry(self.registry.clone(), program, ScalarMode::Whole);
         super::emit::compile_program(&plan,num_vgprs)

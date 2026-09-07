@@ -31,8 +31,7 @@ pub(super) enum InstructionAction {
     ClusterMember,
 }
 
-pub(super) struct InstructionPlan<'a> {
-    pub lowering: super::lift::Lowering<'a>,
+pub(super) struct InstructionPlan {
     pub elide_predicate: bool,
     pub entry_exec_unchanged: bool,
     pub nonempty_exec: bool,
@@ -41,8 +40,8 @@ pub(super) struct InstructionPlan<'a> {
     pub action: InstructionAction,
 }
 
-pub(super) struct BlockPlan<'a> {
-    pub instructions: Vec<InstructionPlan<'a>>,
+pub(super) struct BlockPlan {
+    pub instructions: Vec<InstructionPlan>,
     pub fresh: RegSet,
     pub stale: RegSet,
     pub specialize: bool,
@@ -60,7 +59,7 @@ pub(super) struct PacketPlan<'a> {
     pub width: u32,
     pub function: super::lift::function::Function,
     pub boundary: Option<&'a BTreeMap<usize, BoundaryIo>>,
-    pub blocks: BTreeMap<usize, BlockPlan<'a>>,
+    pub blocks: BTreeMap<usize, BlockPlan>,
     pub f64_pairs: RegSet,
     pub fresh_in: BTreeMap<usize, RegSet>,
     pub mask_region: Option<MaskRegion>,
@@ -116,6 +115,7 @@ impl<'a> PacketPlan<'a> {
         } else {
             super::vec_live::frame_entry(program)
         };
+        let mut lifted = BTreeMap::new();
         let blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             let flags = &elide[&pc];
             let normal = sqrt_idiom::normal_sqrt_ldexp_indices(&block.body);
@@ -124,6 +124,7 @@ impl<'a> PacketPlan<'a> {
             let mut frames = frame_in[&pc].clone();
             let mut cluster_rest = 0;
             let mut instructions = Vec::with_capacity(block.body.len());
+            let mut semantics = Vec::with_capacity(block.body.len());
             let mut entry_exec_unchanged = true;
             for (idx, inst) in block.body.iter().enumerate() {
                 let action = if cluster_rest > 0 {
@@ -148,8 +149,8 @@ impl<'a> PacketPlan<'a> {
                         *expr = super::dialect::rdna4::fold_normal(expr, &registry);
                     }
                 }
+                semantics.push(lowering);
                 instructions.push(InstructionPlan {
-                    lowering,
                     elide_predicate: flags[idx],
                     entry_exec_unchanged,
                     nonempty_exec: nonempty[&pc][idx],
@@ -173,15 +174,16 @@ impl<'a> PacketPlan<'a> {
             let fresh = fresh_in[&pc];
             // Canonical pairs have no live i32 slots to synchronize on edges.
             let stale = [fresh[0] & !f64_pairs[0], fresh[1] & !f64_pairs[1]];
+            lifted.insert(pc, semantics);
             (pc, BlockPlan { instructions, fresh, stale, specialize })
         }).collect();
-        let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().map(|i| &i.lowering).collect())).collect();
+        let lowerings = lifted.iter().map(|(&pc, block)| (pc, block.iter().collect())).collect();
         let preparation=super::lift::function::Preparation::Packet {
             inactive:blocks.iter().flat_map(|(&pc,b)|b.instructions.iter().enumerate()
                 .filter_map(move |(index,i)|i.elide_predicate.then_some((pc,index)))).collect(),
             observe_return,
         };
-        let mut function=super::lift::function::Function::new(registry,program,&lowerings,boundary,preparation);
+        let mut function=super::lift::function::Function::new(registry,program,&lowerings,preparation);
         for plan in function.blocks.values_mut().flat_map(|block| block.memory.values_mut()) {
             use super::ir::typed::effect::{MemoryOp, Space};
             // One ISA atomic instruction has no intervening per-lane effects.

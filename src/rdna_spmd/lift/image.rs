@@ -3,7 +3,7 @@
 use super::*;
 use std::convert::TryInto;
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::VIMAGE(i)=inst {
         if !matches!(i.op,I::IMAGE_BVH64_INTERSECT_RAY) {return None;}
         let mut inputs=vec![input(SourceOperand::ScalarRegister(i.rsrc as u8),Ty::I32),input(SourceOperand::ScalarRegister((i.rsrc+1) as u8),Ty::I32),input(SourceOperand::VectorRegister(i.vaddr0),Ty::I64),input(SourceOperand::VectorRegister(i.vaddr1),Ty::I32)];

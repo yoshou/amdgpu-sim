@@ -165,7 +165,7 @@ fn decode(op: I) -> Option<Comparison> {
     Some(Comparison { bits, predicate, exec })
 }
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (op, sources, dst, abs, neg, opsel) = match inst {
         InstFormat::VOPC(i) => (i.op, [i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1)], 106, 0, 0, 0),
         InstFormat::VOP3(i) => (i.op, [i.src0.clone(), i.src1.clone()], i.vdst as u32, i.abs, i.neg, i.opsel),

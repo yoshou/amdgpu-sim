@@ -2,7 +2,7 @@
 use super::*;
 use crate::rdna_instructions::{VOP1, VOP2, VOP3P};
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::VOPD(i) = inst else { return None; };
     let destinations = [i.vdstx, (i.vdsty << 1) | ((i.vdstx & 1) ^ 1)];
     let mut halves = Vec::new();

@@ -1,13 +1,7 @@
-//! Whole-function SSA construction over the mixed migration stream.
-//!
-//! Register words are SSA variables at the adapter boundary. Each CFG edge
-//! passes their current definitions to destination block parameters. A legacy
-//! operation consumes the previous state and defines only its written words;
-//! typed ALU operations share the same value namespace. The backend lowers
-//! boundary words/block arguments through explicit native SSA definitions, so
-//! this adds no runtime register-file traffic or lane helper calls.
+//! Whole-function SSA construction from lifted instruction semantics.
+//! Register words become block parameters and explicit definitions; effects
+//! define their results before outgoing edges are constructed.
 use super::*;
-use crate::rdna_spmd::boundary::BoundaryIo;
 use crate::rdna_spmd::ir::typed::cfg::*;
 use crate::rdna_spmd::ir::{ScalarProgram, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,11 +63,10 @@ pub(in crate::rdna_spmd) struct Function {
     pub observable_return: bool,
 }
 impl Function {
-    pub fn new<'a>(
+    pub fn new(
         registry: std::sync::Arc<DialectRegistry>,
         program: &ScalarProgram,
-        lowerings: &BTreeMap<usize, Vec<&Lowering<'a>>>,
-        boundary: Option<&BTreeMap<usize, BoundaryIo>>,
+        lowerings: &BTreeMap<usize, Vec<&Lowering>>,
         preparation: Preparation,
     ) -> Self {
         let mut regs = BTreeSet::new();
@@ -94,12 +87,6 @@ impl Function {
                 for r in io.writes.sgprs() { if r != 124 { written.add_sgpr(r); } }
                 for r in io.writes.vgprs() { written.add_vgpr(r); }
                 written.scc |= io.writes.scc;
-                regs.extend(register_words(&io.reads));
-                regs.extend(register_words(&io.writes));
-            }
-        }
-        if let Some(boundary) = boundary {
-            for io in boundary.values() {
                 regs.extend(register_words(&io.reads));
                 regs.extend(register_words(&io.writes));
             }
@@ -350,32 +337,7 @@ impl Function {
                             pairs: operands.pairs,
                         })
                     }
-                    Lowering::Legacy(_) => {
-                        // Remaining register/control and target-specific adapters
-                        // retain their original order during state migration.
-                        let mut deps: Vec<_> = register_words(&io.reads)
-                            .filter_map(|r| words.get(&r).copied()).collect();
-                        deps.extend(writes.iter().filter_map(|r| words.get(r).copied()));
-                        let mut outputs = vec![];
-                        for &r in &writes {
-                            let v = f.value(r.ty());
-                            words.insert(r, v);
-                            outputs.push((v, r.ty()));
-                        }
-                        // The remaining mask SALU defines SCC; ordinary moves
-                        // and vector operations preserve its previous definition.
-                        if io.writes.scc {
-                            deps.push(scc);
-                            scc = f.value(Ty::I1);
-                            outputs.push((scc, Ty::I1));
-                        }
-                        block.insts.push(Inst::Boundary {
-                            inputs: deps,
-                            outputs,
-                        });
-                        invalidate(&mut views, &writes);
-                        None
-                    }
+
                 };
                 instructions.push(plan);
             }
@@ -386,30 +348,7 @@ impl Function {
                 }
                 Some(plan)
             } else { None };
-            if let Terminator::Barrier { resume } = source.term {
-                if let Some(io) = boundary.and_then(|map| map.get(&resume)) {
-                    // A host-side wave operation runs between yield and resume.
-                    // Its register outputs are new definitions on this edge,
-                    // not the values written back before yielding.
-                    let mut inputs: Vec<_> = register_words(&io.reads)
-                        .chain(register_words(&io.writes))
-                        .map(|r| words[&r])
-                        .collect();
-                    let mut outputs: Vec<_> = register_words(&io.writes)
-                        .map(|r| {
-                            let value = f.value(r.ty());
-                            words.insert(r, value);
-                            (value, r.ty())
-                        })
-                        .collect();
-                    if io.reads.scc || io.writes.scc { inputs.push(scc); }
-                    if io.writes.scc {
-                        scc = f.value(Ty::I1);
-                        outputs.push((scc, Ty::I1));
-                    }
-                    block.insts.push(Inst::Boundary { inputs, outputs });
-                }
-            }
+
             let edge = |pc| Edge {
                 dst: BlockId(pc),
                 args: regs.iter().map(|r| words[r]).chain(std::iter::once(scc)).collect(),
@@ -722,13 +661,8 @@ mod tests {
         })]) };
         let lowerings: Vec<_> = program.blocks[&0].body.iter().map(super::super::instruction).collect();
         let f = Function::new(std::sync::Arc::new(DialectRegistry::rdna4()), &program,
-            &BTreeMap::from([(0, lowerings.iter().collect())]), None,Preparation::Inspect);
+            &BTreeMap::from([(0, lowerings.iter().collect())]), Preparation::Inspect);
         let block = &f.ir.func().blocks[&BlockId(0)];
-        for inst in &block.insts {
-            if let Inst::Boundary { outputs, .. } = inst {
-                assert!(outputs.iter().all(|(_, ty)| *ty == Ty::I1), "opaque ordinary word: {inst:?}");
-            }
-        }
         let load = f.blocks[&0].memory[&1].effects[0];
         let Inst::Effect { outputs, .. } = &block.insts[load] else { unreachable!() };
         let loaded_word = outputs[0].0;
@@ -754,7 +688,7 @@ mod tests {
         let program=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([(0,ScalarBlock {pc:0,body,term:Terminator::Return})])};
         let lowerings:Vec<_>=program.blocks[&0].body.iter().map(super::super::instruction).collect();
         let mut f=Function::new(std::sync::Arc::new(DialectRegistry::rdna4()),&program,
-            &BTreeMap::from([(0,lowerings.iter().collect())]),None,Preparation::Inspect);
+            &BTreeMap::from([(0,lowerings.iter().collect())]),Preparation::Inspect);
         f.discard_return_state();
         for index in [0usize,1,2,4] {
             assert!(f.blocks[&0].instructions[index].as_ref().unwrap().outputs.iter().all(|p|f.live[p.1.0]));
@@ -762,58 +696,33 @@ mod tests {
         assert!(f.blocks[&0].instructions[3].as_ref().unwrap().outputs.iter().all(|p|!f.live[p.1.0]));
     }
 
+
     #[test]
-    fn host_written_resume_values_are_new_edge_definitions() {
-        let program = ScalarProgram {
-            entry_pc: 0,
-            blocks: BTreeMap::from([
-                (
-                    0,
-                    ScalarBlock {
-                        pc: 0,
-                        body: vec![],
-                        term: Terminator::Barrier { resume: 1 },
-                    },
-                ),
-                (
-                    1,
-                    ScalarBlock {
-                        pc: 1,
-                        body: vec![],
-                        term: Terminator::Return,
-                    },
-                ),
-            ]),
-        };
-        let mut io = BoundaryIo::default();
-        io.reads.add_vgpr(7);
-        io.writes.add_vgpr(23);
-        io.reads.add_sgpr(7);
-        io.writes.add_sgpr(23);
-        io.writes.scc = true;
-        let boundary = BTreeMap::from([(1, io)]);
-        let f = Function::new(
-            std::sync::Arc::new(DialectRegistry::rdna4()),
-            &program,
-            &BTreeMap::from([(0, vec![]), (1, vec![])]),
-            Some(&boundary),
-            Preparation::Inspect,
-        );
-        let block = &f.ir.func().blocks[&BlockId(0)];
-        let Inst::Boundary { inputs, outputs } = &block.insts[0] else {
-            panic!("missing host boundary")
-        };
-        assert_eq!(inputs.len(), 5);
-        assert_eq!(outputs.len(), 3);
-        let edge = block.term.edges()[0];
-        assert_eq!(edge.args[0], block.params[0].0);
-        assert_eq!(edge.args[1], outputs[0].0);
-        assert_ne!(edge.args[1], block.params[1].0);
-        assert_eq!(edge.args[2], block.params[2].0);
-        assert_eq!(edge.args[3], outputs[1].0);
-        assert_ne!(edge.args[3], block.params[3].0);
-        assert_eq!(*edge.args.last().unwrap(), outputs[2].0);
-        assert_ne!(*edge.args.last().unwrap(), block.params.last().unwrap().0);
-        assert_eq!(outputs[2].1, Ty::I1);
+    fn yield_results_are_new_edge_definitions() {
+        use super::super::wave::{YieldAction, Operand, Destination};
+        use effect::{EffectOp, WaveOp};
+        for destination in [Destination::Sgpr(23), Destination::Vgpr(23), Destination::Scc] {
+            let action = if matches!(destination, Destination::Scc) {
+                YieldAction::new(EffectOp::BarrierSignal { is_first: true },
+                    vec![Operand::Source(SourceOperand::ScalarRegister(7))], vec![destination])
+            } else {
+                YieldAction::new(EffectOp::Wave(WaveOp::ReadLane),
+                    vec![Operand::Source(SourceOperand::VectorRegister(7)),
+                        Operand::Source(SourceOperand::ScalarRegister(7))], vec![destination])
+            };
+            let program = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([
+                (0, ScalarBlock { pc: 0, body: vec![], term: Terminator::Yield { resume: 1, action: Box::new(action) } }),
+                (1, ScalarBlock { pc: 1, body: vec![], term: Terminator::Return }),
+            ]) };
+            let f = Function::new(std::sync::Arc::new(DialectRegistry::rdna4()), &program,
+                &BTreeMap::from([(0, vec![]), (1, vec![])]), Preparation::Inspect);
+            let block = &f.ir.func().blocks[&BlockId(0)];
+            let plan = f.blocks[&0].yield_values.as_ref().unwrap();
+            let definition = plan.definitions[0].1;
+            let edge = block.term.edges()[0];
+            let slot = edge.args.iter().position(|&value| value == definition).expect("yield definition must reach resume");
+            assert_ne!(edge.args[slot], block.params[slot].0);
+            assert!(block.insts.iter().any(|inst| matches!(inst, Inst::Effect { outputs, .. } if outputs == &plan.results)));
+        }
     }
 }

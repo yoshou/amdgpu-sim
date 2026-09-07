@@ -1,5 +1,5 @@
 //! Typed, width-independent SSA operations. ISA registers and lane-mask word
-//! conventions are resolved by the migration adapter, outside the core ops.
+//! conventions are resolved by the ISA lifter, outside the core ops.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Ty {
@@ -96,7 +96,7 @@ pub(crate) enum Cvt {
     Bitcast,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Env { LaneId, PacketLaneId, ValidLane }
+pub(crate) enum Env { LaneId, PacketLaneId, ValidLane, ScratchBase, ScratchSize }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -163,6 +163,7 @@ impl Op {
         match self {
             Self::Env(Env::LaneId | Env::PacketLaneId) => Ok(Ty::I32),
             Self::Env(Env::ValidLane) => Ok(Ty::I1),
+            Self::Env(Env::ScratchBase | Env::ScratchSize) => Ok(Ty::I64),
             Self::Pack64(a, b) => {
                 if pair(a, b)? != Ty::I32 { return Err("pack64 requires two i32 words"); }
                 Ok(Ty::I64)

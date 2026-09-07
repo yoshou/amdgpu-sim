@@ -491,10 +491,9 @@ impl Memory {
             let sb = f.value(Ty::I64);
             let size = f.value(Ty::I64);
             for (param, id) in [(Parameter::ScratchBase, sb), (Parameter::ScratchSize, size)] {
-                block.insts.push(Inst::Boundary {
-                    inputs: vec![],
-                    outputs: vec![(id, Ty::I64)],
-                });
+                block.insts.push(Inst::Core { value: id, ty: Ty::I64,
+                    op: Op::Env(match param { Parameter::ScratchBase => super::super::ir::typed::Env::ScratchBase,
+                        Parameter::ScratchSize => super::super::ir::typed::Env::ScratchSize, _ => unreachable!() }) });
                 parameters.push((param, id));
             }
             let start = block.insts.len();
@@ -643,9 +642,7 @@ impl Memory {
                     architectural=stored;
                     words.insert(word, stored);
                 } else if self.dest + k != 124 {
-                    // Special mask destinations need the paired word-to-mask
-                    // migration. NULL discards its result without a definition.
-                    block.insts.push(Inst::Boundary { inputs: vec![result], outputs: vec![] });
+                    panic!("invalid scalar memory destination: {}", self.dest + k);
                 }
                 if self.scalar() {scalar_results.push((result,architectural));}
             }

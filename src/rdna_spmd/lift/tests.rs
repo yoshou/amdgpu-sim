@@ -153,7 +153,7 @@ fn scalar_words_survive_pair_overlap_shape_changes_and_loop_edges() {
     ];
     // Both halves of a scalar load and subsequent arithmetic have real SSA
     // dependencies, even though their physical LLVM views have different widths.
-    for i in &body[..body.len() - 1] { assert!(!matches!(instruction(i), Lowering::Legacy(_)) || matches!(i, InstFormat::SOP1(_))); }
+    for i in &body[..body.len() - 1] { let _ = instruction(i); }
     let exit = (0..9).map(|index| InstFormat::VGLOBAL(VGLOBAL { op: I::GLOBAL_STORE_B32,
         vaddr: 0, vsrc: 8 + index, vdst: 0, scope: 0, th: 0,
         ioffset: index as u32 * 4, saddr: 0, sve: 0 })).collect();
@@ -581,7 +581,7 @@ fn arithmetic_flags_execute_wraparound_aliasing_and_signed_overflow() {
 // Codegen integration test, not an ISA harness: expectations are the integer
 // rules exercised here, including wraparound and shifts modulo 32. Every lane
 // is observed after EXEC is restored, so inactive-destination preservation is
-// checked too. Mixed legacy instructions consume the typed results in place.
+// checked too. Memory instructions consume the typed results in place.
 #[test]
 fn integer_lift_executes_edge_cases_and_predication_in_scalar_and_all_packet_widths() {
     let ops = [
@@ -615,7 +615,7 @@ fn integer_lift_executes_edge_cases_and_predication_in_scalar_and_all_packet_wid
     body.push(alu(I::V_XOR_B32, SourceOperand::ScalarRegister(6), 19));
     // Destination aliases the first input; the other results already used it.
     body.push(alu(I::V_ADD_NC_U32, SourceOperand::VectorRegister(2), 2));
-    // A typed result feeds another typed expression and then a legacy store.
+    // A typed result feeds another typed expression and then a typed store.
     body.push(alu(I::V_XOR_B32, SourceOperand::VectorRegister(2), 20));
     let mut observe = vec![exec(SourceOperand::IntegerConstant(u32::MAX as u64))];
     let regs: Vec<u8> = (8..20).chain([2, 20]).collect();
@@ -1365,7 +1365,7 @@ fn masked_memory_never_dereferences_inactive_addresses_and_keeps_old_values() {
     }
 }
 
-/// Exercise the register adapter as well as the emitted accesses. The scalar
+/// Exercise native register storage as well as the emitted accesses. The scalar
 /// and packet paths both expose their final register state in cooperative mode.
 fn run_memory_case(
     program: &ScalarProgram,

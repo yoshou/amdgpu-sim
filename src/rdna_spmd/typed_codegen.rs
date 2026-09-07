@@ -14,6 +14,7 @@ pub(super) struct Emitter {
     width: Option<u32>,
     lane_id: Option<LLVMValueRef>,
     valid_lane: Option<LLVMValueRef>,
+    scratch: Option<(LLVMValueRef, LLVMValueRef)>,
 }
 impl Emitter {
     unsafe fn set_lane_id(&mut self, lane_base: LLVMValueRef) {
@@ -38,6 +39,7 @@ impl Emitter {
             width,
             lane_id: None,
             valid_lane: None,
+            scratch: None,
         }
     }
     pub(super) unsafe fn ty(&self, t: Ty) -> LLVMTypeRef {
@@ -112,6 +114,15 @@ impl Emitter {
                     let mut lanes:Vec<_>=(0..width).map(|lane|LLVMConstInt(i32t,lane as u64,0)).collect();
                     LLVMConstVector(lanes.as_mut_ptr(),width)
                 } else {self.constant(Ty::I32,0)}
+            },
+            Op::Env(env @ (Env::ScratchBase | Env::ScratchSize)) => {
+                let (base, size) = self.scratch.expect("scratch requires the invocation environment");
+                let value = if env == Env::ScratchBase { base } else { size };
+                if let Some(width) = self.width {
+                    let i32t = LLVMInt32TypeInContext(self.ctx);
+                    let vector = LLVMBuildInsertElement(b, LLVMGetPoison(self.ty(Ty::I64)), value, LLVMConstInt(i32t, 0, 0), n);
+                    LLVMBuildShuffleVector(b, vector, LLVMGetPoison(self.ty(Ty::I64)), LLVMConstNull(LLVMVectorType(i32t, width)), n)
+                } else { value }
             },
             Op::Env(Env::ValidLane) => self.valid_lane.expect("ValidLane requires the invocation environment"),
             Op::Const(t, bits) => self.constant(t, bits),
@@ -430,8 +441,11 @@ impl Values {
                 self.values[output.0]=raw;
             }
             Inst::Effect {..}=>unreachable!("effects require their native action plan"),
-            Inst::Boundary { .. } => unreachable!("architectural state must be explicit SSA"),
         }
+    }
+    pub unsafe fn set_scratch_environment(&mut self, base: LLVMValueRef, size: LLVMValueRef) {
+        self.emitter.scratch = Some((base, size));
+        self.scalar_emitter.scratch = Some((base, size));
     }
     pub unsafe fn set_bvh_storage(&mut self,storage:super::dialect::rdna4::bvh::Storage) {
         self.emitter.bvh=Some(storage);self.scalar_emitter.bvh=Some(storage);
@@ -591,7 +605,7 @@ impl Values {
             let insts=&f.ir.func().blocks[&cfg::BlockId(pc)].insts[alu.core.clone()];
             for inst in insts {match inst {
                 cfg::Inst::Core {value,..}|cfg::Inst::Packet {output:value,..}=>{local[value.0]=generation;},
-                cfg::Inst::Target {outputs,..}|cfg::Inst::Effect {outputs,..}|cfg::Inst::Boundary {outputs,..}=>{for &(id,_) in outputs {local[id.0]=generation;}},
+                cfg::Inst::Target {outputs,..}|cfg::Inst::Effect {outputs,..}=>{for &(id,_) in outputs {local[id.0]=generation;}},
             }}
             for (_,id) in &alu.inputs {local[id.0]=generation;bound[id.0]=generation;}
             for &(id,_) in &alu.pairs {bound[id.0]=generation;}
@@ -636,7 +650,7 @@ impl Values {
         for inst in &block.insts {
             match inst {
                 Inst::Core { value, .. }|Inst::Packet {output:value,..} => {self.values[value.0] = std::ptr::null_mut();self.mask_words[value.0]=std::ptr::null_mut();self.narrow_words[value.0]=None;self.wide_words[value.0]=None;},
-                Inst::Boundary { outputs, .. } | Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => {
+                Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => {
                     for &(v, _) in outputs {
                         self.values[v.0] = std::ptr::null_mut();
                         self.mask_words[v.0] = std::ptr::null_mut();
@@ -709,7 +723,7 @@ impl Values {
         for inst in &block.insts[alu.core.clone()] {
             match inst {
                 Inst::Core {value,..}|Inst::Packet {output:value,..}=>{if self.retained[value.0] {needed.push(*value);}},
-                Inst::Effect {outputs,..}|Inst::Target {outputs,..}|Inst::Boundary {outputs,..}=>{
+                Inst::Effect {outputs,..}|Inst::Target {outputs,..}=>{
                     needed.extend(outputs.iter().filter_map(|&(id,_)|self.retained[id.0].then_some(id)));
                 },
             }

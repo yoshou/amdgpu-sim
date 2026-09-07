@@ -66,3 +66,25 @@ fn bvh_target_preserves_four_results_aliases_and_packet_masks() {
         }
     }
 }
+
+#[test]
+fn scratch_environment_operands_preserve_native_word_views() {
+    let p = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([(0, ScalarBlock {
+        pc: 0, body: vec![
+            InstFormat::VOP1(crate::rdna_instructions::VOP1 { op: I::V_MOV_B32,
+                src0: SourceOperand::PrivateBase, vdst: 4 }),
+            InstFormat::SOP1(SOP1 { op: I::S_MOV_B64,
+                ssrc0: SourceOperand::PrivateBase, sdst: 22 }),
+        ], term: Terminator::Return,
+    })]) };
+    let base = 0x1234_abcd_7654_3210u64;
+    for width in [0, 1, 2, 4, 8, 16] {
+        let w = width.max(1) as usize;
+        let mut s = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+        s[126] = u32::MAX;
+        let mut v = vec![0u32; 32 * w];
+        run_memory_case(&p, width, &mut s, &mut v, base, 0, 0);
+        assert_eq!(s[22] as u64 | ((s[23] as u64) << 32), base);
+        assert_eq!(&v[4*w..5*w], vec![base as u32; w]);
+    }
+}

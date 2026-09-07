@@ -1,7 +1,7 @@
 //! Division macro operands and explicit VCC input for FMAS.
 use super::*;
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::VOP3SD(i) = inst {
         if !matches!(i.op, I::V_DIV_SCALE_F32 | I::V_DIV_SCALE_F64) { return None; }
         let target = crate::rdna_spmd::dialect::rdna4::division(registry, i.op)?;

@@ -3,7 +3,7 @@
 //! https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content
 use super::*;
 
-fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::SOP2(i) = inst else { return None; };
     let ty = match i.op {
         I::S_ADD_U32 | I::S_ADD_CO_U32 | I::S_ADD_CO_CI_U32 | I::S_SUB_CO_U32 | I::S_SUB_CO_CI_U32
@@ -106,7 +106,7 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<
     Some(b.finish_many(true, results))
 }
 
-fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::SOPC(i) = inst else { return None; };
     let (ty, predicate) = match i.op {
         I::S_CMP_EQ_U32 | I::S_CMP_EQ_I32 => (Ty::I32, IntPred::Eq),
@@ -128,7 +128,7 @@ fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'st
     Some(b.finish_many(true, vec![(Output::Scc, flag)]))
 }
 
-fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::SOP1(i) = inst else { return None; };
     let (from, to, cvt) = match i.op {
         I::S_MOV_B32 => (Ty::I32, Ty::I32, None),
@@ -157,7 +157,7 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'stat
     Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, to), result)]))
 }
 
-fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::SOPK(i) = inst else { return None; };
     let predicate = match i.op {
         I::S_CMPK_EQ_I32 | I::S_CMPK_EQ_U32 => Some(IntPred::Eq),
@@ -199,11 +199,11 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'
     Some(b.finish_many(true, outputs))
 }
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     masks(inst, registry).or_else(|| arithmetic(inst, registry)).or_else(|| compare(inst, registry)).or_else(|| unary(inst, registry)).or_else(|| immediate(inst, registry))
 }
 
-fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::SOP1(i) = inst {
         let op = match i.op {
             I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 => IntOp::And,

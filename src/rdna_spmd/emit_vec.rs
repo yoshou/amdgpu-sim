@@ -298,22 +298,8 @@ impl Cg {
             loop_masks.active.get() && loop_masks.masks.contains_key(&reg)
         })
     }
-    unsafe fn mask_src(&self, op: &SourceOperand) -> LLVMValueRef {
-        if let SourceOperand::ScalarRegister(reg) = op {
-            if let Some(value) = self.structured_mask(*reg as u32) { return value; }
-        }
-        self.mask_to_vec(self.ssrc_u32(op))
-    }
-    unsafe fn mask_any(&self, mask: LLVMValueRef) -> LLVMValueRef {
-        let packed = self.vec_to_mask(mask);
-        llvm::core::LLVMBuildICmp(
-            self.b,
-            llvm::LLVMIntPredicate::LLVMIntNE,
-            packed,
-            self.ci32(0),
-            self.n(),
-        )
-    }
+
+
     unsafe fn sync_structured_masks_to_sgpr(&self) {
         let Some(loop_masks) = self.structured_loop_masks.as_ref() else { return; };
         for (&reg, &cell) in &loop_masks.masks {
@@ -946,6 +932,7 @@ unsafe fn compile_inner(
     // A fiber enters the kernel once and suspends in place at a boundary, so
     // there is no resume dispatch here.
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, Some(plan.width));
+    ssa.set_scratch_environment(cg.scratch_base_scalar, cg.scratch_stride);
     ssa.set_bvh_storage(super::dialect::rdna4::bvh::Storage {scratch: cg.bvh_scratch, packet: cg.bvh_packet, packet_ty: cg.bvh_packet_ty});
     llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
     for (&pc, block_plan) in &plan.blocks {
@@ -1019,8 +1006,8 @@ unsafe fn compile_inner(
                         .collect();
                     cg.emit_memory_cluster(&members, ssa.value(members[0].base), c.lo, c.span, &preds);
                 } else {
-                    match &instruction.lowering {
-                        super::lift::Lowering::TypedAlu { .. } => {
+                    match &plan.function.blocks[&pc].instructions[idx] {
+                        Some(_) => {
                             ssa.emit(&plan.function, pc, idx, !cg.predicate.get(), |reg|!cg.has_structured_mask(reg),
                                 |reg|cg.ld_sgpr32_raw(reg),
                                 |input, scalar| cg.typed_input(input, scalar), |output, value, word| {
@@ -1032,7 +1019,7 @@ unsafe fn compile_inner(
                                 cg.predicate.set(predicate);
                             });
                         }
-                        super::lift::Lowering::Wave(_) => {
+                        None if plan.function.blocks[&pc].wave.contains_key(&idx) => {
                     let (action,wave)=&plan.function.blocks[&pc].wave[&idx];
                     cg.emit_local_wave(action,|reg,raw| {
                         let (ty,value)=ssa.effect_result(wave.results[0].0,wave.definitions[0].1,raw);
@@ -1041,11 +1028,10 @@ unsafe fn compile_inner(
                         cg.typed_output(output,value);
                     });
                 },
-                super::lift::Lowering::Memory(_) => {
+                None => {
                     ssa.prepare_memory(&plan.function,pc,idx,|p,scalar|cg.memory_parameter(p,scalar));
                             cg.emit_memory(&plan.function.blocks[&pc].memory[&idx],&ssa,|k|ssa.memory_data(&plan.function,pc,idx,k));
                         }
-                        super::lift::Lowering::Legacy(inst) => panic!("instruction has no typed IR lowering: {:?}",inst),
                     }
                 }
             }

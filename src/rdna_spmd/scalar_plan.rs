@@ -13,8 +13,7 @@ pub(super) enum ScalarMode {
     Cooperative,
 }
 
-pub(super) struct ScalarBlockPlan<'a> {
-    pub instructions: Vec<super::lift::Lowering<'a>>,
+pub(super) struct ScalarBlockPlan {
     pub active: Vec<bool>,
     pub f64_fresh: RegSet,
     pub sgpr_fresh: u128,
@@ -24,7 +23,7 @@ pub(super) struct ScalarPlan<'a> {
     pub program: &'a ScalarProgram,
     pub mode: ScalarMode,
     pub function: super::lift::function::Function,
-    pub blocks: BTreeMap<usize, ScalarBlockPlan<'a>>,
+    pub blocks: BTreeMap<usize, ScalarBlockPlan>,
 }
 
 impl<'a> ScalarPlan<'a> {
@@ -33,9 +32,10 @@ impl<'a> ScalarPlan<'a> {
     pub fn with_registry(registry: std::sync::Arc<super::dialect::DialectRegistry>, program: &'a ScalarProgram, mode: ScalarMode) -> Self {
         let f64_fresh = super::freshness::analyze(program);
         let sgpr_fresh = super::freshness::analyze_sgpr(program);
+        let lifted: BTreeMap<_, Vec<_>> = program.blocks.iter().map(|(&pc, block)|
+            (pc, block.body.iter().map(|inst| super::lift::instruction_with_registry(inst, &registry)).collect())).collect();
         let mut blocks: BTreeMap<_, _> = program.blocks.iter().map(|(&pc, block)| {
             (pc, ScalarBlockPlan {
-                instructions: block.body.iter().map(|inst| super::lift::instruction_with_registry(inst, &registry)).collect(),
                 active: vec![false;block.body.len()],
                 f64_fresh: f64_fresh[&pc],
                 sgpr_fresh: sgpr_fresh[&pc],
@@ -47,13 +47,13 @@ impl<'a> ScalarPlan<'a> {
                 block.active=super::active::body_active_states(&program.blocks[&pc],active[&pc]);
             }
         }
-        let lowerings = blocks.iter().map(|(&pc, block)| (pc, block.instructions.iter().collect())).collect();
+        let lowerings = lifted.iter().map(|(&pc, block)| (pc, block.iter().collect())).collect();
         let preparation=super::lift::function::Preparation::Scalar {
             active:blocks.iter().flat_map(|(&pc,b)|b.active.iter().enumerate()
                 .filter_map(move |(index,&active)|active.then_some((pc,index)))).collect(),
             dispatch:mode==ScalarMode::Whole,
         };
-        let function=super::lift::function::Function::new(registry,program,&lowerings,None,preparation);
+        let function=super::lift::function::Function::new(registry,program,&lowerings,preparation);
         Self { program, mode, blocks, function }
     }
 }

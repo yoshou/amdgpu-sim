@@ -1,4 +1,4 @@
-//! Register-word dependencies during the migration to architectural state SSA.
+//! Architectural register-word dependencies and typed SSA operand views.
 //! EXEC/VCC keep their explicit mask bindings; NULL is never an SSA variable.
 use super::*;
 use crate::rdna_spmd::boundary::{BoundaryIo, RegSet};
@@ -57,15 +57,6 @@ impl Word {
 pub(super) fn words(set: &RegSet) -> impl Iterator<Item = Word> + '_ {
     set.vgprs().map(Word::Vgpr).chain(set.sgprs().filter_map(Word::scalar))
 }
-pub(super) fn dependencies(source: &SourceOperand, ty: Ty, state: &Words) -> Vec<ValueId> {
-    // A pair may start at a special low word and still contain an ordinary high
-    // word. Enumerate the encoded pair before filtering the special words.
-    (0..ty.bits().div_ceil(32)).filter_map(|k| match *source {
-        SourceOperand::VectorRegister(r) => Some(Word::Vgpr(r as u32 + k)),
-        SourceOperand::ScalarRegister(r) => Word::scalar(r as u32 + k),
-        _ => None,
-    }).filter_map(|r| state.get(&r).copied()).collect()
-}
 /// Register views shared by ALU and memory consumers. The shape is a native
 /// representation choice; ordinary word definitions remain width independent.
 pub(super) type Views = BTreeMap<(Word, Ty, bool), ValueId>;
@@ -101,6 +92,20 @@ impl Operands {
             self.bindings.push((input.clone(), value));
             return value;
         }
+        if matches!(input.source, InputSource::Operand(SourceOperand::PrivateBase)) {
+            let raw = core(f, &mut self.core, Ty::I64, Op::Env(Env::ScratchBase));
+            let value = if input.ty == Ty::I64 { raw } else {
+                let word = core(f, &mut self.core, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, raw));
+                match input.ty {
+                    Ty::I32 => word,
+                    Ty::I1 => project(f, &mut self.core, word),
+                    Ty::F32 => core(f, &mut self.core, Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, word)),
+                    _ => panic!("invalid private-base operand type"),
+                }
+            };
+            self.bindings.push((input.clone(), value));
+            return value;
+        }
         if let InputSource::Operand(source) = &input.source {
             if input.ty == Ty::I1 {
                 if let SourceOperand::ScalarRegister(r @ (106 | 126)) = *source {
@@ -122,7 +127,7 @@ impl Operands {
             }
             if let SourceOperand::ScalarRegister(r) = *source {
                 let count = input.ty.bits().div_ceil(32);
-                if (0..count).any(|k| matches!(r as u32 + k,106|126)) {
+                if (0..count).any(|k| matches!(r as u32 + k,106|124|126)) {
                     let mut parts = vec![];
                     for k in 0..count {
                         let reg = r as u32 + k;
@@ -179,16 +184,7 @@ impl Operands {
                 return value;
             }
         }
-        // Special mask/word conversions stay at the coupled E1–E6 boundary.
-        let deps = match &input.source {
-            InputSource::Operand(source) => dependencies(source, input.ty, words),
-            _ => vec![],
-        };
-        let value = f.value(input.ty);
-        block.insts.push(Inst::Boundary { inputs: deps, outputs: vec![(value, input.ty)] });
-        if let Some(key) = key { views.insert(key, value); }
-        self.bindings.push((input.clone(), value));
-        value
+        panic!("operand lacks an explicit SSA definition: {:?}", input)
     }
 }
 
@@ -201,7 +197,7 @@ fn source(set: &mut RegSet, src: &SourceOperand, count: u32) {
         }
     }
 }
-pub(super) fn footprint(lowering: &Lowering<'_>) -> BoundaryIo {
+pub(super) fn footprint(lowering: &Lowering) -> BoundaryIo {
     let mut io = BoundaryIo::default();
     match lowering {
         Lowering::TypedAlu { inputs, outputs, .. } => {
@@ -243,50 +239,7 @@ pub(super) fn footprint(lowering: &Lowering<'_>) -> BoundaryIo {
             }
         }
         Lowering::Wave(action) => return action.io(),
-        Lowering::Legacy(inst) => {
-            // Native vector effects observe EXEC even when no following typed
-            // instruction reads that definition before the next mask write.
-            if matches!(inst,InstFormat::VOP3(_)|InstFormat::VIMAGE(_)) {io.reads.add_sgpr(126);}
-            // Only the remaining adapter instructions enter here. Wide source
-            // reads are conservative; destinations must describe actual writes.
-            for r in crate::rdna_spmd::vec_live::vgpr_reads(inst) { io.reads.add_vgpr(r); }
-            if let InstFormat::VIMAGE(i)=inst {
-                let counts=if matches!(i.op,I::IMAGE_BVH8_INTERSECT_RAY) {[2,2,3,3,1]} else {[2,1,3,3,3]};
-                for (reg,count) in [i.vaddr0,i.vaddr1,i.vaddr2,i.vaddr3,i.vaddr4].iter().copied().zip(counts) {
-                    for r in reg as u32..reg as u32+count {io.reads.add_vgpr(r);}
-                }
-            }
-            for r in crate::rdna_spmd::freshness::vgpr_writes(inst) { io.writes.add_vgpr(r); }
-            match inst {
-                InstFormat::SOP1(i) => {
-                    source(&mut io.reads, &i.ssrc0, 1);
-                    io.writes.add_sgpr(i.sdst as u32);
-                    if !matches!(i.op, I::S_MOV_B32) { io.reads.add_sgpr(126); io.writes.add_sgpr(126); io.writes.scc = true; }
-                }
-                InstFormat::SOP2(i) => {
-                    source(&mut io.reads, &i.ssrc0, 1); source(&mut io.reads, &i.ssrc1, 1);
-                    io.writes.add_sgpr(i.sdst as u32); io.writes.scc = true;
-                }
-                InstFormat::VOP1(i) => source(&mut io.reads, &i.src0, 2),
-                InstFormat::VOP3(i) => {
-                    for s in [&i.src0, &i.src1, &i.src2] { source(&mut io.reads, s, 2); }
-                    if matches!(i.op, I::V_CMP_CLASS_F32 | I::V_CMP_CLASS_F64 | I::V_CMP_EQ_U16 | I::V_CMP_GT_U16 | I::V_S_RCP_F32) {
-                        io.writes.add_sgpr(i.vdst as u32);
-                    }
-                }
-                InstFormat::VOP3SD(i) => {
-                    for s in [&i.src0, &i.src1, &i.src2] { source(&mut io.reads, s, 2); }
-                    io.writes.add_sgpr(i.sdst as u32);
-                }
-                InstFormat::VOP3P(i) => for s in [&i.src0, &i.src1, &i.src2] { source(&mut io.reads, s, 1); },
-                InstFormat::VIMAGE(i) => for r in i.rsrc as u32..i.rsrc as u32 + 2 { io.reads.add_sgpr(r); },
-                InstFormat::VSAMPLE(i) => {
-                    for r in i.rsrc as u32..i.rsrc as u32 + 8 { io.reads.add_sgpr(r); }
-                    for r in i.samp as u32..i.samp as u32 + 4 { io.reads.add_sgpr(r); }
-                }
-                _ => panic!("missing state footprint for adapter instruction {:?}", inst),
-            }
-        }
+
     }
     io
 }

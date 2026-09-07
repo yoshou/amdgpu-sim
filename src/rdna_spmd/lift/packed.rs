@@ -2,7 +2,7 @@
 //! Both selected source halves are captured before the packed destination write.
 use super::*;
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::VOP3P(i) = inst else { return None; };
     if let Some(dot) = dot_integer(i, registry) { return Some(dot); }
     if let Some(float) = packed_float(i, registry) { return Some(float); }
@@ -88,7 +88,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
 
 // §16.10: IU8/IU4 use NEG[0:1] as signedness selectors. OPSEL selects
 // halves before unpacking; the accumulator is a complete, unmodified word.
-fn dot_integer(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn dot_integer(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering> {
     let (bits, signed) = match i.op {
         I::V_DOT4_I32_IU8 => (8, true), I::V_DOT4_U32_U8 => (8, false),
         I::V_DOT8_I32_IU4 => (4, true), I::V_DOT8_U32_U4 => (4, false),
@@ -152,7 +152,7 @@ fn narrow_wide_half(b: &mut Builder<'_>, value: ValueId) -> ValueId {
     b.target_one(target, Arguments::Unary(single))
 }
 
-fn packed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn packed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering> {
     let arity = match i.op {
         I::V_PK_FMA_F16 => 3,
         I::V_PK_ADD_F16 | I::V_PK_MUL_F16 | I::V_PK_MIN_NUM_F16 | I::V_PK_MAX_NUM_F16 |
@@ -205,7 +205,7 @@ fn packed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry)
 
 // §16.10 MIX: OPSEL_HI chooses precision; OPSEL chooses the half only
 // for F16 inputs. NEG_HI is ABS, and a half destination preserves its sibling.
-fn mixed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn mixed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering> {
     let (partial, high) = match i.op {
         I::V_FMA_MIX_F32 => (false, false), I::V_FMA_MIXLO_F16 => (true, false),
         I::V_FMA_MIXHI_F16 => (true, true), _ => return None,
@@ -242,7 +242,7 @@ fn mixed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) 
 // §16.10 dot products accumulate two exact short-format products and F32 C.
 // Retaining the F64 summation residual avoids losing C when two large
 // products cancel. Captured F32 results allow two ULP; CLAMP is ignored.
-fn dot_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn dot_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering> {
     let bf16 = match i.op { I::V_DOT2_F32_F16 => false, I::V_DOT2_F32_BF16 => true, _ => return None };
     let mut b = Builder::new(registry, vec![input(i.src0, Ty::I32), input(i.src1, Ty::I32), input(i.src2, Ty::F32)]);
     let widen = crate::rdna_spmd::dialect::rdna4::unary(registry, I::V_CVT_F32_F16).unwrap();

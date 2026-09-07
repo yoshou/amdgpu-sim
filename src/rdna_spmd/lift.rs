@@ -1,6 +1,4 @@
-//! Incremental ISA lift. Pure ALU semantics live in typed SSA; register access,
-//! mask-word conventions and the remaining effectful instructions stay in this
-//! explicit migration adapter. Nothing is scheduled across a legacy boundary.
+//! Lift ISA operands, state updates and effects into typed SSA.
 use super::ir::typed::*;
 use super::dialect::{DialectRegistry, Arguments};
 use crate::instructions::I;
@@ -16,7 +14,7 @@ mod image;
 pub(super) mod half;
 mod state;
 
-pub(super) enum Lowering<'a> {
+pub(super) enum Lowering {
     Memory(memory::Memory),
     Wave(wave::YieldAction),
     TypedAlu {
@@ -25,7 +23,6 @@ pub(super) enum Lowering<'a> {
         scalar: bool,
         expr: VerifiedExpr,
     },
-    Legacy(&'a InstFormat),
 }
 #[derive(Clone, Debug)]
 pub(super) struct Input {
@@ -167,10 +164,10 @@ impl<'r> Builder<'r> {
         }
         value
     }
-    fn finish(self, output: Output, result: ValueId) -> Lowering<'static> {
+    fn finish(self, output: Output, result: ValueId) -> Lowering {
         self.finish_many(false, vec![(output, result)])
     }
-    fn finish_many(self, scalar: bool, results: Vec<(Output, ValueId)>) -> Lowering<'static> {
+    fn finish_many(self, scalar: bool, results: Vec<(Output, ValueId)>) -> Lowering {
         let types: Vec<_> = self.inputs.iter().map(|i| i.ty)
             .chain(self.insts.iter().flat_map(|i| i.result_types().iter().copied())).collect();
         for &(output, value) in &results {
@@ -205,7 +202,7 @@ fn signed_input(source: SourceOperand, ty: Ty) -> Input {
 
 /// Arithmetic results and flags are separate SSA values. All operands are
 /// bound before either destination is written, including aliased carry words.
-fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (op, mut sources, dst, mask) = match inst {
         InstFormat::VOP2(i) if matches!(i.op, I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32) =>
             (i.op, vec![i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1), SourceOperand::ScalarRegister(106)], i.vdst, 106),
@@ -249,9 +246,9 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'stat
 }
 
 #[cfg(test)]
-pub(super) fn instruction(inst: &InstFormat) -> Lowering<'_> { instruction_with_registry(inst, &DialectRegistry::rdna4()) }
+pub(super) fn instruction(inst: &InstFormat) -> Lowering { instruction_with_registry(inst, &DialectRegistry::rdna4()) }
 
-pub(super) fn instruction_with_registry<'a>(inst: &'a InstFormat, registry: &DialectRegistry) -> Lowering<'a> {
+pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
     if let Some(action) = wave::instruction(inst) { return Lowering::Wave(action); }
     if let Some(memory) = memory::instruction(inst) { return Lowering::Memory(memory); }
     if let Some(image) = image::instruction(inst, registry) { return image; }
@@ -281,7 +278,7 @@ pub(super) fn instruction_with_registry<'a>(inst: &'a InstFormat, registry: &Dia
             i.cm,
             i.omod,
         ),
-        _ => return Lowering::Legacy(inst),
+        _ => panic!("instruction has no typed IR lowering: {:?}", inst),
     };
     let a = ValueId(0);
     let b = ValueId(1);
@@ -363,7 +360,7 @@ pub(super) fn instruction_with_registry<'a>(inst: &'a InstFormat, registry: &Dia
         }
     };
     if src.len() < arity {
-        return Lowering::Legacy(inst);
+        panic!("instruction has no typed IR lowering: {:?}", inst);
     }
     let mut inputs: Vec<_> = src
         .iter()
@@ -383,7 +380,7 @@ pub(super) fn instruction_with_registry<'a>(inst: &'a InstFormat, registry: &Dia
             _ => None,
         };
         let Some(literal) = literal else {
-            return Lowering::Legacy(inst);
+            panic!("instruction has no typed IR lowering: {:?}", inst);
         };
         inputs.push(input(SourceOperand::LiteralConstant(literal), Ty::F32));
     }
@@ -635,7 +632,7 @@ pub(super) fn instruction_with_registry<'a>(inst: &'a InstFormat, registry: &Dia
             I::V_FMA_F64 => q.push(ty, Op::MulAdd(a, b, c)),
             I::V_FMA_F32 | I::V_FMAC_F32 | I::V_FMAAK_F32 => q.push(ty, Op::Fma(a, b, c)),
             I::V_FMAMK_F32 => q.push(ty, Op::Fma(a, c, b)),
-            _ => return Lowering::Legacy(inst),
+            _ => panic!("instruction has no typed IR lowering: {:?}", inst),
         }
     };
 

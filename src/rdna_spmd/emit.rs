@@ -79,7 +79,6 @@ struct Cg {
     vgpr: Vec<CellId>, // num_vgprs i32 representations
     scc: CellId,       // i1
     // cached types
-    i1: LLVMTypeRef,
     i8: LLVMTypeRef,
     i32t: LLVMTypeRef,
     i64t: LLVMTypeRef,
@@ -359,12 +358,7 @@ impl Cg {
 
 
 
-    // VCC bit 0 (single lane) as i1: (vcc & 1) != 0
-    // Bit 0 of any lane-mask register (EXEC/VCC live as i1; others as i32) as i1.
-    unsafe fn mask_bit(&self, reg: u32) -> LLVMValueRef {
-        let m = llvm::core::LLVMBuildAnd(self.b, self.ld_sgpr32(reg), self.ci32(1), self.n());
-        llvm::core::LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, m, self.ci32(0), self.n())
-    }
+
     // Store an i1 into a lane-mask register (VCC/EXEC/SGPR). The kernel's code
     // was compiled for a 32-lane wavefront and manipulates 32-bit masks
     // (e.g. `~EXEC & m`). To make that logic correct for our single active lane
@@ -508,7 +502,7 @@ unsafe fn compile_inner(
         state: std::cell::RefCell::new(state),
         writeback_words: plan.function.written,
         ctx, b, func, scratch_base, private_base, private_size, yield_frame,
-        sgpr, vgpr, scc, i1, i8, i32t, i64t, f32t, f64t, ptr,
+        sgpr, vgpr, scc, i8, i32t, i64t, f32t, f64t, ptr,
         predicate: std::cell::Cell::new(false),
         vgpr_f64,
         f64_fresh: std::cell::Cell::new([0; 2]),
@@ -563,6 +557,7 @@ unsafe fn compile_inner(
     }
 
     let mut ssa = super::typed_codegen::Values::new(&plan.function, b, None);
+    ssa.set_scratch_environment(cg.private_base, cg.private_size);
     ssa.set_bvh_storage(super::dialect::rdna4::bvh::Storage {scratch: cg.bvh_scratch, packet: std::ptr::null_mut(), packet_ty: std::ptr::null_mut()});
     llvm::core::LLVMBuildBr(b, bbs[&program.entry_pc]);
     for &pc in program.blocks.keys() {
@@ -572,12 +567,12 @@ unsafe fn compile_inner(
         cg.set_f64_fresh(facts.f64_fresh);
         cg.sgpr_fresh.set(facts.sgpr_fresh);
         let states = &facts.active;
-        for (idx, instruction) in facts.instructions.iter().enumerate() {
+        for (idx, instruction) in plan.function.blocks[&pc].instructions.iter().enumerate() {
             // Predicate this instruction's vector writes/compares unless the lane
             // is provably active here (then the mask is a no-op and we drop it).
             cg.predicate.set(!states[idx]);
             match instruction {
-                super::lift::Lowering::TypedAlu { .. } => {
+                Some(_) => {
                     ssa.emit(&plan.function, pc, idx, false, |_|true,
                         |reg|if matches!(reg,106|126) {cg.typed_input(&super::lift::Input {source:super::lift::InputSource::MaskBit(reg),ty:super::ir::typed::Ty::I1})} else {cg.ld_sgpr32(reg)},
                         |input, _| cg.typed_input(input), |output, value, _| {
@@ -586,7 +581,7 @@ unsafe fn compile_inner(
                         cg.predicate.set(predicate);
                     });
                 }
-                super::lift::Lowering::Wave(_) => {
+                None if plan.function.blocks[&pc].wave.contains_key(&idx) => {
                     let (action,wave)=&plan.function.blocks[&pc].wave[&idx];
                     cg.emit_local_wave(action,|reg,raw| {
                         let (ty,value)=ssa.effect_result(wave.results[0].0,wave.definitions[0].1,raw);
@@ -595,11 +590,10 @@ unsafe fn compile_inner(
                         cg.typed_output(output,value);
                     });
                 },
-                super::lift::Lowering::Memory(_) => {
+                None => {
                     ssa.prepare_memory(&plan.function, pc, idx, |p, scalar| cg.memory_parameter(p, scalar));
                     cg.emit_memory(&plan.function.blocks[&pc].memory[&idx], &ssa, |k| ssa.memory_data(&plan.function, pc, idx, k));
                 }
-                super::lift::Lowering::Legacy(inst) => panic!("instruction has no typed IR lowering: {:?}",inst),
             }
         }
         ssa.condition(&plan.function, pc, |reg|cg.ld_sgpr32(reg), |input| cg.typed_input(input));
@@ -718,9 +712,7 @@ impl Cg {
         llvm::core::LLVMBuildAdd(self.b, a, b, self.n())
     }
 
-    unsafe fn b_not(&self, a: LLVMValueRef) -> LLVMValueRef {
-        llvm::core::LLVMBuildNot(self.b, a, self.n())
-    }
+
 
 
 

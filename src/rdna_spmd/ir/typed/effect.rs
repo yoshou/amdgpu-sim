@@ -1,4 +1,4 @@
-//! Ordered, typed effects. Registers and ISA encodings belong to lift adapters.
+//! Ordered, typed effects. ISA operands are resolved by the lifter.
 use super::{Ty, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -50,7 +50,7 @@ pub(in crate::rdna_spmd) fn registers(inst: &InstFormat) -> Option<(Vec<u32>, u3
     Some((reads, o.dst as u32))
 }
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering<'static>> {
+pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let Operands { op, src, dst, abs, neg, clamp, omod, src_high, dst_high, widening } = operands(inst)?;
     let target = crate::rdna_spmd::dialect::rdna4::unary(registry, op).unwrap();
     if widening {
