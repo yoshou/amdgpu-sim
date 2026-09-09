@@ -6,35 +6,8 @@
 //! files and scratch are thread-local; output is written by the kernel itself
 //! through global stores into the (disjoint, per-pixel) result buffer.
 
-use std::thread;
-
 use crate::processor::KernelDescriptor;
 
-use super::kernel::{ScalarKernel, VecKernel};
-
-struct Bufs {
-    vgprs: Vec<u32>,
-    scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>>,
-}
-
-static BUF_POOL: std::sync::Mutex<Vec<Bufs>> = std::sync::Mutex::new(Vec::new());
-const BUF_POOL_LIMIT: usize = 64;
-
-fn acquire_bufs(vgprs: usize, scratch_bytes: usize) -> Bufs {
-    let mut pool = BUF_POOL.lock().unwrap();
-    if let Some(index) = pool.iter().position(|b| b.vgprs.len() == vgprs && b.scratch.len() == scratch_bytes) {
-        return pool.swap_remove(index);
-    }
-    drop(pool);
-    let mut scratch = aligned_vec::AVec::new(0x1_0000_0000);
-    scratch.resize(scratch_bytes, 0u8);
-    Bufs { vgprs: vec![0u32; vgprs], scratch }
-}
-
-fn release_bufs(bufs: Bufs) {
-    let mut pool = BUF_POOL.lock().unwrap();
-    if pool.len() < BUF_POOL_LIMIT { pool.push(bufs); }
-}
 
 /// Grid geometry (workgroup counts and per-workgroup sizes).
 #[derive(Clone, Copy)]
@@ -58,15 +31,17 @@ impl GridDims {
 
 /// Build the 128-entry SGPR file for one work-item, mirroring the masked
 /// backend's `dispatch()` system-SGPR layout.
+#[inline]
 pub(in crate::rdna_spmd) fn setup_sgprs(
+    s: &mut [u32],
     kd: &KernelDescriptor,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
     scratch_base: u64,
     private_segment_size: u32,
     wg_id: (u32, u32, u32),
-) -> [u32; 128] {
-    let mut s = [0u32; 128];
+) {
+    s.fill(0);
     let mut p = 0usize;
 
     if kd.enable_sgpr_private_segment_buffer {
@@ -123,173 +98,4 @@ pub(in crate::rdna_spmd) fn setup_sgprs(
     if kd.enable_sgpr_private_segment_wave_offset {
         s[p] = 0;
     }
-    s
-}
-
-/// Run the whole grid in parallel across `num_threads` CPU threads.
-pub(crate) fn dispatch_parallel(
-    kernel: &ScalarKernel,
-    kd: &KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    num_threads: usize,
-) {
-    let total = dims.total_workitems();
-    let wg_size = dims.workgroup_size();
-    let num_vgprs = kernel.num_vgprs.max(1);
-    // Scratch in u64 units for 8-byte alignment; round up to cover the segment.
-    let scratch_u64 = (private_segment_size as usize / 8) + 2;
-
-    thread::scope(|scope| {
-        for tid in 0..num_threads {
-            let kernel = &kernel;
-            let kd = &kd;
-            let dims = dims;
-            scope.spawn(move || {
-                let mut sgprs;
-                let mut bufs = acquire_bufs(num_vgprs, scratch_u64 * 8);
-                let Bufs { vgprs, scratch } = &mut bufs;
-
-                let mut t = tid as u64;
-                while t < total {
-                    let wg = (t / wg_size as u64) as u32;
-                    let local = (t % wg_size as u64) as u32;
-
-                    let wg_id = (
-                        wg % dims.num_wg_x,
-                        (wg / dims.num_wg_x) % dims.num_wg_y,
-                        (wg / (dims.num_wg_x * dims.num_wg_y)) % dims.num_wg_z,
-                    );
-                    let lx = local % dims.wg_x;
-                    let ly = (local / dims.wg_x) % dims.wg_y;
-                    let lz = (local / (dims.wg_x * dims.wg_y)) % dims.wg_z;
-
-                    let scratch_base = scratch.as_ptr() as u64;
-                    sgprs = setup_sgprs(
-                        kd,
-                        kernarg_ptr,
-                        aql_packet_addr,
-                        scratch_base,
-                        private_segment_size,
-                        wg_id,
-                    );
-
-                    // VGPR0: packed work-item id (x | y<<10 | z<<20).
-                    for v in vgprs.iter_mut() {
-                        *v = 0;
-                    }
-                    vgprs[0] = lx | (ly << 10) | (lz << 20);
-
-                    unsafe {
-                        kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), scratch_base);
-                    }
-
-                    t += num_threads as u64;
-                }
-                release_bufs(bufs);
-            });
-        }
-    });
-}
-
-/// Width-W work-item packing (SPMD-on-SIMD): each [`VecKernel`] call runs `W`
-/// work-items of one workgroup at once (one per SIMD lane). VGPRs are laid out
-/// SoA — register `r`'s W lanes are contiguous at `r*W` — and each lane gets its
-/// own private scratch segment.
-pub(crate) fn dispatch_parallel_vec(
-    kernel: &VecKernel,
-    kd: &KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    num_threads: usize,
-) {
-    dispatch_parallel_vec_impl(
-        kernel,
-        kd,
-        kernarg_ptr,
-        aql_packet_addr,
-        dims,
-        private_segment_size,
-        num_threads,
-    );
-}
-
-fn linear_local_id(dims: GridDims, width: u32, packet: u32, lane: u32) -> (u32, u32, u32) {
-    let linear = packet * width + lane;
-    (
-        linear % dims.wg_x,
-        (linear / dims.wg_x) % dims.wg_y,
-        linear / (dims.wg_x * dims.wg_y),
-    )
-}
-
-fn dispatch_parallel_vec_impl(
-    kernel: &VecKernel,
-    kd: &KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    num_threads: usize,
-) {
-    let w = kernel.width as u64;
-    let wg_size = dims.workgroup_size() as u64;
-    assert!(wg_size % w == 0, "workgroup size {} not divisible by W={}", wg_size, w);
-    match kernel.workgroup_x {
-        Some(x) => assert_eq!(x, dims.wg_x, "kernel compiled for another workgroup width"),
-        None => assert!(dims.wg_x % kernel.width == 0, "workgroup width {} not divisible by W={}; compile with the workgroup layout", dims.wg_x, w),
-    }
-    let num_wg = (dims.num_wg_x * dims.num_wg_y * dims.num_wg_z) as u64;
-    let groups_per_wg = wg_size / w;
-    let total_groups = num_wg * groups_per_wg;
-    let num_vgprs = kernel.num_vgprs.max(1);
-    // Per-lane padded scratch segment (u64 units); stride in bytes spaces the W
-    // per-lane segments so each work-item owns disjoint private memory.
-    let scratch_u64 = ((private_segment_size as usize / 8) + 2).max(kernel.min_private_bytes.div_ceil(8));
-    let stride_bytes = (scratch_u64 * 8) as u64;
-
-    thread::scope(|scope| {
-        for tid in 0..num_threads {
-            let kernel = &kernel;
-            let kd = &kd;
-            let dims = dims;
-            scope.spawn(move || {
-                let mut sgprs;
-                let mut bufs = acquire_bufs(num_vgprs * w as usize, scratch_u64 * w as usize * 8);
-                let Bufs { vgprs, scratch } = &mut bufs;
-
-                let mut g = tid as u64;
-                while g < total_groups {
-                    let wg = g / groups_per_wg;
-                    let packet = (g % groups_per_wg) as u32;
-
-                    let wg_id = (
-                        (wg % dims.num_wg_x as u64) as u32,
-                        ((wg / dims.num_wg_x as u64) % dims.num_wg_y as u64) as u32,
-                        ((wg / (dims.num_wg_x as u64 * dims.num_wg_y as u64)) % dims.num_wg_z as u64) as u32,
-                    );
-
-                    let scratch_base = scratch.as_ptr() as u64;
-                    sgprs = setup_sgprs(kd, kernarg_ptr, aql_packet_addr, scratch_base, private_segment_size, wg_id);
-
-                    // VGPR0 lane k = packed linear local work-item id.
-                    for v in vgprs.iter_mut() { *v = 0; }
-                    for k in 0..w {
-                        let (lx, ly, lz) = linear_local_id(dims, kernel.width, packet, k as u32);
-                        vgprs[k as usize] = lx | (ly << 10) | (lz << 20); // register 0, lane k
-                    }
-
-                    unsafe {
-                        kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), scratch_base, stride_bytes);
-                    }
-                    g += num_threads as u64;
-                }
-                release_bufs(bufs);
-            });
-        }
-    });
 }

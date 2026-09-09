@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use super::program::LiftedFunction;
 
 pub(crate) trait Target: Send + Sync {

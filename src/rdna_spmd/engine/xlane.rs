@@ -1,39 +1,31 @@
-//! Cooperative *wavefront* dispatch for kernels whose only cross-lane traffic is
-//! a wave-wide op (`v_wmma_*`, `v_readlane`/`v_writelane`) — including one that
-//! sits **inside a loop**.
+//! Wave scheduler: cooperative dispatch for kernels whose cross-lane traffic is
+//! a wave-wide op (`v_wmma_*`, `ds_bpermute`, non-constant `v_readlane`) that
+//! may sit inside a loop.
 //!
-//! This reuses the same coroutine machinery as the workgroup-barrier scheduler
-//! ([`super::cooperative`]): each lane is a resumable, single-lane (W=0) scalar
-//! coroutine ([`CoopKernel`]) that yields at a boundary and returns its resume
-//! pc. Where [`super::super::segmented`] handles a cross-lane op *outside* loops by
-//! splitting the kernel into `[pre, boundary, post]` fragments, that model cannot
-//! express a boundary reached many times by a back-edge. Modelling the boundary
-//! as a coroutine *yield* removes that restriction: the loop's back-edge simply
-//! flows back to the post-yield block, so the same boundary yields once per
-//! iteration and the host driver runs the wave-level op each time.
+//! It shares the fiber machinery with the workgroup scheduler
+//! ([`super::cooperative`]): each packet is a resumable coroutine that yields at
+//! a scheduled effect and reports its resume index. Modelling the boundary as a
+//! yield lets a loop's back-edge flow back to the post-yield block, so the same
+//! boundary yields once per iteration and the driver applies the wave-level op
+//! each time. A worker owns whole 32-lane waves; for a uniform boundary all
+//! packets of a wave stop at the same index and the op is applied once per pass.
 //!
-//! Only the cross-lane ops are lifted; every other instruction runs per-lane on
-//! the scalar backend. For a *uniform* boundary (the same op reached the same
-//! number of times by all lanes — true of `rocwmma`'s K-loop) all 32 lanes yield
-//! at the same pc in lockstep, so the driver applies one wave-level op per pass.
+//! [`crate::rdna_spmd::compile`] selects this scheduler from the program;
+//! kernels without exchange ops run on the independent dispatcher and kernels
+//! with workgroup barriers on the workgroup scheduler.
 
 use std::collections::BTreeMap;
-use std::thread;
 
 #[cfg(test)]
 use half::f16;
 
-use crate::processor::KernelDescriptor;
 #[cfg(test)]
 use crate::rdna_instructions::SourceOperand;
 
-use super::dispatch::{setup_sgprs, GridDims};
-use super::kernel::{COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 #[cfg(test)]
 use crate::rdna_spmd::targets::rdna4::lift::regs::RegSet;
-use super::kernel::CoopVecKernel;
-use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 
+#[cfg(test)]
 const WAVE: usize = 32;
 
 /// The wave-level effect applied at a yield, keyed by the resume value the
@@ -50,251 +42,6 @@ use super::super::ir::{EffectOp, WaveOp};
 pub(crate) fn split_at_xlane(program: &impl super::super::CompilationInput) -> (super::super::Program, BTreeMap<usize, XlaneOp>) {
     let (program, ops) = program.to_ssa().schedule(|op| matches!(op, super::super::ir::EffectOp::Wave(w) if *w != super::super::ir::WaveOp::WriteLane));
     (program, ops.into_iter().map(|(key, op)| (key, XlaneOp(op))).collect())
-}
-
-/// Packed counterpart of [`dispatch_xlane`]. Each CPU worker owns complete
-/// 32-lane waves; it advances all `32 / W` packets to a lifted cross-lane
-/// boundary, applies the operation once to their typed argument/result frames,
-/// and resumes the packets. No packet of a wave is scheduled on another thread.
-pub(crate) fn dispatch_xlane_vec(
-    kernel: &CoopVecKernel,
-    kd: &KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    num_threads: usize,
-) {
-    let width = kernel.width as usize;
-    match kernel.workgroup_x {
-        Some(x) => assert_eq!(x, dims.wg_x, "kernel compiled for another workgroup width"),
-        None => assert!(dims.wg_x as usize % width == 0, "workgroup width {} not divisible by W={}; compile with the workgroup layout", dims.wg_x, width),
-    }
-    assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
-    let wg_size = dims.workgroup_size() as usize;
-    let scratch_u64 = (private_segment_size as usize).max(kernel.min_private_bytes).div_ceil(8);
-    let dispatch = VecDispatch {
-        kernel,
-        xlane: &kernel.yields,
-        kd,
-        kernarg_ptr,
-        aql_packet_addr,
-        dims,
-        private_segment_size,
-        width,
-        packets_per_wave: WAVE / width,
-        wg_size,
-        waves_per_wg: (wg_size + WAVE - 1) / WAVE,
-        scratch_bytes: scratch_u64 * WAVE * 8,
-        scratch_stride: (scratch_u64 * 8) as u64,
-        exec: kernel.registers.exec as usize,
-    };
-    let num_wg = (dims.num_wg_x * dims.num_wg_y * dims.num_wg_z) as u64;
-    let total_waves = num_wg * dispatch.waves_per_wg as u64;
-    let num_threads = num_threads.max(1);
-
-    thread::scope(|scope| {
-        for tid in 0..num_threads {
-            let dispatch = &dispatch;
-            scope.spawn(move || {
-                let mut bufs = dispatch.acquire_bufs();
-                let mut wave = tid as u64;
-                while wave < total_waves {
-                    dispatch.run_wave(wave, &mut bufs);
-                    wave += num_threads as u64;
-                }
-                release_bufs(bufs);
-            });
-        }
-    });
-}
-
-/// The wave-invariant half of [`dispatch_xlane_vec`].
-struct VecDispatch<'a> {
-    kernel: &'a CoopVecKernel,
-    xlane: &'a [super::yields::YieldValues],
-    kd: &'a KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    width: usize,
-    packets_per_wave: usize,
-    wg_size: usize,
-    waves_per_wg: usize,
-    scratch_bytes: usize,
-    scratch_stride: u64,
-    exec: usize,
-}
-
-/// Per-worker state, reused for every wave the worker runs.
-struct WaveBufs {
-    sgprs: Vec<[u32; COOP_SGPR_BUF]>,
-    vgprs: Vec<Vec<u32>>,
-    spill: Vec<Vec<u32>>,
-    fibers: Vec<Fiber>,
-    resume: Vec<u64>,
-    done: Vec<bool>,
-    /// 4 GiB-aligned so its low 32 bits are zero: kernels using flat-scratch
-    /// addressing take the pointer's high word from SRC_PRIVATE_BASE and add a
-    /// per-lane low offset, so a nonzero low word would corrupt every private
-    /// pointer.
-    scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>>,
-}
-
-/// Stack per packet fiber. A wave allocates `32 / W` of them, so the size is
-/// kept modest; [`Fiber`] guards the deepest bytes, so a kernel whose frame
-/// does not fit fails loudly rather than silently.
-const FIBER_STACK_BYTES: usize = 32 << 10;
-
-unsafe impl Send for WaveBufs {}
-
-static BUF_POOL: std::sync::Mutex<Vec<WaveBufs>> = std::sync::Mutex::new(Vec::new());
-const BUF_POOL_LIMIT: usize = 64;
-
-fn release_bufs(bufs: WaveBufs) {
-    let mut pool = BUF_POOL.lock().unwrap();
-    if pool.len() < BUF_POOL_LIMIT { pool.push(bufs); }
-}
-
-impl VecDispatch<'_> {
-    fn acquire_bufs(&self) -> WaveBufs {
-        let packets = self.packets_per_wave;
-        let words = self.kernel.num_vgprs * self.width;
-        let mut pool = BUF_POOL.lock().unwrap();
-        let found = pool.iter().position(|b| b.fibers.len() == packets && b.vgprs[0].len() == words && b.scratch.len() == self.scratch_bytes);
-        match found {
-            Some(index) => pool.swap_remove(index),
-            None => { drop(pool); self.new_bufs() }
-        }
-    }
-    fn new_bufs(&self) -> WaveBufs {
-        let packets = self.packets_per_wave;
-        let mut scratch = aligned_vec::AVec::new(0x1_0000_0000);
-        scratch.resize(self.scratch_bytes, 0u8);
-        WaveBufs {
-            sgprs: vec![[0u32; COOP_SGPR_BUF]; packets],
-            vgprs: (0..packets).map(|_| vec![0u32; self.kernel.num_vgprs * self.width]).collect(),
-            spill: (0..packets).map(|_| vec![0u32; COOP_SPILL_SLOTS]).collect(),
-            fibers: Fiber::batch(packets, FIBER_STACK_BYTES),
-            resume: vec![0; packets],
-            done: vec![true; packets],
-            scratch,
-        }
-    }
-
-    /// Reset every packet of `wave` to its entry state and arm its fiber.
-    #[inline(never)]
-    fn start_wave(&self, wave: u64, bufs: &mut WaveBufs) {
-        let wg = wave / self.waves_per_wg as u64;
-        let local_base = (wave % self.waves_per_wg as u64) as usize * WAVE;
-        let wg_id = (
-            (wg % self.dims.num_wg_x as u64) as u32,
-            ((wg / self.dims.num_wg_x as u64) % self.dims.num_wg_y as u64) as u32,
-            ((wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64))
-                % self.dims.num_wg_z as u64) as u32,
-        );
-
-        bufs.scratch.fill(0);
-        let scratch_base = if bufs.scratch.is_empty() { 0 } else { bufs.scratch.as_ptr() as u64 };
-        let initial_sgprs = setup_sgprs(
-            self.kd,
-            self.kernarg_ptr,
-            self.aql_packet_addr,
-            scratch_base,
-            self.private_segment_size,
-            wg_id,
-        );
-
-        for packet in 0..self.packets_per_wave {
-            bufs.sgprs[packet] = [0u32; COOP_SGPR_BUF];
-            bufs.sgprs[packet][..128].copy_from_slice(&initial_sgprs);
-            bufs.vgprs[packet].fill(0);
-            bufs.spill[packet].fill(0);
-
-            let packet_base = local_base + packet * self.width;
-            let valid_lanes = self.wg_size.saturating_sub(packet_base).min(self.width);
-            bufs.done[packet] = valid_lanes == 0; // tail packet of a partial wave
-            if bufs.done[packet] {
-                continue;
-            }
-            let exec = self.exec;
-            bufs.sgprs[packet][exec] = if valid_lanes == 32 {
-                u32::MAX
-            } else {
-                ((1u64 << valid_lanes) - 1) as u32
-            };
-            for lane in 0..valid_lanes {
-                let local = (packet_base + lane) as u32;
-                let x = local % self.dims.wg_x;
-                let y = (local / self.dims.wg_x) % self.dims.wg_y;
-                let z = local / (self.dims.wg_x * self.dims.wg_y);
-                bufs.vgprs[packet][lane] = x | (y << 10) | (z << 20);
-            }
-            bufs.fibers[packet].start(KernelArgs {
-                lds_base: 0,
-                valid_mask: bufs.sgprs[packet][exec],
-                entry: self.kernel.addr(),
-                sgprs: bufs.sgprs[packet].as_mut_ptr(),
-                vgprs: bufs.vgprs[packet].as_mut_ptr(),
-                spill: bufs.spill[packet].as_mut_ptr(),
-                scratch_base,
-                scratch_stride: self.scratch_stride,
-                lane_base: (packet * self.width) as u64,
-            });
-        }
-    }
-
-    /// Run one 32-lane wave to completion: advance every live packet to its
-    /// next boundary, apply the wave-level op once there, repeat.
-    fn run_wave(&self, wave: u64, bufs: &mut WaveBufs) {
-        self.start_wave(wave, bufs);
-        let count = self.wg_size.saturating_sub((wave % self.waves_per_wg as u64) as usize * 32).min(32);
-        let valid = if count == 32 { u32::MAX } else { (1u32 << count) - 1 };
-        loop {
-            let mut live = false;
-            for packet in 0..self.packets_per_wave {
-                if bufs.done[packet] {
-                    continue;
-                }
-                live = true;
-                let pc = bufs.fibers[packet].resume();
-                bufs.done[packet] = pc == FIBER_DONE;
-                bufs.resume[packet] = pc;
-            }
-            if !live {
-                return;
-            }
-            if let Some(pc) = self.boundary_pc(wave, bufs) {
-                let op = self.xlane.get(pc as usize).unwrap_or_else(|| {
-                    panic!("dispatch_xlane_vec: yield {} has no cross-lane op", pc)
-                });
-                op.apply_wave(self.width, valid, &bufs.fibers);
-            }
-        }
-    }
-
-    /// The boundary every live packet stopped at, or `None` once they all
-    /// finished. A wave-level op is one operation over all 32 lanes, so the
-    /// live packets have to agree on which boundary they reached.
-    fn boundary_pc(&self, wave: u64, bufs: &WaveBufs) -> Option<u64> {
-        let mut boundary = None;
-        for packet in 0..self.packets_per_wave {
-            if bufs.done[packet] {
-                continue;
-            }
-            match boundary {
-                None => boundary = Some(bufs.resume[packet]),
-                Some(pc) if pc != bufs.resume[packet] => panic!(
-                    "dispatch_xlane_vec: wave {} reached a non-uniform boundary \
-                     (packet {} at {:#x}, others at {:#x})",
-                    wave, packet, bufs.resume[packet], pc
-                ),
-                _ => {}
-            }
-        }
-        boundary
-    }
 }
 
 #[cfg(test)]

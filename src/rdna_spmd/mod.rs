@@ -103,7 +103,7 @@ pub(crate) use targets::rdna4::decode::{Cond, ScalarBlock, ScalarProgram, Termin
 #[cfg(test)]
 pub(crate) use program::split_at_barriers;
 #[cfg(test)]
-pub(crate) use engine::cooperative::dispatch_cooperative_vec;
+pub(crate) use engine::scheduler::dispatch_cooperative_vec;
 
 /// Recommended default width-W work-item packing (W in {1,2,4,8,16}); 0 = off
 /// (the single-lane scalar path). See [`codegen`] for the packed register
