@@ -25,7 +25,7 @@ fn f64_fixup_preserves_aliases_special_values_and_inactive_lanes() {
         let w=width.max(1) as usize;
         for &(den,num,result) in &cases {
             for mask in [0u32,0xaaaa_aaaa,u32::MAX] {
-                let mut s=[0u32;crate::rdna_spmd::emit::COOP_SGPR_BUF];s[20]=mask;
+                let mut s=[0u32;crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];s[20]=mask;
                 let mut v=vec![0u32;256*w];
                 for lane in 0..w {v[4*w+lane]=den as u32;v[5*w+lane]=(den>>32) as u32;v[6*w+lane]=num as u32;v[7*w+lane]=(num>>32) as u32;}
                 run_memory_case(&p,width,&mut s,&mut v,0,0,0);
@@ -52,7 +52,7 @@ fn bvh_target_preserves_four_results_aliases_and_packet_masks() {
             let w=width.max(1) as usize;
             for (divergent,sorted) in [(false,true),(true,true),(false,false)] {
                 for mask in [0u32,0xaaaa_aaaa,u32::MAX] {
-                    let mut s=[0u32;crate::rdna_spmd::emit::COOP_SGPR_BUF];s[0]=(address>>8) as u32;s[1]=(address>>40) as u32|if sorted {0x8000_0000}else{0};s[20]=mask;
+                    let mut s=[0u32;crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];s[0]=(address>>8) as u32;s[1]=(address>>40) as u32|if sorted {0x8000_0000}else{0};s[20]=mask;
                     let mut v=vec![0xdead_beef;256*w];
                     for lane in 0..w {
                         let ray=[5+if divergent && lane%2==1 {16}else{0},0,100f32.to_bits(),0,0,0,1f32.to_bits(),0,0,1f32.to_bits(),f32::INFINITY.to_bits(),f32::INFINITY.to_bits()];
@@ -80,7 +80,7 @@ fn scratch_environment_operands_preserve_native_word_views() {
     let base = 0x1234_abcd_7654_3210u64;
     for width in [0, 1, 2, 4, 8, 16] {
         let w = width.max(1) as usize;
-        let mut s = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+        let mut s = [0u32; crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];
         s[126] = u32::MAX;
         let mut v = vec![0u32; 32 * w];
         run_memory_case(&p, width, &mut s, &mut v, base, 0, 0);

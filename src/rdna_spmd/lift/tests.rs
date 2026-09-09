@@ -137,6 +137,8 @@ fn scalar_words_survive_pair_overlap_shape_changes_and_loop_edges() {
     let mov = |sdst, ssrc0| InstFormat::SOP1(SOP1 { op: I::S_MOV_B32, sdst, ssrc0 });
     let copy = |vdst, r| InstFormat::VOP1(VOP1 { op: I::V_MOV_B32, vdst, src0: sr(r) });
     let mut body = vec![
+        InstFormat::VOP2(VOP2 { op: I::V_LSHRREV_B32, src0: k(2), vsrc1: 0, vdst: 3, literal_constant: None }),
+        InstFormat::VOP2(VOP2 { op: I::V_ADD_NC_U32, src0: k(100), vsrc1: 3, vdst: 3, literal_constant: None }),
         InstFormat::SMEM(SMEM { op: I::S_LOAD_B64, sbase: 2, sdata: 8, soffset: 124, ioffset: 0, scope: 0, th: 0 }),
         sop(I::S_ADD_NC_U64, 10, sr(8), k(0)),
         copy(8, 10), copy(9, 11),
@@ -178,7 +180,7 @@ fn scalar_words_survive_pair_overlap_shape_changes_and_loop_edges() {
                 }
                 sgprs[6] = trips;
                 let mut vgprs = vec![0u32; 256 * w];
-                for lane in 0..w { vgprs[lane] = lane as u32 * 36; vgprs[3 * w + lane] = 100 + lane as u32; }
+                for lane in 0..w { vgprs[lane] = lane as u32 * 36; }
                 unsafe {
                     if let Some(kernel) = &scalar { kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0); }
                     if let Some(kernel) = &packet { kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0, 0); }
@@ -186,7 +188,7 @@ fn scalar_words_survive_pair_overlap_shape_changes_and_loop_edges() {
                 for lane in 0..w {
                     let pair = (((0x1357_2468u64) << 32) | low as u64).wrapping_add(1);
                     let expected = [low, input[1], pair as u32, (pair >> 32) as u32,
-                        low.wrapping_add(100 + lane as u32), low.wrapping_sub(1).wrapping_add(100 + lane as u32),
+                        low.wrapping_add(100 + 9 * lane as u32), low.wrapping_sub(1).wrapping_add(100 + 9 * lane as u32),
                         low.wrapping_add(7), low.wrapping_sub(1).wrapping_add(7), trips];
                     assert_eq!(&output[lane * 9..lane * 9 + 9], &expected,
                         "width={width} low={low:x} trips={trips} lane={lane}");
@@ -634,7 +636,8 @@ fn integer_lift_executes_edge_cases_and_predication_in_scalar_and_all_packet_wid
     }
     // Exercise reconvergence inside the same block: an EXEC write invalidates
     // the entry-full specialization, and the later widening observes old lanes.
-    let mut single = vec![exec(SourceOperand::ScalarRegister(4))];
+    let load = |vdst, ioffset| InstFormat::VGLOBAL(VGLOBAL { op: I::GLOBAL_LOAD_B32, vaddr: 0, vsrc: 0, vdst, scope: 0, th: 0, ioffset, saddr: 2, sve: 0 });
+    let mut single = vec![load(2, 0), load(3, 4), exec(SourceOperand::ScalarRegister(4))];
     single.extend(body.clone());
     single.extend(observe.clone());
     let single = ScalarProgram {
@@ -655,7 +658,7 @@ fn integer_lift_executes_edge_cases_and_predication_in_scalar_and_all_packet_wid
                 0,
                 ScalarBlock {
                     pc: 0,
-                    body: vec![exec(SourceOperand::ScalarRegister(4))],
+                    body: vec![load(2, 0), load(3, 4), exec(SourceOperand::ScalarRegister(4))],
                     term: Terminator::Jump(1),
                 },
             ),
@@ -714,19 +717,25 @@ fn integer_lift_executes_edge_cases_and_predication_in_scalar_and_all_packet_wid
             let w = width.max(1) as usize;
             for mask in [0, u32::MAX, 0xaaaa_aaaa] {
                 let mut output = vec![0u32; 32 * regs.len()];
+                let mut input = vec![0u32; 32 * regs.len()];
+                for lane in 0..32 {
+                    let (a, b) = inputs[lane % inputs.len()];
+                    input[lane * regs.len()] = a;
+                    input[lane * regs.len() + 1] = b;
+                }
                 for base in (0..32).step_by(w) {
                     let mut sgprs = [0u32; 128];
                     let addr = output.as_mut_ptr() as u64;
                     sgprs[0] = addr as u32;
                     sgprs[1] = (addr >> 32) as u32;
+                    let addr = input.as_ptr() as u64;
+                    sgprs[2] = addr as u32;
+                    sgprs[3] = (addr >> 32) as u32;
                     sgprs[4] = mask >> base;
                     sgprs[6] = 0x1234_5678;
                     let mut vgprs = vec![0xdead_beef; 256 * w];
                     for lane in 0..w {
-                        let (a, b) = inputs[(base + lane) % inputs.len()];
                         vgprs[lane] = ((base + lane) * regs.len() * 4) as u32;
-                        vgprs[2 * w + lane] = a;
-                        vgprs[3 * w + lane] = b;
                     }
                     unsafe {
                         if let Some(kernel) = &scalar {
@@ -953,7 +962,10 @@ fn typed_function_loop_carries_values_through_block_arguments() {
                 0,
                 ScalarBlock {
                     pc: 0,
-                    body: vec![],
+                    body: vec![
+                        InstFormat::VOP2(VOP2 { op: I::V_LSHRREV_B32, src0: SourceOperand::IntegerConstant(2), vsrc1: 0, vdst: 3, literal_constant: None }),
+                        InstFormat::VOP2(VOP2 { op: I::V_ADD_NC_U32, src0: SourceOperand::IntegerConstant(1), vsrc1: 3, vdst: 3, literal_constant: None }),
+                    ],
                     term: Terminator::Jump(1),
                 },
             ),
@@ -1002,12 +1014,8 @@ fn typed_function_loop_carries_values_through_block_arguments() {
             ),
         ]),
     };
-    let plan = super::super::scalar_plan::ScalarPlan::new(
-        &program,
-        super::super::scalar_plan::ScalarMode::Whole,
-    );
-    let f = plan.function.ir.func();
-    let block = &f.blocks[&super::super::ir::typed::cfg::BlockId(1)];
+    let lifted = crate::rdna_spmd::CompilationInput::to_ssa(&program);
+    let block = &lifted.function.ir.blocks[&super::super::ir::BlockId(1)];
     assert!(!block.params.is_empty());
     assert!(block
         .term
@@ -1025,7 +1033,6 @@ fn typed_function_loop_carries_values_through_block_arguments() {
         let mut vgprs = vec![0u32; 256 * w];
         for lane in 0..w {
             vgprs[lane] = (lane * 4) as u32;
-            vgprs[3 * w + lane] = (lane + 1) as u32;
             vgprs[8 * w + lane] = 9;
         }
         unsafe {
@@ -1273,7 +1280,7 @@ fn typed_lds_barrier_rounds_and_first_wave_execute_at_all_widths() {
 
 #[test]
 fn masked_memory_never_dereferences_inactive_addresses_and_keeps_old_values() {
-    use crate::rdna_spmd::fiber::{Fiber, KernelArgs, FIBER_DONE};
+    use crate::rdna_spmd::engine::fiber::{Fiber, KernelArgs, FIBER_DONE};
     for width in [0, 1, 2, 4, 8, 16] {
         let lanes = width.max(1) as usize;
         let mut body = vec![InstFormat::SOP1(SOP1 {
@@ -1307,11 +1314,11 @@ fn masked_memory_never_dereferences_inactive_addresses_and_keeps_old_values() {
                 },
             )]),
         };
-        let scalar = (width == 0).then(|| Compiler::default().compile_writeback(&program, 32));
+        let scalar = (width == 0).then(|| Compiler::default().compile_cooperative(&program, 32));
         let packet = (width != 0).then(|| Compiler::default().compile_cooperative_vec(&program, 32, width));
         let data: Vec<u32> = (0..lanes * 12).map(|x| x as u32 * 17 + 3).collect();
         for mask in [0u32, 0xaaaa_aaaa, u32::MAX] {
-            let mut sgprs = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+            let mut sgprs = [0u32; crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];
             sgprs[8] = mask;
             sgprs[126] = 1;
             let mut vgprs = vec![0xdead_beefu32; 256 * lanes];
@@ -1325,12 +1332,11 @@ fn masked_memory_never_dereferences_inactive_addresses_and_keeps_old_values() {
                 vgprs[lanes + lane] = (addr >> 32) as u32;
             }
             if let Some(kernel) = &scalar {
-                unsafe {
-                    kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0);
-                }
+                let mut spill = [0u32; crate::rdna_spmd::engine::kernel::COOP_SPILL_SLOTS];
+                assert_eq!(unsafe { run_scalar_fiber(kernel, sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0, 0, spill.as_mut_ptr()) }, FIBER_DONE);
             }
             if let Some(kernel) = &packet {
-                let mut spill = [0u32; crate::rdna_spmd::emit::COOP_SPILL_SLOTS];
+                let mut spill = [0u32; crate::rdna_spmd::engine::kernel::COOP_SPILL_SLOTS];
                 let mut fiber = Fiber::new(32 << 10);
                 fiber.start(KernelArgs {
                     valid_mask: u32::MAX,
@@ -1376,8 +1382,8 @@ fn run_memory_case(
     stride: u64,
     lds: u64,
 ) {
-    use crate::rdna_spmd::fiber::{Fiber, KernelArgs, FIBER_DONE};
-    let mut spill = [0u32; crate::rdna_spmd::emit::COOP_SPILL_SLOTS];
+    use crate::rdna_spmd::engine::fiber::{Fiber, KernelArgs, FIBER_DONE};
+    let mut spill = [0u32; crate::rdna_spmd::engine::kernel::COOP_SPILL_SLOTS];
     if width == 0 {
         let kernel = Compiler::default().compile_cooperative(program, 32);
         assert_eq!(
@@ -1424,7 +1430,7 @@ fn inactive_image_samples_suppress_invalid_descriptors_and_preserve_destinations
     for width in [0, 1, 2, 4, 8, 16] {
         let lanes = width.max(1) as usize;
         for mask in [0u32, 0xaaaa_aaaa, u32::MAX] {
-            let mut sgprs = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+            let mut sgprs = [0u32; crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];
             if mask == 0 {
                 // Invalid address, unsupported format, selector, and filter
                 // are unobservable when every lane has EXEC clear.
@@ -1471,7 +1477,7 @@ fn memory_word_ssa_preserves_address_overlap_and_inactive_destinations() {
         let data: Vec<u32> = (0..lanes * 2).map(|i| 0xffff_ffe0u32.wrapping_add(i as u32 * 3)).collect();
         for mask in [0u32, 0xaaaa_aaaa, u32::MAX] {
             let mut output = vec![0xdead_beefu32; lanes];
-            let mut sgprs = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+            let mut sgprs = [0u32; crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];
             let base = output.as_mut_ptr() as u64;
             sgprs[0] = base as u32; sgprs[1] = (base >> 32) as u32; sgprs[8] = mask;
             let mut vgprs = vec![0x0123_4567u32; lanes * 256];
@@ -1611,7 +1617,7 @@ fn typed_memory_subwords_flat_aperture_and_atomic_returns() {
     };
     for width in [0, 1, 2, 4, 8, 16] {
         let w = width.max(1) as usize;
-        let mut sgprs = [0u32; crate::rdna_spmd::emit::COOP_SGPR_BUF];
+        let mut sgprs = [0u32; crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];
         sgprs[126] = 1;
         sgprs[8] = u32::MAX;
         let mut vgprs = vec![0u32; 256 * w];
@@ -1841,7 +1847,7 @@ fn mixed_wave_memory_yields_preserve_full_wave_values_and_partial_waves() {
                 },
             )]),
         },
-    ).split(|_| true).0;
+    ).schedule(|_| true).0;
     let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
     kd.enable_sgpr_kernarg_segment_ptr = true;
     let dims = GridDims {
@@ -1910,7 +1916,7 @@ fn static_private_loads_reserve_their_cells_and_dynamic_inactive_loads_are_maske
         for (scalar,offset) in [(8,0),(124,0xfffff0)] {
             let program=make(vec![InstFormat::SOP1(SOP1{op:I::S_MOV_B32,sdst:126,ssrc0:SourceOperand::IntegerConstant(0)}),scratch(scalar,offset)]);
             let kernel=Compiler::default().compile_cooperative_vec(&program,16,width);assert_eq!(kernel.min_private_bytes,0);
-            let mut sgprs=[0u32;crate::rdna_spmd::emit::COOP_SGPR_BUF];sgprs[126]=u32::MAX;sgprs[8]=0x7fff_ffff;
+            let mut sgprs=[0u32;crate::rdna_spmd::engine::kernel::COOP_SGPR_BUF];sgprs[126]=u32::MAX;sgprs[8]=0x7fff_ffff;
             let mut vgprs=vec![0xdead_beefu32;256*width as usize];
             run_memory_case(&program,width,&mut sgprs,&mut vgprs,0,0,0);
             assert!(vgprs[4*width as usize..8*width as usize].iter().all(|&v|v==0xdead_beef));
@@ -2279,10 +2285,10 @@ fn packed_rounding_cancellation_and_uniform_partial_writes() {
 }
 
 
-unsafe fn run_scalar_fiber(kernel: &crate::rdna_spmd::emit::CoopKernel,
+unsafe fn run_scalar_fiber(kernel: &crate::rdna_spmd::engine::kernel::CoopKernel,
     sgprs: *mut u32, vgprs: *mut u32, scratch_base: u64, lds_base: u64, spill: *mut u32,
 ) -> u64 {
-    use crate::rdna_spmd::fiber::{Fiber, KernelArgs};
+    use crate::rdna_spmd::engine::fiber::{Fiber, KernelArgs};
     let mut fiber = Fiber::new(32 << 10);
     fiber.start(KernelArgs { entry: kernel.addr(), sgprs, vgprs, scratch_base,
         scratch_stride: 0, lds_base, spill, lane_base: 0, valid_mask: 1 });
@@ -2291,16 +2297,18 @@ unsafe fn run_scalar_fiber(kernel: &crate::rdna_spmd::emit::CoopKernel,
 
 #[test]
 fn cooperative_ssa_values_survive_yield_and_accept_only_explicit_results() {
-    use crate::rdna_spmd::fiber::{Fiber, KernelArgs, FIBER_DONE};
+    use crate::rdna_spmd::engine::fiber::{Fiber, KernelArgs, FIBER_DONE};
     use crate::rdna_spmd::lift::wave::{YieldAction, Operand, Destination};
-    use crate::rdna_spmd::ir::typed::effect::{EffectOp, WaveOp};
+    use crate::rdna_spmd::ir::{EffectOp, WaveOp};
     let add = |dst, a, b| InstFormat::VOP2(VOP2 { op: I::V_ADD_NC_U32,
         src0: SourceOperand::VectorRegister(a), vsrc1: b, vdst: dst, literal_constant: None });
     let action = YieldAction::new(EffectOp::Wave(WaveOp::ReadLane),
-        vec![Operand::Source(SourceOperand::VectorRegister(31)), Operand::Source(SourceOperand::IntegerConstant(0))],
+        vec![Operand::Source(SourceOperand::VectorRegister(31)), Operand::Source(SourceOperand::IntegerConstant(0)), Operand::Source(SourceOperand::IntegerConstant(31))],
         vec![Destination::Vgpr(31)]);
     let p = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([
-        (0, ScalarBlock { pc: 0, body: vec![add(8,31,30)], term: Terminator::Yield { resume: 1, action: Box::new(action) } }),
+        (0, ScalarBlock { pc: 0, body: vec![
+            InstFormat::VOP2(VOP2 { op: I::V_ADD_NC_U32, src0: SourceOperand::LiteralConstant(100), vsrc1: 0, vdst: 31, literal_constant: None }),
+            add(8,31,30)], term: Terminator::Yield { resume: 1, action: Box::new(action) } }),
         (1, ScalarBlock { pc: 1, body: vec![add(9,8,31)], term: Terminator::Return }),
     ]) };
     for width in [0u32,1,2,4,8,16] {
@@ -2309,18 +2317,19 @@ fn cooperative_ssa_values_survive_yield_and_accept_only_explicit_results() {
         let w=width.max(1) as usize;
         let mut s=[0u32;129]; s[126]=(1<<w)-1; s[16]=0x13572468; s[124]=0xfeedbeef;
         let mut v=vec![0u32;256*w]; let mut spill=vec![0;256];
-        for lane in 0..w { v[30*w+lane]=1; v[31*w+lane]=100+lane as u32; }
+        for lane in 0..w { v[lane]=lane as u32; v[30*w+lane]=1; }
         let mut fiber=Fiber::new(32<<10);
         fiber.start(KernelArgs { entry:kernel.addr(), sgprs:s.as_mut_ptr(), vgprs:v.as_mut_ptr(),
             spill:spill.as_mut_ptr(), scratch_base:0, scratch_stride:0, lds_base:0, lane_base:0, valid_mask:s[126] });
-        assert_eq!(fiber.resume(),1);
+        let resume=fiber.resume() as usize;
+        assert!(resume < kernel.yields.len());
         for lane in 0..w { unsafe {
             assert_eq!(*fiber.yield_values().add(lane),100+lane as u32);
             *fiber.yield_values().add(lane)=200;
         } }
         assert_eq!(fiber.resume(),FIBER_DONE);
         for lane in 0..w {
-            assert_eq!((v[8*w+lane],v[9*w+lane],v[31*w+lane]),(101+lane as u32,301+lane as u32,200));
+            assert_eq!((v[8*w+lane],v[9*w+lane],v[31*w+lane]),(101+lane as u32,301+lane as u32,200),"width={width} lane={lane}");
         }
         assert_eq!((s[16],s[124]),(0x13572468,0xfeedbeef));
     }

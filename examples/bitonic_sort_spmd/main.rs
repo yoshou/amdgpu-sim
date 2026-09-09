@@ -3,8 +3,10 @@ use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{dispatch_segmented, GridDims, SegmentedProgram};
-use amdgpu_sim::rdna_translator::RDNAProgram;
+use amdgpu_sim::rdna_spmd::{
+    compile_cooperative, compile_xlane_vec_layout, decode_program, dispatch_xlane, dispatch_xlane_vec,
+    split_at_xlane, GridDims,
+};
 use getopts::Options;
 use object::*;
 use std::env;
@@ -121,6 +123,11 @@ fn print_usage(program: &str, opts: Options) {
     print!("{}", opts.usage(&brief));
 }
 
+enum Kernel {
+    Scalar(amdgpu_sim::rdna_spmd::CoopKernel),
+    Vec(amdgpu_sim::rdna_spmd::CoopVecKernel),
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let program = args[0].clone();
@@ -138,7 +145,7 @@ fn main() -> Result<()> {
         "2**l will be the length of the array to be sorted.",
         "LEN",
     );
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (unused: segmented path)", "W");
+    opts.optopt("", "vec_width", "SPMD work-item packing width W (0: scalar lanes)", "W");
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
@@ -291,9 +298,14 @@ fn main() -> Result<()> {
             let kernel_desc = decode_kernel_desc(&mem[kernel_addr..(kernel_addr + 64)]);
             let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
             let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
-            let program = RDNAProgram::new(entry_address, &mem);
-            let segmented_program =
-                SegmentedProgram::compile(&program, num_vgprs).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let program = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let (split, xlane) = split_at_xlane(&program);
+            let vec_width = matches
+                .opt_str("vec_width")
+                .map(|s| s.parse::<u32>().unwrap())
+                .unwrap_or(0);
+            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16));
+            let mut kernels = std::collections::BTreeMap::new();
 
             for i in 0..steps {
                 for j in 0..(i + 1) {
@@ -342,16 +354,37 @@ fn main() -> Result<()> {
                         Some(s) => s.parse::<usize>().unwrap().max(1),
                         None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
                     };
-                    dispatch_segmented(
-                        &segmented_program,
-                        &kernel_desc,
-                        kernarg_ptr,
-                        aql_packet_addr,
-                        dims,
-                        private_segment_size as u32,
-                        num_threads,
-                    )
-                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                    if vec_width == 0 {
+                        let kernel = kernels
+                            .entry(0)
+                            .or_insert_with(|| Kernel::Scalar(compile_cooperative(&split, num_vgprs)));
+                        let Kernel::Scalar(kernel) = kernel else { unreachable!() };
+                        dispatch_xlane(
+                            kernel,
+                            &xlane,
+                            &kernel_desc,
+                            kernarg_ptr,
+                            aql_packet_addr,
+                            dims,
+                            private_segment_size as u32,
+                            num_threads,
+                        );
+                    } else {
+                        let kernel = kernels.entry(dims.wg_x).or_insert_with(|| {
+                            Kernel::Vec(compile_xlane_vec_layout(&split, &xlane, num_vgprs, vec_width, dims.wg_x))
+                        });
+                        let Kernel::Vec(kernel) = kernel else { unreachable!() };
+                        dispatch_xlane_vec(
+                            kernel,
+                            &xlane,
+                            &kernel_desc,
+                            kernarg_ptr,
+                            aql_packet_addr,
+                            dims,
+                            private_segment_size as u32,
+                            num_threads,
+                        );
+                    }
                 }
             }
         }

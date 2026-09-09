@@ -1,5 +1,5 @@
 use super::*;
-use crate::rdna_spmd::{dialect::Arguments, ir::typed::ValueId, jit};
+use crate::rdna_spmd::{dialect::Arguments, ir::ValueId, jit};
 use std::sync::Arc;
 
 struct Case { inputs: [u64; 4], result: u64, flag: u32 }

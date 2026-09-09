@@ -4,21 +4,20 @@
 //! them. Modifiers are applied by lift before/after the target operation.
 use super::{DialectRegistry, Effect, Implementation, Operation, TargetOp};
 use crate::instructions::I;
-use crate::rdna_spmd::{ir::typed::Ty, typed_codegen::Emitter};
+use crate::rdna_spmd::{ir::Ty, codegen::ops::Emitter};
 use llvm_sys::{core::*, prelude::*};
 mod scale;
 mod reduction;
 mod division;
 mod image;
 pub(in crate::rdna_spmd) mod bvh;
-pub(in crate::rdna_spmd) use scale::fold_normal;
 #[cfg(test)]
 pub(in crate::rdna_spmd) use reduction::reference as reference_reduction;
 
-const ID: u32 = 0x52444e34;
+pub(in crate::rdna_spmd) const ID: u32 = 0x52444e34;
 
 pub(super) fn register(registry: &mut DialectRegistry) -> Result<(), &'static str> {
-    registry.register(ID, 36, Operation { name: "image_sample_lz", effect: Effect::ReadGlobal,
+    registry.register(ID, 36, Operation { name: "image_sample_lz", effect: Effect::ReadGlobal { every_lane: true },
         immediates: &[(12, 3)], inputs: &[Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32,
             Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I1, Ty::F32, Ty::F32],
         outputs: vec![Ty::I32], lower: Implementation::Single(image::sample) })?;
@@ -65,7 +64,7 @@ pub(super) fn register(registry: &mut DialectRegistry) -> Result<(), &'static st
     registry.register(ID, 19, Operation { effect: Effect::Pure, immediates: &[], name: "div_fmas.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64, Ty::I1], outputs: vec![Ty::F64], lower: Implementation::Single(division::fmas_f64) })?;
     registry.register(ID, 14, Operation { effect: Effect::Pure, immediates: &[], name: "div_scale.f32", inputs: &[Ty::F32, Ty::F32, Ty::F32], outputs: vec![Ty::F32, Ty::I1], lower: Implementation::Multiple(division::scale_f32) })?;
     registry.register(ID, 15, Operation { effect: Effect::Pure, immediates: &[], name: "div_scale.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64], outputs: vec![Ty::F64, Ty::I1], lower: Implementation::Multiple(division::scale_f64) })?;
-    registry.register(ID, 37, Operation { effect: Effect::ReadGlobal, immediates: &[], name: "image_bvh64_intersect_ray", inputs: &[Ty::I32,Ty::I32,Ty::I64,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I1,Ty::I32], outputs: vec![Ty::I32;4], lower: Implementation::Multiple(bvh::lower) })?;
+    registry.register(ID, 37, Operation { effect: Effect::ReadGlobal { every_lane: false }, immediates: &[], name: "image_bvh64_intersect_ray", inputs: &[Ty::I32,Ty::I32,Ty::I64,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I1,Ty::I32], outputs: vec![Ty::I32;4], lower: Implementation::Multiple(bvh::lower) })?;
     Ok(())
 }
 

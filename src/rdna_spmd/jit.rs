@@ -19,6 +19,7 @@ pub(super) struct Module {
 pub(super) struct NativeCode {
     jit: llvm::orc2::lljit::LLVMOrcLLJITRef,
     address: u64,
+    pub(super) block_counts: Option<(String, usize)>,
 }
 // Compilation is complete before publication. Running native code does not
 // mutate the ORC session, and destruction requires exclusive ownership.
@@ -30,6 +31,16 @@ impl NativeCode {
 impl Drop for NativeCode {
     fn drop(&mut self) {
         unsafe {
+            if let Some((path, blocks)) = self.block_counts.take() {
+                let mut address = 0u64;
+                let name = CString::new("block_counts").unwrap();
+                let error = llvm::orc2::lljit::LLVMOrcLLJITLookup(self.jit, &mut address, name.as_ptr());
+                if error.is_null() && address != 0 {
+                    let counts = std::slice::from_raw_parts(address as *const u64, blocks);
+                    let text: String = counts.iter().enumerate().map(|(i, c)| format!("{i} {c}\n")).collect();
+                    std::fs::write(format!("{path}.counts"), text).unwrap();
+                } else if !error.is_null() { llvm::error::LLVMConsumeError(error); }
+            }
             let error = llvm::orc2::lljit::LLVMOrcDisposeLLJIT(self.jit);
             if !error.is_null() { llvm::error::LLVMConsumeError(error); }
         }
@@ -128,13 +139,28 @@ impl Module {
         LLVMDisposeMessage(triple);
         LLVMDisposeMessage(cpu);
         LLVMDisposeMessage(host_features);
+        if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_LLVM") {
+            static INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let index = INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::fs::create_dir_all(&dir).unwrap();
+            let filename = CString::new(format!("{dir}/{index:04}-before.ll")).unwrap();
+            let mut message = std::ptr::null_mut();
+            LLVMPrintModuleToFile(self.module, filename.as_ptr(), &mut message);
+        }
         let optimized = OptimizedModule { module: self, machine };
         let options = llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
         let error = llvm::transforms::pass_builder::LLVMRunPasses(
-            optimized.module.module, b"default<O3>\0".as_ptr().cast(), machine, options,
+            optimized.module.module, if std::env::var("AMDGPU_SIM_OPT").map_or(false, |v| v == "0") { b"default<O0>\0".as_ptr().cast() } else { b"default<O3>\0".as_ptr().cast() }, machine, options,
         );
         llvm::transforms::pass_builder::LLVMDisposePassBuilderOptions(options);
         check(error, "optimization");
+        if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_LLVM") {
+            static INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let index = INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let filename = CString::new(format!("{dir}/{index:04}-after.ll")).unwrap();
+            let mut message = std::ptr::null_mut();
+            LLVMPrintModuleToFile(optimized.module.module, filename.as_ptr(), &mut message);
+        }
 
         optimized
     }
@@ -158,12 +184,12 @@ impl OptimizedModule {
         llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(builder, machine);
         let mut jit = std::ptr::null_mut();
         check(llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, builder), "creation");
-        let mut native = NativeCode { jit, address: 0 };
+        let mut native = NativeCode { jit, address: 0, block_counts: None };
         let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
         // Bind context-switch entrypoints to this host's FiberCtx ABI. A stale
         // separately built dylib must not supply a different context layout.
         let mut symbols = [
-            (&b"amdgpu_sim_fiber_yield_values\0"[..], super::fiber::amdgpu_sim_fiber_yield_values as *const () as u64),
+            (&b"amdgpu_sim_fiber_yield_values\0"[..], super::engine::fiber::amdgpu_sim_fiber_yield_values as *const () as u64),
         ].map(|(name, address)| llvm::orc2::LLVMOrcCSymbolMapPair {
             Name: llvm::orc2::lljit::LLVMOrcLLJITMangleAndIntern(jit, name.as_ptr().cast()),
             Sym: llvm::orc2::LLVMJITEvaluatedSymbol {
@@ -199,6 +225,24 @@ impl OptimizedModule {
         check(llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(jit, dylib, module), "module registration");
         let symbol = CString::new(symbol).unwrap();
         check(llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut native.address, symbol.as_ptr()), "kernel lookup");
+        if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_CODE") {
+            use std::io::{Read, Seek, Write};
+            let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+            for line in maps.lines() {
+                let range = line.split_whitespace().next().unwrap();
+                let (lo, hi) = range.split_once('-').unwrap();
+                let (lo, hi) = (u64::from_str_radix(lo, 16).unwrap(), u64::from_str_radix(hi, 16).unwrap());
+                if native.address < lo || native.address >= hi { continue; }
+                let mut bytes = vec![0u8; (hi - lo) as usize];
+                let mut mem = std::fs::File::open("/proc/self/mem").unwrap();
+                mem.seek(std::io::SeekFrom::Start(lo)).unwrap();
+                mem.read_exact(&mut bytes).unwrap();
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(format!("{dir}/{lo:x}-{hi:x}.bin"), &bytes).unwrap();
+                let mut index = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/index.txt")).unwrap();
+                writeln!(index, "{} {:x} {lo:x} {hi:x}", symbol.to_string_lossy(), native.address).unwrap();
+            }
+        }
         native
     }
 }

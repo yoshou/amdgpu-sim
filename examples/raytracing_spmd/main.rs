@@ -3,7 +3,6 @@ use yaml_rust::yaml::*;
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_spmd::*;
-use amdgpu_sim::rdna_translator::RDNAProgram;
 use getopts::Options;
 use object::*;
 use png::*;
@@ -343,8 +342,7 @@ fn main() -> Result<()> {
                 let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
                 let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
 
-                let program = RDNAProgram::new(entry_address, &mem);
-                let scalar = build_scalar_program(&program);
+                let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
 
                 let dims = GridDims {
                     num_wg_x: grid_dim[0],
@@ -368,7 +366,7 @@ fn main() -> Result<()> {
                     None => default_width(),
                 };
                 if vec_w > 0 {
-                    let kernel = compile_program_vec(&scalar, num_vgprs, vec_w);
+                    let kernel = compile_program_vec_layout(&scalar, num_vgprs, vec_w, block_dim[0]);
                     let start = Instant::now();
                     dispatch_parallel_vec(
                         &kernel, &kernel_desc, kernarg_ptr, aql_packet_addr, dims,

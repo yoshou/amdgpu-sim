@@ -1,6 +1,6 @@
 //! Memory decoding and address semantics; no LLVM or execution-width knowledge.
-use super::super::ir::typed::{effect::*, *};
-use super::{input, Input};
+use super::super::ir::{*};
+use super::input;
 use crate::{
     instructions::I,
     rdna_instructions::{InstFormat, SourceOperand},
@@ -66,19 +66,6 @@ impl Memory {
             _ => self.data + word,
         }
     }
-    /// Static private cells can be read speculatively once the dispatcher has
-    /// allocated this many bytes for every packet lane. Dynamic addresses keep
-    /// their EXEC mask; they do not participate in this allocation guarantee.
-    pub fn private_load_end(&self) -> Option<u32> {
-        if self.op != MemoryOp::Load(MemSize::B32) || self.semantics.volatile {
-            return None;
-        }
-        match self.address {
-            Address::Scratch { scalar:None, vector:None, offset } if offset>=0 =>
-                Some(offset as u32+self.words*4),
-            _=>None,
-        }
-    }
     pub fn reads(&self) -> Vec<u32> {
         let mut regs = vec![];
         match self.address {
@@ -109,19 +96,6 @@ impl Memory {
     }
     pub fn stores(&self) -> bool {
         matches!(self.op, MemoryOp::Store(_))
-    }
-    pub fn writes(&self) -> Vec<u32> {
-        if self.scalar() || !self.returns {
-            vec![]
-        } else {
-            (self.dest..self.dest + self.words).collect()
-        }
-    }
-    pub fn size(&self) -> MemSize {
-        match self.op {
-            MemoryOp::Load(s) | MemoryOp::Store(s) => s,
-            _ => MemSize::B32,
-        }
     }
 }
 fn sext(v: u32) -> i64 {
@@ -348,40 +322,17 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
     })
 }
 
-#[derive(Clone, Debug)]
-pub(in crate::rdna_spmd) enum Parameter {
-    Register(Input),
-    Exec,
-    ScratchBase,
-    ScratchSize,
-}
-/// Address expressions and word accesses share the function's value namespace.
-/// The original contiguous groups are retained for pairs/transpose selection.
-#[derive(Clone)]
-pub(in crate::rdna_spmd) struct Plan {
-    pub memory: Memory,
-    pub parameters: Vec<(Parameter, ValueId)>,
-    pub core: std::ops::Range<usize>,
-    pub end: usize,
-    pub pairs: Vec<(ValueId, ValueId)>,
-    pub base: ValueId,
-    pub address: ValueId,
-    pub mask: ValueId,
-    pub effects: Vec<usize>,
-    pub scalar_results: Vec<(ValueId,ValueId)>,
-    pub flat: Option<(std::ops::Range<usize>, ValueId, ValueId, ValueId)>,
-}
 impl Memory {
     pub(super) fn lift(
         &self,
-        f: &mut cfg::Func,
-        block: &mut cfg::Block,
-        words: &mut super::state::Words,
-        views: &mut super::state::Views,
+        f: &mut Func,
+        block: &mut Block,
+        words: &mut super::regs::Words,
+        views: &mut super::regs::Views,
         provenance: &mut u64,
-    ) -> Plan {
-        use cfg::Inst;
-        let mut operands = super::state::Operands::default();
+    ) {
+        use crate::rdna_spmd::ir::Inst;
+        let mut operands = super::regs::Operands::default();
         let mut reg = |source: SourceOperand, ty| operands.read(
             &input(source, ty), self.scalar(), None, f, block, words, views,
         );
@@ -444,16 +395,12 @@ impl Memory {
         } else {
             vec![]
         };
-        let mut parameters: Vec<_> = operands.bindings.into_iter()
-            .map(|(input, id)| (Parameter::Register(input), id)).collect();
         let mut core = operands.core;
         let mask = if self.scalar() {
-            super::state::core(f,&mut core,Ty::I1,Op::Const(Ty::I1,1))
+            super::regs::core(f,&mut core,Ty::I1,Op::Const(Ty::I1,1))
         } else {
-            let exec=words[&super::state::Word::Mask(126)];
-            let mask=super::state::core(f,&mut core,Ty::I1,Op::Convert(Cvt::Bitcast,Ty::I1,exec));
-            parameters.push((Parameter::Exec,mask));
-            mask
+            let exec=words[&super::regs::Word::Mask(126)];
+            super::regs::core(f,&mut core,Ty::I1,Op::Convert(Cvt::Bitcast,Ty::I1,exec))
         };
         let mut push = |t, op| {
             let value = f.value(t);
@@ -485,19 +432,12 @@ impl Memory {
             ),
         );
         let address = push(ty, Op::Int(IntOp::Add, base, off));
-        let start = block.insts.len();
         block.insts.extend(core);
-        let end = block.insts.len();
         let flat = if matches!(self.address, Address::Flat { .. }) {
             let sb = f.value(Ty::I64);
             let size = f.value(Ty::I64);
-            for (param, id) in [(Parameter::ScratchBase, sb), (Parameter::ScratchSize, size)] {
-                block.insts.push(Inst::Core { value: id, ty: Ty::I64,
-                    op: Op::Env(match param { Parameter::ScratchBase => super::super::ir::typed::Env::ScratchBase,
-                        Parameter::ScratchSize => super::super::ir::typed::Env::ScratchSize, _ => unreachable!() }) });
-                parameters.push((param, id));
-            }
-            let start = block.insts.len();
+            block.insts.push(Inst::Core { value: sb, ty: Ty::I64, op: Op::Env(super::super::ir::Env::ScratchBase) });
+            block.insts.push(Inst::Core { value: size, ty: Ty::I64, op: Op::Env(super::super::ir::Env::ScratchSize) });
             let mut push = |t, op| {
                 let value = f.value(t);
                 block.insts.push(Inst::Core { value, ty: t, op });
@@ -515,16 +455,17 @@ impl Memory {
             let no = push(Ty::I1, Op::Int(IntOp::And, mask, outside));
             let off = push(Ty::I64, Op::Int(IntOp::Sub, address, sb));
             let private = push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, off));
-            Some((start..block.insts.len(), inside, private, (yes, no)))
+            Some((inside, private, (yes, no)))
         } else {
             None
         };
-        let mut effects = vec![];
-        let mut scalar_results = vec![];
+        let instruction = *provenance << 8;
+        *provenance += 1;
+        let mut sub = 0u64;
+        let mut next_provenance = || { let id = instruction | sub; sub += 1; id };
         if self.op == MemoryOp::Fence {
-            effects.push(block.insts.len());
             block.insts.push(Inst::Effect {
-                provenance: *provenance,
+                provenance: next_provenance(),
                 op: EffectOp::Memory {
                     space: self.space(),
                     op: self.op,
@@ -533,7 +474,6 @@ impl Memory {
                 inputs: vec![],
                 outputs: vec![],
             });
-            *provenance += 1;
         }
         for k in 0..self.words {
             let a = if self.word_offset(k) == 0 {
@@ -557,15 +497,14 @@ impl Memory {
             if !data.is_empty() {
                 inputs.push(data[k as usize]);
             }
-            inputs.push(flat.as_ref().map_or(mask, |f| f.3 .1));
+            inputs.push(flat.as_ref().map_or(mask, |f| f.2 .1));
             let outputs = if self.stores() {
                 vec![]
             } else {
                 vec![(f.value(Ty::I32), Ty::I32)]
             };
-            effects.push(block.insts.len());
             block.insts.push(Inst::Effect {
-                provenance: *provenance,
+                provenance: next_provenance(),
                 op: EffectOp::Memory {
                     space: self.space(),
                     op: self.op,
@@ -574,9 +513,8 @@ impl Memory {
                 inputs,
                 outputs: outputs.clone(),
             });
-            *provenance += 1;
             let mut result = outputs.first().map(|o| o.0);
-            if let Some((_, inside, private, (yes, _))) = &flat {
+            if let Some((inside, private, (yes, _))) = &flat {
                 let a = if k == 0 {
                     *private
                 } else {
@@ -605,7 +543,7 @@ impl Memory {
                     vec![(f.value(Ty::I32), Ty::I32)]
                 };
                 block.insts.push(Inst::Effect {
-                    provenance: *provenance,
+                    provenance: next_provenance(),
                     op: EffectOp::Memory {
                         space: Space::Scratch,
                         op: self.op,
@@ -614,7 +552,6 @@ impl Memory {
                     inputs,
                     outputs: outputs.clone(),
                 });
-                *provenance += 1;
                 if let Some(global) = result {
                     let merged = f.value(Ty::I32);
                     block.insts.push(Inst::Core {
@@ -627,39 +564,23 @@ impl Memory {
             }
             if self.returns {
                 let result = result.unwrap();
-                let mut architectural=result;
-                let word = if self.scalar() { super::state::Word::scalar(self.dest + k) }
-                    else { Some(super::state::Word::Vgpr(self.dest + k)) };
+                let word = if self.scalar() { super::regs::Word::scalar(self.dest + k) }
+                    else { Some(super::regs::Word::Vgpr(self.dest + k)) };
                 if let Some(word) = word {
-                    let stored = if matches!(word,super::state::Word::Mask(_)) {
-                        super::state::project(f,&mut block.insts,result)
+                    let stored = if matches!(word,super::regs::Word::Mask(_)) {
+                        super::regs::project(f,&mut block.insts,result)
                     } else if self.scalar() { result } else {
                         let stored = f.value(Ty::I32);
                         block.insts.push(Inst::Core { value: stored, ty: Ty::I32,
                             op: Op::Select(mask, result, words[&word]) });
                         stored
                     };
-                    let stored=if word==super::state::Word::Mask(126) {super::state::valid_exec(f,&mut block.insts,stored)} else {stored};
-                    architectural=stored;
+                    let stored=if word==super::regs::Word::Mask(126) {super::regs::valid_exec(f,&mut block.insts,stored)} else {stored};
                     words.insert(word, stored);
                 } else if self.dest + k != 124 {
                     panic!("invalid scalar memory destination: {}", self.dest + k);
                 }
-                if self.scalar() {scalar_results.push((result,architectural));}
             }
-        }
-        Plan {
-            memory: self.clone(),
-            parameters,
-            core: start..end,
-            end: block.insts.len(),
-            pairs: operands.pairs,
-            base,
-            address,
-            mask,
-            effects,
-            scalar_results,
-            flat: flat.map(|(range, inside, private, _)| (range, inside, private, mask)),
         }
     }
 }

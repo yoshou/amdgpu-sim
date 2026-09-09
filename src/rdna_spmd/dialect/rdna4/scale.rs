@@ -5,31 +5,6 @@
 use super::*;
 use llvm_sys::{LLVMIntPredicate::*, LLVMTypeKind};
 
-/// Apply the existing normal-power proof before native code generation.
-/// The replacement is ordinary typed SSA; no emitter mode flag is needed.
-pub(in crate::rdna_spmd) fn fold_normal(
-    f: &mut crate::rdna_spmd::ir::typed::cfg::Func,
-    inst: crate::rdna_spmd::ir::typed::cfg::Inst,
-    registry: &DialectRegistry,
-) -> Vec<crate::rdna_spmd::ir::typed::cfg::Inst> {
-    use crate::rdna_spmd::ir::typed::{cfg::Inst, *};
-    use crate::rdna_spmd::dialect::Arguments;
-    let target = registry.lookup(ID, "ldexp.f64").unwrap();
-    let Inst::Target { op, args: Arguments::Binary([x, exp]), ref outputs, .. } = inst else { return vec![inst]; };
-    if op != target { return vec![inst]; }
-    let result = outputs[0].0;
-    let mut out = Vec::new();
-    let mut push = |ty, op| { let value = f.value(ty); out.push(Inst::Core { value, ty, op }); value };
-    let exp = push(Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, exp));
-    let bias = push(Ty::I64, Op::Const(Ty::I64, 1023));
-    let exp = push(Ty::I64, Op::Int(IntOp::Add, exp, bias));
-    let shift = push(Ty::I64, Op::Const(Ty::I64, 52));
-    let bits = push(Ty::I64, Op::Int(IntOp::Shl, exp, shift));
-    let power = push(Ty::F64, Op::Convert(Cvt::Bitcast, Ty::F64, bits));
-    out.push(Inst::Core { value: result, ty: Ty::F64, op: Op::Float(FloatOp::Mul, x, power) });
-    out
-}
-
 pub(super) unsafe fn f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { scale(e, Ty::F32, a[0], a[1]) }
 pub(super) unsafe fn f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { scale(e, Ty::F64, a[0], a[1]) }
 

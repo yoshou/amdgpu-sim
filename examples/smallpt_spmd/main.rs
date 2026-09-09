@@ -4,7 +4,6 @@ use amdgpu_sim::buffer::*;
 use amdgpu_sim::gcn_processor::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_spmd::*;
-use amdgpu_sim::rdna_translator::RDNAProgram;
 use getopts::Options;
 use object::*;
 use png::*;
@@ -579,8 +578,7 @@ fn main() -> Result<()> {
                     private_segment_size);
 
                 // Front end: decode CFG -> Scalar IR.
-                let program = RDNAProgram::new(entry_address, &mem);
-                let scalar = build_scalar_program(&program);
+                let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
                 let dims = GridDims {
                     num_wg_x: (width / 16) as u32,
                     num_wg_y: (height / 16) as u32,
@@ -604,7 +602,7 @@ fn main() -> Result<()> {
                 };
                 if vec_w > 0 {
                     let compile_start = Instant::now();
-                    let kernel = compile_program_vec(&scalar, num_vgprs, vec_w);
+                    let kernel = compile_program_vec_layout(&scalar, num_vgprs, vec_w, dims.wg_x);
                     println!("Vec(W={}) JIT compile: {} ms", vec_w, compile_start.elapsed().as_millis());
                     println!("Dispatching on {} threads...", num_threads);
                     let start = Instant::now();

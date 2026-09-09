@@ -1,5 +1,5 @@
 use super::*;
-use crate::rdna_spmd::{dialect::Arguments, ir::typed::ValueId, jit};
+use crate::rdna_spmd::{dialect::Arguments, ir::ValueId, jit};
 use std::sync::Arc;
 
 // ISA Tables 60–62: R8 resource layout, point sampler addressing and numeric
@@ -37,14 +37,14 @@ fn field(words: &mut [u32], bit: usize, count: usize, value: u32) {
 
 #[test]
 fn image_ir_requires_constant_component_and_unique_effect_provenance() {
-    use crate::rdna_spmd::ir::typed::{cfg::*, Op};
+    use crate::rdna_spmd::ir::{*, Op};
     let registry = DialectRegistry::rdna4(); let op = image_sample(&registry);
     let mut types = registry.operation(op).unwrap().inputs.to_vec(); types.push(Ty::I32);
     let args = Arguments::Sixteen(std::array::from_fn(ValueId));
     let f = Func { entry: BlockId(0), types: types.clone(), blocks: std::collections::BTreeMap::from([(BlockId(0), Block {
         params: types[..16].iter().enumerate().filter(|(k, _)| *k != 12).map(|(k, &ty)| (ValueId(k), ty)).collect(),
         insts: vec![Inst::Core { value: ValueId(12), ty: Ty::I32, op: Op::Const(Ty::I32, 3) },
-            Inst::Target { provenance: Some(7), op, args, outputs: vec![(ValueId(16), Ty::I32)] }], term: Term::Ret,
+            Inst::Target { provenance: Some(7), op, args, outputs: vec![(ValueId(16), Ty::I32)] }], term: Term::Ret(vec![]),
     })]) };
     f.clone().verify_with(&registry).unwrap();
     for case in 0..4 {

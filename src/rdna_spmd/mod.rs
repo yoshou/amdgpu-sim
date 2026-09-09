@@ -8,15 +8,14 @@
 //!
 //! Pipeline:
 //! ```text
-//! Compiler: decoded CFG -> lift -> typed SSA preparation -> SSA CFG splits
-//!           -> scalar/packet analysis -> LLVM IR -> JIT
+//! Compiler: decoded CFG -> lift -> typed SSA passes and analyses -> LLVM IR -> JIT
 //! ```
 //!
 //! It reuses the existing
 //! [`RDNAProgram`](crate::rdna_translator::RDNAProgram) CFG builder, recovers a
-//! scalar IR ([`ir`]), and JITs either a single-work-item body ([`emit`]) or a
-//! width-W SPMD body that packs W work-items per SIMD vector ([`emit_vec`]);
-//! cross-lane and barrier kernels are handled by the cooperative/segmented
+//! scalar IR ([`ir`]), lifts it to typed SSA and JITs either a single-work-item
+//! body or a width-W SPMD body that packs W work-items per SIMD vector
+//! ([`codegen`]); cross-lane and barrier kernels yield to the cooperative
 //! schedulers.
 //!
 //! # Performance notes
@@ -81,54 +80,33 @@
 //! - JIT caching, dispatch specialization, and prefetching had too little
 //!   profile contribution for the tested long-running workload.
 
-mod barrier;
 
 mod analysis;
-mod passes;
-mod cooperative;
-mod coop_xlane;
-mod dispatch;
-mod emit;
-mod emit_vec;
-mod combine;
+mod engine;
+mod pass;
 mod ir;
 mod compiler;
+mod codegen;
+mod decode;
 mod program;
 pub use program::{Program, CompilationInput};
-mod scalar_plan;
 mod lift;
-mod typed_codegen;
-mod native_state;
 mod jit;
 mod dialect;
-mod load_cluster;
-mod memory_shape;
-mod boundary;
-mod packet_plan;
-mod sqrt_idiom;
-mod mathcombine;
-mod regtype;
-mod segmented;
-mod structured;
-mod wmma;
-mod yield_values;
 
-pub mod fiber;
 
-pub use cooperative::{dispatch_cooperative, dispatch_cooperative_vec};
-pub use coop_xlane::{
-    compile_xlane_vec, dispatch_xlane, dispatch_xlane_vec, split_at_xlane, XlaneOp,
+pub use engine::cooperative::{dispatch_cooperative, dispatch_cooperative_vec};
+pub use engine::xlane::{
+    compile_xlane_vec, compile_xlane_vec_layout, dispatch_xlane, dispatch_xlane_vec, split_at_xlane, XlaneOp,
 };
-pub use dispatch::{dispatch_parallel, dispatch_parallel_vec, GridDims};
-pub use compiler::{Compiler, build_scalar_program, compile_cooperative, compile_program, compile_program_vec};
-pub use emit::{CoopKernel, ScalarKernel};
-pub use emit_vec::{CoopVecKernel, VecKernel};
-pub use ir::{split_at_barriers, Cond, ScalarBlock, ScalarProgram, Terminator};
-pub use segmented::{dispatch_segmented, SegmentedProgram};
-pub use structured::analyze_structured;
+pub use engine::dispatch::{dispatch_parallel, dispatch_parallel_vec, GridDims};
+pub use compiler::{Compiler, decode_program, compile_cooperative, compile_program, compile_program_vec, compile_program_vec_layout};
+pub use engine::kernel::{CoopKernel, CoopVecKernel, ScalarKernel, VecKernel};
+pub use decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
+pub use program::split_at_barriers;
 
 /// Recommended default width-W work-item packing (W in {1,2,4,8,16}); 0 = off
-/// (the single-lane scalar path). See [`emit_vec`] for the packed register
+/// (the single-lane scalar path). See [`codegen`] for the packed register
 /// representation.
 ///
 /// Returns **W=16 on AVX-512 hosts**, else 0 (the scalar path). Narrow vector
@@ -143,62 +121,4 @@ pub fn default_width() -> u32 {
         }
     }
     0
-}
-
-#[cfg(test)]
-mod object_predicate_tests {
-    use object::{Object, ObjectSegment};
-
-    use super::{build_scalar_program, sqrt_idiom::normal_sqrt_ldexp_sites};
-    use crate::{processor::decode_kernel_desc, rdna_translator::RDNAProgram};
-
-    fn sites_in_object(path: &str, descriptor_symbol: &str) -> Vec<(usize, usize)> {
-        let data = std::fs::read(path).unwrap();
-        let elf = object::File::parse(data.as_slice()).unwrap();
-        let mut memory = Vec::<u8>::new();
-        for segment in elf.segments() {
-            let offset = segment.address() as usize;
-            let size = segment.size() as usize;
-            memory.resize(memory.len().max(offset + size), 0);
-            let bytes = segment.data();
-            memory[offset..offset + bytes.len().min(size)]
-                .copy_from_slice(&bytes[..bytes.len().min(size)]);
-        }
-        let descriptor_address = elf
-            .symbols()
-            .find(|symbol| symbol.name() == Some(descriptor_symbol))
-            .unwrap()
-            .address() as usize;
-        let descriptor = decode_kernel_desc(&memory[descriptor_address..descriptor_address + 64]);
-        let entry = descriptor_address + descriptor.kernel_code_entry_byte_offset;
-        let decoded = RDNAProgram::new(entry, &memory);
-        normal_sqrt_ldexp_sites(&build_scalar_program(&decoded))
-    }
-
-    #[test]
-    fn detects_smallpt_sites_from_kernel_object() {
-        let sites = sites_in_object(
-            "examples/smallpt/kernel_gfx1200.o",
-            "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd",
-        );
-        // Eleven idioms, both ends of each: every square root in the object
-        // but one. The fixed-order search saw six, and the dead-code pass used
-        // to take the rest apart along with the division expansion it thought
-        // nothing read.
-        assert_eq!(sites.len(), 22);
-    }
-
-    #[test]
-    fn rejects_non_matching_kernel_objects() {
-        let raytracing = sites_in_object(
-            "examples/raytracing/kernel_gfx1200.o",
-            "_Z24ambient_occlusion_kernelP14_hiprtGeometryPh15HIP_vector_typeIiLj2EEf.kd",
-        );
-        let texture = sites_in_object(
-            "examples/texture/kernel_gfx1200.o",
-            "_Z16histogram_kernelPjjjjP13__hip_texture.kd",
-        );
-        assert!(raytracing.is_empty());
-        assert!(texture.is_empty());
-    }
 }

@@ -3,9 +3,8 @@ use yaml_rust::yaml::*;
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_spmd::{
-    build_scalar_program, compile_cooperative, dispatch_cooperative, split_at_barriers, GridDims,
+    decode_program, compile_cooperative, dispatch_cooperative, split_at_barriers, GridDims,
 };
-use amdgpu_sim::rdna_translator::RDNAProgram;
 use getopts::Options;
 use object::*;
 use std::env;
@@ -272,8 +271,7 @@ fn main() -> Result<()> {
             println!("group_segment_size (LDS): {}", group_segment_size);
 
             // Build scalar IR, split at workgroup barriers, JIT the cooperative kernel.
-            let program = RDNAProgram::new(entry_address, &mem);
-            let scalar = split_at_barriers(&build_scalar_program(&program));
+            let scalar = split_at_barriers(&decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?);
             let kernel = compile_cooperative(&scalar, num_vgprs);
 
             set_u64(&mut arg_buffer, 0, input_ptr);

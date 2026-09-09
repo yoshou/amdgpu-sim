@@ -1,7 +1,7 @@
 //! Lift wave and synchronization operations once, including their boundary values.
 use super::super::{
-    boundary::BoundaryIo,
-    ir::typed::{effect::*, Ty},
+    lift::regs::BoundaryIo,
+    ir::{*, Ty},
 };
 use crate::{
     instructions::I,
@@ -15,24 +15,7 @@ pub(crate) enum Operand {
     Exec,
 }
 impl Operand {
-    #[inline]
-    pub(crate) fn is_uniform(&self) -> bool {
-        match self {
-            Self::Source(s) => !matches!(s, SourceOperand::VectorRegister(_) | SourceOperand::PrivateBase),
-            Self::Add(a, _) => a.is_uniform(),
-            Self::Exec => false,
-        }
-    }
-    pub(in crate::rdna_spmd) fn registers(&self, io: &mut BoundaryIo) {
-        match self {
-            Self::Source(SourceOperand::ScalarRegister(r)) => io.reads.add_sgpr(*r as u32),
-            Self::Source(SourceOperand::VectorRegister(r)) => io.reads.add_vgpr(*r as u32),
-            Self::Add(a, _) => a.registers(io),
-            Self::Exec => io.reads.add_sgpr(126),
-            _ => {}
-        }
-    }
-    #[inline]
+    #[cfg(test)]
     pub fn eval(
         &self,
         lane: usize,
@@ -43,6 +26,15 @@ impl Operand {
             Self::Source(s) => read(lane, s),
             Self::Add(s, k) => s.eval(lane, read, exec).wrapping_add(*k),
             Self::Exec => exec(lane) as u32,
+        }
+    }
+    pub(in crate::rdna_spmd) fn registers(&self, io: &mut BoundaryIo) {
+        match self {
+            Self::Source(SourceOperand::ScalarRegister(r)) => io.reads.add_sgpr(*r as u32),
+            Self::Source(SourceOperand::VectorRegister(r)) => io.reads.add_vgpr(*r as u32),
+            Self::Add(a, _) => a.registers(io),
+            Self::Exec => io.reads.add_sgpr(126),
+            _ => {}
         }
     }
 }
@@ -94,66 +86,21 @@ impl YieldAction {
         }
         io
     }
-    pub(crate) fn is_wave(&self) -> bool {
-        matches!(self.op, EffectOp::Wave(_))
-    }
-    /// Register layout selected from the typed operands, outside the lane loop.
-    pub(crate) fn bpermute_registers(&self) -> Option<(u32, u32, u32, u32, bool)> {
-        let fi = match self.op {
-            EffectOp::Wave(WaveOp::Bpermute) => false,
-            EffectOp::Wave(WaveOp::BpermuteFi) => true,
-            _ => return None,
-        };
-        let (address, offset) = match &self.inputs[0] {
-            Operand::Add(a, k) => (a.as_ref(), *k),
-            a => (a, 0),
-        };
-        match (address, &self.inputs[1], &self.inputs[2], self.outputs[0]) {
-            (Operand::Source(SourceOperand::VectorRegister(a)),
-             Operand::Source(SourceOperand::VectorRegister(v)), Operand::Exec, Destination::Vgpr(d)) =>
-                Some((*a as u32, *v as u32, d, offset, fi)),
-            _ => None,
-        }
-    }
-    #[inline]
-    pub(crate) fn wmma_registers(&self) -> Option<(u32, u32, u32, u32)> {
-        if self.op != EffectOp::Wave(WaveOp::Wmma) {
-            return None;
-        }
-        let reg = |k| match self.inputs[k] {
-            Operand::Source(SourceOperand::VectorRegister(r)) => r as u32,
-            _ => unreachable!(),
-        };
-        let dst = match self.outputs[0] {
-            Destination::Vgpr(r) => r,
-            _ => unreachable!(),
-        };
-        Some((dst, reg(0), reg(4), reg(8)))
-    }
-    /// Semantic wave application. Operands are captured before any result is
-    /// written, which also covers source/destination overlap and inactive reads.
+    #[cfg(test)]
     pub(crate) fn evaluate(
         &self,
         valid: u32,
         read: impl Fn(usize, &SourceOperand) -> u32,
         exec: impl Fn(usize) -> bool,
     ) -> [[u32; 32]; 1] {
-        assert!(self.inputs.len() <= 3 && self.outputs.len() == 1);
+        assert!(self.inputs.len() <= 4 && self.outputs.len() == 1);
         let op = match self.op {
             EffectOp::Wave(op) => op,
             _ => panic!("workgroup barrier requires round state"),
         };
-        [crate::rdna_spmd::yield_values::evaluate(op, valid, |index, lane| {
+        [crate::rdna_spmd::engine::yields::evaluate(op, valid, |index, lane| {
             self.inputs[index].eval(lane, &read, &exec)
         })]
-    }
-
-    pub(crate) fn writes_lane(&self, lane: usize, valid: u32, exec: bool) -> bool {
-        valid >> lane & 1 != 0
-            && (!matches!(
-                self.op,
-                EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi)
-            ) || exec)
     }
 }
 fn src(s: SourceOperand) -> Operand {
@@ -172,12 +119,12 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
         ),
         InstFormat::VOP3(i) if matches!(i.op, I::V_READLANE_B32) => YieldAction::new(
             EffectOp::Wave(WaveOp::ReadLane),
-            vec![src(i.src0.clone()), src(i.src1.clone())],
+            vec![src(i.src0.clone()), src(i.src1.clone()), src(SourceOperand::IntegerConstant(match i.src0 { SourceOperand::VectorRegister(r) => r as u64, _ => u64::MAX }))],
             vec![Sgpr(i.vdst as u32)],
         ),
         InstFormat::VOP3(i) if matches!(i.op, I::V_WRITELANE_B32) => YieldAction::new(
             EffectOp::Wave(WaveOp::WriteLane),
-            vec![src(i.src0.clone()), src(i.src1.clone()), v(i.vdst as u32)],
+            vec![src(i.src0.clone()), src(i.src1.clone()), v(i.vdst as u32), src(SourceOperand::IntegerConstant(i.vdst as u64))],
             vec![Vgpr(i.vdst as u32)],
         ),
         InstFormat::DS(i) if matches!(i.op, I::DS_BPERMUTE_B32 | I::DS_BPERMUTE_FI_B32) => {
@@ -229,38 +176,40 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     })
 }
 
-#[derive(Clone)]
+pub(in crate::rdna_spmd) const SCHEDULED: u64 = 1 << 62;
+
+pub(in crate::rdna_spmd) fn mark_scheduled(insts: &mut [super::super::ir::Inst]) {
+    for inst in insts {
+        if let super::super::ir::Inst::Effect { provenance, op, .. } = inst {
+            if matches!(op, EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait) && *provenance & (1 << 63) == 0 { *provenance |= SCHEDULED; }
+        }
+    }
+}
+
 pub(in crate::rdna_spmd) struct Plan {
-    pub local: bool,
-    pub parameters: Vec<(super::Input, super::ValueId)>,
     pub core: std::ops::Range<usize>,
     pub end: usize,
-    pub arguments: Vec<super::ValueId>,
-    pub results: Vec<(super::ValueId, Ty)>,
     pub definitions: Vec<(Destination, super::ValueId)>,
-    pub destinations: Vec<Destination>,
-    pub layout: crate::rdna_spmd::yield_values::YieldValues,
 }
 
 impl YieldAction {
     pub(super) fn lift(
         &self,
-        f: &mut super::super::ir::typed::cfg::Func,
-        block: &mut super::super::ir::typed::cfg::Block,
-        words: &mut super::state::Words,
+        f: &mut super::super::ir::Func,
+        block: &mut super::super::ir::Block,
+        words: &mut super::regs::Words,
         provenance: &mut u64,
     ) -> Plan {
-        use super::super::ir::typed::{cfg::Inst, IntOp, Op, ValueId};
+        use super::super::ir::{Inst, IntOp, Op, ValueId};
         fn operand(
             arg: &Operand,
             ty: Ty,
-            f: &mut super::super::ir::typed::cfg::Func,
-            block: &mut super::super::ir::typed::cfg::Block,
-            words: &super::state::Words,
-            parameters: &mut Vec<(super::Input, ValueId)>,
+            f: &mut super::super::ir::Func,
+            block: &mut super::super::ir::Block,
+            words: &super::regs::Words,
         ) -> ValueId {
             if let Operand::Add(a, k) = arg {
-                let a = operand(a, ty, f, block, words, parameters);
+                let a = operand(a, ty, f, block, words);
                 let b = f.value(ty);
                 block.insts.push(Inst::Core {
                     value: b,
@@ -280,28 +229,26 @@ impl YieldAction {
                 Operand::Exec => SourceOperand::ScalarRegister(126),
                 Operand::Add(..) => unreachable!(),
             };
-            let mut operands = super::state::Operands::default();
+            let mut operands = super::regs::Operands::default();
             let value = operands.read(&super::input(source, ty), false, None,
-                f, block, words, &mut super::state::Views::new());
+                f, block, words, &mut super::regs::Views::new());
             block.insts.extend(operands.core);
-            parameters.extend(operands.bindings);
             value
         }
         let start = block.insts.len();
-        let mut parameters = vec![];
         let (args, results) = self.op.signature();
         let inputs: Vec<_> = self
             .inputs
             .iter()
             .zip(args)
-            .map(|(a, t)| operand(a, t, f, block, words, &mut parameters))
+            .map(|(a, t)| operand(a, t, f, block, words))
             .collect();
         let outputs: Vec<_> = results.into_iter().map(|t| (f.value(t), t)).collect();
         let predicate = matches!(self.op, EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi))
             .then(|| inputs[2]);
         let end = block.insts.len();
         block.insts.push(Inst::Effect {
-            provenance: *provenance,
+            provenance: *provenance << 8,
             op: self.op,
             inputs: inputs.clone(),
             outputs: outputs.clone(),
@@ -310,8 +257,8 @@ impl YieldAction {
         let mut definitions = Vec::new();
         for (&(v, t), dest) in outputs.iter().zip(&self.outputs) {
             let word = match *dest {
-                Destination::Vgpr(r) => Some(super::state::Word::Vgpr(r)),
-                Destination::Sgpr(r) => super::state::Word::scalar(r),
+                Destination::Vgpr(r) => Some(super::regs::Word::Vgpr(r)),
+                Destination::Sgpr(r) => super::regs::Word::scalar(r),
                 Destination::Scc => None,
             };
             let mut stored = v;
@@ -323,21 +270,21 @@ impl YieldAction {
             if matches!(dest, Destination::Sgpr(_)) && t == Ty::I1 {
                 let value = f.value(Ty::I32);
                 block.insts.push(Inst::Core { value, ty: Ty::I32,
-                    op: Op::Convert(super::super::ir::typed::Cvt::ZExt, Ty::I32, stored) });
+                    op: Op::Convert(super::super::ir::Cvt::ZExt, Ty::I32, stored) });
                 stored = value;
             }
             if t == Ty::F32 && word.is_some() {
                 let value = f.value(Ty::I32);
                 block.insts.push(Inst::Core { value, ty: Ty::I32,
-                    op: Op::Convert(super::super::ir::typed::Cvt::Bitcast, Ty::I32, stored) });
+                    op: Op::Convert(super::super::ir::Cvt::Bitcast, Ty::I32, stored) });
                 stored = value;
             }
             if let Some(word) = word {
-                if matches!(word,super::state::Word::Mask(_)) {
-                    stored = super::state::project(f,&mut block.insts,stored);
+                if matches!(word,super::regs::Word::Mask(_)) {
+                    stored = super::regs::project(f,&mut block.insts,stored);
                 }
-                if word==super::state::Word::Mask(126) {
-                    stored=super::state::valid_exec(f,&mut block.insts,stored);
+                if word==super::regs::Word::Mask(126) {
+                    stored=super::regs::valid_exec(f,&mut block.insts,stored);
                 }
                 words.insert(word, stored);
             } else if matches!(dest, Destination::Sgpr(r) if *r != 124) {
@@ -345,22 +292,7 @@ impl YieldAction {
             }
             definitions.push((*dest, stored));
         }
-        let layout = {
-                use crate::rdna_spmd::yield_values::Argument;
-                let mut layout = crate::rdna_spmd::yield_values::YieldValues::new(self.op);
-                layout.uniform_selector = self.op == EffectOp::Wave(WaveOp::ReadLane) && self.inputs[1].is_uniform();
-                for index in 0..inputs.len() {
-                    // WMMA has a dense native fragment ABI; WriteLane's old
-                    // value aliases its varying result and must be materialized.
-                    if self.op == EffectOp::Wave(WaveOp::Wmma)
-                        || self.op == EffectOp::Wave(WaveOp::WriteLane) && index == 2 { continue; }
-                    layout.arguments[index] = if self.inputs[index].is_uniform() { Argument::Uniform }
-                        else { Argument::Lane };
-                }
-                layout
-            };
-        Plan { local: false, parameters, core: start..end, end: block.insts.len(), arguments: inputs, results: outputs,
-            definitions, destinations: self.outputs.clone(), layout }
+        Plan { core: start..end, end: block.insts.len(), definitions }
     }
 }
 
@@ -421,7 +353,7 @@ mod tests {
         }
         let action = YieldAction::new(
             EffectOp::Wave(WaveOp::ReadLane),
-            vec![v(0), v(1)],
+            vec![v(0), v(1), src(SourceOperand::IntegerConstant(0))],
             vec![Destination::Vgpr(2)],
         );
         let result = action.evaluate(
@@ -447,6 +379,7 @@ mod tests {
                 src(SourceOperand::IntegerConstant(99)),
                 src(SourceOperand::IntegerConstant(53)),
                 v(0),
+                src(SourceOperand::IntegerConstant(0)),
             ],
             vec![Destination::Vgpr(0)],
         );
@@ -463,7 +396,7 @@ mod tests {
         }
         assert!(std::panic::catch_unwind(|| YieldAction::new(
             EffectOp::Wave(WaveOp::WriteLane),
-            vec![v(0), src(SourceOperand::IntegerConstant(0)), v(1)],
+            vec![v(0), src(SourceOperand::IntegerConstant(0)), v(1), src(SourceOperand::IntegerConstant(1))],
             vec![Destination::Vgpr(1)]
         ))
         .is_err());

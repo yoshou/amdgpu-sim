@@ -1,6 +1,6 @@
 //! Decode conservative rewrite eligibility and attach SSA observations.
 use super::*;
-use super::state::{Word, Words};
+use super::regs::Word;
 // SGPRs live at 0.., VGPRs at VGPR_BASE.. in the pass's register numbering.
 pub(super) const VGPR_BASE: u32 = 512;
 
@@ -12,10 +12,6 @@ pub(super) struct InstEffects {
     // under-approximated: a partial write (e.g. 16-bit halves) must not be
     // listed here.
     pub kills: Vec<u32>,
-    // Pure VALU instruction whose only effect is writing `kills`.
-    pub removable: bool,
-    // false: unknown effects; treated as reading every register.
-    pub known: bool,
 }
 
 impl InstEffects {
@@ -23,17 +19,13 @@ impl InstEffects {
         InstEffects {
             reads: Vec::new(),
             kills: Vec::new(),
-            removable: false,
-            known: false,
         }
     }
 
-    fn known(reads: Vec<u32>, kills: Vec<u32>, removable: bool) -> Self {
+    fn known(reads: Vec<u32>, kills: Vec<u32>) -> Self {
         InstEffects {
             reads,
             kills,
-            removable,
-            known: true,
         }
     }
 }
@@ -139,15 +131,15 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
             | I::S_CLAUSE
             | I::S_NOP
             | I::S_BRANCH
-            | I::S_ENDPGM => InstEffects::known(Vec::new(), Vec::new(), false),
+            | I::S_ENDPGM => InstEffects::known(Vec::new(), Vec::new()),
             I::S_CBRANCH_VCCZ | I::S_CBRANCH_VCCNZ => {
-                InstEffects::known(vec![106], Vec::new(), false)
+                InstEffects::known(vec![106], Vec::new())
             }
             I::S_CBRANCH_EXECZ | I::S_CBRANCH_EXECNZ => {
-                InstEffects::known(vec![126], Vec::new(), false)
+                InstEffects::known(vec![126], Vec::new())
             }
             I::S_CBRANCH_SCC0 | I::S_CBRANCH_SCC1 => {
-                InstEffects::known(Vec::new(), Vec::new(), false)
+                InstEffects::known(Vec::new(), Vec::new())
             }
             _ => InstEffects::unknown(),
         },
@@ -157,14 +149,14 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 read_src(&inst.ssrc0, 1, &mut reads);
                 let mut kills = Vec::new();
                 kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             }
             I::S_MOV_B64 => {
                 let mut reads = Vec::new();
                 read_src(&inst.ssrc0, 2, &mut reads);
                 let mut kills = Vec::new();
                 kill_sgpr(inst.sdst as u32, 2, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             }
             I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 | I::S_OR_SAVEEXEC_B32 => {
                 let mut reads = Vec::new();
@@ -173,7 +165,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 let mut kills = Vec::new();
                 kill_sgpr(inst.sdst as u32, 1, &mut kills);
                 kill_sgpr(126, 1, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             }
             _ => InstEffects::unknown(),
         },
@@ -191,7 +183,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 read_src(&inst.ssrc1, 1, &mut reads);
                 let mut kills = Vec::new();
                 kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             }
             I::S_ADD_NC_U64 => {
                 let mut reads = Vec::new();
@@ -199,7 +191,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 read_src(&inst.ssrc1, 2, &mut reads);
                 let mut kills = Vec::new();
                 kill_sgpr(inst.sdst as u32, 2, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             }
             _ => InstEffects::unknown(),
         },
@@ -208,13 +200,13 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
             let mut reads = Vec::new();
             read_src(&inst.ssrc0, 2, &mut reads);
             read_src(&inst.ssrc1, 2, &mut reads);
-            InstEffects::known(reads, Vec::new(), false)
+            InstEffects::known(reads, Vec::new())
         }
         InstFormat::SOPK(inst) => {
             // Conservatively treat the destination as read.
             let mut reads = Vec::new();
             read_sgpr(inst.sdst as u32, 2, &mut reads);
-            InstEffects::known(reads, Vec::new(), false)
+            InstEffects::known(reads, Vec::new())
         }
         InstFormat::VOPC(inst) => {
             let name = format!("{:?}", inst.op);
@@ -228,7 +220,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
             } else {
                 kill_sgpr(106, 1, &mut kills);
             }
-            InstEffects::known(reads, kills, false)
+            InstEffects::known(reads, kills)
         }
         InstFormat::VOP1(inst) => match vop1_widths(&inst.op) {
             Some((src_words, dst_words)) => {
@@ -236,7 +228,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 read_src(&inst.src0, src_words, &mut reads);
                 let mut kills = Vec::new();
                 kill_vgpr(inst.vdst as u32, dst_words, &mut kills);
-                InstEffects::known(reads, kills, true)
+                InstEffects::known(reads, kills)
             }
             None => InstEffects::unknown(),
         },
@@ -250,7 +242,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 }
                 let mut kills = Vec::new();
                 kill_vgpr(inst.vdst as u32, dst_words, &mut kills);
-                InstEffects::known(reads, kills, true)
+                InstEffects::known(reads, kills)
             }
             None => InstEffects::unknown(),
         },
@@ -263,7 +255,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 read_sgpr(126, 1, &mut reads);
                 let mut kills = Vec::new();
                 kill_sgpr(126, 1, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             } else if name.starts_with("V_CMP_") {
                 // VOP3-encoded compare: vdst is the destination SGPR.
                 let mut reads = Vec::new();
@@ -271,7 +263,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 read_src(&inst.src1, 2, &mut reads);
                 let mut kills = Vec::new();
                 kill_sgpr(inst.vdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills, false)
+                InstEffects::known(reads, kills)
             } else {
                 match vop3_arith_widths(&inst.op) {
                     Some((src_words, dst_words)) => {
@@ -288,7 +280,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                         }
                         let mut kills = Vec::new();
                         kill_vgpr(inst.vdst as u32, dst_words, &mut kills);
-                        InstEffects::known(reads, kills, true)
+                        InstEffects::known(reads, kills)
                     }
                     None => InstEffects::unknown(),
                 }
@@ -303,7 +295,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 let mut kills = Vec::new();
                 kill_vgpr(inst.vdst as u32, 2, &mut kills);
                 kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills, true)
+                InstEffects::known(reads, kills)
             }
             I::V_MAD_CO_U64_U32 => {
                 let mut reads = Vec::new();
@@ -313,7 +305,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 let mut kills = Vec::new();
                 kill_vgpr(inst.vdst as u32, 2, &mut kills);
                 kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills, true)
+                InstEffects::known(reads, kills)
             }
             I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 => {
                 let mut reads = Vec::new();
@@ -323,7 +315,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 let mut kills = Vec::new();
                 kill_vgpr(inst.vdst as u32, 1, &mut kills);
                 kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills, true)
+                InstEffects::known(reads, kills)
             }
             _ => InstEffects::unknown(),
         },
@@ -348,10 +340,10 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                 // Loads only write lanes with EXEC set, so the destination is
                 // a partial write: model it as a read, never a kill.
                 read_vgpr(inst.vdst as u32, data_words, &mut reads);
-                InstEffects::known(reads, Vec::new(), false)
+                InstEffects::known(reads, Vec::new())
             } else if name.starts_with("GLOBAL_STORE") {
                 read_vgpr(inst.vsrc as u32, data_words, &mut reads);
-                InstEffects::known(reads, Vec::new(), false)
+                InstEffects::known(reads, Vec::new())
             } else {
                 InstEffects::unknown()
             }
@@ -402,7 +394,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
                     reads.extend(ry);
                     let mut kills = kx;
                     kills.extend(ky);
-                    InstEffects::known(reads, kills, false)
+                    InstEffects::known(reads, kills)
                 }
                 _ => InstEffects::unknown(),
             }
@@ -412,117 +404,6 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
 }
 
 
-fn operand(source: SourceOperand, words: &Words) -> crate::rdna_spmd::analysis::rewrite::Operand {
-    use crate::rdna_spmd::analysis::rewrite::{Operand, ConstantEncoding::*};
-    let mut out = Operand { slot: None, scalar: false, constant: None, words: [None; 2] };
-    match source {
-        SourceOperand::VectorRegister(r) => {
-            out.slot = Some(r as u32);
-            out.words = [words.get(&Word::Vgpr(r as u32)).copied(), words.get(&Word::Vgpr(r as u32+1)).copied()];
-        },
-        SourceOperand::ScalarRegister(r) => {
-            out.slot = Some(r as u32); out.scalar = true;
-            out.words = [r as u32, r as u32+1].map(|r| Word::scalar(r).and_then(|w| words.get(&w).copied()));
-        },
-        SourceOperand::FloatConstant(v) => out.constant = Some((Float, v.to_bits())),
-        SourceOperand::IntegerConstant(v) => out.constant = Some((Integer, v)),
-        SourceOperand::LiteralConstant(v) => out.constant = Some((Literal, v as u64)),
-        SourceOperand::PrivateBase => {},
-    }
-    out
-}
-fn math(inst: &InstFormat, before: &Words) -> Option<crate::rdna_spmd::analysis::rewrite::Math> {
-    use crate::rdna_spmd::analysis::rewrite::{Math, Kind};
-    let (op, destination, scalar_destination, inputs, neg, abs, omod, cm, opsel, form) = match inst {
-        InstFormat::VOP1(i) => (i.op, i.vdst, None, [i.src0, SourceOperand::IntegerConstant(0), SourceOperand::IntegerConstant(0)], 0, 0, 0, 0, 0, 1),
-        InstFormat::VOP2(i) => (i.op, i.vdst, None, [i.src0, SourceOperand::VectorRegister(i.vsrc1), SourceOperand::IntegerConstant(0)], 0, 0, 0, 0, 0, 2),
-        InstFormat::VOP3(i) => (i.op, i.vdst, None, [i.src0, i.src1, i.src2], i.neg, i.abs, i.omod, i.cm, i.opsel, 3),
-        InstFormat::VOP3SD(i) => (i.op, i.vdst, Some(i.sdst as u32), [i.src0, i.src1, i.src2], i.neg, 0, i.omod, i.cm, 0, 4),
-        _ => return None,
-    };
-    let kind = match op {
-        I::V_RSQ_F64 => Kind::Rsq, I::V_RCP_F64 => Kind::Rcp, I::V_MUL_F64 => Kind::Mul,
-        I::V_FMA_F64 => Kind::Fma, I::V_DIV_SCALE_F64 => Kind::DivScale,
-        I::V_DIV_FMAS_F64 => Kind::DivFmas, I::V_DIV_FIXUP_F64 => Kind::DivFixup,
-        _ => return None,
-    };
-    let local_sqrt = match kind {
-        Kind::Rsq => form == 1 || (form == 3 && neg == 0 && abs == 0 && omod == 0),
-        Kind::Mul => form == 2 || (form == 3 && neg == 0 && abs == 0 && omod == 0 && cm == 0 && opsel == 0),
-        Kind::Fma => form == 3 && abs == 0 && omod == 0 && cm == 0 && opsel == 0,
-        _ => false,
-    };
-    let local_div = match kind {
-        Kind::Rcp => form == 1 || (form == 3 && neg == 0 && abs == 0 && omod == 0),
-        Kind::Mul => form == 2 || (form == 3 && neg == 0 && abs == 0 && omod == 0 && cm == 0),
-        Kind::Fma => form == 3 && omod == 0 && cm == 0 && opsel == 0,
-        Kind::DivScale => form == 4 && neg == 0 && omod == 0 && cm == 0,
-        Kind::DivFmas => form == 3 && neg == 0 && abs == 0,
-        Kind::DivFixup => form == 3,
-        _ => false,
-    };
-    let cross_sqrt = match kind { Kind::Rsq => form == 1, Kind::Mul => form == 2, Kind::Fma => form == 3, _ => false };
-    Some(Math { kind, destination: destination as u32, scalar_destination, inputs: inputs.map(|s| operand(s, before)), neg, abs,
-        local_sqrt, local_div, cross_sqrt })
-}
 pub(super) fn word(slot: u32) -> Option<Word> {
     if slot >= VGPR_BASE { Some(Word::Vgpr(slot-VGPR_BASE)) } else { Word::scalar(slot) }
-}
-pub(in crate::rdna_spmd) fn observation(inst: &InstFormat, before: &Words, after: &Words) -> crate::rdna_spmd::analysis::rewrite::Observation {
-    let effects = effects_of(inst);
-    crate::rdna_spmd::analysis::rewrite::Observation {
-        reads: effects.reads.iter().filter_map(|&r| word(r).and_then(|w| before.get(&w).copied())).collect(),
-        defined_words: after.iter().filter_map(|(word, &value)| {
-            if before[word] == value { return None; }
-            let slot = match word { Word::Vgpr(r) => VGPR_BASE+r, Word::Sgpr(r) | Word::Mask(r) => *r };
-            Some((slot, value))
-        }).collect(),
-        definitions: effects.kills.iter().filter_map(|&r| Some((r, *after.get(&word(r)?)?))).collect(),
-        replaced: effects.kills.iter().filter_map(|&r| word(r).and_then(|w| before.get(&w).copied())).collect(),
-        known: effects.known, removable: effects.removable, math: math(inst, before),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rdna_instructions::{VOP1, VOP2, VOP3, VOP3SD};
-
-    #[test]
-    fn interleaved_division_uses_the_definition_before_numerator_scaling() {
-        let v = SourceOperand::VectorRegister;
-        let one = SourceOperand::FloatConstant(1.0);
-        let scale = |dst, flag, src0, src1, src2| InstFormat::VOP3SD(VOP3SD {
-            op: I::V_DIV_SCALE_F64, vdst: dst, sdst: flag, src0, src1, src2, cm: 0, omod: 0, neg: 0,
-        });
-        let rcp = |dst, src| InstFormat::VOP1(VOP1 { op: I::V_RCP_F64, vdst: dst, src0: v(src) });
-        let alu = |op, dst, src0, src1, src2, neg| InstFormat::VOP3(VOP3 {
-            op, vdst: dst, src0, src1, src2, neg, abs: 0, cm: 0, omod: 0, opsel: 0,
-        });
-        // Two independent refinements are interleaved. Only the second one
-        // reaches a fixup here. Its first scheduling point is numerator scaling,
-        // which does not itself read the already-scaled denominator v2:v3.
-        let body = vec![
-            scale(16,124,v(14),v(14),one), scale(2,124,v(22),v(22),v(0)),
-            scale(10,106,v(0),v(22),v(0)), rcp(18,16), rcp(6,2),
-            alu(I::V_FMA_F64,32,v(16),v(18),one,1), alu(I::V_FMA_F64,8,v(2),v(6),one,1),
-            alu(I::V_FMA_F64,18,v(18),v(32),v(18),0), alu(I::V_FMA_F64,6,v(6),v(8),v(6),0),
-            alu(I::V_FMA_F64,8,v(2),v(6),one,1), alu(I::V_FMA_F64,6,v(6),v(8),v(6),0),
-            InstFormat::VOP2(VOP2 { op: I::V_MUL_F64, vdst: 8, src0: v(10), vsrc1: 6, literal_constant: None }),
-            alu(I::V_FMA_F64,2,v(2),v(8),v(10),1), alu(I::V_DIV_FMAS_F64,2,v(2),v(6),v(8),0),
-            alu(I::V_DIV_FIXUP_F64,24,v(2),v(22),v(0),0),
-        ];
-        use crate::rdna_spmd::{CompilationInput,ScalarProgram,ScalarBlock,Terminator};
-        use std::collections::BTreeMap;
-        let program=ScalarProgram {entry_pc:0,blocks:BTreeMap::from([(0,ScalarBlock {pc:0,body,term:Terminator::Return})])};
-        let mut f=program.to_ssa().function;
-        let observations:Vec<_>=f.state.sites[&0].iter().map(|s|s.rewrite.clone()).collect();
-        let expected:Vec<_>=[0,3,5,7,14].map(|i|observations[i].math.as_ref().map(|m|(m.kind,m.destination))).into();
-        let remove=crate::rdna_spmd::combine::divisions(&observations);
-        assert_eq!(remove.iter().filter(|&&v|v).count(),10);
-        f.remove_sites(0,&remove);
-        assert_eq!(f.state.sites[&0].iter().map(|s|s.rewrite.math.as_ref().map(|m|(m.kind,m.destination))).collect::<Vec<_>>(),expected);
-        f.compact();
-        f.ir.verify_with(&f.registry).unwrap();
-    }
 }

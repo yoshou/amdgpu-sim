@@ -1,6 +1,6 @@
 //! Immutable, compiler-owned target operation registry. Core IR only retains
 //! stable opaque IDs; signatures and lowering belong to the provider.
-use super::ir::typed::{Ty, ValueId};
+use super::ir::{Ty, ValueId};
 use std::collections::BTreeMap;
 use llvm_sys::prelude::LLVMValueRef;
 
@@ -43,10 +43,10 @@ pub(super) struct Operation {
     pub immediates: &'static [(usize, u64)],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Effect { Pure, ReadGlobal }
+pub(crate) enum Effect { Pure, ReadGlobal { every_lane: bool } }
 pub(super) enum Implementation {
-    Single(unsafe fn(&super::typed_codegen::Emitter, &[LLVMValueRef]) -> LLVMValueRef),
-    Multiple(unsafe fn(&super::typed_codegen::Emitter, &[LLVMValueRef]) -> Vec<LLVMValueRef>),
+    Single(unsafe fn(&super::codegen::ops::Emitter, &[LLVMValueRef]) -> LLVMValueRef),
+    Multiple(unsafe fn(&super::codegen::ops::Emitter, &[LLVMValueRef]) -> Vec<LLVMValueRef>),
 }
 impl Operation {
     pub fn verify_immediates(&self, args: Arguments, constant: impl Fn(ValueId) -> Option<u64>) -> Result<(), &'static str> {
@@ -57,7 +57,7 @@ impl Operation {
         }
         Ok(())
     }
-    pub unsafe fn emit(&self, emitter: &super::typed_codegen::Emitter, args: &[LLVMValueRef]) -> Vec<LLVMValueRef> {
+    pub unsafe fn emit(&self, emitter: &super::codegen::ops::Emitter, args: &[LLVMValueRef]) -> Vec<LLVMValueRef> {
         let values = match self.lower {
             Implementation::Single(lower) => vec![lower(emitter, args)],
             Implementation::Multiple(lower) => lower(emitter, args),
@@ -70,13 +70,21 @@ impl Operation {
 #[derive(Default)]
 pub(super) struct DialectRegistry {
     operations: BTreeMap<TargetOp, Operation>,
+    dialects: BTreeMap<u32, &'static str>,
+}
+impl TargetOp {
+    pub fn dialect(self) -> u32 { self.dialect }
 }
 impl DialectRegistry {
     pub fn rdna4() -> Self {
         let mut registry = Self::default();
+        registry.dialects.insert(rdna4::ID, "rdna4");
         rdna4::register(&mut registry).expect("RDNA4 target registration conflict");
         registry
     }
+    pub fn dialect_name(&self, dialect: u32) -> Option<&'static str> { self.dialects.get(&dialect).copied() }
+    #[cfg(test)]
+    pub fn dialect_id(&self, name: &str) -> Option<u32> { self.dialects.iter().find_map(|(&id, &n)| (n == name).then_some(id)) }
     fn register(&mut self, dialect: u32, operation: u32, spec: Operation) -> Result<TargetOp, &'static str> {
         let op = TargetOp { dialect, operation };
         if self.operations.contains_key(&op) || self.operations.iter().any(|(id, other)| id.dialect == dialect && other.name == spec.name) {
@@ -124,7 +132,7 @@ mod tests {
     #[test]
     fn target_provider_matches_reference_at_all_widths() {
         use crate::instructions::I;
-        use crate::rdna_spmd::{jit, typed_codegen::Emitter};
+        use crate::rdna_spmd::{jit, codegen::ops::Emitter};
         use llvm_sys::core::*;
         use std::sync::Arc;
         let registry = Arc::new(DialectRegistry::rdna4());

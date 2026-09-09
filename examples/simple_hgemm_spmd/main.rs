@@ -3,10 +3,9 @@ use yaml_rust::yaml::*;
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_spmd::{
-    build_scalar_program, compile_cooperative, compile_xlane_vec, dispatch_xlane,
+    decode_program, compile_cooperative, compile_xlane_vec_layout, dispatch_xlane,
     dispatch_xlane_vec, split_at_xlane, GridDims,
 };
-use amdgpu_sim::rdna_translator::RDNAProgram;
 use getopts::Options;
 use half::f16;
 use object::*;
@@ -340,8 +339,7 @@ fn main() -> Result<()> {
             // read/writelane) to coroutine yields. W=0 uses the original scalar
             // lanes; W>0 advances width-W packets between the same wave-level
             // rendezvous points.
-            let program = RDNAProgram::new(entry_address, &mem);
-            let scalar = build_scalar_program(&program);
+            let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
             let (split, xlane) = split_at_xlane(&scalar);
             let vec_width = matches
                 .opt_str("vec_width")
@@ -437,7 +435,7 @@ fn main() -> Result<()> {
                         start.elapsed().as_secs_f64() * 1000.0
                     );
                 } else {
-                    let kernel = compile_xlane_vec(&split, &xlane, num_vgprs, width);
+                    let kernel = compile_xlane_vec_layout(&split, &xlane, num_vgprs, width, block_dim[0] as u32);
                     let start = Instant::now();
                     dispatch_xlane_vec(
                         &kernel,
