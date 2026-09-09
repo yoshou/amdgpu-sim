@@ -6,7 +6,7 @@ use llvm::prelude::*;
 use llvm_sys as llvm;
 
 pub(in crate::rdna_spmd) struct Emitter {
-    pub(in crate::rdna_spmd) bvh: Option<super::super::dialect::rdna4::bvh::Storage>,
+    pub(in crate::rdna_spmd) state: Option<Box<dyn std::any::Any>>,
     registry: std::sync::Arc<super::super::dialect::DialectRegistry>,
     pub b: LLVMBuilderRef,
     module: LLVMModuleRef,
@@ -32,7 +32,7 @@ impl Emitter {
         let module = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(b)));
         Self {
             registry,
-            bvh: None,
+            state: None,
             b,
             module,
             ctx: LLVMGetModuleContext(module),
@@ -80,6 +80,7 @@ impl Emitter {
         self.width.map_or_else(|| t.into(), |w| format!("v{w}{t}"))
     }
     pub(in crate::rdna_spmd) fn width(&self) -> Option<u32> { self.width }
+    pub(in crate::rdna_spmd) fn state<T: 'static>(&self) -> Option<&T> { self.state.as_ref().and_then(|s| s.downcast_ref::<T>()) }
     pub(in crate::rdna_spmd) unsafe fn call(&self, name: &str, ret: Ty, args: &[LLVMValueRef]) -> LLVMValueRef {
         let name = std::ffi::CString::new(name).unwrap();
         let mut types: Vec<_> = args.iter().map(|&v| LLVMTypeOf(v)).collect();

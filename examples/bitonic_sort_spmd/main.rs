@@ -3,10 +3,7 @@ use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{
-    compile_cooperative, compile_xlane_vec_layout, decode_program, dispatch_xlane, dispatch_xlane_vec,
-    split_at_xlane, GridDims,
-};
+use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims, Kernel};
 use getopts::Options;
 use object::*;
 use std::env;
@@ -121,11 +118,6 @@ fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [OPTIONS]", program);
     print!("{}", opts.usage(&brief));
-}
-
-enum Kernel {
-    Scalar(amdgpu_sim::rdna_spmd::CoopKernel),
-    Vec(amdgpu_sim::rdna_spmd::CoopVecKernel),
 }
 
 fn main() -> Result<()> {
@@ -299,13 +291,12 @@ fn main() -> Result<()> {
             let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
             let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
             let program = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-            let (split, xlane) = split_at_xlane(&program);
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
                 .unwrap_or(0);
             assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16));
-            let mut kernels = std::collections::BTreeMap::new();
+            let mut kernels: std::collections::BTreeMap<u32, Kernel> = std::collections::BTreeMap::new();
 
             for i in 0..steps {
                 for j in 0..(i + 1) {
@@ -354,37 +345,19 @@ fn main() -> Result<()> {
                         Some(s) => s.parse::<usize>().unwrap().max(1),
                         None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
                     };
-                    if vec_width == 0 {
-                        let kernel = kernels
-                            .entry(0)
-                            .or_insert_with(|| Kernel::Scalar(compile_cooperative(&split, num_vgprs)));
-                        let Kernel::Scalar(kernel) = kernel else { unreachable!() };
-                        dispatch_xlane(
-                            kernel,
-                            &xlane,
-                            &kernel_desc,
-                            kernarg_ptr,
-                            aql_packet_addr,
-                            dims,
-                            private_segment_size as u32,
-                            num_threads,
-                        );
-                    } else {
-                        let kernel = kernels.entry(dims.wg_x).or_insert_with(|| {
-                            Kernel::Vec(compile_xlane_vec_layout(&split, &xlane, num_vgprs, vec_width, dims.wg_x))
-                        });
-                        let Kernel::Vec(kernel) = kernel else { unreachable!() };
-                        dispatch_xlane_vec(
-                            kernel,
-                            &xlane,
-                            &kernel_desc,
-                            kernarg_ptr,
-                            aql_packet_addr,
-                            dims,
-                            private_segment_size as u32,
-                            num_threads,
-                        );
-                    }
+                    let kernel = kernels.entry(dims.wg_x).or_insert_with(|| {
+                        compile(&program, CompileOptions { width: vec_width, num_vgprs, workgroup_x: Some(dims.wg_x) })
+                    });
+                    dispatch(
+                        kernel,
+                        &kernel_desc,
+                        kernarg_ptr,
+                        aql_packet_addr,
+                        dims,
+                        private_segment_size as u32,
+                        0,
+                        num_threads,
+                    );
                 }
             }
         }

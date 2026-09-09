@@ -6,6 +6,7 @@ pub(crate) mod active;
 pub(crate) mod pairs;
 pub(crate) mod simplify;
 pub(crate) mod dce;
+pub(crate) mod entry;
 use super::ir::{*, Op, Ty, ValueId};
 
 pub(super) trait Program {

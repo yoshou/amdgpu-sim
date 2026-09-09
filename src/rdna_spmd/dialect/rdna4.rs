@@ -15,6 +15,7 @@ pub(in crate::rdna_spmd) mod bvh;
 pub(in crate::rdna_spmd) use reduction::reference as reference_reduction;
 
 pub(in crate::rdna_spmd) const ID: u32 = 0x52444e34;
+pub(super) const REGISTERS: super::Registers = super::Registers { exec: 126, vcc: 106, null: 124, scc_slot: 128, sgprs: 128, vgprs: 256 };
 
 pub(super) fn register(registry: &mut DialectRegistry) -> Result<(), &'static str> {
     registry.register(ID, 36, Operation { name: "image_sample_lz", effect: Effect::ReadGlobal { every_lane: true },

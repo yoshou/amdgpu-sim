@@ -85,6 +85,6 @@ impl Program {
     }
 }
 
-pub fn split_at_barriers(program: &impl CompilationInput) -> Program {
+pub(crate) fn split_at_barriers(program: &impl CompilationInput) -> Program {
     program.to_ssa().schedule(|op| !matches!(op, super::ir::EffectOp::Wave(_))).0
 }

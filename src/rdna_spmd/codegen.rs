@@ -16,8 +16,6 @@ use super::lift::{Input, InputSource};
 use ops::Emitter;
 use crate::rdna_instructions::SourceOperand;
 
-pub(super) const EXEC: u32 = 126;
-pub(super) const SCC_SLOT: u32 = 128;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Abi { Whole, Cooperative }
@@ -111,7 +109,7 @@ pub(super) struct Cg<'a> {
     loaded_pairs: BTreeMap<(ValueId, ValueId), LLVMValueRef>,
     valid_mask: LLVMValueRef,
     yield_frame: LLVMValueRef,
-    bvh_scratch: LLVMValueRef,
+    sink: LLVMValueRef,
     store_sink: LLVMValueRef,
     tile_sink: LLVMValueRef,
     i1: LLVMTypeRef, i32t: LLVMTypeRef, i64t: LLVMTypeRef, f32t: LLVMTypeRef, f64t: LLVMTypeRef, ptr: LLVMTypeRef,
@@ -159,23 +157,11 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
         let sized = LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntNE, scratch_stride, LLVMConstInt(i64t, 0, 0), n);
         LLVMBuildSelect(b, sized, aperture, scratch_base, n)
     } else { scratch_base };
-    let bvh_scratch = LLVMBuildArrayAlloca(b, i32t, LLVMConstInt(i32t, 10, 0), n);
+    let sink = LLVMBuildArrayAlloca(b, i32t, LLVMConstInt(i32t, 10, 0), n);
     let mut em = Emitter::new(b, p.width, p.registry.clone());
+    em.state = p.registry.lowering_state(&em, sink);
     let mut sem = Emitter::new(b, None, p.registry.clone());
-    let bvh_packet = if p.width.is_some() {
-        let packet_i64 = LLVMArrayType2(i64t, 16);
-        let packet_f32 = LLVMArrayType2(f32t, 16);
-        let packet_i32 = LLVMArrayType2(i32t, 16);
-        let mut fields = [packet_i64; 15];
-        fields[1..11].fill(packet_f32);
-        fields[11..15].fill(packet_i32);
-        let packet_ty = LLVMStructTypeInContext(ctx, fields.as_mut_ptr(), fields.len() as u32, 0);
-        let packet = LLVMBuildAlloca(b, packet_ty, n);
-        LLVMSetAlignment(packet, 64);
-        (packet, packet_ty)
-    } else { (std::ptr::null_mut(), std::ptr::null_mut()) };
-    let storage = super::dialect::rdna4::bvh::Storage { scratch: bvh_scratch, packet: bvh_packet.0, packet_ty: bvh_packet.1 };
-    em.bvh = Some(storage); sem.bvh = Some(storage);
+    sem.state = p.registry.lowering_state(&sem, sink);
     let scratch_env = if p.width.is_some() { (scratch_base_scalar, scratch_stride) } else {
         let base = if coop { LLVMBuildAdd(b, scratch_base, LLVMBuildMul(b, scratch_stride, lane_base, n), n) } else { scratch_base };
         (scratch_base_scalar, if coop { scratch_stride } else { LLVMConstInt(i64t, 0, 0) }).0;
@@ -213,7 +199,7 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
         sgprs_p, vgprs_p, scratch_base_scalar, scratch_vec: scratch_base, lds_base, spill_base,
         spill: std::cell::RefCell::new(BTreeMap::new()),
         loaded_pairs: BTreeMap::new(),
-        valid_mask, yield_frame, bvh_scratch,
+        valid_mask, yield_frame, sink,
         store_sink: LLVMBuildAlloca(b, i64t, cstr("store_sink").as_ptr()),
         tile_sink: LLVMBuildArrayAlloca(b, i32t, LLVMConstInt(i32t, 64, 0), cstr("tile_sink").as_ptr()),
         i1, i32t, i64t, f32t, f64t, ptr,
@@ -274,6 +260,8 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
 }
 
 impl<'a> Cg<'a> {
+    fn regs(&self) -> super::dialect::Registers { self.p.registry.registers() }
+
     fn n(&self) -> *const std::ffi::c_char { b"\0".as_ptr() as *const _ }
     fn mask_words(&self) -> bool { self.p.width.is_some() && std::env::var("AMDGPU_SIM_MASK_WORDS").map_or(false, |v| v == "1") }
     fn width(&self) -> u32 { self.p.width.unwrap_or(1) }
@@ -375,24 +363,24 @@ impl<'a> Cg<'a> {
                 }
                 InputSource::Operand(SourceOperand::ScalarRegister(r)) => {
                     let r = r as u32;
-                    if r == 124 { self.ci32(0) } else {
+                    if r == self.regs().null { self.ci32(0) } else {
                         let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                         LLVMBuildLoad2(self.b, self.i32t, gep, n)
                     }
                 }
                 InputSource::MaskBit(r) => {
-                    let word = if r == EXEC && self.p.abi == Abi::Whole {
+                    let word = if r == self.regs().exec && self.p.abi == Abi::Whole {
                         if self.p.width.is_some() { self.ci32(((1u64 << self.width()) - 1) as u32) } else { self.ci32(1) }
                     } else {
                         let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                         let word = LLVMBuildLoad2(self.b, self.i32t, gep, n);
-                        if r == EXEC && coop { LLVMBuildAnd(self.b, word, self.valid_mask, n) } else { word }
+                        if r == self.regs().exec && coop { LLVMBuildAnd(self.b, word, self.valid_mask, n) } else { word }
                     };
                     self.mask_to_vec(word)
                 }
                 InputSource::Scc => {
                     if coop {
-                        let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(SCC_SLOT)].as_mut_ptr(), 1, n);
+                        let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(self.regs().scc_slot)].as_mut_ptr(), 1, n);
                         let word = LLVMBuildLoad2(self.b, self.i32t, gep, n);
                         LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, word, self.ci32(0), n)
                     } else { LLVMConstInt(self.i1, 0, 0) }
@@ -517,7 +505,7 @@ impl<'a> Cg<'a> {
                 }
                 InputSource::Operand(SourceOperand::ScalarRegister(r)) => {
                     let r = r as u32;
-                    if r == 124 { continue; }
+                    if r == self.regs().null { continue; }
                     let value = self.scalar(arg);
                     let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                     LLVMBuildStore(self.b, value, gep);
@@ -531,7 +519,7 @@ impl<'a> Cg<'a> {
                 InputSource::Scc => {
                     let value = self.scalar(arg);
                     let word = LLVMBuildZExt(self.b, value, self.i32t, n);
-                    let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(SCC_SLOT)].as_mut_ptr(), 1, n);
+                    let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(self.regs().scc_slot)].as_mut_ptr(), 1, n);
                     LLVMBuildStore(self.b, word, gep);
                 }
                 _ => {}

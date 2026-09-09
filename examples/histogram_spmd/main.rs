@@ -2,9 +2,7 @@ use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{
-    decode_program, compile_cooperative, dispatch_cooperative, split_at_barriers, GridDims,
-};
+use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
 use getopts::Options;
 use object::*;
 use std::env;
@@ -126,7 +124,7 @@ fn main() -> Result<()> {
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.optopt("", "arch", "Architecture", "ARCH");
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (unused: cooperative path)", "W");
+    opts.optopt("", "vec_width", "SPMD work-item packing width W (0: scalar lanes)", "W");
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
@@ -271,8 +269,9 @@ fn main() -> Result<()> {
             println!("group_segment_size (LDS): {}", group_segment_size);
 
             // Build scalar IR, split at workgroup barriers, JIT the cooperative kernel.
-            let scalar = split_at_barriers(&decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?);
-            let kernel = compile_cooperative(&scalar, num_vgprs);
+            let program = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let vec_width = matches.opt_str("vec_width").map(|s| s.parse::<u32>().unwrap()).unwrap_or(0);
+            let kernel = compile(&program, CompileOptions { width: vec_width, num_vgprs, workgroup_x: Some(threads_per_block as u32) });
 
             set_u64(&mut arg_buffer, 0, input_ptr);
             set_u64(&mut arg_buffer, 8, block_bins_ptr);
@@ -316,7 +315,7 @@ fn main() -> Result<()> {
                 None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
             };
 
-            dispatch_cooperative(
+            dispatch(
                 &kernel,
                 &kernel_desc,
                 kernarg_ptr,

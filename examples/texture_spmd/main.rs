@@ -352,29 +352,17 @@ fn main() -> Result<()> {
                 num_threads, vec_w
             );
             let start = Instant::now();
-            if vec_w > 0 {
-                let kernel = compile_program_vec_layout(&scalar, num_vgprs, vec_w, block_dim[0]);
-                dispatch_parallel_vec(
-                    &kernel,
-                    &kernel_desc,
-                    kernarg_ptr,
-                    aql_packet_addr,
-                    dims,
-                    private_segment_size as u32,
-                    num_threads,
-                );
-            } else {
-                let kernel = compile_program(&scalar, num_vgprs);
-                dispatch_parallel(
-                    &kernel,
-                    &kernel_desc,
-                    kernarg_ptr,
-                    aql_packet_addr,
-                    dims,
-                    private_segment_size as u32,
-                    num_threads,
-                );
-            }
+            let kernel = compile(&scalar, CompileOptions { width: vec_w, num_vgprs, workgroup_x: Some(block_dim[0]) });
+            dispatch(
+                &kernel,
+                &kernel_desc,
+                kernarg_ptr,
+                aql_packet_addr,
+                dims,
+                private_segment_size as u32,
+                0,
+                num_threads,
+            );
             println!("Elapsed time: {:.3} [ms]", start.elapsed().as_secs_f64() * 1000.0);
         }
     }

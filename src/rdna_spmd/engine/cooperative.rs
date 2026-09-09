@@ -14,31 +14,16 @@ use std::thread;
 use crate::processor::KernelDescriptor;
 
 use super::dispatch::{setup_sgprs, GridDims};
-use super::kernel::{CoopKernel, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
+use super::kernel::{COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 
-const EXEC: usize = 126;
 
 /// Run a cooperative kernel over the whole grid across `num_threads` CPU threads.
 /// Each workgroup runs entirely on one thread with its own zeroed LDS buffer of
 /// `group_segment_size` bytes.
-pub fn dispatch_cooperative(
-    kernel: &CoopKernel,
-    kd: &KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    group_segment_size: usize,
-    num_threads: usize,
-) {
-    dispatch_cooperative_vec(kernel, kd, kernarg_ptr, aql_packet_addr, dims,
-        private_segment_size, group_segment_size, num_threads);
-}
-
 /// The existing packet fiber ABI extended with workgroup LDS and typed barrier
 /// rounds. Every worker owns complete workgroups; only yield operands/results
 /// cross the packet/host boundary.
-pub fn dispatch_cooperative_vec(
+pub(crate) fn dispatch_cooperative_vec(
     kernel: &super::kernel::CoopVecKernel,
     kd: &KernelDescriptor,
     kernarg_ptr: u64,
@@ -51,6 +36,7 @@ pub fn dispatch_cooperative_vec(
     use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
     use super::super::ir::EffectOp;
     let width = kernel.width as usize;
+    let exec = kernel.registers.exec as usize;
     let ppw = 32 / width;
     let wg_size = dims.workgroup_size() as usize;
     let waves = wg_size.div_ceil(32);
@@ -105,7 +91,7 @@ pub fn dispatch_cooperative_vec(
                             private_segment_size,
                             wg_id,
                         ));
-                        sgprs[p][EXEC] = ((1u64 << valid) - 1) as u32;
+                        sgprs[p][exec] = ((1u64 << valid) - 1) as u32;
                         done[p] = valid == 0;
                         for lane in 0..valid {
                             let wi = (local + lane) as u32;

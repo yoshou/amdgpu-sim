@@ -8,15 +8,16 @@
 //!
 //! Pipeline:
 //! ```text
-//! Compiler: decoded CFG -> lift -> typed SSA passes and analyses -> LLVM IR -> JIT
+//! decode_program: shared decoder -> CFG -> lift -> typed SSA
+//! compile:        passes and analyses -> LLVM IR -> JIT (width 0 = scalar lanes, 1..16 = packets)
+//! dispatch:       independent, wave-cooperative or workgroup-cooperative scheduler
 //! ```
 //!
-//! It reuses the existing
-//! [`RDNAProgram`](crate::rdna_translator::RDNAProgram) CFG builder, recovers a
-//! scalar IR ([`ir`]), lifts it to typed SSA and JITs either a single-work-item
-//! body or a width-W SPMD body that packs W work-items per SIMD vector
-//! ([`codegen`]); cross-lane and barrier kernels yield to the cooperative
-//! schedulers.
+//! [`compile`] chooses the scheduler from the program: workgroup barriers select
+//! the workgroup scheduler, wave operations that exchange values across packets
+//! select the wave scheduler, and everything else runs as independent packets.
+//! The public surface is `decode_program`, `compile` with [`CompileOptions`], and
+//! `dispatch` with [`GridDims`]; the width is an option, not an API.
 //!
 //! # Performance notes
 //!
@@ -89,21 +90,20 @@ mod compiler;
 mod codegen;
 mod decode;
 mod program;
-pub use program::{Program, CompilationInput};
 mod lift;
 mod jit;
 mod dialect;
 
 
-pub use engine::cooperative::{dispatch_cooperative, dispatch_cooperative_vec};
-pub use engine::xlane::{
-    compile_xlane_vec, compile_xlane_vec_layout, dispatch_xlane, dispatch_xlane_vec, split_at_xlane, XlaneOp,
-};
-pub use engine::dispatch::{dispatch_parallel, dispatch_parallel_vec, GridDims};
-pub use compiler::{Compiler, decode_program, compile_cooperative, compile_program, compile_program_vec, compile_program_vec_layout};
-pub use engine::kernel::{CoopKernel, CoopVecKernel, ScalarKernel, VecKernel};
-pub use decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
-pub use program::split_at_barriers;
+pub use program::{Program, CompilationInput};
+pub use compiler::{compile, decode_program, CompileOptions, Compiler};
+pub use engine::{dispatch, dispatch::GridDims, kernel::{Kernel, Scheduler}};
+#[cfg(test)]
+pub(crate) use decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
+#[cfg(test)]
+pub(crate) use program::split_at_barriers;
+#[cfg(test)]
+pub(crate) use engine::cooperative::dispatch_cooperative_vec;
 
 /// Recommended default width-W work-item packing (W in {1,2,4,8,16}); 0 = off
 /// (the single-lane scalar path). See [`codegen`] for the packed register

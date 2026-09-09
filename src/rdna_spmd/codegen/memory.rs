@@ -192,7 +192,7 @@ impl<'a> Cg<'a> {
     unsafe fn bcast_load(&self, ptrs: LLVMValueRef, exec: LLVMValueRef, nonempty: bool, elem: LLVMTypeRef) -> LLVMValueRef {
         let p0 = LLVMBuildExtractElement(self.b, ptrs, self.ci32(0), self.n());
         let any = self.any_active(exec, nonempty);
-        let p0 = LLVMBuildSelect(self.b, any, p0, self.bvh_scratch, self.n());
+        let p0 = LLVMBuildSelect(self.b, any, p0, self.sink, self.n());
         let v = LLVMBuildLoad2(self.b, elem, p0, self.n());
         self.splat(v)
     }
@@ -202,7 +202,7 @@ impl<'a> Cg<'a> {
         for l in 0..self.width() {
             let p = LLVMBuildExtractElement(self.b, ptrs, self.ci32(l), n);
             let active = LLVMBuildExtractElement(self.b, exec, self.ci32(l), n);
-            let p = if allocated { p } else { LLVMBuildSelect(self.b, active, p, self.bvh_scratch, n) };
+            let p = if allocated { p } else { LLVMBuildSelect(self.b, active, p, self.sink, n) };
             let ld = LLVMBuildLoad2(self.b, self.i32t, p, n);
             LLVMSetAlignment(ld, 4);
             v = LLVMBuildInsertElement(self.b, v, ld, self.ci32(l), n);
@@ -383,7 +383,7 @@ impl<'a> Cg<'a> {
                 let predicated = shape != Shape::ScalarWords && !access.scalar();
                 let active = if predicated { Some(self.scalar(mask)) } else { None };
                 let guard = |cg: &Self, a: LLVMValueRef| -> LLVMValueRef {
-                    match active { Some(active) => { let dummy = LLVMBuildPtrToInt(cg.b, cg.bvh_scratch, cg.i64t, n); LLVMBuildSelect(cg.b, active, a, dummy, n) } None => a }
+                    match active { Some(active) => { let dummy = LLVMBuildPtrToInt(cg.b, cg.sink, cg.i64t, n); LLVMBuildSelect(cg.b, active, a, dummy, n) } None => a }
                 };
                 if shape == Shape::ScalarAtomic {
                     let p = LLVMBuildIntToPtr(self.b, guard(self, addr), self.ptr, n);
@@ -457,7 +457,7 @@ impl<'a> Cg<'a> {
                     let bit = LLVMBuildAnd(self.b, LLVMBuildLShr(self.b, packed_exec, self.ci32(k), n), self.ci32(1), n);
                     let active = LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bit, self.ci32(0), n);
                     let ptr = LLVMBuildExtractElement(self.b, ptrs, self.ci32(k), n);
-                    let ptr = LLVMBuildSelect(self.b, active, ptr, self.bvh_scratch, n);
+                    let ptr = LLVMBuildSelect(self.b, active, ptr, self.sink, n);
                     let value = LLVMBuildExtractElement(self.b, d, self.ci32(k), n);
                     let value = LLVMBuildSelect(self.b, active, value, self.ci32(0), n);
                     let old = LLVMBuildAtomicRMW(self.b, llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd, ptr, value, llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent, 0);

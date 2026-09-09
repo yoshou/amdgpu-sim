@@ -18,8 +18,20 @@ struct Native {
     vi1:LLVMTypeRef,vi32:LLVMTypeRef,vi64:LLVMTypeRef,vf32:LLVMTypeRef,
     bvh_packet:LLVMValueRef,bvh_packet_ty:LLVMTypeRef,
 }
+pub(in crate::rdna_spmd) unsafe fn lowering_state(e:&Emitter,sink:LLVMValueRef)->Box<dyn std::any::Any> {
+    let (packet,packet_ty)=if e.width().is_some() {
+        let ctx=e.ctx;let i32t=LLVMInt32TypeInContext(ctx);let i64t=LLVMInt64TypeInContext(ctx);let f32t=LLVMFloatTypeInContext(ctx);
+        let packet_i64=LLVMArrayType2(i64t,16);let packet_f32=LLVMArrayType2(f32t,16);let packet_i32=LLVMArrayType2(i32t,16);
+        let mut fields=[packet_i64;15];fields[1..11].fill(packet_f32);fields[11..15].fill(packet_i32);
+        let packet_ty=LLVMStructTypeInContext(ctx,fields.as_mut_ptr(),fields.len() as u32,0);
+        let packet=LLVMBuildAlloca(e.b,packet_ty,b"\0".as_ptr().cast());
+        LLVMSetAlignment(packet,64);
+        (packet,packet_ty)
+    } else {(std::ptr::null_mut(),std::ptr::null_mut())};
+    Box::new(Storage {scratch:sink,packet,packet_ty})
+}
 pub(super) unsafe fn lower(e:&Emitter,a:&[LLVMValueRef])->Vec<LLVMValueRef> {
-    let storage=e.bvh.expect("BVH lowering requires native scratch storage");
+    let storage=*e.state::<Storage>().expect("BVH lowering requires native scratch storage");
     let ctx=e.ctx;let b=e.b;let module=LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(b)));
     let i1=LLVMInt1TypeInContext(ctx);let i32t=LLVMInt32TypeInContext(ctx);let i64t=LLVMInt64TypeInContext(ctx);let f32t=LLVMFloatTypeInContext(ctx);let ptr=LLVMPointerTypeInContext(ctx,0);
     let cg=Native {b,module,ctx,w:e.width().unwrap_or(1),i1,i32t,i64t,f32t,ptr,vi1:e.ty(Ty::I1),vi32:e.ty(Ty::I32),vi64:e.ty(Ty::I64),vf32:e.ty(Ty::F32),bvh_packet:storage.packet,bvh_packet_ty:storage.packet_ty};

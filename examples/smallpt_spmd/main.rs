@@ -600,31 +600,17 @@ fn main() -> Result<()> {
                     Some(s) => s.parse::<u32>().unwrap(),
                     None => default_width(),
                 };
-                if vec_w > 0 {
-                    let compile_start = Instant::now();
-                    let kernel = compile_program_vec_layout(&scalar, num_vgprs, vec_w, dims.wg_x);
-                    println!("Vec(W={}) JIT compile: {} ms", vec_w, compile_start.elapsed().as_millis());
-                    println!("Dispatching on {} threads...", num_threads);
-                    let start = Instant::now();
-                    dispatch_parallel_vec(
-                        &kernel, &kernel_desc, kernarg_ptr, aql_packet_addr, dims,
-                        private_segment_size as u32, num_threads,
-                    );
-                    let end = start.elapsed();
-                    println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
-                } else {
-                    let compile_start = Instant::now();
-                    let kernel = compile_program(&scalar, num_vgprs);
-                    println!("Scalar JIT compile: {} ms", compile_start.elapsed().as_millis());
-                    println!("Dispatching on {} threads...", num_threads);
-                    let start = Instant::now();
-                    dispatch_parallel(
-                        &kernel, &kernel_desc, kernarg_ptr, aql_packet_addr, dims,
-                        private_segment_size as u32, num_threads,
-                    );
-                    let end = start.elapsed();
-                    println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
-                }
+                let compile_start = Instant::now();
+                let kernel = compile(&scalar, CompileOptions { width: vec_w, num_vgprs, workgroup_x: Some(dims.wg_x) });
+                println!("W={} JIT compile: {} ms", vec_w, compile_start.elapsed().as_millis());
+                println!("Dispatching on {} threads...", num_threads);
+                let start = Instant::now();
+                dispatch(
+                    &kernel, &kernel_desc, kernarg_ptr, aql_packet_addr, dims,
+                    private_segment_size as u32, 0, num_threads,
+                );
+                let end = start.elapsed();
+                println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
             } else {
                 println!("Unsupported architecture: {}", arch);
                 return Ok(());

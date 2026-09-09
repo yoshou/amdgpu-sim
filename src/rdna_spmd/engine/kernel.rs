@@ -64,6 +64,7 @@ impl VecKernel {
 /// boundaries to exchange typed operands and results with the scheduler.
 pub struct CoopVecKernel {
     pub(crate) yields: Vec<super::yields::YieldValues>,
+    pub(crate) registers: super::super::dialect::Registers,
     pub(in crate::rdna_spmd) code: super::super::jit::NativeCode,
     pub num_vgprs: usize,
     pub width: u32,
@@ -73,8 +74,9 @@ pub struct CoopVecKernel {
 }
 
 impl CoopVecKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::jit::NativeCode, yields: Vec<super::yields::YieldValues>, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>) -> Self {
-        Self { yields, code, num_vgprs, width, min_private_bytes, workgroup_x }
+    pub(in crate::rdna_spmd) fn from_code(code: super::super::jit::NativeCode, yields: Vec<super::yields::YieldValues>, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, registers: super::super::dialect::Registers) -> Self {
+        assert_eq!(registers.scc_slot as usize + 1, COOP_SGPR_BUF);
+        Self { yields, registers, code, num_vgprs, width, min_private_bytes, workgroup_x }
     }
     /// Entry address of the compiled packet kernel. It is not callable
     /// directly: the kernel yields by switching stacks, so it has to be
@@ -83,4 +85,21 @@ impl CoopVecKernel {
     pub fn addr(&self) -> u64 {
         self.code.address()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheduler { Independent, Wave, Workgroup }
+
+pub(crate) enum Code { Scalar(ScalarKernel), Packet(VecKernel), Cooperative(CoopVecKernel) }
+
+pub struct Kernel {
+    pub(crate) code: Code,
+    scheduler: Scheduler,
+    width: u32,
+}
+
+impl Kernel {
+    pub(crate) fn new(code: Code, scheduler: Scheduler, width: u32) -> Self { Self { code, scheduler, width } }
+    pub fn width(&self) -> u32 { self.width }
+    pub fn scheduler(&self) -> Scheduler { self.scheduler }
 }

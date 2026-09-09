@@ -2,10 +2,7 @@ use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{
-    compile_cooperative, compile_xlane_vec_layout, decode_program, dispatch_xlane, dispatch_xlane_vec,
-    split_at_xlane, GridDims,
-};
+use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
 use getopts::Options;
 use object::*;
 use std::env;
@@ -284,7 +281,6 @@ fn main() -> Result<()> {
 
             // Front end: decode CFG -> Scalar IR -> segmented (cross-lane) program.
             let program = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-            let (split, xlane) = split_at_xlane(&program);
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
@@ -329,35 +325,18 @@ fn main() -> Result<()> {
             };
 
             use std::time::Instant;
-            let start = if vec_width == 0 {
-                let kernel = compile_cooperative(&split, num_vgprs);
-                let start = Instant::now();
-                dispatch_xlane(
-                    &kernel,
-                    &xlane,
-                    &kernel_desc,
-                    kernarg_ptr,
-                    aql_packet_addr,
-                    dims,
-                    private_segment_size as u32,
-                    num_threads,
-                );
-                start
-            } else {
-                let kernel = compile_xlane_vec_layout(&split, &xlane, num_vgprs, vec_width, block_dim[0]);
-                let start = Instant::now();
-                dispatch_xlane_vec(
-                    &kernel,
-                    &xlane,
-                    &kernel_desc,
-                    kernarg_ptr,
-                    aql_packet_addr,
-                    dims,
-                    private_segment_size as u32,
-                    num_threads,
-                );
-                start
-            };
+            let kernel = compile(&program, CompileOptions { width: vec_width, num_vgprs, workgroup_x: Some(block_dim[0]) });
+            let start = Instant::now();
+            dispatch(
+                &kernel,
+                &kernel_desc,
+                kernarg_ptr,
+                aql_packet_addr,
+                dims,
+                private_segment_size as u32,
+                0,
+                num_threads,
+            );
             let end = start.elapsed();
             println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
         }

@@ -139,27 +139,6 @@ pub(in crate::rdna_spmd) fn lift(
         }}).chain(std::iter::once(Input {ty:Ty::I1,source:InputSource::Scc})).collect();
         LiftedFunction { registry, ir: f, parameter_inputs, revision: 0 }
 }
-pub(in crate::rdna_spmd) fn assume_dispatch_exec(parameter_inputs:&[Input],f:&mut Func) {
-    let index=parameter_inputs.iter().position(|p|matches!(p.source,InputSource::MaskBit(126))).unwrap();
-    let exec=f.blocks[&f.entry].params[index].0;
-    crate::rdna_spmd::pass::constant_queries(f,&[exec]);
-}
-/// The whole-program ABI keeps mask words within one packet. Explicit
-/// cross-lane instructions retain their separately selected scope.
-pub(in crate::rdna_spmd) fn packet_state(f:&mut Func) {
-        for block in f.blocks.values_mut() {for inst in &mut block.insts {
-            if let Inst::Effect {provenance,op,inputs,outputs}=inst {
-                if *provenance & (1u64<<63)!=0 {
-                    let op=match *op {
-                        effect::EffectOp::Wave(effect::WaveOp::Any)=>PacketOp::Any,
-                        effect::EffectOp::Wave(effect::WaveOp::Ballot)=>PacketOp::Ballot,
-                        _=>continue,
-                    };
-                    *inst=Inst::Packet {op,input:inputs[0],output:outputs[0].0};
-                }
-            }
-        }}
-    }
 fn invalidate(views: &mut BTreeMap<(Word, Ty, bool), ValueId>, writes: &[Word]) {
     views.retain(|&(r, t, _), _| {
         !(0..t.bits().div_ceil(32)).filter_map(|k| r.offset(k)).any(|r| writes.contains(&r))

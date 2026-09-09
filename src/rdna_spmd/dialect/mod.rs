@@ -67,10 +67,22 @@ impl Operation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Registers {
+    pub exec: u32,
+    pub vcc: u32,
+    pub null: u32,
+    pub scc_slot: u32,
+    pub sgprs: u32,
+    pub vgprs: u32,
+}
+
 #[derive(Default)]
 pub(super) struct DialectRegistry {
     operations: BTreeMap<TargetOp, Operation>,
     dialects: BTreeMap<u32, &'static str>,
+    registers: Registers,
+    state: Option<unsafe fn(&super::codegen::ops::Emitter, LLVMValueRef) -> Box<dyn std::any::Any>>,
 }
 impl TargetOp {
     pub fn dialect(self) -> u32 { self.dialect }
@@ -79,8 +91,14 @@ impl DialectRegistry {
     pub fn rdna4() -> Self {
         let mut registry = Self::default();
         registry.dialects.insert(rdna4::ID, "rdna4");
+        registry.registers = rdna4::REGISTERS;
+        registry.state = Some(rdna4::bvh::lowering_state);
         rdna4::register(&mut registry).expect("RDNA4 target registration conflict");
         registry
+    }
+    pub fn registers(&self) -> Registers { self.registers }
+    pub unsafe fn lowering_state(&self, emitter: &super::codegen::ops::Emitter, sink: LLVMValueRef) -> Option<Box<dyn std::any::Any>> {
+        self.state.map(|prepare| prepare(emitter, sink))
     }
     pub fn dialect_name(&self, dialect: u32) -> Option<&'static str> { self.dialects.get(&dialect).copied() }
     #[cfg(test)]

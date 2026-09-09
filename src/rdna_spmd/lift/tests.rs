@@ -1106,7 +1106,7 @@ fn typed_lds_load_redefines_a_typed_input() {
 fn typed_lds_barrier_rounds_and_first_wave_execute_at_all_widths() {
     use crate::rdna_instructions::{DS, SOP2, SOPP};
     use crate::rdna_spmd::{
-        dispatch_cooperative, dispatch_cooperative_vec, split_at_barriers, GridDims,
+        dispatch_cooperative_vec, split_at_barriers, GridDims,
     };
     for count in [40u32, 64] {
         let mut body = vec![];
@@ -1234,7 +1234,7 @@ fn typed_lds_barrier_rounds_and_first_wave_execute_at_all_widths() {
                 let mut output = vec![u32::MAX; count as usize * 2];
                 if width == 0 {
                     let kernel = Compiler::default().compile_cooperative(&program, 16);
-                    dispatch_cooperative(
+                    dispatch_cooperative_vec(
                         &kernel,
                         &kd,
                         output.as_mut_ptr() as u64,
@@ -1745,7 +1745,7 @@ fn typed_memory_subwords_flat_aperture_and_atomic_returns() {
 #[test]
 fn mixed_wave_memory_yields_preserve_full_wave_values_and_partial_waves() {
     use crate::rdna_instructions::{DS, VOP1, VOP3, VOPC};
-    use crate::rdna_spmd::{dispatch_cooperative, dispatch_cooperative_vec, GridDims};
+    use crate::rdna_spmd::{dispatch_cooperative_vec, GridDims};
     let mov = |src0, vdst| {
         InstFormat::VOP1(VOP1 {
             op: I::V_MOV_B32,
@@ -1862,7 +1862,7 @@ fn mixed_wave_memory_yields_preserve_full_wave_values_and_partial_waves() {
         let mut output = vec![u32::MAX; count as usize * 4];
         if width == 0 {
             let kernel = Compiler::default().compile_cooperative(&program, 16);
-            dispatch_cooperative(&kernel, &kd, output.as_mut_ptr() as u64, 0, dims, 0, 0, 2);
+            dispatch_cooperative_vec(&kernel, &kd, output.as_mut_ptr() as u64, 0, dims, 0, 0, 2);
         } else {
             let kernel = Compiler::default().compile_cooperative_vec(&program, 16, width);
             dispatch_cooperative_vec(&kernel, &kd, output.as_mut_ptr() as u64, 0, dims, 0, 0, 2);

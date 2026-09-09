@@ -2,10 +2,7 @@ use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{
-    decode_program, compile_cooperative, compile_xlane_vec_layout, dispatch_xlane,
-    dispatch_xlane_vec, split_at_xlane, GridDims,
-};
+use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
 use getopts::Options;
 use half::f16;
 use object::*;
@@ -340,7 +337,6 @@ fn main() -> Result<()> {
             // lanes; W>0 advances width-W packets between the same wave-level
             // rendezvous points.
             let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-            let (split, xlane) = split_at_xlane(&scalar);
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
@@ -417,41 +413,22 @@ fn main() -> Result<()> {
             for width in widths {
                 matrix_d.fill(f16::NAN);
                 println!("vec_width={}", width);
-                if width == 0 {
-                    let kernel = compile_cooperative(&split, num_vgprs);
-                    let start = Instant::now();
-                    dispatch_xlane(
-                        &kernel,
-                        &xlane,
-                        &kernel_desc,
-                        kernarg_ptr,
-                        aql_packet_addr,
-                        dims,
-                        private_segment_size as u32,
-                        num_threads,
-                    );
-                    println!(
-                        "Elapsed time: {:.3} [ms]",
-                        start.elapsed().as_secs_f64() * 1000.0
-                    );
-                } else {
-                    let kernel = compile_xlane_vec_layout(&split, &xlane, num_vgprs, width, block_dim[0] as u32);
-                    let start = Instant::now();
-                    dispatch_xlane_vec(
-                        &kernel,
-                        &xlane,
-                        &kernel_desc,
-                        kernarg_ptr,
-                        aql_packet_addr,
-                        dims,
-                        private_segment_size as u32,
-                        num_threads,
-                    );
-                    println!(
-                        "Elapsed time: {:.3} [ms]",
-                        start.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
+                let kernel = compile(&scalar, CompileOptions { width, num_vgprs, workgroup_x: Some(block_dim[0] as u32) });
+                let start = Instant::now();
+                dispatch(
+                    &kernel,
+                    &kernel_desc,
+                    kernarg_ptr,
+                    aql_packet_addr,
+                    dims,
+                    private_segment_size as u32,
+                    0,
+                    num_threads,
+                );
+                println!(
+                    "Elapsed time: {:.3} [ms]",
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
 
                 if verify_widths {
                     let actual_bits: Vec<u16> = matrix_d.iter().map(|value| value.to_bits()).collect();

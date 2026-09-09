@@ -28,19 +28,18 @@ use crate::processor::KernelDescriptor;
 use crate::rdna_instructions::SourceOperand;
 
 use super::dispatch::{setup_sgprs, GridDims};
-use super::kernel::{CoopKernel, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
+use super::kernel::{COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 #[cfg(test)]
 use super::super::lift::regs::RegSet;
 use super::kernel::CoopVecKernel;
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 
 const WAVE: usize = 32;
-const EXEC: usize = 126;
 
 /// The wave-level effect applied at a yield, keyed by the resume value the
 /// fiber reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct XlaneOp(pub(in crate::rdna_spmd) super::super::ir::EffectOp);
+pub(crate) struct XlaneOp(pub(in crate::rdna_spmd) super::super::ir::EffectOp);
 #[cfg(test)]
 use super::super::lift::wave::{Destination, YieldAction};
 #[cfg(test)]
@@ -48,56 +47,17 @@ use super::super::lift::wave::Operand;
 #[cfg(test)]
 use super::super::ir::{EffectOp, WaveOp};
 
-pub fn split_at_xlane(program: &impl super::super::CompilationInput) -> (super::super::Program, BTreeMap<usize, XlaneOp>) {
+pub(crate) fn split_at_xlane(program: &impl super::super::CompilationInput) -> (super::super::Program, BTreeMap<usize, XlaneOp>) {
     let (program, ops) = program.to_ssa().schedule(|op| matches!(op, super::super::ir::EffectOp::Wave(w) if *w != super::super::ir::WaveOp::WriteLane));
     (program, ops.into_iter().map(|(key, op)| (key, XlaneOp(op))).collect())
-}
-
-/// Compile a split cross-lane program into a width-W packet kernel, passing
-/// the boundary IO derived from the program's typed yields.
-pub fn compile_xlane_vec(
-    program: &impl super::super::CompilationInput,
-    _xlane: &BTreeMap<usize, XlaneOp>,
-    num_vgprs: usize,
-    width: u32,
-) -> CoopVecKernel {
-    super::super::compiler::Compiler::default().compile_cooperative_vec(program, num_vgprs, width)
-}
-
-pub fn compile_xlane_vec_layout(
-    program: &impl super::super::CompilationInput,
-    _xlane: &BTreeMap<usize, XlaneOp>,
-    num_vgprs: usize,
-    width: u32,
-    workgroup_x: u32,
-) -> CoopVecKernel {
-    super::super::compiler::Compiler::default().compile_cooperative_vec_layout(program, num_vgprs, width, Some(workgroup_x))
-}
-
-/// Run a cross-lane cooperative kernel over the whole grid, one 32-lane wavefront
-/// at a time. `xlane` maps each yield's resume pc to the wave-level op to apply
-/// there (built by [`split_at_xlane`]).
-pub fn dispatch_xlane(
-    kernel: &CoopKernel,
-    xlane: &BTreeMap<usize, XlaneOp>,
-    kd: &KernelDescriptor,
-    kernarg_ptr: u64,
-    aql_packet_addr: u64,
-    dims: GridDims,
-    private_segment_size: u32,
-    num_threads: usize,
-) {
-    dispatch_xlane_vec(kernel, xlane, kd, kernarg_ptr, aql_packet_addr, dims,
-        private_segment_size, num_threads);
 }
 
 /// Packed counterpart of [`dispatch_xlane`]. Each CPU worker owns complete
 /// 32-lane waves; it advances all `32 / W` packets to a lifted cross-lane
 /// boundary, applies the operation once to their typed argument/result frames,
 /// and resumes the packets. No packet of a wave is scheduled on another thread.
-pub fn dispatch_xlane_vec(
+pub(crate) fn dispatch_xlane_vec(
     kernel: &CoopVecKernel,
-    _xlane: &BTreeMap<usize, XlaneOp>,
     kd: &KernelDescriptor,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
@@ -127,6 +87,7 @@ pub fn dispatch_xlane_vec(
         waves_per_wg: (wg_size + WAVE - 1) / WAVE,
         scratch_bytes: scratch_u64 * WAVE * 8,
         scratch_stride: (scratch_u64 * 8) as u64,
+        exec: kernel.registers.exec as usize,
     };
     let num_wg = (dims.num_wg_x * dims.num_wg_y * dims.num_wg_z) as u64;
     let total_waves = num_wg * dispatch.waves_per_wg as u64;
@@ -163,6 +124,7 @@ struct VecDispatch<'a> {
     waves_per_wg: usize,
     scratch_bytes: usize,
     scratch_stride: u64,
+    exec: usize,
 }
 
 /// Per-worker state, reused for every wave the worker runs.
@@ -222,6 +184,7 @@ impl VecDispatch<'_> {
     }
 
     /// Reset every packet of `wave` to its entry state and arm its fiber.
+    #[inline(never)]
     fn start_wave(&self, wave: u64, bufs: &mut WaveBufs) {
         let wg = wave / self.waves_per_wg as u64;
         let local_base = (wave % self.waves_per_wg as u64) as usize * WAVE;
@@ -255,7 +218,8 @@ impl VecDispatch<'_> {
             if bufs.done[packet] {
                 continue;
             }
-            bufs.sgprs[packet][EXEC] = if valid_lanes == 32 {
+            let exec = self.exec;
+            bufs.sgprs[packet][exec] = if valid_lanes == 32 {
                 u32::MAX
             } else {
                 ((1u64 << valid_lanes) - 1) as u32
@@ -269,7 +233,7 @@ impl VecDispatch<'_> {
             }
             bufs.fibers[packet].start(KernelArgs {
                 lds_base: 0,
-                valid_mask: bufs.sgprs[packet][EXEC],
+                valid_mask: bufs.sgprs[packet][exec],
                 entry: self.kernel.addr(),
                 sgprs: bufs.sgprs[packet].as_mut_ptr(),
                 vgprs: bufs.vgprs[packet].as_mut_ptr(),

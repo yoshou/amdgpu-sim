@@ -12,6 +12,30 @@ use crate::processor::KernelDescriptor;
 
 use super::kernel::{ScalarKernel, VecKernel};
 
+struct Bufs {
+    vgprs: Vec<u32>,
+    scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>>,
+}
+
+static BUF_POOL: std::sync::Mutex<Vec<Bufs>> = std::sync::Mutex::new(Vec::new());
+const BUF_POOL_LIMIT: usize = 64;
+
+fn acquire_bufs(vgprs: usize, scratch_bytes: usize) -> Bufs {
+    let mut pool = BUF_POOL.lock().unwrap();
+    if let Some(index) = pool.iter().position(|b| b.vgprs.len() == vgprs && b.scratch.len() == scratch_bytes) {
+        return pool.swap_remove(index);
+    }
+    drop(pool);
+    let mut scratch = aligned_vec::AVec::new(0x1_0000_0000);
+    scratch.resize(scratch_bytes, 0u8);
+    Bufs { vgprs: vec![0u32; vgprs], scratch }
+}
+
+fn release_bufs(bufs: Bufs) {
+    let mut pool = BUF_POOL.lock().unwrap();
+    if pool.len() < BUF_POOL_LIMIT { pool.push(bufs); }
+}
+
 /// Grid geometry (workgroup counts and per-workgroup sizes).
 #[derive(Clone, Copy)]
 pub struct GridDims {
@@ -103,7 +127,7 @@ pub(in crate::rdna_spmd) fn setup_sgprs(
 }
 
 /// Run the whole grid in parallel across `num_threads` CPU threads.
-pub fn dispatch_parallel(
+pub(crate) fn dispatch_parallel(
     kernel: &ScalarKernel,
     kd: &KernelDescriptor,
     kernarg_ptr: u64,
@@ -125,14 +149,8 @@ pub fn dispatch_parallel(
             let dims = dims;
             scope.spawn(move || {
                 let mut sgprs;
-                let mut vgprs = vec![0u32; num_vgprs];
-                // Scratch must be 4 GiB-aligned so its low 32 address bits are 0:
-                // kernels using flat-scratch addressing read SRC_PRIVATE_BASE and
-                // force the low word to 0 when forming flat pointers into private
-                // memory (matches the interpreter's `AVec<u8, ConstAlign<4GiB>>`).
-                let mut scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>> =
-                    aligned_vec::AVec::new(0x1_0000_0000);
-                scratch.resize(scratch_u64 * 8, 0u8);
+                let mut bufs = acquire_bufs(num_vgprs, scratch_u64 * 8);
+                let Bufs { vgprs, scratch } = &mut bufs;
 
                 let mut t = tid as u64;
                 while t < total {
@@ -170,6 +188,7 @@ pub fn dispatch_parallel(
 
                     t += num_threads as u64;
                 }
+                release_bufs(bufs);
             });
         }
     });
@@ -179,7 +198,7 @@ pub fn dispatch_parallel(
 /// work-items of one workgroup at once (one per SIMD lane). VGPRs are laid out
 /// SoA — register `r`'s W lanes are contiguous at `r*W` — and each lane gets its
 /// own private scratch segment.
-pub fn dispatch_parallel_vec(
+pub(crate) fn dispatch_parallel_vec(
     kernel: &VecKernel,
     kd: &KernelDescriptor,
     kernarg_ptr: u64,
@@ -240,15 +259,8 @@ fn dispatch_parallel_vec_impl(
             let dims = dims;
             scope.spawn(move || {
                 let mut sgprs;
-                let mut vgprs = vec![0u32; num_vgprs * w as usize];
-                // 4 GiB-aligned so the base's low 32 bits are 0: kernels using
-                // flat-scratch addressing read SRC_PRIVATE_BASE for the flat
-                // pointer's high word and add the per-lane low offset, so a
-                // nonzero base low word would corrupt every private pointer
-                // (matches the scalar path and the interpreter's aligned AVec).
-                let mut scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>> =
-                    aligned_vec::AVec::new(0x1_0000_0000);
-                scratch.resize(scratch_u64 * w as usize * 8, 0u8);
+                let mut bufs = acquire_bufs(num_vgprs * w as usize, scratch_u64 * w as usize * 8);
+                let Bufs { vgprs, scratch } = &mut bufs;
 
                 let mut g = tid as u64;
                 while g < total_groups {
@@ -276,6 +288,7 @@ fn dispatch_parallel_vec_impl(
                     }
                     g += num_threads as u64;
                 }
+                release_bufs(bufs);
             });
         }
     });

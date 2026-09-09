@@ -25,6 +25,7 @@ pub enum Cond {
 
 /// How a scalar block transfers control.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum Terminator {
     /// `s_endpgm`: return from the work-item function.
     Return,
@@ -48,6 +49,7 @@ pub enum Terminator {
 
 /// A basic block lowered for scalar execution.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ScalarBlock {
     pub pc: usize,
     /// Body instructions (terminator removed), scheduling no-ops filtered out.
