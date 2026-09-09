@@ -89,6 +89,27 @@ fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
     needed
 }
 
+pub(crate) struct DeadWrites;
+impl super::Pass for DeadWrites {
+    fn name(&self) -> &str { "dead_writes" }
+    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
+        let masks = analyses.masks(f);
+        dead_writes(f, masks, analyses.context().exec_index) > 0
+    }
+}
+
+pub(crate) struct Dce;
+impl super::Pass for Dce {
+    fn name(&self) -> &str { "dce" }
+    fn run(&self, f: &mut Func, _: &super::Analyses) -> bool { run(f) > 0 }
+}
+
+pub(crate) struct DeadParams;
+impl super::Pass for DeadParams {
+    fn name(&self) -> &str { "dead_params" }
+    fn run(&self, f: &mut Func, _: &super::Analyses) -> bool { dead_params(f) > 0 }
+}
+
 pub(crate) fn dead_writes(f: &mut Func, masks: &Masks, exec_index: usize) -> usize {
     let needed = needed(f, masks, exec_index);
     let mut renames: BTreeMap<ValueId, ValueId> = BTreeMap::new();

@@ -4,28 +4,40 @@ use std::collections::BTreeMap;
 
 #[cfg(test)]
 use crate::rdna_instructions::InstFormat;
+use super::target::Target;
 
 use super::engine::kernel::{Code, CoopKernel, CoopVecKernel, Kernel, ScalarKernel, Scheduler, VecKernel};
 #[cfg(test)]
-use super::decode::{self as ir, ScalarBlock, ScalarProgram};
+use crate::rdna_spmd::targets::rdna4::decode::{self as ir, ScalarBlock, ScalarProgram};
 use super::program::{Program, CompilationInput};
 
-use super::lift::function::LiftedFunction;
-use super::pass::Driver;
+use super::program::{LiftedFunction, Parameter, ParameterSource};
+use super::pass::{Analyses, Context, Driver, LocalWriteLanes, Pass};
+use super::pass::{active::Active, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, PacketState}, idioms::Idioms, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
 use super::ir::BlockId;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarMode { Whole, Cooperative }
 
 /// Coordinates the SPMD compilation stages.
-pub struct Compiler { registry: std::sync::Arc<super::dialect::DialectRegistry> }
+pub struct Compiler { target: std::sync::Arc<dyn Target> }
+#[cfg(test)]
 impl Default for Compiler {
-    fn default() -> Self { Self { registry: std::sync::Arc::new(super::dialect::DialectRegistry::rdna4()) } }
+    fn default() -> Self { Self::for_arch("gfx1200").unwrap() }
+}
+impl Compiler {
+    pub fn for_arch(arch: &str) -> Result<Self, String> {
+        super::targets::select(arch).map(|target| Self { target }).ok_or_else(|| format!("no SPMD target supports {arch}"))
+    }
 }
 
-pub(super) fn exec_index(inputs: &[super::lift::Input], registry: &super::dialect::DialectRegistry) -> usize {
+pub(super) fn exec_index(inputs: &[Parameter], registry: &super::dialect::DialectRegistry) -> usize {
     let exec = registry.registers().exec;
-    inputs.iter().position(|p| matches!(p.source, super::lift::InputSource::MaskBit(r) if r == exec)).unwrap()
+    inputs.iter().position(|p| matches!(p.source, ParameterSource::MaskBit(r) if r == exec)).unwrap()
+}
+
+fn analyses<'r>(registry: &'r super::dialect::DialectRegistry, exec_index: usize, lanes: u32, entry_full: bool, exec_initial: bool, exec_packed: bool, packet: Option<(&'r [Parameter], bool)>) -> Analyses<'r> {
+    Analyses::new(Context { registry, exec_index, lanes, entry_full, exec_initial, exec_packed, packet })
 }
 
 pub(super) fn input_passes_ir(f: &mut LiftedFunction) {
@@ -34,13 +46,8 @@ pub(super) fn input_passes_ir(f: &mut LiftedFunction) {
     let mut program = super::pass::FuncProgram { ir: std::mem::replace(&mut f.ir, super::ir::Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] }), registry: &registry };
     let driver = Driver::new();
     let limit = 1 + program.ir.types.len();
-    driver.fixpoint(&mut program, "idioms", limit, |p| {
-        let constants = super::analysis::constants(&p.ir);
-        let masks = super::analysis::masks::analyze(&registry, &p.ir, exec_index, &constants, 32, false);
-        super::pass::idioms::run(&mut p.ir, &masks, &constants, &registry);
-        super::pass::simplify::run(&mut p.ir);
-        super::pass::dce::run(&mut p.ir);
-    }).unwrap();
+    let mut an = analyses(&registry, exec_index, 32, false, false, false, None);
+    driver.fixpoint(&mut program, &mut an, "input", limit, &[&Idioms, &Simplify, &Dce]).unwrap();
     f.ir = program.ir;
     f.revision += 1;
 }
@@ -50,35 +57,13 @@ pub(super) fn packet_uniformity(f: &LiftedFunction, width: u32, entry_full: bool
     let constants = super::analysis::constants(&f.ir);
     let exec_index = exec_index(&f.parameter_inputs, &f.registry);
     let masks = super::analysis::masks::analyze(&f.registry, &f.ir, exec_index, &constants, width, entry_full);
-    super::analysis::uniformity::packet(&f.ir, &packet_entry(&f.ir, &f.parameter_inputs, aligned), &constants, &masks.guarded)
-}
-
-fn packet_entry(ir: &super::ir::Func, inputs: &[super::lift::Input], aligned: bool) -> super::analysis::uniformity::Entry {
-    use super::lift::InputSource;
-    use crate::rdna_instructions::SourceOperand;
-    let entry = &ir.blocks[&ir.entry];
-    let mut uniform = Vec::new();
-    let mut affine = Vec::new();
-    let mut varying = Vec::new();
-    for (input, &(id, _)) in inputs.iter().zip(&entry.params) {
-        match input.source {
-            InputSource::Operand(SourceOperand::VectorRegister(0)) => if aligned { affine.push((id, 1, Some((0, 10)))) } else { varying.push(id) },
-            InputSource::Operand(SourceOperand::VectorRegister(_)) | InputSource::Operand(SourceOperand::ScalarRegister(_)) | InputSource::Scc => uniform.push(id),
-            _ => {}
-        }
-    }
-    super::analysis::uniformity::Entry { uniform, affine, varying }
+    super::analysis::uniformity::packet(&f.ir, &super::pass::entry::packet_entry(&f.ir, &f.parameter_inputs, aligned), &constants, &masks.guarded)
 }
 
 fn dead_writes(program: &mut super::pass::FuncProgram, driver: &Driver, exec_index: usize, width: u32) {
     let limit = 1 + program.ir.types.len();
-    driver.fixpoint(program, "dead_writes", limit, |p| {
-        let constants = super::analysis::constants(&p.ir);
-        let masks = super::analysis::masks::analyze(p.registry, &p.ir, exec_index, &constants, width, false);
-        super::pass::dce::dead_writes(&mut p.ir, &masks, exec_index);
-        super::pass::simplify::run(&mut p.ir);
-        super::pass::dce::run(&mut p.ir);
-    }).unwrap();
+    let mut an = analyses(program.registry, exec_index, width, false, false, false, None);
+    driver.fixpoint(program, &mut an, "dead_writes", limit, &[&DeadWrites, &Simplify, &Dce]).unwrap();
 }
 
 fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<u64>]) -> BTreeMap<u64, super::engine::yields::YieldValues> {
@@ -88,7 +73,7 @@ fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<
     for block in ir.blocks.values() {
         for inst in &block.insts {
             let Inst::Effect { provenance, op, inputs, .. } = inst else { continue; };
-            let scheduled = *provenance & super::lift::wave::SCHEDULED != 0 || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait);
+            let scheduled = *provenance & crate::rdna_spmd::ir::SCHEDULED != 0 || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait);
             if !scheduled || *provenance & (1 << 63) != 0 { continue; }
             let mut layout = YieldValues::new(*op);
             layout.uniform_selector = *op == EffectOp::Wave(WaveOp::ReadLane) && uniform[inputs[1].0];
@@ -103,7 +88,7 @@ fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<
     out
 }
 
-struct Bare { ir: super::ir::Func, inputs: Vec<super::lift::Input>, registry: std::sync::Arc<super::dialect::DialectRegistry> }
+struct Bare { ir: super::ir::Func, inputs: Vec<Parameter>, registry: std::sync::Arc<super::dialect::DialectRegistry> }
 
 fn bare(f: LiftedFunction) -> Bare { Bare { ir: f.ir, inputs: f.parameter_inputs, registry: f.registry } }
 
@@ -114,49 +99,29 @@ fn prepared(bare: Bare, width: Option<u32>, abi: super::codegen::Abi, observable
     let driver = Driver::new();
     let exec_index = exec_index(&inputs, &registry);
     let lanes = width.unwrap_or(1);
-    driver.run(&mut program, "packet_state", |p| super::pass::entry::packet_state(&mut p.ir)).unwrap();
-    if abi == super::codegen::Abi::Cooperative {
-        driver.run(&mut program, "local_write_lanes", |p| { super::pass::local_write_lanes(&mut p.ir); }).unwrap();
-    }
-    if width.is_none() {
-        let constants = super::analysis::constants(&program.ir);
-        let masks = super::analysis::masks::analyze(&registry, &program.ir, exec_index, &constants, 1, true);
-        let exec = super::analysis::masks::exec(&program.ir, exec_index, &constants, 1, true, false);
-        driver.run(&mut program, "active", |p| { super::pass::active::run(&mut p.ir, &masks, &exec); }).unwrap();
-    }
-    if !observable_return || (width.is_none() && abi == super::codegen::Abi::Whole) {
-        driver.run(&mut program, "assume_dispatch_exec", |p| super::pass::entry::assume_dispatch_exec(&inputs, &registry, &mut p.ir)).unwrap();
-    }
+    let mut an = analyses(&registry, exec_index, lanes, entry_full, initial_exec, lanes > 1, width.map(|_| (inputs.as_slice(), aligned)));
+    let assume = AssumeDispatchExec { inputs: &inputs };
+    let mut passes: Vec<&dyn Pass> = vec![&PacketState];
+    if abi == super::codegen::Abi::Cooperative { passes.push(&LocalWriteLanes); }
+    if width.is_none() { passes.push(&Active); }
+    if !observable_return || (width.is_none() && abi == super::codegen::Abi::Whole) { passes.push(&assume); }
+    driver.pipeline(&mut program, &mut an, &passes).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
-        let uniform: Vec<bool> = match width {
-            Some(w) => {
-                let constants = super::analysis::constants(&program.ir);
-                let masks = super::analysis::masks::analyze(&registry, &program.ir, exec_index, &constants, w, entry_full);
-                let facts = super::analysis::uniformity::packet(&program.ir, &packet_entry(&program.ir, &inputs, aligned), &constants, &masks.guarded);
-                facts.facts.iter().map(|&fact| fact == Fact::Uniform).collect()
-            }
-            None => vec![true; program.ir.types.len()],
-        };
-        driver.run(&mut program, "simplify", |p| { super::pass::simplify::run(&mut p.ir); super::pass::dce::run(&mut p.ir); }).unwrap();
-        driver.run(&mut program, "pairs", |p| { super::pass::pairs::run(&mut p.ir, &uniform); }).unwrap();
+        driver.pipeline(&mut program, &mut an, &[&Simplify, &Dce]).unwrap();
+        driver.pipeline(&mut program, &mut an, &[&Pairs]).unwrap();
         let limit = 1 + program.ir.types.len();
-        driver.fixpoint(&mut program, "simplify", limit, |p| { super::pass::simplify::run(&mut p.ir); super::pass::dce::run(&mut p.ir); super::pass::dce::dead_params(&mut p.ir); }).unwrap();
+        driver.fixpoint(&mut program, &mut an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
     }
     let ir = program.ir;
-    let constants = super::analysis::constants(&ir);
+    let constants = an.constants(&ir).to_vec();
     let exec = super::analysis::masks::exec(&ir, exec_index, &constants, lanes, initial_exec, lanes > 1);
-    let (uniform, affine): (Vec<bool>, BTreeMap<super::ir::ValueId, u32>) = match width {
-        Some(w) => {
-            let masks = super::analysis::masks::analyze(&registry, &ir, exec_index, &constants, w, entry_full);
-            let facts = super::analysis::uniformity::packet(&ir, &packet_entry(&ir, &inputs, aligned), &constants, &masks.guarded);
-            let uniform = facts.facts.iter().map(|&fact| fact == Fact::Uniform).collect();
-            let affine = facts.facts.iter().enumerate().filter_map(|(v, fact)| match *fact {
-                Fact::Affine { stride, .. } if stride > 0 && stride <= 256 && ir.types[v] == super::ir::Ty::I64 => Some((super::ir::ValueId(v), stride as u32)),
-                _ => None,
-            }).collect();
-            (uniform, affine)
-        }
-        None => (vec![true; ir.types.len()], BTreeMap::new()),
+    let uniform = an.uniform(&ir).to_vec();
+    let affine: BTreeMap<super::ir::ValueId, u32> = match an.uniformity(&ir) {
+        Some(facts) => facts.facts.iter().enumerate().filter_map(|(v, fact)| match *fact {
+            Fact::Affine { stride, .. } if stride > 0 && stride <= 256 && ir.types[v] == super::ir::Ty::I64 => Some((super::ir::ValueId(v), stride as u32)),
+            _ => None,
+        }).collect(),
+        None => BTreeMap::new(),
     };
     let yields = yield_layouts_ir(&ir, &uniform, &constants);
     let accesses = super::analysis::memory::accesses(&ir, &constants, &uniform);
@@ -176,26 +141,15 @@ pub(super) fn prepare_packet(f: LiftedFunction, width: u32, cooperative: bool, o
     let driver = Driver::new();
     let exec_index = exec_index(&inputs, &registry);
     if !observe_return {
-        driver.run(&mut program, "discard_return", |p| for block in p.ir.blocks.values_mut() {
-            if let super::ir::Term::Ret(args) = &mut block.term { args.clear(); }
-        }).unwrap();
+        let mut an = analyses(&registry, exec_index, width, false, false, false, None);
+        driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
     }
     dead_writes(&mut program, &driver, exec_index, width);
-    let narrow = |program: &mut super::pass::FuncProgram, driver: &Driver| {
-        let constants = super::analysis::constants(&program.ir);
-        let masks = super::analysis::masks::analyze(&registry, &program.ir, exec_index, &constants, width, !observe_return);
-        driver.run(program, "narrow", |p| { super::pass::narrow::run(&mut p.ir, &masks); }).unwrap();
-    };
-    narrow(&mut program, &driver);
-    if std::env::var("AMDGPU_SIM_SPECIALISE").map_or(true, |v| v != "0") {
-        let constants = super::analysis::constants(&program.ir);
-        let masks = super::analysis::masks::analyze(&registry, &program.ir, exec_index, &constants, width, !observe_return);
-        let blocks = super::pass::specialise::candidates(&program.ir, &masks, exec_index);
-        if !blocks.is_empty() {
-            driver.run(&mut program, "specialise", |p| { super::pass::specialise::run(&mut p.ir, &blocks, exec_index); }).unwrap();
-        }
-    }
-    narrow(&mut program, &driver);
+    let mut an = analyses(&registry, exec_index, width, !observe_return, false, false, None);
+    let mut passes: Vec<&dyn Pass> = vec![&Narrow];
+    if std::env::var("AMDGPU_SIM_SPECIALISE").map_or(true, |v| v != "0") { passes.push(&Specialise); }
+    passes.push(&Narrow);
+    driver.pipeline(&mut program, &mut an, &passes).unwrap();
     let abi = if cooperative { super::codegen::Abi::Cooperative } else { super::codegen::Abi::Whole };
     prepared(Bare { ir: program.ir, inputs, registry }, Some(width), abi, observe_return, !observe_return, !cooperative, num_vgprs, aligned)
 }
@@ -207,9 +161,8 @@ pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usi
         let driver = Driver::new();
         let exec_index = exec_index(&inputs, &registry);
         if mode == ScalarMode::Whole {
-            driver.run(&mut program, "discard_return", |p| for block in p.ir.blocks.values_mut() {
-                if let super::ir::Term::Ret(args) = &mut block.term { args.clear(); }
-            }).unwrap();
+            let mut an = analyses(&registry, exec_index, 1, false, false, false, None);
+            driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
         }
         dead_writes(&mut program, &driver, exec_index, 1);
     }
@@ -219,60 +172,63 @@ pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usi
 
 impl Compiler {
     pub fn decode_program(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-        Ok(Program::decoded(&super::decode::program(entry_pc, memory)?, self.registry.clone()))
+        let mut function = self.target.decode(entry_pc, memory)?;
+        input_passes_ir(&mut function);
+        Ok(Program { function })
     }
 
-    /// Compile lane-local execution. General 32-lane effects are scheduled
-    /// with `split_at_xlane` and executed by a wave/cooperative dispatcher.
-    pub(crate) fn compile_program(&self, program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel {
-        let p = prepare_scalar(program.to_ssa().function, ScalarMode::Whole, num_vgprs.max(256));
-        let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
-        ScalarKernel::from_code(code, p.num_vgprs)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn compile_program_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> VecKernel {
-        self.compile_program_vec_layout(program, num_vgprs, width, None)
-    }
-
-    pub(crate) fn compile_program_vec_layout(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
-        let aligned = workgroup_x.map_or(true, |x| x % width == 0);
-        let p = prepare_packet(program.to_ssa().function, width, false, false, num_vgprs.max(256), aligned);
-        let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
-        VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn compile_cooperative_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> CoopVecKernel {
-        self.compile_cooperative_vec_layout(program, num_vgprs, width, None)
-    }
-
-    pub(crate) fn compile_cooperative_vec_layout(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> CoopVecKernel {
-        assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
-        let aligned = workgroup_x.map_or(true, |x| x % width == 0);
-        let program = program.to_ssa();
-        let num_vgprs = program.vgpr_count(num_vgprs);
-        let p = prepare_packet(program.function, width, true, true, num_vgprs, aligned);
-        let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
-        let yields = p.resume_layouts();
-        if yields.iter().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
-        CoopVecKernel::from_code(code, yields, p.num_vgprs, width, p.min_private_bytes, workgroup_x, p.registry.registers())
-    }
-
-    /// Compile a program whose scheduled effects yield to the cooperative scheduler.
-    pub(crate) fn compile_cooperative(&self, program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel {
-        let program = program.to_ssa();
-        let num_vgprs = program.vgpr_count(num_vgprs);
-        let p = prepare_scalar(program.function, ScalarMode::Cooperative, num_vgprs);
-        let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
-        let yields = p.resume_layouts();
-        if yields.iter().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(1); }
-        CoopKernel::from_code(code, yields, p.num_vgprs, 1, p.min_private_bytes, None, p.registry.registers())
-    }
 }
 
-pub fn decode_program(entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-    Compiler::default().decode_program(entry_pc, memory)
+/// Compile lane-local execution. General 32-lane effects are scheduled
+/// with `split_at_xlane` and executed by a wave/cooperative dispatcher.
+pub(crate) fn compile_scalar(program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel {
+    let p = prepare_scalar(program.to_ssa().function, ScalarMode::Whole, num_vgprs.max(256));
+    let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
+    ScalarKernel::from_code(code, p.num_vgprs)
+}
+
+
+pub(crate) fn compile_packet(program: &impl CompilationInput, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
+    let aligned = workgroup_x.map_or(true, |x| x % width == 0);
+    let p = prepare_packet(program.to_ssa().function, width, false, false, num_vgprs.max(256), aligned);
+    let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
+    VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x)
+}
+
+
+pub(crate) fn compile_cooperative_packet(program: &impl CompilationInput, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> CoopVecKernel {
+    assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
+    let aligned = workgroup_x.map_or(true, |x| x % width == 0);
+    let program = program.to_ssa();
+    let num_vgprs = program.vgpr_count(num_vgprs);
+    let p = prepare_packet(program.function, width, true, true, num_vgprs, aligned);
+    let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
+    let yields = p.resume_layouts();
+    if yields.iter().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
+    CoopVecKernel::from_code(code, yields, p.num_vgprs, width, p.min_private_bytes, workgroup_x, p.registry.registers())
+}
+
+/// Compile a program whose scheduled effects yield to the cooperative scheduler.
+pub(crate) fn compile_cooperative_scalar(program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel {
+    let program = program.to_ssa();
+    let num_vgprs = program.vgpr_count(num_vgprs);
+    let p = prepare_scalar(program.function, ScalarMode::Cooperative, num_vgprs);
+    let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
+    let yields = p.resume_layouts();
+    if yields.iter().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(1); }
+    CoopKernel::from_code(code, yields, p.num_vgprs, 1, p.min_private_bytes, None, p.registry.registers())
+}
+
+pub fn decode_program(arch: &str, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
+    Compiler::for_arch(arch)?.decode_program(entry_pc, memory)
+}
+
+#[cfg(test)]
+impl Compiler {
+    pub(crate) fn compile_program(&self, program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel { compile_scalar(program, num_vgprs) }
+    pub(crate) fn compile_program_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> VecKernel { compile_packet(program, num_vgprs, width, None) }
+    pub(crate) fn compile_cooperative_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> CoopVecKernel { compile_cooperative_packet(program, num_vgprs, width, None) }
+    pub(crate) fn compile_cooperative(&self, program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel { compile_cooperative_scalar(program, num_vgprs) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,35 +263,34 @@ fn scheduler_for(program: &Program) -> Scheduler {
 }
 
 impl Compiler {
-    pub fn compile(&self, program: &impl CompilationInput, options: CompileOptions) -> Kernel {
-        assert!(matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", options.width);
-        let program = program.to_ssa();
-        let scheduler = scheduler_for(&program);
-        let cooperative = |program: &Program| if options.width == 0 {
-            self.compile_cooperative(program, options.num_vgprs)
-        } else {
-            self.compile_cooperative_vec_layout(program, options.num_vgprs, options.width, options.workgroup_x)
-        };
-        let code = match scheduler {
-            Scheduler::Independent if options.width == 0 => Code::Scalar(self.compile_program(&program, options.num_vgprs)),
-            Scheduler::Independent => Code::Packet(self.compile_program_vec_layout(&program, options.num_vgprs, options.width, options.workgroup_x)),
-            Scheduler::Wave => Code::Cooperative(cooperative(&super::engine::xlane::split_at_xlane(&program).0)),
-            Scheduler::Workgroup => Code::Cooperative(cooperative(&super::program::split_at_barriers(&program))),
-        };
-        Kernel::new(code, scheduler, options.width)
-    }
+    pub fn compile(&self, program: &impl CompilationInput, options: CompileOptions) -> Kernel { compile(program, options) }
 }
 
 pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kernel {
-    Compiler::default().compile(program, options)
+    assert!(matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", options.width);
+    let program = program.to_ssa();
+    let scheduler = scheduler_for(&program);
+    let cooperative = |program: &Program| if options.width == 0 {
+        compile_cooperative_scalar(program, options.num_vgprs)
+    } else {
+        compile_cooperative_packet(program, options.num_vgprs, options.width, options.workgroup_x)
+    };
+    let code = match scheduler {
+        Scheduler::Independent if options.width == 0 => Code::Scalar(compile_scalar(&program, options.num_vgprs)),
+        Scheduler::Independent => Code::Packet(compile_packet(&program, options.num_vgprs, options.width, options.workgroup_x)),
+        Scheduler::Wave => Code::Cooperative(cooperative(&super::engine::xlane::split_at_xlane(&program).0)),
+        Scheduler::Workgroup => Code::Cooperative(cooperative(&super::program::split_at_barriers(&program))),
+    };
+    Kernel::new(code, scheduler, options.width)
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::instructions::I;
     use crate::rdna_instructions::{SourceOperand, SOPP, VOP1};
-    use super::super::decode::Terminator;
+    use crate::rdna_spmd::targets::rdna4::decode::Terminator;
     use super::super::ir::{Inst, Term, Op};
 
     fn mov(value: u32) -> InstFormat {

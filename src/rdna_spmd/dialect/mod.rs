@@ -4,7 +4,6 @@ use super::ir::{Ty, ValueId};
 use std::collections::BTreeMap;
 use llvm_sys::prelude::LLVMValueRef;
 
-pub(super) mod rdna4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TargetOp { dialect: u32, operation: u32 }
@@ -32,7 +31,7 @@ impl Arguments {
     }
 }
 
-pub(super) struct Operation {
+pub(crate) struct Operation {
     pub name: &'static str,
     pub inputs: &'static [Ty],
     pub outputs: Vec<Ty>,
@@ -44,7 +43,7 @@ pub(super) struct Operation {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Effect { Pure, ReadGlobal { every_lane: bool } }
-pub(super) enum Implementation {
+pub(crate) enum Implementation {
     Single(unsafe fn(&super::codegen::ops::Emitter, &[LLVMValueRef]) -> LLVMValueRef),
     Multiple(unsafe fn(&super::codegen::ops::Emitter, &[LLVMValueRef]) -> Vec<LLVMValueRef>),
 }
@@ -78,32 +77,31 @@ pub(crate) struct Registers {
 }
 
 #[derive(Default)]
-pub(super) struct DialectRegistry {
+pub(crate) struct DialectRegistry {
     operations: BTreeMap<TargetOp, Operation>,
     dialects: BTreeMap<u32, &'static str>,
     registers: Registers,
     state: Option<unsafe fn(&super::codegen::ops::Emitter, LLVMValueRef) -> Box<dyn std::any::Any>>,
+    idioms: Vec<Box<dyn super::pass::idioms::Idiom>>,
 }
 impl TargetOp {
     pub fn dialect(self) -> u32 { self.dialect }
 }
 impl DialectRegistry {
-    pub fn rdna4() -> Self {
-        let mut registry = Self::default();
-        registry.dialects.insert(rdna4::ID, "rdna4");
-        registry.registers = rdna4::REGISTERS;
-        registry.state = Some(rdna4::bvh::lowering_state);
-        rdna4::register(&mut registry).expect("RDNA4 target registration conflict");
-        registry
-    }
+    pub fn new() -> Self { Self::default() }
+    pub fn add_dialect(&mut self, id: u32, name: &'static str) { self.dialects.insert(id, name); }
+    pub fn set_registers(&mut self, registers: Registers) { self.registers = registers; }
+    pub fn set_lowering_state(&mut self, prepare: unsafe fn(&super::codegen::ops::Emitter, LLVMValueRef) -> Box<dyn std::any::Any>) { self.state = Some(prepare); }
+    pub fn add_idiom(&mut self, idiom: Box<dyn super::pass::idioms::Idiom>) { self.idioms.push(idiom); }
     pub fn registers(&self) -> Registers { self.registers }
+    pub fn idioms(&self) -> &[Box<dyn super::pass::idioms::Idiom>] { &self.idioms }
     pub unsafe fn lowering_state(&self, emitter: &super::codegen::ops::Emitter, sink: LLVMValueRef) -> Option<Box<dyn std::any::Any>> {
         self.state.map(|prepare| prepare(emitter, sink))
     }
     pub fn dialect_name(&self, dialect: u32) -> Option<&'static str> { self.dialects.get(&dialect).copied() }
     #[cfg(test)]
     pub fn dialect_id(&self, name: &str) -> Option<u32> { self.dialects.iter().find_map(|(&id, &n)| (n == name).then_some(id)) }
-    fn register(&mut self, dialect: u32, operation: u32, spec: Operation) -> Result<TargetOp, &'static str> {
+    pub fn register(&mut self, dialect: u32, operation: u32, spec: Operation) -> Result<TargetOp, &'static str> {
         let op = TargetOp { dialect, operation };
         if self.operations.contains_key(&op) || self.operations.iter().any(|(id, other)| id.dialect == dialect && other.name == spec.name) {
             return Err("duplicate target ID or mnemonic");
@@ -135,9 +133,10 @@ impl DialectRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdna_spmd::targets::rdna4::dialect as rdna4;
     #[test]
     fn registry_rejects_collisions_missing_providers_and_bad_types() {
-        let mut registry = DialectRegistry::rdna4();
+        let mut registry = crate::rdna_spmd::targets::rdna4::registry();
         let id = rdna4::unary(&registry, crate::instructions::I::V_RCP_F32).unwrap();
         assert!(rdna4::register(&mut registry).is_err());
         assert!(DialectRegistry::default().operation(id).is_err());
@@ -153,7 +152,7 @@ mod tests {
         use crate::rdna_spmd::{jit, codegen::ops::Emitter};
         use llvm_sys::core::*;
         use std::sync::Arc;
-        let registry = Arc::new(DialectRegistry::rdna4());
+        let registry = Arc::new(crate::rdna_spmd::targets::rdna4::registry());
         for opcode in [I::V_RCP_F32, I::V_RCP_F64, I::V_RSQ_F32, I::V_RSQ_F64,
             I::V_SQRT_F32, I::V_SQRT_F64, I::V_FLOOR_F32, I::V_FLOOR_F64,
             I::V_CEIL_F32, I::V_TRUNC_F32, I::V_TRUNC_F64, I::V_RNDNE_F32,

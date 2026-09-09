@@ -7,7 +7,7 @@
 //!
 //! `lift` produces typed SSA semantics for analysis and code generation; this layer only
 //! normalizes control flow and removes scheduling no-ops. Optimization order
-//! belongs to [`super::compiler::Compiler`].
+//! belongs to [`crate::rdna_spmd::compiler::Compiler`].
 use crate::instructions::I;
 use crate::rdna4_decoder::{decode_rdna4, InstStream};
 use crate::rdna_instructions::InstFormat;
@@ -150,7 +150,7 @@ fn lower_terminator(last: &InstFormat, next_pcs: &[usize]) -> Terminator {
 
 /// Normalize one instruction block without applying optimization passes.
 /// `insts` still contains its final instruction so fallthrough blocks retain it.
-pub(super) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
+pub(crate) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
     let (last, head) = insts.split_last().expect("empty block");
 
     let term = lower_terminator(last, next_pcs);
@@ -180,12 +180,12 @@ pub(super) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -
 /// Split barriers into typed signal/wait yields, preserving IDs, signal-is-first
 /// results and the original instruction order. Resume entries retain the body
 /// after each effect; existing branch targets remain unchanged.
-pub(super) struct DecodedBlock {
+pub(crate) struct DecodedBlock {
     pub insts: Vec<InstFormat>,
     pub next_pcs: Vec<usize>,
 }
 
-pub(super) struct Decoded {
+pub(crate) struct Decoded {
     pub entry_pc: usize,
     pub blocks: BTreeMap<usize, DecodedBlock>,
 }
@@ -250,7 +250,7 @@ impl Search<'_> {
     }
 }
 
-pub(super) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
+pub(crate) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
     let mut search = Search { memory, ranges: BTreeSet::new() };
     search.walk(entry_pc)?;
     let ranges: Vec<_> = search.ranges.into_iter().collect();
@@ -275,7 +275,7 @@ pub(super) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String>
 }
 
 #[cfg(test)]
-pub(super) fn load_object(path: &str, descriptor_symbol: &str) -> (usize, Vec<u8>) {
+pub(crate) fn load_object(path: &str, descriptor_symbol: &str) -> (usize, Vec<u8>) {
     use object::{Object, ObjectSegment};
     let data = std::fs::read(path).unwrap();
     let elf = object::File::parse(data.as_slice()).unwrap();
@@ -293,7 +293,7 @@ pub(super) fn load_object(path: &str, descriptor_symbol: &str) -> (usize, Vec<u8
 }
 
 #[cfg(test)]
-pub(super) const OBJECTS: &[(&str, &str)] = &[
+pub(crate) const OBJECTS: &[(&str, &str)] = &[
     ("examples/smallpt/kernel_gfx1200.o", "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd"),
     ("examples/raytracing/kernel_gfx1200.o", "_Z24ambient_occlusion_kernelP14_hiprtGeometryPh15HIP_vector_typeIiLj2EEf.kd"),
     ("examples/texture/kernel_gfx1200.o", "_Z16histogram_kernelPjjjjP13__hip_texture.kd"),

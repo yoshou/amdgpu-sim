@@ -148,7 +148,7 @@ fn narrow_wide_half(b: &mut Builder<'_>, value: ValueId) -> ValueId {
     let odd = b.int(IntOp::Or, truncated, one);
     let bits = b.push(Ty::I32, Op::Select(inexact, odd, bits));
     let single = b.push(Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, bits));
-    let target = crate::rdna_spmd::dialect::rdna4::unary(b.registry, I::V_CVT_F16_F32).unwrap();
+    let target = crate::rdna_spmd::targets::rdna4::dialect::unary(b.registry, I::V_CVT_F16_F32).unwrap();
     b.target_one(target, Arguments::Unary(single))
 }
 
@@ -161,8 +161,8 @@ fn packed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry)
     };
     let mut b = Builder::new(registry, [i.src0, i.src1, i.src2].iter().copied().take(arity)
         .map(|s| input(half::source(s), Ty::I32)).collect());
-    let widen = crate::rdna_spmd::dialect::rdna4::unary(registry, I::V_CVT_F32_F16).unwrap();
-    let narrow = crate::rdna_spmd::dialect::rdna4::unary(registry, I::V_CVT_F16_F32).unwrap();
+    let widen = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, I::V_CVT_F32_F16).unwrap();
+    let narrow = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, I::V_CVT_F16_F32).unwrap();
     let mut results = Vec::new();
     for (select, neg) in [(i.opsel, i.neg), (i.opsel_hi | i.opsel_hi2 << 2, i.neg_hi)] {
         let mut values = Vec::new();
@@ -216,7 +216,7 @@ fn mixed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) 
     }).collect::<Vec<_>>();
     if partial { inputs.push(input(SourceOperand::VectorRegister(i.vdst), Ty::I32)); }
     let mut b = Builder::new(registry, inputs);
-    let widen = crate::rdna_spmd::dialect::rdna4::unary(registry, I::V_CVT_F32_F16).unwrap();
+    let widen = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, I::V_CVT_F32_F16).unwrap();
     let mut values = Vec::new();
     for index in 0..3 {
         let mut value = ValueId(index);
@@ -229,7 +229,7 @@ fn mixed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) 
     let value = b.push(Ty::F32, Op::Fma(values[0], values[1], values[2]));
     let mut value = b.output_mod(Ty::F32, value, i.cm, 0);
     if partial {
-        let narrow = crate::rdna_spmd::dialect::rdna4::unary(registry, I::V_CVT_F16_F32).unwrap();
+        let narrow = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, I::V_CVT_F16_F32).unwrap();
         value = b.target_one(narrow, Arguments::Unary(value));
         if high { let shift = b.k(Ty::I32, 16); value = b.int(IntOp::Shl, value, shift); }
         let keep = b.k(Ty::I32, if high { 0xffff } else { 0xffff_0000 });
@@ -245,7 +245,7 @@ fn mixed_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) 
 fn dot_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering> {
     let bf16 = match i.op { I::V_DOT2_F32_F16 => false, I::V_DOT2_F32_BF16 => true, _ => return None };
     let mut b = Builder::new(registry, vec![input(i.src0, Ty::I32), input(i.src1, Ty::I32), input(i.src2, Ty::F32)]);
-    let widen = crate::rdna_spmd::dialect::rdna4::unary(registry, I::V_CVT_F32_F16).unwrap();
+    let widen = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, I::V_CVT_F32_F16).unwrap();
     let mut products = Vec::new();
     for (select, neg) in [(i.opsel, i.neg), (i.opsel_hi | i.opsel_hi2 << 2, i.neg_hi)] {
         let mut values = Vec::new();

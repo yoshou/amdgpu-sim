@@ -84,13 +84,13 @@
 
 mod analysis;
 mod engine;
+mod target;
+mod targets;
 mod pass;
 mod ir;
 mod compiler;
 mod codegen;
-mod decode;
 mod program;
-mod lift;
 mod jit;
 mod dialect;
 
@@ -99,7 +99,7 @@ pub use program::{Program, CompilationInput};
 pub use compiler::{compile, decode_program, CompileOptions, Compiler};
 pub use engine::{dispatch, dispatch::GridDims, kernel::{Kernel, Scheduler}};
 #[cfg(test)]
-pub(crate) use decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
+pub(crate) use targets::rdna4::decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
 #[cfg(test)]
 pub(crate) use program::split_at_barriers;
 #[cfg(test)]

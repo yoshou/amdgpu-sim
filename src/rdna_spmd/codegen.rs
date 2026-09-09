@@ -12,9 +12,8 @@ use llvm::prelude::*;
 use super::analysis::masks::Exec;
 use super::analysis::memory::Access;
 use super::ir::{*, Cvt, Env, IntOp, Op, Ty, ValueId};
-use super::lift::{Input, InputSource};
+use super::program::{Parameter, ParameterSource};
 use ops::Emitter;
-use crate::rdna_instructions::SourceOperand;
 
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,7 +29,7 @@ pub(super) struct Cluster {
 pub(super) struct Prepared {
     pub registry: std::sync::Arc<super::dialect::DialectRegistry>,
     pub ir: VerifiedFunc,
-    pub inputs: Vec<Input>,
+    pub inputs: Vec<Parameter>,
     pub width: Option<u32>,
     pub abi: Abi,
     pub observable_return: bool,
@@ -45,7 +44,7 @@ pub(super) struct Prepared {
     pub num_vgprs: usize,
 }
 
-pub(super) fn resume_key(provenance: u64) -> usize { (provenance & !super::lift::wave::SCHEDULED) as usize }
+pub(super) fn resume_key(provenance: u64) -> usize { (provenance & !crate::rdna_spmd::ir::SCHEDULED) as usize }
 
 impl Prepared {
     pub fn resume_layouts(&self) -> Vec<super::engine::yields::YieldValues> {
@@ -349,8 +348,7 @@ impl<'a> Cg<'a> {
         for (index, &(id, ty)) in entry.params.iter().enumerate() {
             let input = &self.p.inputs[index];
             let value = match input.source {
-                InputSource::Operand(SourceOperand::VectorRegister(r)) => {
-                    let r = r as u32;
+                ParameterSource::Vgpr(r) => {
                     if let Some(w) = self.p.width {
                         let gep = LLVMBuildGEP2(self.b, self.i32t, self.vgprs_p, [self.ci32(r * w)].as_mut_ptr(), 1, n);
                         let load = LLVMBuildLoad2(self.b, LLVMVectorType(self.i32t, w), gep, n);
@@ -361,14 +359,13 @@ impl<'a> Cg<'a> {
                         LLVMBuildLoad2(self.b, self.i32t, gep, n)
                     }
                 }
-                InputSource::Operand(SourceOperand::ScalarRegister(r)) => {
-                    let r = r as u32;
+                ParameterSource::Sgpr(r) => {
                     if r == self.regs().null { self.ci32(0) } else {
                         let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                         LLVMBuildLoad2(self.b, self.i32t, gep, n)
                     }
                 }
-                InputSource::MaskBit(r) => {
+                ParameterSource::MaskBit(r) => {
                     let word = if r == self.regs().exec && self.p.abi == Abi::Whole {
                         if self.p.width.is_some() { self.ci32(((1u64 << self.width()) - 1) as u32) } else { self.ci32(1) }
                     } else {
@@ -378,14 +375,13 @@ impl<'a> Cg<'a> {
                     };
                     self.mask_to_vec(word)
                 }
-                InputSource::Scc => {
+                ParameterSource::Scc => {
                     if coop {
                         let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(self.regs().scc_slot)].as_mut_ptr(), 1, n);
                         let word = LLVMBuildLoad2(self.b, self.i32t, gep, n);
                         LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, word, self.ci32(0), n)
                     } else { LLVMConstInt(self.i1, 0, 0) }
                 }
-                _ => panic!("unsupported entry parameter binding {:?}", input),
             };
             assert_eq!(ty, input.ty);
             self.define(id, value);
@@ -495,34 +491,31 @@ impl<'a> Cg<'a> {
             let input = &self.p.inputs[index];
             if arg == entry.params[index].0 { continue; }
             match input.source {
-                InputSource::Operand(SourceOperand::VectorRegister(r)) => {
-                    let r = r as u32;
+                ParameterSource::Vgpr(r) => {
                     if r as usize >= self.p.num_vgprs { continue; }
                     let value = self.vector(arg);
                     let gep = LLVMBuildGEP2(self.b, self.i32t, self.vgprs_p, [self.ci32(r * self.width())].as_mut_ptr(), 1, n);
                     let store = LLVMBuildStore(self.b, value, gep);
                     LLVMSetAlignment(store, 4);
                 }
-                InputSource::Operand(SourceOperand::ScalarRegister(r)) => {
-                    let r = r as u32;
+                ParameterSource::Sgpr(r) => {
                     if r == self.regs().null { continue; }
                     let value = self.scalar(arg);
                     let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                     LLVMBuildStore(self.b, value, gep);
                 }
-                InputSource::MaskBit(r) => {
+                ParameterSource::MaskBit(r) => {
                     let value = self.vector(arg);
                     let word = self.vec_to_mask(value);
                     let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                     LLVMBuildStore(self.b, word, gep);
                 }
-                InputSource::Scc => {
+                ParameterSource::Scc => {
                     let value = self.scalar(arg);
                     let word = LLVMBuildZExt(self.b, value, self.i32t, n);
                     let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(self.regs().scc_slot)].as_mut_ptr(), 1, n);
                     LLVMBuildStore(self.b, word, gep);
                 }
-                _ => {}
             }
         }
     }
@@ -566,7 +559,7 @@ impl<'a> Cg<'a> {
                     }
                 }
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
-                    if *provenance & super::lift::wave::SCHEDULED != 0 || !matches!(op, EffectOp::Wave(_)) {
+                    if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0 || !matches!(op, EffectOp::Wave(_)) {
                         self.emit_yield(*provenance, inputs, outputs);
                     } else {
                         self.emit_local_wave(*op, inputs, outputs);

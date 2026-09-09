@@ -336,7 +336,7 @@ fn main() -> Result<()> {
             // read/writelane) to coroutine yields. W=0 uses the original scalar
             // lanes; W>0 advances width-W packets between the same wave-level
             // rendezvous points.
-            let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let scalar = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())

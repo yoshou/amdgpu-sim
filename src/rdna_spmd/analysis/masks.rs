@@ -379,12 +379,12 @@ mod tests {
             Inst::Effect { provenance: 0, op: EffectOp::Memory { space: super::super::super::ir::Space::Lds, op: super::super::super::ir::MemoryOp::Store(super::super::super::ir::MemSize::B32), semantics }, inputs: vec![q, p, always], outputs: vec![] },
         ], term: Term::Ret(vec![]) });
         let constants = super::super::constants(&f);
-        let masks = analyze(&crate::rdna_spmd::dialect::DialectRegistry::rdna4(), &f, 0, &constants, 16, false);
+        let masks = analyze(&crate::rdna_spmd::targets::rdna4::registry(), &f, 0, &constants, 16, false);
         assert_eq!(masks.reactivation, vec![(BlockId(0), 10)]);
         assert!(!masks.guarded[first.0]);
         assert!(!masks.guarded[second.0]);
         assert!(masks.guarded[third.0]);
-        let masks = analyze(&crate::rdna_spmd::dialect::DialectRegistry::rdna4(), &f, 0, &constants, 16, true);
+        let masks = analyze(&crate::rdna_spmd::targets::rdna4::registry(), &f, 0, &constants, 16, true);
         assert!(masks.full[exec.0]);
         assert!(masks.full[cmp.0]);
         assert!(!masks.full[restored.0]);

@@ -38,7 +38,7 @@ fn field(words: &mut [u32], bit: usize, count: usize, value: u32) {
 #[test]
 fn image_ir_requires_constant_component_and_unique_effect_provenance() {
     use crate::rdna_spmd::ir::{*, Op};
-    let registry = DialectRegistry::rdna4(); let op = image_sample(&registry);
+    let registry = crate::rdna_spmd::targets::rdna4::registry(); let op = image_sample(&registry);
     let mut types = registry.operation(op).unwrap().inputs.to_vec(); types.push(Ty::I32);
     let args = Arguments::Sixteen(std::array::from_fn(ValueId));
     let f = Func { entry: BlockId(0), types: types.clone(), blocks: std::collections::BTreeMap::from([(BlockId(0), Block {
@@ -63,7 +63,7 @@ fn image_ir_requires_constant_component_and_unique_effect_provenance() {
 
 #[test]
 fn native_sampler_matches_reference_with_lane_distinct_descriptors_and_coordinates() {
-    let registry = Arc::new(DialectRegistry::rdna4());
+    let registry = Arc::new(crate::rdna_spmd::targets::rdna4::registry());
     let target = image_sample(&registry);
     let mut storage = vec![0u8; 384 + 255];
     let offset = (256 - storage.as_ptr() as usize % 256) % 256;

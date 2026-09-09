@@ -1,8 +1,6 @@
 //! Lift wave and synchronization operations once, including their boundary values.
-use super::super::{
-    lift::regs::BoundaryIo,
-    ir::{*, Ty},
-};
+use super::regs::BoundaryIo;
+use crate::rdna_spmd::ir::{*, Ty};
 use crate::{
     instructions::I,
     rdna_instructions::{InstFormat, SourceOperand},
@@ -176,12 +174,11 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     })
 }
 
-pub(in crate::rdna_spmd) const SCHEDULED: u64 = 1 << 62;
 
-pub(in crate::rdna_spmd) fn mark_scheduled(insts: &mut [super::super::ir::Inst]) {
+pub(in crate::rdna_spmd) fn mark_scheduled(insts: &mut [crate::rdna_spmd::ir::Inst]) {
     for inst in insts {
-        if let super::super::ir::Inst::Effect { provenance, op, .. } = inst {
-            if matches!(op, EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait) && *provenance & (1 << 63) == 0 { *provenance |= SCHEDULED; }
+        if let crate::rdna_spmd::ir::Inst::Effect { provenance, op, .. } = inst {
+            if matches!(op, EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait) && *provenance & (1 << 63) == 0 { *provenance |= crate::rdna_spmd::ir::SCHEDULED; }
         }
     }
 }
@@ -195,17 +192,17 @@ pub(in crate::rdna_spmd) struct Plan {
 impl YieldAction {
     pub(super) fn lift(
         &self,
-        f: &mut super::super::ir::Func,
-        block: &mut super::super::ir::Block,
+        f: &mut crate::rdna_spmd::ir::Func,
+        block: &mut crate::rdna_spmd::ir::Block,
         words: &mut super::regs::Words,
         provenance: &mut u64,
     ) -> Plan {
-        use super::super::ir::{Inst, IntOp, Op, ValueId};
+        use crate::rdna_spmd::ir::{Inst, IntOp, Op, ValueId};
         fn operand(
             arg: &Operand,
             ty: Ty,
-            f: &mut super::super::ir::Func,
-            block: &mut super::super::ir::Block,
+            f: &mut crate::rdna_spmd::ir::Func,
+            block: &mut crate::rdna_spmd::ir::Block,
             words: &super::regs::Words,
         ) -> ValueId {
             if let Operand::Add(a, k) = arg {
@@ -270,13 +267,13 @@ impl YieldAction {
             if matches!(dest, Destination::Sgpr(_)) && t == Ty::I1 {
                 let value = f.value(Ty::I32);
                 block.insts.push(Inst::Core { value, ty: Ty::I32,
-                    op: Op::Convert(super::super::ir::Cvt::ZExt, Ty::I32, stored) });
+                    op: Op::Convert(crate::rdna_spmd::ir::Cvt::ZExt, Ty::I32, stored) });
                 stored = value;
             }
             if t == Ty::F32 && word.is_some() {
                 let value = f.value(Ty::I32);
                 block.insts.push(Inst::Core { value, ty: Ty::I32,
-                    op: Op::Convert(super::super::ir::Cvt::Bitcast, Ty::I32, stored) });
+                    op: Op::Convert(crate::rdna_spmd::ir::Cvt::Bitcast, Ty::I32, stored) });
                 stored = value;
             }
             if let Some(word) = word {

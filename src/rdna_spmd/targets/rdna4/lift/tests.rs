@@ -1015,7 +1015,7 @@ fn typed_function_loop_carries_values_through_block_arguments() {
         ]),
     };
     let lifted = crate::rdna_spmd::CompilationInput::to_ssa(&program);
-    let block = &lifted.function.ir.blocks[&super::super::ir::BlockId(1)];
+    let block = &lifted.function.ir.blocks[&crate::rdna_spmd::ir::BlockId(1)];
     assert!(!block.params.is_empty());
     assert!(block
         .term
@@ -1966,7 +1966,7 @@ fn comparison_classes_accept_dynamic_lane_selectors_at_all_widths() {
                         vgprs[6 * w + lane] = selector;
                         expected.push((selector >> (index % 10)) & 1);
                         if bits != 16 {
-                            assert_eq!(crate::rdna_spmd::dialect::rdna4::reference_class(
+                            assert_eq!(crate::rdna_spmd::targets::rdna4::dialect::reference_class(
                                 if bits == 32 { Ty::F32 } else { Ty::F64 }, pattern, selector) as u32,
                                 expected[lane]);
                         }
@@ -2114,7 +2114,7 @@ fn captured_float_edges_and_integer_clamps_execute_at_all_widths() {
 #[test]
 fn target_math_matches_reference_for_runtime_values_in_every_lane() {
     use crate::rdna_instructions::VOP1;
-    use crate::rdna_spmd::dialect::rdna4::reference;
+    use crate::rdna_spmd::targets::rdna4::dialect::reference;
     for (ops, bits, size) in [
         ([I::V_RCP_F32, I::V_RSQ_F32, I::V_SQRT_F32],
             vec![0, 0x80000000, 1, 0x807fffff, 0x00800000, 0x3f800000,
@@ -2298,7 +2298,7 @@ unsafe fn run_scalar_fiber(kernel: &crate::rdna_spmd::engine::kernel::CoopKernel
 #[test]
 fn cooperative_ssa_values_survive_yield_and_accept_only_explicit_results() {
     use crate::rdna_spmd::engine::fiber::{Fiber, KernelArgs, FIBER_DONE};
-    use crate::rdna_spmd::lift::wave::{YieldAction, Operand, Destination};
+    use crate::rdna_spmd::targets::rdna4::lift::wave::{YieldAction, Operand, Destination};
     use crate::rdna_spmd::ir::{EffectOp, WaveOp};
     let add = |dst, a, b| InstFormat::VOP2(VOP2 { op: I::V_ADD_NC_U32,
         src0: SourceOperand::VectorRegister(a), vsrc1: b, vdst: dst, literal_constant: None });

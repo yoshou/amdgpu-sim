@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use crate::rdna_spmd::{Compiler, ScalarBlock, ScalarProgram, Terminator};
     use crate::rdna_spmd::engine::fiber::{KernelArgs, FIBER_DONE};
-    use crate::rdna_spmd::lift::wave::{Destination, Operand, YieldAction};
+    use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, Operand, YieldAction};
     use crate::rdna_instructions::SourceOperand;
     use std::collections::BTreeMap;
 
@@ -320,7 +320,7 @@ mod tests {
     fn architectural_mask_words_and_branches_use_packet_bits() {
         use crate::instructions::I;
         use crate::rdna_instructions::{InstFormat,SOP1};
-        use crate::rdna_spmd::decode::Cond;
+        use crate::rdna_spmd::targets::rdna4::decode::Cond;
         let mov = |sdst,ssrc0| InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst,ssrc0});
         let p = ScalarProgram {entry_pc:0,blocks:BTreeMap::from([
             (0,ScalarBlock {pc:0,body:vec![
@@ -360,7 +360,7 @@ mod tests {
     fn exec_vcc_and_scc_branches_reduce_within_each_packet() {
         use crate::instructions::I;
         use crate::rdna_instructions::{InstFormat,SOP1};
-        use crate::rdna_spmd::decode::Cond;
+        use crate::rdna_spmd::targets::rdna4::decode::Cond;
         let mov=|value|InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst:12,
             ssrc0:SourceOperand::IntegerConstant(value)});
         for cond in [Cond::ExecZ,Cond::ExecNz,Cond::VccZ,Cond::VccNz,Cond::Scc0,Cond::Scc1] {

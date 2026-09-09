@@ -290,7 +290,7 @@ fn main() -> Result<()> {
             let kernel_desc = decode_kernel_desc(&mem[kernel_addr..(kernel_addr + 64)]);
             let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
             let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
-            let program = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let program = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())

@@ -291,12 +291,12 @@ mod tests {
     use super::*;
     use crate::rdna_spmd::ir::print;
 
-    fn registry() -> DialectRegistry { DialectRegistry::rdna4() }
+    fn registry() -> DialectRegistry { crate::rdna_spmd::targets::rdna4::registry() }
 
     #[test]
     fn every_operation_form_prints_and_parses_back_to_the_same_function() {
         let registry = registry();
-        let rcp = registry.lookup(crate::rdna_spmd::dialect::rdna4::ID, "rcp.f32").unwrap();
+        let rcp = registry.lookup(crate::rdna_spmd::targets::rdna4::dialect::ID, "rcp.f32").unwrap();
         let semantics = MemorySemantics { scope: Scope::Device, ordering: Ordering::Relaxed, cache_policy: CachePolicy::NearNonTemporalFarWriteBack, volatile: true, deferred_scope: false };
         let mut f = Func { entry: BlockId(4), blocks: BTreeMap::new(), types: vec![] };
         let p0 = f.value(Ty::I32); let p1 = f.value(Ty::I64); let p2 = f.value(Ty::I1); let p3 = f.value(Ty::F32);
@@ -360,9 +360,9 @@ mod tests {
     #[test]
     fn lifted_kernel_objects_round_trip_through_the_printer() {
         let registry = registry();
-        for &(path, symbol) in crate::rdna_spmd::decode::OBJECTS {
-            let (entry, memory) = crate::rdna_spmd::decode::load_object(path, symbol);
-            let program = crate::rdna_spmd::decode_program(entry, &memory).unwrap();
+        for &(path, symbol) in crate::rdna_spmd::targets::rdna4::decode::OBJECTS {
+            let (entry, memory) = crate::rdna_spmd::targets::rdna4::decode::load_object(path, symbol);
+            let program = crate::rdna_spmd::decode_program("gfx1200", entry, &memory).unwrap();
             let text = print::func(&registry, &program.function.ir);
             let parsed = func(&registry, &text).unwrap();
             assert_eq!(parsed, program.function.ir);

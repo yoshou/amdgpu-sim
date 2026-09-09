@@ -1,6 +1,8 @@
 //! Ordered, typed effects. ISA operands are resolved by the lifter.
 use super::{Ty, ValueId};
 
+pub(crate) const SCHEDULED: u64 = 1 << 62;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Space {
     Global,

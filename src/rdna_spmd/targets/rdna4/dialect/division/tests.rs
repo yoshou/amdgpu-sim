@@ -7,7 +7,7 @@ struct Case { inputs: [u64; 4], result: u64, flag: u32 }
 // Invoke actual generated providers with lane-distinct runtime arguments.
 // Store both results independently, so dropped/reordered target outputs fail.
 fn check(opcode: I, cases: &[Case]) {
-    let registry = Arc::new(DialectRegistry::rdna4());
+    let registry = Arc::new(crate::rdna_spmd::targets::rdna4::registry());
     let target = super::super::division(&registry, opcode).unwrap();
     let spec = registry.operation(target).unwrap();
     let ty = spec.inputs[0];

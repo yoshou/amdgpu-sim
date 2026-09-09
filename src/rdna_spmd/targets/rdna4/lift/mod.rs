@@ -1,23 +1,23 @@
 //! Lift ISA operands, state updates and effects into typed SSA.
-use super::ir::*;
-use super::dialect::{DialectRegistry, Arguments};
+use crate::rdna_spmd::ir::*;
+use crate::rdna_spmd::dialect::{DialectRegistry, Arguments};
 use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
-pub(super) mod memory;
-pub(super) mod wave;
+pub(crate) mod memory;
+pub(crate) mod wave;
 mod scalar;
 mod compare;
 mod dual;
 mod packed;
 mod division;
 mod image;
-pub(super) mod half;
-pub(super) mod regs;
-pub(super) mod control;
-pub(super) mod access;
-pub(super) mod rewrite;
+pub(crate) mod half;
+pub(crate) mod regs;
+pub(crate) mod control;
+pub(crate) mod access;
+pub(crate) mod rewrite;
 
-pub(super) enum Lowering {
+pub(crate) enum Lowering {
     Memory(memory::Memory),
     Wave(wave::YieldAction),
     TypedAlu {
@@ -28,7 +28,7 @@ pub(super) enum Lowering {
     },
 }
 #[derive(Clone, Debug)]
-pub(super) struct Input {
+pub(crate) struct Input {
     pub source: InputSource,
     pub ty: Ty,
 }
@@ -49,7 +49,7 @@ impl Input {
     }
 }
 #[derive(Clone, Debug)]
-pub(super) enum InputSource {
+pub(crate) enum InputSource {
     Operand(SourceOperand),
     Scc,
     /// Architectural per-work-item state; never a wave reduction.
@@ -59,7 +59,7 @@ pub(super) enum InputSource {
     ExecPredicate,
 }
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Output {
+pub(crate) enum Output {
     Vgpr(u32, Ty),
     Compare(u32),
     Mask(u32),
@@ -95,14 +95,14 @@ impl<'r> Builder<'r> {
         self.insts.push(ExprInst::Core(ty, op));
         id
     }
-    fn target(&mut self, op: super::dialect::TargetOp, args: Arguments) -> Vec<ValueId> {
+    fn target(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> Vec<ValueId> {
         let outputs = self.registry.operation(op).expect("missing target provider").outputs.clone();
         let values = (self.next_value..self.next_value + outputs.len()).map(ValueId).collect();
         self.next_value += outputs.len();
         self.insts.push(ExprInst::Target { op, args, outputs });
         values
     }
-    fn target_one(&mut self, op: super::dialect::TargetOp, args: Arguments) -> ValueId {
+    fn target_one(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> ValueId {
         let values = self.target(op, args);
         assert_eq!(values.len(), 1);
         values[0]
@@ -242,7 +242,7 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
 }
 
 #[cfg(test)]
-pub(super) fn instruction(inst: &InstFormat) -> Lowering { instruction_with_registry(inst, &DialectRegistry::rdna4()) }
+pub(super) fn instruction(inst: &InstFormat) -> Lowering { instruction_with_registry(inst, &crate::rdna_spmd::targets::rdna4::registry()) }
 
 pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
     if let Some(action) = wave::instruction(inst) { return Lowering::Wave(action); }
@@ -282,8 +282,8 @@ pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectReg
     // Decide input types/arity before assigning IDs. Literals retain their ISA
     // interpretation in Input, while constants introduced by the lift are bits.
     let cvt = conversion(op);
-    let target = super::dialect::rdna4::unary(registry, op)
-        .or_else(|| super::dialect::rdna4::binary(registry, op));
+    let target = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, op)
+        .or_else(|| crate::rdna_spmd::targets::rdna4::dialect::binary(registry, op));
     let float_ty = match op {
         I::V_ADD_F64
         | I::V_MUL_F64
@@ -653,4 +653,4 @@ fn conversion(op: I) -> Option<(Ty, Ty, Cvt)> {
 #[cfg(test)]
 mod tests;
 
-pub(super) mod function;
+pub(crate) mod function;

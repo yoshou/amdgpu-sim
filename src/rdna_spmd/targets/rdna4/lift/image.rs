@@ -13,7 +13,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         inputs.push(Input {source:InputSource::ExecPredicate,ty:Ty::I1});
         inputs.push(input(SourceOperand::ScalarRegister(126),Ty::I32));
         let mut b=Builder::new(registry,inputs);
-        let values=b.target(crate::rdna_spmd::dialect::rdna4::bvh(registry),Arguments::Fifteen(std::array::from_fn(ValueId)));
+        let values=b.target(crate::rdna_spmd::targets::rdna4::dialect::bvh(registry),Arguments::Fifteen(std::array::from_fn(ValueId)));
         return Some(b.finish_many(false,values.into_iter().enumerate().map(|(k,v)|(Output::Vgpr(i.vdata as u32+k as u32,Ty::I32),v)).collect()));
     }
     let InstFormat::VSAMPLE(i) = inst else { return None; };
@@ -33,7 +33,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         let (ty, zero) = if k < 12 { (Ty::I32, zero_word) } else { (Ty::F32, zero_float) };
         b.push(ty, Op::Select(ValueId(14), ValueId(k), zero))
     });
-    let target = super::super::dialect::rdna4::image_sample(registry);
+    let target = crate::rdna_spmd::targets::rdna4::dialect::image_sample(registry);
     let unrm = b.k(Ty::I1, (i.unrm != 0) as u64);
     let mut results = vec![];
     for component in 0..4 {

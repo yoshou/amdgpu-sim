@@ -313,9 +313,9 @@ pub(super) fn define(
 }
 
 pub(super) fn branch(
-    f: &mut Func, insts: &mut Vec<Inst>, words: &Words, scc: ValueId, cond: crate::rdna_spmd::decode::Cond,
+    f: &mut Func, insts: &mut Vec<Inst>, words: &Words, scc: ValueId, cond: crate::rdna_spmd::targets::rdna4::decode::Cond,
 ) -> ValueId {
-    use crate::rdna_spmd::decode::Cond;
+    use crate::rdna_spmd::targets::rdna4::decode::Cond;
     use crate::rdna_spmd::ir::Inst;
     let input_value = match cond {
         Cond::Scc0 | Cond::Scc1 => scc,

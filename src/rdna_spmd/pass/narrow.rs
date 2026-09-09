@@ -2,7 +2,19 @@ use super::super::analysis::masks::Masks;
 use super::super::ir::{*, Cvt, Op, ValueId};
 use std::collections::BTreeMap;
 
-pub(crate) fn run(f: &mut Func, masks: &Masks) -> Vec<bool> {
+pub(crate) struct Narrow;
+impl super::Pass for Narrow {
+    fn name(&self) -> &str { "narrow" }
+    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
+        let (narrowed, rewrites) = apply(f, analyses.masks(f));
+        rewrites > 0 || narrowed.iter().any(|&b| b)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn run(f: &mut Func, masks: &Masks) -> Vec<bool> { apply(f, masks).0 }
+
+fn apply(f: &mut Func, masks: &Masks) -> (Vec<bool>, usize) {
     let mut narrowed = vec![false; f.types.len()];
     for block in f.blocks.values_mut() {
         for inst in &mut block.insts {
@@ -16,13 +28,13 @@ pub(crate) fn run(f: &mut Func, masks: &Masks) -> Vec<bool> {
             }
         }
     }
-    forward(f, masks, &narrowed);
-    distribute(f, masks, &narrowed);
+    let rewrites = forward(f, masks, &narrowed) + distribute(f, masks, &narrowed);
     narrowed.resize(f.types.len(), false);
-    narrowed
+    (narrowed, rewrites)
 }
 
-fn distribute(f: &mut Func, masks: &Masks, narrowed: &[bool]) {
+fn distribute(f: &mut Func, masks: &Masks, narrowed: &[bool]) -> usize {
+    let mut count = 0;
     let mut defs: Vec<Option<Op>> = vec![None; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { defs[value.0] = Some(*op); } }
@@ -41,6 +53,7 @@ fn distribute(f: &mut Func, masks: &Masks, narrowed: &[bool]) {
                         insts.push(Inst::Core { value: lo, ty, op: Op::Pack64(x, z) });
                         insts.push(Inst::Core { value: hi, ty, op: Op::Pack64(y, w) });
                         insts.push(Inst::Core { value, ty, op: Op::Select(c, lo, hi) });
+                        count += 1;
                         continue;
                     }
                 }
@@ -49,9 +62,11 @@ fn distribute(f: &mut Func, masks: &Masks, narrowed: &[bool]) {
         }
         f.blocks.get_mut(&id).unwrap().insts = insts;
     }
+    count
 }
 
-fn forward(f: &mut Func, masks: &Masks, narrowed: &[bool]) {
+fn forward(f: &mut Func, masks: &Masks, narrowed: &[bool]) -> usize {
+    let mut count = 0;
     let mut defs: Vec<Option<Op>> = vec![None; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { defs[value.0] = Some(*op); } }
@@ -73,22 +88,30 @@ fn forward(f: &mut Func, masks: &Masks, narrowed: &[bool]) {
             match inst {
                 Inst::Core { value, op, .. } => {
                     if masks.exposed.get(value.0).copied().unwrap_or(0) == 0 {
+                        let before = *op;
                         match *op {
                             Op::Select(c, new, old) if masks.predicated.get(value.0).is_some_and(|p| p.is_some()) => *op = Op::Select(c, substitute(new, f, &mut fresh), old),
                             _ => *op = op.map(|v| substitute(v, f, &mut fresh)),
                         }
+                        if *op != before { count += 1; }
                     }
                 }
                 Inst::Target { provenance: None, args, outputs, .. } => {
-                    if outputs.iter().all(|(v, _)| masks.exposed.get(v.0).copied().unwrap_or(0) == 0) { *args = args.map(|v| substitute(v, f, &mut fresh)); }
+                    if outputs.iter().all(|(v, _)| masks.exposed.get(v.0).copied().unwrap_or(0) == 0) {
+                        let before = *args;
+                        *args = args.map(|v| substitute(v, f, &mut fresh));
+                        if *args != before { count += 1; }
+                    }
                 }
                 _ => {}
             }
+            count += fresh.len();
             out.extend(fresh);
             out.push(inst.clone());
         }
         f.blocks.get_mut(&id).unwrap().insts = out;
     }
+    count
 }
 
 fn resolve(v: ValueId, current: ValueId, masks: &Masks, narrowed: &[bool], _defs: &[Option<Op>], _f: &mut Func, _fresh: &mut Vec<Inst>, _depth: usize) -> Option<ValueId> {
@@ -112,7 +135,7 @@ mod tests {
     }
     fn masks(f: &Func) -> Masks {
         let constants = super::super::super::analysis::constants(f);
-        super::super::super::analysis::masks::analyze(&super::super::super::dialect::DialectRegistry::rdna4(), f, 0, &constants, 16, false)
+        super::super::super::analysis::masks::analyze(&crate::rdna_spmd::targets::rdna4::registry(), f, 0, &constants, 16, false)
     }
 
     #[test]

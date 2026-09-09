@@ -30,7 +30,7 @@ use crate::rdna_instructions::SourceOperand;
 use super::dispatch::{setup_sgprs, GridDims};
 use super::kernel::{COOP_SGPR_BUF, COOP_SPILL_SLOTS};
 #[cfg(test)]
-use super::super::lift::regs::RegSet;
+use crate::rdna_spmd::targets::rdna4::lift::regs::RegSet;
 use super::kernel::CoopVecKernel;
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 
@@ -41,9 +41,9 @@ const WAVE: usize = 32;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct XlaneOp(pub(in crate::rdna_spmd) super::super::ir::EffectOp);
 #[cfg(test)]
-use super::super::lift::wave::{Destination, YieldAction};
+use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, YieldAction};
 #[cfg(test)]
-use super::super::lift::wave::Operand;
+use crate::rdna_spmd::targets::rdna4::lift::wave::Operand;
 #[cfg(test)]
 use super::super::ir::{EffectOp, WaveOp};
 

@@ -1,5 +1,5 @@
 //! Memory decoding and address semantics; no LLVM or execution-width knowledge.
-use super::super::ir::{*};
+use crate::rdna_spmd::ir::{*};
 use super::input;
 use crate::{
     instructions::I,
@@ -436,8 +436,8 @@ impl Memory {
         let flat = if matches!(self.address, Address::Flat { .. }) {
             let sb = f.value(Ty::I64);
             let size = f.value(Ty::I64);
-            block.insts.push(Inst::Core { value: sb, ty: Ty::I64, op: Op::Env(super::super::ir::Env::ScratchBase) });
-            block.insts.push(Inst::Core { value: size, ty: Ty::I64, op: Op::Env(super::super::ir::Env::ScratchSize) });
+            block.insts.push(Inst::Core { value: sb, ty: Ty::I64, op: Op::Env(crate::rdna_spmd::ir::Env::ScratchBase) });
+            block.insts.push(Inst::Core { value: size, ty: Ty::I64, op: Op::Env(crate::rdna_spmd::ir::Env::ScratchSize) });
             let mut push = |t, op| {
                 let value = f.value(t);
                 block.insts.push(Inst::Core { value, ty: t, op });

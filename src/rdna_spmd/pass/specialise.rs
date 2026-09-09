@@ -2,6 +2,16 @@ use super::super::analysis::masks::Masks;
 use super::super::ir::{*, EffectOp, Env, IntOp, Op, Ty, ValueId};
 use std::collections::BTreeMap;
 
+pub(crate) struct Specialise;
+impl super::Pass for Specialise {
+    fn name(&self) -> &str { "specialise" }
+    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
+        let exec_index = analyses.context().exec_index;
+        let blocks = candidates(f, analyses.masks(f), exec_index);
+        !blocks.is_empty() && run(f, &blocks, exec_index) > 0
+    }
+}
+
 pub(crate) fn candidates(f: &Func, masks: &Masks, exec_index: usize) -> Vec<BlockId> {
     let mut out = Vec::new();
     for (&id, block) in &f.blocks {
@@ -11,7 +21,7 @@ pub(crate) fn candidates(f: &Func, masks: &Masks, exec_index: usize) -> Vec<Bloc
         let Some(&(exec, _)) = block.params.iter().filter(|p| p.1 == Ty::I1).nth(k) else { continue; };
         if masks.full[exec.0] { continue; }
         if block.insts.iter().any(|inst| matches!(inst, Inst::Effect { provenance, op, .. }
-            if *provenance & super::super::lift::wave::SCHEDULED != 0 || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait))) { continue; }
+            if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0 || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait))) { continue; }
         let wanted = block.insts.iter().filter(|inst| match inst {
             Inst::Core { value, op: Op::Select(..), .. } => masks.predicated[value.0].is_some_and(|(_, e)| e == exec),
             _ => false,

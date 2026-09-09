@@ -2,18 +2,12 @@
 //! Register words become block parameters and explicit definitions; effects
 //! define their results before outgoing edges are constructed.
 use super::*;
-use crate::rdna_spmd::decode::{ScalarProgram, Terminator};
+use crate::rdna_spmd::targets::rdna4::decode::{ScalarProgram, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
 use super::regs::{Word, Words, footprint, words as register_words};
 
 /// Typed SSA before native representation and predication decisions are applied.
-#[derive(Clone)]
-pub(in crate::rdna_spmd) struct LiftedFunction {
-    pub registry: std::sync::Arc<DialectRegistry>,
-    pub ir: Func,
-    pub parameter_inputs: Vec<Input>,
-    pub revision: u64,
-}
+use crate::rdna_spmd::program::{LiftedFunction, Parameter, ParameterSource};
 pub(in crate::rdna_spmd) fn lift(
         registry: std::sync::Arc<DialectRegistry>,
         program: &ScalarProgram,
@@ -132,11 +126,11 @@ pub(in crate::rdna_spmd) fn lift(
             };
             f.blocks.insert(BlockId(pc), block);
         }
-        let parameter_inputs:Vec<_>=regs.iter().map(|word|Input {ty:word.ty(),source:match *word {
-            Word::Vgpr(r)=>InputSource::Operand(SourceOperand::VectorRegister(r as u8)),
-            Word::Sgpr(r)=>InputSource::Operand(SourceOperand::ScalarRegister(r as u8)),
-            Word::Mask(r)=>InputSource::MaskBit(r),
-        }}).chain(std::iter::once(Input {ty:Ty::I1,source:InputSource::Scc})).collect();
+        let parameter_inputs:Vec<_>=regs.iter().map(|word|Parameter {ty:word.ty(),source:match *word {
+            Word::Vgpr(r)=>ParameterSource::Vgpr(r),
+            Word::Sgpr(r)=>ParameterSource::Sgpr(r),
+            Word::Mask(r)=>ParameterSource::MaskBit(r),
+        }}).chain(std::iter::once(Parameter {ty:Ty::I1,source:ParameterSource::Scc})).collect();
         LiftedFunction { registry, ir: f, parameter_inputs, revision: 0 }
 }
 fn invalidate(views: &mut BTreeMap<(Word, Ty, bool), ValueId>, writes: &[Word]) {

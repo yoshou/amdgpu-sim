@@ -277,22 +277,22 @@ pub(crate) fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded
 mod tests {
     use super::*;
     use super::super::super::ir::{IntPred};
-    use crate::rdna_spmd::{decode::{ScalarProgram, ScalarBlock, Terminator}, lift::wave::{YieldAction, Operand, Destination}, CompilationInput};
+    use crate::rdna_spmd::{targets::rdna4::decode::{ScalarProgram, ScalarBlock, Terminator}, targets::rdna4::lift::wave::{YieldAction, Operand, Destination}, CompilationInput};
     use crate::rdna_instructions::{InstFormat, SourceOperand, VOP3SD, VSCRATCH, VGLOBAL};
     use crate::instructions::I;
 
-    fn lifted(program: &ScalarProgram) -> (crate::rdna_spmd::lift::function::LiftedFunction, Uniformity) {
+    fn lifted(program: &ScalarProgram) -> (crate::rdna_spmd::program::LiftedFunction, Uniformity) {
         let f = program.to_ssa().function;
         let u = crate::rdna_spmd::compiler::packet_uniformity(&f, 16, true, true);
         (f, u)
     }
-    fn slot(f: &crate::rdna_spmd::lift::function::LiftedFunction, slot: u32) -> usize {
-        f.parameter_inputs.iter().position(|p| matches!(p.source, crate::rdna_spmd::lift::InputSource::Operand(SourceOperand::VectorRegister(r)) if r as u32 == slot)).unwrap()
+    fn slot(f: &crate::rdna_spmd::program::LiftedFunction, slot: u32) -> usize {
+        f.parameter_inputs.iter().position(|p| matches!(p.source, crate::rdna_spmd::program::ParameterSource::Vgpr(r) if r == slot)).unwrap()
     }
-    fn parameter(f: &crate::rdna_spmd::lift::function::LiftedFunction, pc: usize, register: u32) -> ValueId {
+    fn parameter(f: &crate::rdna_spmd::program::LiftedFunction, pc: usize, register: u32) -> ValueId {
         f.ir.blocks[&BlockId(pc)].params[slot(f, register)].0
     }
-    fn returned(f: &crate::rdna_spmd::lift::function::LiftedFunction, pc: usize, register: u32) -> ValueId {
+    fn returned(f: &crate::rdna_spmd::program::LiftedFunction, pc: usize, register: u32) -> ValueId {
         let Term::Ret(args) = &f.ir.blocks[&BlockId(pc)].term else { panic!("block does not return") };
         args[slot(f, register)]
     }

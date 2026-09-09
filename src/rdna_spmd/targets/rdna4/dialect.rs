@@ -2,7 +2,7 @@
 //! root. The design selects exact host division/sqrt within the ISA error
 //! allowance. F32 flushes input/output subnormals to signed zero; F64 preserves
 //! them. Modifiers are applied by lift before/after the target operation.
-use super::{DialectRegistry, Effect, Implementation, Operation, TargetOp};
+use crate::rdna_spmd::dialect::{DialectRegistry, Effect, Implementation, Operation, TargetOp};
 use crate::instructions::I;
 use crate::rdna_spmd::{ir::Ty, codegen::ops::Emitter};
 use llvm_sys::{core::*, prelude::*};
@@ -15,9 +15,10 @@ pub(in crate::rdna_spmd) mod bvh;
 pub(in crate::rdna_spmd) use reduction::reference as reference_reduction;
 
 pub(in crate::rdna_spmd) const ID: u32 = 0x52444e34;
-pub(super) const REGISTERS: super::Registers = super::Registers { exec: 126, vcc: 106, null: 124, scc_slot: 128, sgprs: 128, vgprs: 256 };
+pub(crate) mod idioms;
+pub(crate) const REGISTERS: crate::rdna_spmd::dialect::Registers = crate::rdna_spmd::dialect::Registers { exec: 126, vcc: 106, null: 124, scc_slot: 128, sgprs: 128, vgprs: 256 };
 
-pub(super) fn register(registry: &mut DialectRegistry) -> Result<(), &'static str> {
+pub(crate) fn register(registry: &mut DialectRegistry) -> Result<(), &'static str> {
     registry.register(ID, 36, Operation { name: "image_sample_lz", effect: Effect::ReadGlobal { every_lane: true },
         immediates: &[(12, 3)], inputs: &[Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32,
             Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I1, Ty::F32, Ty::F32],

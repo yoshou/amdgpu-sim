@@ -269,7 +269,7 @@ fn main() -> Result<()> {
             println!("group_segment_size (LDS): {}", group_segment_size);
 
             // Build scalar IR, split at workgroup barriers, JIT the cooperative kernel.
-            let program = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let program = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
             let vec_width = matches.opt_str("vec_width").map(|s| s.parse::<u32>().unwrap()).unwrap_or(0);
             let kernel = compile(&program, CompileOptions { width: vec_width, num_vgprs, workgroup_x: Some(threads_per_block as u32) });
 

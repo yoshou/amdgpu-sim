@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct VerifiedFunc(Func);
 impl Func {
     #[cfg(test)]
-    pub fn verify(self) -> Result<VerifiedFunc, &'static str> { self.verify_with(&crate::rdna_spmd::dialect::DialectRegistry::rdna4()) }
+    pub fn verify(self) -> Result<VerifiedFunc, &'static str> { self.verify_with(&crate::rdna_spmd::targets::rdna4::registry()) }
     pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedFunc, &'static str> {
         if !self.blocks.contains_key(&self.entry) {
             return Err("missing entry");
@@ -110,7 +110,7 @@ impl VerifiedFunc {
 pub(crate) struct VerifiedExpr(Expr);
 impl Expr {
     #[cfg(test)]
-    pub fn verify(self) -> Result<VerifiedExpr, &'static str> { self.verify_with(&crate::rdna_spmd::dialect::DialectRegistry::rdna4()) }
+    pub fn verify(self) -> Result<VerifiedExpr, &'static str> { self.verify_with(&crate::rdna_spmd::targets::rdna4::registry()) }
     pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedExpr, &'static str> {
         let mut types = self.params.clone();
         let mut constants = std::collections::BTreeMap::new();

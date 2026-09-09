@@ -578,7 +578,7 @@ fn main() -> Result<()> {
                     private_segment_size);
 
                 // Front end: decode CFG -> Scalar IR.
-                let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+                let scalar = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
                 let dims = GridDims {
                     num_wg_x: (width / 16) as u32,
                     num_wg_y: (height / 16) as u32,

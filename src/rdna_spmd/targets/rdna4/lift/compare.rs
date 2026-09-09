@@ -233,7 +233,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
             } else {
                 let float = if comparison.bits == 32 { Ty::F32 } else { Ty::F64 };
                 let a = b.push(float, Op::Convert(Cvt::Bitcast, float, a));
-                let target = crate::rdna_spmd::dialect::rdna4::comparison(registry, float);
+                let target = crate::rdna_spmd::targets::rdna4::dialect::comparison(registry, float);
                 b.target_one(target, Arguments::Binary([a, c]))
             }
         }

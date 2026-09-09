@@ -28,6 +28,15 @@ fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut BTreeSet<(Val
     }
 }
 
+pub(crate) struct Pairs;
+impl super::Pass for Pairs {
+    fn name(&self) -> &str { "pairs" }
+    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
+        let uniform = analyses.uniform(f).to_vec();
+        run(f, &uniform) > 0
+    }
+}
+
 pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
     let defs = definitions(f);
     let mut params: BTreeMap<ValueId, (BlockId, usize)> = BTreeMap::new();

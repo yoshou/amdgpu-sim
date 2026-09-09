@@ -1,6 +1,15 @@
 use super::super::analysis::masks::{Exec, Masks};
 use super::super::ir::{*, Cvt, Op};
 
+pub(crate) struct Active;
+impl super::Pass for Active {
+    fn name(&self) -> &str { "active" }
+    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
+        let (masks, exec) = (analyses.masks(f), analyses.exec(f));
+        run(f, masks, exec) > 0
+    }
+}
+
 pub(crate) fn run(f: &mut Func, masks: &Masks, exec: &Exec) -> usize {
     let mut count = 0;
     for (&id, block) in f.blocks.iter_mut() {

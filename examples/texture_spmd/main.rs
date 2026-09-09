@@ -329,7 +329,7 @@ fn main() -> Result<()> {
             let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
             let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
 
-            let scalar = decode_program(entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
+            let scalar = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
 
             let dims = GridDims {
                 num_wg_x: grid_dim[0],

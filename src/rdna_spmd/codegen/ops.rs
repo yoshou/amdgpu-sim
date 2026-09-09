@@ -5,7 +5,7 @@ use llvm::core::*;
 use llvm::prelude::*;
 use llvm_sys as llvm;
 
-pub(in crate::rdna_spmd) struct Emitter {
+pub(crate) struct Emitter {
     pub(in crate::rdna_spmd) state: Option<Box<dyn std::any::Any>>,
     registry: std::sync::Arc<super::super::dialect::DialectRegistry>,
     pub b: LLVMBuilderRef,

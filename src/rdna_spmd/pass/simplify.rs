@@ -28,6 +28,12 @@ pub(crate) fn rename(f: &mut Func, map: &BTreeMap<ValueId, ValueId>) {
     }
 }
 
+pub(crate) struct Simplify;
+impl super::Pass for Simplify {
+    fn name(&self) -> &str { "simplify" }
+    fn run(&self, f: &mut Func, _: &super::Analyses) -> bool { run(f) > 0 }
+}
+
 pub(crate) fn run(f: &mut Func) -> usize {
     let defs = definitions(f);
     let mut map: BTreeMap<ValueId, ValueId> = BTreeMap::new();

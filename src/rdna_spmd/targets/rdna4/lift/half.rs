@@ -52,7 +52,7 @@ pub(in crate::rdna_spmd) fn registers(inst: &InstFormat) -> Option<(Vec<u32>, u3
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let Operands { op, src, dst, abs, neg, clamp, omod, src_high, dst_high, widening } = operands(inst)?;
-    let target = crate::rdna_spmd::dialect::rdna4::unary(registry, op).unwrap();
+    let target = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, op).unwrap();
     if widening {
         let mut b = Builder::new(registry, vec![input(source(src), Ty::I32)]);
         let mut value = ValueId(0);
