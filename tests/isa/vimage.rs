@@ -15,7 +15,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// The BVH resource for image_bvh64_intersect_ray, as Table 65 lays it out:
 /// box sorting on with the closest-first heuristic and no box growth, a size
@@ -268,7 +267,7 @@ fn check_vimage(words: &[u32], rsrc: [u32; 4], origin: u32, cases: &[VimageCase]
             src[lane * harness.src_stride..(lane + 1) * harness.src_stride]
                 .copy_from_slice(&case.ray);
         }
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run_with_data(engine, words, &src, &uni, &case.node);
             let got: Vec<u32> = out[..10].to_vec();
             if got == case.expected {
@@ -294,7 +293,7 @@ fn check_vimage(words: &[u32], rsrc: [u32; 4], origin: u32, cases: &[VimageCase]
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

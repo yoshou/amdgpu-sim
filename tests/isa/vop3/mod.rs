@@ -8,7 +8,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// One VOP3 case. Every operand and modifier the format has is a field, so a
 /// test cannot leave one unstated.
@@ -71,7 +70,7 @@ pub(crate) fn check_vop3_f32_ulp(op: u32, ulp: i64, cases: &[Vop3F32]) {
         .to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = harness.run(engine, &words, &src, &uni)[0];
             if got == case.expected {
                 continue;
@@ -113,7 +112,7 @@ pub(crate) fn check_vop3_f32_ulp(op: u32, ulp: i64, cases: &[Vop3F32]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -172,7 +171,7 @@ pub(crate) fn check_vop3_f64_ulp(op: u32, ulp: i128, cases: &[Vop3F64]) {
         .to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let got = out[0] as u64 | ((out[1] as u64) << 32);
             if got == case.expected {
@@ -205,7 +204,7 @@ pub(crate) fn check_vop3_f64_ulp(op: u32, ulp: i128, cases: &[Vop3F64]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -252,7 +251,7 @@ pub(crate) fn check_vop3_u32_ulp(op: u32, tolerance: i64, cases: &[Vop3F32]) {
         .to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = harness.run(engine, &words, &src, &uni)[0];
             let distance = (got as i64 - case.expected as i64).abs();
             if distance <= tolerance {
@@ -269,7 +268,7 @@ pub(crate) fn check_vop3_u32_ulp(op: u32, tolerance: i64, cases: &[Vop3F32]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -326,7 +325,7 @@ pub(crate) fn check_vop3sd(op: u32, cases: &[Vop3sdCase]) {
         let mut words = vop3sd(op, 6, SDST, field[0], field[1], field[2], case.neg).to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let got = out[0] as u64 | ((out[1] as u64) << 32);
             let got_sdst = out[2];
@@ -349,7 +348,7 @@ pub(crate) fn check_vop3sd(op: u32, cases: &[Vop3sdCase]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -396,7 +395,7 @@ pub(crate) fn check_vop3_scalar_f32_ulp(op: u32, ulp: i64, cases: &[Vop3ScalarF3
             .to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = harness.run(engine, &words, &src, &uni)[2];
             if got == case.expected {
                 continue;
@@ -425,7 +424,7 @@ pub(crate) fn check_vop3_scalar_f32_ulp(op: u32, ulp: i64, cases: &[Vop3ScalarF3
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

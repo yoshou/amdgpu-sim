@@ -13,7 +13,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// One VOP3P case.
 pub(crate) struct Vop3pCase {
@@ -90,7 +89,7 @@ pub(crate) fn check_vop3p_ulp(op: u32, ulp: i64, cases: &[Vop3pCase]) {
         .to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = harness.run(engine, &words, &src, &uni)[0];
             if got == case.expected {
                 continue;
@@ -124,7 +123,7 @@ pub(crate) fn check_vop3p_ulp(op: u32, ulp: i64, cases: &[Vop3pCase]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

@@ -9,7 +9,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// One VOPD case. Both halves are stated, because one instruction runs both.
 pub(crate) struct VopdCase {
@@ -69,7 +68,7 @@ pub(crate) fn check_vopd(opx: u32, opy: u32, literal: Option<u32>, cases: &[Vopd
             words.push(value);
         }
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let (got_x, got_y) = (out[0], out[1]);
             if got_x == case.expected_x && got_y == case.expected_y {
@@ -90,7 +89,7 @@ pub(crate) fn check_vopd(opx: u32, opy: u32, literal: Option<u32>, cases: &[Vopd
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

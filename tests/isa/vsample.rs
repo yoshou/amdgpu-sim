@@ -14,7 +14,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// The image the tests sample, in texels.
 const WIDTH: u32 = 64;
@@ -127,7 +126,7 @@ fn check_vsample_texture(
             src[lane * harness.src_stride] = case.u.to_bits();
             src[lane * harness.src_stride + 1] = case.v.to_bits();
         }
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run_with_data(engine, &words, &src, &uni, &data);
             let got: Vec<u32> = out[..4].to_vec();
             if got == case.expected {
@@ -155,7 +154,7 @@ fn check_vsample_texture(
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

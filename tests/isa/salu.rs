@@ -9,7 +9,6 @@
 
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// The SGPR pair the harness gives these instructions as a destination.
 const SDST: u32 = 16;
@@ -107,7 +106,7 @@ pub(crate) fn check_sop1(op: u32, cases: &[Sop1Case]) {
         uni[5] = case.exec_in;
         let mut words = vec![sop1(op, SDST, field)];
         words.extend(literal);
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = run(&harness, engine, &words, &uni);
             let ctx = format!("scc_in={} exec_in=0x{:08X}", case.scc_in, case.exec_in);
             compare(
@@ -122,7 +121,7 @@ pub(crate) fn check_sop1(op: u32, cases: &[Sop1Case]) {
             );
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// SOP2: two sources, an SGPR destination.
@@ -146,14 +145,14 @@ pub(crate) fn check_sop2(op: u32, cases: &[Sop2Case]) {
         uni[5] = 0xFFFF_FFFF;
         let mut words = vec![sop2(op, SDST, f1, f0)];
         words.extend(literal);
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = run(&harness, engine, &words, &uni);
             let ctx = format!("scc_in={}", case.scc_in);
             compare(engine, i, &got, case.expected, case.expected_scc, 0xFFFF_FFFF,
                     &ctx, &mut failures);
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// SOPC: two sources and no destination field -- the result is SCC alone.
@@ -174,14 +173,14 @@ pub(crate) fn check_sopc(op: u32, cases: &[SopcCase]) {
         uni[5] = 0xFFFF_FFFF;
         let mut words = vec![sopc(op, f1, f0)];
         words.extend(literal);
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = run(&harness, engine, &words, &uni);
             // The destination register must be left alone: this format has no
             // destination field, so a write there would be a decoding mistake.
             compare(engine, i, &got, 0, case.expected_scc, 0xFFFF_FFFF, "", &mut failures);
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// SOPK: a 16-bit immediate and an SGPR destination.
@@ -204,7 +203,7 @@ pub(crate) fn check_sopk(op: u32, cases: &[SopkCase]) {
         // Seed the destination through a preceding s_mov, since these forms
         // read it.
         let words = vec![sop1(0, SDST, 255), case.dst_in, sopk(op, SDST, case.simm16)];
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = run(&harness, engine, &words, &uni);
             let ctx = format!(
                 "simm16=0x{:04X} dst_in=0x{:08X} scc_in={}",
@@ -222,7 +221,7 @@ pub(crate) fn check_sopk(op: u32, cases: &[SopkCase]) {
             );
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 #[test]
 fn s_and_not1_saveexec_b32_sop1() {

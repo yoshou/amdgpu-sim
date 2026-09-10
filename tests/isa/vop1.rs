@@ -3,7 +3,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// Bit-exact comparison of a VOP1 f32 instruction against captured hardware.
 pub(crate) fn check_vop1_f32(op: u32, cases: &[(u64, u32)]) {
@@ -25,7 +24,7 @@ pub(crate) fn check_vop1_f32_ulp(op: u32, ulp: i64, cases: &[(u64, u32)]) {
     let words = [vop1(op, 6, vgpr(0))];
 
     let mut failures = Vec::new();
-    for engine in [Engine::Interpreter, Engine::LlvmJit] {
+    for engine in ENGINES {
         let out = harness.run(engine, &words, &src, &uni);
         for (i, (input, hw)) in cases.iter().enumerate() {
             let got = out[i * harness.out_stride];
@@ -65,7 +64,7 @@ pub(crate) fn check_vop1_f32_ulp(op: u32, ulp: i64, cases: &[(u64, u32)]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -90,7 +89,7 @@ pub(crate) fn check_vop1_f64_ulp(op: u32, ulp: i128, cases: &[(u64, u64)]) {
     let words = [vop1(op, 6, vgpr(0))];
 
     let mut failures = Vec::new();
-    for engine in [Engine::Interpreter, Engine::LlvmJit] {
+    for engine in ENGINES {
         let out = harness.run(engine, &words, &src, &uni);
         for (i, (input, hw)) in cases.iter().enumerate() {
             let lo = out[i * harness.out_stride] as u64;
@@ -126,7 +125,7 @@ pub(crate) fn check_vop1_f64_ulp(op: u32, ulp: i128, cases: &[(u64, u64)]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -151,7 +150,7 @@ pub(crate) fn check_vop1_u32_ulp(op: u32, tolerance: i64, cases: &[(u64, u32)]) 
     let words = [vop1(op, 6, vgpr(0))];
 
     let mut failures = Vec::new();
-    for engine in [Engine::Interpreter, Engine::LlvmJit] {
+    for engine in ENGINES {
         let out = harness.run(engine, &words, &src, &uni);
         for (i, (input, hw)) in cases.iter().enumerate() {
             let got = out[i * harness.out_stride];
@@ -169,7 +168,7 @@ pub(crate) fn check_vop1_u32_ulp(op: u32, tolerance: i64, cases: &[(u64, u32)]) 
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

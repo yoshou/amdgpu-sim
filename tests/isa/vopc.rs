@@ -11,7 +11,6 @@
 
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// Per-lane src0 values, repeated to fill the wave. Chosen so that a compare
 /// against a mid-range src1 splits the wave, and so that every special value is
@@ -130,7 +129,7 @@ pub(crate) fn check_vopc(op: u32, cases: &[VopcCase]) {
         let mut words = vec![vopc(op, 2, field)];
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let (vcc, exec) = (out[0], out[1]);
             if vcc == case.expected_vcc && exec == case.expected_exec {
@@ -143,7 +142,7 @@ pub(crate) fn check_vopc(op: u32, cases: &[VopcCase]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// A compare in the VOP3 encoding, which writes the SGPR named in SDST.
@@ -157,7 +156,7 @@ pub(crate) fn check_vopc_vop3(op: u32, cases: &[Vopc3Case]) {
         let mut words = vop3_sdst(op, SDST, field, vgpr(2), case.abs, case.neg).to_vec();
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let (exec, sdst) = (out[1], out[2]);
             if sdst == case.expected_sdst && exec == case.expected_exec {
@@ -170,7 +169,7 @@ pub(crate) fn check_vopc_vop3(op: u32, cases: &[Vopc3Case]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 #[test]
 fn v_cmpx_eq_f32_vopc() {

@@ -4,7 +4,6 @@
 use crate::compare::*;
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// One VOP2 case. src0 takes the full 9-bit operand field; vsrc1 can only name
 /// a VGPR, which is the format's own asymmetry.
@@ -66,7 +65,7 @@ pub(crate) fn check_vop2_f32(op: u32, cases: &[Vop2F32]) {
         let mut words = vec![vop2(op, 6, 2, field)];
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = harness.run(engine, &words, &src, &uni)[0];
             if got == case.expected {
                 continue;
@@ -85,7 +84,7 @@ pub(crate) fn check_vop2_f32(op: u32, cases: &[Vop2F32]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -124,7 +123,7 @@ pub(crate) fn check_vop2_f64(op: u32, cases: &[Vop2F64]) {
         let mut words = vec![vop2(op, 6, 2, field)];
         words.extend(literal);
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let got = out[0] as u64 | ((out[1] as u64) << 32);
             if got == case.expected {
@@ -144,7 +143,7 @@ pub(crate) fn check_vop2_f64(op: u32, cases: &[Vop2F64]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -188,7 +187,7 @@ pub(crate) fn check_vop2_literal_f32(op: u32, cases: &[Vop2Literal]) {
         }
         let words = [vop2(op, 6, 2, field), case.k];
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let got = harness.run(engine, &words, &src, &uni)[0];
             if got == case.expected {
                 continue;
@@ -207,7 +206,7 @@ pub(crate) fn check_vop2_literal_f32(op: u32, cases: &[Vop2Literal]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }
@@ -240,7 +239,7 @@ pub(crate) fn check_vop2_vcc(op: u32, cases: &[Vop2Vcc]) {
         uni[4] = case.vcc_in;
         let words = [vop2(op, 6, 2, field)];
 
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = harness.run(engine, &words, &src, &uni);
             let (got, vcc) = (out[0], out[2]);
             if got == case.expected && vcc == case.expected_vcc {
@@ -257,7 +256,7 @@ pub(crate) fn check_vop2_vcc(op: u32, cases: &[Vop2Vcc]) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

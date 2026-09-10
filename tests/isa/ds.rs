@@ -13,7 +13,6 @@
 
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// The lanes every case checks.
 const CHECK_LANES: [usize; 2] = [0, 7];
@@ -92,7 +91,7 @@ pub(crate) fn check_ds_load(op: u32, cases: &[DsCase]) {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let words = ds(op, 6, 0, 2, 3, case.offset0 as u32, case.offset1 as u32).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let (vdst, lds) = run(&harness, engine, &words);
             if vdst == case.vdst && lds == case.lds {
                 continue;
@@ -108,7 +107,7 @@ pub(crate) fn check_ds_load(op: u32, cases: &[DsCase]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// A DS store: it writes LDS and leaves VDST alone. The data registers are
@@ -118,7 +117,7 @@ pub(crate) fn check_ds_store(op: u32, cases: &[DsCase]) {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let words = ds(op, 6, 0, 2, 3, case.offset0 as u32, case.offset1 as u32).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let (vdst, lds) = run(&harness, engine, &words);
             if vdst == case.vdst && lds == case.lds {
                 continue;
@@ -134,7 +133,7 @@ pub(crate) fn check_ds_store(op: u32, cases: &[DsCase]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 #[test]

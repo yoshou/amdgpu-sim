@@ -11,7 +11,6 @@
 
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// The lanes every case checks.
 const CHECK_LANES: [usize; 2] = [0, 7];
@@ -91,7 +90,7 @@ fn check(op: u32, cases: &[ScratchCase], vdst_reg: u32, vsrc_reg: u32) {
             case.sve,
         )
         .to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let (vdst, mem) = run(&harness, engine, &words);
             if vdst == case.vdst && mem == case.mem {
                 continue;
@@ -113,7 +112,7 @@ fn check(op: u32, cases: &[ScratchCase], vdst_reg: u32, vsrc_reg: u32) {
         failures.is_empty(),
         "{} of {} case-results differ from hardware:\n{}",
         failures.len(),
-        cases.len() * 2,
+        cases.len() * ENGINES.len(),
         failures.join("\n"),
     );
 }

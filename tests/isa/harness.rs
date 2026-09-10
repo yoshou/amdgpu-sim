@@ -9,12 +9,26 @@
 use crate::encoding::{slot_marker, SLOT_BYTES, S_NOP};
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_processor::*;
+use amdgpu_sim::rdna_processor::{Engine as RdnaEngine, RDNAProcessor};
+use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
 use object::*;
 use std::fs::File;
 use std::io::Read;
 
 pub(crate) const LANES: usize = 32;
+
+#[derive(Clone, Copy)]
+pub(crate) enum Engine {
+    Interpreter,
+    LlvmJit,
+    Spmd(u32),
+}
+
+pub(crate) const ENGINES: [Engine; 8] = [
+    Engine::Interpreter, Engine::LlvmJit,
+    Engine::Spmd(0), Engine::Spmd(1), Engine::Spmd(2),
+    Engine::Spmd(4), Engine::Spmd(8), Engine::Spmd(16),
+];
 
 /// The pattern the memory harness puts in its buffer: word `k` holds this, so a
 /// loaded value says which address it came from.
@@ -263,8 +277,40 @@ impl Harness {
             kernarg_address: Pointer::new(&arg_buffer, 0),
         };
 
-        let mut processor = RDNAProcessor::with_engine(&aql, 32, 32, &mem, engine);
-        processor.execute();
+        match engine {
+            Engine::Interpreter | Engine::LlvmJit => {
+                let legacy = match engine {
+                    Engine::Interpreter => RdnaEngine::Interpreter,
+                    _ => RdnaEngine::LlvmJit,
+                };
+                let mut processor = RDNAProcessor::with_engine(&aql, 32, 32, &mem, legacy);
+                processor.execute();
+            }
+            Engine::Spmd(width) => {
+                let kd = decode_kernel_desc(&mem[self.kernel_addr..self.kernel_addr + 64]);
+                // The legacy engine counts workgroups in AQL; SPMD takes
+                // that count in GridDims and work-item counts in AQL.
+                let aql = HsaKernelDispatchPacket {
+                    grid_size_x: LANES as u32,
+                    group_segment_size: kd.group_segment_fixed_size as u32,
+                    ..aql
+                };
+                let program = decode_program("gfx1200", self.kernel_addr + kd.kernel_code_entry_byte_offset, &mem)
+                    .unwrap_or_else(|error| panic!("{} decode: {}", engine_name(engine), error));
+                let kernel = compile(&program, CompileOptions {
+                    width,
+                    num_vgprs: kd.granulated_workitem_vgpr_count,
+                    workgroup_x: Some(LANES as u32),
+                });
+                dispatch(
+                    &kernel, &kd, arg_buffer.as_ptr() as u64,
+                    &aql as *const HsaKernelDispatchPacket as u64,
+                    GridDims { num_wg_x: 1, num_wg_y: 1, num_wg_z: 1,
+                        wg_x: LANES as u32, wg_y: 1, wg_z: 1 },
+                    aql.private_segment_size, aql.group_segment_size as usize, 1,
+                );
+            }
+        }
         out
     }
 }
@@ -317,5 +363,12 @@ pub(crate) fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Interpreter => "interpreter",
         Engine::LlvmJit => "LLVM JIT",
+        Engine::Spmd(0) => "SPMD W=0",
+        Engine::Spmd(1) => "SPMD W=1",
+        Engine::Spmd(2) => "SPMD W=2",
+        Engine::Spmd(4) => "SPMD W=4",
+        Engine::Spmd(8) => "SPMD W=8",
+        Engine::Spmd(16) => "SPMD W=16",
+        Engine::Spmd(width) => panic!("unsupported SPMD test width {}", width),
     }
 }

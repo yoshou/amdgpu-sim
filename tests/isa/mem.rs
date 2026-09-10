@@ -12,7 +12,6 @@
 
 use crate::encoding::*;
 use crate::harness::*;
-use amdgpu_sim::rdna_processor::Engine;
 
 /// Where the destination and the memory windows sit in the harness output.
 const VDST: usize = 0;
@@ -68,7 +67,7 @@ pub(crate) fn check_vmem_load(enc: u32, op: u32, cases: &[MemLoad]) {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let words = vmem(enc, op, 6, 0, 0, case.saddr, case.ioffset).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = read_all(&harness, engine, &words, 0);
             let got = [out[VDST], out[VDST + 1], out[VDST + 2], out[VDST + 3]];
             let data = out[DATA];
@@ -82,7 +81,7 @@ pub(crate) fn check_vmem_load(enc: u32, op: u32, cases: &[MemLoad]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// A FLAT, GLOBAL or SCRATCH store. The destination register must stay clear:
@@ -92,7 +91,7 @@ pub(crate) fn check_vmem_store(enc: u32, op: u32, cases: &[MemStore]) {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let words = vmem(enc, op, 0, 2, 0, case.saddr, case.ioffset).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = read_all(&harness, engine, &words, case.store_value);
             let (data, vdst) = (out[DATA], out[VDST]);
             if data == case.expected_data && vdst == 0 {
@@ -105,7 +104,7 @@ pub(crate) fn check_vmem_store(enc: u32, op: u32, cases: &[MemStore]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// A GLOBAL atomic. Lane `n` operates on word `n` of the buffer, so the case
@@ -132,7 +131,7 @@ pub(crate) fn check_vmem_atomic(enc: u32, op: u32, cases: &[MemAtomic]) {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let words = vmem_hint(enc, op, 6, 2, 0, case.saddr, case.ioffset, case.th, 0).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = read_all(&harness, engine, &words, case.addend as u64);
             let (data, vdst) = (out[DATA], out[VDST]);
             if data == case.expected_data && vdst == case.expected_vdst {
@@ -145,7 +144,7 @@ pub(crate) fn check_vmem_atomic(enc: u32, op: u32, cases: &[MemAtomic]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 /// An instruction that acts on the caches alone. Nothing it does is visible to
@@ -156,7 +155,7 @@ pub(crate) fn check_vmem_cache_op(enc: u32, op: u32, scopes: &[u32]) {
     let mut failures = Vec::new();
     for (i, &scope) in scopes.iter().enumerate() {
         let words = vmem_hint(enc, op, 0, 0, 0, SADDR_NULL, 0, 0, scope).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = read_all(&harness, engine, &words, 0);
             let touched: Vec<usize> = (0..4)
                 .filter(|&k| out[VDST + k] != 0)
@@ -171,7 +170,7 @@ pub(crate) fn check_vmem_cache_op(enc: u32, op: u32, scopes: &[u32]) {
             ));
         }
     }
-    report(failures, scopes.len() * 2);
+    report(failures, scopes.len() * ENGINES.len());
 }
 
 /// An SMEM load, which reads through a wave-uniform base in s[10:11] and writes
@@ -181,7 +180,7 @@ pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         let words = smem(op, 16, 5, case.ioffset).to_vec();
-        for engine in [Engine::Interpreter, Engine::LlvmJit] {
+        for engine in ENGINES {
             let out = read_all(&harness, engine, &words, 0);
             let mut got = [0u32; 8];
             got.copy_from_slice(&out[SDST..SDST + 8]);
@@ -198,7 +197,7 @@ pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
             ));
         }
     }
-    report(failures, cases.len() * 2);
+    report(failures, cases.len() * ENGINES.len());
 }
 
 #[test]
