@@ -159,7 +159,7 @@ impl Driver {
     }
     fn check<P: Program>(&self, program: &P, name: &str) -> Result<(), String> {
         if self.trace { eprintln!("; after {name}\n{}", super::ir::print::func(program.registry(), program.ir())); }
-        program.ir().clone().verify_with(program.registry()).map_err(|e| format!("{name}: {e}"))?;
+        program.ir().check(program.registry()).map_err(|e| format!("{name}: {e}"))?;
         Ok(())
     }
 }

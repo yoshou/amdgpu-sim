@@ -11,20 +11,20 @@ fn definitions(f: &Func) -> Vec<Option<Op>> {
 
 enum Source { Packed(ValueId), Carried(BlockId, usize), Fresh }
 
-fn source(a: ValueId, b: ValueId, defs: &[Option<Op>], params: &BTreeMap<ValueId, (BlockId, usize)>, f: &Func) -> Source {
+fn source(a: ValueId, b: ValueId, defs: &[Option<Op>], params: &[Option<(BlockId, usize)>], f: &Func) -> Source {
     if let (Some(Op::UnpackLo(x)), Some(Op::UnpackHi(y))) = (defs[a.0], defs[b.0]) {
         if x == y && f.types[x.0] == Ty::I64 { return Source::Packed(x); }
     }
-    if let (Some(&(block, index)), Some(&(other, next))) = (params.get(&a), params.get(&b)) {
+    if let (Some((block, index)), Some((other, next))) = (params[a.0], params[b.0]) {
         if block == other && next == index + 1 { return Source::Carried(block, index); }
     }
     Source::Fresh
 }
 
-fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut BTreeSet<(ValueId, ValueId)>) {
+fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut [Vec<ValueId>]) {
     match (defs[a.0], defs[b.0]) {
         (Some(Op::Select(c, x, y)), Some(Op::Select(d, z, w))) if c == d => { observed(x, z, defs, out); observed(y, w, defs, out); }
-        _ => { out.insert((a, b)); }
+        _ => { if !out[a.0].contains(&b) { out[a.0].push(b); } }
     }
 }
 
@@ -39,17 +39,17 @@ impl super::Pass for Pairs {
 
 pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
     let defs = definitions(f);
-    let mut params: BTreeMap<ValueId, (BlockId, usize)> = BTreeMap::new();
+    let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut incoming: BTreeMap<BlockId, Vec<(BlockId, usize)>> = BTreeMap::new();
-    let mut packed: BTreeSet<(ValueId, ValueId)> = BTreeSet::new();
-    let mut float: BTreeSet<ValueId> = BTreeSet::new();
+    let mut packed: Vec<Vec<ValueId>> = vec![Vec::new(); f.types.len()];
+    let mut float = vec![false; f.types.len()];
     for block in f.blocks.values() {
-        for inst in &block.insts { if let Inst::Core { op: Op::Convert(super::super::ir::Cvt::Bitcast, Ty::F64, a), .. } = inst { float.insert(*a); } }
+        for inst in &block.insts { if let Inst::Core { op: Op::Convert(super::super::ir::Cvt::Bitcast, Ty::F64, a), .. } = inst { float[a.0] = true; } }
     }
     for (&id, block) in &f.blocks {
-        for (index, &(p, _)) in block.params.iter().enumerate() { params.insert(p, (id, index)); }
+        for (index, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, index)); }
         for (edge_index, edge) in block.term.edges().iter().enumerate() { incoming.entry(edge.dst).or_default().push((id, edge_index)); }
-        for inst in &block.insts { if let Inst::Core { op: Op::Pack64(a, b), value, .. } = inst { if float.contains(value) { observed(*a, *b, &defs, &mut packed); } } }
+        for inst in &block.insts { if let Inst::Core { op: Op::Pack64(a, b), value, .. } = inst { if float[value.0] { observed(*a, *b, &defs, &mut packed); } } }
     }
     let edge_args = |f: &Func, from: BlockId, edge_index: usize| -> Vec<ValueId> { f.blocks[&from].term.edges()[edge_index].args.clone() };
     let eligible = |block: &Block, index: usize| {
@@ -60,7 +60,7 @@ pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
     for (&id, block) in &f.blocks {
         if id == f.entry { continue; }
         for index in 0..block.params.len() {
-            if eligible(block, index) && packed.contains(&(block.params[index].0, block.params[index + 1].0)) { candidates.insert((id, index)); }
+            if eligible(block, index) && packed[block.params[index].0 .0].contains(&block.params[index + 1].0) { candidates.insert((id, index)); }
         }
     }
     loop {

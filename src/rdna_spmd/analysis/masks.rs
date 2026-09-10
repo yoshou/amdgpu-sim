@@ -50,18 +50,47 @@ fn definitions(f: &Func) -> Vec<Option<Op>> {
     out
 }
 
-fn ballot_of(f: &Func) -> BTreeMap<ValueId, ValueId> {
-    let mut out = BTreeMap::new();
+fn ballot_of(f: &Func) -> Vec<Option<ValueId>> {
+    let mut out = vec![None; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts {
             match inst {
-                Inst::Packet { op: PacketOp::Ballot, input, output } => { out.insert(*output, *input); }
-                Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, outputs, .. } => { out.insert(outputs[0].0, inputs[0]); }
+                Inst::Packet { op: PacketOp::Ballot, input, output } => out[output.0] = Some(*input),
+                Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, outputs, .. } => out[outputs[0].0 .0] = Some(inputs[0]),
                 _ => {}
             }
         }
     }
     out
+}
+
+fn block_index(f: &Func) -> Vec<usize> {
+    let mut out = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
+    for (index, id) in f.blocks.keys().enumerate() { out[id.0] = index; }
+    out
+}
+
+fn incoming_edges<'f>(f: &'f Func, index: &[usize]) -> Vec<Vec<&'f Edge>> {
+    let mut out: Vec<Vec<&Edge>> = (0..f.blocks.len()).map(|_| Vec::new()).collect();
+    for block in f.blocks.values() {
+        for edge in block.term.edges() { out[index[edge.dst.0]].push(edge); }
+    }
+    out
+}
+
+struct Bits(Vec<u64>);
+impl Bits {
+    fn new(values: usize) -> Self { Self(vec![0; values.div_ceil(64)]) }
+    fn clear(&mut self) { self.0.fill(0); }
+    fn insert(&mut self, v: ValueId) { self.0[v.0 / 64] |= 1 << (v.0 % 64); }
+    fn remove(&mut self, v: ValueId) { self.0[v.0 / 64] &= !(1 << (v.0 % 64)); }
+    fn contains(&self, v: ValueId) -> bool { self.0[v.0 / 64] >> (v.0 % 64) & 1 != 0 }
+    fn for_each(&self, mut f: impl FnMut(ValueId)) {
+        for (w, &word) in self.0.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 { let b = bits.trailing_zeros() as usize; bits &= bits - 1; f(ValueId(w * 64 + b)); }
+        }
+    }
 }
 
 fn same_bit(value: ValueId, exec: ValueId, defs: &[Option<Op>]) -> bool {
@@ -75,7 +104,7 @@ fn same_bit(value: ValueId, exec: ValueId, defs: &[Option<Op>]) -> bool {
     }
 }
 
-fn subset(bit: ValueId, exec: ValueId, defs: &[Option<Op>], ballots: &BTreeMap<ValueId, ValueId>, constants: &[Option<u64>]) -> bool {
+fn subset(bit: ValueId, exec: ValueId, defs: &[Option<Op>], ballots: &[Option<ValueId>], constants: &[Option<u64>]) -> bool {
     if same_bit(bit, exec, defs) { return true; }
     if constants[bit.0] == Some(0) { return true; }
     match defs[bit.0].as_ref() {
@@ -84,8 +113,8 @@ fn subset(bit: ValueId, exec: ValueId, defs: &[Option<Op>], ballots: &BTreeMap<V
             Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::PacketLaneId))) => {
                 if constants[word.0] == Some(0) { return true; }
                 match defs[word.0].as_ref() {
-                    Some(Op::Int(IntOp::And, a, b)) => [a, b].iter().any(|w| ballots.get(w).is_some_and(|bit| same_bit(*bit, exec, defs))),
-                    _ => ballots.get(word).is_some_and(|bit| same_bit(*bit, exec, defs)),
+                    Some(Op::Int(IntOp::And, a, b)) => [a, b].iter().any(|w| ballots[w.0].is_some_and(|bit| same_bit(bit, exec, defs))),
+                    _ => ballots[word.0].is_some_and(|bit| same_bit(bit, exec, defs)),
                 }
             }
             _ => false,
@@ -94,9 +123,9 @@ fn subset(bit: ValueId, exec: ValueId, defs: &[Option<Op>], ballots: &BTreeMap<V
     }
 }
 
-fn full_word(word: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ballots: &BTreeMap<ValueId, ValueId>, constants: &[Option<u64>], lane_mask: u64) -> bool {
+fn full_word(word: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ballots: &[Option<ValueId>], constants: &[Option<u64>], lane_mask: u64) -> bool {
     if let Some(k) = constants[word.0] { return k & lane_mask == lane_mask; }
-    if let Some(bit) = ballots.get(&word) { return full[bit.0] || same_bit(*bit, old, defs) && full[old.0]; }
+    if let Some(bit) = ballots[word.0] { return full[bit.0] || same_bit(bit, old, defs) && full[old.0]; }
     match defs[word.0].as_ref() {
         Some(Op::Int(IntOp::Or, a, b)) => full_word(*a, old, full, defs, ballots, constants, lane_mask) || full_word(*b, old, full, defs, ballots, constants, lane_mask),
         Some(Op::Int(IntOp::And, a, b)) => full_word(*a, old, full, defs, ballots, constants, lane_mask) && full_word(*b, old, full, defs, ballots, constants, lane_mask),
@@ -105,7 +134,7 @@ fn full_word(word: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ba
     }
 }
 
-fn full_bit(bit: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ballots: &BTreeMap<ValueId, ValueId>, constants: &[Option<u64>], lane_mask: u64) -> bool {
+fn full_bit(bit: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ballots: &[Option<ValueId>], constants: &[Option<u64>], lane_mask: u64) -> bool {
     if same_bit(bit, old, defs) { return full[old.0]; }
     if let Some(k) = constants[bit.0] { return k & 1 != 0; }
     match defs[bit.0].as_ref() {
@@ -167,7 +196,8 @@ pub(crate) fn analyze(registry: &super::super::dialect::DialectRegistry, f: &Fun
         for &(value, old, bit) in &updates {
             full[value.0] = full_bit(bit, old, &full, &defs, &ballots, constants, lane_mask);
         }
-        let mut incoming = BTreeMap::from([(entry_exec, entry_full)]);
+        let mut incoming: Vec<Option<bool>> = vec![None; f.types.len()];
+        incoming[entry_exec.0] = Some(entry_full);
         for (&id, block) in &f.blocks {
             let outgoing = chain[&id].last().unwrap().1;
             let guarded_edge = match &block.term {
@@ -177,10 +207,10 @@ pub(crate) fn analyze(registry: &super::super::dialect::DialectRegistry, f: &Fun
             for edge in block.term.edges() {
                 let param = exec_param(&f.blocks[&edge.dst], exec_index, f);
                 let fact = full[outgoing.0] || guarded_edge == Some(edge.dst);
-                incoming.entry(param).and_modify(|v| *v &= fact).or_insert(fact);
+                incoming[param.0] = Some(incoming[param.0].map_or(fact, |v| v & fact));
             }
         }
-        for (value, fact) in incoming { full[value.0] = fact; }
+        for (value, fact) in incoming.iter().enumerate() { if let Some(fact) = *fact { full[value] = fact; } }
         if full == before { break; }
     }
     let live = live_across(f, &reactivation, &predicated);
@@ -190,16 +220,40 @@ pub(crate) fn analyze(registry: &super::super::dialect::DialectRegistry, f: &Fun
     Masks { reactivation, full, guarded, predicated, masked, masked_result, exposed, chain }
 }
 
+fn for_each_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
+    match inst {
+        Inst::Core { op, .. } => { op.map(|v| { f(v); v }); }
+        Inst::Packet { input, .. } => f(*input),
+        Inst::Target { args, .. } => for &v in args.values() { f(v); },
+        Inst::Effect { inputs, .. } => for &v in inputs { f(v); },
+    }
+}
+
+fn for_each_output(inst: &Inst, mut f: impl FnMut(ValueId)) {
+    match inst {
+        Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
+        Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => for o in outputs { f(o.0); },
+    }
+}
+
+fn for_each_read(inst: &Inst, predicated: &[Option<(ValueId, ValueId)>], mut f: impl FnMut(ValueId)) {
+    match inst {
+        Inst::Core { value, op: Op::Select(c, new, _), .. } if predicated[value.0].is_some() => { f(*c); f(*new); }
+        _ => for_each_use(inst, f),
+    }
+}
+
 fn exposure(f: &Func, predicated: &[Option<(ValueId, ValueId)>], masked: &[bool], live: &[bool], returns: bool, every_lane: &dyn Fn(super::super::dialect::TargetOp) -> bool) -> Vec<u8> {
     let words = |v: ValueId| if f.types[v.0].bits() == 64 { 3u8 } else { 1u8 };
     let mut producers: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
-    let mut incoming: BTreeMap<BlockId, Vec<&Edge>> = BTreeMap::new();
+    let block_index_of = block_index(f);
+    let incoming = incoming_edges(f, &block_index_of);
     let mut pending: Vec<(ValueId, u8)> = live.iter().enumerate().filter_map(|(id, &live)| live.then_some((ValueId(id), 3))).collect();
     for (&id, block) in &f.blocks {
         for (index, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, index)); }
         for (index, inst) in block.insts.iter().enumerate() {
-            for v in outputs(inst) { producers[v.0] = Some((id, index)); }
+            for_each_output(inst, |v| producers[v.0] = Some((id, index)));
             match inst {
                 Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadLane | WaveOp::WriteLane | WaveOp::BpermuteFi | WaveOp::Wmma), inputs, .. } => pending.extend(inputs.iter().map(|&v| (v, 3))),
                 Inst::Packet { input, .. } => pending.push((*input, 3)),
@@ -208,7 +262,6 @@ fn exposure(f: &Func, predicated: &[Option<(ValueId, ValueId)>], masked: &[bool]
             }
         }
         if let (true, Term::Ret(args)) = (returns, &block.term) { pending.extend(args.iter().map(|&v| (v, 3))); }
-        for edge in block.term.edges() { incoming.entry(edge.dst).or_default().push(edge); }
     }
     let mut exposed = vec![0u8; f.types.len()];
     while let Some((v, mask)) = pending.pop() {
@@ -233,66 +286,43 @@ fn exposure(f: &Func, predicated: &[Option<(ValueId, ValueId)>], masked: &[bool]
                 Inst::Effect { .. } => {}
             }
         } else if let Some((block, index)) = params[v.0] {
-            for edge in incoming.get(&block).into_iter().flatten() { pending.push((edge.args[index], added)); }
+            for edge in &incoming[block_index_of[block.0]] { pending.push((edge.args[index], added)); }
         }
     }
     exposed
 }
 
-fn uses(inst: &Inst) -> Vec<ValueId> {
-    match inst {
-        Inst::Core { op, .. } => { let mut out = Vec::new(); op.map(|v| { out.push(v); v }); out }
-        Inst::Packet { input, .. } => vec![*input],
-        Inst::Target { args, .. } => args.values().to_vec(),
-        Inst::Effect { inputs, .. } => inputs.clone(),
-    }
-}
-
-fn outputs(inst: &Inst) -> Vec<ValueId> {
-    match inst {
-        Inst::Core { value, .. } | Inst::Packet { output: value, .. } => vec![*value],
-        Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => outputs.iter().map(|o| o.0).collect(),
-    }
-}
-
-fn reads(inst: &Inst, predicated: &[Option<(ValueId, ValueId)>]) -> Vec<ValueId> {
-    match inst {
-        Inst::Core { value, op: Op::Select(c, new, _), .. } if predicated[value.0].is_some() => vec![*c, *new],
-        _ => uses(inst),
-    }
-}
-
 fn needed(f: &Func, predicated: &[Option<(ValueId, ValueId)>]) -> Vec<bool> {
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut producers: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
-    let mut incoming: BTreeMap<BlockId, Vec<&Edge>> = BTreeMap::new();
+    let index = block_index(f);
+    let incoming = incoming_edges(f, &index);
     let mut pending = Vec::new();
     for (&id, block) in &f.blocks {
-        for (index, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, index)); }
-        for (index, inst) in block.insts.iter().enumerate() {
+        for (position, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, position)); }
+        for (position, inst) in block.insts.iter().enumerate() {
             match inst {
-                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => producers[value.0] = Some((id, index)),
+                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => producers[value.0] = Some((id, position)),
                 Inst::Effect { inputs, outputs, .. } => {
                     pending.extend(inputs.iter().copied());
-                    for &(v, _) in outputs { producers[v.0] = Some((id, index)); }
+                    for &(v, _) in outputs { producers[v.0] = Some((id, position)); }
                 }
                 Inst::Target { args, outputs, .. } => {
                     pending.extend(args.values().iter().copied());
-                    for &(v, _) in outputs { producers[v.0] = Some((id, index)); }
+                    for &(v, _) in outputs { producers[v.0] = Some((id, position)); }
                 }
             }
         }
         match &block.term { Term::CondBr { cond, .. } => pending.push(*cond), Term::Ret(args) => pending.extend(args.iter().copied()), Term::Br(_) => {} }
-        for edge in block.term.edges() { incoming.entry(edge.dst).or_default().push(edge); }
     }
     let mut needed = vec![false; f.types.len()];
     while let Some(v) = pending.pop() {
         if needed[v.0] { continue; }
         needed[v.0] = true;
-        if let Some((block, index)) = producers[v.0] {
-            if let inst @ (Inst::Core { .. } | Inst::Packet { .. }) = &f.blocks[&block].insts[index] { pending.extend(reads(inst, predicated)); }
-        } else if let Some((block, index)) = params[v.0] {
-            for edge in incoming.get(&block).into_iter().flatten() { pending.push(edge.args[index]); }
+        if let Some((block, position)) = producers[v.0] {
+            if let inst @ (Inst::Core { .. } | Inst::Packet { .. }) = &f.blocks[&block].insts[position] { for_each_read(inst, predicated, |r| pending.push(r)); }
+        } else if let Some((block, position)) = params[v.0] {
+            for edge in &incoming[index[block.0]] { pending.push(edge.args[position]); }
         }
     }
     needed
@@ -305,43 +335,47 @@ fn active(inst: &Inst, needed: &[bool]) -> bool {
     }
 }
 
+fn live_out(f: &Func, block: &Block, needed: &[bool], index: &[usize], live_in: &[Bits], live: &mut Bits) {
+    live.clear();
+    for edge in block.term.edges() {
+        let dst = &live_in[index[edge.dst.0]];
+        for (&arg, &(param, _)) in edge.args.iter().zip(&f.blocks[&edge.dst].params) {
+            if needed[param.0] && dst.contains(param) { live.insert(arg); }
+        }
+    }
+    match &block.term { Term::CondBr { cond, .. } => live.insert(*cond), Term::Ret(args) => for &a in args { live.insert(a); }, Term::Br(_) => {} }
+}
+
 fn live_across(f: &Func, points: &[(BlockId, usize)], predicated: &[Option<(ValueId, ValueId)>]) -> Vec<bool> {
     let needed = needed(f, predicated);
-    let mut live_in: BTreeMap<BlockId, BTreeSet<ValueId>> = f.blocks.keys().map(|&id| (id, BTreeSet::new())).collect();
+    let values = f.types.len();
+    let index = block_index(f);
+    let mut live_in: Vec<Bits> = (0..f.blocks.len()).map(|_| Bits::new(values)).collect();
+    let mut live = Bits::new(values);
     loop {
         let mut changed = false;
-        for (&id, block) in &f.blocks {
-            let mut live = BTreeSet::new();
-            for edge in block.term.edges() {
-                for (&arg, &(param, _)) in edge.args.iter().zip(&f.blocks[&edge.dst].params) {
-                    if needed[param.0] && live_in[&edge.dst].contains(&param) { live.insert(arg); }
-                }
-            }
-            match &block.term { Term::CondBr { cond, .. } => { live.insert(*cond); } Term::Ret(args) => live.extend(args.iter().copied()), Term::Br(_) => {} }
+        for (b, block) in f.blocks.values().enumerate() {
+            live_out(f, block, &needed, &index, &live_in, &mut live);
             for inst in block.insts.iter().rev() {
-                for v in outputs(inst) { live.remove(&v); }
-                if active(inst, &needed) { for v in reads(inst, predicated) { live.insert(v); } }
+                for_each_output(inst, |v| live.remove(v));
+                if active(inst, &needed) { for_each_read(inst, predicated, |v| live.insert(v)); }
             }
-            if live != live_in[&id] { live_in.insert(id, live); changed = true; }
+            if live.0 != live_in[b].0 { std::mem::swap(&mut live_in[b].0, &mut live.0); changed = true; }
         }
         if !changed { break; }
     }
-    let mut across = vec![false; f.types.len()];
-    for &(id, index) in points {
+    let mut across = vec![false; values];
+    let mut defined_after = Bits::new(values);
+    for &(id, position) in points {
         let block = &f.blocks[&id];
-        let mut live = BTreeSet::new();
-        for edge in block.term.edges() {
-            for (&arg, &(param, _)) in edge.args.iter().zip(&f.blocks[&edge.dst].params) {
-                if needed[param.0] && live_in[&edge.dst].contains(&param) { live.insert(arg); }
-            }
+        live_out(f, block, &needed, &index, &live_in, &mut live);
+        for inst in block.insts[position + 1..].iter().rev() {
+            for_each_output(inst, |v| live.remove(v));
+            if active(inst, &needed) { for_each_read(inst, predicated, |v| live.insert(v)); }
         }
-        match &block.term { Term::CondBr { cond, .. } => { live.insert(*cond); } Term::Ret(args) => live.extend(args.iter().copied()), Term::Br(_) => {} }
-        for inst in block.insts[index + 1..].iter().rev() {
-            for v in outputs(inst) { live.remove(&v); }
-            if active(inst, &needed) { for v in reads(inst, predicated) { live.insert(v); } }
-        }
-        let defined_after: BTreeSet<_> = block.insts[index..].iter().flat_map(outputs).collect();
-        for v in live { if !defined_after.contains(&v) { across[v.0] = true; } }
+        defined_after.clear();
+        for inst in &block.insts[position..] { for_each_output(inst, |v| defined_after.insert(v)); }
+        live.for_each(|v| if !defined_after.contains(v) { across[v.0] = true; });
     }
     across
 }
@@ -411,9 +445,9 @@ impl Exec {
 
 enum Word { Constant, Ballot(ValueId), Or(ValueId, ValueId), And, Other }
 
-fn word_of(value: ValueId, defs: &[Option<Op>], ballots: &BTreeMap<ValueId, ValueId>, constants: &[Option<u64>]) -> Word {
+fn word_of(value: ValueId, defs: &[Option<Op>], ballots: &[Option<ValueId>], constants: &[Option<u64>]) -> Word {
     if constants[value.0].is_some() { return Word::Constant; }
-    if let Some(bit) = ballots.get(&value) { return Word::Ballot(*bit); }
+    if let Some(bit) = ballots[value.0] { return Word::Ballot(bit); }
     match defs[value.0].as_ref() {
         Some(Op::Int(IntOp::Or, a, b)) => Word::Or(*a, *b),
         Some(Op::Int(IntOp::And, ..)) => Word::And,
@@ -468,12 +502,12 @@ pub(crate) fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width
     let mut active = vec![true; f.types.len()];
     let mut saved = vec![true; f.types.len()];
     let entry_exec = exec_param(&f.blocks[&f.entry], exec_index, f);
-    let mut any_of: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+    let mut any_of: Vec<Option<ValueId>> = vec![None; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts {
             match inst {
-                Inst::Packet { op: PacketOp::Any, input, output } => { any_of.insert(*output, *input); }
-                Inst::Effect { op: EffectOp::Wave(WaveOp::Any), inputs, outputs, .. } => { any_of.insert(outputs[0].0, inputs[0]); }
+                Inst::Packet { op: PacketOp::Any, input, output } => any_of[output.0] = Some(*input),
+                Inst::Effect { op: EffectOp::Wave(WaveOp::Any), inputs, outputs, .. } => any_of[outputs[0].0 .0] = Some(inputs[0]),
                 _ => {}
             }
         }
@@ -530,7 +564,7 @@ pub(crate) fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width
                         Some(Op::Cmp(super::super::ir::IntPred::Eq, q, zero)) if constants[zero.0] == Some(0) => (*q, true),
                         _ => (*cond, false),
                     };
-                    match any_of.get(&query).copied() {
+                    match any_of[query.0] {
                         Some(bit) if same_bit(bit, outgoing, &defs) || same_bit(outgoing, bit, &defs) => vec![(yes.dst, !negated), (no.dst, negated)],
                         _ if !negated && all_active_guard(f, *cond, outgoing, &defs) => vec![(no.dst, true)],
                         _ => vec![],

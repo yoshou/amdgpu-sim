@@ -1,46 +1,54 @@
 use super::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 pub(crate) struct VerifiedFunc(Func);
 impl Func {
     #[cfg(test)]
     pub fn verify(self) -> Result<VerifiedFunc, &'static str> { self.verify_with(&crate::rdna_spmd::targets::rdna4::registry()) }
     pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedFunc, &'static str> {
+        self.check(registry)?;
+        Ok(VerifiedFunc(self))
+    }
+    pub fn check(&self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<(), &'static str> {
         if !self.blocks.contains_key(&self.entry) {
             return Err("missing entry");
         }
-        let mut definitions = BTreeSet::new();
+        let count = self.types.len();
+        let mut defined = vec![false; count];
+        let mut definitions = 0usize;
         let mut effects = BTreeSet::new();
-        let mut constants = BTreeMap::new();
+        let mut constants: Vec<Option<u64>> = vec![None; count];
+        let mut local = vec![0u32; count];
+        let mut generation = 0u32;
         for block in self.blocks.values() {
-            let mut local = BTreeSet::new();
-            let define = |id: ValueId,
-                          ty: Ty,
-                          local: &mut BTreeSet<ValueId>,
-                          all: &mut BTreeSet<ValueId>| {
+            generation += 1;
+            let seen = |id: ValueId, local: &[u32]| id.0 < count && local[id.0] == generation;
+            let define = |id: ValueId, ty: Ty, local: &mut Vec<u32>, defined: &mut Vec<bool>, definitions: &mut usize| {
                 if self.types.get(id.0) != Some(&ty) {
                     return Err("invalid value type");
                 }
-                if !all.insert(id) {
+                if defined[id.0] {
                     return Err("duplicate SSA definition");
                 }
-                local.insert(id);
+                defined[id.0] = true;
+                *definitions += 1;
+                local[id.0] = generation;
                 Ok(())
             };
             for &(id, ty) in &block.params {
-                define(id, ty, &mut local, &mut definitions)?;
+                define(id, ty, &mut local, &mut defined, &mut definitions)?;
             }
             for inst in &block.insts {
                 match inst {
-                    Inst::Packet {op,input,output}=>{
-                        if !local.contains(input) {return Err("non-dominating packet input");}
-                        if self.types[input.0]!=Ty::I1 {return Err("packet query requires a predicate");}
-                        define(*output,op.result_type(),&mut local,&mut definitions)?;
-                    },
+                    Inst::Packet { op, input, output } => {
+                        if !seen(*input, &local) { return Err("non-dominating packet input"); }
+                        if self.types[input.0] != Ty::I1 { return Err("packet query requires a predicate"); }
+                        define(*output, op.result_type(), &mut local, &mut defined, &mut definitions)?;
+                    }
                     Inst::Target { provenance, op, args, outputs } => {
-                        if args.values().iter().any(|v| !local.contains(v)) { return Err("non-dominating target input"); }
+                        if args.values().iter().any(|v| !seen(*v, &local)) { return Err("non-dominating target input"); }
                         let spec = registry.operation(*op)?;
-                        spec.verify_immediates(*args, |v| constants.get(&v).copied())?;
+                        spec.verify_immediates(*args, |v| constants.get(v.0).copied().flatten())?;
                         if (spec.effect == crate::rdna_spmd::dialect::Effect::Pure) != provenance.is_none() {
                             return Err("target effect provenance mismatch");
                         }
@@ -49,18 +57,18 @@ impl Func {
                         if expected.len() != outputs.len() || outputs.iter().zip(expected).any(|((_, ty), expected)| ty != expected) {
                             return Err("target result signature mismatch");
                         }
-                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut definitions)?; }
+                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut defined, &mut definitions)?; }
                     }
                     Inst::Effect { provenance, op, inputs, outputs } => {
                         if !effects.insert(*provenance) { return Err("duplicate effect provenance"); }
-                        if inputs.iter().any(|v| !local.contains(v)) { return Err("non-dominating effect input"); }
+                        if inputs.iter().any(|v| !seen(*v, &local)) { return Err("non-dominating effect input"); }
                         op.verify(inputs, outputs, &self.types)?;
-                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut definitions)?; }
+                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut defined, &mut definitions)?; }
                     }
                     Inst::Core { value, ty, op } => {
                         let mut valid = true;
                         op.map(|v| {
-                            valid &= local.contains(&v);
+                            valid &= seen(v, &local);
                             v
                         });
                         if !valid {
@@ -69,19 +77,18 @@ impl Func {
                         if op.result_type(&self.types)? != *ty {
                             return Err("incorrect core result type");
                         }
-                        define(*value, *ty, &mut local, &mut definitions)?;
-                        if let Op::Const(_, bits) = op { constants.insert(*value, *bits); }
+                        define(*value, *ty, &mut local, &mut defined, &mut definitions)?;
+                        if let Op::Const(_, bits) = op { constants[value.0] = Some(*bits); }
                     }
-
                 }
             }
             if let Term::CondBr { cond, .. } = block.term {
-                if !local.contains(&cond) || self.types[cond.0] != Ty::I1 {
+                if !seen(cond, &local) || self.types[cond.0] != Ty::I1 {
                     return Err("branch requires a dominating i1");
                 }
             }
             if let Term::Ret(args) = &block.term {
-                if args.iter().any(|arg| !local.contains(arg)) { return Err("invalid return argument"); }
+                if args.iter().any(|arg| !seen(*arg, &local)) { return Err("invalid return argument"); }
             }
             for e in block.term.edges() {
                 let dst = self.blocks.get(&e.dst).ok_or("missing branch target")?;
@@ -89,16 +96,16 @@ impl Func {
                     return Err("block argument count mismatch");
                 }
                 for (&arg, &(_, ty)) in e.args.iter().zip(&dst.params) {
-                    if !local.contains(&arg) || self.types[arg.0] != ty {
+                    if !seen(arg, &local) || self.types[arg.0] != ty {
                         return Err("invalid block argument");
                     }
                 }
             }
         }
-        if definitions.len() != self.types.len() {
+        if definitions != count {
             return Err("undefined SSA value");
         }
-        Ok(VerifiedFunc(self))
+        Ok(())
     }
 }
 impl VerifiedFunc {
