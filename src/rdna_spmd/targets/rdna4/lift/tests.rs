@@ -1020,7 +1020,6 @@ fn typed_function_loop_carries_values_through_block_arguments() {
     assert!(block
         .term
         .edges()
-        .iter()
         .any(|e| e.dst.0 == 1 && e.args.iter().zip(&block.params).any(|(a, p)| *a != p.0)));
     for width in [0, 1, 2, 4, 8, 16] {
         let w = width.max(1) as usize;
@@ -1208,7 +1207,7 @@ fn typed_lds_barrier_rounds_and_first_wave_execute_at_all_widths() {
                 simm16: 7,
             }));
         }
-        let program = split_at_barriers(&ScalarProgram {
+        let program = split_at_barriers(crate::rdna_spmd::CompilationInput::to_ssa(&ScalarProgram {
             entry_pc: 0,
             blocks: BTreeMap::from([(
                 0,
@@ -1218,7 +1217,7 @@ fn typed_lds_barrier_rounds_and_first_wave_execute_at_all_widths() {
                     term: Terminator::Return,
                 },
             )]),
-        });
+        }));
         let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
         kd.enable_sgpr_kernarg_segment_ptr = true;
         let dims = GridDims {

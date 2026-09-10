@@ -1,4 +1,4 @@
-use crate::rdna_spmd::analysis::masks::Masks;
+use crate::rdna_spmd::analysis::masks::Predication;
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry, TargetOp};
 use crate::rdna_spmd::ir::{*, FloatOp, FloatUnary, Op, Ty, ValueId};
 use crate::rdna_spmd::pass::idioms::Idiom;
@@ -12,19 +12,19 @@ impl SqrtIdioms {
     }
 }
 impl Idiom for SqrtIdioms {
-    fn rewrite(&self, f: &mut Func, masks: &Masks, constants: &[Option<u64>]) -> usize { run(f, masks, constants, self) }
+    fn rewrite(&self, f: &mut Func, masks: &Predication, constants: &[Option<u64>]) -> usize { run(f, masks, constants, self) }
 }
 
 struct View<'a> {
     f: &'a Func,
     defs: Vec<Option<Op>>,
     targets: Vec<Option<(TargetOp, Vec<ValueId>)>>,
-    masks: &'a Masks,
+    masks: &'a Predication,
     constants: &'a [Option<u64>],
 }
 
 impl<'a> View<'a> {
-    fn new(f: &'a Func, masks: &'a Masks, constants: &'a [Option<u64>]) -> Self {
+    fn new(f: &'a Func, masks: &'a Predication, constants: &'a [Option<u64>]) -> Self {
         let mut defs = vec![None; f.types.len()];
         let mut targets = vec![None; f.types.len()];
         for block in f.blocks.values() {
@@ -132,7 +132,7 @@ fn scaled_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> {
     Some(view.raw(x))
 }
 
-fn run(f: &mut Func, masks: &Masks, constants: &[Option<u64>], ops: &SqrtIdioms) -> usize {
+fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtIdioms) -> usize {
     let mut rewrites: Vec<(BlockId, usize, ValueId, ValueId)> = Vec::new();
     {
         let view = View::new(f, masks, constants);
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!((count(&ir, "rsq.f64"), count(&ir, "sqrt.f64"), count(&ir, "ldexp.f64")), (1, 0, 2));
         for _ in 0..3 {
             let constants = crate::rdna_spmd::analysis::constants(&ir);
-            let masks = crate::rdna_spmd::analysis::masks::analyze(&registry, &ir, exec_index, &constants, 32, false);
+            let masks = crate::rdna_spmd::analysis::masks::predication(&ir, exec_index, &constants);
             run(&mut ir, &masks, &constants, &SqrtIdioms::new(&registry));
             let masks = crate::rdna_spmd::analysis::masks::analyze(&registry, &ir, exec_index, &constants, 32, false);
             crate::rdna_spmd::pass::dce::dead_writes(&mut ir, &masks, exec_index);

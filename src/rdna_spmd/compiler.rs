@@ -181,25 +181,24 @@ impl Compiler {
 
 /// Compile lane-local execution. General 32-lane effects are scheduled
 /// with `split_at_xlane` and executed by a wave/cooperative dispatcher.
-pub(crate) fn compile_scalar(program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel {
-    let p = prepare_scalar(program.to_ssa().function, ScalarMode::Whole, num_vgprs.max(256));
+pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel {
+    let p = prepare_scalar(program.function, ScalarMode::Whole, num_vgprs.max(256));
     let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
     ScalarKernel::from_code(code, p.num_vgprs)
 }
 
 
-pub(crate) fn compile_packet(program: &impl CompilationInput, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
+pub(crate) fn compile_packet(program: Program, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
-    let p = prepare_packet(program.to_ssa().function, width, false, false, num_vgprs.max(256), aligned);
+    let p = prepare_packet(program.function, width, false, false, num_vgprs.max(256), aligned);
     let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
     VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x)
 }
 
 
-pub(crate) fn compile_cooperative_packet(program: &impl CompilationInput, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> CoopVecKernel {
+pub(crate) fn compile_cooperative_packet(program: Program, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> CoopVecKernel {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
-    let program = program.to_ssa();
     let num_vgprs = program.vgpr_count(num_vgprs);
     let p = prepare_packet(program.function, width, true, true, num_vgprs, aligned);
     let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
@@ -209,8 +208,7 @@ pub(crate) fn compile_cooperative_packet(program: &impl CompilationInput, num_vg
 }
 
 /// Compile a program whose scheduled effects yield to the cooperative scheduler.
-pub(crate) fn compile_cooperative_scalar(program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel {
-    let program = program.to_ssa();
+pub(crate) fn compile_cooperative_scalar(program: Program, num_vgprs: usize) -> CoopKernel {
     let num_vgprs = program.vgpr_count(num_vgprs);
     let p = prepare_scalar(program.function, ScalarMode::Cooperative, num_vgprs);
     let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
@@ -225,10 +223,10 @@ pub fn decode_program(arch: &str, entry_pc: usize, memory: &[u8]) -> Result<Prog
 
 #[cfg(test)]
 impl Compiler {
-    pub(crate) fn compile_program(&self, program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel { compile_scalar(program, num_vgprs) }
-    pub(crate) fn compile_program_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> VecKernel { compile_packet(program, num_vgprs, width, None) }
-    pub(crate) fn compile_cooperative_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> CoopVecKernel { compile_cooperative_packet(program, num_vgprs, width, None) }
-    pub(crate) fn compile_cooperative(&self, program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel { compile_cooperative_scalar(program, num_vgprs) }
+    pub(crate) fn compile_program(&self, program: &impl CompilationInput, num_vgprs: usize) -> ScalarKernel { compile_scalar(program.to_ssa(), num_vgprs) }
+    pub(crate) fn compile_program_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> VecKernel { compile_packet(program.to_ssa(), num_vgprs, width, None) }
+    pub(crate) fn compile_cooperative_vec(&self, program: &impl CompilationInput, num_vgprs: usize, width: u32) -> CoopVecKernel { compile_cooperative_packet(program.to_ssa(), num_vgprs, width, None) }
+    pub(crate) fn compile_cooperative(&self, program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel { compile_cooperative_scalar(program.to_ssa(), num_vgprs) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,16 +268,16 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
     assert!(matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", options.width);
     let program = program.to_ssa();
     let scheduler = scheduler_for(&program);
-    let cooperative = |program: &Program| if options.width == 0 {
+    let cooperative = |program: Program| if options.width == 0 {
         compile_cooperative_scalar(program, options.num_vgprs)
     } else {
         compile_cooperative_packet(program, options.num_vgprs, options.width, options.workgroup_x)
     };
     let code = match scheduler {
-        Scheduler::Independent if options.width == 0 => Code::Scalar(compile_scalar(&program, options.num_vgprs)),
-        Scheduler::Independent => Code::Packet(compile_packet(&program, options.num_vgprs, options.width, options.workgroup_x)),
-        Scheduler::Wave => Code::Cooperative(cooperative(&super::engine::xlane::split_at_xlane(&program).0)),
-        Scheduler::Workgroup => Code::Cooperative(cooperative(&super::program::split_at_barriers(&program))),
+        Scheduler::Independent if options.width == 0 => Code::Scalar(compile_scalar(program, options.num_vgprs)),
+        Scheduler::Independent => Code::Packet(compile_packet(program, options.num_vgprs, options.width, options.workgroup_x)),
+        Scheduler::Wave => Code::Cooperative(cooperative(super::engine::xlane::split_at_xlane(program).0)),
+        Scheduler::Workgroup => Code::Cooperative(cooperative(super::program::split_at_barriers(program))),
     };
     Kernel::new(code, scheduler, options.width)
 }

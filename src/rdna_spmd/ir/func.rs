@@ -49,12 +49,13 @@ pub(crate) enum Term {
     Ret(Vec<ValueId>),
 }
 impl Term {
-    pub fn edges(&self) -> Vec<&Edge> {
-        match self {
-            Self::Br(e) => vec![e],
-            Self::CondBr { yes, no, .. } => vec![yes, no],
-            Self::Ret(_) => vec![],
-        }
+    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
+        let (first, second) = match self {
+            Self::Br(e) => (Some(e), None),
+            Self::CondBr { yes, no, .. } => (Some(yes), Some(no)),
+            Self::Ret(_) => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 }
 #[derive(Clone, Debug, PartialEq)]

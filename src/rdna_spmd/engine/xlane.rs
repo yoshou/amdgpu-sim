@@ -39,8 +39,8 @@ use crate::rdna_spmd::targets::rdna4::lift::wave::Operand;
 #[cfg(test)]
 use super::super::ir::{EffectOp, WaveOp};
 
-pub(crate) fn split_at_xlane(program: &impl super::super::CompilationInput) -> (super::super::Program, BTreeMap<usize, XlaneOp>) {
-    let (program, ops) = program.to_ssa().schedule(|op| matches!(op, super::super::ir::EffectOp::Wave(w) if *w != super::super::ir::WaveOp::WriteLane));
+pub(crate) fn split_at_xlane(program: super::super::Program) -> (super::super::Program, BTreeMap<usize, XlaneOp>) {
+    let (program, ops) = program.schedule(|op| matches!(op, super::super::ir::EffectOp::Wave(w) if *w != super::super::ir::WaveOp::WriteLane));
     (program, ops.into_iter().map(|(key, op)| (key, XlaneOp(op))).collect())
 }
 

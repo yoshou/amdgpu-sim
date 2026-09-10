@@ -15,7 +15,21 @@ impl Fact {
         }
     }
 }
-enum Definition { External, Phi(Vec<ValueId>), Core(Ty, Op) }
+enum Definition { External, Phi, Core(Ty, Op) }
+
+struct Lists { starts: Vec<u32>, items: Vec<u32> }
+impl Lists {
+    fn build(entries: usize, count: impl Fn(&mut dyn FnMut(usize)), fill: impl Fn(&mut dyn FnMut(usize, u32))) -> Self {
+        let mut starts = vec![0u32; entries + 1];
+        count(&mut |key| starts[key + 1] += 1);
+        for i in 0..entries { starts[i + 1] += starts[i]; }
+        let mut cursor = starts.clone();
+        let mut items = vec![0u32; starts[entries] as usize];
+        fill(&mut |key, value| { items[cursor[key] as usize] = value; cursor[key] += 1; });
+        Self { starts, items }
+    }
+    fn get(&self, key: usize) -> &[u32] { &self.items[self.starts[key] as usize..self.starts[key + 1] as usize] }
+}
 
 /// A conservative, monotone constant analysis. All incoming CFG edges take
 /// part, including loop backedges; an unseeded cycle proves no constant.
@@ -31,7 +45,7 @@ fn constant_facts(f:&Func,entry_true:&[ValueId],valid_queries:bool)->Vec<Option<
     let mut definitions: Vec<_> = (0..f.types.len()).map(|_| Definition::External).collect();
     for (&id, block) in &f.blocks {
         if id != f.entry {
-            for &(value, _) in &block.params { definitions[value.0] = Definition::Phi(vec![]); }
+            for &(value, _) in &block.params { definitions[value.0] = Definition::Phi; }
         }
         for inst in &block.insts {
             if let Inst::Core { value, ty, op } = *inst {
@@ -49,23 +63,32 @@ fn constant_facts(f:&Func,entry_true:&[ValueId],valid_queries:bool)->Vec<Option<
             }
         }
     }
-    for block in f.blocks.values() {
-        for edge in block.term.edges() {
-            for (&arg, &(value, _)) in edge.args.iter().zip(&f.blocks[&edge.dst].params) {
-                if let Definition::Phi(inputs) = &mut definitions[value.0] { inputs.push(arg); }
+    let arguments = {
+        let each = |visit: &mut dyn FnMut(usize, u32)| {
+            for block in f.blocks.values() {
+                for edge in block.term.edges() {
+                    let params = &f.blocks[&edge.dst].params;
+                    for (&arg, &(value, _)) in edge.args.iter().zip(params) {
+                        if matches!(definitions[value.0], Definition::Phi) { visit(value.0, arg.0 as u32); }
+                    }
+                }
             }
-        }
-    }
+        };
+        Lists::build(definitions.len(), |count| each(&mut |key, _| count(key)), |fill| each(fill))
+    };
     for &id in entry_true {definitions[id.0]=Definition::Core(Ty::I1,Op::Const(Ty::I1,1));}
-    let mut users = vec![vec![]; definitions.len()];
-    for (id, definition) in definitions.iter().enumerate() {
-        let mut add = |value: ValueId| { users[value.0].push(id); value };
-        match definition {
-            Definition::Core(_, op) => { op.map(&mut add); }
-            Definition::Phi(inputs) => { for &value in inputs { add(value); } }
-            Definition::External => {}
-        }
-    }
+    let users = {
+        let each = |visit: &mut dyn FnMut(usize, u32)| {
+            for (id, definition) in definitions.iter().enumerate() {
+                match definition {
+                    Definition::Core(_, op) => { op.map(|value| { visit(value.0, id as u32); value }); }
+                    Definition::Phi => { for &value in arguments.get(id) { visit(value as usize, id as u32); } }
+                    Definition::External => {}
+                }
+            }
+        };
+        Lists::build(definitions.len(), |count| each(&mut |key, _| count(key)), |fill| each(fill))
+    };
     let mut facts = vec![Fact::Pending; definitions.len()];
     let mut queue: VecDeque<_> = (0..definitions.len()).collect();
     let mut queued = vec![true; definitions.len()];
@@ -73,13 +96,14 @@ fn constant_facts(f:&Func,entry_true:&[ValueId],valid_queries:bool)->Vec<Option<
         queued[id] = false;
         let next = match &definitions[id] {
             Definition::External => Fact::Dynamic,
-            Definition::Phi(inputs) => inputs.iter().fold(Fact::Pending, |a, b| a.join(facts[b.0])),
+            Definition::Phi => arguments.get(id).iter().fold(Fact::Pending, |a, &b| a.join(facts[b as usize])),
             Definition::Core(ty, op) => evaluate(*ty, *op, &f.types, &facts),
         };
         let next = facts[id].join(next);
         if next != facts[id] {
             facts[id] = next;
-            for &user in &users[id] {
+            for &user in users.get(id) {
+                let user = user as usize;
                 if !queued[user] { queued[user] = true; queue.push_back(user); }
             }
         }

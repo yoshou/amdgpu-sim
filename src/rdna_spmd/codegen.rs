@@ -63,7 +63,7 @@ pub(super) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
     let mut stack: Vec<(BlockId, usize)> = vec![(f.entry, 0)];
     visited.insert(f.entry);
     while let Some((id, next)) = stack.last_mut() {
-        let edges = f.blocks[id].term.edges();
+        let edges: Vec<&Edge> = f.blocks[id].term.edges().collect();
         if *next < edges.len() {
             let dst = edges[*next].dst;
             *next += 1;

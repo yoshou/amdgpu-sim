@@ -41,9 +41,9 @@ impl Program {
         }).max().unwrap_or(1);
         declared.max(needed)
     }
-    pub(super) fn schedule(&self, accept:impl Fn(&super::ir::EffectOp)->bool) -> (Self,BTreeMap<usize,super::ir::EffectOp>) {
+    pub(super) fn schedule(self, accept:impl Fn(&super::ir::EffectOp)->bool) -> (Self,BTreeMap<usize,super::ir::EffectOp>) {
         use super::ir::{Inst, EffectOp};
-        let mut out=self.clone();
+        let mut out=self;
         let mut yields=BTreeMap::new();
         for block in out.function.ir.blocks.values_mut() {
             for inst in &mut block.insts {
@@ -60,6 +60,6 @@ impl Program {
     }
 }
 
-pub(crate) fn split_at_barriers(program: &impl CompilationInput) -> Program {
-    program.to_ssa().schedule(|op| !matches!(op, super::ir::EffectOp::Wave(_))).0
+pub(crate) fn split_at_barriers(program: Program) -> Program {
+    program.schedule(|op| !matches!(op, super::ir::EffectOp::Wave(_))).0
 }

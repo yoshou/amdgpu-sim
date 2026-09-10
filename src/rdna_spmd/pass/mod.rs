@@ -9,7 +9,7 @@ pub(crate) mod entry;
 pub(crate) mod idioms;
 use super::ir::{*, Op, Ty, ValueId};
 
-use super::analysis::masks::{Exec, Masks};
+use super::analysis::masks::{Exec, Masks, Predication};
 use super::analysis::uniformity::{Fact, Uniformity};
 use super::dialect::DialectRegistry;
 use std::cell::OnceCell;
@@ -27,6 +27,7 @@ pub(crate) struct Context<'r> {
 pub(crate) struct Analyses<'r> {
     ctx: Context<'r>,
     constants: OnceCell<Vec<Option<u64>>>,
+    predication: OnceCell<Predication>,
     masks: OnceCell<Masks>,
     exec: OnceCell<Exec>,
     uniformity: OnceCell<Option<Uniformity>>,
@@ -35,11 +36,12 @@ pub(crate) struct Analyses<'r> {
 
 impl<'r> Analyses<'r> {
     pub fn new(ctx: Context<'r>) -> Self {
-        Self { ctx, constants: OnceCell::new(), masks: OnceCell::new(), exec: OnceCell::new(), uniformity: OnceCell::new(), uniform: OnceCell::new() }
+        Self { ctx, constants: OnceCell::new(), predication: OnceCell::new(), masks: OnceCell::new(), exec: OnceCell::new(), uniformity: OnceCell::new(), uniform: OnceCell::new() }
     }
     pub fn context(&self) -> &Context<'r> { &self.ctx }
     pub fn invalidate(&mut self) {
         self.constants.take();
+        self.predication.take();
         self.masks.take();
         self.exec.take();
         self.uniformity.take();
@@ -48,8 +50,11 @@ impl<'r> Analyses<'r> {
     pub fn constants(&self, f: &Func) -> &[Option<u64>] {
         self.constants.get_or_init(|| super::analysis::constants(f))
     }
+    pub fn predication(&self, f: &Func) -> &Predication {
+        self.predication.get_or_init(|| super::analysis::masks::predication(f, self.ctx.exec_index, self.constants(f)))
+    }
     pub fn masks(&self, f: &Func) -> &Masks {
-        self.masks.get_or_init(|| super::analysis::masks::analyze(self.ctx.registry, f, self.ctx.exec_index, self.constants(f), self.ctx.lanes, self.ctx.entry_full))
+        self.masks.get_or_init(|| super::analysis::masks::analyze_from(self.ctx.registry, f, self.predication(f), self.ctx.exec_index, self.constants(f), self.ctx.lanes, self.ctx.entry_full))
     }
     pub fn exec(&self, f: &Func) -> &Exec {
         self.exec.get_or_init(|| super::analysis::masks::exec(f, self.ctx.exec_index, self.constants(f), self.ctx.lanes, self.ctx.exec_initial, self.ctx.exec_packed))
@@ -82,7 +87,7 @@ pub(super) trait Program {
     fn registry(&self) -> &DialectRegistry;
     fn touch(&mut self);
 }
-pub(super) struct Driver { trace: bool }
+pub(super) struct Driver { trace: bool, verify_each: bool }
 pub(super) struct FuncProgram<'r> { pub ir: Func, pub registry: &'r DialectRegistry }
 impl Program for FuncProgram<'_> {
     type Snapshot = Func;
@@ -132,7 +137,10 @@ pub(crate) fn compact(f: &mut Func) {
 }
 
 impl Driver {
-    pub fn new() -> Self { Self { trace: std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() } }
+    pub fn new() -> Self {
+        let trace = std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some();
+        Self { trace, verify_each: trace || cfg!(test) }
+    }
     pub fn pipeline<P: Program>(&self, program: &mut P, analyses: &mut Analyses, passes: &[&dyn Pass]) -> Result<bool, String> {
         let mut any = false;
         for pass in passes {
@@ -146,8 +154,9 @@ impl Driver {
                 analyses.invalidate();
                 any = true;
             }
-            self.check(program, pass.name())?;
+            if self.verify_each { self.check(program, pass.name())?; }
         }
+        if !self.verify_each { self.check(program, passes.last().map_or("pipeline", |p| p.name()))?; }
         Ok(any)
     }
     pub fn fixpoint<P: Program>(&self, program: &mut P, analyses: &mut Analyses, name: &str, limit: usize, passes: &[&dyn Pass]) -> Result<(), String> {

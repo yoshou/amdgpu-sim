@@ -143,14 +143,71 @@ pub(crate) fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded
     for (&id, block) in &f.blocks {
         if id != f.entry { for w in block.params.windows(2) { top[w[0].0 .0] = Some(w[1].0); } }
     }
-    let mut incoming: Vec<Option<Fact>> = vec![None; f.types.len()];
-    let mut incoming_pairs: Vec<Option<(ValueId, Option<Fact>)>> = vec![None; f.types.len()];
-    let mut touched: Vec<ValueId> = Vec::new();
-    let mut touched_pairs: Vec<ValueId> = Vec::new();
+    let blocks: Vec<&Block> = f.blocks.values().collect();
+    let mut position = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
+    for (at, id) in f.blocks.keys().enumerate() { position[id.0] = at; }
+    let mut incoming_edges: Vec<Vec<&Edge>> = (0..blocks.len()).map(|_| Vec::new()).collect();
+    for block in &blocks {
+        for edge in block.term.edges() { incoming_edges[position[edge.dst.0]].push(edge); }
+    }
+    let order = {
+        let mut order = Vec::with_capacity(blocks.len());
+        let mut seen = vec![false; blocks.len()];
+        let entry = position[f.entry.0];
+        seen[entry] = true;
+        let mut stack: Vec<(usize, usize)> = vec![(entry, 0)];
+        while let Some((at, next)) = stack.last_mut() {
+            match blocks[*at].term.edges().nth(*next) {
+                Some(edge) => {
+                    *next += 1;
+                    let dst = position[edge.dst.0];
+                    if !seen[dst] { seen[dst] = true; stack.push((dst, 0)); }
+                }
+                None => { order.push(*at); stack.pop(); }
+            }
+        }
+        order.reverse();
+        for at in 0..blocks.len() { if !seen[at] { order.push(at); } }
+        order
+    };
+    let entry_at = position[f.entry.0];
     loop {
         let mut changed = false;
         fn assign(facts: &mut [Option<Fact>], changed: &mut bool, id: ValueId, fact: Fact) { if facts[id.0] != Some(fact) { facts[id.0] = Some(fact); *changed = true; } }
-        for block in f.blocks.values() {
+        for &at in &order {
+            let block = blocks[at];
+            if at != entry_at {
+                for (index, &(param, _)) in block.params.iter().enumerate() {
+                    let high = block.params.get(index + 1).map(|p| p.0);
+                    let mut merged: Option<Fact> = None;
+                    let mut merged_pair: Option<Option<Fact>> = None;
+                    for edge in &incoming_edges[at] {
+                        let Some(&arg) = edge.args.get(index) else { continue };
+                        if let Some(fact) = facts[arg.0] {
+                            merged = Some(match merged { Some(current) => current.meet(fact), None => fact });
+                        }
+                        let Some(high) = high else { continue };
+                        if index + 1 >= edge.args.len() { continue; }
+                        let source = (arg, edge.args[index + 1]);
+                        if top[source.0 .0] == Some(source.1) { continue; }
+                        let fact = pairs[source.0 .0].filter(|p| p.0 == source.1).map(|p| p.1).or_else(|| {
+                            let (a, b) = (unpacked(source.0, &definitions)?, unpacked(source.1, &definitions)?);
+                            (a.0 == b.0 && !a.1 && b.1).then(|| facts[a.0 .0]).flatten().filter(|fact| matches!(fact, Fact::Affine { .. }))
+                        });
+                        let _ = high;
+                        merged_pair = Some(match merged_pair {
+                            Some(current) => match (current, fact) { (Some(a), Some(b)) if a == b => Some(a), _ => None },
+                            None => fact,
+                        });
+                    }
+                    if let Some(fact) = merged { assign(&mut facts, &mut changed, param, fact); }
+                    if let (Some(fact), Some(high)) = (merged_pair, high) {
+                        if top[param.0] == Some(high) { top[param.0] = None; changed = true; }
+                        let next = fact.map(|fact| (high, fact));
+                        if pairs[param.0] != next { pairs[param.0] = next; changed = true; }
+                    }
+                }
+            }
             for inst in &block.insts {
                 match inst {
                     Inst::Core { value, ty, op } => {
@@ -231,41 +288,6 @@ pub(crate) fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded
             if let Some(fact @ Fact::Affine { .. }) = facts[x.0] {
                 if pairs[lo.0] != Some((hi, fact)) { pairs[lo.0] = Some((hi, fact)); changed = true; }
             }
-        }
-        for &v in &touched { incoming[v.0] = None; }
-        for &v in &touched_pairs { incoming_pairs[v.0] = None; }
-        touched.clear();
-        touched_pairs.clear();
-        for block in f.blocks.values() {
-            for edge in block.term.edges() {
-                let dest = &f.blocks[&edge.dst];
-                for (index, (&arg, &(param, _))) in edge.args.iter().zip(&dest.params).enumerate() {
-                    if edge.dst == f.entry { continue; }
-                    if let Some(fact) = facts[arg.0] {
-                        incoming[param.0] = Some(match incoming[param.0] { Some(current) => { current.meet(fact) } None => { touched.push(param); fact } });
-                    }
-                    if index + 1 < edge.args.len() {
-                        let hi = dest.params[index + 1].0;
-                        let source = (arg, edge.args[index + 1]);
-                        if top[source.0 .0] == Some(source.1) { continue; }
-                        let fact = pairs[source.0 .0].filter(|p| p.0 == source.1).map(|p| p.1).or_else(|| {
-                            let (a, b) = (unpacked(source.0, &definitions)?, unpacked(source.1, &definitions)?);
-                            (a.0 == b.0 && !a.1 && b.1).then(|| facts[a.0 .0]).flatten().filter(|fact| matches!(fact, Fact::Affine { .. }))
-                        });
-                        incoming_pairs[param.0] = Some((hi, match incoming_pairs[param.0] {
-                            Some((_, current)) => match (current, fact) { (Some(a), Some(b)) if a == b => Some(a), _ => None },
-                            None => { touched_pairs.push(param); fact }
-                        }));
-                    }
-                }
-            }
-        }
-        for &param in &touched { assign(&mut facts, &mut changed, param, incoming[param.0].unwrap()); }
-        for &lo in &touched_pairs {
-            let (hi, fact) = incoming_pairs[lo.0].unwrap();
-            if top[lo.0] == Some(hi) { top[lo.0] = None; changed = true; }
-            let next = fact.map(|fact| (hi, fact));
-            if pairs[lo.0] != next { pairs[lo.0] = next; changed = true; }
         }
         if !changed { break; }
     }

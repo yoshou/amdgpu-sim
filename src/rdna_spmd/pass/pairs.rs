@@ -40,7 +40,9 @@ impl super::Pass for Pairs {
 pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
     let defs = definitions(f);
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
-    let mut incoming: BTreeMap<BlockId, Vec<(BlockId, usize)>> = BTreeMap::new();
+    let mut position = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
+    for (at, id) in f.blocks.keys().enumerate() { position[id.0] = at; }
+    let mut incoming: Vec<Vec<&Edge>> = (0..f.blocks.len()).map(|_| Vec::new()).collect();
     let mut packed: Vec<Vec<ValueId>> = vec![Vec::new(); f.types.len()];
     let mut float = vec![false; f.types.len()];
     for block in f.blocks.values() {
@@ -48,10 +50,10 @@ pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
     }
     for (&id, block) in &f.blocks {
         for (index, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, index)); }
-        for (edge_index, edge) in block.term.edges().iter().enumerate() { incoming.entry(edge.dst).or_default().push((id, edge_index)); }
+        let _ = id;
+        for edge in block.term.edges() { incoming[position[edge.dst.0]].push(edge); }
         for inst in &block.insts { if let Inst::Core { op: Op::Pack64(a, b), value, .. } = inst { if float[value.0] { observed(*a, *b, &defs, &mut packed); } } }
     }
-    let edge_args = |f: &Func, from: BlockId, edge_index: usize| -> Vec<ValueId> { f.blocks[&from].term.edges()[edge_index].args.clone() };
     let eligible = |block: &Block, index: usize| {
         index + 1 < block.params.len() && block.params[index].1 == Ty::I32 && block.params[index + 1].1 == Ty::I32
             && uniform[block.params[index].0.0] == uniform[block.params[index + 1].0.0]
@@ -63,23 +65,19 @@ pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
             if eligible(block, index) && packed[block.params[index].0 .0].contains(&block.params[index + 1].0) { candidates.insert((id, index)); }
         }
     }
-    loop {
-        let mut added = Vec::new();
-        for &(id, index) in &candidates {
-            for &(from, edge_index) in incoming.get(&id).into_iter().flatten() {
-                let args = edge_args(f, from, edge_index);
-                if let Source::Carried(block, pi) = source(args[index], args[index + 1], &defs, &params, f) {
-                    if block != f.entry && eligible(&f.blocks[&block], pi) && !candidates.contains(&(block, pi)) { added.push((block, pi)); }
-                }
+    let mut pending: Vec<(BlockId, usize)> = candidates.iter().copied().collect();
+    while let Some((id, index)) = pending.pop() {
+        for edge in &incoming[position[id.0]] {
+            let args = &edge.args;
+            if let Source::Carried(block, pi) = source(args[index], args[index + 1], &defs, &params, f) {
+                if block != f.entry && eligible(&f.blocks[&block], pi) && candidates.insert((block, pi)) { pending.push((block, pi)); }
             }
         }
-        if added.is_empty() { break; }
-        candidates.extend(added);
     }
     let mut kept: BTreeSet<(BlockId, usize)> = BTreeSet::new();
     let mut last: Option<(BlockId, usize)> = None;
     for &(id, index) in &candidates {
-        if !incoming.contains_key(&id) { continue; }
+        if incoming[position[id.0]].is_empty() { continue; }
         if last.is_some_and(|(previous, at)| previous == id && index == at + 1) { continue; }
         kept.insert((id, index));
         last = Some((id, index));
