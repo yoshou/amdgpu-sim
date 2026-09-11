@@ -19,6 +19,7 @@ struct View<'a> {
     f: &'a Func,
     defs: Vec<Option<Op>>,
     targets: Vec<Option<(TargetOp, usize, Vec<ValueId>)>>,
+    ballots: Vec<Option<ValueId>>,
     masks: &'a Predication,
     constants: &'a [Option<u64>],
 }
@@ -27,10 +28,14 @@ impl<'a> View<'a> {
     fn new(f: &'a Func, masks: &'a Predication, constants: &'a [Option<u64>]) -> Self {
         let mut defs = vec![None; f.types.len()];
         let mut targets = vec![None; f.types.len()];
+        let mut ballots = vec![None; f.types.len()];
         for block in f.blocks.values() {
             for inst in &block.insts {
                 match inst {
                     Inst::Core { value, op, .. } => defs[value.0] = Some(*op),
+                    Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, outputs, .. } => {
+                        ballots[outputs[0].0.0] = Some(inputs[0]);
+                    }
                     Inst::Target { op, args, outputs, .. } => for (index, out) in outputs.iter().enumerate() {
                         targets[out.0 .0] = Some((*op, index, args.values().to_vec()));
                     },
@@ -38,7 +43,14 @@ impl<'a> View<'a> {
                 }
             }
         }
-        Self { f, defs, targets, masks, constants }
+        Self { f, defs, targets, ballots, masks, constants }
+    }
+    fn alias(&self, mut v: ValueId) -> ValueId {
+        while let Some(Op::Convert(Cvt::Bitcast, to, a)) = self.defs[v.0] {
+            if self.f.types[a.0] != to { break; }
+            v = a;
+        }
+        v
     }
     fn raw(&self, mut v: ValueId) -> ValueId {
         loop {
@@ -153,7 +165,103 @@ impl DivisionIdioms {
     }
 }
 impl Idiom for DivisionIdioms {
-    fn rewrite(&self, f: &mut Func, masks: &Predication, constants: &[Option<u64>]) -> usize { divisions(f, masks, constants, self) }
+    fn rewrite(&self, f: &mut Func, masks: &Predication, constants: &[Option<u64>]) -> usize {
+        let count = divisions(f, masks, constants, self);
+        count + quotient_fixups(f, self.fixup)
+    }
+}
+
+/// A quotient formed from these exact operands already has the right sign
+/// and handles zero/infinity. Keep the ISA-specific NaN and tiny-result rules
+/// as ordinary SSA operations; code generation needs no special case.
+pub(super) fn quotient_fixups(f: &mut Func, fixup: TargetOp) -> usize {
+    let defs = crate::rdna_spmd::analysis::masks::definitions(f);
+    let alias = |mut value: ValueId| {
+        while let Some(Op::Convert(Cvt::Bitcast, to, source)) = defs[value.0] {
+            if to != f.types[source.0] { break; }
+            value = source;
+        }
+        value
+    };
+    let mut sites: BTreeMap<BlockId, Vec<usize>> = BTreeMap::new();
+    for (&id, block) in &f.blocks {
+        for (index, inst) in block.insts.iter().enumerate() {
+            let Inst::Target { op, args, .. } = inst else { continue };
+            if *op != fixup { continue; }
+            let a = args.values();
+            // Do not strip predicated selects: an inactive lane may still
+            // hold an old quotient or different denominator/numerator.
+            if let Some(Op::Float(FloatOp::Div, numerator, denominator)) = defs[alias(a[0]).0] {
+                if alias(numerator) == alias(a[2]) && alias(denominator) == alias(a[1]) {
+                    sites.entry(id).or_default().push(index);
+                }
+            }
+        }
+    }
+    let count = sites.values().map(Vec::len).sum();
+    for (id, indices) in sites {
+        for index in indices.into_iter().rev() {
+            let Inst::Target { args, outputs, .. } = &f.blocks[&id].insts[index] else { unreachable!() };
+            let a = args.values();
+            let (quotient, denominator, numerator, result) = (a[0], a[1], a[2], outputs[0].0);
+            let insts = fixup_division(f, quotient, denominator, numerator, result);
+            f.blocks.get_mut(&id).unwrap().insts.splice(index..=index, insts);
+        }
+    }
+    count
+}
+
+fn fixup_division(f: &mut Func, quotient: ValueId, denominator: ValueId, numerator: ValueId, result: ValueId) -> Vec<Inst> {
+    let mut insts = Vec::new();
+    let mut push = |ty, op| {
+        let value = f.value(ty);
+        insts.push(Inst::Core { value, ty, op });
+        value
+    };
+    let zero = push(Ty::I64, Op::Const(Ty::I64, 0));
+    let sign = push(Ty::I64, Op::Const(Ty::I64, 0x8000_0000_0000_0000));
+    let magnitude = push(Ty::I64, Op::Const(Ty::I64, 0x7FFF_FFFF_FFFF_FFFF));
+    let infinity = push(Ty::I64, Op::Const(Ty::I64, 0x7FF0_0000_0000_0000));
+    let quiet = push(Ty::I64, Op::Const(Ty::I64, 0x0008_0000_0000_0000));
+    let invalid = push(Ty::I64, Op::Const(Ty::I64, 0xFFF8_0000_0000_0000));
+    let fraction = push(Ty::I64, Op::Const(Ty::I64, 52));
+    let exponent_mask = push(Ty::I64, Op::Const(Ty::I64, 0x7FF));
+    let tiny_limit = push(Ty::I64, Op::Const(Ty::I64, (-1075i64) as u64));
+    let den = push(Ty::I64, Op::Convert(Cvt::Bitcast, Ty::I64, denominator));
+    let num = push(Ty::I64, Op::Convert(Cvt::Bitcast, Ty::I64, numerator));
+    let abs_den = push(Ty::I64, Op::Int(IntOp::And, den, magnitude));
+    let abs_num = push(Ty::I64, Op::Int(IntOp::And, num, magnitude));
+    let den_nan = push(Ty::I1, Op::Cmp(IntPred::Ugt, abs_den, infinity));
+    let num_nan = push(Ty::I1, Op::Cmp(IntPred::Ugt, abs_num, infinity));
+    let den_zero = push(Ty::I1, Op::Cmp(IntPred::Eq, abs_den, zero));
+    let num_zero = push(Ty::I1, Op::Cmp(IntPred::Eq, abs_num, zero));
+    let both_zero = push(Ty::I1, Op::Int(IntOp::And, den_zero, num_zero));
+    let den_inf = push(Ty::I1, Op::Cmp(IntPred::Eq, abs_den, infinity));
+    let num_inf = push(Ty::I1, Op::Cmp(IntPred::Eq, abs_num, infinity));
+    let both_inf = push(Ty::I1, Op::Int(IntOp::And, den_inf, num_inf));
+    let den_exp = push(Ty::I64, Op::Int(IntOp::LShr, den, fraction));
+    let den_exp = push(Ty::I64, Op::Int(IntOp::And, den_exp, exponent_mask));
+    let num_exp = push(Ty::I64, Op::Int(IntOp::LShr, num, fraction));
+    let num_exp = push(Ty::I64, Op::Int(IntOp::And, num_exp, exponent_mask));
+    let delta = push(Ty::I64, Op::Int(IntOp::Sub, num_exp, den_exp));
+    let tiny = push(Ty::I1, Op::Cmp(IntPred::Slt, delta, tiny_limit));
+    let sign_out = push(Ty::I64, Op::Int(IntOp::Xor, den, num));
+    let signed_zero = push(Ty::I64, Op::Int(IntOp::And, sign_out, sign));
+    let invalid_operands = push(Ty::I1, Op::Int(IntOp::Or, both_zero, both_inf));
+    let fixed = push(Ty::I64, Op::Select(invalid_operands, invalid, signed_zero));
+    let quiet_den = push(Ty::I64, Op::Int(IntOp::Or, den, quiet));
+    let quiet_num = push(Ty::I64, Op::Int(IntOp::Or, num, quiet));
+    // Reverse ISA priority: numerator NaN wins over denominator NaN, then
+    // invalid operand pairs, then the exponent-based signed-zero correction.
+    let fixed = push(Ty::I64, Op::Select(den_nan, quiet_den, fixed));
+    let fixed = push(Ty::I64, Op::Select(num_nan, quiet_num, fixed));
+    let fix = push(Ty::I1, Op::Int(IntOp::Or, tiny, invalid_operands));
+    let nan = push(Ty::I1, Op::Int(IntOp::Or, den_nan, num_nan));
+    let fix = push(Ty::I1, Op::Int(IntOp::Or, fix, nan));
+    let quotient = push(Ty::I64, Op::Convert(Cvt::Bitcast, Ty::I64, quotient));
+    let bits = push(Ty::I64, Op::Select(fix, fixed, quotient));
+    insts.push(Inst::Core { value: result, ty: Ty::F64, op: Op::Convert(Cvt::Bitcast, Ty::F64, bits) });
+    insts
 }
 
 fn reciprocal(view: &View, r: ValueId, d: ValueId, ops: &DivisionIdioms) -> bool {
@@ -172,6 +280,18 @@ fn scale_flag(view: &View, v: ValueId, denominator: ValueId, numerator: ValueId,
             && view.same(args[1], denominator) && view.same(args[2], numerator);
     }
     let raw = view.raw(v);
+    // Packing a lane flag into its wave word and projecting that same lane
+    // preserves the flag. A packet ballot or a different lane is not enough.
+    // Only strip bitcast aliases here: a selected word may contain old bits.
+    if let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = view.defs[raw.0] {
+        if let Some(Op::Int(IntOp::LShr, word, lane)) = view.defs[view.alias(shifted).0] {
+            if matches!(view.defs[view.alias(lane).0], Some(Op::Env(Env::LaneId))) {
+                if let Some(bit) = view.ballots[view.alias(word).0] {
+                    return scale_flag(view, bit, denominator, numerator, exec, ops);
+                }
+            }
+        }
+    }
     let Some(bit) = view.masks.masked[raw.0].then(|| view.masks.masked_result[raw.0]).flatten() else { return false };
     let Some(Op::Int(IntOp::And, a, b)) = view.defs[raw.0] else { return false };
     let mask = if view.same(a, bit) { b } else { a };
@@ -360,24 +480,62 @@ mod tests {
         body
     }
 
-    fn division_fixups(flag: u8) -> usize {
+    fn division_fixups(flag: u8, projection: u8) -> usize {
         let program = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([(0, ScalarBlock { pc: 0, body: division_body(flag), term: Terminator::Return })]) };
         let f = program.to_ssa().function;
         let registry = f.registry.clone();
         let mut ir = f.ir.clone();
+        if projection != 0 {
+            // Exercise the SSA word round trip used when VCC is observed as
+            // an SGPR before FMAS consumes its lane bit.
+            let fmas = registry.lookup(super::super::ID, "div_fmas.f64").unwrap();
+            let (index, inputs) = ir.blocks[&BlockId(0)].insts.iter().enumerate().find_map(|(index, inst)| {
+                match inst { Inst::Target { op, args, .. } if *op == fmas => Some((index, args.values().to_vec())), _ => None }
+            }).unwrap();
+            let mut inserted = Vec::new();
+            let word = ir.value(Ty::I32);
+            inserted.push(if projection == 4 {
+                Inst::Packet { op: PacketOp::Ballot, input: inputs[3], output: word }
+            } else {
+                Inst::Effect { provenance: 999, op: EffectOp::Wave(WaveOp::Ballot), inputs: vec![inputs[3]], outputs: vec![(word, Ty::I32)] }
+            });
+            let lane = ir.value(Ty::I32);
+            inserted.push(Inst::Core { value: lane, ty: Ty::I32, op: if projection == 2 { Op::Const(Ty::I32, 0) } else { Op::Env(Env::LaneId) } });
+            let word = if projection == 3 {
+                let mask = ir.value(Ty::I32); let narrowed = ir.value(Ty::I32);
+                inserted.push(Inst::Core { value: mask, ty: Ty::I32, op: Op::Const(Ty::I32, 0x55555555) });
+                inserted.push(Inst::Core { value: narrowed, ty: Ty::I32, op: Op::Int(IntOp::And, word, mask) });
+                narrowed
+            } else { word };
+            let shifted = ir.value(Ty::I32); let bit = ir.value(Ty::I1);
+            inserted.push(Inst::Core { value: shifted, ty: Ty::I32, op: Op::Int(IntOp::LShr, word, lane) });
+            inserted.push(Inst::Core { value: bit, ty: Ty::I1, op: Op::Convert(Cvt::Trunc, Ty::I1, shifted) });
+            let block = ir.blocks.get_mut(&BlockId(0)).unwrap();
+            if let Inst::Target { args, .. } = &mut block.insts[index] {
+                *args = Arguments::Quaternary([inputs[0], inputs[1], inputs[2], bit]);
+            }
+            block.insts.splice(index..index, inserted);
+        }
         let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &registry);
         let constants = crate::rdna_spmd::analysis::constants(&ir);
         let masks = crate::rdna_spmd::analysis::masks::predication(&ir, exec_index, &constants);
         let collapsed = divisions(&mut ir, &masks, &constants, &DivisionIdioms::new(&registry));
+        let fixup = registry.lookup(super::super::ID, "div_fixup.f64").unwrap();
+        assert_eq!(quotient_fixups(&mut ir, fixup), collapsed, "each recognized macro gets its SSA correction");
         ir.clone().verify_with(&registry).unwrap();
         collapsed
     }
 
     #[test]
     fn a_division_macro_collapses_only_when_its_own_scale_sets_the_fmas_flag() {
-        assert_eq!(division_fixups(0), 1, "the macro's own scale sets the flag, so it is a division");
-        assert_eq!(division_fixups(1), 0, "a foreign flag scales the result by 2^64, so it is not");
-        assert_eq!(division_fixups(2), 0, "a flag narrowed by anything but the lane mask changes the scaling too");
-        assert_eq!(division_fixups(3), 0, "lanes reactivated after the flag was made, so its cleared bits still count");
+        for projection in [0, 1] {
+            assert_eq!(division_fixups(0, projection), 1, "the macro's own scale sets the flag, so it is a division");
+            assert_eq!(division_fixups(1, projection), 0, "a foreign flag scales the result by 2^64, so it is not");
+            assert_eq!(division_fixups(2, projection), 0, "a flag narrowed by anything but the lane mask changes the scaling too");
+            assert_eq!(division_fixups(3, projection), 0, "lanes reactivated after the flag was made, so its cleared bits still count");
+        }
+        assert_eq!(division_fixups(0, 2), 0, "another lane's bit cannot prove this lane's scaling");
+        assert_eq!(division_fixups(0, 3), 0, "masking the wave word changes the scaling");
+        assert_eq!(division_fixups(0, 4), 0, "a packet ballot is not a wave word");
     }
 }

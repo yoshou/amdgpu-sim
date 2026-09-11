@@ -4,6 +4,116 @@ use std::sync::Arc;
 
 struct Case { inputs: [u64; 4], result: u64, flag: u32 }
 
+fn quotient_ir(target: crate::rdna_spmd::dialect::TargetOp, kind: u8) -> crate::rdna_spmd::ir::Func {
+    use crate::rdna_spmd::ir::*;
+    let mut f = Func { entry: BlockId(0), blocks: std::collections::BTreeMap::new(), types: vec![] };
+    let den = f.value(Ty::F64); let num = f.value(Ty::F64);
+    let mut insts = Vec::new();
+    let mut push = |ty, op| {
+        let value = f.value(ty);
+        insts.push(Inst::Core { value, ty, op });
+        value
+    };
+    let mut quotient = push(Ty::F64, match kind {
+        0 | 6 | 7 | 8 => Op::Float(FloatOp::Div, num, den),
+        1 => Op::Convert(Cvt::Bitcast, Ty::F64, num), // Arbitrary src0.
+        2 => Op::Float(FloatOp::Div, den, num),
+        3 => Op::Float(FloatOp::Div, num, num), // Wrong denominator.
+        4 => Op::Float(FloatOp::Div, den, den), // Wrong numerator.
+        5 => Op::Const(Ty::F64, 0xfff8_1234_5678_9abc),
+        _ => unreachable!(),
+    });
+    if kind == 7 { quotient = push(Ty::F64, Op::Convert(Cvt::Bitcast, Ty::F64, quotient)); }
+    let denominator = if matches!(kind, 6 | 8) {
+        let zero = push(Ty::F64, Op::Const(Ty::F64, 0));
+        let predicate = push(Ty::I1, Op::FCmp(FloatPred::Ogt, num, zero));
+        if kind == 6 {
+            quotient = push(Ty::F64, Op::Select(predicate, quotient, num));
+            den
+        } else { push(Ty::F64, Op::Select(predicate, den, num)) }
+    } else { den };
+    let result = f.value(Ty::F64);
+    insts.push(Inst::Target { provenance: None, op: target,
+        args: Arguments::Ternary([quotient, denominator, num]), outputs: vec![(result, Ty::F64)] });
+    f.blocks.insert(BlockId(0), Block { params: vec![(den, Ty::F64), (num, Ty::F64)], insts,
+        term: Term::Ret(vec![quotient, denominator, num, result]) });
+    f
+}
+
+#[test]
+fn proven_quotient_matches_general_fixup_and_other_quotients_keep_isa_corrections() {
+    use crate::rdna_spmd::ir::{Inst, Term};
+    let mut cases = Vec::new();
+    let edge = [0u64, 1, 0x000f_ffff_ffff_ffff, 0x0010_0000_0000_0000,
+        0x3ff0_0000_0000_0000, 0x4000_0000_0000_0000,
+        1075 << 52, 1076 << 52, 1077 << 52,
+        0x7fef_ffff_ffff_ffff, 0x7ff0_0000_0000_0000,
+        0x7ff0_0000_0000_0001, 0x7ff8_1234_5678_9abc];
+    for &d in &edge { for &n in &edge {
+        for sd in [0, 1u64 << 63] { for sn in [0, 1u64 << 63] { cases.push((d | sd, n | sn)); } }
+    } }
+    let mut seed = 0x0123_4567_89ab_cdefu64;
+    let mut random = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+    for _ in 0..20_000 { cases.push((random(), random())); }
+    let registry = Arc::new(crate::rdna_spmd::targets::rdna4::registry());
+    let target = super::super::division(&registry, I::V_DIV_FIXUP_F64).unwrap();
+    let programs: Vec<_> = (0..9).map(|kind| {
+        let mut ir = quotient_ir(target, kind);
+        ir.check(&registry).unwrap();
+        let count = super::super::idioms::quotient_fixups(&mut ir, target);
+        assert_eq!(count, usize::from(matches!(kind, 0 | 7)), "quotient kind {kind}");
+        assert_eq!(super::super::idioms::quotient_fixups(&mut ir, target), 0);
+        ir.check(&registry).unwrap();
+        ir
+    }).collect();
+    for width in [0, 1, 2, 4, 8, 16, 32] {
+        unsafe {
+            let module = jit::Module::new("fixup_quotients");
+            let b = module.builder; let ctx = module.ctx; let n = b"\0".as_ptr().cast();
+            let ptr = LLVMPointerTypeInContext(ctx, 0);
+            let ft = LLVMFunctionType(LLVMVoidTypeInContext(ctx), [ptr; 4].as_mut_ptr(), 4, 0);
+            let f = LLVMAddFunction(module.module, b"kernel\0".as_ptr().cast(), ft);
+            LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, f, n));
+            let e = Emitter::new(b, (width != 0).then_some(width), registry.clone());
+            let den = LLVMBuildLoad2(b, e.ty(Ty::F64), LLVMGetParam(f, 0), n); LLVMSetAlignment(den, 4);
+            let num = LLVMBuildLoad2(b, e.ty(Ty::F64), LLVMGetParam(f, 1), n); LLVMSetAlignment(num, 4);
+            let lanes = width.max(1) as usize;
+            for (index, ir) in programs.iter().enumerate() {
+                let mut values = vec![std::ptr::null_mut(); ir.types.len()];
+                values[0] = den; values[1] = num;
+                let block = &ir.blocks[&ir.entry];
+                for inst in &block.insts {
+                    match inst {
+                        Inst::Core { value, ty, op } => values[value.0] = e.op(*ty, *op, &values),
+                        Inst::Target { op, args, outputs, .. } => {
+                            let results = e.target(*op, *args, &values);
+                            for ((value, _), result) in outputs.iter().zip(results) { values[value.0] = result; }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                let Term::Ret(returned) = &block.term else { unreachable!() };
+                let args = [values[returned[0].0], values[returned[1].0], values[returned[2].0]];
+                for (output, value) in [(2, fixup(&e, Ty::F64, &args)), (3, values[returned[3].0])] {
+                    let mut offset = LLVMConstInt(LLVMInt64TypeInContext(ctx), (index * lanes) as u64, 0);
+                    let dest = LLVMBuildGEP2(b, LLVMDoubleTypeInContext(ctx), LLVMGetParam(f, output), &mut offset, 1, n);
+                    LLVMSetAlignment(LLVMBuildStore(b, value, dest), 4);
+                }
+            }
+            LLVMBuildRetVoid(b);
+            let code = module.finish(if width == 0 { jit::Mode::Scalar } else { jit::Mode::Packet });
+            let run: unsafe extern "C" fn(*const u64, *const u64, *mut u64, *mut u64) = std::mem::transmute(code.address());
+            let mut den = vec![0; lanes]; let mut num = vec![0; lanes];
+            let mut general = vec![0; lanes * programs.len()]; let mut specialized = general.clone();
+            for start in (0..cases.len()).step_by(lanes) {
+                for lane in 0..lanes { (den[lane], num[lane]) = cases[(start + lane) % cases.len()]; }
+                run(den.as_ptr(), num.as_ptr(), general.as_mut_ptr(), specialized.as_mut_ptr());
+                assert_eq!(general, specialized, "width={width} case={start}");
+            }
+        }
+    }
+}
+
 // Invoke actual generated providers with lane-distinct runtime arguments.
 // Store both results independently, so dropped/reordered target outputs fail.
 fn check(opcode: I, cases: &[Case]) {
