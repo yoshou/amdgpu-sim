@@ -9,6 +9,7 @@ pub(crate) mod entry;
 pub(crate) mod idioms;
 pub(crate) mod mask_projection;
 pub(crate) mod uniform_queries;
+pub(crate) mod cse;
 pub(crate) mod adjacency;
 use super::ir::{*, Op, Ty, ValueId};
 

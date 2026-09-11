@@ -14,6 +14,7 @@ use super::program::{Program, CompilationInput};
 use super::program::{LiftedFunction, Parameter, ParameterSource};
 use super::pass::{Analyses, Context, Driver, LocalWriteLanes, Pass};
 use super::pass::uniform_queries::UniformQueries;
+use super::pass::cse::Cse;
 use super::pass::{active::Active, adjacency::Adjacency, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, PacketState}, idioms::Idioms, mask_projection::MaskProjection, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
 use super::ir::BlockId;
 
@@ -62,7 +63,7 @@ pub(super) fn dispatch_passes_ir(f: &mut LiftedFunction, fold_masks: bool) {
     let mut an = analyses(&registry, exec_index, 32, false, false, false, None);
     let queries = UniformQueries { inputs: &f.parameter_inputs };
     let mut passes: Vec<&dyn Pass> = Vec::new();
-    if fold_masks { passes.extend([&DeadWrites as &dyn Pass, &queries, &MaskProjection]); }
+    if fold_masks { passes.extend([&DeadWrites as &dyn Pass, &Cse, &queries, &MaskProjection]); }
     passes.extend([&Simplify as &dyn Pass, &Dce, &DeadParams]);
     driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
     driver.fixpoint(&mut program, &mut an, "mask_words", limit, &passes).unwrap();
