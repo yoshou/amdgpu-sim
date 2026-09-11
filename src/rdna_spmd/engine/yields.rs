@@ -1,6 +1,8 @@
 //! Typed values exchanged by a suspended packet and its wave scheduler.
 //! Slots describe effect arguments/results, never architectural registers.
 use super::fiber::Fiber;
+
+fn lanes(width: usize) -> u32 { if width >= 32 { u32::MAX } else { (1u32 << width) - 1 } }
 use super::super::ir::{Ty, EffectOp, WaveOp};
 
 #[derive(Clone, Copy)]
@@ -16,6 +18,7 @@ pub(crate) struct YieldValues {
     pub inputs: Vec<Ty>,
     pub outputs: Vec<Ty>,
     pub output_base: usize,
+    pub base: usize,
     pub uniform_selector: bool,
     pub arguments: Vec<Argument>,
 }
@@ -33,7 +36,7 @@ impl YieldValues {
             _ => 0,
         };
         let arguments = vec![Argument::Lane; inputs.len()];
-        Self { op, inputs, outputs, output_base, uniform_selector: false, arguments }
+        Self { op, inputs, outputs, output_base, base: 0, uniform_selector: false, arguments }
     }
     pub fn cells(&self) -> usize { self.inputs.len().max(self.output_base + self.outputs.len()) }
     pub fn uniform_result(&self) -> bool {
@@ -51,8 +54,8 @@ impl YieldValues {
     fn argument(&self, index: usize, lane: usize, width: usize, fibers: &[Fiber]) -> u32 {
         let offset = match self.arguments[index] {
             Argument::Constant(value) => return value,
-            Argument::Uniform => index * width,
-            Argument::Lane => index * width + lane % width,
+            Argument::Uniform => (self.base + index) * width,
+            Argument::Lane => (self.base + index) * width + lane % width,
         };
         unsafe { *fibers[lane / width].yield_values().add(offset) }
     }
@@ -71,13 +74,13 @@ impl YieldValues {
             // A uniform result has one scalar cell per packet. Native code
             // broadcasts that cell only when a varying consumer needs it.
             for (packet, fiber) in fibers.iter().enumerate() {
-                if valid >> (packet*width) & ((1u32 << width)-1) != 0 {
-                    unsafe { *fiber.yield_values().add(self.output_base*width) = value; }
+                if valid >> (packet*width) & lanes(width) != 0 {
+                    unsafe { *fiber.yield_values().add((self.base + self.output_base)*width) = value; }
                 }
             }
         } else {
             for lane in 0..32 { if valid >> lane & 1 != 0 {
-                unsafe { *fibers[lane / width].yield_values().add(self.output_base * width + lane % width) = value; }
+                unsafe { *fibers[lane / width].yield_values().add((self.base + self.output_base) * width + lane % width) = value; }
             } }
         }
     }
@@ -96,7 +99,7 @@ impl YieldValues {
             let first = valid.trailing_zeros() as usize;
             let value = arg(0, first); let lane = (arg(1, first) & 31) as usize;
             if valid >> lane & 1 != 0 {
-                unsafe { *fibers[lane/width].yield_values().add(self.output_base*width + lane%width) = value; }
+                unsafe { *fibers[lane/width].yield_values().add((self.base + self.output_base)*width + lane%width) = value; }
             }
             return;
         }
@@ -110,8 +113,8 @@ impl YieldValues {
             let mut padding = (valid != u32::MAX).then(|| vec![0u32; self.cells() * width]);
             let mut pointers = [std::ptr::null_mut(); 32];
             for packet in 0..fibers.len() {
-                pointers[packet] = if valid >> (packet * width) & ((1u32 << width) - 1) != 0 {
-                    fibers[packet].yield_values()
+                pointers[packet] = if valid >> (packet * width) & lanes(width) != 0 {
+                    unsafe { fibers[packet].yield_values().add(self.base * width) }
                 } else { padding.as_mut().unwrap().as_mut_ptr() };
             }
             if valid != u32::MAX {
@@ -129,7 +132,7 @@ impl YieldValues {
         let result = evaluate(op, valid, |index, lane| self.argument(index, lane, width, fibers));
         if self.uniform_result() { self.broadcast_result(width, valid, fibers, result[0]); }
         else { for lane in 0..32 { if valid >> lane & 1 != 0 {
-            unsafe { *fibers[lane / width].yield_values().add(self.output_base * width + lane % width) = result[lane]; }
+            unsafe { *fibers[lane / width].yield_values().add((self.base + self.output_base) * width + lane % width) = result[lane]; }
         } } }
     }
 }
@@ -209,14 +212,14 @@ mod tests {
                 entry: kernel.addr(), sgprs: sgprs[packet].as_mut_ptr(),
                 vgprs: vgprs[packet].as_mut_ptr(), spill: spill[packet].as_mut_ptr(),
                 scratch_base, scratch_stride, lane_base: (packet*width) as u64,
-                lds_base: 0, valid_mask: (valid >> (packet*width)) & ((1 << width)-1),
+                lds_base: 0, valid_mask: valid,
             });
         }
         loop {
             let stops: Vec<_> = fibers[..count.div_ceil(width)].iter_mut().map(Fiber::resume).collect();
             assert!(stops.iter().all(|pc| *pc == stops[0]));
             if stops[0] == FIBER_DONE { break; }
-            kernel.yields[stops[0] as usize].apply_wave(width, valid, &fibers);
+            for action in &kernel.yields[stops[0] as usize] { action.apply_wave(width, valid, &fibers); }
         }
     }
     fn program(actions: Vec<YieldAction>) -> ScalarProgram {
@@ -270,7 +273,7 @@ mod tests {
         }
     }
     #[test]
-    fn memory_and_wave_results_use_packet_mask_projection_before_saveexec() {
+    fn memory_and_wave_results_use_wave_mask_words_before_saveexec() {
         use crate::instructions::I;
         use crate::rdna_instructions::{InstFormat,SMEM,SOP1};
         let mov=|sdst,ssrc0|InstFormat::SOP1(SOP1 {op:I::S_MOV_B32,sdst,ssrc0});
@@ -296,7 +299,7 @@ mod tests {
                 let word=0x80a02005u32;
                 let ptr=&word as *const u32 as u64;
                 let chosen=0x80200004u32;
-                let ballot=if count>21 {chosen & ((1<<width)-1)} else {0};
+                let ballot=if count>21 {chosen & valid} else {0};
                 let mut s=vec![[0;129];32/width];
                 let mut v=vec![vec![0;24*width];32/width];
                 for packet in 0..count.div_ceil(width) {
@@ -306,18 +309,17 @@ mod tests {
                 }
                 run(&p,code_width,count,&mut s,&mut v);
                 for packet in 0..count.div_ceil(width) {
-                    let packet_valid=(valid>>(packet*width))&((1<<width)-1);
-                    assert_eq!(s[packet][10],word&packet_valid,"width={code_width} count={count} packet={packet}");
+                    assert_eq!(s[packet][10],word&valid,"width={code_width} count={count} packet={packet}");
                     assert_eq!(s[packet][11],ballot,"width={code_width} count={count} packet={packet}");
-                    assert_eq!(s[packet][20],word&packet_valid);
-                    assert_eq!(s[packet][12],word&ballot&packet_valid);
-                    assert_eq!(s[packet][128],(word&ballot&packet_valid!=0) as u32);
+                    assert_eq!(s[packet][20],word&valid);
+                    assert_eq!(s[packet][12],word&ballot&valid);
+                    assert_eq!(s[packet][128],(word&ballot&valid!=0) as u32);
                 }
             }
         }
     }
     #[test]
-    fn architectural_mask_words_and_branches_use_packet_bits() {
+    fn architectural_mask_words_and_branches_hold_wave_bits() {
         use crate::instructions::I;
         use crate::rdna_instructions::{InstFormat,SOP1};
         use crate::rdna_spmd::targets::rdna4::decode::Cond;
@@ -346,18 +348,17 @@ mod tests {
                     run(&p,code_width,count,&mut s,&mut v);
                     for (packet,regs) in s[..count.div_ceil(width)].iter().enumerate() {
                         let packet_mask=((mask&valid)>>(packet*width))&((1<<width)-1);
-                        let packet_valid=(valid>>(packet*width))&((1<<width)-1);
-                        assert_eq!(regs[10],packet_mask,"saved packet mask after entry validity clipping");
-                        assert_eq!(regs[11],0x80000001&packet_valid,"packet lane projection");
-                        assert_eq!(regs[12],(packet_mask!=0) as u32,"packet branch width={code_width} packet={packet}");
-                        assert_eq!(regs[126],((mask&valid)>>(packet*width))&((1<<width)-1));
+                        assert_eq!(regs[10],mask&valid,"saved wave mask after entry validity clipping");
+                        assert_eq!(regs[11],0x80000001&valid,"wave lane projection");
+                        assert_eq!(regs[12],(mask&valid!=0) as u32,"wave branch width={code_width} packet={packet}");
+                        assert_eq!(regs[126],packet_mask);
                     }
                 }
             }
         }
     }
     #[test]
-    fn exec_vcc_and_scc_branches_reduce_within_each_packet() {
+    fn exec_and_vcc_branches_reduce_over_the_wave_and_scc_stays_scalar() {
         use crate::instructions::I;
         use crate::rdna_instructions::{InstFormat,SOP1};
         use crate::rdna_spmd::targets::rdna4::decode::Cond;
@@ -379,12 +380,11 @@ mod tests {
                     regs[128]=(packet%2) as u32;
                 }
                 run(&program,code_width,count,&mut s,&mut v);
+                let valid=(u32::MAX as u64>>(32-count)) as u32;
                 for (packet,regs) in s[..count.div_ceil(width)].iter().enumerate() {
-                    // The existing branch ABI observes the packet word, even
-                    // when a caller supplied bits for padding lanes.
                     let nonzero=match cond {
-                        Cond::ExecZ|Cond::ExecNz=>regs[126]!=0,
-                        Cond::VccZ|Cond::VccNz=>regs[106]!=0,
+                        Cond::ExecZ|Cond::ExecNz=>(1u32<<21)&valid!=0,
+                        Cond::VccZ|Cond::VccNz=>(1u32<<3)&valid!=0,
                         Cond::Scc0|Cond::Scc1=>regs[128]!=0,
                     };
                     let inverted=matches!(cond,Cond::ExecZ|Cond::VccZ|Cond::Scc0);

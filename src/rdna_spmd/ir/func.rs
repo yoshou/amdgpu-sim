@@ -57,6 +57,14 @@ impl Term {
         };
         first.into_iter().chain(second)
     }
+    pub fn edges_mut(&mut self) -> impl Iterator<Item = &mut Edge> {
+        let (first, second) = match self {
+            Self::Br(e) => (Some(e), None),
+            Self::CondBr { yes, no, .. } => (Some(yes), Some(no)),
+            Self::Ret(_) => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Block {

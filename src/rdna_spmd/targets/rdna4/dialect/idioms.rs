@@ -18,7 +18,7 @@ impl Idiom for SqrtIdioms {
 struct View<'a> {
     f: &'a Func,
     defs: Vec<Option<Op>>,
-    targets: Vec<Option<(TargetOp, Vec<ValueId>)>>,
+    targets: Vec<Option<(TargetOp, usize, Vec<ValueId>)>>,
     masks: &'a Predication,
     constants: &'a [Option<u64>],
 }
@@ -31,7 +31,9 @@ impl<'a> View<'a> {
             for inst in &block.insts {
                 match inst {
                     Inst::Core { value, op, .. } => defs[value.0] = Some(*op),
-                    Inst::Target { op, args, outputs, .. } if outputs.len() == 1 => targets[outputs[0].0 .0] = Some((*op, args.values().to_vec())),
+                    Inst::Target { op, args, outputs, .. } => for (index, out) in outputs.iter().enumerate() {
+                        targets[out.0 .0] = Some((*op, index, args.values().to_vec()));
+                    },
                     _ => {}
                 }
             }
@@ -50,8 +52,11 @@ impl<'a> View<'a> {
         }
     }
     fn target(&self, v: ValueId, wanted: TargetOp) -> Option<&[ValueId]> {
-        let (op, args) = self.targets[self.raw(v).0].as_ref()?;
-        (wanted == *op).then_some(args.as_slice())
+        self.result(v, wanted, 0)
+    }
+    fn result(&self, v: ValueId, wanted: TargetOp, index: usize) -> Option<&[ValueId]> {
+        let (op, produced, args) = self.targets[self.raw(v).0].as_ref()?;
+        (wanted == *op && *produced == index).then_some(args.as_slice())
     }
     fn neg(&self, v: ValueId) -> Option<ValueId> {
         match self.defs[self.raw(v).0] { Some(Op::Unary(FloatUnary::Neg, a)) => Some(self.raw(a)), _ => None }
@@ -65,7 +70,15 @@ impl<'a> View<'a> {
     fn fma(&self, v: ValueId) -> Option<(ValueId, ValueId, ValueId)> {
         match self.defs[self.raw(v).0] { Some(Op::MulAdd(a, b, c)) | Some(Op::Fma(a, b, c)) => Some((a, b, c)), _ => None }
     }
-    fn same(&self, a: ValueId, b: ValueId) -> bool { self.raw(a) == self.raw(b) }
+    fn exec_at(&self, block: BlockId, index: usize) -> Option<ValueId> {
+        let entries = self.masks.chain.get(&block)?;
+        entries.iter().rev().find(|(at, _)| *at <= index).map(|&(_, v)| v)
+    }
+    fn same(&self, a: ValueId, b: ValueId) -> bool {
+        let (a, b) = (self.raw(a), self.raw(b));
+        a == b || (self.f.types[a.0] == self.f.types[b.0]
+            && self.constants[a.0].is_some() && self.constants[a.0] == self.constants[b.0])
+    }
 }
 
 fn either(view: &View, pair: (ValueId, ValueId), x: ValueId, y: ValueId) -> bool {
@@ -132,6 +145,96 @@ fn scaled_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> {
     Some(view.raw(x))
 }
 
+pub(in crate::rdna_spmd) struct DivisionIdioms { fixup: TargetOp, fmas: TargetOp, scale: TargetOp, rcp: TargetOp }
+impl DivisionIdioms {
+    pub(in crate::rdna_spmd) fn new(registry: &DialectRegistry) -> Self {
+        let op = |name: &str| registry.lookup(super::ID, name).expect("missing RDNA4 provider");
+        Self { fixup: op("div_fixup.f64"), fmas: op("div_fmas.f64"), scale: op("div_scale.f64"), rcp: op("rcp.f64") }
+    }
+}
+impl Idiom for DivisionIdioms {
+    fn rewrite(&self, f: &mut Func, masks: &Predication, constants: &[Option<u64>]) -> usize { divisions(f, masks, constants, self) }
+}
+
+fn reciprocal(view: &View, r: ValueId, d: ValueId, ops: &DivisionIdioms) -> bool {
+    if let Some(args) = view.target(r, ops.rcp) { return view.same(args[0], d); }
+    let Some((previous, error, added)) = view.fma(r) else { return false };
+    if !view.same(previous, added) { return false; }
+    let Some((negated, refined, one)) = view.fma(error) else { return false };
+    let Some(positive) = view.neg(negated) else { return false };
+    view.same(positive, d) && view.same(refined, previous) && view.constant_f64(one, 1.0)
+        && reciprocal(view, previous, d, ops)
+}
+
+fn scale_flag(view: &View, v: ValueId, denominator: ValueId, numerator: ValueId, exec: ValueId, ops: &DivisionIdioms) -> bool {
+    if let Some(args) = view.result(v, ops.scale, 1) {
+        return (view.same(args[0], denominator) || view.same(args[0], numerator))
+            && view.same(args[1], denominator) && view.same(args[2], numerator);
+    }
+    let raw = view.raw(v);
+    let Some(bit) = view.masks.masked[raw.0].then(|| view.masks.masked_result[raw.0]).flatten() else { return false };
+    let Some(Op::Int(IntOp::And, a, b)) = view.defs[raw.0] else { return false };
+    let mask = if view.same(a, bit) { b } else { a };
+    view.same(mask, exec) && scale_flag(view, bit, denominator, numerator, exec, ops)
+}
+
+fn division_macro(view: &View, quotient: ValueId, denominator: ValueId, numerator: ValueId, exec: ValueId, ops: &DivisionIdioms) -> bool {
+    let scaled = |v: ValueId, first: ValueId| match view.target(v, ops.scale) {
+        Some(args) => view.same(args[0], first) && view.same(args[1], denominator) && view.same(args[2], numerator),
+        None => false,
+    };
+    let Some(fmas) = view.target(quotient, ops.fmas) else { return false };
+    let (error, refined, approximate) = (fmas[0], fmas[1], fmas[2]);
+    let scaling = scale_flag(view, fmas[3], denominator, numerator, exec, ops);
+    if !scaling { return false; }
+    let Some(product) = view.mul(approximate) else { return false };
+    let Some((negated, multiplied, scaled_numerator)) = view.fma(error) else { return false };
+    let Some(scaled_denominator) = view.neg(negated) else { return false };
+    either(view, product, scaled_numerator, refined)
+        && view.same(multiplied, approximate)
+        && scaled(scaled_denominator, denominator)
+        && scaled(scaled_numerator, numerator)
+        && reciprocal(view, refined, scaled_denominator, ops)
+}
+
+fn divisions(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &DivisionIdioms) -> usize {
+    let mut sites: Vec<(BlockId, usize, ValueId, ValueId)> = Vec::new();
+    {
+        let view = View::new(f, masks, constants);
+        for (&id, block) in &f.blocks {
+            for (index, inst) in block.insts.iter().enumerate() {
+                let Inst::Target { op, args, .. } = inst else { continue };
+                if *op != ops.fixup { continue; }
+                let args = args.values();
+                let (quotient, denominator, numerator) = (args[0], args[1], args[2]);
+                let Some(exec) = view.exec_at(id, index) else { continue };
+                if division_macro(&view, quotient, denominator, numerator, exec, ops) {
+                    sites.push((id, index, denominator, numerator));
+                }
+            }
+        }
+    }
+    if sites.is_empty() { return 0; }
+    let mut by_block: BTreeMap<BlockId, Vec<(usize, ValueId, ValueId, ValueId)>> = BTreeMap::new();
+    for &(block, index, denominator, numerator) in &sites {
+        let direct = f.value(Ty::F64);
+        by_block.entry(block).or_default().push((index, direct, denominator, numerator));
+    }
+    for (block, mut sites) in by_block {
+        sites.sort_by_key(|(index, ..)| std::cmp::Reverse(*index));
+        let b = f.blocks.get_mut(&block).unwrap();
+        for (index, direct, denominator, numerator) in sites {
+            if let Inst::Target { args, .. } = &mut b.insts[index] {
+                let mut values: Vec<ValueId> = args.values().to_vec();
+                values[0] = direct;
+                *args = Arguments::Ternary([values[0], values[1], values[2]]);
+            }
+            b.insts.insert(index, Inst::Core { value: direct, ty: Ty::F64, op: Op::Float(FloatOp::Div, numerator, denominator) });
+        }
+    }
+    sites.len()
+}
+
 fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtIdioms) -> usize {
     let mut rewrites: Vec<(BlockId, usize, ValueId, ValueId)> = Vec::new();
     {
@@ -171,7 +274,7 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
 mod tests {
     use super::*;
     use crate::instructions::I;
-    use crate::rdna_instructions::{InstFormat, SourceOperand, VOP1, VOP2, VOP3};
+    use crate::rdna_instructions::{InstFormat, SOP1, SOP2, SourceOperand, VOP1, VOP2, VOP3, VOP3SD, VOPC};
     use crate::rdna_spmd::{CompilationInput, ScalarBlock, ScalarProgram, Terminator};
 
     fn v(r: u8) -> SourceOperand { SourceOperand::VectorRegister(r) }
@@ -221,5 +324,60 @@ mod tests {
         }
         ir.clone().verify_with(&registry).unwrap();
         assert_eq!((count(&ir, "rsq.f64"), count(&ir, "sqrt.f64"), count(&ir, "ldexp.f64")), (0, 1, 0));
+    }
+
+    fn division_body(flag: u8) -> Vec<InstFormat> {
+        let scale = |dst: u8, a: SourceOperand, b: u8, c: SourceOperand| InstFormat::VOP3SD(VOP3SD {
+            op: I::V_DIV_SCALE_F64, vdst: dst, sdst: 106, src0: a, src1: SourceOperand::VectorRegister(b), src2: c,
+            neg: 0, cm: 0, omod: 0 });
+        let one = SourceOperand::FloatConstant(1.0);
+        let mut body = vec![
+            scale(4, v(2), 2, v(0)),
+            scale(6, v(0), 2, v(0)),
+            InstFormat::VOP1(VOP1 { op: I::V_RCP_F64, vdst: 8, src0: v(4) }),
+            fma(10, v(4), v(8), one.clone(), 1),
+            fma(8, v(8), v(10), v(8), 0),
+            fma(10, v(4), v(8), one, 1),
+            fma(8, v(8), v(10), v(8), 0),
+            mul(12, v(6), 8),
+            fma(14, v(4), v(12), v(6), 1),
+        ];
+        if flag == 1 {
+            body.push(InstFormat::VOPC(VOPC { op: I::V_CMP_EQ_U32, src0: SourceOperand::IntegerConstant(0), vsrc1: 0 }));
+        }
+        if flag == 3 {
+            body.insert(0, InstFormat::SOP1(SOP1 { op: I::S_AND_SAVEEXEC_B32, sdst: 2, ssrc0: SourceOperand::ScalarRegister(3) }));
+            body.push(InstFormat::SOP1(SOP1 { op: I::S_MOV_B32, sdst: 126, ssrc0: SourceOperand::IntegerConstant(u32::MAX as u64) }));
+        }
+        if flag == 2 {
+            body.push(InstFormat::SOP2(SOP2 { op: I::S_AND_B32, sdst: 106,
+                ssrc0: SourceOperand::ScalarRegister(106), ssrc1: SourceOperand::ScalarRegister(20) }));
+        }
+        body.push(InstFormat::VOP3(VOP3 { op: I::V_DIV_FMAS_F64, vdst: 16, src0: v(14), src1: v(8), src2: v(12),
+            neg: 0, abs: 0, cm: 0, omod: 0, opsel: 0 }));
+        body.push(InstFormat::VOP3(VOP3 { op: I::V_DIV_FIXUP_F64, vdst: 18, src0: v(16), src1: v(2), src2: v(0),
+            neg: 0, abs: 0, cm: 0, omod: 0, opsel: 0 }));
+        body
+    }
+
+    fn division_fixups(flag: u8) -> usize {
+        let program = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([(0, ScalarBlock { pc: 0, body: division_body(flag), term: Terminator::Return })]) };
+        let f = program.to_ssa().function;
+        let registry = f.registry.clone();
+        let mut ir = f.ir.clone();
+        let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &registry);
+        let constants = crate::rdna_spmd::analysis::constants(&ir);
+        let masks = crate::rdna_spmd::analysis::masks::predication(&ir, exec_index, &constants);
+        let collapsed = divisions(&mut ir, &masks, &constants, &DivisionIdioms::new(&registry));
+        ir.clone().verify_with(&registry).unwrap();
+        collapsed
+    }
+
+    #[test]
+    fn a_division_macro_collapses_only_when_its_own_scale_sets_the_fmas_flag() {
+        assert_eq!(division_fixups(0), 1, "the macro's own scale sets the flag, so it is a division");
+        assert_eq!(division_fixups(1), 0, "a foreign flag scales the result by 2^64, so it is not");
+        assert_eq!(division_fixups(2), 0, "a flag narrowed by anything but the lane mask changes the scaling too");
+        assert_eq!(division_fixups(3), 0, "lanes reactivated after the flag was made, so its cleared bits still count");
     }
 }

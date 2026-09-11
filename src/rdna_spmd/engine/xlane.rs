@@ -12,8 +12,8 @@
 //!
 //! [`crate::rdna_spmd::compile`] selects this scheduler from the program;
 //! kernels without exchange ops run on the independent dispatcher and kernels
-//! with workgroup barriers on the workgroup scheduler.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -28,21 +28,10 @@ use crate::rdna_spmd::targets::rdna4::lift::regs::RegSet;
 #[cfg(test)]
 const WAVE: usize = 32;
 
-/// The wave-level effect applied at a yield, keyed by the resume value the
-/// fiber reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct XlaneOp(pub(in crate::rdna_spmd) super::super::ir::EffectOp);
 #[cfg(test)]
-use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, YieldAction};
-#[cfg(test)]
-use crate::rdna_spmd::targets::rdna4::lift::wave::Operand;
+use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, Operand, YieldAction};
 #[cfg(test)]
 use super::super::ir::{EffectOp, WaveOp};
-
-pub(crate) fn split_at_xlane(program: super::super::Program) -> (super::super::Program, BTreeMap<usize, XlaneOp>) {
-    let (program, ops) = program.schedule(|op| matches!(op, super::super::ir::EffectOp::Wave(w) if *w != super::super::ir::WaveOp::WriteLane));
-    (program, ops.into_iter().map(|(key, op)| (key, XlaneOp(op))).collect())
-}
 
 #[cfg(test)]
 mod tests {

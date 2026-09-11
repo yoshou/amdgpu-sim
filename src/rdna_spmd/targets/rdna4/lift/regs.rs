@@ -19,9 +19,8 @@ pub(super) fn query(f: &mut Func, insts: &mut Vec<Inst>, op: WaveOp, bit: ValueI
         op: EffectOp::Wave(op), inputs: vec![bit], outputs: vec![(value,ty)] });
     value
 }
-/// E1/E5: extract the lane's bit in the existing packet-local mask word.
 pub(super) fn project(f: &mut Func, insts: &mut Vec<Inst>, word: ValueId) -> ValueId {
-    let lane = core(f,insts,Ty::I32,Op::Env(Env::PacketLaneId));
+    let lane = core(f,insts,Ty::I32,Op::Env(Env::LaneId));
     let shifted = core(f,insts,Ty::I32,Op::Int(IntOp::LShr,word,lane));
     core(f,insts,Ty::I1,Op::Convert(Cvt::Trunc,Ty::I1,shifted))
 }
@@ -323,9 +322,7 @@ pub(super) fn branch(
         Cond::VccZ | Cond::VccNz => words[&Word::Mask(106)],
     };
     let query = if matches!(cond, Cond::Scc0 | Cond::Scc1) { input_value } else {
-        let query = f.value(Ty::I1);
-        insts.push(Inst::Packet { op: PacketOp::Any, input: input_value, output: query });
-        query
+        query(f, insts, WaveOp::Any, input_value)
     };
     let result = if matches!(cond, Cond::Scc0 | Cond::ExecZ | Cond::VccZ) {
         let zero = f.value(Ty::I1);

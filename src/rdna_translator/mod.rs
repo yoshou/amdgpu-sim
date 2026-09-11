@@ -11,7 +11,7 @@ use std::ffi::c_ulonglong;
 use std::os::raw::c_void;
 use std::sync::Arc;
 
-mod bvh;
+pub(crate) mod bvh;
 mod emitter;
 mod register_usage;
 

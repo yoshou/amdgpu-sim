@@ -13,7 +13,8 @@ use super::program::{Program, CompilationInput};
 
 use super::program::{LiftedFunction, Parameter, ParameterSource};
 use super::pass::{Analyses, Context, Driver, LocalWriteLanes, Pass};
-use super::pass::{active::Active, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, PacketState}, idioms::Idioms, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
+use super::pass::uniform_queries::UniformQueries;
+use super::pass::{active::Active, adjacency::Adjacency, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, PacketState}, idioms::Idioms, mask_projection::MaskProjection, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
 use super::ir::BlockId;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,23 @@ pub(super) fn input_passes_ir(f: &mut LiftedFunction) {
     f.revision += 1;
 }
 
+pub(super) fn dispatch_passes_ir(f: &mut LiftedFunction, fold_masks: bool) {
+    let registry = f.registry.clone();
+    let exec_index = exec_index(&f.parameter_inputs, &registry);
+    let mut program = super::pass::FuncProgram { ir: std::mem::replace(&mut f.ir, super::ir::Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] }), registry: &registry };
+    let driver = Driver::new();
+    let limit = 1 + program.ir.types.len();
+    let mut an = analyses(&registry, exec_index, 32, false, false, false, None);
+    let queries = UniformQueries { inputs: &f.parameter_inputs };
+    let mut passes: Vec<&dyn Pass> = Vec::new();
+    if fold_masks { passes.extend([&DeadWrites as &dyn Pass, &queries, &MaskProjection]); }
+    passes.extend([&Simplify as &dyn Pass, &Dce, &DeadParams]);
+    driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
+    driver.fixpoint(&mut program, &mut an, "mask_words", limit, &passes).unwrap();
+    f.ir = program.ir;
+    f.revision += 1;
+}
+
 #[cfg(test)]
 pub(super) fn packet_uniformity(f: &LiftedFunction, width: u32, entry_full: bool, aligned: bool) -> super::analysis::uniformity::Uniformity {
     let constants = super::analysis::constants(&f.ir);
@@ -66,15 +84,19 @@ fn dead_writes(program: &mut super::pass::FuncProgram, driver: &Driver, exec_ind
     driver.fixpoint(program, &mut an, "dead_writes", limit, &[&DeadWrites, &Simplify, &Dce]).unwrap();
 }
 
-fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<u64>]) -> BTreeMap<u64, super::engine::yields::YieldValues> {
+fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<u64>])
+    -> (BTreeMap<u64, super::engine::yields::YieldValues>, Vec<Vec<u64>>) {
     use super::ir::{Inst, EffectOp, WaveOp};
     use super::engine::yields::{Argument, YieldValues};
-    let mut out = BTreeMap::new();
+    let mut out: BTreeMap<u64, YieldValues> = BTreeMap::new();
+    let mut groups: Vec<Vec<u64>> = Vec::new();
     for block in ir.blocks.values() {
+        let mut open: Option<(usize, std::collections::BTreeSet<usize>)> = None;
         for inst in &block.insts {
-            let Inst::Effect { provenance, op, inputs, .. } = inst else { continue; };
-            let scheduled = *provenance & crate::rdna_spmd::ir::SCHEDULED != 0 || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait);
-            if !scheduled || *provenance & (1 << 63) != 0 { continue; }
+            let Inst::Effect { provenance, op, inputs, outputs } = inst else { open = None; continue };
+            let scheduled = *provenance & crate::rdna_spmd::ir::SCHEDULED != 0
+                || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait);
+            if !scheduled { open = None; continue; }
             let mut layout = YieldValues::new(*op);
             layout.uniform_selector = *op == EffectOp::Wave(WaveOp::ReadLane) && uniform[inputs[1].0];
             for (index, &input) in inputs.iter().enumerate() {
@@ -82,10 +104,25 @@ fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<
                 layout.arguments[index] = if let Some(k) = constants[input.0] { Argument::Constant(k as u32) }
                     else if uniform[input.0] { Argument::Uniform } else { Argument::Lane };
             }
+            let joinable = matches!(op, EffectOp::Wave(w) if *w != WaveOp::Wmma);
+            let joins = match (&open, joinable) {
+                (Some((_, produced)), true) => !inputs.iter().any(|v| produced.contains(&v.0)),
+                _ => false,
+            };
+            if joins {
+                let (group, produced) = open.as_mut().unwrap();
+                let last = *groups[*group].last().unwrap();
+                layout.base = out[&last].base + out[&last].cells();
+                for (v, _) in outputs { produced.insert(v.0); }
+                groups[*group].push(*provenance);
+            } else {
+                groups.push(vec![*provenance]);
+                open = joinable.then(|| (groups.len() - 1, outputs.iter().map(|(v, _)| v.0).collect()));
+            }
             out.insert(*provenance, layout);
         }
     }
-    out
+    (out, groups)
 }
 
 struct Bare { ir: super::ir::Func, inputs: Vec<Parameter>, registry: std::sync::Arc<super::dialect::DialectRegistry> }
@@ -112,6 +149,7 @@ fn prepared(bare: Bare, width: Option<u32>, abi: super::codegen::Abi, observable
         let limit = 1 + program.ir.types.len();
         driver.fixpoint(&mut program, &mut an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
     }
+    driver.pipeline(&mut program, &mut an, &[&Adjacency]).unwrap();
     let ir = program.ir;
     let constants = an.constants(&ir).to_vec();
     let exec = super::analysis::masks::exec(&ir, exec_index, &constants, lanes, initial_exec, lanes > 1);
@@ -123,7 +161,7 @@ fn prepared(bare: Bare, width: Option<u32>, abi: super::codegen::Abi, observable
         }).collect(),
         None => BTreeMap::new(),
     };
-    let yields = yield_layouts_ir(&ir, &uniform, &constants);
+    let (yields, groups) = yield_layouts_ir(&ir, &uniform, &constants);
     let accesses = super::analysis::memory::accesses(&ir, &constants, &uniform);
     let shapes = accesses.iter().map(|a| super::codegen::memory::shape(a, width, super::codegen::memory::global_load(a, &uniform, &affine), &constants)).collect();
     let clusters = super::codegen::memory::clusters(&ir, &accesses, width, &uniform, &affine);
@@ -131,7 +169,7 @@ fn prepared(bare: Bare, width: Option<u32>, abi: super::codegen::Abi, observable
     let ir = ir.verify_with(&registry).expect("invalid prepared function SSA");
     super::codegen::Prepared {
         registry, ir, inputs, width, abi, observable_return,
-        uniform, exec, constants, accesses, shapes, clusters, yields, min_private_bytes, num_vgprs,
+        uniform, exec, constants, accesses, shapes, clusters, yields, groups, min_private_bytes, num_vgprs,
     }
 }
 
@@ -180,40 +218,43 @@ impl Compiler {
 }
 
 /// Compile lane-local execution. General 32-lane effects are scheduled
-/// with `split_at_xlane` and executed by a wave/cooperative dispatcher.
 pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel {
     let p = prepare_scalar(program.function, ScalarMode::Whole, num_vgprs.max(256));
+    let group = p.group();
     let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
-    ScalarKernel::from_code(code, p.num_vgprs)
+    ScalarKernel::from_code(code, p.num_vgprs, group)
 }
 
 
 pub(crate) fn compile_packet(program: Program, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
     let p = prepare_packet(program.function, width, false, false, num_vgprs.max(256), aligned);
+    let group = p.group();
     let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
-    VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x)
+    VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x, group)
 }
 
 
 pub(crate) fn compile_cooperative_packet(program: Program, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> CoopVecKernel {
-    assert!(matches!(width, 1 | 2 | 4 | 8 | 16));
+    assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32));
+    let program = super::program::split_at_effects(program, width >= 32);
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
     let num_vgprs = program.vgpr_count(num_vgprs);
     let p = prepare_packet(program.function, width, true, true, num_vgprs, aligned);
     let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
     let yields = p.resume_layouts();
-    if yields.iter().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
+    if yields.iter().flatten().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
     CoopVecKernel::from_code(code, yields, p.num_vgprs, width, p.min_private_bytes, workgroup_x, p.registry.registers())
 }
 
 /// Compile a program whose scheduled effects yield to the cooperative scheduler.
 pub(crate) fn compile_cooperative_scalar(program: Program, num_vgprs: usize) -> CoopKernel {
+    let program = super::program::split_at_effects(program, false);
     let num_vgprs = program.vgpr_count(num_vgprs);
     let p = prepare_scalar(program.function, ScalarMode::Cooperative, num_vgprs);
     let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
     let yields = p.resume_layouts();
-    if yields.iter().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(1); }
+    if yields.iter().flatten().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(1); }
     CoopKernel::from_code(code, yields, p.num_vgprs, 1, p.min_private_bytes, None, p.registry.registers())
 }
 
@@ -229,6 +270,8 @@ impl Compiler {
     pub(crate) fn compile_cooperative(&self, program: &impl CompilationInput, num_vgprs: usize) -> CoopKernel { compile_cooperative_scalar(program.to_ssa(), num_vgprs) }
 }
 
+const WAVE: u32 = 32;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompileOptions {
     pub width: u32,
@@ -236,28 +279,26 @@ pub struct CompileOptions {
     pub workgroup_x: Option<u32>,
 }
 
-fn scheduler_for(program: &Program) -> Scheduler {
-    use super::ir::{EffectOp, Inst, WaveOp};
+struct Sharing { barrier: bool, group: bool, exchange: bool }
+
+fn sharing(program: &Program, whole_wave: bool) -> Sharing {
+    use super::ir::{EffectOp, Inst, Space, WaveOp};
     let f = &program.function.ir;
     let constants = super::analysis::constants(f);
-    let known = |v: super::ir::ValueId| constants[v.0].is_some();
-    let mut barrier = false;
-    let mut exchange = false;
+    let mut out = Sharing { barrier: false, group: false, exchange: false };
     for block in f.blocks.values() {
         for inst in &block.insts {
-            let Inst::Effect { provenance, op, inputs, .. } = inst else { continue; };
-            if *provenance & (1 << 63) != 0 { continue; }
+            let Inst::Effect { op, inputs, .. } = inst else { continue; };
             match op {
-                EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => barrier = true,
-                EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane) => {}
-                EffectOp::Wave(WaveOp::ReadLane) => exchange |= !(known(inputs[1]) && known(inputs[2])),
-                EffectOp::Wave(WaveOp::WriteLane) => exchange |= !(known(inputs[1]) && known(inputs[3])),
-                EffectOp::Wave(_) => exchange = true,
-                _ => {}
+                EffectOp::Memory { space: Space::Lds, .. } => out.group = true,
+                EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => out.barrier = true,
+                EffectOp::Wave(WaveOp::Any) => {}
+                EffectOp::Wave(WaveOp::Ballot | WaveOp::ReadFirstLane) if whole_wave => {}
+                _ => out.exchange |= super::program::exchange(op, inputs, &constants),
             }
         }
     }
-    if barrier { Scheduler::Workgroup } else if exchange { Scheduler::Wave } else { Scheduler::Independent }
+    out
 }
 
 impl Compiler {
@@ -265,21 +306,38 @@ impl Compiler {
 }
 
 pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kernel {
-    assert!(matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", options.width);
+    assert!(matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16 | 32), "unsupported packet width {}", options.width);
     let program = program.to_ssa();
-    let scheduler = scheduler_for(&program);
-    let cooperative = |program: Program| if options.width == 0 {
+    let mut folded = program.clone();
+    dispatch_passes_ir(&mut folded.function, true);
+    let sharing = sharing(&folded, false);
+    let width = options.width;
+    let program = if width >= WAVE || !(sharing.barrier || sharing.exchange) {
+        let mut program = program;
+        dispatch_passes_ir(&mut program.function, false);
+        program
+    } else { folded };
+    let sharing = if width >= WAVE { self::sharing(&program, true) } else { sharing };
+    let cooperative = |program: Program| if width == 0 {
         compile_cooperative_scalar(program, options.num_vgprs)
     } else {
-        compile_cooperative_packet(program, options.num_vgprs, options.width, options.workgroup_x)
+        compile_cooperative_packet(program, options.num_vgprs, width, options.workgroup_x)
     };
-    let code = match scheduler {
-        Scheduler::Independent if options.width == 0 => Code::Scalar(compile_scalar(program, options.num_vgprs)),
-        Scheduler::Independent => Code::Packet(compile_packet(program, options.num_vgprs, options.width, options.workgroup_x)),
-        Scheduler::Wave => Code::Cooperative(cooperative(super::engine::xlane::split_at_xlane(program).0)),
-        Scheduler::Workgroup => Code::Cooperative(cooperative(super::program::split_at_barriers(program))),
+    let alone = |program: Program| if width == 0 {
+        Code::Scalar(compile_scalar(program, options.num_vgprs))
+    } else {
+        Code::Packet(compile_packet(program, options.num_vgprs, width, options.workgroup_x))
     };
-    Kernel::new(code, scheduler, options.width)
+    let (scheduler, code) = if sharing.barrier {
+        (Scheduler::Workgroup, Code::Cooperative(cooperative(program)))
+    } else if sharing.exchange {
+        (Scheduler::Wave, Code::Cooperative(cooperative(program)))
+    } else if sharing.group {
+        (Scheduler::Workgroup, alone(program))
+    } else {
+        (Scheduler::Independent, alone(program))
+    };
+    Kernel::new(code, scheduler, width)
 }
 
 

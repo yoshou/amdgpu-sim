@@ -29,11 +29,11 @@ use llvm_sys as llvm;
 type ApplyFn = unsafe extern "C" fn(*const *mut u32);
 
 /// One compiled function per supported width, indexed by `log2(width)`.
-static APPLY: [OnceLock<super::super::jit::NativeCode>; 5] =
-    [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+static APPLY: [OnceLock<super::super::jit::NativeCode>; 6] =
+    [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
 
 fn apply_fn(width: usize) -> ApplyFn {
-    assert!(matches!(width, 1 | 2 | 4 | 8 | 16), "unsupported packet width {}", width);
+    assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32), "unsupported packet width {}", width);
     let addr = APPLY[width.trailing_zeros() as usize]
         .get_or_init(|| unsafe { compile(width as u32) }).address();
     unsafe { std::mem::transmute::<u64, ApplyFn>(addr) }

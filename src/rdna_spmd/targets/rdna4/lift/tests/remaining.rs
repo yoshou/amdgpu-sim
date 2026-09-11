@@ -14,7 +14,7 @@ fn f64_fixup_preserves_aliases_special_values_and_inactive_lanes() {
         src0:SourceOperand::FloatConstant(123.0),src1:SourceOperand::VectorRegister(4),src2:SourceOperand::VectorRegister(6),
         abs:0,neg:0,opsel:0,cm:0,omod:0}));
     let cases=[
-        (2f64.to_bits(),6f64.to_bits(),3f64.to_bits()),
+        (2f64.to_bits(),6f64.to_bits(),123f64.to_bits()),
         (0,0,0xfff8_0000_0000_0000),
         (2f64.to_bits(),0x8000_0000_0000_0000,0x8000_0000_0000_0000),
         (f64::INFINITY.to_bits(),f64::INFINITY.to_bits(),0xfff8_0000_0000_0000),

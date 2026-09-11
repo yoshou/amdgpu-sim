@@ -66,7 +66,8 @@ pub(crate) fn register(registry: &mut DialectRegistry) -> Result<(), &'static st
     registry.register(ID, 19, Operation { effect: Effect::Pure, immediates: &[], name: "div_fmas.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64, Ty::I1], outputs: vec![Ty::F64], lower: Implementation::Single(division::fmas_f64) })?;
     registry.register(ID, 14, Operation { effect: Effect::Pure, immediates: &[], name: "div_scale.f32", inputs: &[Ty::F32, Ty::F32, Ty::F32], outputs: vec![Ty::F32, Ty::I1], lower: Implementation::Multiple(division::scale_f32) })?;
     registry.register(ID, 15, Operation { effect: Effect::Pure, immediates: &[], name: "div_scale.f64", inputs: &[Ty::F64, Ty::F64, Ty::F64], outputs: vec![Ty::F64, Ty::I1], lower: Implementation::Multiple(division::scale_f64) })?;
-    registry.register(ID, 37, Operation { effect: Effect::ReadGlobal { every_lane: false }, immediates: &[], name: "image_bvh64_intersect_ray", inputs: &[Ty::I32,Ty::I32,Ty::I64,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I1,Ty::I32], outputs: vec![Ty::I32;4], lower: Implementation::Multiple(bvh::lower) })?;
+    registry.register(ID, 38, Operation { effect: Effect::ReadGlobal { every_lane: false }, immediates: &[], name: "image_bvh8_intersect_ray", inputs: &[Ty::I32,Ty::I32,Ty::I64,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I1], outputs: vec![Ty::I32;10], lower: Implementation::Multiple(bvh::lower8) })?;
+    registry.register(ID, 37, Operation { effect: Effect::ReadGlobal { every_lane: false }, immediates: &[], name: "image_bvh64_intersect_ray", inputs: &[Ty::I32,Ty::I32,Ty::I64,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I32,Ty::I1], outputs: vec![Ty::I32;4], lower: Implementation::Multiple(bvh::lower) })?;
     Ok(())
 }
 
@@ -364,3 +365,4 @@ pub(in crate::rdna_spmd) fn reference(op: I, bits: u64) -> u64 {
 }
 
 pub(in crate::rdna_spmd) fn bvh(registry:&DialectRegistry)->TargetOp {registry.lookup(ID,"image_bvh64_intersect_ray").expect("missing BVH provider")}
+pub(in crate::rdna_spmd) fn bvh8(registry:&DialectRegistry)->TargetOp {registry.lookup(ID,"image_bvh8_intersect_ray").expect("missing BVH8 provider")}

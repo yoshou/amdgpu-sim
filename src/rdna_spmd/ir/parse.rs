@@ -91,7 +91,7 @@ const FLOAT_PREDS: &[(&str, FloatPred)] = &[("oeq", FloatPred::Oeq), ("ogt", Flo
 const CVTS: &[(&str, Cvt)] = &[("sitofp.rte", Cvt::SignedToFloatRte), ("uitofp.rte", Cvt::UnsignedToFloatRte), ("fptosi.sat.rtz", Cvt::FloatToSignedSatRtz),
     ("fptoui.sat.rtz", Cvt::FloatToUnsignedSatRtz), ("fpresize.rte", Cvt::FloatResizeRte), ("zext", Cvt::ZExt), ("sext", Cvt::SExt),
     ("trunc", Cvt::Trunc), ("bitcast", Cvt::Bitcast)];
-const ENVS: &[(&str, Env)] = &[("lane_id", Env::LaneId), ("packet_lane_id", Env::PacketLaneId), ("valid_lane", Env::ValidLane),
+const ENVS: &[(&str, Env)] = &[("lane_id", Env::LaneId), ("packet_lane_id", Env::PacketLaneId), ("valid_lane", Env::ValidLane), ("outside_lanes", Env::OutsideLanes),
     ("scratch_base", Env::ScratchBase), ("scratch_size", Env::ScratchSize)];
 const SPACES: &[(&str, Space)] = &[("global", Space::Global), ("scratch", Space::Scratch), ("lds", Space::Lds)];
 const SIZES: &[(&str, MemSize)] = &[("u8", MemSize::U8), ("i8", MemSize::I8), ("u16", MemSize::U16), ("i16", MemSize::I16), ("b32", MemSize::B32)];
@@ -182,6 +182,8 @@ fn arguments(line: usize, values: Vec<ValueId>) -> Result<Arguments> {
         2 => Arguments::Binary([values[0], values[1]]),
         3 => Arguments::Ternary([values[0], values[1], values[2]]),
         4 => Arguments::Quaternary([values[0], values[1], values[2], values[3]]),
+        13 => Arguments::Thirteen(values.try_into().unwrap()),
+        14 => Arguments::Fourteen(values.try_into().unwrap()),
         15 => Arguments::Fifteen(values.try_into().unwrap()),
         16 => Arguments::Sixteen(values.try_into().unwrap()),
         n => return Err(format!("line {line}: unsupported target arity {n}")),

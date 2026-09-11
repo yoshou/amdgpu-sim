@@ -230,6 +230,12 @@ impl<'a> Cg<'a> {
         let hi = LLVMBuildTrunc(self.b, shifted, self.vec_ty(self.i32t), n);
         (lo, hi)
     }
+    unsafe fn vwiden_i32(&self, value: LLVMValueRef, have: u32, want: u32) -> LLVMValueRef {
+        if have == want { return value; }
+        let mut idx: Vec<LLVMValueRef> = (0..want).map(|k| self.ci32(k.min(have - 1))).collect();
+        let mask = LLVMConstVector(idx.as_mut_ptr(), idx.len() as u32);
+        LLVMBuildShuffleVector(self.b, value, LLVMGetPoison(LLVMTypeOf(value)), mask, self.n())
+    }
     unsafe fn vconcat_i32(&self, parts: &[LLVMValueRef]) -> LLVMValueRef {
         let mut cur = parts.to_vec();
         while cur.len() > 1 {
@@ -239,7 +245,9 @@ impl<'a> Cg<'a> {
                 let (a, b) = (cur[i], cur[i + 1]);
                 let na = LLVMGetVectorSize(LLVMTypeOf(a));
                 let nb = LLVMGetVectorSize(LLVMTypeOf(b));
-                let mut idx: Vec<LLVMValueRef> = (0..na + nb).map(|k| self.ci32(k)).collect();
+                let wide = na.max(nb);
+                let (a, b) = (self.vwiden_i32(a, na, wide), self.vwiden_i32(b, nb, wide));
+                let mut idx: Vec<LLVMValueRef> = (0..na).chain(wide..wide + nb).map(|k| self.ci32(k)).collect();
                 let mask = LLVMConstVector(idx.as_mut_ptr(), idx.len() as u32);
                 next.push(LLVMBuildShuffleVector(self.b, a, b, mask, self.n()));
                 i += 2;

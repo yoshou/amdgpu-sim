@@ -13,6 +13,7 @@ pub(crate) struct Emitter {
     pub(in crate::rdna_spmd) ctx: LLVMContextRef,
     width: Option<u32>,
     pub(in crate::rdna_spmd) valid_lane: Option<LLVMValueRef>,
+    pub(in crate::rdna_spmd) outside_lanes: Option<LLVMValueRef>,
     pub(in crate::rdna_spmd) scratch: Option<(LLVMValueRef, LLVMValueRef)>,
     pub(in crate::rdna_spmd) lane_id: Option<LLVMValueRef>,
 }
@@ -38,6 +39,7 @@ impl Emitter {
             ctx: LLVMGetModuleContext(module),
             width,
             valid_lane: None,
+            outside_lanes: None,
             scratch: None,
             lane_id: None,
         }
@@ -126,6 +128,7 @@ impl Emitter {
                 } else { value }
             },
             Op::Env(Env::ValidLane) => self.valid_lane.expect("ValidLane requires the invocation environment"),
+            Op::Env(Env::OutsideLanes) => self.outside_lanes.expect("OutsideLanes requires the invocation environment"),
             Op::Const(t, bits) => self.constant(t, bits),
             Op::Pack64(a, c) => {
                 let lo = LLVMBuildZExt(b, v(a), self.ty(Ty::I64), n);

@@ -5,15 +5,26 @@ use std::convert::TryInto;
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::VIMAGE(i)=inst {
+        if matches!(i.op,I::IMAGE_BVH8_INTERSECT_RAY) {
+            let mut inputs=vec![input(SourceOperand::ScalarRegister(i.rsrc as u8),Ty::I32),input(SourceOperand::ScalarRegister((i.rsrc+1) as u8),Ty::I32),input(SourceOperand::VectorRegister(i.vaddr0),Ty::I64),
+                input(SourceOperand::VectorRegister(i.vaddr1),Ty::I32),input(SourceOperand::VectorRegister(i.vaddr1+1),Ty::I32)];
+            for reg in [i.vaddr2,i.vaddr3] {
+                for k in 0..3 {inputs.push(input(SourceOperand::VectorRegister(reg+k),Ty::I32));}
+            }
+            inputs.push(input(SourceOperand::VectorRegister(i.vaddr4),Ty::I32));
+            inputs.push(Input {source:InputSource::ExecPredicate,ty:Ty::I1});
+            let mut b=Builder::new(registry,inputs);
+            let values=b.target(crate::rdna_spmd::targets::rdna4::dialect::bvh8(registry),Arguments::Thirteen(std::array::from_fn(ValueId)));
+            return Some(b.finish_many(false,values.into_iter().enumerate().map(|(k,v)|(Output::Vgpr(i.vdata as u32+k as u32,Ty::I32),v)).collect()));
+        }
         if !matches!(i.op,I::IMAGE_BVH64_INTERSECT_RAY) {return None;}
         let mut inputs=vec![input(SourceOperand::ScalarRegister(i.rsrc as u8),Ty::I32),input(SourceOperand::ScalarRegister((i.rsrc+1) as u8),Ty::I32),input(SourceOperand::VectorRegister(i.vaddr0),Ty::I64),input(SourceOperand::VectorRegister(i.vaddr1),Ty::I32)];
         for reg in [i.vaddr2,i.vaddr3,i.vaddr4] {
             for k in 0..3 {inputs.push(input(SourceOperand::VectorRegister(reg+k),Ty::I32));}
         }
         inputs.push(Input {source:InputSource::ExecPredicate,ty:Ty::I1});
-        inputs.push(input(SourceOperand::ScalarRegister(126),Ty::I32));
         let mut b=Builder::new(registry,inputs);
-        let values=b.target(crate::rdna_spmd::targets::rdna4::dialect::bvh(registry),Arguments::Fifteen(std::array::from_fn(ValueId)));
+        let values=b.target(crate::rdna_spmd::targets::rdna4::dialect::bvh(registry),Arguments::Fourteen(std::array::from_fn(ValueId)));
         return Some(b.finish_many(false,values.into_iter().enumerate().map(|(k,v)|(Output::Vgpr(i.vdata as u32+k as u32,Ty::I32),v)).collect()));
     }
     let InstFormat::VSAMPLE(i) = inst else { return None; };

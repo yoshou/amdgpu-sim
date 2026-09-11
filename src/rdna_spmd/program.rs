@@ -41,15 +41,15 @@ impl Program {
         }).max().unwrap_or(1);
         declared.max(needed)
     }
-    pub(super) fn schedule(self, accept:impl Fn(&super::ir::EffectOp)->bool) -> (Self,BTreeMap<usize,super::ir::EffectOp>) {
+    pub(super) fn schedule(self, accept:impl Fn(&super::ir::EffectOp,&[super::ir::ValueId])->bool) -> (Self,BTreeMap<usize,super::ir::EffectOp>) {
         use super::ir::{Inst, EffectOp};
         let mut out=self;
         let mut yields=BTreeMap::new();
         for block in out.function.ir.blocks.values_mut() {
             for inst in &mut block.insts {
-                let Inst::Effect {provenance,op,..}=inst else {continue};
-                if *provenance&(1<<63)!=0||!matches!(op,EffectOp::Wave(_)|EffectOp::BarrierSignal {..}|EffectOp::BarrierWait) {continue;}
-                if accept(op) {
+                let Inst::Effect {provenance,op,inputs,..}=inst else {continue};
+                if !matches!(op,EffectOp::Wave(_)|EffectOp::BarrierSignal {..}|EffectOp::BarrierWait) {continue;}
+                if accept(op,inputs) {
                     *provenance|=crate::rdna_spmd::ir::SCHEDULED;
                     yields.insert(super::codegen::resume_key(*provenance),*op);
                 }
@@ -60,6 +60,23 @@ impl Program {
     }
 }
 
-pub(crate) fn split_at_barriers(program: Program) -> Program {
-    program.schedule(|op| !matches!(op, super::ir::EffectOp::Wave(_))).0
+pub(crate) fn exchange(op: &super::ir::EffectOp, inputs: &[super::ir::ValueId], constants: &[Option<u64>]) -> bool {
+    use super::ir::{EffectOp, WaveOp};
+    let known = |v: super::ir::ValueId| constants[v.0].is_some();
+    match op {
+        EffectOp::Wave(WaveOp::ReadLane) => !(known(inputs[1]) && known(inputs[2])),
+        EffectOp::Wave(WaveOp::WriteLane) => !(known(inputs[1]) && known(inputs[3])),
+        EffectOp::Wave(_) => true,
+        _ => false,
+    }
+}
+
+pub(crate) fn split_at_effects(program: Program, whole_wave: bool) -> Program {
+    use super::ir::{EffectOp, WaveOp};
+    program.schedule(|op, _| match op {
+        EffectOp::Wave(WaveOp::WriteLane) => false,
+        EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane) => !whole_wave,
+        EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => true,
+        _ => false,
+    }).0
 }

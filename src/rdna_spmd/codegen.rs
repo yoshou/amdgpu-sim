@@ -40,6 +40,7 @@ pub(super) struct Prepared {
     pub shapes: Vec<memory::Shape>,
     pub clusters: BTreeMap<usize, Cluster>,
     pub yields: BTreeMap<u64, super::engine::yields::YieldValues>,
+    pub groups: Vec<Vec<u64>>,
     pub min_private_bytes: usize,
     pub num_vgprs: usize,
 }
@@ -47,11 +48,17 @@ pub(super) struct Prepared {
 pub(super) fn resume_key(provenance: u64) -> usize { (provenance & !crate::rdna_spmd::ir::SCHEDULED) as usize }
 
 impl Prepared {
-    pub fn resume_layouts(&self) -> Vec<super::engine::yields::YieldValues> {
-        self.yields.values().cloned().collect()
+    pub fn group(&self) -> bool {
+        self.accesses.iter().any(|a| a.space == super::ir::Space::Lds)
+    }
+    pub fn resume_layouts(&self) -> Vec<Vec<super::engine::yields::YieldValues>> {
+        self.groups.iter().map(|g| g.iter().map(|p| self.yields[p].clone()).collect()).collect()
     }
     pub fn resume_index(&self, provenance: u64) -> usize {
-        self.yields.keys().position(|&key| key == provenance).expect("scheduled effect lacks a yield layout")
+        self.groups.iter().position(|g| g[0] == provenance).expect("scheduled effect lacks a yield layout")
+    }
+    pub fn group_at(&self, provenance: u64) -> Option<&[u64]> {
+        self.groups.iter().find(|g| g[0] == provenance).map(|g| g.as_slice())
     }
 }
 
@@ -107,6 +114,7 @@ pub(super) struct Cg<'a> {
     spill: std::cell::RefCell<BTreeMap<(u32, u32), usize>>,
     loaded_pairs: BTreeMap<(ValueId, ValueId), LLVMValueRef>,
     valid_mask: LLVMValueRef,
+    lane_base: Option<LLVMValueRef>,
     yield_frame: LLVMValueRef,
     sink: LLVMValueRef,
     store_sink: LLVMValueRef,
@@ -127,15 +135,16 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
     let ptr = LLVMPointerTypeInContext(ctx, 0);
     let void = LLVMVoidTypeInContext(ctx);
     let coop = p.abi == Abi::Cooperative;
+    let group = p.group();
     let func = if coop {
         let mut params = [ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t];
         LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, LLVMFunctionType(i64t, params.as_mut_ptr(), 9, 0))
     } else if p.width.is_some() {
-        let mut params = [ptr, ptr, i64t, i64t];
-        LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, LLVMFunctionType(void, params.as_mut_ptr(), 4, 0))
+        let mut params = [ptr, ptr, i64t, i64t, i32t, i64t];
+        LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, LLVMFunctionType(void, params.as_mut_ptr(), 4 + 2 * group as u32, 0))
     } else {
-        let mut params = [ptr, ptr, i64t];
-        LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, LLVMFunctionType(void, params.as_mut_ptr(), 3, 0))
+        let mut params = [ptr, ptr, i64t, i64t];
+        LLVMAddFunction(module, b"kernel\0".as_ptr() as *const _, LLVMFunctionType(void, params.as_mut_ptr(), 3 + group as u32, 0))
     };
     let entry = LLVMAppendBasicBlockInContext(ctx, func, b"entry\0".as_ptr() as *const _);
     LLVMPositionBuilderAtEnd(b, entry);
@@ -145,9 +154,13 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
     let scratch_base = LLVMGetParam(func, 2);
     let scratch_stride = if coop || p.width.is_some() { LLVMGetParam(func, 3) } else { LLVMConstInt(i64t, 0, 0) };
     let lane_base = if coop { LLVMGetParam(func, 6) } else { LLVMConstInt(i64t, 0, 0) };
-    let lds_base = if coop { LLVMGetParam(func, 5) } else if p.width.is_some() { LLVMConstInt(i64t, 0, 0) } else { LLVMGetUndef(i64t) };
+    let lds_base = if coop { LLVMGetParam(func, 5) }
+        else if group { LLVMGetParam(func, 3 + 2 * p.width.is_some() as u32) }
+        else if p.width.is_some() { LLVMConstInt(i64t, 0, 0) } else { LLVMGetUndef(i64t) };
     let width_lanes = p.width.unwrap_or(1);
-    let valid_mask = if coop { LLVMGetParam(func, 8) } else { LLVMConstInt(i32t, if p.width.is_some() { (1u64 << width_lanes) - 1 } else { u32::MAX as u64 }, 0) };
+    let valid_mask = if coop { LLVMGetParam(func, 8) }
+        else if group && p.width.is_some() { LLVMGetParam(func, 4) }
+        else { LLVMConstInt(i32t, if p.width.is_some() { (1u64 << width_lanes) - 1 } else { u32::MAX as u64 }, 0) };
     let spill_base = if coop { LLVMGetParam(func, 4) } else {
         LLVMBuildArrayAlloca(b, i32t, LLVMConstInt(i32t, super::engine::kernel::COOP_SPILL_SLOTS as u64, 0), n)
     };
@@ -168,7 +181,7 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
     };
     em.scratch = Some((scratch_base_scalar, if coop || p.width.is_some() { scratch_stride } else { LLVMConstInt(i64t, 0, 0) }));
     sem.scratch = em.scratch;
-    let cells = p.yields.values().map(|l| l.cells()).max().unwrap_or(0);
+    let cells = p.yields.values().map(|l| l.base + l.cells()).max().unwrap_or(0);
     let yield_frame = if cells == 0 { LLVMConstNull(ptr) } else {
         let frame = LLVMBuildAlloca(b, LLVMArrayType2(i32t, cells as u64 * width_lanes as u64), cstr("yield.values").as_ptr());
         LLVMSetAlignment(frame, 64);
@@ -198,7 +211,7 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
         sgprs_p, vgprs_p, scratch_base_scalar, scratch_vec: scratch_base, lds_base, spill_base,
         spill: std::cell::RefCell::new(BTreeMap::new()),
         loaded_pairs: BTreeMap::new(),
-        valid_mask, yield_frame, sink,
+        valid_mask, lane_base: coop.then(|| LLVMBuildTrunc(b, lane_base, i32t, n)), yield_frame, sink,
         store_sink: LLVMBuildAlloca(b, i64t, cstr("store_sink").as_ptr()),
         tile_sink: LLVMBuildArrayAlloca(b, i32t, LLVMConstInt(i32t, 64, 0), cstr("tile_sink").as_ptr()),
         i1, i32t, i64t, f32t, f64t, ptr,
@@ -216,11 +229,15 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
     } else {
         cg.scratch_vec = if coop { LLVMBuildAdd(b, scratch_base, LLVMBuildMul(b, scratch_stride, lane_base, n), n) } else { scratch_base };
     }
-    let valid_vec = cg.mask_to_vec(valid_mask);
+    let packet_valid = cg.lane_base_word(valid_mask);
+    let valid_vec = cg.mask_to_vec(packet_valid);
     cg.em.valid_lane = Some(valid_vec);
     cg.em.set_lane_id(lane_base);
     cg.sem.set_lane_id(lane_base);
-    cg.sem.valid_lane = Some(LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntNE, LLVMBuildAnd(b, valid_mask, LLVMConstInt(i32t, 1, 0), n), LLVMConstInt(i32t, 0, 0), n));
+    cg.sem.valid_lane = Some(LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntNE, LLVMBuildAnd(b, packet_valid, LLVMConstInt(i32t, 1, 0), n), LLVMConstInt(i32t, 0, 0), n));
+    let outside_lanes = if coop { LLVMBuildNot(b, valid_mask, n) } else { LLVMConstInt(i32t, 0, 0) };
+    cg.em.outside_lanes = Some(outside_lanes);
+    cg.sem.outside_lanes = Some(outside_lanes);
     for &id in f.blocks.keys() {
         let name = cstr(&format!("b{:x}", id.0));
         cg.bbs.insert(id, LLVMAppendBasicBlockInContext(ctx, func, name.as_ptr()));
@@ -367,11 +384,11 @@ impl<'a> Cg<'a> {
                 }
                 ParameterSource::MaskBit(r) => {
                     let word = if r == self.regs().exec && self.p.abi == Abi::Whole {
-                        if self.p.width.is_some() { self.ci32(((1u64 << self.width()) - 1) as u32) } else { self.ci32(1) }
+                        if self.p.width.is_some() { self.lane_base_word(self.valid_mask) } else { self.ci32(1) }
                     } else {
                         let gep = LLVMBuildGEP2(self.b, self.i32t, self.sgprs_p, [self.ci32(r)].as_mut_ptr(), 1, n);
                         let word = LLVMBuildLoad2(self.b, self.i32t, gep, n);
-                        if r == self.regs().exec && coop { LLVMBuildAnd(self.b, word, self.valid_mask, n) } else { word }
+                        if r == self.regs().exec && coop { LLVMBuildAnd(self.b, word, self.lane_base_word(self.valid_mask), n) } else { word }
                     };
                     self.mask_to_vec(word)
                 }
@@ -467,6 +484,13 @@ impl<'a> Cg<'a> {
         let _ = (id, n);
     }
 
+    unsafe fn lane_base_word(&self, word: LLVMValueRef) -> LLVMValueRef {
+        match self.lane_base {
+            Some(base) => LLVMBuildLShr(self.b, word, base, self.n()),
+            None => word,
+        }
+    }
+
     unsafe fn any_of_word(&mut self, input: ValueId) -> Option<LLVMValueRef> {
         let Some(w) = self.p.width else { return None; };
         let (bit, valid) = match self.definitions[input.0] {
@@ -476,11 +500,12 @@ impl<'a> Cg<'a> {
         };
         let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = self.definitions[bit.0] else { return None; };
         let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shifted.0] else { return None; };
-        if !matches!(self.definitions[lane.0], Some(Op::Env(Env::PacketLaneId))) || !self.p.uniform[word.0] { return None; }
+        if !matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId))) || !self.p.uniform[word.0] { return None; }
         let n = self.n();
         let word = self.scalar(word);
+        let word = self.lane_base_word(word);
         let mut bits = LLVMBuildAnd(self.b, word, self.ci32(((1u64 << w) - 1) as u32), n);
-        if valid { bits = LLVMBuildAnd(self.b, bits, self.valid_mask, n); }
+        if valid { let packet = self.lane_base_word(self.valid_mask); bits = LLVMBuildAnd(self.b, bits, packet, n); }
         Some(LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bits, self.ci32(0), n))
     }
 
@@ -560,7 +585,19 @@ impl<'a> Cg<'a> {
                 }
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
                     if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0 || !matches!(op, EffectOp::Wave(_)) {
-                        self.emit_yield(*provenance, inputs, outputs);
+                        let Some(group) = self.p.group_at(*provenance) else { return };
+                        let mut members = Vec::with_capacity(group.len());
+                        let mut wanted = group.iter();
+                        let mut next = wanted.next();
+                        for inst in &self.p.ir.func().blocks[&id].insts[index..] {
+                            let Some(&want) = next else { break };
+                            let Inst::Effect { provenance: at, inputs, outputs, .. } = inst else { continue };
+                            if *at != want { continue; }
+                            members.push((want, inputs.clone(), outputs.clone()));
+                            next = wanted.next();
+                        }
+                        assert_eq!(members.len(), group.len(), "a yield group lost a member");
+                        self.emit_yield(&members);
                     } else {
                         self.emit_local_wave(*op, inputs, outputs);
                     }
@@ -581,8 +618,9 @@ impl<'a> Cg<'a> {
         let n = self.n();
         if let Op::Convert(Cvt::Trunc, Ty::I1, shift) = op {
             if let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shift.0] {
-                if matches!(self.definitions[lane.0], Some(Op::Env(Env::PacketLaneId))) && self.p.uniform[word.0] {
+                if matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId))) && self.p.uniform[word.0] {
                     let w = self.scalar(word);
+                    let w = self.lane_base_word(w);
                     let out = self.mask_to_vec(w);
                     self.define(value, out);
                     return;

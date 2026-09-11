@@ -142,6 +142,7 @@ pub(crate) fn run(f: &mut Func) -> usize {
             block.insts.retain(|inst| match inst {
                 Inst::Core { value, .. } | Inst::Packet { output: value, .. } => uses[value.0] != 0,
                 Inst::Target { provenance: None, outputs, .. } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
+                Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot), outputs, .. } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
                 _ => true,
             });
             round += before - block.insts.len();
@@ -154,15 +155,74 @@ pub(crate) fn run(f: &mut Func) -> usize {
     removed
 }
 
+fn live_values(f: &Func) -> Vec<bool> {
+    let mut producer: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
+    let mut parameter: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
+    let mut incoming: BTreeMap<BlockId, Vec<&Edge>> = BTreeMap::new();
+    let mut pending: Vec<ValueId> = Vec::new();
+    for (&id, block) in &f.blocks {
+        for (index, &(p, ty)) in block.params.iter().enumerate() {
+            parameter[p.0] = Some((id, index));
+            if ty == Ty::I1 || id == f.entry { pending.push(p); }
+        }
+        for (index, inst) in block.insts.iter().enumerate() {
+            let observed = match inst {
+                Inst::Effect { op, .. } => !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot)),
+                Inst::Target { provenance, .. } => provenance.is_some(),
+                _ => false,
+            };
+            match inst {
+                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => producer[value.0] = Some((id, index)),
+                Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => for &(v, _) in outputs { producer[v.0] = Some((id, index)); },
+            }
+            if observed { operands(inst, |v| pending.push(v)); }
+        }
+        match &block.term {
+            Term::CondBr { cond, .. } => pending.push(*cond),
+            Term::Ret(args) => pending.extend(args.iter().copied()),
+            Term::Br(_) => {}
+        }
+        for edge in block.term.edges() { incoming.entry(edge.dst).or_default().push(edge); }
+    }
+    let mut live = vec![false; f.types.len()];
+    while let Some(value) = pending.pop() {
+        if live[value.0] { continue; }
+        live[value.0] = true;
+        if let Some((block, index)) = producer[value.0] { operands(&f.blocks[&block].insts[index], |v| pending.push(v)); }
+        if let Some((block, index)) = parameter[value.0] {
+            for edge in incoming.get(&block).into_iter().flatten() { pending.push(edge.args[index]); }
+        }
+    }
+    live
+}
+
+pub(crate) fn operands(inst: &Inst, mut f: impl FnMut(ValueId)) {
+    match inst {
+        Inst::Core { op, .. } => { op.map(|v| { f(v); v }); }
+        Inst::Packet { input, .. } => f(*input),
+        Inst::Effect { inputs, .. } => for &v in inputs { f(v) },
+        Inst::Target { args, .. } => for &v in args.values() { f(v) },
+    }
+}
+
 pub(crate) fn dead_params(f: &mut Func) -> usize {
     let mut removed = 0;
     loop {
-        let mut uses = vec![0usize; f.types.len()];
-        count_uses(f, &mut uses);
+        let live = live_values(f);
+        for block in f.blocks.values_mut() {
+            let before = block.insts.len();
+            block.insts.retain(|inst| match inst {
+                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => live[value.0],
+                Inst::Effect { op, outputs, .. } => !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot))
+                    || outputs.iter().any(|(v, _)| live[v.0]),
+                Inst::Target { provenance, outputs, .. } => provenance.is_some() || outputs.iter().any(|(v, _)| live[v.0]),
+            });
+            removed += before - block.insts.len();
+        }
         let mut dead: BTreeMap<BlockId, Vec<usize>> = BTreeMap::new();
         for (&id, block) in &f.blocks {
             if id == f.entry { continue; }
-            let indices: Vec<usize> = block.params.iter().enumerate().filter(|(_, &(v, ty))| ty != Ty::I1 && uses[v.0] == 0).map(|(i, _)| i).collect();
+            let indices: Vec<usize> = block.params.iter().enumerate().filter(|(_, &(v, ty))| ty != Ty::I1 && !live[v.0]).map(|(i, _)| i).collect();
             if !indices.is_empty() { dead.insert(id, indices); }
         }
         if dead.is_empty() { break; }

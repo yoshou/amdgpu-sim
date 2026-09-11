@@ -21,7 +21,8 @@ struct Native {
 pub(in crate::rdna_spmd) unsafe fn lowering_state(e:&Emitter,sink:LLVMValueRef)->Box<dyn std::any::Any> {
     let (packet,packet_ty)=if e.width().is_some() {
         let ctx=e.ctx;let i32t=LLVMInt32TypeInContext(ctx);let i64t=LLVMInt64TypeInContext(ctx);let f32t=LLVMFloatTypeInContext(ctx);
-        let packet_i64=LLVMArrayType2(i64t,16);let packet_f32=LLVMArrayType2(f32t,16);let packet_i32=LLVMArrayType2(i32t,16);
+        let lanes=crate::rdna_translator::bvh::BVH_RAY_PACKET_LANES as u64;
+        let packet_i64=LLVMArrayType2(i64t,lanes);let packet_f32=LLVMArrayType2(f32t,lanes);let packet_i32=LLVMArrayType2(i32t,lanes);
         let mut fields=[packet_i64;15];fields[1..11].fill(packet_f32);fields[11..15].fill(packet_i32);
         let packet_ty=LLVMStructTypeInContext(ctx,fields.as_mut_ptr(),fields.len() as u32,0);
         let packet=LLVMBuildAlloca(e.b,packet_ty,b"\0".as_ptr().cast());
@@ -37,10 +38,8 @@ pub(super) unsafe fn lower(e:&Emitter,a:&[LLVMValueRef])->Vec<LLVMValueRef> {
     let cg=Native {b,module,ctx,w:e.width().unwrap_or(1),i1,i32t,i64t,f32t,ptr,vi1:e.ty(Ty::I1),vi32:e.ty(Ty::I32),vi64:e.ty(Ty::I64),vf32:e.ty(Ty::F32),bvh_packet:storage.packet,bvh_packet_ty:storage.packet_ty};
     if e.width().is_some() {
         let resource=[LLVMBuildExtractElement(b,a[0],cg.ci32(0),cg.n()),LLVMBuildExtractElement(b,a[1],cg.ci32(0),cg.n())];
-        // Preserve the numerical packet mask as well as its per-lane predicate.
-        let mask=if LLVMGetTypeKind(LLVMTypeOf(a[14]))==llvm::LLVMTypeKind::LLVMVectorTypeKind {
-            LLVMBuildExtractElement(b,a[14],cg.ci32(0),cg.n())
-        } else {a[14]};
+        let width=LLVMIntTypeInContext(ctx,cg.w);
+        let mask=LLVMBuildZExt(b,LLVMBuildBitCast(b,a[13],width,cg.n()),i32t,cg.n());
         cg.packet(a,resource,mask)
     } else {
         let scratch_ptr=|k:u32|LLVMBuildGEP2(b,i32t,storage.scratch,[cg.ci32(k)].as_mut_ptr(),1,cg.n());
@@ -50,7 +49,60 @@ pub(super) unsafe fn lower(e:&Emitter,a:&[LLVMValueRef])->Vec<LLVMValueRef> {
         (0..4).map(|k|LLVMBuildLoad2(b,i32t,scratch_ptr(k),cg.n())).collect()
     }
 }
+pub(super) unsafe fn lower8(e:&Emitter,a:&[LLVMValueRef])->Vec<LLVMValueRef> {
+    let ctx=e.ctx;let b=e.b;
+    let module=LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(b)));
+    let i1=LLVMInt1TypeInContext(ctx);let i32t=LLVMInt32TypeInContext(ctx);let i64t=LLVMInt64TypeInContext(ctx);let f32t=LLVMFloatTypeInContext(ctx);let ptr=LLVMPointerTypeInContext(ctx,0);
+    let cg=Native {b,module,ctx,w:e.width().unwrap_or(1),i1,i32t,i64t,f32t,ptr,vi1:e.ty(Ty::I1),vi32:e.ty(Ty::I32),vi64:e.ty(Ty::I64),vf32:e.ty(Ty::F32),bvh_packet:std::ptr::null_mut(),bvh_packet_ty:std::ptr::null_mut()};
+    let n=cg.n();
+    let packed=e.width().is_some();
+    let lanes=e.width().unwrap_or(1);
+    const RESULTS:u32=10;
+    let slots=cg.entry_alloca(LLVMArrayType2(i32t,(RESULTS*lanes) as u64));
+    let lane=|v:LLVMValueRef,l:u32|if packed {LLVMBuildExtractElement(b,v,cg.ci32(l),n)} else {v};
+    let params=[ptr,ptr,ptr,ptr,ptr,ptr,ptr,ptr,ptr,ptr,i32t,i32t,i64t,f32t,i32t,f32t,f32t,f32t,f32t,f32t,f32t,i32t];
+    let func=LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+    for l in 0..lanes {
+        let slot=|k:u32|LLVMBuildGEP2(b,i32t,slots,[cg.ci32(l*RESULTS+k)].as_mut_ptr(),1,n);
+        let ptrs:Vec<LLVMValueRef>=(0..RESULTS).map(slot).collect();
+        let call_bb=LLVMAppendBasicBlockInContext(ctx,func,cstr("bvh8.lane").as_ptr());
+        let join=LLVMAppendBasicBlockInContext(ctx,func,cstr("bvh8.join").as_ptr());
+        LLVMBuildCondBr(b,lane(a[12],l),call_bb,join);
+        LLVMPositionBuilderAtEnd(b,call_bb);
+        let float=|v:LLVMValueRef|LLVMBuildBitCast(b,lane(v,l),f32t,n);
+        let args=[ptrs[0],ptrs[1],ptrs[2],ptrs[3],ptrs[4],ptrs[5],ptrs[6],ptrs[7],ptrs[8],ptrs[9],
+            lane(a[0],l),lane(a[1],l),lane(a[2],l),float(a[3]),lane(a[4],l),
+            float(a[5]),float(a[6]),float(a[7]),float(a[8]),float(a[9]),float(a[10]),lane(a[11],l)];
+        cg.call("image_bvh8_intersect_ray",LLVMVoidTypeInContext(ctx),&params,&args);
+        LLVMBuildBr(b,join);
+        LLVMPositionBuilderAtEnd(b,join);
+    }
+    (0..RESULTS).map(|k| {
+        if !packed {
+            return LLVMBuildLoad2(b,i32t,LLVMBuildGEP2(b,i32t,slots,[cg.ci32(k)].as_mut_ptr(),1,n),n);
+        }
+        let mut out=LLVMGetPoison(cg.vi32);
+        for l in 0..lanes {
+            let value=LLVMBuildLoad2(b,i32t,LLVMBuildGEP2(b,i32t,slots,[cg.ci32(l*RESULTS+k)].as_mut_ptr(),1,n),n);
+            out=LLVMBuildInsertElement(b,out,value,cg.ci32(l),n);
+        }
+        out
+    }).collect()
+}
+
 impl Native {
+    unsafe fn entry_alloca(&self,ty:LLVMTypeRef)->LLVMValueRef {
+        let entry=LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(LLVMGetInsertBlock(self.b)));
+        let builder=LLVMCreateBuilderInContext(self.ctx);
+        match LLVMGetFirstInstruction(entry) {
+            first if first.is_null() => LLVMPositionBuilderAtEnd(builder,entry),
+            first => LLVMPositionBuilderBefore(builder,first),
+        }
+        let value=LLVMBuildAlloca(builder,ty,self.n());
+        LLVMSetAlignment(value,64);
+        LLVMDisposeBuilder(builder);
+        value
+    }
     unsafe fn n(&self) -> *const std::ffi::c_char {
         b"\0".as_ptr() as *const std::ffi::c_char
     }
@@ -533,34 +585,61 @@ impl Native {
                     inv[1],
                     inv[2],
                 ];
-                for (f, value) in inputs.iter().copied().enumerate() {
-                    let store = llvm::core::LLVMBuildStore(self.b, value, field_ptr(f as u32));
-                    llvm::core::LLVMSetAlignment(store, if f == 0 { 8 } else { 4 });
-                }
-                self.call(
-                    "image_bvh64_intersect_ray_packet",
-                    llvm::core::LLVMVoidTypeInContext(self.ctx),
-                    &[self.ptr, self.i32t, self.i32t, self.i32t, self.i32t],
-                    &[
-                        self.bvh_packet,
-                        self.ci32(self.w),
-                        mask,
-                        resource[0],
-                        resource[1],
-                    ],
-                );
-                let slow_res: Vec<LLVMValueRef> = (0..4)
-                    .map(|k| {
-                        let ld = llvm::core::LLVMBuildLoad2(
-                            self.b,
-                            self.vi32,
-                            field_ptr(11 + k),
-                            n,
-                        );
+                let step = self.w.min(crate::rdna_translator::bvh::BVH_RAY_PACKET_LANES as u32);
+                let slice = |v: LLVMValueRef, off: u32, len: u32| -> LLVMValueRef {
+                    if off == 0 && len == self.w { return v; }
+                    let mut idx: Vec<LLVMValueRef> = (0..len).map(|k| self.ci32(off + k)).collect();
+                    let mask = llvm::core::LLVMConstVector(idx.as_mut_ptr(), len);
+                    llvm::core::LLVMBuildShuffleVector(self.b, v, llvm::core::LLVMGetPoison(llvm::core::LLVMTypeOf(v)), mask, n)
+                };
+                let mut chunks: Vec<Vec<LLVMValueRef>> = Vec::new();
+                let mut off = 0;
+                while off < self.w {
+                    let len = step.min(self.w - off);
+                    for (f, value) in inputs.iter().copied().enumerate() {
+                        let store = llvm::core::LLVMBuildStore(self.b, slice(value, off, len), field_ptr(f as u32));
+                        llvm::core::LLVMSetAlignment(store, if f == 0 { 8 } else { 4 });
+                    }
+                    self.call(
+                        "image_bvh64_intersect_ray_packet",
+                        llvm::core::LLVMVoidTypeInContext(self.ctx),
+                        &[self.ptr, self.i32t, self.i32t, self.i32t, self.i32t],
+                        &[
+                            self.bvh_packet,
+                            self.ci32(len),
+                            llvm::core::LLVMBuildLShr(self.b, mask, self.ci32(off), n),
+                            resource[0],
+                            resource[1],
+                        ],
+                    );
+                    chunks.push((0..4).map(|k| {
+                        let ty = llvm::core::LLVMVectorType(self.i32t, len);
+                        let ld = llvm::core::LLVMBuildLoad2(self.b, ty, field_ptr(11 + k), n);
                         llvm::core::LLVMSetAlignment(ld, 4);
                         ld
-                    })
-                    .collect();
+                    }).collect());
+                    off += len;
+                }
+                let slow_res: Vec<LLVMValueRef> = (0..4).map(|k| {
+                    let mut value = chunks[0][k as usize];
+                    let mut have = llvm::core::LLVMGetVectorSize(llvm::core::LLVMTypeOf(value));
+                    for chunk in &chunks[1..] {
+                        let next = chunk[k as usize];
+                        let more = llvm::core::LLVMGetVectorSize(llvm::core::LLVMTypeOf(next));
+                        let wide = have.max(more);
+                        let pad = |v: LLVMValueRef, n_have: u32| if n_have == wide { v } else {
+                            let mut idx: Vec<LLVMValueRef> = (0..wide).map(|j| self.ci32(j.min(n_have - 1))).collect();
+                            let m = llvm::core::LLVMConstVector(idx.as_mut_ptr(), wide);
+                            llvm::core::LLVMBuildShuffleVector(self.b, v, llvm::core::LLVMGetPoison(llvm::core::LLVMTypeOf(v)), m, n)
+                        };
+                        let (a, b) = (pad(value, have), pad(next, more));
+                        let mut idx: Vec<LLVMValueRef> = (0..have).chain(wide..wide + more).map(|j| self.ci32(j)).collect();
+                        let m = llvm::core::LLVMConstVector(idx.as_mut_ptr(), idx.len() as u32);
+                        value = llvm::core::LLVMBuildShuffleVector(self.b, a, b, m, n);
+                        have += more;
+                    }
+                    value
+                }).collect();
                 llvm::core::LLVMBuildBr(self.b, join);
                 let slow_end = llvm::core::LLVMGetInsertBlock(self.b);
 

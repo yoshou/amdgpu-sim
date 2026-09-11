@@ -67,25 +67,27 @@ impl<'a> Cg<'a> {
         LLVMBuildCall2(self.b, fty, f, args.as_ptr() as *mut _, args.len() as u32, self.n())
     }
 
-    pub(super) unsafe fn emit_yield(&mut self, provenance: u64, inputs: &[ValueId], outputs: &[(ValueId, Ty)]) {
+    pub(super) unsafe fn emit_yield(&mut self, members: &[(u64, Vec<ValueId>, Vec<(ValueId, Ty)>)]) {
         let n = self.n();
-        let layout = self.p.yields.get(&provenance).expect("scheduled effect lacks a yield layout").clone();
-        let resume = self.p.resume_index(provenance);
+        let resume = self.p.resume_index(members[0].0);
         let width = self.width() as u64;
         let frame = self.yield_frame;
         let pointer = |cg: &Self, slot: usize| LLVMBuildGEP2(cg.b, cg.i32t, frame, [LLVMConstInt(cg.i32t, slot as u64 * width, 0)].as_mut_ptr(), 1, n);
-        for (i, (&id, &ty)) in inputs.iter().zip(&layout.inputs).enumerate() {
-            if matches!(layout.arguments[i], Argument::Constant(_)) { continue; }
-            let uniform = matches!(layout.arguments[i], Argument::Uniform);
-            let value = self.shaped(id, uniform || self.p.width.is_none());
-            let int_ty = if uniform || self.p.width.is_none() { self.i32t } else { self.vi32() };
-            let bits = match ty {
-                Ty::I1 => LLVMBuildZExt(self.b, value, int_ty, n),
-                Ty::F32 => LLVMBuildBitCast(self.b, value, int_ty, n),
-                Ty::I32 => value,
-                _ => unreachable!("wide wave operand"),
-            };
-            LLVMSetAlignment(LLVMBuildStore(self.b, bits, pointer(self, i)), 4);
+        for (provenance, inputs, _) in members {
+            let layout = self.p.yields.get(provenance).expect("scheduled effect lacks a yield layout").clone();
+            for (i, (&id, &ty)) in inputs.iter().zip(&layout.inputs).enumerate() {
+                if matches!(layout.arguments[i], Argument::Constant(_)) { continue; }
+                let uniform = matches!(layout.arguments[i], Argument::Uniform);
+                let value = self.shaped(id, uniform || self.p.width.is_none());
+                let int_ty = if uniform || self.p.width.is_none() { self.i32t } else { self.vi32() };
+                let bits = match ty {
+                    Ty::I1 => LLVMBuildZExt(self.b, value, int_ty, n),
+                    Ty::F32 => LLVMBuildBitCast(self.b, value, int_ty, n),
+                    Ty::I32 => value,
+                    _ => unreachable!("wide wave operand"),
+                };
+                LLVMSetAlignment(LLVMBuildStore(self.b, bits, pointer(self, layout.base + i)), 4);
+            }
         }
         let i64t = self.i64t; let ptr = self.ptr;
         let ty = LLVMFunctionType(LLVMVoidTypeInContext(self.ctx), [ptr, i64t, ptr].as_mut_ptr(), 3, 0);
@@ -94,20 +96,23 @@ impl<'a> Cg<'a> {
         if function.is_null() { function = LLVMAddFunction(self.module, name, ty); }
         let context = LLVMGetParam(self.func, 7);
         LLVMBuildCall2(self.b, ty, function, [context, LLVMConstInt(i64t, resume as u64, 0), frame].as_mut_ptr(), 3, n);
-        let uniform = layout.uniform_result();
-        for (i, &(id, ty)) in outputs.iter().enumerate() {
-            let int_ty = if uniform || self.p.width.is_none() { self.i32t } else { self.vi32() };
-            let bits = LLVMBuildLoad2(self.b, int_ty, pointer(self, layout.output_base + i), n);
-            LLVMSetAlignment(bits, 4);
-            let bool_ty = if uniform || self.p.width.is_none() { self.i1 } else { self.vi1() };
-            let f32_ty = if uniform || self.p.width.is_none() { self.f32t } else { self.vec_ty(self.f32t) };
-            let result = match ty {
-                Ty::I1 => LLVMBuildTrunc(self.b, bits, bool_ty, n),
-                Ty::F32 => LLVMBuildBitCast(self.b, bits, f32_ty, n),
-                Ty::I32 => bits,
-                _ => unreachable!("wide wave result"),
-            };
-            self.define(id, result);
+        for (provenance, _, outputs) in members {
+            let layout = self.p.yields.get(provenance).expect("scheduled effect lacks a yield layout").clone();
+            let uniform = layout.uniform_result();
+            for (i, &(id, ty)) in outputs.iter().enumerate() {
+                let int_ty = if uniform || self.p.width.is_none() { self.i32t } else { self.vi32() };
+                let bits = LLVMBuildLoad2(self.b, int_ty, pointer(self, layout.base + layout.output_base + i), n);
+                LLVMSetAlignment(bits, 4);
+                let bool_ty = if uniform || self.p.width.is_none() { self.i1 } else { self.vi1() };
+                let f32_ty = if uniform || self.p.width.is_none() { self.f32t } else { self.vec_ty(self.f32t) };
+                let result = match ty {
+                    Ty::I1 => LLVMBuildTrunc(self.b, bits, bool_ty, n),
+                    Ty::F32 => LLVMBuildBitCast(self.b, bits, f32_ty, n),
+                    Ty::I32 => bits,
+                    _ => unreachable!("wide wave result"),
+                };
+                self.define(id, result);
+            }
         }
     }
 }

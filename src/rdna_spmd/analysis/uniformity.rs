@@ -215,6 +215,7 @@ pub(crate) fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded
                         let fact = match *op {
                             Op::Const(..) => Fact::Uniform,
                             Op::Env(Env::LaneId | Env::PacketLaneId) => Fact::Affine { stride: 1, span: None },
+                            Op::Env(Env::OutsideLanes) => Fact::Uniform,
                             Op::Env(Env::ValidLane | Env::ScratchBase | Env::ScratchSize) => Fact::Varying,
                             Op::Int(IntOp::Add, a, b) => v(a).add(v(b), false),
                             Op::Int(IntOp::Sub, a, b) => v(a).add(v(b), true),

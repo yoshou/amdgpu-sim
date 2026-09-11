@@ -15,6 +15,8 @@ pub(crate) fn registry() -> DialectRegistry {
     dialect::register(&mut registry).expect("RDNA4 target registration conflict");
     let idioms = dialect::idioms::SqrtIdioms::new(&registry);
     registry.add_idiom(Box::new(idioms));
+    let divisions = dialect::idioms::DivisionIdioms::new(&registry);
+    registry.add_idiom(Box::new(divisions));
     registry
 }
 

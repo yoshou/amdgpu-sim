@@ -24,10 +24,10 @@ pub(crate) enum Engine {
     Spmd(u32),
 }
 
-pub(crate) const ENGINES: [Engine; 8] = [
+pub(crate) const ENGINES: [Engine; 9] = [
     Engine::Interpreter, Engine::LlvmJit,
     Engine::Spmd(0), Engine::Spmd(1), Engine::Spmd(2),
-    Engine::Spmd(4), Engine::Spmd(8), Engine::Spmd(16),
+    Engine::Spmd(4), Engine::Spmd(8), Engine::Spmd(16), Engine::Spmd(32),
 ];
 
 /// The pattern the memory harness puts in its buffer: word `k` holds this, so a
@@ -369,6 +369,7 @@ pub(crate) fn engine_name(engine: Engine) -> &'static str {
         Engine::Spmd(4) => "SPMD W=4",
         Engine::Spmd(8) => "SPMD W=8",
         Engine::Spmd(16) => "SPMD W=16",
+        Engine::Spmd(32) => "SPMD W=32",
         Engine::Spmd(width) => panic!("unsupported SPMD test width {}", width),
     }
 }

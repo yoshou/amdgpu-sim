@@ -101,7 +101,7 @@ pub use engine::{dispatch, dispatch::GridDims, kernel::{Kernel, Scheduler}};
 #[cfg(test)]
 pub(crate) use targets::rdna4::decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
 #[cfg(test)]
-pub(crate) use program::split_at_barriers;
+pub(crate) use program::split_at_effects;
 #[cfg(test)]
 pub(crate) use engine::scheduler::dispatch_cooperative_vec;
 

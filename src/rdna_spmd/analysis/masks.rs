@@ -52,7 +52,7 @@ fn exec_param(block: &Block, exec_index: usize, f: &Func) -> ValueId {
     block.params.iter().filter(|p| p.1 == Ty::I1).nth(k).expect("block lacks its EXEC parameter").0
 }
 
-fn definitions(f: &Func) -> Vec<Option<Op>> {
+pub(crate) fn definitions(f: &Func) -> Vec<Option<Op>> {
     let mut out = vec![None; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
@@ -143,7 +143,7 @@ fn subset(bit: ValueId, exec: ValueId, defs: &[Option<Op>], ballots: &[Option<Va
     match defs[bit.0].as_ref() {
         Some(Op::Int(IntOp::And, a, b)) => same_bit(*a, exec, defs) || same_bit(*b, exec, defs),
         Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match defs[shifted.0].as_ref() {
-            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::PacketLaneId))) => {
+            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) => {
                 if constants[word.0] == Some(0) { return true; }
                 match defs[word.0].as_ref() {
                     Some(Op::Int(IntOp::And, a, b)) => [a, b].iter().any(|w| ballots[w.0].is_some_and(|bit| same_bit(bit, exec, defs))),
@@ -173,7 +173,7 @@ fn full_bit(bit: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ball
     match defs[bit.0].as_ref() {
         Some(Op::Convert(Cvt::Bitcast, Ty::I1, inner)) => full_bit(*inner, old, full, defs, ballots, constants, lane_mask),
         Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match defs[shifted.0].as_ref() {
-            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::PacketLaneId))) =>
+            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) =>
                 full_word(*word, old, full, defs, ballots, constants, lane_mask),
             _ => false,
         },
@@ -209,6 +209,7 @@ pub(crate) fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]
         let query = match &block.term {
             Term::CondBr { cond, .. } => block.insts.iter().find_map(|inst| match inst {
                 Inst::Packet { op: PacketOp::Any, input, output } if output == cond => Some(*input),
+                Inst::Effect { op: EffectOp::Wave(WaveOp::Any), inputs, outputs, .. } if outputs[0].0 == *cond => Some(inputs[0]),
                 _ => None,
             }).filter(|input| !block.term.edges().any(|e| e.args.contains(input))),
             _ => None,
@@ -323,7 +324,7 @@ fn exposure(f: &Func, predicated: &[Option<(ValueId, ValueId)>], masked: &[bool]
     for block in &layout.blocks {
         for inst in block.insts.iter() {
             match inst {
-                Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadLane | WaveOp::WriteLane | WaveOp::BpermuteFi | WaveOp::Wmma), inputs, .. } => pending.extend(inputs.iter().map(|&v| (v, 3))),
+                Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane | WaveOp::ReadLane | WaveOp::WriteLane | WaveOp::BpermuteFi | WaveOp::Wmma), inputs, .. } => pending.extend(inputs.iter().map(|&v| (v, 3))),
                 Inst::Packet { input, .. } => pending.push((*input, 3)),
                 Inst::Target { op, args, provenance: Some(_), .. } if every_lane(*op) => pending.extend(args.values().iter().map(|&v| (v, 3))),
                 _ => {}
@@ -523,7 +524,7 @@ fn update_of(bit: ValueId, defs: &[Option<Op>], constants: &[Option<u64>]) -> Up
     match defs[bit.0].as_ref() {
         Some(Op::Convert(Cvt::Bitcast, Ty::I1, inner)) => update_of(*inner, defs, constants),
         Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match defs[shifted.0].as_ref() {
-            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::PacketLaneId))) => {
+            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) => {
                 if let Some(k) = constants[word.0] { Update::Constant(k) } else { Update::Word(*word) }
             }
             _ => Update::Unknown,

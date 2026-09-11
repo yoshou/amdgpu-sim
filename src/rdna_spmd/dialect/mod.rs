@@ -14,6 +14,8 @@ pub(crate) enum Arguments {
     Binary([ValueId; 2]),
     Ternary([ValueId; 3]),
     Quaternary([ValueId; 4]),
+    Thirteen([ValueId; 13]),
+    Fourteen([ValueId; 14]),
     Sixteen([ValueId; 16]),
     Fifteen([ValueId; 15]),
 }
@@ -22,12 +24,14 @@ impl Arguments {
         match self {
             Self::Unary(a) => Self::Unary(f(a)), Self::Binary(a) => Self::Binary(a.map(f)),
             Self::Ternary(a) => Self::Ternary(a.map(f)), Self::Quaternary(a) => Self::Quaternary(a.map(f)),
+            Self::Thirteen(a) => Self::Thirteen(a.map(f)), Self::Fourteen(a) => Self::Fourteen(a.map(f)),
             Self::Sixteen(a) => Self::Sixteen(a.map(f)), Self::Fifteen(a) => Self::Fifteen(a.map(f)),
         }
     }
     pub fn values(&self) -> &[ValueId] {
         match self { Self::Unary(a) => std::slice::from_ref(a), Self::Binary(a) => a,
-            Self::Ternary(a) => a, Self::Quaternary(a) => a, Self::Sixteen(a) => a, Self::Fifteen(a) => a }
+            Self::Ternary(a) => a, Self::Quaternary(a) => a, Self::Thirteen(a) => a, Self::Fourteen(a) => a,
+            Self::Sixteen(a) => a, Self::Fifteen(a) => a }
     }
 }
 
