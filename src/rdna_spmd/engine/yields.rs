@@ -60,6 +60,35 @@ impl YieldValues {
         unsafe { *fibers[lane / width].yield_values().add(offset) }
     }
 
+    /// Collect nonzero lanes, stopping at the first match for Any/ReadFirstLane.
+    /// Test the argument layout once, and address each packet's frame once.
+    #[inline]
+    fn query_bits(&self, index: usize, width: usize, valid: u32, fibers: &[Fiber], first_only: bool) -> u32 {
+        if let Argument::Constant(value) = self.arguments[index] {
+            return if value == 0 { 0 } else { valid };
+        }
+        let uniform = matches!(self.arguments[index], Argument::Uniform);
+        let mut result = 0;
+        for (packet, fiber) in fibers.iter().enumerate() {
+            let shift = packet * width;
+            let mask = (valid >> shift) & lanes(width);
+            if mask == 0 { continue; }
+            let ptr = unsafe { fiber.yield_values().add((self.base + index) * width) };
+            if uniform {
+                if unsafe { *ptr } != 0 { result |= mask << shift; }
+            } else {
+                for lane in 0..width {
+                    if mask >> lane & 1 != 0 && unsafe { *ptr.add(lane) } != 0 {
+                        result |= 1 << (shift + lane);
+                        if first_only { return result; }
+                    }
+                }
+            }
+            if first_only && result != 0 { return result; }
+        }
+        result
+    }
+
     pub fn uniform_id(&self, width: usize, valid: u32, fibers: &[Fiber]) -> u32 {
         assert_ne!(valid, 0);
         let first = valid.trailing_zeros() as usize;
@@ -89,6 +118,22 @@ impl YieldValues {
         assert_eq!(fibers.len(), 32 / width);
         assert_ne!(valid, 0);
         let op = match self.op { EffectOp::Wave(op) => op, _ => panic!("not a wave effect") };
+        let answer = match op {
+            WaveOp::Any => Some((self.query_bits(0, width, valid, fibers, true) != 0) as u32),
+            WaveOp::Ballot => Some(self.query_bits(0, width, valid, fibers, false)),
+            WaveOp::ReadFirstLane => {
+                let bits = self.query_bits(1, width, valid, fibers, true);
+                // Empty EXEC reads lane 0, even if another valid lane exists.
+                let lane = if bits == 0 { 0 } else { bits.trailing_zeros() as usize };
+                Some(if valid >> lane & 1 != 0 { self.argument(0, lane, width, fibers) } else { 0 })
+            }
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            // Finish all input reads before overwriting the aliased result.
+            self.broadcast_result(width, valid, fibers, answer);
+            return;
+        }
         let arg = |index: usize, lane: usize| if valid >> lane & 1 == 0 { 0 } else {
             self.argument(index, lane, width, fibers)
         };
@@ -191,6 +236,74 @@ mod tests {
     use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, Operand, YieldAction};
     use crate::rdna_instructions::SourceOperand;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn reduced_queries_match_wave_semantics_for_all_layouts_and_valid_lanes() {
+        use crate::rdna_spmd::engine::fiber::{FiberCtx, amdgpu_sim_fiber_yield_values};
+        unsafe extern "C" fn yield_frame(
+            frame: *mut u32, _: *mut u32, _: u64, _: u64, _: *mut u32,
+            _: u64, _: u64, ctx: *mut FiberCtx, _: u32,
+        ) -> u64 {
+            amdgpu_sim_fiber_yield_values(ctx, 0, frame);
+            FIBER_DONE
+        }
+        for width in [1, 2, 4, 8, 16, 32] {
+            let mut fibers = Fiber::batch(32 / width, 64 * 1024);
+            for valid in [1, 0x1ffff, 0x80000000, 0xaaaa_aaaa, u32::MAX] {
+                for predicate in [0, 0x80000000, 0x5555_5555, u32::MAX] {
+                    for source_kind in [Argument::Lane, Argument::Uniform, Argument::Constant(0x12345678)] {
+                        for mask_kind in [Argument::Lane, Argument::Uniform, Argument::Constant(0), Argument::Constant(1)] {
+                            for op in [WaveOp::Any, WaveOp::Ballot, WaveOp::ReadFirstLane] {
+                                let mut layout = YieldValues::new(EffectOp::Wave(op));
+                                layout.base = 1; // An effect can follow others in a shared frame.
+                                layout.arguments = if op == WaveOp::ReadFirstLane { vec![source_kind, mask_kind] } else { vec![mask_kind] };
+                                let mut frames = vec![vec![0xdeadbeef; 4 * width]; fibers.len()];
+                                let mut logical = [[0u32; 32]; 2];
+                                for (index, &kind) in layout.arguments.iter().enumerate() {
+                                    let is_mask = op != WaveOp::ReadFirstLane || index == 1;
+                                    for lane in 0..32 {
+                                        let packet = lane / width;
+                                        let representative = if matches!(kind, Argument::Uniform) { packet * width } else { lane };
+                                        let value = match kind {
+                                            Argument::Constant(value) => value,
+                                            _ if is_mask => (predicate >> representative & 1) * 0x80000000,
+                                            _ => 100 + representative as u32,
+                                        };
+                                        logical[index][lane] = value;
+                                        match kind {
+                                            Argument::Constant(_) => {},
+                                            Argument::Uniform => frames[packet][(layout.base + index) * width] = value,
+                                            Argument::Lane if valid >> lane & 1 != 0 => frames[packet][(layout.base + index) * width + lane % width] = value,
+                                            _ => {}, // Poison padding; it must never contribute.
+                                        }
+                                    }
+                                }
+                                let before = frames.clone();
+                                for (packet, fiber) in fibers.iter_mut().enumerate() {
+                                    if valid >> (packet * width) & lanes(width) == 0 { continue; }
+                                    fiber.start(KernelArgs { entry: yield_frame as *const () as u64,
+                                        sgprs: frames[packet].as_mut_ptr(), vgprs: std::ptr::null_mut(), spill: std::ptr::null_mut(),
+                                        scratch_base: 0, scratch_stride: 0, lane_base: (packet * width) as u64,
+                                        lds_base: 0, valid_mask: valid });
+                                    assert_eq!(fiber.resume(), 0);
+                                }
+                                let expected = evaluate(op, valid, |index, lane| logical[index][lane])[0];
+                                layout.apply_wave(width, valid, &fibers);
+                                for (packet, fiber) in fibers.iter_mut().enumerate() {
+                                    let active = valid >> (packet * width) & lanes(width) != 0;
+                                    for (cell, &value) in frames[packet].iter().enumerate() {
+                                        let expected = if active && cell == layout.base * width { expected } else { before[packet][cell] };
+                                        assert_eq!(value, expected, "{op:?} width={width} valid={valid:#x} predicate={predicate:#x} packet={packet} cell={cell}");
+                                    }
+                                    if active { assert_eq!(fiber.resume(), FIBER_DONE); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Invoke the compiled packet entry on real fibers, including its native
     // argument stores and result loads. Register buffers are observed only at
