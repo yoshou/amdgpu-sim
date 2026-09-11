@@ -76,11 +76,17 @@ fn describe(vdst: &[[u32; 4]; 2], mem: &[[u32; 8]; 2]) -> String {
 
 fn check(op: u32, cases: &[ScratchCase], vdst_reg: u32, vsrc_reg: u32) {
     let harness = Harness::scratch();
+    assert!(harness.private_segment_size >= 48);
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
+        // The kernel allocates 48 bytes but initializes only the first 32.
+        // Captures read zeros in the tail; pooled simulator scratch may hold
+        // an earlier dispatch's data. v[6:9] are zero at the patch slot, so
+        // initialize that allocated tail without changing the captured words.
+        let mut words = vscratch(29, 0, 6, 0, 0x7C, 32, 0).to_vec();
         // The harness leaves v0 at zero and v1 at 8, and s10 at 4, so a case
         // reaches each of the three address parts by naming them.
-        let words = vscratch(
+        words.extend(vscratch(
             op,
             vdst_reg,
             vsrc_reg,
@@ -88,8 +94,7 @@ fn check(op: u32, cases: &[ScratchCase], vdst_reg: u32, vsrc_reg: u32) {
             case.saddr,
             case.ioffset,
             case.sve,
-        )
-        .to_vec();
+        ));
         for engine in ENGINES {
             let (vdst, mem) = run(&harness, engine, &words);
             if vdst == case.vdst && mem == case.mem {
