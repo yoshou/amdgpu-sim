@@ -1,5 +1,6 @@
 use super::super::ir::{*, EffectOp, MemoryOp, MemSize, Space, WaveOp, Cvt, Env, IntOp, Op, Ty, ValueId};
 use super::super::program::{Parameter, ParameterSource};
+use super::dataflow::{Cfg, Lattice, Sparse};
 use super::{Analyses, Analysis, Constants, Masks, Packet};
 use std::collections::BTreeMap;
 
@@ -143,17 +144,46 @@ fn effect_output(op: EffectOp, inputs: &[Fact]) -> Fact {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Known { Top, Fact(Fact) }
+impl Known {
+    fn get(self) -> Fact { match self { Known::Top => Fact::Uniform, Known::Fact(fact) => fact } }
+}
+impl Lattice for Known {
+    fn meet(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Known::Top, x) | (x, Known::Top) => *x,
+            (Known::Fact(a), Known::Fact(b)) => Known::Fact(a.meet(*b)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pair { Unknown, Of(ValueId, Fact), Broken }
+impl Lattice for Pair {
+    fn meet(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Pair::Unknown, x) | (x, Pair::Unknown) => *x,
+            (Pair::Of(a, x), Pair::Of(b, y)) if a == b && x == y => *self,
+            _ => Pair::Broken,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Lane { fact: Known, pair: Pair }
+impl Lattice for Lane {
+    fn meet(&self, other: &Self) -> Self { Lane { fact: self.fact.meet(&other.fact), pair: self.pair.meet(&other.pair) } }
+}
+
 fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) -> Uniformity {
-    let mut facts: Vec<Option<Fact>> = vec![None; f.types.len()];
-    let mut pairs: Vec<Option<(ValueId, Fact)>> = vec![None; f.types.len()];
-    let mut definitions: Vec<Option<Op>> = vec![None; f.types.len()];
-    let mut unpacked_pairs: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
+    let definitions = f.definitions();
+    let mut high_of: Vec<Option<ValueId>> = vec![None; f.types.len()];
     for block in f.blocks.values() {
         let mut lows: Vec<(ValueId, ValueId)> = Vec::new();
         let mut highs: Vec<(ValueId, ValueId)> = Vec::new();
         for inst in &block.insts {
             if let Inst::Core { value, op, .. } = inst {
-                definitions[value.0] = Some(*op);
                 match op {
                     Op::UnpackLo(x) => lows.push((*x, *value)),
                     Op::UnpackHi(x) => highs.push((*x, *value)),
@@ -161,174 +191,124 @@ fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) 
                 }
             }
         }
-        for &(x, lo) in &lows { for &(y, hi) in &highs { if y == x { unpacked_pairs.push((lo, hi, x)); } } }
+        for &(x, lo) in &lows { for &(y, hi) in &highs { if y == x { high_of[lo.0] = Some(hi); } } }
     }
-    let entry_block = &f.blocks[&f.entry];
-    for &(id, ty) in &entry_block.params {
-        facts[id.0] = Some(if entry.varying.contains(&id) { Fact::Varying }
+    let unpacked = |value: ValueId| -> Option<(ValueId, bool)> {
+        match definitions[value.0] { Some(Op::UnpackLo(x)) => Some((x, false)), Some(Op::UnpackHi(x)) => Some((x, true)), _ => None }
+    };
+    let cfg = Cfg::new(f);
+    let boundary = |id: ValueId| {
+        let ty = f.types[id.0];
+        let fact = if entry.varying.contains(&id) { Fact::Varying }
             else if entry.uniform.contains(&id) { Fact::Uniform }
             else if let Some(&(_, stride, span)) = entry.affine.iter().find(|(v, _, _)| *v == id) { Fact::Affine { stride, span } }
             else if ty == Ty::I1 { Fact::Varying }
-            else { Fact::Uniform });
-    }
-    let unpacked = |value: ValueId, definitions: &[Option<Op>]| -> Option<(ValueId, bool)> {
-        match definitions[value.0] { Some(Op::UnpackLo(x)) => Some((x, false)), Some(Op::UnpackHi(x)) => Some((x, true)), _ => None }
+            else { Fact::Uniform };
+        Lane { fact: Known::Fact(fact), pair: Pair::Broken }
     };
-    let mut top: Vec<Option<ValueId>> = vec![None; f.types.len()];
-    for (&id, block) in &f.blocks {
-        if id != f.entry { for w in block.params.windows(2) { top[w[0].0 .0] = Some(w[1].0); } }
-    }
-    let blocks: Vec<&Block> = f.blocks.values().collect();
-    let mut position = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
-    for (at, id) in f.blocks.keys().enumerate() { position[id.0] = at; }
-    let mut incoming_edges: Vec<Vec<&Edge>> = (0..blocks.len()).map(|_| Vec::new()).collect();
-    for block in &blocks {
-        for edge in block.term.edges() { incoming_edges[position[edge.dst.0]].push(edge); }
-    }
-    let order = {
-        let mut order = Vec::with_capacity(blocks.len());
-        let mut seen = vec![false; blocks.len()];
-        let entry = position[f.entry.0];
-        seen[entry] = true;
-        let mut stack: Vec<(usize, usize)> = vec![(entry, 0)];
-        while let Some((at, next)) = stack.last_mut() {
-            match blocks[*at].term.edges().nth(*next) {
-                Some(edge) => {
-                    *next += 1;
-                    let dst = position[edge.dst.0];
-                    if !seen[dst] { seen[dst] = true; stack.push((dst, 0)); }
-                }
-                None => { order.push(*at); stack.pop(); }
-            }
-        }
-        order.reverse();
-        for at in 0..blocks.len() { if !seen[at] { order.push(at); } }
-        order
+    let edge = |edge: &Edge, _: usize, position: usize, facts: &[Lane]| {
+        let dst = &cfg.blocks[cfg.index[edge.dst.0]];
+        let arg = edge.args[position];
+        let fact = facts[arg.0].fact;
+        let known = |id: ValueId| facts[id.0].fact.get();
+        let pair = match (dst.params.get(position + 1), edge.args.get(position + 1)) {
+            (Some(&(high, _)), Some(&next)) => match facts[arg.0].pair {
+                Pair::Unknown => Pair::Unknown,
+                Pair::Of(h, fact) if h == next => Pair::Of(high, fact),
+                _ => match (unpacked(arg), unpacked(next)) {
+                    (Some((x, false)), Some((y, true))) if x == y && matches!(known(x), Fact::Affine { .. }) => Pair::Of(high, known(x)),
+                    _ => Pair::Broken,
+                },
+            },
+            _ => Pair::Broken,
+        };
+        Lane { fact, pair }
     };
-    let entry_at = position[f.entry.0];
-    loop {
-        let mut changed = false;
-        fn assign(facts: &mut [Option<Fact>], changed: &mut bool, id: ValueId, fact: Fact) { if facts[id.0] != Some(fact) { facts[id.0] = Some(fact); *changed = true; } }
-        for &at in &order {
-            let block = blocks[at];
-            if at != entry_at {
-                for (index, &(param, _)) in block.params.iter().enumerate() {
-                    let high = block.params.get(index + 1).map(|p| p.0);
-                    let mut merged: Option<Fact> = None;
-                    let mut merged_pair: Option<Option<Fact>> = None;
-                    for edge in &incoming_edges[at] {
-                        let Some(&arg) = edge.args.get(index) else { continue };
-                        if let Some(fact) = facts[arg.0] {
-                            merged = Some(match merged { Some(current) => current.meet(fact), None => fact });
+    let transfer = |inst: &Inst, value: ValueId, facts: &[Lane]| {
+        let v = |id: ValueId| facts[id.0].fact.get();
+        let fact = match inst {
+            Inst::Core { ty, op, .. } => {
+                let fact = match *op {
+                    Op::Const(..) => Fact::Uniform,
+                    Op::Env(Env::LaneId | Env::PacketLaneId) => Fact::Affine { stride: 1, span: None },
+                    Op::Env(Env::OutsideLanes) => Fact::Uniform,
+                    Op::Env(Env::ValidLane | Env::ScratchBase | Env::ScratchSize) => Fact::Varying,
+                    Op::Int(IntOp::Add, a, b) => v(a).add(v(b), false),
+                    Op::Int(IntOp::Sub, a, b) => v(a).add(v(b), true),
+                    Op::Int(IntOp::Mul, a, b) => match (v(a), v(b), constants[a.0], constants[b.0]) {
+                        (Fact::Uniform, Fact::Uniform, _, _) => Fact::Uniform,
+                        (fact @ Fact::Affine { .. }, _, _, Some(c)) | (_, fact @ Fact::Affine { .. }, Some(c), _) => {
+                            if c != 0 && c.is_power_of_two() { fact.shifted_left(c.trailing_zeros() as u64) }
+                            else if let Fact::Affine { stride, .. } = fact { Fact::Affine { stride: stride.wrapping_mul(c as i64), span: None } }
+                            else { Fact::Varying }
                         }
-                        let Some(high) = high else { continue };
-                        if index + 1 >= edge.args.len() { continue; }
-                        let source = (arg, edge.args[index + 1]);
-                        if top[source.0 .0] == Some(source.1) { continue; }
-                        let fact = pairs[source.0 .0].filter(|p| p.0 == source.1).map(|p| p.1).or_else(|| {
-                            let (a, b) = (unpacked(source.0, &definitions)?, unpacked(source.1, &definitions)?);
-                            (a.0 == b.0 && !a.1 && b.1).then(|| facts[a.0 .0]).flatten().filter(|fact| matches!(fact, Fact::Affine { .. }))
-                        });
-                        let _ = high;
-                        merged_pair = Some(match merged_pair {
-                            Some(current) => match (current, fact) { (Some(a), Some(b)) if a == b => Some(a), _ => None },
-                            None => fact,
-                        });
+                        _ => Fact::Varying,
+                    },
+                    Op::Int(IntOp::Shl, a, b) => match constants[b.0] {
+                        Some(c) => v(a).shifted_left(c),
+                        None => Fact::join_all(v(a), v(b)),
+                    },
+                    Op::Int(IntOp::LShr, a, b) => match constants[b.0] {
+                        Some(c) => v(a).shifted_right(c),
+                        None => Fact::join_all(v(a), v(b)),
+                    },
+                    Op::Int(IntOp::And, a, b) => match (constants[a.0], constants[b.0]) {
+                        (_, Some(m)) => v(a).masked(m),
+                        (Some(m), _) => v(b).masked(m),
+                        _ => Fact::join_all(v(a), v(b)),
+                    },
+                    Op::Int(_, a, b) => Fact::join_all(v(a), v(b)),
+                    Op::Convert(Cvt::Trunc, to, a) => v(a).word(to.bits()),
+                    Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Bitcast, _, a) => v(a),
+                    Op::Convert(_, _, a) => if v(a) == Fact::Uniform { Fact::Uniform } else { Fact::Varying },
+                    Op::Pack64(lo, hi) => match facts[lo.0].pair {
+                        Pair::Of(h, fact) if h == hi => fact,
+                        _ => match (v(lo), v(hi)) {
+                            (Fact::Affine { stride, span }, Fact::Uniform) => Fact::Affine { stride, span: span.filter(|&(_, end)| end <= 32) },
+                            (Fact::Uniform, Fact::Affine { stride, span }) => Fact::Affine { stride: stride.wrapping_shl(32), span: span.map(|(a, b)| (a + 32, b + 32)) },
+                            (a, b) => Fact::join_all(a, b),
+                        },
+                    },
+                    Op::UnpackLo(a) => v(a).word(32),
+                    Op::UnpackHi(a) => match v(a) {
+                        Fact::Uniform => Fact::Uniform,
+                        Fact::Affine { span: Some((_, end)), .. } if end <= 32 => Fact::Uniform,
+                        Fact::Affine { stride, span: Some((start, end)) } if start >= 32 => Fact::Affine { stride: stride >> 32, span: Some((start - 32, end - 32)) },
+                        Fact::Affine { stride, span: None } if stride.trailing_zeros() >= 32 => Fact::Affine { stride: stride >> 32, span: None },
+                        _ => Fact::Varying,
+                    },
+                    Op::Select(c, a, b) => {
+                        if a == b || guarded[value.0] { v(a) }
+                        else if v(c) == Fact::Uniform { v(a).meet(v(b)) }
+                        else { Fact::Varying }
                     }
-                    if let Some(fact) = merged { assign(&mut facts, &mut changed, param, fact); }
-                    if let (Some(fact), Some(high)) = (merged_pair, high) {
-                        if top[param.0] == Some(high) { top[param.0] = None; changed = true; }
-                        let next = fact.map(|fact| (high, fact));
-                        if pairs[param.0] != next { pairs[param.0] = next; changed = true; }
-                    }
-                }
+                    Op::TrailingZeros(a) | Op::LeadingZeros(a) | Op::PopulationCount(a) | Op::ReverseBits(a) | Op::Unary(_, a) =>
+                        if v(a) == Fact::Uniform { Fact::Uniform } else { Fact::Varying },
+                    Op::Cmp(_, a, b) | Op::FCmp(_, a, b) | Op::Float(_, a, b) => Fact::join_all(v(a), v(b)),
+                    Op::Fma(a, b, c) | Op::MulAdd(a, b, c) => Fact::join_all(Fact::join_all(v(a), v(b)), v(c)),
+                };
+                if *ty == Ty::I1 && fact != Fact::Uniform { Fact::Varying } else { fact }
             }
-            for inst in &block.insts {
-                match inst {
-                    Inst::Core { value, ty, op } => {
-                        let v = |id: ValueId| facts[id.0].unwrap_or(Fact::Uniform);
-                        let fact = match *op {
-                            Op::Const(..) => Fact::Uniform,
-                            Op::Env(Env::LaneId | Env::PacketLaneId) => Fact::Affine { stride: 1, span: None },
-                            Op::Env(Env::OutsideLanes) => Fact::Uniform,
-                            Op::Env(Env::ValidLane | Env::ScratchBase | Env::ScratchSize) => Fact::Varying,
-                            Op::Int(IntOp::Add, a, b) => v(a).add(v(b), false),
-                            Op::Int(IntOp::Sub, a, b) => v(a).add(v(b), true),
-                            Op::Int(IntOp::Mul, a, b) => match (v(a), v(b), constants[a.0], constants[b.0]) {
-                                (Fact::Uniform, Fact::Uniform, _, _) => Fact::Uniform,
-                                (fact @ Fact::Affine { .. }, _, _, Some(c)) | (_, fact @ Fact::Affine { .. }, Some(c), _) => {
-                                    if c != 0 && c.is_power_of_two() { fact.shifted_left(c.trailing_zeros() as u64) }
-                                    else if let Fact::Affine { stride, .. } = fact { Fact::Affine { stride: stride.wrapping_mul(c as i64), span: None } }
-                                    else { Fact::Varying }
-                                }
-                                _ => Fact::Varying,
-                            },
-                            Op::Int(IntOp::Shl, a, b) => match constants[b.0] {
-                                Some(c) => v(a).shifted_left(c),
-                                None => Fact::join_all(v(a), v(b)),
-                            },
-                            Op::Int(IntOp::LShr, a, b) => match constants[b.0] {
-                                Some(c) => v(a).shifted_right(c),
-                                None => Fact::join_all(v(a), v(b)),
-                            },
-                            Op::Int(IntOp::And, a, b) => match (constants[a.0], constants[b.0]) {
-                                (_, Some(m)) => v(a).masked(m),
-                                (Some(m), _) => v(b).masked(m),
-                                _ => Fact::join_all(v(a), v(b)),
-                            },
-                            Op::Int(_, a, b) => Fact::join_all(v(a), v(b)),
-                            Op::Convert(Cvt::Trunc, to, a) => v(a).word(to.bits()),
-                            Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Bitcast, _, a) => v(a),
-                            Op::Convert(_, _, a) => if v(a) == Fact::Uniform { Fact::Uniform } else { Fact::Varying },
-                            Op::Pack64(lo, hi) => pairs[lo.0].filter(|p| p.0 == hi).map(|p| p.1).unwrap_or_else(|| match (v(lo), v(hi)) {
-                                (Fact::Affine { stride, span }, Fact::Uniform) => Fact::Affine { stride, span: span.filter(|&(_, end)| end <= 32) },
-                                (Fact::Uniform, Fact::Affine { stride, span }) => Fact::Affine { stride: stride.wrapping_shl(32), span: span.map(|(a, b)| (a + 32, b + 32)) },
-                                (a, b) => Fact::join_all(a, b),
-                            }),
-                            Op::UnpackLo(a) => v(a).word(32),
-                            Op::UnpackHi(a) => match v(a) {
-                                Fact::Uniform => Fact::Uniform,
-                                Fact::Affine { span: Some((_, end)), .. } if end <= 32 => Fact::Uniform,
-                                Fact::Affine { stride, span: Some((start, end)) } if start >= 32 => Fact::Affine { stride: stride >> 32, span: Some((start - 32, end - 32)) },
-                                Fact::Affine { stride, span: None } if stride.trailing_zeros() >= 32 => Fact::Affine { stride: stride >> 32, span: None },
-                                _ => Fact::Varying,
-                            },
-                            Op::Select(c, a, b) => {
-                                if a == b || guarded[value.0] { v(a) }
-                                else if v(c) == Fact::Uniform { v(a).meet(v(b)) }
-                                else { Fact::Varying }
-                            }
-                            Op::TrailingZeros(a) | Op::LeadingZeros(a) | Op::PopulationCount(a) | Op::ReverseBits(a) | Op::Unary(_, a) =>
-                                if v(a) == Fact::Uniform { Fact::Uniform } else { Fact::Varying },
-                            Op::Cmp(_, a, b) | Op::FCmp(_, a, b) | Op::Float(_, a, b) => Fact::join_all(v(a), v(b)),
-                            Op::Fma(a, b, c) | Op::MulAdd(a, b, c) => Fact::join_all(Fact::join_all(v(a), v(b)), v(c)),
-                        };
-                        let fact = if *ty == Ty::I1 && fact != Fact::Uniform { Fact::Varying } else { fact };
-                        assign(&mut facts, &mut changed, *value, fact);
-                    }
-                    Inst::Packet { output, .. } => assign(&mut facts, &mut changed, *output, Fact::Uniform),
-                    Inst::Target { provenance, args, outputs, .. } => {
-                        let fact = if provenance.is_some() { Fact::Varying }
-                            else if args.values().iter().all(|a| facts[a.0].unwrap_or(Fact::Uniform) == Fact::Uniform) { Fact::Uniform } else { Fact::Varying };
-                        for &(id, _) in outputs { assign(&mut facts, &mut changed, id, fact); }
-                    }
-                    Inst::Effect { op, inputs, outputs, .. } => {
-                        let input_facts: Vec<_> = inputs.iter().map(|id| facts[id.0].unwrap_or(Fact::Uniform)).collect();
-                        let fact = effect_output(*op, &input_facts);
-                        for &(id, _) in outputs { assign(&mut facts, &mut changed, id, fact); }
-                    }
-                }
+            Inst::Packet { .. } => Fact::Uniform,
+            Inst::Target { provenance, args, .. } => {
+                if provenance.is_some() { Fact::Varying }
+                else if args.values().iter().all(|a| v(*a) == Fact::Uniform) { Fact::Uniform } else { Fact::Varying }
             }
-        }
-        for &(lo, hi, x) in &unpacked_pairs {
-            if let Some(fact @ Fact::Affine { .. }) = facts[x.0] {
-                if pairs[lo.0] != Some((hi, fact)) { pairs[lo.0] = Some((hi, fact)); changed = true; }
+            Inst::Effect { op, inputs, .. } => {
+                let input_facts: Vec<_> = inputs.iter().map(|id| v(*id)).collect();
+                effect_output(*op, &input_facts)
             }
-        }
-        if !changed { break; }
-    }
-    let pairs = pairs.iter().enumerate().filter_map(|(lo, p)| p.map(|(hi, fact)| ((ValueId(lo), hi), fact))).collect();
-    Uniformity { facts: facts.into_iter().map(|fact| fact.unwrap_or(Fact::Uniform)).collect(), pairs }
+        };
+        let pair = match (definitions[value.0], high_of[value.0]) {
+            (Some(Op::UnpackLo(x)), Some(hi)) => match v(x) { fact @ Fact::Affine { .. } => Pair::Of(hi, fact), _ => Pair::Broken },
+            _ => Pair::Broken,
+        };
+        Lane { fact: Known::Fact(fact), pair }
+    };
+    let start = Lane { fact: Known::Top, pair: Pair::Unknown };
+    let lanes = Sparse { cfg: &cfg, start, boundary: &boundary, edge: &edge, transfer: &transfer }.solve(f.types.len());
+    let pairs = lanes.iter().enumerate().filter_map(|(lo, lane)| match lane.pair { Pair::Of(hi, fact) => Some(((ValueId(lo), hi), fact)), _ => None }).collect();
+    Uniformity { facts: lanes.iter().map(|lane| lane.fact.get()).collect(), pairs }
 }
 
 #[cfg(test)]

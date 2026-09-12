@@ -1,4 +1,5 @@
 use super::super::ir::{*, EffectOp, WaveOp, Cvt, Env, IntOp, Op, Ty, ValueId};
+use super::dataflow::{Backward, Cfg, Lattice, Sparse, for_each_output};
 use super::{Analyses, Analysis, Constants};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -115,7 +116,6 @@ fn block_index(f: &Func) -> Vec<usize> {
 
 struct Layout<'f> {
     blocks: Vec<&'f Block>,
-    index: Vec<usize>,
     incoming: Vec<Vec<&'f Edge>>,
     producers: Vec<Option<(usize, usize)>>,
     params: Vec<Option<(usize, usize)>>,
@@ -133,7 +133,7 @@ fn layout(f: &Func) -> Layout<'_> {
             for_each_output(inst, |v| producers[v.0] = Some((at, position)));
         }
     }
-    Layout { blocks, index, incoming, producers, params }
+    Layout { blocks, incoming, producers, params }
 }
 
 fn incoming_edges<'f>(f: &'f Func, index: &[usize]) -> Vec<Vec<&'f Edge>> {
@@ -144,7 +144,11 @@ fn incoming_edges<'f>(f: &'f Func, index: &[usize]) -> Vec<Vec<&'f Edge>> {
     out
 }
 
+#[derive(Clone, PartialEq)]
 struct Bits(Vec<u64>);
+impl Lattice for Bits {
+    fn meet(&self, other: &Self) -> Self { Bits(self.0.iter().zip(&other.0).map(|(a, b)| a | b).collect()) }
+}
 impl Bits {
     fn new(values: usize) -> Self { Self(vec![0; values.div_ceil(64)]) }
     fn clear(&mut self) { self.0.fill(0); }
@@ -185,33 +189,6 @@ fn subset(bit: ValueId, exec: ValueId, defs: &[Option<Op>], ballots: &[Option<Va
             }
             _ => false,
         },
-        _ => false,
-    }
-}
-
-fn full_word(word: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ballots: &[Option<ValueId>], constants: &[Option<u64>], lane_mask: u64) -> bool {
-    if let Some(k) = constants[word.0] { return k & lane_mask == lane_mask; }
-    if let Some(bit) = ballots[word.0] { return full[bit.0] || same_bit(bit, old, defs) && full[old.0]; }
-    match defs[word.0].as_ref() {
-        Some(Op::Int(IntOp::Or, a, b)) => full_word(*a, old, full, defs, ballots, constants, lane_mask) || full_word(*b, old, full, defs, ballots, constants, lane_mask),
-        Some(Op::Int(IntOp::And, a, b)) => full_word(*a, old, full, defs, ballots, constants, lane_mask) && full_word(*b, old, full, defs, ballots, constants, lane_mask),
-        Some(Op::Convert(Cvt::Bitcast, _, a)) => full_word(*a, old, full, defs, ballots, constants, lane_mask),
-        _ => false,
-    }
-}
-
-fn full_bit(bit: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ballots: &[Option<ValueId>], constants: &[Option<u64>], lane_mask: u64) -> bool {
-    if same_bit(bit, old, defs) { return full[old.0]; }
-    if let Some(k) = constants[bit.0] { return k & 1 != 0; }
-    match defs[bit.0].as_ref() {
-        Some(Op::Convert(Cvt::Bitcast, Ty::I1, inner)) => full_bit(*inner, old, full, defs, ballots, constants, lane_mask),
-        Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match defs[shifted.0].as_ref() {
-            Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) =>
-                full_word(*word, old, full, defs, ballots, constants, lane_mask),
-            _ => false,
-        },
-        Some(Op::Int(IntOp::And, a, b)) => full_bit(*a, old, full, defs, ballots, constants, lane_mask) && full_bit(*b, old, full, defs, ballots, constants, lane_mask),
-        Some(Op::Int(IntOp::Or, a, b)) => full_bit(*a, old, full, defs, ballots, constants, lane_mask) || full_bit(*b, old, full, defs, ballots, constants, lane_mask),
         _ => false,
     }
 }
@@ -276,51 +253,52 @@ fn analyze(registry: &super::super::dialect::DialectRegistry, f: &Func, exec_ind
 
 fn analyze_from(registry: &super::super::dialect::DialectRegistry, f: &Func, p: &Predication, exec_index: usize, constants: &[Option<u64>], width: u32, entry_full: bool) -> Masks {
     let every_lane = |op: super::super::dialect::TargetOp| registry.operation(op).is_ok_and(|o| o.effect == super::super::dialect::Effect::ReadGlobal { every_lane: true });
-    let (defs, ballots) = (&p.defs, &p.ballots);
+    let defs = &p.defs;
     let any = any_of(f);
     let lane_mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
     let (reactivation, predicated, masked, chain, updates) = (Rc::clone(&p.reactivation), Rc::clone(&p.predicated), Rc::clone(&p.masked), Rc::clone(&p.chain), &p.updates);
-    let mut full = vec![true; f.types.len()];
-    let entry_exec = exec_param(&f.blocks[&f.entry], exec_index, f);
-    full[entry_exec.0] = entry_full;
     let layout = layout(f);
-    let index = &layout.index;
-    let execs: Vec<ValueId> = {
-        let entry = &f.blocks[&f.entry];
-        let k = entry.params[..exec_index].iter().filter(|p| p.1 == Ty::I1).count();
-        f.blocks.values().map(|block| block.params.iter().filter(|p| p.1 == Ty::I1).nth(k).expect("block lacks its EXEC parameter").0).collect()
-    };
-    let transfers: Vec<(ValueId, ValueId, bool)> = {
-        let mut out = Vec::new();
-        for (&id, block) in &f.blocks {
-            let outgoing = chain[&id].last().unwrap().1;
-            let guarded_edge = match &block.term {
-                Term::CondBr { cond, no, .. } if all_active_guard(&any, *cond, outgoing, defs) => Some(no.dst),
-                _ => None,
-            };
-            for edge in block.term.edges() { out.push((execs[index[edge.dst.0]], outgoing, guarded_edge == Some(edge.dst))); }
-        }
+    let cfg = Cfg::new(f);
+    let execs: Vec<ValueId> = cfg.blocks.iter().map(|block| exec_param(block, exec_index, f)).collect();
+    let entry_exec = execs[cfg.entry];
+    let guarded_edge: Vec<Option<BlockId>> = cfg.blocks.iter().enumerate().map(|(at, block)| match &block.term {
+        Term::CondBr { cond, no, .. } if all_active_guard(&any, *cond, chain[&cfg.ids[at]].last().unwrap().1, defs) => Some(no.dst),
+        _ => None,
+    }).collect();
+    let bit_update: Vec<Option<(ValueId, ValueId)>> = {
+        let mut out = vec![None; f.types.len()];
+        for &(value, old, bit) in updates.iter() { out[value.0] = Some((old, bit)); }
         out
     };
-    let mut incoming: Vec<Option<bool>> = vec![None; f.types.len()];
-    loop {
-        let mut changed = false;
-        for &(value, old, bit) in updates.iter() {
-            let fact = full_bit(bit, old, &full, defs, ballots, constants, lane_mask);
-            if full[value.0] != fact { full[value.0] = fact; changed = true; }
+    let known = |v: ValueId| constants[v.0].map(|k| if f.types[v.0] == Ty::I1 { k & 1 != 0 } else { k & lane_mask == lane_mask });
+    let boundary = |p: ValueId| if p == entry_exec { entry_full } else { known(p).unwrap_or(false) };
+    let edge = |edge: &Edge, src: usize, position: usize, facts: &[bool]| {
+        let dst = cfg.index[edge.dst.0];
+        let param = cfg.blocks[dst].params[position].0;
+        if param != execs[dst] { return known(param).unwrap_or(false); }
+        facts[edge.args[position].0] || guarded_edge[src] == Some(edge.dst)
+    };
+    let transfer = |inst: &Inst, v: ValueId, facts: &[bool]| -> bool {
+        if let Some((old, bit)) = bit_update[v.0] { return facts[bit.0] || same_bit(bit, old, defs) && facts[old.0]; }
+        if let Some(fact) = known(v) { return fact; }
+        match inst {
+            Inst::Packet { op: PacketOp::Ballot, input, .. } => facts[input.0],
+            Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, .. } => facts[inputs[0].0],
+            Inst::Core { op, .. } => match *op {
+                Op::Env(Env::ValidLane) => true,
+                Op::Convert(Cvt::Bitcast, _, a) => facts[a.0],
+                Op::Convert(Cvt::Trunc, Ty::I1, shifted) => match defs[shifted.0].as_ref() {
+                    Some(Op::Int(IntOp::LShr, word, lane)) if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) => facts[word.0],
+                    _ => false,
+                },
+                Op::Int(IntOp::And, a, b) => facts[a.0] && facts[b.0],
+                Op::Int(IntOp::Or, a, b) => facts[a.0] || facts[b.0],
+                _ => false,
+            },
+            _ => false,
         }
-        for &param in &execs { incoming[param.0] = None; }
-        incoming[entry_exec.0] = Some(entry_full);
-        for &(param, outgoing, guarded) in &transfers {
-            let fact = full[outgoing.0] || guarded;
-            incoming[param.0] = Some(incoming[param.0].map_or(fact, |v| v & fact));
-        }
-        for &param in &execs {
-            if let Some(fact) = incoming[param.0] { if full[param.0] != fact { full[param.0] = fact; changed = true; } }
-        }
-        if let Some(fact) = incoming[entry_exec.0] { if full[entry_exec.0] != fact { full[entry_exec.0] = fact; changed = true; } }
-        if !changed { break; }
-    }
+    };
+    let full = Sparse { cfg: &cfg, start: true, boundary: &boundary, edge: &edge, transfer: &transfer }.solve(f.types.len());
     let live = live_across(f, &reactivation, &predicated, &layout);
     let internal = exposure(f, &predicated, &masked, &live, false, &every_lane, &layout);
     let exposed = exposure(f, &predicated, &masked, &live, true, &every_lane, &layout);
@@ -334,13 +312,6 @@ fn for_each_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::Packet { input, .. } => f(*input),
         Inst::Target { args, .. } => for &v in args.values() { f(v); },
         Inst::Effect { inputs, .. } => for &v in inputs { f(v); },
-    }
-}
-
-fn for_each_output(inst: &Inst, mut f: impl FnMut(ValueId)) {
-    match inst {
-        Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
-        Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => for o in outputs { f(o.0); },
     }
 }
 
@@ -428,42 +399,38 @@ fn active(inst: &Inst, needed: &[bool]) -> bool {
     }
 }
 
-fn live_out(blocks: &[&Block], block: &Block, needed: &[bool], index: &[usize], live_in: &[Bits], live: &mut Bits) {
-    live.clear();
-    for edge in block.term.edges() {
-        let dst = &live_in[index[edge.dst.0]];
-        for (&arg, &(param, _)) in edge.args.iter().zip(&blocks[index[edge.dst.0]].params) {
-            if needed[param.0] && dst.contains(param) { live.insert(arg); }
-        }
-    }
-    match &block.term { Term::CondBr { cond, .. } => live.insert(*cond), Term::Ret(args) => for &a in args { live.insert(a); }, Term::Br(_) => {} }
-}
-
 fn live_across(f: &Func, points: &[(BlockId, usize)], predicated: &[Option<(ValueId, ValueId)>], layout: &Layout) -> Vec<bool> {
     if points.is_empty() { return vec![false; f.types.len()]; }
     let needed = needed(f, predicated, layout);
     let values = f.types.len();
-    let index = &layout.index;
-    let blocks = &layout.blocks;
-    let mut live_in: Vec<Bits> = (0..f.blocks.len()).map(|_| Bits::new(values)).collect();
-    let mut live = Bits::new(values);
-    loop {
-        let mut changed = false;
-        for (b, block) in blocks.iter().enumerate().rev() {
-            live_out(blocks, block, &needed, index, &live_in, &mut live);
-            for inst in block.insts.iter().rev() {
-                for_each_output(inst, |v| live.remove(v));
-                if active(inst, &needed) { for_each_read(inst, predicated, |v| live.insert(v)); }
-            }
-            if live.0 != live_in[b].0 { std::mem::swap(&mut live_in[b].0, &mut live.0); changed = true; }
+    let cfg = Cfg::new(f);
+    let with_terminator = |at: usize, exit: &Bits| {
+        let mut live = exit.clone();
+        match &cfg.blocks[at].term { Term::CondBr { cond, .. } => live.insert(*cond), Term::Ret(args) => for &a in args { live.insert(a); }, Term::Br(_) => {} }
+        live
+    };
+    let edge = |_: usize, edge: &Edge, entry: &Bits| {
+        let mut out = Bits::new(values);
+        for (&arg, &(param, _)) in edge.args.iter().zip(&cfg.blocks[cfg.index[edge.dst.0]].params) {
+            if needed[param.0] && entry.contains(param) { out.insert(arg); }
         }
-        if !changed { break; }
-    }
+        out
+    };
+    let transfer = |at: usize, exit: &Bits| {
+        let mut live = with_terminator(at, exit);
+        for inst in cfg.blocks[at].insts.iter().rev() {
+            for_each_output(inst, |v| live.remove(v));
+            if active(inst, &needed) { for_each_read(inst, predicated, |v| live.insert(v)); }
+        }
+        live
+    };
+    let (_, exit) = Backward { cfg: &cfg, start: Bits::new(values), edge: &edge, transfer: &transfer }.solve();
     let mut across = vec![false; values];
     let mut defined_after = Bits::new(values);
     for &(id, position) in points {
-        let block = blocks[index[id.0]];
-        live_out(blocks, block, &needed, index, &live_in, &mut live);
+        let at = cfg.index[id.0];
+        let block = cfg.blocks[at];
+        let mut live = with_terminator(at, &exit[at]);
         for inst in block.insts[position + 1..].iter().rev() {
             for_each_output(inst, |v| live.remove(v));
             if active(inst, &needed) { for_each_read(inst, predicated, |v| live.insert(v)); }
@@ -513,6 +480,23 @@ mod tests {
             assert!(!facts.active_at(BlockId(2), 0) && !facts.nonempty_at(BlockId(2), 0), "the exec-zero edge carries the empty EXEC");
             assert!(!facts.active_at(BlockId(2), 2), "a restore from a saved bit of unknown activeness proves nothing");
         }
+    }
+
+    #[test]
+    fn a_bit_saved_from_the_entry_exec_restores_an_active_lane() {
+        let mut f = Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] };
+        let e0 = f.value(Ty::I1); let saved = f.value(Ty::I1);
+        f.blocks.insert(BlockId(0), Block { params: vec![(e0, Ty::I1)], insts: vec![
+            Inst::Core { value: saved, ty: Ty::I1, op: Op::Convert(Cvt::Bitcast, Ty::I1, e0) },
+        ], term: Term::Br(Edge { dst: BlockId(1), args: vec![e0, saved] }) });
+        let e1 = f.value(Ty::I1); let s1 = f.value(Ty::I1); let valid = f.value(Ty::I1); let restored = f.value(Ty::I1);
+        f.blocks.insert(BlockId(1), Block { params: vec![(e1, Ty::I1), (s1, Ty::I1)], insts: vec![
+            Inst::Core { value: valid, ty: Ty::I1, op: Op::Env(Env::ValidLane) },
+            Inst::Core { value: restored, ty: Ty::I1, op: Op::Int(IntOp::And, s1, valid) },
+        ], term: Term::Ret(vec![]) });
+        let constants = super::super::constant::constants(&f);
+        let facts = exec(&f, 0, &constants, 1, true);
+        assert!(facts.active_at(BlockId(1), 2), "the saved bit was taken while the lane was active");
     }
 
     #[test]
@@ -605,6 +589,14 @@ fn update_of(bit: ValueId, defs: &[Option<Op>], constants: &[Option<u64>]) -> Up
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+struct ExecFact { nonempty: bool, active: bool, saved: bool }
+impl Lattice for ExecFact {
+    fn meet(&self, other: &Self) -> Self {
+        ExecFact { nonempty: self.nonempty && other.nonempty, active: self.active && other.active, saved: self.saved && other.saved }
+    }
+}
+
 fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, initial: bool) -> Exec {
     let defs = f.definitions();
     let ballots = ballot_of(f);
@@ -635,19 +627,10 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
         chain.insert(id, entries);
     }
     let lane_mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
-    let mut nonempty = vec![true; f.types.len()];
-    let mut active = vec![true; f.types.len()];
-    let mut saved = vec![true; f.types.len()];
-    let entry_exec = exec_param(&f.blocks[&f.entry], exec_index, f);
     let any_of = any_of(f);
     let wave_any = wave_any_of(f);
-    let index = block_index(f);
-    let blocks: Vec<&Block> = f.blocks.values().collect();
-    let execs: Vec<ValueId> = {
-        let entry = &f.blocks[&f.entry];
-        let k = entry.params[..exec_index].iter().filter(|p| p.1 == Ty::I1).count();
-        blocks.iter().map(|block| block.params.iter().filter(|p| p.1 == Ty::I1).nth(k).expect("block lacks its EXEC parameter").0).collect()
-    };
+    let cfg = Cfg::new(f);
+    let execs: Vec<ValueId> = cfg.blocks.iter().map(|block| exec_param(block, exec_index, f)).collect();
     enum Resolved {
         Copy(ValueId),
         Constant(u64),
@@ -655,7 +638,8 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
         Ballot(ValueId),
         Empty,
     }
-    let resolved: Vec<(ValueId, ValueId, Resolved)> = updates.iter().map(|&(value, old, ref update)| {
+    let mut resolved: Vec<Option<(ValueId, Resolved)>> = (0..f.types.len()).map(|_| None).collect();
+    for &(value, old, ref update) in &updates {
         let kind = match update {
             Update::Copy(v) => Resolved::Copy(*v),
             Update::Constant(k) => Resolved::Constant(*k),
@@ -669,105 +653,67 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
             },
             Update::Bit | Update::Unknown => Resolved::Empty,
         };
-        (value, old, kind)
-    }).collect();
-    struct Transfer<'f> { param: ValueId, outgoing: ValueId, stops: bool, pinned: Option<bool>, edge: &'f Edge, params: &'f [(ValueId, Ty)] }
-    let transfers: Vec<Transfer> = {
-        let mut out = Vec::new();
-        for (&id, block) in &f.blocks {
-            let outgoing = chain[&id].last().unwrap().1;
-            let pins: Vec<(BlockId, bool)> = match &block.term {
-                Term::CondBr { cond, yes, no } => {
-                    let (query, negated) = match defs[cond.0].as_ref() {
-                        Some(Op::Cmp(super::super::ir::IntPred::Eq, q, zero)) if constants[zero.0] == Some(0) => (*q, true),
-                        _ => (*cond, false),
-                    };
-                    let pins = match any_of[query.0] {
-                        Some(bit) if same_bit(bit, outgoing, &defs) || same_bit(outgoing, bit, &defs) => vec![(yes.dst, !negated), (no.dst, negated)],
-                        _ if !negated && all_active_guard(&any_of, *cond, outgoing, &defs) => vec![(no.dst, true)],
-                        _ => vec![],
-                    };
-                    if wave_any[query.0] { pins.into_iter().filter(|(_, held)| !held).collect() } else { pins }
-                }
-                _ => vec![],
-            };
-            let stops = barrier.contains(&id);
-            for edge in block.term.edges() {
-                let pinned = pins.iter().find(|(dst, _)| *dst == edge.dst).map(|(_, v)| *v);
-                let dst = index[edge.dst.0];
-                let position = blocks[dst].params.iter().position(|p| p.0 == execs[dst]).expect("block lacks its EXEC parameter");
-                out.push(Transfer { param: execs[dst], outgoing: edge.args[position], stops, pinned, edge, params: &blocks[dst].params });
-            }
-        }
-        out
-    };
-    let mut incoming_nonempty: Vec<Option<bool>> = vec![None; f.types.len()];
-    let mut incoming_active: Vec<Option<bool>> = vec![None; f.types.len()];
-    let mut incoming_saved: Vec<Option<bool>> = vec![None; f.types.len()];
-    let all_params: Vec<ValueId> = blocks.iter().flat_map(|b| b.params.iter().map(|p| p.0)).collect();
+        resolved[value.0] = Some((old, kind));
+    }
     let mut tracked = vec![false; f.types.len()];
     for &p in &execs { tracked[p.0] = true; }
-    for &(value, ..) in &resolved { tracked[value.0] = true; }
-    for v in 0..f.types.len() { if !tracked[v] { nonempty[v] = false; active[v] = false; } }
-    let held = |v: ValueId, saved: &[bool], active: &[bool]| if tracked[v.0] { active[v.0] } else { saved[v.0] };
-    loop {
-        let mut changed = false;
-        let mut set = |table: &mut Vec<bool>, id: ValueId, fact: bool| { if table[id.0] != fact { table[id.0] = fact; changed = true; } };
-        for block in f.blocks.values() {
-            for inst in &block.insts {
-                match inst {
-                    Inst::Packet { op: PacketOp::Ballot, input, output } => { let fact = held(*input, &saved, &active); set(&mut saved, *output, fact); }
-                    Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, outputs, .. } => { let fact = held(inputs[0], &saved, &active); set(&mut saved, outputs[0].0, fact); }
-                    Inst::Core { value, .. } if tracked[value.0] => {}
-                    Inst::Core { value, op, .. } => {
-                        let fact = match op {
-                            Op::Convert(Cvt::Bitcast, _, a) => held(*a, &saved, &active),
-                            _ => false,
-                        };
-                        set(&mut saved, *value, fact);
-                    }
-                    Inst::Packet { output, .. } => set(&mut saved, *output, false),
-                    Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => for &(v, _) in outputs { set(&mut saved, v, false); },
-                }
+    for &(value, ..) in &updates { tracked[value.0] = true; }
+    let pins: Vec<Vec<(BlockId, bool)>> = cfg.blocks.iter().enumerate().map(|(at, block)| {
+        let outgoing = chain[&cfg.ids[at]].last().unwrap().1;
+        match &block.term {
+            Term::CondBr { cond, yes, no } => {
+                let (query, negated) = match defs[cond.0].as_ref() {
+                    Some(Op::Cmp(super::super::ir::IntPred::Eq, q, zero)) if constants[zero.0] == Some(0) => (*q, true),
+                    _ => (*cond, false),
+                };
+                let pins = match any_of[query.0] {
+                    Some(bit) if same_bit(bit, outgoing, &defs) || same_bit(outgoing, bit, &defs) => vec![(yes.dst, !negated), (no.dst, negated)],
+                    _ if !negated && all_active_guard(&any_of, *cond, outgoing, &defs) => vec![(no.dst, true)],
+                    _ => vec![],
+                };
+                if wave_any[query.0] { pins.into_iter().filter(|(_, held)| !held).collect() } else { pins }
             }
+            _ => vec![],
         }
-        for &p in &execs { let fact = active[p.0]; set(&mut saved, p, fact); }
-        for &(value, ..) in &resolved { let fact = active[value.0]; set(&mut saved, value, fact); }
-        for &(value, old, ref update) in &resolved {
-            let (n, a) = match *update {
-                Resolved::Copy(v) => if tracked[v.0] { (nonempty[v.0], active[v.0]) } else { (saved[v.0], saved[v.0]) },
+    }).collect();
+    let entry_exec = execs[cfg.entry];
+    let boundary = |p: ValueId| ExecFact { nonempty: p == entry_exec && initial, active: p == entry_exec, saved: p == entry_exec };
+    let edge = |edge: &Edge, src: usize, position: usize, facts: &[ExecFact]| {
+        let dst = cfg.index[edge.dst.0];
+        let arg = edge.args[position];
+        if cfg.blocks[dst].params[position].0 != execs[dst] {
+            return ExecFact { nonempty: false, active: false, saved: facts[arg.0].saved };
+        }
+        let pinned = pins[src].iter().find(|(d, _)| *d == edge.dst).map(|(_, v)| *v);
+        let nonempty = !barrier.contains(&cfg.ids[src]) && pinned.unwrap_or(facts[arg.0].nonempty);
+        let active = pinned.unwrap_or(facts[arg.0].active);
+        ExecFact { nonempty, active, saved: active }
+    };
+    let transfer = |inst: &Inst, v: ValueId, facts: &[ExecFact]| {
+        let none = ExecFact { nonempty: false, active: false, saved: false };
+        if let Some((old, kind)) = &resolved[v.0] {
+            let held = |x: ValueId| if tracked[x.0] { (facts[x.0].nonempty, facts[x.0].active) } else { (facts[x.0].saved, facts[x.0].saved) };
+            let (nonempty, active) = match *kind {
+                Resolved::Copy(x) => held(x),
                 Resolved::Constant(k) => (initial && k & lane_mask != 0, k & 1 != 0),
-                Resolved::Or { x, y, reads_old_x, reads_old_y } => {
-                    let preserves = reads_old_x || reads_old_y;
-                    (preserves && nonempty[old.0], (reads_old_x && active[old.0]) || (reads_old_y && active[old.0]) || saved[x.0] || saved[y.0])
-                }
-                Resolved::Ballot(bit) => if tracked[bit.0] { (nonempty[bit.0], active[bit.0]) } else { (saved[bit.0], saved[bit.0]) },
+                Resolved::Or { x, y, reads_old_x, reads_old_y } => (
+                    (reads_old_x || reads_old_y) && facts[old.0].nonempty,
+                    (reads_old_x || reads_old_y) && facts[old.0].active || facts[x.0].saved || facts[y.0].saved,
+                ),
+                Resolved::Ballot(bit) => held(bit),
                 Resolved::Empty => (false, false),
             };
-            set(&mut nonempty, value, n);
-            set(&mut active, value, a);
+            return ExecFact { nonempty, active, saved: active };
         }
-        for &p in &all_params { incoming_nonempty[p.0] = None; incoming_active[p.0] = None; incoming_saved[p.0] = None; }
-        incoming_nonempty[entry_exec.0] = Some(initial);
-        incoming_active[entry_exec.0] = Some(true);
-        for &(id, _) in &f.blocks[&f.entry].params { incoming_saved[id.0] = Some(false); }
-        let meet = |table: &mut Vec<Option<bool>>, id: ValueId, fact: bool| { table[id.0] = Some(table[id.0].unwrap_or(true) & fact); };
-        for t in &transfers {
-            let fact = if t.stops { false } else { t.pinned.unwrap_or(nonempty[t.outgoing.0]) };
-            meet(&mut incoming_nonempty, t.param, fact);
-            let fact = t.pinned.unwrap_or(active[t.outgoing.0]);
-            meet(&mut incoming_active, t.param, fact);
-            for (&arg, &(p, _)) in t.edge.args.iter().zip(t.params) {
-                meet(&mut incoming_saved, p, saved[arg.0]);
-            }
+        match inst {
+            Inst::Packet { op: PacketOp::Ballot, input, .. } => ExecFact { saved: facts[input.0].saved, ..none },
+            Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, .. } => ExecFact { saved: facts[inputs[0].0].saved, ..none },
+            Inst::Core { op: Op::Convert(Cvt::Bitcast, _, a), .. } => ExecFact { saved: facts[a.0].saved, ..none },
+            _ => none,
         }
-        for &p in &all_params {
-            if let Some(fact) = incoming_nonempty[p.0] { set(&mut nonempty, p, fact); }
-            if let Some(fact) = incoming_active[p.0] { set(&mut active, p, fact); }
-            if let Some(fact) = incoming_saved[p.0] { if !tracked[p.0] { set(&mut saved, p, fact); } }
-        }
-        if !changed { break; }
-    }
-    Exec { chain, nonempty, active }
+    };
+    let start = ExecFact { nonempty: true, active: true, saved: true };
+    let facts = Sparse { cfg: &cfg, start, boundary: &boundary, edge: &edge, transfer: &transfer }.solve(f.types.len());
+    Exec { chain, nonempty: facts.iter().map(|x| x.nonempty).collect(), active: facts.iter().map(|x| x.active).collect() }
 }
 

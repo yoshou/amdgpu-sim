@@ -1,4 +1,5 @@
 pub(super) mod constant;
+pub(super) mod dataflow;
 pub(in crate::rdna_spmd) mod masks;
 pub(super) mod memory;
 pub(in crate::rdna_spmd) mod uniformity;
