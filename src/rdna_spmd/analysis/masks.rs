@@ -48,8 +48,18 @@ impl Analysis for Exec {
     fn compute(f: &Func, analyses: &Analyses) -> Self {
         let ctx = analyses.context();
         let constants = analyses.get::<Constants>(f);
-        exec(f, ctx.exec_index, &constants, ctx.lanes, ctx.exec_initial, ctx.lanes > 1)
+        exec(f, ctx.exec_index, &constants, ctx.lanes, ctx.exec_initial)
     }
+}
+
+fn wave_any_of(f: &Func) -> Vec<bool> {
+    let mut out = vec![false; f.types.len()];
+    for block in f.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Effect { op: EffectOp::Wave(WaveOp::Any), outputs, .. } = inst { out[outputs[0].0 .0] = true; }
+        }
+    }
+    out
 }
 
 fn any_of(f: &Func) -> Vec<Option<ValueId>> {
@@ -470,6 +480,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wave_level_queries_never_prove_a_lane_active_and_empty_exec_edges_carry() {
+        fn build(wave: bool) -> (Func, ValueId) {
+            let mut f = Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] };
+            let exec = f.value(Ty::I1); let saved = f.value(Ty::I1); let flag = f.value(Ty::I1);
+            let narrowed = f.value(Ty::I1); let any = f.value(Ty::I1);
+            let query = if wave {
+                Inst::Effect { provenance: 7, op: EffectOp::Wave(WaveOp::Any), inputs: vec![narrowed], outputs: vec![(any, Ty::I1)] }
+            } else {
+                Inst::Packet { op: PacketOp::Any, input: narrowed, output: any }
+            };
+            f.blocks.insert(BlockId(0), Block { params: vec![(exec, Ty::I1), (saved, Ty::I1), (flag, Ty::I1)], insts: vec![
+                Inst::Core { value: narrowed, ty: Ty::I1, op: Op::Int(IntOp::And, flag, exec) },
+                query,
+            ], term: Term::CondBr { cond: any, yes: Edge { dst: BlockId(1), args: vec![narrowed, saved] }, no: Edge { dst: BlockId(2), args: vec![narrowed, saved] } } });
+            let e1 = f.value(Ty::I1); let s1 = f.value(Ty::I1);
+            f.blocks.insert(BlockId(1), Block { params: vec![(e1, Ty::I1), (s1, Ty::I1)], insts: vec![], term: Term::Ret(vec![]) });
+            let e2 = f.value(Ty::I1); let s2 = f.value(Ty::I1); let valid = f.value(Ty::I1); let restored = f.value(Ty::I1);
+            f.blocks.insert(BlockId(2), Block { params: vec![(e2, Ty::I1), (s2, Ty::I1)], insts: vec![
+                Inst::Core { value: valid, ty: Ty::I1, op: Op::Env(Env::ValidLane) },
+                Inst::Core { value: restored, ty: Ty::I1, op: Op::Int(IntOp::And, s2, valid) },
+            ], term: Term::Ret(vec![]) });
+            (f, narrowed)
+        }
+        for wave in [true, false] {
+            let (f, _) = build(wave);
+            let constants = super::super::constant::constants(&f);
+            let facts = exec(&f, 0, &constants, 1, true);
+            assert!(facts.active_at(BlockId(0), 0), "the launched lane is active at entry");
+            assert!(!facts.active_at(BlockId(0), 1), "a compare masked by EXEC narrows it without a valid-lane operand");
+            assert_eq!(facts.active_at(BlockId(1), 0), !wave, "a wave's Any does not speak for this lane, a packet's Any does");
+            assert!(!facts.active_at(BlockId(2), 0) && !facts.nonempty_at(BlockId(2), 0), "the exec-zero edge carries the empty EXEC");
+            assert!(!facts.active_at(BlockId(2), 2), "a restore from a saved bit of unknown activeness proves nothing");
+        }
+    }
+
+    #[test]
     fn narrowing_exec_keeps_predicated_writes_guarded_and_widening_does_not() {
         let mut f = Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] };
         let exec = f.value(Ty::I1); let x = f.value(Ty::I32); let saved = f.value(Ty::I32);
@@ -559,7 +605,7 @@ fn update_of(bit: ValueId, defs: &[Option<Op>], constants: &[Option<u64>]) -> Up
     }
 }
 
-fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, initial: bool, packed: bool) -> Exec {
+fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, initial: bool) -> Exec {
     let defs = f.definitions();
     let ballots = ballot_of(f);
     let mut chain: BTreeMap<BlockId, Vec<(usize, ValueId)>> = BTreeMap::new();
@@ -577,6 +623,11 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
                     current = *value;
                     entries.push((index + 1, current));
                 }
+                Inst::Core { value, ty: Ty::I1, op: Op::Int(IntOp::And, a, b), .. } if same_bit(*a, current, &defs) || same_bit(*b, current, &defs) => {
+                    updates.push((*value, current, Update::Bit));
+                    current = *value;
+                    entries.push((index + 1, current));
+                }
                 Inst::Effect { op: EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait, .. } => { barrier.insert(id); }
                 _ => {}
             }
@@ -589,6 +640,7 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
     let mut saved = vec![true; f.types.len()];
     let entry_exec = exec_param(&f.blocks[&f.entry], exec_index, f);
     let any_of = any_of(f);
+    let wave_any = wave_any_of(f);
     let index = block_index(f);
     let blocks: Vec<&Block> = f.blocks.values().collect();
     let execs: Vec<ValueId> = {
@@ -619,7 +671,7 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
         };
         (value, old, kind)
     }).collect();
-    struct Transfer<'f> { param: ValueId, outgoing: ValueId, stops: bool, pinned: Option<bool>, carries: bool, edge: &'f Edge, params: &'f [(ValueId, Ty)] }
+    struct Transfer<'f> { param: ValueId, outgoing: ValueId, stops: bool, pinned: Option<bool>, edge: &'f Edge, params: &'f [(ValueId, Ty)] }
     let transfers: Vec<Transfer> = {
         let mut out = Vec::new();
         for (&id, block) in &f.blocks {
@@ -630,11 +682,12 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
                         Some(Op::Cmp(super::super::ir::IntPred::Eq, q, zero)) if constants[zero.0] == Some(0) => (*q, true),
                         _ => (*cond, false),
                     };
-                    match any_of[query.0] {
+                    let pins = match any_of[query.0] {
                         Some(bit) if same_bit(bit, outgoing, &defs) || same_bit(outgoing, bit, &defs) => vec![(yes.dst, !negated), (no.dst, negated)],
                         _ if !negated && all_active_guard(&any_of, *cond, outgoing, &defs) => vec![(no.dst, true)],
                         _ => vec![],
-                    }
+                    };
+                    if wave_any[query.0] { pins.into_iter().filter(|(_, held)| !held).collect() } else { pins }
                 }
                 _ => vec![],
             };
@@ -642,11 +695,8 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
             for edge in block.term.edges() {
                 let pinned = pins.iter().find(|(dst, _)| *dst == edge.dst).map(|(_, v)| *v);
                 let dst = index[edge.dst.0];
-                out.push(Transfer {
-                    param: execs[dst], outgoing, stops, pinned,
-                    carries: packed || !(edge.dst <= id || pinned == Some(false)),
-                    edge, params: &blocks[dst].params,
-                });
+                let position = blocks[dst].params.iter().position(|p| p.0 == execs[dst]).expect("block lacks its EXEC parameter");
+                out.push(Transfer { param: execs[dst], outgoing: edge.args[position], stops, pinned, edge, params: &blocks[dst].params });
             }
         }
         out
@@ -655,34 +705,43 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
     let mut incoming_active: Vec<Option<bool>> = vec![None; f.types.len()];
     let mut incoming_saved: Vec<Option<bool>> = vec![None; f.types.len()];
     let all_params: Vec<ValueId> = blocks.iter().flat_map(|b| b.params.iter().map(|p| p.0)).collect();
+    let mut tracked = vec![false; f.types.len()];
+    for &p in &execs { tracked[p.0] = true; }
+    for &(value, ..) in &resolved { tracked[value.0] = true; }
+    for v in 0..f.types.len() { if !tracked[v] { nonempty[v] = false; active[v] = false; } }
+    let held = |v: ValueId, saved: &[bool], active: &[bool]| if tracked[v.0] { active[v.0] } else { saved[v.0] };
     loop {
         let mut changed = false;
         let mut set = |table: &mut Vec<bool>, id: ValueId, fact: bool| { if table[id.0] != fact { table[id.0] = fact; changed = true; } };
         for block in f.blocks.values() {
             for inst in &block.insts {
                 match inst {
-                    Inst::Packet { op: PacketOp::Ballot, input, output } => set(&mut saved, *output, active[input.0]),
-                    Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, outputs, .. } => set(&mut saved, outputs[0].0, active[inputs[0].0]),
+                    Inst::Packet { op: PacketOp::Ballot, input, output } => { let fact = held(*input, &saved, &active); set(&mut saved, *output, fact); }
+                    Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), inputs, outputs, .. } => { let fact = held(inputs[0], &saved, &active); set(&mut saved, outputs[0].0, fact); }
+                    Inst::Core { value, .. } if tracked[value.0] => {}
                     Inst::Core { value, op, .. } => {
                         let fact = match op {
-                            Op::Convert(Cvt::Bitcast, _, a) => saved[a.0],
+                            Op::Convert(Cvt::Bitcast, _, a) => held(*a, &saved, &active),
                             _ => false,
                         };
                         set(&mut saved, *value, fact);
                     }
-                    _ => {}
+                    Inst::Packet { output, .. } => set(&mut saved, *output, false),
+                    Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => for &(v, _) in outputs { set(&mut saved, v, false); },
                 }
             }
         }
+        for &p in &execs { let fact = active[p.0]; set(&mut saved, p, fact); }
+        for &(value, ..) in &resolved { let fact = active[value.0]; set(&mut saved, value, fact); }
         for &(value, old, ref update) in &resolved {
             let (n, a) = match *update {
-                Resolved::Copy(v) => (nonempty[v.0], active[v.0]),
+                Resolved::Copy(v) => if tracked[v.0] { (nonempty[v.0], active[v.0]) } else { (saved[v.0], saved[v.0]) },
                 Resolved::Constant(k) => (initial && k & lane_mask != 0, k & 1 != 0),
                 Resolved::Or { x, y, reads_old_x, reads_old_y } => {
                     let preserves = reads_old_x || reads_old_y;
                     (preserves && nonempty[old.0], (reads_old_x && active[old.0]) || (reads_old_y && active[old.0]) || saved[x.0] || saved[y.0])
                 }
-                Resolved::Ballot(bit) => (nonempty[bit.0], active[bit.0]),
+                Resolved::Ballot(bit) => if tracked[bit.0] { (nonempty[bit.0], active[bit.0]) } else { (saved[bit.0], saved[bit.0]) },
                 Resolved::Empty => (false, false),
             };
             set(&mut nonempty, value, n);
@@ -696,7 +755,6 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
         for t in &transfers {
             let fact = if t.stops { false } else { t.pinned.unwrap_or(nonempty[t.outgoing.0]) };
             meet(&mut incoming_nonempty, t.param, fact);
-            if !t.carries { continue; }
             let fact = t.pinned.unwrap_or(active[t.outgoing.0]);
             meet(&mut incoming_active, t.param, fact);
             for (&arg, &(p, _)) in t.edge.args.iter().zip(t.params) {
@@ -706,7 +764,7 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
         for &p in &all_params {
             if let Some(fact) = incoming_nonempty[p.0] { set(&mut nonempty, p, fact); }
             if let Some(fact) = incoming_active[p.0] { set(&mut active, p, fact); }
-            if let Some(fact) = incoming_saved[p.0] { set(&mut saved, p, fact); }
+            if let Some(fact) = incoming_saved[p.0] { if !tracked[p.0] { set(&mut saved, p, fact); } }
         }
         if !changed { break; }
     }

@@ -45,7 +45,14 @@ pub(super) unsafe fn lower(e:&Emitter,a:&[LLVMValueRef])->Vec<LLVMValueRef> {
         let scratch_ptr=|k:u32|LLVMBuildGEP2(b,i32t,storage.scratch,[cg.ci32(k)].as_mut_ptr(),1,cg.n());
         let params=[ptr,ptr,ptr,ptr,i32t,i32t,i64t,f32t,f32t,f32t,f32t,f32t,f32t,f32t,f32t,f32t,f32t];
         let args=[scratch_ptr(0),scratch_ptr(1),scratch_ptr(2),scratch_ptr(3),a[0],a[1],a[2],cg.vf32_of(a[3]),cg.vf32_of(a[4]),cg.vf32_of(a[5]),cg.vf32_of(a[6]),cg.vf32_of(a[7]),cg.vf32_of(a[8]),cg.vf32_of(a[9]),cg.vf32_of(a[10]),cg.vf32_of(a[11]),cg.vf32_of(a[12])];
+        let func=LLVMGetBasicBlockParent(LLVMGetInsertBlock(b));
+        let call_bb=LLVMAppendBasicBlockInContext(ctx,func,cstr("bvh.lane").as_ptr());
+        let join=LLVMAppendBasicBlockInContext(ctx,func,cstr("bvh.join").as_ptr());
+        LLVMBuildCondBr(b,a[13],call_bb,join);
+        LLVMPositionBuilderAtEnd(b,call_bb);
         cg.call("image_bvh64_intersect_ray",LLVMVoidTypeInContext(ctx),&params,&args);
+        LLVMBuildBr(b,join);
+        LLVMPositionBuilderAtEnd(b,join);
         (0..4).map(|k|LLVMBuildLoad2(b,i32t,scratch_ptr(k),cg.n())).collect()
     }
 }
