@@ -62,8 +62,18 @@ impl YieldValues {
 
     /// Collect nonzero lanes, stopping at the first match for Any/ReadFirstLane.
     /// Test the argument layout once, and address each packet's frame once.
-    #[inline]
+    #[inline(never)]
     fn query_bits(&self, index: usize, width: usize, valid: u32, fibers: &[Fiber], first_only: bool) -> u32 {
+        // Preserve the scalar scan without SIMD setup or a packet-width specialization.
+        #[cfg(target_arch = "x86_64")]
+        if width >= 4 {
+            return self.query_bits_simd(index, width, valid, fibers, first_only);
+        }
+        self.query_bits_scalar(index, width, valid, fibers, first_only)
+    }
+
+    #[inline(never)]
+    fn query_bits_scalar(&self, index: usize, width: usize, valid: u32, fibers: &[Fiber], first_only: bool) -> u32 {
         if let Argument::Constant(value) = self.arguments[index] {
             return if value == 0 { 0 } else { valid };
         }
@@ -74,6 +84,52 @@ impl YieldValues {
             let mask = (valid >> shift) & lanes(width);
             if mask == 0 { continue; }
             let ptr = unsafe { fiber.yield_values().add((self.base + index) * width) };
+            if uniform {
+                if unsafe { *ptr } != 0 { result |= mask << shift; }
+            } else {
+                for lane in 0..width {
+                    if mask >> lane & 1 != 0 && unsafe { *ptr.add(lane) } != 0 {
+                        result |= 1 << (shift + lane);
+                        if first_only { return result; }
+                    }
+                }
+            }
+            if first_only && result != 0 { return result; }
+        }
+        result
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(never)]
+    fn query_bits_simd(&self, index: usize, width: usize, valid: u32, fibers: &[Fiber], first_only: bool) -> u32 {
+        if let Argument::Constant(value) = self.arguments[index] {
+            return if value == 0 { 0 } else { valid };
+        }
+        let uniform = matches!(self.arguments[index], Argument::Uniform);
+        let mut result = 0;
+        for (packet, fiber) in fibers.iter().enumerate() {
+            let shift = packet * width;
+            let mask = (valid >> shift) & lanes(width);
+            if mask == 0 { continue; }
+            let ptr = unsafe { fiber.yield_values().add((self.base + index) * width) };
+            #[cfg(target_arch = "x86_64")]
+            if !uniform && width >= 4 && mask == lanes(width) {
+                // SSE2 is available on every x86-64 host. A full packet lets
+                // us read four initialized lanes at once; padding falls back.
+                use std::arch::x86_64::{_mm_loadu_si128, _mm_cmpeq_epi32, _mm_setzero_si128, _mm_movemask_ps, _mm_castsi128_ps};
+                let mut lane = 0;
+                while lane < width {
+                    let bits = unsafe {
+                        let values = _mm_loadu_si128(ptr.add(lane).cast());
+                        let zeros = _mm_cmpeq_epi32(values, _mm_setzero_si128());
+                        (_mm_movemask_ps(_mm_castsi128_ps(zeros)) as u32) ^ 15
+                    };
+                    result |= bits << (shift + lane);
+                    if first_only && result != 0 { return result; }
+                    lane += 4;
+                }
+                continue;
+            }
             if uniform {
                 if unsafe { *ptr } != 0 { result |= mask << shift; }
             } else {
@@ -247,10 +303,12 @@ mod tests {
             amdgpu_sim_fiber_yield_values(ctx, 0, frame);
             FIBER_DONE
         }
+        let predicates: Vec<u32> = [0, 0x5555_5555, u32::MAX].iter().copied()
+            .chain((0..32).map(|lane| 1 << lane)).collect();
         for width in [1, 2, 4, 8, 16, 32] {
             let mut fibers = Fiber::batch(32 / width, 64 * 1024);
             for valid in [1, 0x1ffff, 0x80000000, 0xaaaa_aaaa, u32::MAX] {
-                for predicate in [0, 0x80000000, 0x5555_5555, u32::MAX] {
+                for &predicate in &predicates {
                     for source_kind in [Argument::Lane, Argument::Uniform, Argument::Constant(0x12345678)] {
                         for mask_kind in [Argument::Lane, Argument::Uniform, Argument::Constant(0), Argument::Constant(1)] {
                             for op in [WaveOp::Any, WaveOp::Ballot, WaveOp::ReadFirstLane] {
