@@ -172,9 +172,17 @@ pub(crate) fn run(
             scope.spawn(move || {
                 let mut state = acquire(engine.shape);
                 let mut index = tid as u64;
-                while index < engine.units {
-                    engine.run_unit(index, &mut state);
-                    index += threads as u64;
+                match (engine.unit, engine.view.invoke) {
+                    (Unit::Packet, Invoke::Scalar(kernel)) if !kernel.group => {
+                        while index < engine.units {
+                            engine.run_scalar_packet(index, &mut state, kernel);
+                            index += threads as u64;
+                        }
+                    }
+                    _ => while index < engine.units {
+                        engine.run_unit(index, &mut state);
+                        index += threads as u64;
+                    },
                 }
                 release(engine.shape, state);
             });
@@ -276,6 +284,28 @@ impl Engine<'_> {
             }
             Invoke::Fiber(_) => self.run_fibers(state),
         }
+    }
+
+    // An independent scalar unit contains exactly one allocated work-item.
+    // It needs register initialization, but no packet masks or fiber state.
+    #[inline(never)]
+    fn run_scalar_packet(&self, index: u64, state: &mut State, kernel: &ScalarKernel) {
+        let (wg, local) = self.locate(index);
+        let wg_id = (
+            (wg % self.dims.num_wg_x as u64) as u32,
+            ((wg / self.dims.num_wg_x as u64) % self.dims.num_wg_y as u64) as u32,
+            (wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64)) as u32,
+        );
+        let scratch = if state.scratch.is_empty() { 0 } else { state.scratch.as_ptr() as u64 };
+        let sgprs = &mut state.sgprs[0];
+        setup_sgprs(&mut sgprs[..], self.kd, self.kernarg_ptr, self.aql_packet_addr, scratch, self.private_segment_size, wg_id);
+        let vgprs = &mut state.vgprs[0];
+        vgprs.fill(0);
+        let item = local as u32;
+        vgprs[0] = item % self.dims.wg_x
+            | ((item / self.dims.wg_x) % self.dims.wg_y) << 10
+            | (item / (self.dims.wg_x * self.dims.wg_y)) << 20;
+        unsafe { kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), scratch, 0); }
     }
 
     fn packet_scratch(&self, packet: usize, state: &State) -> u64 {
@@ -384,4 +414,75 @@ pub(crate) fn dispatch_cooperative_vec(
     num_threads: usize,
 ) {
     run(View::cooperative(kernel, Scheduler::Workgroup), kd, kernarg_ptr, aql_packet_addr, dims, private_segment_size, group_segment_size, num_threads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instructions::I;
+    use crate::rdna_instructions::{InstFormat, SourceOperand, VGLOBAL, VOP1, VSCRATCH};
+    use crate::rdna_spmd::{Compiler, ScalarBlock, ScalarProgram, Terminator};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn independent_scalar_initializes_reused_state_across_a_three_dimensional_grid() {
+        let mov = |vdst, src0| InstFormat::VOP1(VOP1 { op: I::V_MOV_B32, src0, vdst });
+        let scratch = |op, vdst, vsrc| InstFormat::VSCRATCH(VSCRATCH {
+            op, saddr: 124, vaddr: 0, vsrc, vdst, scope: 0, th: 0, ioffset: 32, sve: 0,
+        });
+        let mut body = vec![
+            mov(2, SourceOperand::IntegerConstant(0)),
+            mov(3, SourceOperand::ScalarRegister(117)),
+            mov(4, SourceOperand::ScalarRegister(115)),
+            scratch(I::SCRATCH_STORE_B32, 0, 0),
+            scratch(I::SCRATCH_LOAD_B32, 5, 0),
+            mov(6, SourceOperand::ScalarRegister(4)),
+            mov(8, SourceOperand::ScalarRegister(5)),
+            mov(9, SourceOperand::ScalarRegister(12)),
+        ];
+        // Observe both ABI-provided values and otherwise unwritten registers.
+        for (slot, vsrc) in [0, 7, 3, 4, 5, 6, 8, 9].iter().copied().enumerate() {
+            body.push(InstFormat::VGLOBAL(VGLOBAL { op: I::GLOBAL_STORE_B32,
+                saddr: 6, vaddr: 2, vsrc, vdst: 0, scope: 0, th: 0, ioffset: slot as u32 * 4, sve: 0 }));
+        }
+        let program = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([
+            (0, ScalarBlock { pc: 0, body, term: Terminator::Return }),
+        ]) };
+        let kernel = Kernel::new(Code::Scalar(Compiler::default().compile_program(&program, 16)), Scheduler::Independent, 0);
+        let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
+        kd.enable_sgpr_private_segment_buffer = true;
+        kd.enable_sgpr_dispatch_ptr = true;
+        kd.enable_sgpr_kernarg_segment_ptr = true;
+        kd.enable_sgpr_workgroup_id_x = true;
+        kd.enable_sgpr_workgroup_id_y = true;
+        kd.enable_sgpr_workgroup_id_z = true;
+        let dims = GridDims { num_wg_x: 2, num_wg_y: 3, num_wg_z: 2, wg_x: 3, wg_y: 2, wg_z: 2 };
+        let view = View::of(&kernel);
+        let shape = Shape { packets: 1, waves: 1, words: view.num_vgprs, fibers: false, scratch: 64, lds: 0, stack: fiber_stack_bytes(1) };
+        let mut output = [u32::MAX; 8];
+        let engine = Engine { view, kd: &kd, kernarg_ptr: output.as_mut_ptr() as u64,
+            aql_packet_addr: 0x01234567_89abcdef, dims, private_segment_size: 48,
+            unit: Unit::Packet, wg_size: 12, packets_per_wave: 32, waves_per_wg: 1,
+            packets_per_wg: 12, units: 144, stride: 64, shape };
+        let mut state = acquire(shape);
+        let Invoke::Scalar(scalar) = view.invoke else { unreachable!() };
+        let mut index = 0;
+        for wz in 0..2 { for wy in 0..3 { for wx in 0..2 {
+            for z in 0..2 { for y in 0..2 { for x in 0..3 {
+                state.sgprs[0].fill(0xdeadbeef);
+                state.vgprs[0].fill(0xdeadbeef);
+                state.scratch.fill(0xa5);
+                output.fill(u32::MAX);
+                engine.run_scalar_packet(index, &mut state, scalar);
+                let item = x | (y << 10) | (z << 20);
+                assert_eq!(output, [item, 0, wx, wy | (wz << 16), item, 0x89abcdef, 0x01234567, 0], "work-item {}", index);
+                index += 1;
+            } } }
+        } } }
+        assert_eq!(index, engine.units);
+        release(shape, state);
+        let one = GridDims { num_wg_x: 1, num_wg_y: 1, num_wg_z: 1, wg_x: 1, wg_y: 1, wg_z: 1 };
+        run(view, &kd, output.as_mut_ptr() as u64, engine.aql_packet_addr, one, 48, 0, 1);
+        assert_eq!(output, [0, 0, 0, 0, 0, 0x89abcdef, 0x01234567, 0]);
+    }
 }
