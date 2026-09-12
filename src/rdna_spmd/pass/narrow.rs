@@ -1,12 +1,13 @@
-use super::super::analysis::masks::Masks;
+use super::super::analysis::{Analyses, Masks};
 use super::super::ir::{*, Cvt, Op, ValueId};
 use std::collections::BTreeMap;
 
 pub(crate) struct Narrow;
 impl super::Pass for Narrow {
     fn name(&self) -> &str { "narrow" }
-    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
-        let (narrowed, rewrites) = apply(f, analyses.masks(f));
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
+        let masks = analyses.get::<Masks>(f);
+        let (narrowed, rewrites) = apply(f, &masks);
         rewrites > 0 || narrowed.iter().any(|&b| b)
     }
 }
@@ -133,9 +134,9 @@ mod tests {
             self.insts.push(Inst::Effect { provenance: 0, op: EffectOp::Memory { space: Space::Lds, op: MemoryOp::Store(MemSize::B32), semantics }, inputs: vec![address, data, mask], outputs: vec![] });
         }
     }
-    fn masks(f: &Func) -> Masks {
-        let constants = super::super::super::analysis::constants(f);
-        super::super::super::analysis::masks::analyze(&crate::rdna_spmd::targets::rdna4::registry(), f, 0, &constants, 16, false)
+    fn masks(f: &Func) -> std::rc::Rc<Masks> {
+        let registry = crate::rdna_spmd::targets::rdna4::registry();
+        Analyses::new(super::super::super::analysis::Context::new(&registry, &[], 0, 16)).get::<Masks>(f)
     }
 
     #[test]

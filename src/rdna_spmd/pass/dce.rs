@@ -1,5 +1,5 @@
 use super::super::ir::{*, Cvt, Op, Ty, ValueId};
-use super::super::analysis::masks::Masks;
+use super::super::analysis::{Analyses, Masks};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn count_uses(f: &Func, uses: &mut [usize]) {
@@ -92,22 +92,22 @@ fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
 pub(crate) struct DeadWrites;
 impl super::Pass for DeadWrites {
     fn name(&self) -> &str { "dead_writes" }
-    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
-        let masks = analyses.masks(f);
-        dead_writes(f, masks, analyses.context().exec_index) > 0
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
+        let masks = analyses.get::<Masks>(f);
+        dead_writes(f, &masks, analyses.context().exec_index) > 0
     }
 }
 
 pub(crate) struct Dce;
 impl super::Pass for Dce {
     fn name(&self) -> &str { "dce" }
-    fn run(&self, f: &mut Func, _: &super::Analyses) -> bool { run(f) > 0 }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool { run(f) > 0 }
 }
 
 pub(crate) struct DeadParams;
 impl super::Pass for DeadParams {
     fn name(&self) -> &str { "dead_params" }
-    fn run(&self, f: &mut Func, _: &super::Analyses) -> bool { dead_params(f) > 0 }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool { dead_params(f) > 0 }
 }
 
 pub(crate) fn dead_writes(f: &mut Func, masks: &Masks, exec_index: usize) -> usize {
@@ -127,7 +127,7 @@ pub(crate) fn dead_writes(f: &mut Func, masks: &Masks, exec_index: usize) -> usi
     }
     let count = renames.len();
     run(f);
-    super::compact(f);
+    f.compact();
     count
 }
 
@@ -150,7 +150,7 @@ pub(crate) fn run(f: &mut Func) -> usize {
         removed += round;
         if round == 0 { break; }
     }
-    if removed != 0 { super::compact(f); }
+    if removed != 0 { f.compact(); }
     let _ = ValueId(0);
     removed
 }
@@ -240,6 +240,6 @@ pub(crate) fn dead_params(f: &mut Func) -> usize {
             }
         }
     }
-    if removed != 0 { super::compact(f); }
+    if removed != 0 { f.compact(); }
     removed
 }

@@ -1,4 +1,4 @@
-use crate::rdna_spmd::analysis::masks::Predication;
+use crate::rdna_spmd::analysis::Predication;
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry, TargetOp};
 use crate::rdna_spmd::ir::{*, FloatOp, FloatUnary, Op, Ty, ValueId};
 use crate::rdna_spmd::pass::idioms::Idiom;
@@ -175,7 +175,7 @@ impl Idiom for DivisionIdioms {
 /// and handles zero/infinity. Keep the ISA-specific NaN and tiny-result rules
 /// as ordinary SSA operations; code generation needs no special case.
 pub(super) fn quotient_fixups(f: &mut Func, fixup: TargetOp) -> usize {
-    let defs = crate::rdna_spmd::analysis::masks::definitions(f);
+    let defs = f.definitions();
     let alias = |mut value: ValueId| {
         while let Some(Op::Convert(Cvt::Bitcast, to, source)) = defs[value.0] {
             if to != f.types[source.0] { break; }
@@ -393,6 +393,7 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rdna_spmd::analysis::{Analyses, Constants, Context, Masks};
     use crate::instructions::I;
     use crate::rdna_instructions::{InstFormat, SOP1, SOP2, SourceOperand, VOP1, VOP2, VOP3, VOP3SD, VOPC};
     use crate::rdna_spmd::{CompilationInput, ScalarBlock, ScalarProgram, Terminator};
@@ -434,10 +435,10 @@ mod tests {
         let count = |ir: &Func, name: &str| ir.blocks.values().flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Target { op, .. } if registry.lookup(crate::rdna_spmd::targets::rdna4::dialect::ID, name).ok() == Some(*op))).count();
         assert_eq!((count(&ir, "rsq.f64"), count(&ir, "sqrt.f64"), count(&ir, "ldexp.f64")), (1, 0, 2));
         for _ in 0..3 {
-            let constants = crate::rdna_spmd::analysis::constants(&ir);
-            let masks = crate::rdna_spmd::analysis::masks::predication(&ir, exec_index, &constants);
+            let analyses = || Analyses::new(Context::new(&registry, &f.parameter_inputs, exec_index, 32));
+            let (constants, masks) = (analyses().get::<Constants>(&ir), analyses().get::<Predication>(&ir));
             run(&mut ir, &masks, &constants, &SqrtIdioms::new(&registry));
-            let masks = crate::rdna_spmd::analysis::masks::analyze(&registry, &ir, exec_index, &constants, 32, false);
+            let masks = analyses().get::<Masks>(&ir);
             crate::rdna_spmd::pass::dce::dead_writes(&mut ir, &masks, exec_index);
             crate::rdna_spmd::pass::simplify::run(&mut ir);
             crate::rdna_spmd::pass::dce::run(&mut ir);
@@ -517,8 +518,8 @@ mod tests {
             block.insts.splice(index..index, inserted);
         }
         let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &registry);
-        let constants = crate::rdna_spmd::analysis::constants(&ir);
-        let masks = crate::rdna_spmd::analysis::masks::predication(&ir, exec_index, &constants);
+        let analyses = Analyses::new(Context::new(&registry, &f.parameter_inputs, exec_index, 32));
+        let (constants, masks) = (analyses.get::<Constants>(&ir), analyses.get::<Predication>(&ir));
         let collapsed = divisions(&mut ir, &masks, &constants, &DivisionIdioms::new(&registry));
         let fixup = registry.lookup(super::super::ID, "div_fixup.f64").unwrap();
         assert_eq!(quotient_fixups(&mut ir, fixup), collapsed, "each recognized macro gets its SSA correction");

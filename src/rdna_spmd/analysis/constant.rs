@@ -2,7 +2,25 @@
 //! Architectural register classes do not supply facts to this analysis.
 
 use super::super::ir::{*, Cvt, IntOp, IntPred, Op, Ty, ValueId};
+use super::{Analyses, Analysis};
 use std::collections::VecDeque;
+
+pub(crate) struct Constants;
+impl Analysis for Constants {
+    type Result = Vec<Option<u64>>;
+    const NAME: &'static str = "constants";
+    fn compute(f: &Func, _: &Analyses) -> Self::Result { constant_facts(f, &[], false) }
+}
+
+pub(crate) struct DispatchConstants;
+impl Analysis for DispatchConstants {
+    type Result = Vec<Option<u64>>;
+    const NAME: &'static str = "dispatch_constants";
+    fn compute(f: &Func, analyses: &Analyses) -> Self::Result {
+        let exec = f.blocks[&f.entry].params[analyses.context().exec_index].0;
+        constant_facts(f, &[exec], true)
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fact { Pending, Constant(u64), Dynamic }
@@ -33,14 +51,12 @@ impl Lists {
 
 /// A conservative, monotone constant analysis. All incoming CFG edges take
 /// part, including loop backedges; an unseeded cycle proves no constant.
-pub(crate) fn constants(function: &Func) -> Vec<Option<u64>> {
+#[cfg(test)]
+pub(super) fn constants(function: &Func) -> Vec<Option<u64>> {
     constant_facts(function,&[],false)
 }
 /// Facts valid on allocated work items. Use these only to fold queries which
 /// explicitly ignore padding; they must not replace ordinary EXEC/memory masks.
-pub(crate) fn valid_predicate_constants(f:&Func,entry_true:&[ValueId])->Vec<Option<u64>> {
-    constant_facts(f,entry_true,true)
-}
 fn constant_facts(f:&Func,entry_true:&[ValueId],valid_queries:bool)->Vec<Option<u64>> {
     let mut definitions: Vec<_> = (0..f.types.len()).map(|_| Definition::External).collect();
     for (&id, block) in &f.blocks {

@@ -1,11 +1,13 @@
+use super::super::analysis::{Analyses, Constants, DispatchConstants, Preserved};
 use super::super::ir::*;
-use super::{Analyses, Pass};
+use super::Pass;
 use std::collections::BTreeSet;
 
 pub(crate) struct Adjacency;
 impl Pass for Adjacency {
     fn name(&self) -> &str { "adjacency" }
     fn run(&self, f: &mut Func, _: &Analyses) -> bool { run(f) > 0 }
+    fn preserves(&self) -> Preserved { Preserved::of::<Constants>().and::<DispatchConstants>() }
 }
 
 fn member(inst: &Inst) -> bool {

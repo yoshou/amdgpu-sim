@@ -1,4 +1,16 @@
 use super::super::ir::{*, Cvt, IntOp, Op, Ty, ValueId};
+use super::{Analyses, Analysis, Constants, Uniformity};
+
+pub(crate) struct Accesses;
+impl Analysis for Accesses {
+    type Result = Vec<Access>;
+    const NAME: &'static str = "accesses";
+    fn compute(f: &Func, analyses: &Analyses) -> Self::Result {
+        let constants = analyses.get::<Constants>(f);
+        let uniform = analyses.get::<Uniformity>(f).uniform();
+        accesses(f, &constants, &uniform)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Form {
@@ -9,7 +21,7 @@ pub(crate) enum Form {
     Lds,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Access {
     pub block: BlockId,
     pub start: usize,
@@ -46,14 +58,6 @@ impl Access {
     }
 }
 
-fn definitions(f: &Func) -> Vec<Option<Op>> {
-    let mut out = vec![None; f.types.len()];
-    for block in f.blocks.values() {
-        for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
-    }
-    out
-}
-
 fn added_constant(value: ValueId, defs: &[Option<Op>], constants: &[Option<u64>], ty: Ty) -> Option<(ValueId, i64)> {
     let Some(Op::Int(IntOp::Add, a, b)) = defs[value.0] else { return None; };
     let k = constants[b.0]?;
@@ -87,7 +91,7 @@ fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
     }
 }
 
-pub(crate) fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
+fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
     let mut uses = vec![false; f.types.len()];
     for b in f.blocks.values() {
         for inst in &b.insts {
@@ -101,7 +105,7 @@ pub(crate) fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) ->
         for edge in b.term.edges() { for v in &edge.args { uses[v.0] = true; } }
         match &b.term { Term::CondBr { cond, .. } => uses[cond.0] = true, Term::Ret(args) => for v in args { uses[v.0] = true; }, Term::Br(_) => {} }
     }
-    let defs = definitions(f);
+    let defs = f.definitions();
     let mut out = Vec::new();
     for (&block, b) in &f.blocks {
         let mut index = 0;

@@ -1,13 +1,14 @@
-use super::super::analysis::masks::Masks;
+use super::super::analysis::{Analyses, Masks};
 use super::super::ir::{*, EffectOp, Env, IntOp, Op, Ty, ValueId};
 use std::collections::BTreeMap;
 
 pub(crate) struct Specialise;
 impl super::Pass for Specialise {
     fn name(&self) -> &str { "specialise" }
-    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
         let exec_index = analyses.context().exec_index;
-        let blocks = candidates(f, analyses.masks(f), exec_index);
+        let masks = analyses.get::<Masks>(f);
+        let blocks = candidates(f, &masks, exec_index);
         !blocks.is_empty() && run(f, &blocks, exec_index) > 0
     }
 }

@@ -1,7 +1,9 @@
 use super::super::ir::{*, EffectOp, WaveOp, Cvt, Env, IntOp, Op, Ty, ValueId};
+use super::{Analyses, Analysis, Constants};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+#[derive(PartialEq)]
 pub(crate) struct Masks {
     #[cfg_attr(not(test), allow(dead_code))]
     pub reactivation: Rc<Vec<(BlockId, usize)>>,
@@ -18,6 +20,35 @@ impl Masks {
     pub fn at(&self, block: BlockId, index: usize) -> ValueId {
         let chain = &self.chain[&block];
         chain.iter().rev().find(|(at, _)| *at <= index).map(|(_, v)| *v).unwrap_or(chain[0].1)
+    }
+}
+
+impl Analysis for Predication {
+    type Result = Predication;
+    const NAME: &'static str = "predication";
+    fn compute(f: &Func, analyses: &Analyses) -> Self {
+        let constants = analyses.get::<Constants>(f);
+        predication(f, analyses.context().exec_index, &constants)
+    }
+}
+
+impl Analysis for Masks {
+    type Result = Masks;
+    const NAME: &'static str = "masks";
+    fn compute(f: &Func, analyses: &Analyses) -> Self {
+        let ctx = analyses.context();
+        let (predication, constants) = (analyses.get::<Predication>(f), analyses.get::<Constants>(f));
+        analyze_from(ctx.registry, f, &predication, ctx.exec_index, &constants, ctx.lanes, ctx.entry_full)
+    }
+}
+
+impl Analysis for Exec {
+    type Result = Exec;
+    const NAME: &'static str = "exec";
+    fn compute(f: &Func, analyses: &Analyses) -> Self {
+        let ctx = analyses.context();
+        let constants = analyses.get::<Constants>(f);
+        exec(f, ctx.exec_index, &constants, ctx.lanes, ctx.exec_initial, ctx.lanes > 1)
     }
 }
 
@@ -50,14 +81,6 @@ fn exec_param(block: &Block, exec_index: usize, f: &Func) -> ValueId {
     let entry = &f.blocks[&f.entry];
     let k = entry.params[..exec_index].iter().filter(|p| p.1 == Ty::I1).count();
     block.params.iter().filter(|p| p.1 == Ty::I1).nth(k).expect("block lacks its EXEC parameter").0
-}
-
-pub(crate) fn definitions(f: &Func) -> Vec<Option<Op>> {
-    let mut out = vec![None; f.types.len()];
-    for block in f.blocks.values() {
-        for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
-    }
-    out
 }
 
 fn ballot_of(f: &Func) -> Vec<Option<ValueId>> {
@@ -183,6 +206,7 @@ fn full_bit(bit: ValueId, old: ValueId, full: &[bool], defs: &[Option<Op>], ball
     }
 }
 
+#[derive(PartialEq)]
 pub(crate) struct Predication {
     pub reactivation: Rc<Vec<(BlockId, usize)>>,
     pub predicated: Rc<Vec<Option<(ValueId, ValueId)>>>,
@@ -194,8 +218,8 @@ pub(crate) struct Predication {
     ballots: Vec<Option<ValueId>>,
 }
 
-pub(crate) fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predication {
-    let defs = definitions(f);
+fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predication {
+    let defs = f.definitions();
     let ballots = ballot_of(f);
     let mut reactivation = Vec::new();
     let mut updates: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
@@ -235,12 +259,12 @@ pub(crate) fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]
 }
 
 #[cfg(test)]
-pub(crate) fn analyze(registry: &super::super::dialect::DialectRegistry, f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, entry_full: bool) -> Masks {
+fn analyze(registry: &super::super::dialect::DialectRegistry, f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, entry_full: bool) -> Masks {
     let predication = predication(f, exec_index, constants);
     analyze_from(registry, f, &predication, exec_index, constants, width, entry_full)
 }
 
-pub(crate) fn analyze_from(registry: &super::super::dialect::DialectRegistry, f: &Func, p: &Predication, exec_index: usize, constants: &[Option<u64>], width: u32, entry_full: bool) -> Masks {
+fn analyze_from(registry: &super::super::dialect::DialectRegistry, f: &Func, p: &Predication, exec_index: usize, constants: &[Option<u64>], width: u32, entry_full: bool) -> Masks {
     let every_lane = |op: super::super::dialect::TargetOp| registry.operation(op).is_ok_and(|o| o.effect == super::super::dialect::Effect::ReadGlobal { every_lane: true });
     let (defs, ballots) = (&p.defs, &p.ballots);
     let any = any_of(f);
@@ -473,7 +497,7 @@ mod tests {
             Inst::Core { value: always, ty: Ty::I1, op: Op::Const(Ty::I1, 1) },
             Inst::Effect { provenance: 0, op: EffectOp::Memory { space: super::super::super::ir::Space::Lds, op: super::super::super::ir::MemoryOp::Store(super::super::super::ir::MemSize::B32), semantics }, inputs: vec![q, p, always], outputs: vec![] },
         ], term: Term::Ret(vec![]) });
-        let constants = super::super::constants(&f);
+        let constants = super::super::constant::constants(&f);
         let masks = analyze(&crate::rdna_spmd::targets::rdna4::registry(), &f, 0, &constants, 16, false);
         assert_eq!(*masks.reactivation, vec![(BlockId(0), 10)]);
         assert!(!masks.guarded[first.0]);
@@ -489,6 +513,7 @@ mod tests {
     }
 }
 
+#[derive(PartialEq)]
 pub(crate) struct Exec {
     chain: BTreeMap<BlockId, Vec<(usize, ValueId)>>,
     nonempty: Vec<bool>,
@@ -534,8 +559,8 @@ fn update_of(bit: ValueId, defs: &[Option<Op>], constants: &[Option<u64>]) -> Up
     }
 }
 
-pub(crate) fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, initial: bool, packed: bool) -> Exec {
-    let defs = definitions(f);
+fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, initial: bool, packed: bool) -> Exec {
+    let defs = f.definitions();
     let ballots = ballot_of(f);
     let mut chain: BTreeMap<BlockId, Vec<(usize, ValueId)>> = BTreeMap::new();
     let mut updates: Vec<(ValueId, ValueId, Update)> = Vec::new();

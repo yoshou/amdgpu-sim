@@ -1,12 +1,12 @@
-use super::super::analysis::masks::{Exec, Predication};
+use super::super::analysis::{Analyses, Exec, Predication};
 use super::super::ir::{*, Cvt, Op};
 
 pub(crate) struct Active;
 impl super::Pass for Active {
     fn name(&self) -> &str { "active" }
-    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
-        let (masks, exec) = (analyses.predication(f), analyses.exec(f));
-        run(f, masks, exec) > 0
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
+        let (masks, exec) = (analyses.get::<Predication>(f), analyses.get::<Exec>(f));
+        run(f, &masks, &exec) > 0
     }
 }
 

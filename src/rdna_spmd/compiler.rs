@@ -1,6 +1,7 @@
 //! Decode/lift once, prepare typed SSA, then emit LLVM from the IR alone.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[cfg(test)]
 use crate::rdna_instructions::InstFormat;
@@ -11,18 +12,24 @@ use super::engine::kernel::{Code, CoopKernel, CoopVecKernel, Kernel, ScalarKerne
 use crate::rdna_spmd::targets::rdna4::decode::{self as ir, ScalarBlock, ScalarProgram};
 use super::program::{Program, CompilationInput};
 
+use super::analysis::{Accesses, Analyses, Constants, Context, Exec, Packet, Uniformity};
+use super::analysis::uniformity::Fact;
+use super::codegen::{Abi, Prepared};
+use super::dialect::DialectRegistry;
+#[cfg(test)]
+use super::ir::BlockId;
+use super::ir::{Func, ValueId};
 use super::program::{LiftedFunction, Parameter, ParameterSource};
-use super::pass::{Analyses, Context, Driver, LocalWriteLanes, Pass};
+use super::pass::{Driver, Pass};
 use super::pass::uniform_queries::UniformQueries;
 use super::pass::cse::Cse;
-use super::pass::{active::Active, adjacency::Adjacency, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, PacketState}, idioms::Idioms, mask_projection::MaskProjection, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
-use super::ir::BlockId;
+use super::pass::{active::Active, adjacency::Adjacency, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, LocalWriteLanes, PacketState}, idioms::Idioms, mask_projection::MaskProjection, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarMode { Whole, Cooperative }
 
 /// Coordinates the SPMD compilation stages.
-pub struct Compiler { target: std::sync::Arc<dyn Target> }
+pub struct Compiler { target: Arc<dyn Target> }
 #[cfg(test)]
 impl Default for Compiler {
     fn default() -> Self { Self::for_arch("gfx1200").unwrap() }
@@ -33,59 +40,41 @@ impl Compiler {
     }
 }
 
-pub(super) fn exec_index(inputs: &[Parameter], registry: &super::dialect::DialectRegistry) -> usize {
+pub(super) fn exec_index(inputs: &[Parameter], registry: &DialectRegistry) -> usize {
     let exec = registry.registers().exec;
     inputs.iter().position(|p| matches!(p.source, ParameterSource::MaskBit(r) if r == exec)).unwrap()
 }
 
-fn analyses<'r>(registry: &'r super::dialect::DialectRegistry, exec_index: usize, lanes: u32, entry_full: bool, exec_initial: bool, exec_packed: bool, packet: Option<(&'r [Parameter], bool)>) -> Analyses<'r> {
-    Analyses::new(Context { registry, exec_index, lanes, entry_full, exec_initial, exec_packed, packet })
+fn context<'r>(registry: &'r DialectRegistry, inputs: &'r [Parameter], lanes: u32) -> Context<'r> {
+    Context::new(registry, inputs, exec_index(inputs, registry), lanes)
 }
 
 pub(super) fn input_passes_ir(f: &mut LiftedFunction) {
-    let registry = f.registry.clone();
-    let exec_index = exec_index(&f.parameter_inputs, &registry);
-    let mut program = super::pass::FuncProgram { ir: std::mem::replace(&mut f.ir, super::ir::Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] }), registry: &registry };
     let driver = Driver::new();
-    let limit = 1 + program.ir.types.len();
-    let mut an = analyses(&registry, exec_index, 32, false, false, false, None);
-    driver.fixpoint(&mut program, &mut an, "input", limit, &[&Idioms, &Simplify, &Dce]).unwrap();
-    f.ir = program.ir;
+    let limit = 1 + f.ir.types.len();
+    let mut an = Analyses::new(context(&f.registry, &f.parameter_inputs, 32));
+    driver.fixpoint(&mut f.ir, &mut an, "input", limit, &[&Idioms, &Simplify, &Dce]).unwrap();
     f.revision += 1;
 }
 
 pub(super) fn dispatch_passes_ir(f: &mut LiftedFunction, fold_masks: bool) {
-    let registry = f.registry.clone();
-    let exec_index = exec_index(&f.parameter_inputs, &registry);
-    let mut program = super::pass::FuncProgram { ir: std::mem::replace(&mut f.ir, super::ir::Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] }), registry: &registry };
     let driver = Driver::new();
-    let limit = 1 + program.ir.types.len();
-    let mut an = analyses(&registry, exec_index, 32, false, false, false, None);
-    let queries = UniformQueries { inputs: &f.parameter_inputs };
+    let limit = 1 + f.ir.types.len();
+    let mut an = Analyses::new(context(&f.registry, &f.parameter_inputs, 32));
     let mut passes: Vec<&dyn Pass> = Vec::new();
-    if fold_masks { passes.extend([&DeadWrites as &dyn Pass, &Cse, &queries, &MaskProjection]); }
+    if fold_masks { passes.extend([&DeadWrites as &dyn Pass, &Cse, &UniformQueries, &MaskProjection]); }
     passes.extend([&Simplify as &dyn Pass, &Dce, &DeadParams]);
-    driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
-    driver.fixpoint(&mut program, &mut an, "mask_words", limit, &passes).unwrap();
-    f.ir = program.ir;
+    driver.pipeline(&mut f.ir, &mut an, &[&DiscardReturn]).unwrap();
+    driver.fixpoint(&mut f.ir, &mut an, "mask_words", limit, &passes).unwrap();
     f.revision += 1;
 }
 
-#[cfg(test)]
-pub(super) fn packet_uniformity(f: &LiftedFunction, width: u32, entry_full: bool, aligned: bool) -> super::analysis::uniformity::Uniformity {
-    let constants = super::analysis::constants(&f.ir);
-    let exec_index = exec_index(&f.parameter_inputs, &f.registry);
-    let masks = super::analysis::masks::analyze(&f.registry, &f.ir, exec_index, &constants, width, entry_full);
-    super::analysis::uniformity::packet(&f.ir, &super::pass::entry::packet_entry(&f.ir, &f.parameter_inputs, aligned), &constants, &masks.guarded)
+fn dead_writes(f: &mut Func, an: &mut Analyses, driver: &Driver) {
+    let limit = 1 + f.types.len();
+    driver.fixpoint(f, an, "dead_writes", limit, &[&DeadWrites, &Simplify, &Dce]).unwrap();
 }
 
-fn dead_writes(program: &mut super::pass::FuncProgram, driver: &Driver, exec_index: usize, width: u32) {
-    let limit = 1 + program.ir.types.len();
-    let mut an = analyses(program.registry, exec_index, width, false, false, false, None);
-    driver.fixpoint(program, &mut an, "dead_writes", limit, &[&DeadWrites, &Simplify, &Dce]).unwrap();
-}
-
-fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<u64>])
+fn yield_layouts_ir(ir: &Func, uniform: &[bool], constants: &[Option<u64>])
     -> (BTreeMap<u64, super::engine::yields::YieldValues>, Vec<Vec<u64>>) {
     use super::ir::{Inst, EffectOp, WaveOp};
     use super::engine::yields::{Argument, YieldValues};
@@ -126,87 +115,75 @@ fn yield_layouts_ir(ir: &super::ir::Func, uniform: &[bool], constants: &[Option<
     (out, groups)
 }
 
-struct Bare { ir: super::ir::Func, inputs: Vec<Parameter>, registry: std::sync::Arc<super::dialect::DialectRegistry> }
+struct Bare { ir: Func, inputs: Vec<Parameter>, registry: Arc<DialectRegistry> }
 
 fn bare(f: LiftedFunction) -> Bare { Bare { ir: f.ir, inputs: f.parameter_inputs, registry: f.registry } }
 
-fn prepared(bare: Bare, width: Option<u32>, abi: super::codegen::Abi, observable_return: bool, entry_full: bool, initial_exec: bool, num_vgprs: usize, aligned: bool) -> super::codegen::Prepared {
-    use super::analysis::uniformity::Fact;
-    let Bare { ir, inputs, registry } = bare;
-    let mut program = super::pass::FuncProgram { ir, registry: &registry };
+fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, width: Option<u32>, abi: Abi, observable_return: bool, num_vgprs: usize) -> Prepared {
     let driver = Driver::new();
-    let exec_index = exec_index(&inputs, &registry);
-    let lanes = width.unwrap_or(1);
-    let mut an = analyses(&registry, exec_index, lanes, entry_full, initial_exec, lanes > 1, width.map(|_| (inputs.as_slice(), aligned)));
-    let assume = AssumeDispatchExec { inputs: &inputs };
     let mut passes: Vec<&dyn Pass> = vec![&PacketState];
-    if abi == super::codegen::Abi::Cooperative { passes.push(&LocalWriteLanes); }
+    if abi == Abi::Cooperative { passes.push(&LocalWriteLanes); }
     if width.is_none() { passes.push(&Active); }
-    if !observable_return || (width.is_none() && abi == super::codegen::Abi::Whole) { passes.push(&assume); }
-    driver.pipeline(&mut program, &mut an, &passes).unwrap();
+    if !observable_return || (width.is_none() && abi == Abi::Whole) { passes.push(&AssumeDispatchExec); }
+    driver.pipeline(&mut ir, an, &passes).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
-        driver.pipeline(&mut program, &mut an, &[&Simplify, &Dce]).unwrap();
-        driver.pipeline(&mut program, &mut an, &[&Pairs]).unwrap();
-        let limit = 1 + program.ir.types.len();
-        driver.fixpoint(&mut program, &mut an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
+        driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
+        driver.pipeline(&mut ir, an, &[&Pairs]).unwrap();
+        let limit = 1 + ir.types.len();
+        driver.fixpoint(&mut ir, an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
     }
-    driver.pipeline(&mut program, &mut an, &[&Adjacency]).unwrap();
-    let ir = program.ir;
-    let constants = an.constants(&ir).to_vec();
-    let exec = super::analysis::masks::exec(&ir, exec_index, &constants, lanes, initial_exec, lanes > 1);
-    let uniform = an.uniform(&ir).to_vec();
-    let affine: BTreeMap<super::ir::ValueId, u32> = match an.uniformity(&ir) {
-        Some(facts) => facts.facts.iter().enumerate().filter_map(|(v, fact)| match *fact {
-            Fact::Affine { stride, .. } if stride > 0 && stride <= 256 && ir.types[v] == super::ir::Ty::I64 => Some((super::ir::ValueId(v), stride as u32)),
-            _ => None,
-        }).collect(),
-        None => BTreeMap::new(),
-    };
+    driver.pipeline(&mut ir, an, &[&Adjacency]).unwrap();
+    let constants = an.get::<Constants>(&ir);
+    let exec = an.get::<Exec>(&ir);
+    let uniformity = an.get::<Uniformity>(&ir);
+    let accesses = an.get::<Accesses>(&ir);
+    let uniform = uniformity.uniform();
+    let affine: BTreeMap<ValueId, u32> = uniformity.facts.iter().enumerate().filter_map(|(v, fact)| match *fact {
+        Fact::Affine { stride, .. } if stride > 0 && stride <= 256 && ir.types[v] == super::ir::Ty::I64 => Some((ValueId(v), stride as u32)),
+        _ => None,
+    }).collect();
     let (yields, groups) = yield_layouts_ir(&ir, &uniform, &constants);
-    let accesses = super::analysis::memory::accesses(&ir, &constants, &uniform);
     let shapes = accesses.iter().map(|a| super::codegen::memory::shape(a, width, super::codegen::memory::global_load(a, &uniform, &affine), &constants)).collect();
     let clusters = super::codegen::memory::clusters(&ir, &accesses, width, &uniform, &affine);
     let min_private_bytes = accesses.iter().filter_map(|a| a.static_scratch_end(&constants)).max().unwrap_or(0) as usize;
-    let ir = ir.verify_with(&registry).expect("invalid prepared function SSA");
-    super::codegen::Prepared {
-        registry, ir, inputs, width, abi, observable_return,
+    let inputs = an.context().inputs.to_vec();
+    let ir = ir.verify_with(registry).expect("invalid prepared function SSA");
+    Prepared {
+        registry: Arc::clone(registry), ir, inputs, width, abi, observable_return,
         uniform, exec, constants, accesses, shapes, clusters, yields, groups, min_private_bytes, num_vgprs,
     }
 }
 
-pub(super) fn prepare_packet(f: LiftedFunction, width: u32, cooperative: bool, observe_return: bool, num_vgprs: usize, aligned: bool) -> super::codegen::Prepared {
-    let Bare { ir, inputs, registry } = bare(f);
-    let mut program = super::pass::FuncProgram { ir, registry: &registry };
+pub(super) fn prepare_packet(f: LiftedFunction, width: u32, cooperative: bool, observe_return: bool, num_vgprs: usize, aligned: bool) -> Prepared {
+    let Bare { mut ir, inputs, registry } = bare(f);
     let driver = Driver::new();
-    let exec_index = exec_index(&inputs, &registry);
-    if !observe_return {
-        let mut an = analyses(&registry, exec_index, width, false, false, false, None);
-        driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
+    let base = context(&registry, &inputs, width);
+    {
+        let mut an = Analyses::new(base);
+        if !observe_return { driver.pipeline(&mut ir, &mut an, &[&DiscardReturn]).unwrap(); }
+        dead_writes(&mut ir, &mut an, &driver);
     }
-    dead_writes(&mut program, &driver, exec_index, width);
-    let mut an = analyses(&registry, exec_index, width, !observe_return, false, false, None);
+    let mut an = Analyses::new(Context { entry_full: !observe_return, exec_initial: !cooperative, packet: Some(Packet { aligned }), ..base });
     let mut passes: Vec<&dyn Pass> = vec![&Narrow];
     if std::env::var("AMDGPU_SIM_SPECIALISE").map_or(true, |v| v != "0") { passes.push(&Specialise); }
     passes.push(&Narrow);
-    driver.pipeline(&mut program, &mut an, &passes).unwrap();
-    let abi = if cooperative { super::codegen::Abi::Cooperative } else { super::codegen::Abi::Whole };
-    prepared(Bare { ir: program.ir, inputs, registry }, Some(width), abi, observe_return, !observe_return, !cooperative, num_vgprs, aligned)
+    driver.pipeline(&mut ir, &mut an, &passes).unwrap();
+    let abi = if cooperative { Abi::Cooperative } else { Abi::Whole };
+    prepared(ir, &mut an, &registry, Some(width), abi, observe_return, num_vgprs)
 }
 
-pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usize) -> super::codegen::Prepared {
-    let Bare { ir, inputs, registry } = bare(f);
-    let mut program = super::pass::FuncProgram { ir, registry: &registry };
+pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usize) -> Prepared {
+    let Bare { mut ir, inputs, registry } = bare(f);
+    let driver = Driver::new();
+    let base = context(&registry, &inputs, 1);
     {
-        let driver = Driver::new();
-        let exec_index = exec_index(&inputs, &registry);
-        if mode == ScalarMode::Whole {
-            let mut an = analyses(&registry, exec_index, 1, false, false, false, None);
-            driver.pipeline(&mut program, &mut an, &[&DiscardReturn]).unwrap();
-        }
-        dead_writes(&mut program, &driver, exec_index, 1);
+        let mut an = Analyses::new(base);
+        if mode == ScalarMode::Whole { driver.pipeline(&mut ir, &mut an, &[&DiscardReturn]).unwrap(); }
+        dead_writes(&mut ir, &mut an, &driver);
     }
-    let abi = match mode { ScalarMode::Whole => super::codegen::Abi::Whole, ScalarMode::Cooperative => super::codegen::Abi::Cooperative };
-    prepared(Bare { ir: program.ir, inputs, registry }, None, abi, mode != ScalarMode::Whole, true, true, num_vgprs, true)
+    let abi = match mode { ScalarMode::Whole => Abi::Whole, ScalarMode::Cooperative => Abi::Cooperative };
+    let mut an = Analyses::new(Context { entry_full: true, exec_initial: true, ..base });
+    prepared(ir, &mut an, &registry, None, abi, mode != ScalarMode::Whole, num_vgprs)
 }
 
 impl Compiler {
@@ -285,7 +262,7 @@ struct Sharing { barrier: bool, group: bool, exchange: bool }
 fn sharing(program: &Program, whole_wave: bool) -> Sharing {
     use super::ir::{EffectOp, Inst, Space, WaveOp};
     let f = &program.function.ir;
-    let constants = super::analysis::constants(f);
+    let constants = Analyses::new(context(&program.function.registry, &program.function.parameter_inputs, 32)).get::<Constants>(f);
     let mut out = Sharing { barrier: false, group: false, exchange: false };
     for block in f.blocks.values() {
         for inst in &block.insts {

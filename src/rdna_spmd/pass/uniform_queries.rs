@@ -1,7 +1,7 @@
-use super::super::analysis::masks::Predication;
+use super::super::analysis::Analyses;
 use super::super::ir::*;
 use super::super::program::{Parameter, ParameterSource};
-use super::{Analyses, Pass};
+use super::Pass;
 
 struct Facts<'a> {
     f: &'a Func,
@@ -66,7 +66,7 @@ impl Facts<'_> {
     }
 }
 
-pub(crate) fn run(f: &mut Func, _predication: &Predication, inputs: &[Parameter]) -> usize {
+pub(crate) fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
     let mut defs = vec![None; f.types.len()];
     let mut parameter = vec![None; f.types.len()];
     let mut effect = vec![false; f.types.len()];
@@ -104,15 +104,15 @@ pub(crate) fn run(f: &mut Func, _predication: &Predication, inputs: &[Parameter]
     }
     super::simplify::rename(f, &renames);
     let count = renames.len();
-    super::compact(f);
+    f.compact();
     count
 }
 
-pub(crate) struct UniformQueries<'a> { pub inputs: &'a [Parameter] }
-impl Pass for UniformQueries<'_> {
+pub(crate) struct UniformQueries;
+impl Pass for UniformQueries {
     fn name(&self) -> &str { "uniform_queries" }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        run(f, analyses.predication(f), self.inputs) > 0
+        run(f, analyses.context().inputs) > 0
     }
 }
 
@@ -122,11 +122,6 @@ mod tests {
     use super::super::super::ir::{BlockId, Block, Ty, Term, IntOp, Env};
     use super::super::super::program::{Parameter, ParameterSource};
     use std::collections::BTreeMap;
-
-    fn predication(f: &Func) -> Predication {
-        let constants = super::super::super::analysis::constants(f);
-        super::super::super::analysis::masks::predication(f, 0, &constants)
-    }
 
     fn folded(shape: u8) -> Option<Op> {
         let mut f = Func { entry: BlockId(0), blocks: BTreeMap::new(), types: vec![] };
@@ -154,14 +149,13 @@ mod tests {
         f.blocks.insert(BlockId(0), Block {
             params: vec![(exec, Ty::I1), (old, Ty::I32), (upper, Ty::I1), (uniform, Ty::I32)],
             insts, term: Term::Ret(vec![answer]) });
-        let p = predication(&f);
         let inputs = [
             Parameter { source: ParameterSource::MaskBit(126), ty: Ty::I1 },
             Parameter { source: ParameterSource::Vgpr(1), ty: Ty::I32 },
             Parameter { source: ParameterSource::MaskBit(106), ty: Ty::I1 },
             Parameter { source: ParameterSource::Sgpr(4), ty: Ty::I32 },
         ];
-        if run(&mut f, &p, &inputs) == 0 { return None; }
+        if run(&mut f, &inputs) == 0 { return None; }
         let Term::Ret(returned) = &f.blocks[&BlockId(0)].term else { panic!("expected a return") };
         let kept = returned[0];
         f.blocks[&BlockId(0)].insts.iter().find_map(|inst| match inst {

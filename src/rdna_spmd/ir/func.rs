@@ -84,6 +84,49 @@ impl Func {
         self.types.push(ty);
         v
     }
+    pub fn definitions(&self) -> Vec<Option<Op>> {
+        let mut out = vec![None; self.types.len()];
+        for block in self.blocks.values() {
+            for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
+        }
+        out
+    }
+    pub fn compact(&mut self) {
+        let mut map: Vec<Option<ValueId>> = vec![None; self.types.len()];
+        let mut types = Vec::new();
+        let mut definitions: Vec<ValueId> = Vec::new();
+        for block in self.blocks.values() {
+            for &(p, _) in &block.params { definitions.push(p); }
+            for inst in &block.insts {
+                match inst {
+                    Inst::Core { value, .. } | Inst::Packet { output: value, .. } => definitions.push(*value),
+                    Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => definitions.extend(outputs.iter().map(|o| o.0)),
+                }
+            }
+        }
+        for v in definitions {
+            map[v.0] = Some(ValueId(types.len()));
+            types.push(self.types[v.0]);
+        }
+        let m = |v: ValueId| map[v.0].expect("use of a removed SSA value");
+        for block in self.blocks.values_mut() {
+            for (p, _) in &mut block.params { *p = m(*p); }
+            for inst in &mut block.insts {
+                match inst {
+                    Inst::Core { value, op, .. } => { *op = op.map(m); *value = m(*value); }
+                    Inst::Packet { input, output, .. } => { *input = m(*input); *output = m(*output); }
+                    Inst::Target { args, outputs, .. } => { *args = args.map(m); for (v, _) in outputs { *v = m(*v); } }
+                    Inst::Effect { inputs, outputs, .. } => { for v in inputs { *v = m(*v); } for (v, _) in outputs { *v = m(*v); } }
+                }
+            }
+            match &mut block.term {
+                Term::Br(e) => for v in &mut e.args { *v = m(*v); },
+                Term::CondBr { cond, yes, no } => { *cond = m(*cond); for v in yes.args.iter_mut().chain(&mut no.args) { *v = m(*v); } }
+                Term::Ret(args) => for v in args { *v = m(*v); },
+            }
+        }
+        self.types = types;
+    }
 }
 
 #[cfg(test)]

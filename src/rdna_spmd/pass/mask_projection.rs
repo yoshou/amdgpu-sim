@@ -1,5 +1,6 @@
+use super::super::analysis::{Analyses, Constants};
 use super::super::ir::*;
-use super::{Analyses, Pass};
+use super::Pass;
 use std::collections::{BTreeMap, BTreeSet};
 
 enum Use {
@@ -52,9 +53,9 @@ fn incoming<'a>(f: &'a Func, block: BlockId, index: usize) -> impl Iterator<Item
 impl Mask {
     fn of(&self, value: ValueId) -> usize { self.repr[value.0].0 }
 
-    fn new(f: &Func) -> Self {
-        let defs = super::super::analysis::masks::definitions(f);
-        let constants = super::super::analysis::constants(f);
+    fn new(f: &Func, constants: &[Option<u64>]) -> Self {
+        let defs = f.definitions();
+        let constants = constants.to_vec();
         let mut repr: Vec<ValueId> = (0..f.types.len()).map(ValueId).collect();
         for block in f.blocks.values() {
             for inst in &block.insts {
@@ -239,8 +240,8 @@ impl Emit {
     }
 }
 
-pub(crate) fn run(f: &mut Func) -> usize {
-    let mut mask = Mask::new(f);
+pub(crate) fn run(f: &mut Func, constants: &[Option<u64>]) -> usize {
+    let mut mask = Mask::new(f, constants);
     if mask.ballot.iter().all(Option::is_none) { return 0; }
     mask.settle(f);
     let mut required = vec![false; f.types.len()];
@@ -404,12 +405,15 @@ pub(crate) fn run(f: &mut Func) -> usize {
         block.insts.retain(|inst| !matches!(inst, Inst::Core { value, .. } if dropped.contains(value)));
     }
     super::simplify::rename(f, &renames);
-    super::compact(f);
+    f.compact();
     count
 }
 
 pub(crate) struct MaskProjection;
 impl Pass for MaskProjection {
     fn name(&self) -> &str { "mask_projection" }
-    fn run(&self, f: &mut Func, _: &Analyses) -> bool { run(f) > 0 }
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
+        let constants = analyses.get::<Constants>(f);
+        run(f, &constants) > 0
+    }
 }

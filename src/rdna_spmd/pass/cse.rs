@@ -1,6 +1,7 @@
 //! Reuse wave answers with identical SSA operands in the same block.
+use super::super::analysis::Analyses;
 use super::super::ir::*;
-use super::{Analyses, Pass};
+use super::Pass;
 
 pub(crate) struct Cse;
 impl Pass for Cse {
@@ -29,7 +30,7 @@ fn run(f: &mut Func) -> usize {
     // and unnecessarily retain a wave rendezvous.
     if !renames.is_empty() {
         super::simplify::rename(f, &renames);
-        super::compact(f);
+        f.compact();
     }
     renames.len()
 }
@@ -111,13 +112,15 @@ mod tests {
             Inst::Core { value: next_nonzero, ty: Ty::I1, op: Op::Cmp(IntPred::Ne, carried, next_zero) },
         ], term: Term::Ret(vec![previous, next_nonzero]) });
         assert_eq!(run(&mut f), 1);
+        let registry = crate::rdna_spmd::targets::rdna4::registry();
         for _ in 0..4 {
-            super::super::mask_projection::run(&mut f);
+            let constants = Analyses::new(super::super::super::analysis::Context::new(&registry, &[], 0, 16)).get::<super::super::super::analysis::Constants>(&f);
+            super::super::mask_projection::run(&mut f, &constants);
             super::super::simplify::run(&mut f);
             super::super::dce::run(&mut f);
             super::super::dce::dead_params(&mut f);
         }
-        f.check(&crate::rdna_spmd::targets::rdna4::registry()).unwrap();
+        f.check(&registry).unwrap();
         assert!(!f.blocks.values().flat_map(|b| &b.insts).any(|inst| matches!(inst,
             Inst::Effect { op: EffectOp::Wave(WaveOp::Ballot), .. })));
     }

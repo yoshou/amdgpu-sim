@@ -1,13 +1,6 @@
+use super::super::analysis::{Analyses, Uniformity};
 use super::super::ir::{*, Op, Ty, ValueId};
 use std::collections::{BTreeMap, BTreeSet};
-
-fn definitions(f: &Func) -> Vec<Option<Op>> {
-    let mut out = vec![None; f.types.len()];
-    for block in f.blocks.values() {
-        for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
-    }
-    out
-}
 
 enum Source { Packed(ValueId), Carried(BlockId, usize), Fresh }
 
@@ -31,14 +24,14 @@ fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut [Vec<ValueId>
 pub(crate) struct Pairs;
 impl super::Pass for Pairs {
     fn name(&self) -> &str { "pairs" }
-    fn run(&self, f: &mut Func, analyses: &super::Analyses) -> bool {
-        let uniform = analyses.uniform(f).to_vec();
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
+        let uniform = analyses.get::<Uniformity>(f).uniform();
         run(f, &uniform) > 0
     }
 }
 
 pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
-    let defs = definitions(f);
+    let defs = f.definitions();
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut position = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
     for (at, id) in f.blocks.keys().enumerate() { position[id.0] = at; }

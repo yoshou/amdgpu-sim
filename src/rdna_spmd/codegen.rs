@@ -9,8 +9,8 @@ use llvm_sys as llvm;
 use llvm::core::*;
 use llvm::prelude::*;
 
-use super::analysis::masks::Exec;
-use super::analysis::memory::Access;
+use std::rc::Rc;
+use super::analysis::{Access, Exec};
 use super::ir::{*, Cvt, Env, IntOp, Op, Ty, ValueId};
 use super::program::{Parameter, ParameterSource};
 use ops::Emitter;
@@ -34,9 +34,9 @@ pub(super) struct Prepared {
     pub abi: Abi,
     pub observable_return: bool,
     pub uniform: Vec<bool>,
-    pub exec: Exec,
-    pub constants: Vec<Option<u64>>,
-    pub accesses: Vec<Access>,
+    pub exec: Rc<Exec>,
+    pub constants: Rc<Vec<Option<u64>>>,
+    pub accesses: Rc<Vec<Access>>,
     pub shapes: Vec<memory::Shape>,
     pub clusters: BTreeMap<usize, Cluster>,
     pub yields: BTreeMap<u64, super::engine::yields::YieldValues>,

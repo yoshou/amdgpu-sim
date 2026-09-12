@@ -1,5 +1,35 @@
 use super::super::ir::{*, EffectOp, MemoryOp, MemSize, Space, WaveOp, Cvt, Env, IntOp, Op, Ty, ValueId};
+use super::super::program::{Parameter, ParameterSource};
+use super::{Analyses, Analysis, Constants, Masks, Packet};
 use std::collections::BTreeMap;
+
+impl Analysis for Uniformity {
+    type Result = Uniformity;
+    const NAME: &'static str = "uniformity";
+    fn compute(f: &Func, analyses: &Analyses) -> Self {
+        let ctx = analyses.context();
+        let Some(Packet { aligned }) = ctx.packet else {
+            return Uniformity { facts: vec![Fact::Uniform; f.types.len()], pairs: BTreeMap::new() };
+        };
+        let (constants, masks) = (analyses.get::<Constants>(f), analyses.get::<Masks>(f));
+        packet(f, &entry(f, ctx.inputs, aligned), &constants, &masks.guarded)
+    }
+}
+
+fn entry(f: &Func, inputs: &[Parameter], aligned: bool) -> Entry {
+    let block = &f.blocks[&f.entry];
+    let mut uniform = Vec::new();
+    let mut affine = Vec::new();
+    let mut varying = Vec::new();
+    for (input, &(id, _)) in inputs.iter().zip(&block.params) {
+        match input.source {
+            ParameterSource::Vgpr(0) => if aligned { affine.push((id, 1, Some((0, 10)))) } else { varying.push(id) },
+            ParameterSource::Vgpr(_) | ParameterSource::Sgpr(_) | ParameterSource::Scc => uniform.push(id),
+            _ => {}
+        }
+    }
+    Entry { uniform, affine, varying }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fact {
@@ -78,16 +108,21 @@ impl Fact {
     }
 }
 
-pub(crate) struct Entry {
-    pub uniform: Vec<ValueId>,
-    pub affine: Vec<(ValueId, i64, Option<(u32, u32)>)>,
-    pub varying: Vec<ValueId>,
+struct Entry {
+    uniform: Vec<ValueId>,
+    affine: Vec<(ValueId, i64, Option<(u32, u32)>)>,
+    varying: Vec<ValueId>,
 }
 
+#[derive(PartialEq)]
 pub(crate) struct Uniformity {
     pub facts: Vec<Fact>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub pairs: BTreeMap<(ValueId, ValueId), Fact>,
+}
+
+impl Uniformity {
+    pub fn uniform(&self) -> Vec<bool> { self.facts.iter().map(|&fact| fact == Fact::Uniform).collect() }
 }
 
 #[cfg(test)]
@@ -108,7 +143,7 @@ fn effect_output(op: EffectOp, inputs: &[Fact]) -> Fact {
     }
 }
 
-pub(crate) fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) -> Uniformity {
+fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) -> Uniformity {
     let mut facts: Vec<Option<Fact>> = vec![None; f.types.len()];
     let mut pairs: Vec<Option<(ValueId, Fact)>> = vec![None; f.types.len()];
     let mut definitions: Vec<Option<Op>> = vec![None; f.types.len()];
@@ -304,9 +339,11 @@ mod tests {
     use crate::rdna_instructions::{InstFormat, SourceOperand, VOP3SD, VSCRATCH, VGLOBAL};
     use crate::instructions::I;
 
-    fn lifted(program: &ScalarProgram) -> (crate::rdna_spmd::program::LiftedFunction, Uniformity) {
+    fn lifted(program: &ScalarProgram) -> (crate::rdna_spmd::program::LiftedFunction, std::rc::Rc<Uniformity>) {
         let f = program.to_ssa().function;
-        let u = crate::rdna_spmd::compiler::packet_uniformity(&f, 16, true, true);
+        let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &f.registry);
+        let ctx = super::super::Context { entry_full: true, packet: Some(Packet { aligned: true }), ..super::super::Context::new(&f.registry, &f.parameter_inputs, exec_index, 16) };
+        let u = Analyses::new(ctx).get::<Uniformity>(&f.ir);
         (f, u)
     }
     fn slot(f: &crate::rdna_spmd::program::LiftedFunction, slot: u32) -> usize {
@@ -380,7 +417,7 @@ mod tests {
         let cmp = core(&mut f, Ty::I1, Op::Cmp(IntPred::Eq, base, base));
         let product = core(&mut f, Ty::I64, Op::Int(IntOp::Mul, wide, base64));
         f.blocks.insert(BlockId(0), Block { params: vec![(lane, Ty::I32), (base, Ty::I32), (flag, Ty::I1)], insts, term: Term::Ret(vec![]) });
-        let constants = super::super::constants(&f);
+        let constants = super::super::constant::constants(&f);
         let u = packet(&f, &Entry { uniform: vec![base], affine: vec![(lane, 1, Some((0, 10)))] , varying: vec![] }, &constants, &vec![false; f.types.len()]);
         assert_eq!(u.fact(scaled), Fact::Affine { stride: 16, span: Some((4, 14)) });
         assert_eq!(u.fact(sum), Fact::Affine { stride: 16, span: None });
@@ -421,7 +458,7 @@ mod tests {
         let low_word = core(&mut f, Ty::I32, Op::UnpackLo(sum));
         let high_word = core(&mut f, Ty::I32, Op::UnpackHi(high_pair));
         f.blocks.insert(BlockId(0), Block { params: vec![(ids, Ty::I32), (other, Ty::I32)], insts, term: Term::Ret(vec![]) });
-        let constants = super::super::constants(&f);
+        let constants = super::super::constant::constants(&f);
         let u = packet(&f, &Entry { uniform: vec![other], affine: vec![(ids, 1, Some((0, 10)))] , varying: vec![] }, &constants, &vec![false; f.types.len()]);
         assert_eq!(u.fact(x), Fact::Affine { stride: 1, span: Some((0, 10)) });
         assert_eq!(u.fact(shifted), Fact::Uniform);
@@ -458,7 +495,7 @@ mod tests {
             insts: vec![Inst::Core { value: next, ty: Ty::I32, op: Op::Int(IntOp::Add, p_base, one) }],
             term: Term::CondBr { cond, yes: Edge { dst: BlockId(1), args: vec![p_lo, p_hi, next, p_mixed] }, no: Edge { dst: BlockId(2), args: vec![] } } });
         f.blocks.insert(BlockId(2), Block { params: vec![], insts: vec![], term: Term::Ret(vec![]) });
-        let constants = super::super::constants(&f);
+        let constants = super::super::constant::constants(&f);
         let u = packet(&f, &Entry { uniform: vec![base], affine: vec![(lane, 1, Some((0, 10)))] , varying: vec![] }, &constants, &vec![false; f.types.len()]);
         assert_eq!(u.pair(p_lo, p_hi), Some(Fact::Affine { stride: 8, span: Some((3, 13)) }));
         assert_eq!(u.fact(p_lo), Fact::Affine { stride: 8, span: Some((3, 13)) });

@@ -1,12 +1,25 @@
-use super::super::ir::*;
-use super::super::program::{Parameter, ParameterSource};
-use super::super::dialect::DialectRegistry;
+use super::super::analysis::{Constants, DispatchConstants, Preserved};
+use super::super::ir::{*, Env, IntOp, IntPred, Op, Ty};
 use super::{Analyses, Pass};
 
-pub(crate) fn assume_dispatch_exec(parameter_inputs: &[Parameter], registry: &DialectRegistry, f: &mut Func) -> usize {
-    let index = super::super::compiler::exec_index(parameter_inputs, registry);
-    let exec = f.blocks[&f.entry].params[index].0;
-    super::constant_queries(f, &[exec])
+pub(crate) fn constant_queries(f: &mut Func, facts: &[Option<u64>]) -> usize {
+    let mut count = 0;
+    for block in f.blocks.values_mut() {
+        for inst in &mut block.insts {
+            let query = match inst {
+                Inst::Packet { op: PacketOp::Any, input, output } => Some((*input, *output)),
+                Inst::Effect { op: EffectOp::Wave(WaveOp::Any), inputs, outputs, .. } => Some((inputs[0], outputs[0].0)),
+                _ => None,
+            };
+            if let Some((input, output)) = query {
+                if let Some(bits) = facts[input.0] {
+                    *inst = Inst::Core { value: output, ty: Ty::I1, op: Op::Const(Ty::I1, bits) };
+                    count += 1;
+                }
+            }
+        }
+    }
+    count
 }
 
 fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
@@ -68,7 +81,7 @@ fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
 
 pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     let scheduled = f.blocks.values().flat_map(|b| &b.insts)
-        .any(|inst| matches!(inst, Inst::Effect { provenance, .. } if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0));
+        .any(|inst| matches!(inst, Inst::Effect { provenance, .. } if *provenance & SCHEDULED != 0));
     let all = !scheduled || whole_wave;
     let mut count = 0;
     loop {
@@ -95,19 +108,38 @@ pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     count
 }
 
-pub(crate) fn packet_entry(f: &Func, inputs: &[Parameter], aligned: bool) -> super::super::analysis::uniformity::Entry {
-    let entry = &f.blocks[&f.entry];
-    let mut uniform = Vec::new();
-    let mut affine = Vec::new();
-    let mut varying = Vec::new();
-    for (input, &(id, _)) in inputs.iter().zip(&entry.params) {
-        match input.source {
-            ParameterSource::Vgpr(0) => if aligned { affine.push((id, 1, Some((0, 10)))) } else { varying.push(id) },
-            ParameterSource::Vgpr(_) | ParameterSource::Sgpr(_) | ParameterSource::Scc => uniform.push(id),
-            _ => {}
+/// WriteLane requires wave-uniform value and selector. Lane i's result is
+/// exactly `i == (selector & 31) ? value : old[i]`, so no value crosses a
+/// packet boundary and the rendezvous can be removed.
+pub(crate) fn local_write_lanes(f: &mut Func) -> usize {
+    let scheduled_reads = f.blocks.values().flat_map(|b| &b.insts).any(|inst| matches!(inst,
+        Inst::Effect { op: EffectOp::Wave(WaveOp::ReadLane), provenance, .. } if provenance & SCHEDULED != 0));
+    if !scheduled_reads { return 0; }
+    let mut count = 0;
+    let ids: Vec<BlockId> = f.blocks.keys().copied().collect();
+    for id in ids {
+        let old = std::mem::take(&mut f.blocks.get_mut(&id).unwrap().insts);
+        let mut insts = Vec::with_capacity(old.len());
+        for inst in old {
+            match inst {
+                Inst::Effect { op: EffectOp::Wave(WaveOp::WriteLane), inputs, outputs, provenance } if provenance & (SCHEDULED | (1 << 63)) == 0 => {
+                    let (result, ty) = outputs[0];
+                    assert_eq!(ty, Ty::I32);
+                    let lane = f.value(Ty::I32); let mask = f.value(Ty::I32);
+                    let selector = f.value(Ty::I32); let selected = f.value(Ty::I1);
+                    insts.push(Inst::Core { value: lane, ty: Ty::I32, op: Op::Env(Env::LaneId) });
+                    insts.push(Inst::Core { value: mask, ty: Ty::I32, op: Op::Const(Ty::I32, 31) });
+                    insts.push(Inst::Core { value: selector, ty: Ty::I32, op: Op::Int(IntOp::And, inputs[1], mask) });
+                    insts.push(Inst::Core { value: selected, ty: Ty::I1, op: Op::Cmp(IntPred::Eq, lane, selector) });
+                    insts.push(Inst::Core { value: result, ty: Ty::I32, op: Op::Select(selected, inputs[0], inputs[2]) });
+                    count += 1;
+                }
+                other => insts.push(other),
+            }
         }
+        f.blocks.get_mut(&id).unwrap().insts = insts;
     }
-    super::super::analysis::uniformity::Entry { uniform, affine, varying }
+    count
 }
 
 pub(crate) struct PacketState;
@@ -116,13 +148,15 @@ impl Pass for PacketState {
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
         packet_state(f, analyses.context().lanes >= 32) > 0
     }
+    fn preserves(&self) -> Preserved { Preserved::of::<Constants>().and::<DispatchConstants>() }
 }
 
-pub(crate) struct AssumeDispatchExec<'a> { pub inputs: &'a [Parameter] }
-impl Pass for AssumeDispatchExec<'_> {
+pub(crate) struct AssumeDispatchExec;
+impl Pass for AssumeDispatchExec {
     fn name(&self) -> &str { "assume_dispatch_exec" }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        assume_dispatch_exec(self.inputs, analyses.context().registry, f) > 0
+        let facts = analyses.get::<DispatchConstants>(f);
+        constant_queries(f, &facts) > 0
     }
 }
 
@@ -138,4 +172,10 @@ impl Pass for DiscardReturn {
         }
         count > 0
     }
+}
+
+pub(crate) struct LocalWriteLanes;
+impl Pass for LocalWriteLanes {
+    fn name(&self) -> &str { "local_write_lanes" }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool { local_write_lanes(f) > 0 }
 }

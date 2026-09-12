@@ -1,13 +1,6 @@
+use super::super::analysis::Analyses;
 use super::super::ir::{*, Cvt, Op, Ty, ValueId};
 use std::collections::{BTreeMap, BTreeSet};
-
-fn definitions(f: &Func) -> Vec<Option<Op>> {
-    let mut out = vec![None; f.types.len()];
-    for block in f.blocks.values() {
-        for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
-    }
-    out
-}
 
 pub(crate) fn rename(f: &mut Func, map: &BTreeMap<ValueId, ValueId>) {
     let m = |v: ValueId| { let mut v = v; while let Some(&next) = map.get(&v) { v = next; } v };
@@ -31,11 +24,11 @@ pub(crate) fn rename(f: &mut Func, map: &BTreeMap<ValueId, ValueId>) {
 pub(crate) struct Simplify;
 impl super::Pass for Simplify {
     fn name(&self) -> &str { "simplify" }
-    fn run(&self, f: &mut Func, _: &super::Analyses) -> bool { run(f) > 0 }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool { run(f) > 0 }
 }
 
 pub(crate) fn run(f: &mut Func) -> usize {
-    let defs = definitions(f);
+    let defs = f.definitions();
     let mut map: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     for block in f.blocks.values() {
         for inst in &block.insts {
@@ -68,7 +61,7 @@ pub(crate) fn run(f: &mut Func) -> usize {
         }
     }
     count += distribute_packs(f);
-    if count != 0 { super::compact(f); }
+    if count != 0 { f.compact(); }
     count
 }
 
@@ -83,7 +76,7 @@ fn cancels(mut a: ValueId, mut b: ValueId, defs: &[Option<Op>]) -> bool {
 }
 
 fn distribute_packs(f: &mut Func) -> usize {
-    let defs = definitions(f);
+    let defs = f.definitions();
     let mut float: BTreeSet<ValueId> = BTreeSet::new();
     for block in f.blocks.values() {
         for inst in &block.insts {
