@@ -28,6 +28,23 @@ impl super::Pass for Simplify {
 }
 
 pub(crate) fn run(f: &mut Func) -> usize {
+    let mut folded = 0usize;
+    let known = f.definitions();
+    for block in f.blocks.values_mut() {
+        for inst in &mut block.insts {
+            let Inst::Core { op, .. } = inst else { continue };
+            let constant = match *op {
+                Op::Pack64(a, b) => match (known[a.0], known[b.0]) {
+                    (Some(Op::Const(_, lo)), Some(Op::Const(_, hi))) => Some(Op::Const(Ty::I64, (lo & 0xffff_ffff) | (hi << 32))),
+                    _ => None,
+                },
+                Op::UnpackLo(a) => match known[a.0] { Some(Op::Const(_, bits)) => Some(Op::Const(Ty::I32, bits & 0xffff_ffff)), _ => None },
+                Op::UnpackHi(a) => match known[a.0] { Some(Op::Const(_, bits)) => Some(Op::Const(Ty::I32, bits >> 32)), _ => None },
+                _ => None,
+            };
+            if let Some(constant) = constant { *op = constant; folded += 1; }
+        }
+    }
     let defs = f.definitions();
     let mut map: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     for block in f.blocks.values() {
@@ -53,7 +70,7 @@ pub(crate) fn run(f: &mut Func) -> usize {
             }
         }
     }
-    let mut count = map.len();
+    let mut count = map.len() + folded;
     if !map.is_empty() {
         rename(f, &map);
         for block in f.blocks.values_mut() {

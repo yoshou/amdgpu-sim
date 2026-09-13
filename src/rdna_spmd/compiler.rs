@@ -128,7 +128,7 @@ fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, wi
     driver.pipeline(&mut ir, an, &passes).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
         driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
-        driver.pipeline(&mut ir, an, &[&Pairs { every_use: wide_masks }]).unwrap();
+        driver.pipeline(&mut ir, an, &[&Pairs]).unwrap();
         let limit = 1 + ir.types.len();
         driver.fixpoint(&mut ir, an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
     }
