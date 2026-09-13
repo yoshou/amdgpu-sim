@@ -44,7 +44,7 @@ pub(crate) fn space(s: Space) -> &'static str {
     match s { Space::Global => "global", Space::Scratch => "scratch", Space::Lds => "lds" }
 }
 pub(crate) fn mem_size(s: MemSize) -> &'static str {
-    match s { MemSize::U8 => "u8", MemSize::I8 => "i8", MemSize::U16 => "u16", MemSize::I16 => "i16", MemSize::B32 => "b32" }
+    match s { MemSize::U8 => "u8", MemSize::I8 => "i8", MemSize::U16 => "u16", MemSize::I16 => "i16", MemSize::B32 => "b32", MemSize::B64 => "b64" }
 }
 pub(crate) fn scope(s: Scope) -> &'static str {
     match s { Scope::WorkItem => "workitem", Scope::ComputeUnit => "cu", Scope::ShaderEngine => "se", Scope::Device => "device", Scope::System => "system", Scope::Workgroup => "workgroup" }

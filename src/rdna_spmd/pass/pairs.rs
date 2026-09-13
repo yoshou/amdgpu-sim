@@ -1,4 +1,4 @@
-use super::super::analysis::{Analyses, Uniformity};
+use super::super::analysis::{Analyses, Constants, Uniformity};
 use super::super::ir::{*, Op, Ty, ValueId};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -154,4 +154,132 @@ pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
         for &(kept, _) in retained.get(id).into_iter().flatten() { block.params.push((kept, Ty::I32)); }
     }
     candidates.len()
+}
+
+pub(crate) struct WideMemory;
+impl super::Pass for WideMemory {
+    fn name(&self) -> &str { "wide_memory" }
+    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
+        let constants = analyses.get::<Constants>(f);
+        wide_loads(f, &constants) + wide_stores(f, &constants) > 0
+    }
+}
+
+fn located(defs: &[Option<Op>], constants: &[Option<u64>], mut v: ValueId) -> (ValueId, i64) {
+    let mut offset = 0i64;
+    while let Some(Op::Int(IntOp::Add, x, k)) = defs[v.0] {
+        let Some(k) = constants[k.0] else { break };
+        offset += k as i64;
+        v = x;
+    }
+    (v, offset)
+}
+
+pub(crate) fn wide_stores(f: &mut Func, constants: &[Option<u64>]) -> usize {
+    let defs = f.definitions();
+    let word_store = |inst: &Inst| -> Option<(u64, MemorySemantics, ValueId, ValueId, ValueId)> {
+        match inst {
+            Inst::Effect { provenance, op: EffectOp::Memory { space: Space::Global, op: MemoryOp::Store(MemSize::B32), semantics }, inputs, .. } if !semantics.volatile => {
+                Some((*provenance, *semantics, inputs[0], inputs[1], inputs[2]))
+            }
+            _ => None,
+        }
+    };
+    let half = |v: ValueId| match defs[v.0] { Some(Op::UnpackLo(x)) => Some((x, false)), Some(Op::UnpackHi(x)) => Some((x, true)), _ => None };
+    let mut count = 0;
+    for block in f.blocks.values_mut() {
+        let mut pending: Vec<(usize, u64, MemorySemantics, ValueId, i64, ValueId, ValueId)> = Vec::new();
+        let mut removed: Vec<usize> = Vec::new();
+        for index in 0..block.insts.len() {
+            let Some((provenance, semantics, address, data, exec)) = word_store(&block.insts[index]) else {
+                if matches!(block.insts[index], Inst::Effect { .. }) { pending.clear(); }
+                continue;
+            };
+            let (root, offset) = located(&defs, constants, address);
+            let Some((x, true)) = half(data) else { pending.push((index, provenance, semantics, root, offset, exec, data)); continue };
+            let partner = pending.iter().position(|&(_, p, m, r, o, e, d)| p >> 8 == provenance >> 8 && m == semantics && r == root && o + 4 == offset && e == exec && half(d) == Some((x, false)));
+            match partner {
+                Some(k) => {
+                    let first = pending.remove(k).0;
+                    if let Inst::Effect { op: EffectOp::Memory { op, .. }, inputs, .. } = &mut block.insts[first] {
+                        *op = MemoryOp::Store(MemSize::B64);
+                        inputs[1] = x;
+                    }
+                    removed.push(index);
+                    count += 1;
+                }
+                None => pending.push((index, provenance, semantics, root, offset, exec, data)),
+            }
+        }
+        for &index in removed.iter().rev() { block.insts.remove(index); }
+    }
+    count
+}
+
+pub(crate) fn wide_loads(f: &mut Func, constants: &[Option<u64>]) -> usize {
+    let defs = f.definitions();
+    let mut uses: Vec<Vec<ValueId>> = vec![Vec::new(); f.types.len()];
+    let mut packs: BTreeMap<ValueId, (ValueId, ValueId)> = BTreeMap::new();
+    for block in f.blocks.values() {
+        for inst in &block.insts {
+            match inst {
+                Inst::Core { value, op: Op::Pack64(a, b), .. } => { packs.insert(*value, (*a, *b)); uses[a.0].push(*value); uses[b.0].push(*value); }
+                _ => super::dce::operands(inst, |v| uses[v.0].push(ValueId(usize::MAX))),
+            }
+        }
+        for edge in block.term.edges() { for &v in &edge.args { uses[v.0].push(ValueId(usize::MAX)); } }
+        if let Term::CondBr { cond, .. } = &block.term { uses[cond.0].push(ValueId(usize::MAX)); }
+    }
+    let word_load = |inst: &Inst| -> Option<(u64, MemorySemantics, ValueId, ValueId, ValueId)> {
+        match inst {
+            Inst::Effect { provenance, op: EffectOp::Memory { space: Space::Global, op: MemoryOp::Load(MemSize::B32), semantics }, inputs, outputs } if !semantics.volatile => {
+                Some((*provenance, *semantics, inputs[0], inputs[1], outputs[0].0))
+            }
+            _ => None,
+        }
+    };
+    let mut renames: BTreeMap<ValueId, ValueId> = BTreeMap::new();
+    let mut count = 0;
+    let mut next = f.types.len();
+    let mut fresh: Vec<Ty> = Vec::new();
+    for block in f.blocks.values_mut() {
+        let mut pending: Vec<(usize, u64, MemorySemantics, ValueId, i64, ValueId, ValueId)> = Vec::new();
+        let mut removed: Vec<usize> = Vec::new();
+        for index in 0..block.insts.len() {
+            let Some((provenance, semantics, address, exec, hi)) = word_load(&block.insts[index]) else {
+                if matches!(block.insts[index], Inst::Effect { .. }) { pending.clear(); }
+                continue;
+            };
+            let (root, offset) = located(&defs, constants, address);
+            let partner = pending.iter().position(|&(_, p, m, r, o, e, _)| p >> 8 == provenance >> 8 && m == semantics && r == root && o + 4 == offset && e == exec);
+            let joined = partner.map(|k| pending[k]).filter(|&(_, _, _, _, _, _, lo)| {
+                !uses[lo.0].is_empty() && uses[lo.0].iter().chain(&uses[hi.0]).all(|u| packs.get(u).is_some_and(|&(a, b)| a == lo && b == hi))
+            });
+            match joined {
+                Some((first, _, _, _, _, _, lo)) => {
+                    let wide = ValueId(next);
+                    next += 1;
+                    fresh.push(Ty::I64);
+                    if let Inst::Effect { op: EffectOp::Memory { op, .. }, outputs, .. } = &mut block.insts[first] {
+                        *op = MemoryOp::Load(MemSize::B64);
+                        *outputs = vec![(wide, Ty::I64)];
+                    }
+                    removed.push(index);
+                    for &u in &uses[lo.0] { renames.insert(u, wide); }
+                    pending.remove(partner.unwrap());
+                    count += 1;
+                }
+                None => pending.push((index, provenance, semantics, root, offset, exec, hi)),
+            }
+        }
+        for &index in removed.iter().rev() { block.insts.remove(index); }
+    }
+    if count == 0 { return 0; }
+    f.types.extend(fresh);
+    for block in f.blocks.values_mut() {
+        block.insts.retain(|inst| !matches!(inst, Inst::Core { value, .. } if renames.contains_key(value)));
+    }
+    super::simplify::rename(f, &renames);
+    f.compact();
+    count
 }

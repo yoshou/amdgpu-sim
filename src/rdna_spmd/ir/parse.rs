@@ -94,7 +94,7 @@ const CVTS: &[(&str, Cvt)] = &[("sitofp.rte", Cvt::SignedToFloatRte), ("uitofp.r
 const ENVS: &[(&str, Env)] = &[("lane_id", Env::LaneId), ("packet_lane_id", Env::PacketLaneId), ("valid_lane", Env::ValidLane), ("outside_lanes", Env::OutsideLanes),
     ("scratch_base", Env::ScratchBase), ("scratch_size", Env::ScratchSize)];
 const SPACES: &[(&str, Space)] = &[("global", Space::Global), ("scratch", Space::Scratch), ("lds", Space::Lds)];
-const SIZES: &[(&str, MemSize)] = &[("u8", MemSize::U8), ("i8", MemSize::I8), ("u16", MemSize::U16), ("i16", MemSize::I16), ("b32", MemSize::B32)];
+const SIZES: &[(&str, MemSize)] = &[("u8", MemSize::U8), ("i8", MemSize::I8), ("u16", MemSize::U16), ("i16", MemSize::I16), ("b32", MemSize::B32), ("b64", MemSize::B64)];
 const SCOPES: &[(&str, Scope)] = &[("workitem", Scope::WorkItem), ("cu", Scope::ComputeUnit), ("se", Scope::ShaderEngine), ("device", Scope::Device),
     ("system", Scope::System), ("workgroup", Scope::Workgroup)];
 const ORDERINGS: &[(&str, Ordering)] = &[("relaxed", Ordering::Relaxed), ("acquire", Ordering::Acquire), ("release", Ordering::Release),

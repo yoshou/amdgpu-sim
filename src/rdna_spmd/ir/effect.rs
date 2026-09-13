@@ -25,6 +25,7 @@ pub(crate) enum MemSize {
     U16,
     I16,
     B32,
+    B64,
 }
 impl MemSize {
     pub fn bytes(self) -> u32 {
@@ -32,6 +33,7 @@ impl MemSize {
             Self::U8 | Self::I8 => 1,
             Self::U16 | Self::I16 => 2,
             Self::B32 => 4,
+            Self::B64 => 8,
         }
     }
     pub fn signed(self) -> bool {
@@ -110,7 +112,9 @@ impl EffectOp {
         use Ty::*;
         match self {
             Self::Memory { space, op, .. } => match op {
+                MemoryOp::Load(MemSize::B64) => (vec![space.address_type(), I1], vec![I64]),
                 MemoryOp::Load(_) => (vec![space.address_type(), I1], vec![I32]),
+                MemoryOp::Store(MemSize::B64) => (vec![space.address_type(), I64, I1], vec![]),
                 MemoryOp::Store(_) => (vec![space.address_type(), I32, I1], vec![]),
                 MemoryOp::AtomicAdd => (vec![space.address_type(), I32, I1], vec![I32]),
                 MemoryOp::Fence => (vec![], vec![]),
