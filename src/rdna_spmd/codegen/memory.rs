@@ -43,13 +43,14 @@ pub(in crate::rdna_spmd) enum Shape {
 pub(in crate::rdna_spmd) fn global_load(access: &Access, uniform: &[bool], affine: &BTreeMap<ValueId, u32>) -> GlobalLoad {
     if std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("gather")) { return GlobalLoad::Gather; }
     if !matches!(access.form, Form::Global { .. }) { return GlobalLoad::Gather; }
-    if access.op != MemoryOp::Load(MemSize::B32) || !(1..=4).contains(&access.words) { return GlobalLoad::Gather; }
+    if !matches!(access.op, MemoryOp::Load(MemSize::B32 | MemSize::B64)) || !(1..=4).contains(&access.words) { return GlobalLoad::Gather; }
     if uniform[access.base.0] { return GlobalLoad::Broadcast; }
     if access.form == (Form::Global { scalar_base: false }) {
         if let Some(&stride) = affine.get(&access.base) {
             let words = stride / 4;
             let offset_word = access.offset / 4;
-            if words >= 1 && access.offset % 4 == 0 && offset_word >= 0 && offset_word as u32 + access.words <= words {
+            let span = access.words * (access.size().bytes() / 4);
+            if words >= 1 && access.offset % 4 == 0 && offset_word >= 0 && offset_word as u32 + span <= words {
                 return GlobalLoad::Frame { stride_words: words, offset_words: offset_word as u32 };
             }
         }
@@ -71,11 +72,18 @@ pub(in crate::rdna_spmd) fn shape(access: &Access, width: Option<u32>, load: Glo
     }
     let affine = access.form == (Form::Scratch { uniform: true });
     if access.stores() {
-        return Shape::Store(if access.size() != MemSize::B32 { StoreShape::Narrow }
+        return Shape::Store(if access.size().bytes() < 4 { StoreShape::Narrow }
             else if access.space == Space::Lds { StoreShape::Lds }
             else if affine && access.words >= 2 && access.static_scratch_end(constants).is_some() { StoreShape::Tile }
             else if affine { StoreShape::Affine }
             else { StoreShape::Scatter });
+    }
+    if access.size() == MemSize::B64 {
+        return match load {
+            GlobalLoad::Frame { stride_words, offset_words } => Shape::Frame { stride_words, offset_words, group: width.min(8) },
+            GlobalLoad::Broadcast => Shape::Words { lanes: Lanes::Broadcast, pairs: false },
+            GlobalLoad::Gather => Shape::Words { lanes: Lanes::Gather, pairs: false },
+        };
     }
     if access.size() != MemSize::B32 { return Shape::NarrowLoad; }
     let allocated = access.static_scratch_end(constants).is_some();
@@ -100,9 +108,10 @@ pub(in crate::rdna_spmd) fn clusters(f: &Func, accesses: &[Access], width: Optio
     let mut start = 0;
     while start < accesses.len() {
         let first = &accesses[start];
-        let eligible = |a: &Access| a.form == (Form::Global { scalar_base: false }) && a.op == MemoryOp::Load(MemSize::B32) && matches!(a.words, 2 | 4) && a.base == first.base;
+        let eligible = |a: &Access| a.form == (Form::Global { scalar_base: false }) && a.base == first.base
+            && (a.op == MemoryOp::Load(MemSize::B32) && matches!(a.words, 2 | 4) || a.op == MemoryOp::Load(MemSize::B64) && matches!(a.words, 1 | 2));
         if !eligible(first) || uniform[first.base.0] || affine.contains_key(&first.base) { start += 1; continue; }
-        let mut ranges = vec![(first.offset, first.offset + 4 * first.words as i64)];
+        let mut ranges = vec![(first.offset, first.offset + (first.size().bytes() * first.words) as i64)];
         let mut len = 1;
         while start + len < accesses.len() {
             let prev = &accesses[start + len - 1];
@@ -110,7 +119,7 @@ pub(in crate::rdna_spmd) fn clusters(f: &Func, accesses: &[Access], width: Optio
             if next.block != prev.block || !eligible(next) { break; }
             let between = &f.blocks[&prev.block].insts[prev.end..next.start];
             if between.iter().any(|inst| !matches!(inst, Inst::Core { .. })) { break; }
-            ranges.push((next.offset, next.offset + 4 * next.words as i64));
+            ranges.push((next.offset, next.offset + (next.size().bytes() * next.words) as i64));
             len += 1;
         }
         if len >= 3 {
@@ -328,6 +337,13 @@ impl<'a> Cg<'a> {
             let access = &self.p.accesses[m];
             let f0 = ((access.offset - cluster.lo) / 8) as usize;
             let results = access.results.clone();
+            if access.size() == MemSize::B64 {
+                for j in 0..access.words as usize {
+                    let wide = LLVMBuildBitCast(self.b, cols[f0 + j], self.vi64(), n);
+                    self.define(results[j], wide);
+                }
+                continue;
+            }
             for j in 0..(access.words / 2) as usize {
                 let (lo, hi) = self.split_pair(cols[f0 + j]);
                 self.define(results[2 * j], lo);
@@ -349,7 +365,7 @@ impl<'a> Cg<'a> {
             LLVMBuildFence(self.b, order, 0, n);
             return;
         }
-        let elem = match access.size().bytes() { 1 => LLVMInt8TypeInContext(self.ctx), 2 => LLVMInt16TypeInContext(self.ctx), _ => self.i32t };
+        let elem = match access.size().bytes() { 1 => LLVMInt8TypeInContext(self.ctx), 2 => LLVMInt16TypeInContext(self.ctx), 8 => self.i64t, _ => self.i32t };
         let size = access.size();
         let words = access.words;
         let offsets = access.offsets.clone();
@@ -392,7 +408,7 @@ impl<'a> Cg<'a> {
                 if shape == Shape::ScalarStore {
                     for k in 0..words as usize {
                         let value = self.scalar(data[k]);
-                        let value = if size == MemSize::B32 { value } else { LLVMBuildTrunc(self.b, value, elem, n) };
+                        let value = if size.bytes() >= 4 { value } else { LLVMBuildTrunc(self.b, value, elem, n) };
                         let a = guard(self, LLVMBuildAdd(self.b, addr, self.ci64(offsets[k] as u64), n));
                         let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
                         let store = LLVMBuildStore(self.b, value, p);
@@ -417,9 +433,9 @@ impl<'a> Cg<'a> {
                     } else {
                         let p = LLVMBuildIntToPtr(self.b, LLVMBuildAdd(self.b, load_addr, self.ci64(offsets[k] as u64), n), self.ptr, n);
                         let load = LLVMBuildLoad2(self.b, elem, p, n);
-                        LLVMSetAlignment(load, if shape == Shape::ScalarWords { if size == MemSize::B32 { 4 } else { 1 } } else if space == Space::Lds || size != MemSize::B32 { 1 } else { 4 });
+                        LLVMSetAlignment(load, if shape == Shape::ScalarWords { if size.bytes() >= 4 { 4 } else { 1 } } else if space == Space::Lds || size.bytes() < 4 { 1 } else { 4 });
                         if shape != Shape::ScalarWords { LLVMSetVolatile(load, volatile as i32); }
-                        let value = if size == MemSize::B32 { load } else if size.signed() { LLVMBuildSExt(self.b, load, self.i32t, n) } else { LLVMBuildZExt(self.b, load, self.i32t, n) };
+                        let value = if size.bytes() >= 4 { load } else if size.signed() { LLVMBuildSExt(self.b, load, self.i32t, n) } else { LLVMBuildZExt(self.b, load, self.i32t, n) };
                         self.define(results[k], value);
                         k += 1;
                     }
@@ -504,7 +520,7 @@ impl<'a> Cg<'a> {
                         StoreShape::Lds => self.masked_scatter_ty(value, ptrs, exec, self.i32t, 1),
                         StoreShape::Affine => self.affine_store(value, ptrs, exec),
                         StoreShape::Tile => unreachable!("tile stores are emitted as rows"),
-                        StoreShape::Scatter => self.masked_scatter_ty(value, ptrs, exec, self.i32t, 4),
+                        StoreShape::Scatter => self.masked_scatter_ty(value, ptrs, exec, elem, 4),
                     }
                 }
             }
@@ -537,15 +553,17 @@ impl<'a> Cg<'a> {
                     LLVMSetAlignment(ld, 4);
                     ld
                 }).collect();
+                let per = size.bytes() / 4;
                 let extract = |cg: &Self, fw: u32| -> LLVMValueRef {
                     let parts: Vec<LLVMValueRef> = blocks.iter().map(|&blk| {
-                        let mut idx: Vec<LLVMValueRef> = (0..grp).map(|lane| cg.ci32(lane * sp4 + fw)).collect();
-                        let mask = LLVMConstVector(idx.as_mut_ptr(), grp);
+                        let mut idx: Vec<LLVMValueRef> = (0..grp).flat_map(|lane| (0..per).map(move |w| lane * sp4 + fw + w)).map(|i| cg.ci32(i)).collect();
+                        let mask = LLVMConstVector(idx.as_mut_ptr(), grp * per);
                         LLVMBuildShuffleVector(cg.b, blk, poison_blk, mask, n)
                     }).collect();
-                    cg.vconcat_i32(&parts)
+                    let joined = cg.vconcat_i32(&parts);
+                    if per == 1 { joined } else { LLVMBuildBitCast(cg.b, joined, cg.vi64(), n) }
                 };
-                for k in 0..words as usize { let v = extract(self, ioff_w + k as u32); self.define(results[k], v); }
+                for k in 0..words as usize { let v = extract(self, ioff_w + k as u32 * per); self.define(results[k], v); }
             }
             Shape::Words { lanes, pairs } => {
                 let mut k = 0usize;
@@ -564,10 +582,10 @@ impl<'a> Cg<'a> {
                     } else {
                         let ptrs = self.ptr_at_vec(addr, offsets[k] as u64);
                         let d = match lanes {
-                            Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, self.i32t),
+                            Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, elem),
                             Lanes::Lds => self.masked_gather_ty(ptrs, exec, self.i32t, 1),
                             Lanes::Affine { allocated } => self.affine_load(ptrs, exec, allocated),
-                            Lanes::Gather => self.masked_gather_ty(ptrs, exec, self.i32t, 4),
+                            Lanes::Gather => self.masked_gather_ty(ptrs, exec, elem, 4),
                         };
                         self.define(results[k], d);
                         k += 1;

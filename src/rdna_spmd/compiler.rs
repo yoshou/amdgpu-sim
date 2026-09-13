@@ -23,7 +23,7 @@ use super::program::{LiftedFunction, Parameter, ParameterSource};
 use super::pass::{Driver, Pass};
 use super::pass::uniform_queries::UniformQueries;
 use super::pass::cse::Cse;
-use super::pass::{active::Active, adjacency::Adjacency, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, LocalWriteLanes, PacketState}, idioms::Idioms, mask_projection::MaskProjection, narrow::Narrow, pairs::Pairs, simplify::Simplify, specialise::Specialise};
+use super::pass::{active::Active, adjacency::Adjacency, dce::{Dce, DeadParams, DeadWrites}, entry::{AssumeDispatchExec, DiscardReturn, LocalWriteLanes, PacketState}, idioms::Idioms, mask_projection::MaskProjection, narrow::Narrow, pairs::{Pairs, WideMemory}, simplify::Simplify, specialise::Specialise};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ScalarMode { Whole, Cooperative }
@@ -130,7 +130,7 @@ fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, wi
         driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
         driver.pipeline(&mut ir, an, &[&Pairs]).unwrap();
         let limit = 1 + ir.types.len();
-        driver.fixpoint(&mut ir, an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
+        driver.fixpoint(&mut ir, an, "simplify", limit, &[&Simplify, &Dce, &DeadParams, &WideMemory]).unwrap();
     }
     driver.pipeline(&mut ir, an, &[&Adjacency]).unwrap();
     let constants = an.get::<Constants>(&ir);

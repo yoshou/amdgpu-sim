@@ -80,6 +80,8 @@ impl Fact {
                 else if mask & lane == 0 { Self::Uniform }
                 else { Self::Varying }
             }
+            Self::Affine { span: None, .. } if mask != 0 && (mask + 1).is_power_of_two() => self.word(mask.count_ones()),
+            Self::Affine { stride, span: None } if mask != 0 && (!mask + 1).is_power_of_two() && stride.trailing_zeros() >= (!mask).count_ones() => Self::Affine { stride, span: None },
             _ => Self::Varying,
         }
     }
@@ -89,6 +91,7 @@ impl Fact {
             Self::Affine { span: Some((_, end)), .. } if amount >= end as u64 => Self::Uniform,
             Self::Affine { stride, span: Some((start, end)) } if amount <= start as u64 && stride.trailing_zeros() as u64 >= amount =>
                 Self::Affine { stride: stride >> amount, span: Some((start - amount as u32, end - amount as u32)) },
+            Self::Affine { stride, span: None } if amount < 64 && stride.trailing_zeros() as u64 >= amount => Self::Affine { stride: stride >> amount, span: None },
             _ => Self::Varying,
         }
     }
@@ -136,7 +139,7 @@ fn effect_output(op: EffectOp, inputs: &[Fact]) -> Fact {
     match op {
         EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane | WaveOp::ReadLane) => Fact::Uniform,
         EffectOp::Wave(_) => Fact::Varying,
-        EffectOp::Memory { space: Space::Global, op: MemoryOp::Load(MemSize::B32), .. } => {
+        EffectOp::Memory { space: Space::Global, op: MemoryOp::Load(MemSize::B32 | MemSize::B64), .. } => {
             if inputs[0] == Fact::Uniform { Fact::Uniform } else { Fact::Varying }
         }
         EffectOp::Memory { .. } => Fact::Varying,
