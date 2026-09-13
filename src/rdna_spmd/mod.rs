@@ -83,6 +83,7 @@
 
 
 mod analysis;
+mod host;
 mod engine;
 mod target;
 mod targets;

@@ -31,6 +31,7 @@ pub(super) struct Prepared {
     pub ir: VerifiedFunc,
     pub inputs: Vec<Parameter>,
     pub width: Option<u32>,
+    pub wide_masks: bool,
     pub abi: Abi,
     pub observable_return: bool,
     pub uniform: Vec<bool>,
@@ -172,6 +173,7 @@ pub(super) unsafe fn compile(p: &Prepared, name: &str, mode: super::jit::Mode) -
     let sink = LLVMBuildArrayAlloca(b, i32t, LLVMConstInt(i32t, 10, 0), n);
     let mut em = Emitter::new(b, p.width, p.registry.clone());
     em.state = p.registry.lowering_state(&em, sink);
+    em.set_wide(p.wide_masks);
     let mut sem = Emitter::new(b, None, p.registry.clone());
     sem.state = p.registry.lowering_state(&sem, sink);
     let scratch_env = if p.width.is_some() { (scratch_base_scalar, scratch_stride) } else {
@@ -299,7 +301,7 @@ impl<'a> Cg<'a> {
             Some(w) => {
                 let iw = LLVMIntTypeInContext(self.ctx, w);
                 let bits = LLVMBuildTrunc(self.b, word, iw, self.n());
-                LLVMBuildBitCast(self.b, bits, LLVMVectorType(self.i1, w), self.n())
+                self.em.from_bool(LLVMBuildBitCast(self.b, bits, LLVMVectorType(self.i1, w), self.n()))
             }
             None => LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, LLVMBuildAnd(self.b, word, self.ci32(1), self.n()), self.ci32(0), self.n()),
         }
@@ -308,7 +310,7 @@ impl<'a> Cg<'a> {
         match self.p.width {
             Some(w) => {
                 let iw = LLVMIntTypeInContext(self.ctx, w);
-                let bits = LLVMBuildBitCast(self.b, v, iw, self.n());
+                let bits = LLVMBuildBitCast(self.b, self.em.to_bool(v), iw, self.n());
                 LLVMBuildZExt(self.b, bits, self.i32t, self.n())
             }
             None => LLVMBuildZExt(self.b, v, self.i32t, self.n()),
@@ -338,6 +340,7 @@ impl<'a> Cg<'a> {
         if self.p.width.is_none() || self.is_vector(value) { return value; }
         if !self.vectors[v.0].is_null() { return self.vectors[v.0]; }
         let out = self.splat(value);
+        let out = if self.types[v.0] == Ty::I1 { self.em.from_bool(out) } else { out };
         self.vectors[v.0] = out;
         out
     }
@@ -347,6 +350,7 @@ impl<'a> Cg<'a> {
         if !self.is_vector(value) { return value; }
         if !self.scalars[v.0].is_null() { return self.scalars[v.0]; }
         let out = LLVMBuildExtractElement(self.b, value, self.ci32(0), self.n());
+        let out = if self.em.wide() && self.types[v.0] == Ty::I1 { LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, out, self.ci64(0), self.n()) } else { out };
         self.scalars[v.0] = out;
         out
     }
@@ -563,11 +567,7 @@ impl<'a> Cg<'a> {
                     if let Some(result) = self.any_of_word(*input) { self.define(*output, result); return; }
                 }
                 let bits = match self.p.width {
-                    Some(w) => {
-                        let v = self.vector(*input);
-                        let iw = LLVMIntTypeInContext(self.ctx, w);
-                        LLVMBuildZExt(self.b, LLVMBuildBitCast(self.b, v, iw, n), self.i32t, n)
-                    }
+                    Some(_) => { let v = self.vector(*input); self.vec_to_mask(v) }
                     None => { let v = self.scalar(*input); LLVMBuildZExt(self.b, v, self.i32t, n) }
                 };
                 let result = if *op == PacketOp::Any { LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bits, self.ci32(0), n) } else { bits };
@@ -638,7 +638,9 @@ impl<'a> Cg<'a> {
             && args.iter().all(|a| !self.is_vector(self.values[a.0])));
         let mut table = self.values.clone();
         for a in &args { table[a.0] = self.shaped(*a, scalar); }
+        if let Op::Convert(Cvt::ZExt | Cvt::SExt, _, a) = op { if self.types[a.0] == Ty::I1 { table[a.0] = self.em.to_bool(table[a.0]); } }
         let result = if scalar { self.sem.op(ty, op, &table) } else { self.em.op(ty, op, &table) };
+        let result = if matches!(op, Op::Convert(Cvt::Trunc, Ty::I1, _)) { self.em.from_bool(result) } else { result };
         let _ = n;
         self.define(value, result);
     }

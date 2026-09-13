@@ -119,7 +119,7 @@ struct Bare { ir: Func, inputs: Vec<Parameter>, registry: Arc<DialectRegistry> }
 
 fn bare(f: LiftedFunction) -> Bare { Bare { ir: f.ir, inputs: f.parameter_inputs, registry: f.registry } }
 
-fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, width: Option<u32>, abi: Abi, observable_return: bool, num_vgprs: usize) -> Prepared {
+fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, width: Option<u32>, wide_masks: bool, abi: Abi, observable_return: bool, num_vgprs: usize) -> Prepared {
     let driver = Driver::new();
     let mut passes: Vec<&dyn Pass> = vec![&PacketState];
     if abi == Abi::Cooperative { passes.push(&LocalWriteLanes); }
@@ -128,7 +128,7 @@ fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, wi
     driver.pipeline(&mut ir, an, &passes).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
         driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
-        driver.pipeline(&mut ir, an, &[&Pairs]).unwrap();
+        driver.pipeline(&mut ir, an, &[&Pairs { every_use: wide_masks }]).unwrap();
         let limit = 1 + ir.types.len();
         driver.fixpoint(&mut ir, an, "simplify", limit, &[&Simplify, &Dce, &DeadParams]).unwrap();
     }
@@ -149,12 +149,12 @@ fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, wi
     let inputs = an.context().inputs.to_vec();
     let ir = ir.verify_with(registry).expect("invalid prepared function SSA");
     Prepared {
-        registry: Arc::clone(registry), ir, inputs, width, abi, observable_return,
+        registry: Arc::clone(registry), ir, inputs, width, wide_masks, abi, observable_return,
         uniform, exec, constants, accesses, shapes, clusters, yields, groups, min_private_bytes, num_vgprs,
     }
 }
 
-pub(super) fn prepare_packet(f: LiftedFunction, width: u32, cooperative: bool, observe_return: bool, num_vgprs: usize, aligned: bool) -> Prepared {
+pub(super) fn prepare_packet(f: LiftedFunction, width: u32, wide_masks: bool, cooperative: bool, observe_return: bool, num_vgprs: usize, aligned: bool) -> Prepared {
     let Bare { mut ir, inputs, registry } = bare(f);
     let driver = Driver::new();
     let base = context(&registry, &inputs, width);
@@ -169,7 +169,7 @@ pub(super) fn prepare_packet(f: LiftedFunction, width: u32, cooperative: bool, o
     passes.push(&Narrow);
     driver.pipeline(&mut ir, &mut an, &passes).unwrap();
     let abi = if cooperative { Abi::Cooperative } else { Abi::Whole };
-    prepared(ir, &mut an, &registry, Some(width), abi, observe_return, num_vgprs)
+    prepared(ir, &mut an, &registry, Some(width), wide_masks, abi, observe_return, num_vgprs)
 }
 
 pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usize) -> Prepared {
@@ -183,7 +183,7 @@ pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usi
     }
     let abi = match mode { ScalarMode::Whole => Abi::Whole, ScalarMode::Cooperative => Abi::Cooperative };
     let mut an = Analyses::new(Context { entry_full: true, exec_initial: true, ..base });
-    prepared(ir, &mut an, &registry, None, abi, mode != ScalarMode::Whole, num_vgprs)
+    prepared(ir, &mut an, &registry, None, false, abi, mode != ScalarMode::Whole, num_vgprs)
 }
 
 impl Compiler {
@@ -206,7 +206,8 @@ pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel
 
 pub(crate) fn compile_packet(program: Program, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
-    let p = prepare_packet(program.function, width, false, false, num_vgprs.max(256), aligned);
+    let wide = wide_masks(&program.function.ir, width);
+    let p = prepare_packet(program.function, width, wide, false, false, num_vgprs.max(256), aligned);
     let group = p.group();
     let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
     VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x, group)
@@ -218,7 +219,8 @@ pub(crate) fn compile_cooperative_packet(program: Program, num_vgprs: usize, wid
     let program = super::program::split_at_effects(program, width >= 32);
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
     let num_vgprs = program.vgpr_count(num_vgprs);
-    let p = prepare_packet(program.function, width, true, true, num_vgprs, aligned);
+    let wide = wide_masks(&program.function.ir, width);
+    let p = prepare_packet(program.function, width, wide, true, true, num_vgprs, aligned);
     let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
     let yields = p.resume_layouts();
     if yields.iter().flatten().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
@@ -283,6 +285,15 @@ impl Compiler {
     pub fn compile(&self, program: &impl CompilationInput, options: CompileOptions) -> Kernel { compile(program, options) }
 }
 
+fn wide_masks(f: &Func, width: u32) -> bool {
+    let setting = std::env::var("AMDGPU_SIM_WIDE_MASKS").unwrap_or_default();
+    if width == 0 || width >= WAVE || setting.is_empty() || setting == "0" { return false; }
+    if setting == "force" { return true; }
+    let (narrow, wide) = super::analysis::mask_cost::costs(f, width, &super::host::Vectors::detect());
+    if Driver::new().trace { eprintln!("; mask representation W={width}: narrow cost {narrow:.0}, wide cost {wide:.0}, {}", if wide < narrow { "wide" } else { "narrow" }); }
+    wide < narrow
+}
+
 pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kernel {
     assert!(matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16 | 32), "unsupported packet width {}", options.width);
     let program = program.to_ssa();
@@ -290,7 +301,9 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
     dispatch_passes_ir(&mut folded.function, true);
     let sharing = sharing(&folded, false);
     let width = options.width;
-    let program = if width >= WAVE || !(sharing.barrier || sharing.exchange) {
+    let wide_masks = wide_masks(&program.function.ir, width);
+    let lanes_as_bits = wide_masks;
+    let program = if width >= WAVE || !(sharing.barrier || sharing.exchange || lanes_as_bits) {
         let mut program = program;
         dispatch_passes_ir(&mut program.function, false);
         program
@@ -364,7 +377,7 @@ mod tests {
         assert!(constants(&p.function.ir, 4).contains(&2));
         assert!(matches!(p.function.ir.blocks[&BlockId(4)].term, Term::Ret(_)));
         assert!(constants(&p.function.ir, 4).contains(&1));
-        let packet = prepare_packet(p.function, 16, false, false, 256, true);
+        let packet = prepare_packet(p.function, 16, false, false, false, 256, true);
         assert!(constants(packet.ir.func(), 4).is_empty());
     }
 

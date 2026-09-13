@@ -21,49 +21,83 @@ fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut [Vec<ValueId>
     }
 }
 
-pub(crate) struct Pairs;
+pub(crate) struct Pairs { pub every_use: bool }
 impl super::Pass for Pairs {
     fn name(&self) -> &str { "pairs" }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
         let uniform = analyses.get::<Uniformity>(f).uniform();
-        run(f, &uniform) > 0
+        run(f, &uniform, self.every_use) > 0
     }
 }
 
-pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
+pub(crate) fn run(f: &mut Func, uniform: &[bool], every_use: bool) -> usize {
     let defs = f.definitions();
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut position = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
     for (at, id) in f.blocks.keys().enumerate() { position[id.0] = at; }
     let mut incoming: Vec<Vec<&Edge>> = (0..f.blocks.len()).map(|_| Vec::new()).collect();
     let mut packed: Vec<Vec<ValueId>> = vec![Vec::new(); f.types.len()];
-    let mut float = vec![false; f.types.len()];
+    let mut wide = vec![false; f.types.len()];
     for block in f.blocks.values() {
-        for inst in &block.insts { if let Inst::Core { op: Op::Convert(super::super::ir::Cvt::Bitcast, Ty::F64, a), .. } = inst { float[a.0] = true; } }
+        for inst in &block.insts {
+            match inst {
+                Inst::Core { op: Op::Convert(super::super::ir::Cvt::Bitcast, Ty::F64, a), .. } => wide[a.0] = true,
+                _ if !every_use => {}
+                Inst::Core { op: Op::UnpackLo(_) | Op::UnpackHi(_), .. } => {}
+                _ => super::dce::operands(inst, |v| wide[v.0] = true),
+            }
+        }
+        if !every_use { continue; }
+        for edge in block.term.edges() { for &v in &edge.args { wide[v.0] = true; } }
+        match &block.term { Term::CondBr { cond, .. } => wide[cond.0] = true, Term::Ret(args) => for &v in args { wide[v.0] = true; }, Term::Br(_) => {} }
     }
     for (&id, block) in &f.blocks {
         for (index, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, index)); }
-        let _ = id;
         for edge in block.term.edges() { incoming[position[edge.dst.0]].push(edge); }
-        for inst in &block.insts { if let Inst::Core { op: Op::Pack64(a, b), value, .. } = inst { if float[value.0] { observed(*a, *b, &defs, &mut packed); } } }
+        for inst in &block.insts { if let Inst::Core { op: Op::Pack64(a, b), value, .. } = inst { if wide[value.0] { observed(*a, *b, &defs, &mut packed); } } }
     }
     let eligible = |block: &Block, index: usize| {
         index + 1 < block.params.len() && block.params[index].1 == Ty::I32 && block.params[index + 1].1 == Ty::I32
             && uniform[block.params[index].0.0] == uniform[block.params[index + 1].0.0]
     };
-    let mut candidates: BTreeSet<(BlockId, usize)> = BTreeSet::new();
+    let mut slots: BTreeMap<(BlockId, usize), usize> = BTreeMap::new();
     for (&id, block) in &f.blocks {
         if id == f.entry { continue; }
         for index in 0..block.params.len() {
-            if eligible(block, index) && packed[block.params[index].0 .0].contains(&block.params[index + 1].0) { candidates.insert((id, index)); }
+            if eligible(block, index) { let next = slots.len(); slots.insert((id, index), next); }
         }
     }
-    let mut pending: Vec<(BlockId, usize)> = candidates.iter().copied().collect();
-    while let Some((id, index)) = pending.pop() {
+    let mut class: Vec<usize> = (0..slots.len()).collect();
+    fn find(class: &mut Vec<usize>, mut i: usize) -> usize {
+        while class[i] != i { class[i] = class[class[i]]; i = class[i]; }
+        i
+    }
+    for (&(id, index), &slot) in &slots {
         for edge in &incoming[position[id.0]] {
-            let args = &edge.args;
-            if let Source::Carried(block, pi) = source(args[index], args[index + 1], &defs, &params, f) {
-                if block != f.entry && eligible(&f.blocks[&block], pi) && candidates.insert((block, pi)) { pending.push((block, pi)); }
+            if let Source::Carried(block, pi) = source(edge.args[index], edge.args[index + 1], &defs, &params, f) {
+                if let Some(&other) = slots.get(&(block, pi)) {
+                    let (a, b) = (find(&mut class, slot), find(&mut class, other));
+                    class[a] = b;
+                }
+            }
+        }
+    }
+    let mut observed_class = vec![false; slots.len()];
+    for (&(id, index), &slot) in &slots {
+        let block = &f.blocks[&id];
+        if packed[block.params[index].0 .0].contains(&block.params[index + 1].0) { let root = find(&mut class, slot); observed_class[root] = true; }
+    }
+    let mut candidates: BTreeSet<(BlockId, usize)> = slots.iter()
+        .filter(|(&(id, index), &slot)| if every_use { observed_class[find(&mut class, slot)] } else { let block = &f.blocks[&id]; packed[block.params[index].0 .0].contains(&block.params[index + 1].0) })
+        .map(|(&pair, _)| pair)
+        .collect();
+    if !every_use {
+        let mut pending: Vec<(BlockId, usize)> = candidates.iter().copied().collect();
+        while let Some((id, index)) = pending.pop() {
+            for edge in &incoming[position[id.0]] {
+                if let Source::Carried(block, pi) = source(edge.args[index], edge.args[index + 1], &defs, &params, f) {
+                    if slots.contains_key(&(block, pi)) && candidates.insert((block, pi)) { pending.push((block, pi)); }
+                }
             }
         }
     }

@@ -12,6 +12,7 @@ pub(crate) struct Emitter {
     module: LLVMModuleRef,
     pub(in crate::rdna_spmd) ctx: LLVMContextRef,
     width: Option<u32>,
+    wide: std::cell::Cell<bool>,
     pub(in crate::rdna_spmd) valid_lane: Option<LLVMValueRef>,
     pub(in crate::rdna_spmd) outside_lanes: Option<LLVMValueRef>,
     pub(in crate::rdna_spmd) scratch: Option<(LLVMValueRef, LLVMValueRef)>,
@@ -37,6 +38,7 @@ impl Emitter {
             b,
             module,
             ctx: LLVMGetModuleContext(module),
+            wide: std::cell::Cell::new(false),
             width,
             valid_lane: None,
             outside_lanes: None,
@@ -46,6 +48,7 @@ impl Emitter {
     }
     pub(in crate::rdna_spmd) unsafe fn ty(&self, t: Ty) -> LLVMTypeRef {
         let t = match t {
+            Ty::I1 if self.wide.get() => LLVMInt64TypeInContext(self.ctx),
             Ty::I1 => LLVMInt1TypeInContext(self.ctx),
             Ty::I32 => LLVMInt32TypeInContext(self.ctx),
             Ty::I64 => LLVMInt64TypeInContext(self.ctx),
@@ -54,11 +57,22 @@ impl Emitter {
         };
         self.shaped(t)
     }
+    pub(in crate::rdna_spmd) fn wide(&self) -> bool { self.wide.get() }
+    pub(in crate::rdna_spmd) fn set_wide(&mut self, wide: bool) { self.wide.set(wide && self.width.is_some()); }
+    unsafe fn varying(&self, v: LLVMValueRef) -> bool { LLVMGetTypeKind(LLVMTypeOf(v)) == llvm::LLVMTypeKind::LLVMVectorTypeKind }
+    pub(in crate::rdna_spmd) unsafe fn to_bool(&self, v: LLVMValueRef) -> LLVMValueRef {
+        if !self.wide.get() || !self.varying(v) { return v; }
+        LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntSLT, v, LLVMConstNull(LLVMTypeOf(v)), b"\0".as_ptr().cast())
+    }
+    pub(in crate::rdna_spmd) unsafe fn from_bool(&self, v: LLVMValueRef) -> LLVMValueRef {
+        if !self.wide.get() || !self.varying(v) { return v; }
+        LLVMBuildSExt(self.b, v, self.ty(Ty::I1), b"\0".as_ptr().cast())
+    }
     pub(in crate::rdna_spmd) unsafe fn shaped(&self, scalar: LLVMTypeRef) -> LLVMTypeRef {
         self.width.map_or(scalar, |w| LLVMVectorType(scalar, w))
     }
     pub(in crate::rdna_spmd) unsafe fn constant(&self, ty: Ty, bits: u64) -> LLVMValueRef {
-        let t = LLVMIntTypeInContext(self.ctx, ty.bits());
+        let (t, bits) = if ty == Ty::I1 && self.wide.get() { (LLVMInt64TypeInContext(self.ctx), if bits & 1 == 1 { u64::MAX } else { 0 }) } else { (LLVMIntTypeInContext(self.ctx, ty.bits()), bits) };
         let v = LLVMConstInt(t, bits, 0);
         let v = if let Some(w) = self.width {
             LLVMConstVector(vec![v; w as usize].as_mut_ptr(), w)
@@ -102,8 +116,11 @@ impl Emitter {
     }
     pub unsafe fn target(&self, op: super::super::dialect::TargetOp, args: super::super::dialect::Arguments, values: &[LLVMValueRef]) -> Vec<LLVMValueRef> {
         let spec = self.registry.operation(op).expect("unverified target");
-        let args = args.values().iter().map(|id| values[id.0]).collect::<Vec<_>>();
-        spec.emit(self, &args)
+        let args = args.values().iter().enumerate().map(|(i, id)| if spec.inputs.get(i) == Some(&Ty::I1) { self.to_bool(values[id.0]) } else { values[id.0] }).collect::<Vec<_>>();
+        let wide = self.wide.replace(false);
+        let results = spec.emit(self, &args);
+        self.wide.set(wide);
+        results.into_iter().zip(&spec.outputs).map(|(v, &t)| if t == Ty::I1 { self.from_bool(v) } else { v }).collect()
     }
     pub unsafe fn op(&self, ty: Ty, op: Op, values: &[LLVMValueRef]) -> LLVMValueRef {
         let b = self.b;
@@ -165,7 +182,7 @@ impl Emitter {
                     IntOp::AShr => LLVMBuildAShr(b, a, c, n),
                 }
             }
-            Op::Cmp(p, a, c) => LLVMBuildICmp(
+            Op::Cmp(p, a, c) => self.from_bool(LLVMBuildICmp(
                 b,
                 match p {
                     IntPred::Eq => llvm::LLVMIntPredicate::LLVMIntEQ,
@@ -182,8 +199,8 @@ impl Emitter {
                 v(a),
                 v(c),
                 n,
-            ),
-            Op::FCmp(p, a, c) => LLVMBuildFCmp(
+            )),
+            Op::FCmp(p, a, c) => self.from_bool(LLVMBuildFCmp(
                 b,
                 match p {
                     FloatPred::Oeq => llvm::LLVMRealPredicate::LLVMRealOEQ,
@@ -204,8 +221,8 @@ impl Emitter {
                 v(a),
                 v(c),
                 n,
-            ),
-            Op::Select(c, a, d) => LLVMBuildSelect(b, v(c), v(a), v(d), n),
+            )),
+            Op::Select(c, a, d) => LLVMBuildSelect(b, self.to_bool(v(c)), v(a), v(d), n),
             Op::Float(op, a, c) => match op {
                 FloatOp::Add => LLVMBuildFAdd(b, v(a), v(c), n),
                 FloatOp::Sub => LLVMBuildFSub(b, v(a), v(c), n),
@@ -251,7 +268,7 @@ impl Emitter {
             Op::Convert(op, to, a) => {
                 let a = v(a);
                 let t = self.ty(to);
-                match op {
+                let converted = match op {
                     Cvt::Bitcast => LLVMBuildBitCast(b, a, t, n),
                     Cvt::ZExt => LLVMBuildZExt(b, a, t, n),
                     Cvt::SExt => LLVMBuildSExt(b, a, t, n),
@@ -292,7 +309,8 @@ impl Emitter {
                             &[a],
                         )
                     }
-                }
+                };
+                if to == Ty::I1 { self.from_bool(converted) } else { converted }
             }
         }
     }
