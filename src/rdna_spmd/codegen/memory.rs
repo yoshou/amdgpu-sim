@@ -19,19 +19,7 @@ pub(in crate::rdna_spmd) enum StoreShape {
 }
 
 pub(super) fn transpose_tile(width: u32) -> u32 {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    let native = if std::arch::is_x86_feature_detected!("avx512f") {
-        8
-    } else if std::arch::is_x86_feature_detected!("avx2") {
-        4
-    } else {
-        2
-    };
-    #[cfg(target_arch = "aarch64")]
-    let native = 2;
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-    let native = 1;
-    width.min(native)
+    width.min(super::super::host::Vectors::detect().lanes(64))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -320,6 +308,7 @@ impl<'a> Cg<'a> {
         let n = self.n();
         let first = &self.p.accesses[members[0]];
         let exec = self.vector(first.mask);
+        let exec = self.em.to_bool(exec);
         let addr = self.vector(first.base);
         let zero = LLVMConstNull(self.vi64());
         let masked = LLVMBuildSelect(self.b, exec, addr, zero, n);
@@ -442,6 +431,7 @@ impl<'a> Cg<'a> {
         }
         let mut addr = self.vector(address);
         let exec = self.vector(mask);
+        let exec = self.em.to_bool(exec);
         if space == Space::Scratch {
             addr = LLVMBuildAdd(self.b, self.scratch_vec, LLVMBuildSExt(self.b, addr, self.vi64(), n), n);
         }
@@ -452,6 +442,7 @@ impl<'a> Cg<'a> {
             let lane_offset = LLVMBuildSub(self.b, self.scratch_vec, self.splat(self.scratch_base_scalar), n);
             let physical = LLVMBuildAdd(self.b, addr, lane_offset, n);
             let inside = self.vector(inside);
+            let inside = self.em.to_bool(inside);
             addr = LLVMBuildSelect(self.b, inside, physical, addr, n);
         }
         match shape {

@@ -20,7 +20,7 @@ impl<'a> Cg<'a> {
         match op {
             EffectOp::Wave(WaveOp::Any) | EffectOp::Wave(WaveOp::Ballot) => {
                 let bits = match self.p.width {
-                    Some(w) => { let v = self.vector(inputs[0]); LLVMBuildZExt(self.b, LLVMBuildBitCast(self.b, v, LLVMIntTypeInContext(self.ctx, w), n), self.i32t, n) }
+                    Some(_) => { let v = self.vector(inputs[0]); self.vec_to_mask(v) }
                     None => { let v = self.scalar(inputs[0]); LLVMBuildZExt(self.b, v, self.i32t, n) }
                 };
                 let result = if op == EffectOp::Wave(WaveOp::Any) { LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bits, self.ci32(0), n) } else { bits };
@@ -30,6 +30,7 @@ impl<'a> Cg<'a> {
                 let result = if let Some(w) = self.p.width {
                     let src = self.vector(inputs[0]);
                     let exec = self.vector(inputs[1]);
+                    let exec = self.em.to_bool(exec);
                     let word = self.vec_to_mask(exec);
                     let tz = self.call_i32("llvm.cttz.i32", &[self.i32t, self.i1], &[word, LLVMConstInt(self.i1, 0, 0)]);
                     let over = LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntUGE, tz, self.ci32(w), n);
@@ -81,7 +82,7 @@ impl<'a> Cg<'a> {
                 let value = self.shaped(id, uniform || self.p.width.is_none());
                 let int_ty = if uniform || self.p.width.is_none() { self.i32t } else { self.vi32() };
                 let bits = match ty {
-                    Ty::I1 => LLVMBuildZExt(self.b, value, int_ty, n),
+                    Ty::I1 => LLVMBuildZExt(self.b, self.em.to_bool(value), int_ty, n),
                     Ty::F32 => LLVMBuildBitCast(self.b, value, int_ty, n),
                     Ty::I32 => value,
                     _ => unreachable!("wide wave operand"),
@@ -106,7 +107,7 @@ impl<'a> Cg<'a> {
                 let bool_ty = if uniform || self.p.width.is_none() { self.i1 } else { self.vi1() };
                 let f32_ty = if uniform || self.p.width.is_none() { self.f32t } else { self.vec_ty(self.f32t) };
                 let result = match ty {
-                    Ty::I1 => LLVMBuildTrunc(self.b, bits, bool_ty, n),
+                    Ty::I1 => self.em.from_bool(LLVMBuildTrunc(self.b, bits, bool_ty, n)),
                     Ty::F32 => LLVMBuildBitCast(self.b, bits, f32_ty, n),
                     Ty::I32 => bits,
                     _ => unreachable!("wide wave result"),

@@ -7,6 +7,7 @@ pub(super) enum Mode {
     Packet,
 }
 
+
 pub(super) struct Module {
     pub ctx: LLVMContextRef,
     pub module: LLVMModuleRef,
@@ -149,9 +150,8 @@ impl Module {
         }
         let optimized = OptimizedModule { module: self, machine };
         let options = llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
-        let error = llvm::transforms::pass_builder::LLVMRunPasses(
-            optimized.module.module, if std::env::var("AMDGPU_SIM_OPT").map_or(false, |v| v == "0") { b"default<O0>\0".as_ptr().cast() } else { b"default<O3>\0".as_ptr().cast() }, machine, options,
-        );
+        let pipeline = if std::env::var("AMDGPU_SIM_OPT").map_or(false, |v| v == "0") { b"default<O0>\0".as_ptr() } else { b"default<O3>\0".as_ptr() };
+        let error = llvm::transforms::pass_builder::LLVMRunPasses(optimized.module.module, pipeline.cast(), machine, options);
         llvm::transforms::pass_builder::LLVMDisposePassBuilderOptions(options);
         check(error, "optimization");
         if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_LLVM") {

@@ -22,7 +22,7 @@ pub(crate) trait Pass: Send + Sync {
     fn preserves(&self) -> Preserved { Preserved::none() }
 }
 
-pub(super) struct Driver { trace: bool, verify_each: bool }
+pub(super) struct Driver { pub(super) trace: bool, verify_each: bool }
 
 impl Driver {
     pub fn new() -> Self {
