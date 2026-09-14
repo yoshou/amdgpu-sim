@@ -29,13 +29,24 @@ use super::super::native::Value;
 type ApplyFn = unsafe extern "C" fn(*const *mut u32);
 
 /// One compiled function per supported width, indexed by `log2(width)`.
-static APPLY: [OnceLock<super::super::native::jit::NativeCode>; 6] =
-    [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+static APPLY: [OnceLock<super::super::native::jit::NativeCode>; 6] = [
+    OnceLock::new(),
+    OnceLock::new(),
+    OnceLock::new(),
+    OnceLock::new(),
+    OnceLock::new(),
+    OnceLock::new(),
+];
 
 fn apply_fn(width: usize) -> ApplyFn {
-    assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32), "unsupported packet width {}", width);
+    assert!(
+        matches!(width, 1 | 2 | 4 | 8 | 16 | 32),
+        "unsupported packet width {}",
+        width
+    );
     let addr = APPLY[width.trailing_zeros() as usize]
-        .get_or_init(|| compile(width as u32)).address();
+        .get_or_init(|| compile(width as u32))
+        .address();
     unsafe { std::mem::transmute::<u64, ApplyFn>(addr) }
 }
 
@@ -55,19 +66,30 @@ pub(in crate::rdna_spmd) unsafe fn apply_values(width: usize, packets: *const *m
 /// layout (`vgprs[packet][reg * width + lane]`). WMMA ignores EXEC, so every
 /// lane is read and written.
 #[cfg(test)]
-pub(in crate::rdna_spmd) fn apply(vdst: u32, a: u32, b: u32, c: u32, width: usize, vgprs: &mut [Vec<u32>]) {
+pub(in crate::rdna_spmd) fn apply(
+    vdst: u32,
+    a: u32,
+    b: u32,
+    c: u32,
+    width: usize,
+    vgprs: &mut [Vec<u32>],
+) {
     assert_eq!(vgprs.len(), 32 / width, "a wave is 32 lanes");
     let mut frames = vec![vec![0u32; 16 * width]; vgprs.len()];
     for (frame, registers) in frames.iter_mut().zip(vgprs.iter()) {
         for (slot, first, count) in [(0, a, 4), (4, b, 4), (8, c, 8)] {
-            frame[slot*width..(slot+count)*width]
-                .copy_from_slice(&registers[first as usize*width..(first as usize+count)*width]);
+            frame[slot * width..(slot + count) * width].copy_from_slice(
+                &registers[first as usize * width..(first as usize + count) * width],
+            );
         }
     }
     let pointers: Vec<_> = frames.iter_mut().map(|frame| frame.as_mut_ptr()).collect();
-    unsafe { apply_values(width, pointers.as_ptr()); }
+    unsafe {
+        apply_values(width, pointers.as_ptr());
+    }
     for (frame, registers) in frames.iter().zip(vgprs.iter_mut()) {
-        registers[vdst as usize*width..(vdst as usize+8)*width].copy_from_slice(&frame[8*width..]);
+        registers[vdst as usize * width..(vdst as usize + 8) * width]
+            .copy_from_slice(&frame[8 * width..]);
     }
 }
 
@@ -108,7 +130,10 @@ fn compile(w: u32) -> super::super::native::jit::NativeCode {
         let offset = ir.mul(reg, konst(w));
         let mut parts: Vec<Value> = packets
             .iter()
-            .map(|&p| ir.load(packet_i32, ir.gep(i32t, p, &[offset])).set_alignment(4))
+            .map(|&p| {
+                ir.load(packet_i32, ir.gep(i32t, p, &[offset]))
+                    .set_alignment(4)
+            })
             .collect();
         let mut size = w;
         while size < 32 {
@@ -176,9 +201,12 @@ fn compile(w: u32) -> super::super::native::jit::NativeCode {
         for (p, &packet) in packets.iter().enumerate() {
             let mask: Vec<u32> = (0..w).map(|lane| p as u32 * w + lane).collect();
             let lanes = ir.shuffle_by(value, wave_i32.poison(), &mask);
-            ir.store(lanes, ir.gep(i32t, packet, &[offset])).set_alignment(4);
+            ir.store(lanes, ir.gep(i32t, packet, &[offset]))
+                .set_alignment(4);
         }
     }
     ir.ret_void();
-    native.optimize(super::super::native::jit::Mode::Packet).compile(&name)
+    native
+        .optimize(super::super::native::jit::Mode::Packet)
+        .compile(&name)
 }

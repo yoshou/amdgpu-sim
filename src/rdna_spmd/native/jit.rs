@@ -7,7 +7,6 @@ pub(in crate::rdna_spmd) enum Mode {
     Packet,
 }
 
-
 pub(in crate::rdna_spmd) struct Module {
     ctx: LLVMContextRef,
     module: LLVMModuleRef,
@@ -27,7 +26,9 @@ pub(in crate::rdna_spmd) struct NativeCode {
 unsafe impl Send for NativeCode {}
 unsafe impl Sync for NativeCode {}
 impl NativeCode {
-    pub fn address(&self) -> u64 { self.address }
+    pub fn address(&self) -> u64 {
+        self.address
+    }
 }
 impl Drop for NativeCode {
     fn drop(&mut self) {
@@ -35,15 +36,24 @@ impl Drop for NativeCode {
             if let Some((path, blocks)) = self.block_counts.take() {
                 let mut address = 0u64;
                 let name = CString::new("block_counts").unwrap();
-                let error = llvm::orc2::lljit::LLVMOrcLLJITLookup(self.jit, &mut address, name.as_ptr());
+                let error =
+                    llvm::orc2::lljit::LLVMOrcLLJITLookup(self.jit, &mut address, name.as_ptr());
                 if error.is_null() && address != 0 {
                     let counts = std::slice::from_raw_parts(address as *const u64, blocks);
-                    let text: String = counts.iter().enumerate().map(|(i, c)| format!("{i} {c}\n")).collect();
+                    let text: String = counts
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{i} {c}\n"))
+                        .collect();
                     std::fs::write(format!("{path}.counts"), text).unwrap();
-                } else if !error.is_null() { llvm::error::LLVMConsumeError(error); }
+                } else if !error.is_null() {
+                    llvm::error::LLVMConsumeError(error);
+                }
             }
             let error = llvm::orc2::lljit::LLVMOrcDisposeLLJIT(self.jit);
-            if !error.is_null() { llvm::error::LLVMConsumeError(error); }
+            if !error.is_null() {
+                llvm::error::LLVMConsumeError(error);
+            }
         }
     }
 }
@@ -57,7 +67,9 @@ pub(in crate::rdna_spmd) struct OptimizedModule {
 impl Drop for OptimizedModule {
     fn drop(&mut self) {
         if !self.machine.is_null() {
-            unsafe { llvm::target_machine::LLVMDisposeTargetMachine(self.machine); }
+            unsafe {
+                llvm::target_machine::LLVMDisposeTargetMachine(self.machine);
+            }
         }
     }
 }
@@ -94,7 +106,9 @@ impl Module {
         }
     }
 
-    pub fn builder(&self) -> super::Builder { super::Builder::new(self.ctx, self.module, self.builder) }
+    pub fn builder(&self) -> super::Builder {
+        super::Builder::new(self.ctx, self.module, self.builder)
+    }
 
     pub fn finish(self, mode: Mode) -> NativeCode {
         self.optimize(mode).compile("kernel")
@@ -110,13 +124,15 @@ impl Module {
                 llvm::analysis::LLVMVerifierFailureAction::LLVMReturnStatusAction,
                 &mut message,
             );
-            let diagnostic = if message.is_null() { String::new() } else {
+            let diagnostic = if message.is_null() {
+                String::new()
+            } else {
                 let text = CStr::from_ptr(message).to_string_lossy().into_owned();
                 LLVMDisposeMessage(message);
                 text
             };
             assert_eq!(invalid, 0, "SPMD module verification: {}", diagnostic);
-    
+
             let triple = llvm::target_machine::LLVMGetDefaultTargetTriple();
             let mut target = std::ptr::null_mut();
             let mut error = std::ptr::null_mut();
@@ -132,12 +148,21 @@ impl Module {
             // Preserve the scalar backend's measured AVX-512 exclusion: scalar
             // f64 selects use blend/cmov rather than mask-register round trips.
             let features = CString::new(if matches!(mode, Mode::Scalar) {
-                format!("{},-avx512f,-avx512vl,-avx512dq,-avx512bw,-avx512cd", features)
-            } else { features.into_owned() }).unwrap();
+                format!(
+                    "{},-avx512f,-avx512vl,-avx512dq,-avx512bw,-avx512cd",
+                    features
+                )
+            } else {
+                features.into_owned()
+            })
+            .unwrap();
             // Keep JITDefault relocation/code model. Small/PIC changed LICM and
             // regressed the existing scalar reciprocal loop.
             let machine = llvm::target_machine::LLVMCreateTargetMachine(
-                target, triple, cpu, features.as_ptr(),
+                target,
+                triple,
+                cpu,
+                features.as_ptr(),
                 llvm::target_machine::LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
                 llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
                 llvm::target_machine::LLVMCodeModel::LLVMCodeModelJITDefault,
@@ -146,27 +171,41 @@ impl Module {
             LLVMDisposeMessage(cpu);
             LLVMDisposeMessage(host_features);
             if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_LLVM") {
-                static INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static INDEX: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
                 let index = INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::fs::create_dir_all(&dir).unwrap();
                 let filename = CString::new(format!("{dir}/{index:04}-before.ll")).unwrap();
                 let mut message = std::ptr::null_mut();
                 LLVMPrintModuleToFile(self.module, filename.as_ptr(), &mut message);
             }
-            let optimized = OptimizedModule { module: self, machine };
+            let optimized = OptimizedModule {
+                module: self,
+                machine,
+            };
             let options = llvm::transforms::pass_builder::LLVMCreatePassBuilderOptions();
-            let pipeline = if std::env::var("AMDGPU_SIM_OPT").map_or(false, |v| v == "0") { b"default<O0>\0".as_ptr() } else { b"default<O3>\0".as_ptr() };
-            let error = llvm::transforms::pass_builder::LLVMRunPasses(optimized.module.module, pipeline.cast(), machine, options);
+            let pipeline = if std::env::var("AMDGPU_SIM_OPT").map_or(false, |v| v == "0") {
+                b"default<O0>\0".as_ptr()
+            } else {
+                b"default<O3>\0".as_ptr()
+            };
+            let error = llvm::transforms::pass_builder::LLVMRunPasses(
+                optimized.module.module,
+                pipeline.cast(),
+                machine,
+                options,
+            );
             llvm::transforms::pass_builder::LLVMDisposePassBuilderOptions(options);
             check(error, "optimization");
             if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_LLVM") {
-                static INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                static INDEX: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
                 let index = INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let filename = CString::new(format!("{dir}/{index:04}-after.ll")).unwrap();
                 let mut message = std::ptr::null_mut();
                 LLVMPrintModuleToFile(optimized.module.module, filename.as_ptr(), &mut message);
             }
-    
+
             optimized
         }
     }
@@ -186,12 +225,20 @@ impl OptimizedModule {
     pub fn compile(mut self, symbol: &str) -> NativeCode {
         unsafe {
             let builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
-            let machine = llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(self.machine);
+            let machine =
+                llvm::orc2::LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(self.machine);
             self.machine = std::ptr::null_mut();
             llvm::orc2::lljit::LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(builder, machine);
             let mut jit = std::ptr::null_mut();
-            check(llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, builder), "creation");
-            let mut native = NativeCode { jit, address: 0, block_counts: None };
+            check(
+                llvm::orc2::lljit::LLVMOrcCreateLLJIT(&mut jit, builder),
+                "creation",
+            );
+            let mut native = NativeCode {
+                jit,
+                address: 0,
+                block_counts: None,
+            };
             let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
             // Bind context-switch entrypoints to this host's FiberCtx ABI. A stale
             // separately built dylib must not supply a different context layout.
@@ -210,44 +257,87 @@ impl OptimizedModule {
             });
             let unit = llvm::orc2::LLVMOrcAbsoluteSymbols(symbols.as_mut_ptr(), symbols.len());
             let error = llvm::orc2::LLVMOrcJITDylibDefine(dylib, unit);
-            if !error.is_null() { llvm::orc2::LLVMOrcDisposeMaterializationUnit(unit); }
+            if !error.is_null() {
+                llvm::orc2::LLVMOrcDisposeMaterializationUnit(unit);
+            }
             check(error, "fiber symbols");
             let prefix = llvm::orc2::lljit::LLVMOrcLLJITGetGlobalPrefix(jit);
             let mut generator = std::ptr::null_mut();
-            check(llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
-                &mut generator, prefix, None, std::ptr::null_mut()), "process symbols");
+            check(
+                llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForProcess(
+                    &mut generator,
+                    prefix,
+                    None,
+                    std::ptr::null_mut(),
+                ),
+                "process symbols",
+            );
             llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, generator);
             let library: &[u8] = if cfg!(debug_assertions) {
                 b"target/debug/libamdgpu_sim.so\0"
-            } else { b"target/release/libamdgpu_sim.so\0" };
+            } else {
+                b"target/release/libamdgpu_sim.so\0"
+            };
             let mut generator = std::ptr::null_mut();
-            check(llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
-                &mut generator, library.as_ptr().cast(), prefix, None, std::ptr::null_mut()), "runtime symbols");
+            check(
+                llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
+                    &mut generator,
+                    library.as_ptr().cast(),
+                    prefix,
+                    None,
+                    std::ptr::null_mut(),
+                ),
+                "runtime symbols",
+            );
             llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, generator);
-    
+
             // The module and ORC wrapper share the very same LLVMContext. ORC
             // retains its reference after this construction handle is released.
-            let module = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(self.module.module, self.module.context);
+            let module = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(
+                self.module.module,
+                self.module.context,
+            );
             self.module.module = std::ptr::null_mut();
-            check(llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(jit, dylib, module), "module registration");
+            check(
+                llvm::orc2::lljit::LLVMOrcLLJITAddLLVMIRModule(jit, dylib, module),
+                "module registration",
+            );
             let symbol = CString::new(symbol).unwrap();
-            check(llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut native.address, symbol.as_ptr()), "kernel lookup");
+            check(
+                llvm::orc2::lljit::LLVMOrcLLJITLookup(jit, &mut native.address, symbol.as_ptr()),
+                "kernel lookup",
+            );
             if let Ok(dir) = std::env::var("AMDGPU_SIM_DUMP_CODE") {
                 use std::io::{Read, Seek, Write};
                 let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
                 for line in maps.lines() {
                     let range = line.split_whitespace().next().unwrap();
                     let (lo, hi) = range.split_once('-').unwrap();
-                    let (lo, hi) = (u64::from_str_radix(lo, 16).unwrap(), u64::from_str_radix(hi, 16).unwrap());
-                    if native.address < lo || native.address >= hi { continue; }
+                    let (lo, hi) = (
+                        u64::from_str_radix(lo, 16).unwrap(),
+                        u64::from_str_radix(hi, 16).unwrap(),
+                    );
+                    if native.address < lo || native.address >= hi {
+                        continue;
+                    }
                     let mut bytes = vec![0u8; (hi - lo) as usize];
                     let mut mem = std::fs::File::open("/proc/self/mem").unwrap();
                     mem.seek(std::io::SeekFrom::Start(lo)).unwrap();
                     mem.read_exact(&mut bytes).unwrap();
                     std::fs::create_dir_all(&dir).unwrap();
                     std::fs::write(format!("{dir}/{lo:x}-{hi:x}.bin"), &bytes).unwrap();
-                    let mut index = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/index.txt")).unwrap();
-                    writeln!(index, "{} {:x} {lo:x} {hi:x}", symbol.to_string_lossy(), native.address).unwrap();
+                    let mut index = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/index.txt"))
+                        .unwrap();
+                    writeln!(
+                        index,
+                        "{} {:x} {lo:x} {hi:x}",
+                        symbol.to_string_lossy(),
+                        native.address
+                    )
+                    .unwrap();
                 }
             }
             native
@@ -258,8 +348,12 @@ impl OptimizedModule {
 impl Drop for Module {
     fn drop(&mut self) {
         unsafe {
-            if !self.builder.is_null() { LLVMDisposeBuilder(self.builder); }
-            if !self.module.is_null() { LLVMDisposeModule(self.module); }
+            if !self.builder.is_null() {
+                LLVMDisposeBuilder(self.builder);
+            }
+            if !self.module.is_null() {
+                LLVMDisposeModule(self.module);
+            }
             llvm::orc2::LLVMOrcDisposeThreadSafeContext(self.context);
         }
     }
@@ -280,7 +374,8 @@ mod tests {
                 let optimized = module.optimize(Mode::Packet);
                 assert!(optimized.ir().contains(&format!("ret i32 {}", constant)));
                 let code = optimized.compile("answer");
-                let call = std::mem::transmute::<u64, unsafe extern "C" fn() -> u32>(code.address());
+                let call =
+                    std::mem::transmute::<u64, unsafe extern "C" fn() -> u32>(code.address());
                 assert_eq!(call(), constant as u32);
                 // Drop this ORC session before building and calling the next one.
             }

@@ -81,30 +81,32 @@
 //! - JIT caching, dispatch specialization, and prefetching had too little
 //!   profile contribution for the tested long-running workload.
 
-
 mod analysis;
-mod host;
+mod codegen;
+mod compiler;
+mod dialect;
 mod engine;
+mod host;
+mod ir;
+mod native;
+mod pass;
+mod program;
 mod target;
 mod targets;
-mod pass;
-mod ir;
-mod compiler;
-mod codegen;
-mod program;
-mod dialect;
-mod native;
 
-
-pub use program::{Program, CompilationInput};
 pub use compiler::{compile, decode_program, CompileOptions, Compiler};
-pub use engine::{dispatch, dispatch::GridDims, kernel::{Kernel, Scheduler}};
-#[cfg(test)]
-pub(crate) use targets::rdna4::decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
-#[cfg(test)]
-pub(crate) use program::split_at_effects;
 #[cfg(test)]
 pub(crate) use engine::scheduler::dispatch_cooperative_vec;
+pub use engine::{
+    dispatch,
+    dispatch::GridDims,
+    kernel::{Kernel, Scheduler},
+};
+#[cfg(test)]
+pub(crate) use program::split_at_effects;
+pub use program::{CompilationInput, Program};
+#[cfg(test)]
+pub(crate) use targets::rdna4::decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
 
 /// Recommended default width-W work-item packing (W in {1,2,4,8,16}); 0 = off
 /// (the single-lane scalar path). See [`codegen`] for the packed register

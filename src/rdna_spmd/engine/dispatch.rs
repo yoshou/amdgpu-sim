@@ -8,7 +8,6 @@
 
 use crate::processor::KernelDescriptor;
 
-
 /// Grid geometry (workgroup counts and per-workgroup sizes).
 #[derive(Clone, Copy)]
 pub struct GridDims {

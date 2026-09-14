@@ -33,11 +33,15 @@ pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
             (0..words).fold(0u128, |m, k| m | bit(i.sdata as u32 + k))
         }
         InstFormat::VOP3SD(i) => bit(i.sdst as u32),
-        InstFormat::VOP1(i) if matches!(i.op,I::V_READFIRSTLANE_B32) => bit(i.vdst as u32),
-        InstFormat::VOP3(i) if matches!(i.op,I::V_READLANE_B32) => bit(i.vdst as u32),
+        InstFormat::VOP1(i) if matches!(i.op, I::V_READFIRSTLANE_B32) => bit(i.vdst as u32),
+        InstFormat::VOP3(i) if matches!(i.op, I::V_READLANE_B32) => bit(i.vdst as u32),
         // VOPC / VOP3 compares write a lane mask (VCC or, for V_CMPX, EXEC).
         InstFormat::VOPC(i) => {
-            if format!("{:?}", i.op).starts_with("V_CMPX") { bit(EXEC) } else { bit(106) }
+            if format!("{:?}", i.op).starts_with("V_CMPX") {
+                bit(EXEC)
+            } else {
+                bit(106)
+            }
         }
         InstFormat::VOP3(i) if format!("{:?}", i.op).contains("V_CMP") => bit(i.vdst as u32),
         _ => 0,
@@ -46,7 +50,8 @@ pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
 
 /// Includes implicit EXEC writes (saveexec and cmpx), not just scalar destinations.
 pub(in crate::rdna_spmd) fn writes_exec(inst: &InstFormat) -> bool {
-    scalar_dests(inst) & (1u128 << EXEC) != 0 || matches!(inst,
+    scalar_dests(inst) & (1u128 << EXEC) != 0
+        || matches!(inst,
         InstFormat::SOP1(i) if matches!(i.op,
             I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 |
             I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32))
@@ -60,17 +65,21 @@ fn scalar_reg(op: &SourceOperand) -> Option<u32> {
 }
 
 fn mask_logic_op(op: I) -> bool {
-    matches!(op,
-        I::S_AND_B32 | I::S_OR_B32 | I::S_XOR_B32 |
-        I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32)
+    matches!(
+        op,
+        I::S_AND_B32 | I::S_OR_B32 | I::S_XOR_B32 | I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32
+    )
 }
 
 fn saveexec_op(op: I) -> bool {
-    matches!(op,
-        I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 |
-        I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32)
+    matches!(
+        op,
+        I::S_AND_SAVEEXEC_B32
+            | I::S_AND_NOT1_SAVEEXEC_B32
+            | I::S_OR_SAVEEXEC_B32
+            | I::S_XOR_SAVEEXEC_B32
+    )
 }
-
 
 fn operand_is_reg(op: &SourceOperand, reg: u32) -> bool {
     scalar_reg(op) == Some(reg)
@@ -86,28 +95,35 @@ fn range_contains(first: u32, words: u32, reg: u32) -> bool {
 /// definition transfer below kills it before a later read.
 fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
     match inst {
-        InstFormat::SOP1(i) => !(matches!(i.op, I::S_MOV_B32) || saveexec_op(i.op))
-            && operand_is_reg(&i.ssrc0, reg),
-        InstFormat::SOP2(i) => !mask_logic_op(i.op)
-            && (operand_is_reg(&i.ssrc0, reg) || operand_is_reg(&i.ssrc1, reg)),
+        InstFormat::SOP1(i) => {
+            !(matches!(i.op, I::S_MOV_B32) || saveexec_op(i.op)) && operand_is_reg(&i.ssrc0, reg)
+        }
+        InstFormat::SOP2(i) => {
+            !mask_logic_op(i.op) && (operand_is_reg(&i.ssrc0, reg) || operand_is_reg(&i.ssrc1, reg))
+        }
         InstFormat::SOPK(_) => false,
         InstFormat::SOPC(i) => operand_is_reg(&i.ssrc0, reg) || operand_is_reg(&i.ssrc1, reg),
         InstFormat::SOPP(_) => false,
-        InstFormat::SMEM(i) => {
-            range_contains(i.sbase as u32, 2, reg)
-                || i.soffset as u32 == reg
-        }
+        InstFormat::SMEM(i) => range_contains(i.sbase as u32, 2, reg) || i.soffset as u32 == reg,
         InstFormat::VOP1(i) => operand_is_reg(&i.src0, reg),
         InstFormat::VOP2(i) => operand_is_reg(&i.src0, reg),
         InstFormat::VOP3(i) => {
             // V_CMP writes EXEC/VCC implicitly; its vector operands do not
             // alias an SGPR unless one is explicitly encoded as a source.
-            operand_is_reg(&i.src0, reg) || operand_is_reg(&i.src1, reg) || operand_is_reg(&i.src2, reg)
+            operand_is_reg(&i.src0, reg)
+                || operand_is_reg(&i.src1, reg)
+                || operand_is_reg(&i.src2, reg)
         }
-        InstFormat::VOP3SD(i) => operand_is_reg(&i.src0, reg)
-            || operand_is_reg(&i.src1, reg) || operand_is_reg(&i.src2, reg),
-        InstFormat::VOP3P(i) => operand_is_reg(&i.src0, reg)
-            || operand_is_reg(&i.src1, reg) || operand_is_reg(&i.src2, reg),
+        InstFormat::VOP3SD(i) => {
+            operand_is_reg(&i.src0, reg)
+                || operand_is_reg(&i.src1, reg)
+                || operand_is_reg(&i.src2, reg)
+        }
+        InstFormat::VOP3P(i) => {
+            operand_is_reg(&i.src0, reg)
+                || operand_is_reg(&i.src1, reg)
+                || operand_is_reg(&i.src2, reg)
+        }
         InstFormat::VOPC(i) => operand_is_reg(&i.src0, reg),
         InstFormat::VOPD(i) => operand_is_reg(&i.src0x, reg) || operand_is_reg(&i.src0y, reg),
         InstFormat::VFLAT(i) => {
@@ -120,7 +136,9 @@ fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
             i.saddr != 124 && i.saddr != 127 && range_contains(i.saddr as u32, 2, reg)
         }
         InstFormat::VIMAGE(i) => range_contains(i.rsrc as u32, 4, reg),
-        InstFormat::VSAMPLE(i) => range_contains(i.rsrc as u32, 4, reg) || range_contains(i.samp as u32, 4, reg),
+        InstFormat::VSAMPLE(i) => {
+            range_contains(i.rsrc as u32, 4, reg) || range_contains(i.samp as u32, 4, reg)
+        }
         InstFormat::DS(_) => false,
     }
 }

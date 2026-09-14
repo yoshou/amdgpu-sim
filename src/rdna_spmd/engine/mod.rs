@@ -1,6 +1,6 @@
-pub mod fiber;
 pub(super) mod barrier;
 pub(super) mod dispatch;
+pub mod fiber;
 pub(super) mod kernel;
 pub(super) mod scheduler;
 pub(super) mod wmma;
@@ -20,5 +20,14 @@ pub fn dispatch(
     group_segment_size: usize,
     num_threads: usize,
 ) {
-    scheduler::run(scheduler::View::of(kernel), kd, kernarg_ptr, aql_packet_addr, dims, private_segment_size, group_segment_size, num_threads)
+    scheduler::run(
+        scheduler::View::of(kernel),
+        kd,
+        kernarg_ptr,
+        aql_packet_addr,
+        dims,
+        private_segment_size,
+        group_segment_size,
+        num_threads,
+    )
 }

@@ -1,21 +1,21 @@
 //! Lift ISA operands, state updates and effects into typed SSA.
-use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::dialect::{DialectRegistry, Arguments};
 use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
-pub(crate) mod memory;
-pub(crate) mod wave;
-mod scalar;
-mod compare;
-mod dual;
-mod packed;
-mod division;
-mod image;
-pub(crate) mod half;
-pub(crate) mod regs;
-pub(crate) mod control;
+use crate::rdna_spmd::dialect::{Arguments, DialectRegistry};
+use crate::rdna_spmd::ir::*;
 pub(crate) mod access;
+mod compare;
+pub(crate) mod control;
+mod division;
+mod dual;
+pub(crate) mod half;
+mod image;
+pub(crate) mod memory;
+mod packed;
+pub(crate) mod regs;
 pub(crate) mod rewrite;
+mod scalar;
+pub(crate) mod wave;
 
 pub(crate) enum Lowering {
     Memory(memory::Memory),
@@ -36,16 +36,42 @@ impl Input {
     /// Resolve encoded constant precision at the ISA boundary. Mask constants
     /// still require lane extraction, so they are not plain I1 constants.
     fn constant_bits(&self) -> Option<u64> {
-        if self.ty == Ty::I1 { return None; }
-        let InputSource::Operand(source) = self.source else { return None; };
+        if self.ty == Ty::I1 {
+            return None;
+        }
+        let InputSource::Operand(source) = self.source else {
+            return None;
+        };
         let bits = match source {
-            SourceOperand::LiteralConstant(value) => if self.ty == Ty::F64 { (value as u64) << 32 } else { value as u64 },
-            SourceOperand::IntegerConstant(value) => if self.ty == Ty::F64 { value << 32 } else { value },
-            SourceOperand::FloatConstant(value) => if self.ty.bits() == 64 { value.to_bits() } else { (value as f32).to_bits() as u64 },
+            SourceOperand::LiteralConstant(value) => {
+                if self.ty == Ty::F64 {
+                    (value as u64) << 32
+                } else {
+                    value as u64
+                }
+            }
+            SourceOperand::IntegerConstant(value) => {
+                if self.ty == Ty::F64 {
+                    value << 32
+                } else {
+                    value
+                }
+            }
+            SourceOperand::FloatConstant(value) => {
+                if self.ty.bits() == 64 {
+                    value.to_bits()
+                } else {
+                    (value as f32).to_bits() as u64
+                }
+            }
             SourceOperand::ScalarRegister(124) if self.ty.bits() == 32 => 0,
             _ => return None,
         };
-        Some(if self.ty.bits() == 32 { bits as u32 as u64 } else { bits })
+        Some(if self.ty.bits() == 32 {
+            bits as u32 as u64
+        } else {
+            bits
+        })
     }
 }
 #[derive(Clone, Debug)]
@@ -96,8 +122,15 @@ impl<'r> Builder<'r> {
         id
     }
     fn target(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> Vec<ValueId> {
-        let outputs = self.registry.operation(op).expect("missing target provider").outputs.clone();
-        let values = (self.next_value..self.next_value + outputs.len()).map(ValueId).collect();
+        let outputs = self
+            .registry
+            .operation(op)
+            .expect("missing target provider")
+            .outputs
+            .clone();
+        let values = (self.next_value..self.next_value + outputs.len())
+            .map(ValueId)
+            .collect();
         self.next_value += outputs.len();
         self.insts.push(ExprInst::Target { op, args, outputs });
         values
@@ -124,9 +157,24 @@ impl<'r> Builder<'r> {
     }
     /// Preserve captured VOP3 bit-modifier behavior also on integer encodings
     /// (ISA §7.2.2.1 leaves that combination undefined). This is not integer negation.
-    fn bits_mod(&mut self, ty: Ty, bits: u32, mut value: ValueId, abs: u8, neg: u8, index: usize) -> ValueId {
+    fn bits_mod(
+        &mut self,
+        ty: Ty,
+        bits: u32,
+        mut value: ValueId,
+        abs: u8,
+        neg: u8,
+        index: usize,
+    ) -> ValueId {
         if abs >> index & 1 != 0 {
-            let mask = self.k(ty, if ty == Ty::I64 { u64::MAX } else { u32::MAX as u64 } ^ (1u64 << (bits - 1)));
+            let mask = self.k(
+                ty,
+                if ty == Ty::I64 {
+                    u64::MAX
+                } else {
+                    u32::MAX as u64
+                } ^ (1u64 << (bits - 1)),
+            );
             value = self.push(ty, Op::Int(IntOp::And, value, mask));
         }
         if neg >> index & 1 != 0 {
@@ -137,13 +185,32 @@ impl<'r> Builder<'r> {
     }
     fn output_mod(&mut self, ty: Ty, mut value: ValueId, clamp: u8, omod: u8) -> ValueId {
         if omod != 0 {
-            let factor: f64 = match omod { 1 => 2.0, 2 => 4.0, 3 => 0.5, _ => unreachable!() };
-            let factor = self.k(ty, if ty == Ty::F64 { factor.to_bits() } else { (factor as f32).to_bits() as u64 });
+            let factor: f64 = match omod {
+                1 => 2.0,
+                2 => 4.0,
+                3 => 0.5,
+                _ => unreachable!(),
+            };
+            let factor = self.k(
+                ty,
+                if ty == Ty::F64 {
+                    factor.to_bits()
+                } else {
+                    (factor as f32).to_bits() as u64
+                },
+            );
             value = self.push(ty, Op::Float(FloatOp::Mul, value, factor));
             // ISA §7.2.3.1: OMOD flushes output subnormals and maps -0 to +0.
             let word_ty = if ty == Ty::F64 { Ty::I64 } else { Ty::I32 };
             let word = self.push(word_ty, Op::Convert(Cvt::Bitcast, word_ty, value));
-            let mask = self.k(word_ty, if ty == Ty::F64 { 0x7ff0_0000_0000_0000 } else { 0x7f80_0000 });
+            let mask = self.k(
+                word_ty,
+                if ty == Ty::F64 {
+                    0x7ff0_0000_0000_0000
+                } else {
+                    0x7f80_0000
+                },
+            );
             let exponent = self.push(word_ty, Op::Int(IntOp::And, word, mask));
             let zero = self.k(word_ty, 0);
             let tiny = self.push(Ty::I1, Op::Cmp(IntPred::Eq, exponent, zero));
@@ -152,7 +219,14 @@ impl<'r> Builder<'r> {
         }
         if clamp != 0 {
             let zero = self.k(ty, 0);
-            let one = self.k(ty, if ty == Ty::F64 { 1f64.to_bits() } else { 1f32.to_bits() as u64 });
+            let one = self.k(
+                ty,
+                if ty == Ty::F64 {
+                    1f64.to_bits()
+                } else {
+                    1f32.to_bits() as u64
+                },
+            );
             // Ordered > maps NaNs, negative values and both zeros to +0.
             let positive = self.push(Ty::I1, Op::FCmp(FloatPred::Ogt, value, zero));
             value = self.push(ty, Op::Float(FloatOp::MinNum, value, one));
@@ -164,10 +238,22 @@ impl<'r> Builder<'r> {
         self.finish_many(false, vec![(output, result)])
     }
     fn finish_many(self, scalar: bool, results: Vec<(Output, ValueId)>) -> Lowering {
-        let types: Vec<_> = self.inputs.iter().map(|i| i.ty)
-            .chain(self.insts.iter().flat_map(|i| i.result_types().iter().copied())).collect();
+        let types: Vec<_> = self
+            .inputs
+            .iter()
+            .map(|i| i.ty)
+            .chain(
+                self.insts
+                    .iter()
+                    .flat_map(|i| i.result_types().iter().copied()),
+            )
+            .collect();
         for &(output, value) in &results {
-            assert_eq!(types.get(value.0), Some(&output.ty()), "incorrect ALU output type");
+            assert_eq!(
+                types.get(value.0),
+                Some(&output.ty()),
+                "incorrect ALU output type"
+            );
         }
         let expr = Expr {
             params: self.inputs.iter().map(|i| i.ty).collect(),
@@ -185,33 +271,99 @@ impl<'r> Builder<'r> {
     }
 }
 fn input(source: SourceOperand, ty: Ty) -> Input {
-    Input { source: InputSource::Operand(source), ty }
+    Input {
+        source: InputSource::Operand(source),
+        ty,
+    }
 }
 /// Literal words in signed 64-bit operand positions are sign-extended;
 /// unsigned and bit-pattern positions retain their zero-extension rule.
 fn signed_input(source: SourceOperand, ty: Ty) -> Input {
-    input(match (source, ty) {
-        (SourceOperand::LiteralConstant(word), Ty::I64) => SourceOperand::IntegerConstant(word as i32 as i64 as u64),
-        _ => source,
-    }, ty)
+    input(
+        match (source, ty) {
+            (SourceOperand::LiteralConstant(word), Ty::I64) => {
+                SourceOperand::IntegerConstant(word as i32 as i64 as u64)
+            }
+            _ => source,
+        },
+        ty,
+    )
 }
 
 /// Arithmetic results and flags are separate SSA values. All operands are
 /// bound before either destination is written, including aliased carry words.
 fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (op, mut sources, dst, mask) = match inst {
-        InstFormat::VOP2(i) if matches!(i.op, I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32) =>
-            (i.op, vec![i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1), SourceOperand::ScalarRegister(106)], i.vdst, 106),
-        InstFormat::VOP3SD(i) if matches!(i.op, I::V_ADD_CO_U32 | I::V_ADD_CO_CI_U32 | I::V_SUB_CO_U32 | I::V_SUBREV_CO_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32 | I::V_MAD_CO_U64_U32) =>
-            (i.op, vec![i.src0.clone(), i.src1.clone(), i.src2.clone()], i.vdst, i.sdst),
+        InstFormat::VOP2(i)
+            if matches!(
+                i.op,
+                I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32
+            ) =>
+        {
+            (
+                i.op,
+                vec![
+                    i.src0.clone(),
+                    SourceOperand::VectorRegister(i.vsrc1),
+                    SourceOperand::ScalarRegister(106),
+                ],
+                i.vdst,
+                106,
+            )
+        }
+        InstFormat::VOP3SD(i)
+            if matches!(
+                i.op,
+                I::V_ADD_CO_U32
+                    | I::V_ADD_CO_CI_U32
+                    | I::V_SUB_CO_U32
+                    | I::V_SUBREV_CO_U32
+                    | I::V_SUB_CO_CI_U32
+                    | I::V_SUBREV_CO_CI_U32
+                    | I::V_MAD_CO_U64_U32
+            ) =>
+        {
+            (
+                i.op,
+                vec![i.src0.clone(), i.src1.clone(), i.src2.clone()],
+                i.vdst,
+                i.sdst,
+            )
+        }
         _ => return None,
     };
     let mad = matches!(op, I::V_MAD_CO_U64_U32);
-    let carry_in = matches!(op, I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32);
-    if !carry_in && !mad { sources.truncate(2); }
-    let mut b = Builder::new(registry, sources.into_iter().enumerate()
-        .map(|(i, s)| input(s, if i < 2 { Ty::I32 } else if mad { Ty::I64 } else { Ty::I1 })).collect());
-    let neg = if let InstFormat::VOP3SD(i) = inst { i.neg } else { 0 };
+    let carry_in = matches!(
+        op,
+        I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32
+    );
+    if !carry_in && !mad {
+        sources.truncate(2);
+    }
+    let mut b = Builder::new(
+        registry,
+        sources
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                input(
+                    s,
+                    if i < 2 {
+                        Ty::I32
+                    } else if mad {
+                        Ty::I64
+                    } else {
+                        Ty::I1
+                    },
+                )
+            })
+            .collect(),
+    );
+    let neg = if let InstFormat::VOP3SD(i) = inst {
+        i.neg
+    } else {
+        0
+    };
     let a = b.bits_mod(Ty::I32, 32, ValueId(0), 0, neg, 0);
     let c = b.bits_mod(Ty::I32, 32, ValueId(1), 0, neg, 1);
     let a = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, a));
@@ -222,8 +374,19 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ult, sum, product));
         (sum, flag, Ty::I64)
     } else {
-        let (a, c) = if matches!(op, I::V_SUBREV_CO_U32 | I::V_SUBREV_CO_CI_U32) { (c, a) } else { (a, c) };
-        let arithmetic = if matches!(op, I::V_SUB_CO_U32 | I::V_SUBREV_CO_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32) { IntOp::Sub } else { IntOp::Add };
+        let (a, c) = if matches!(op, I::V_SUBREV_CO_U32 | I::V_SUBREV_CO_CI_U32) {
+            (c, a)
+        } else {
+            (a, c)
+        };
+        let arithmetic = if matches!(
+            op,
+            I::V_SUB_CO_U32 | I::V_SUBREV_CO_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32
+        ) {
+            IntOp::Sub
+        } else {
+            IntOp::Add
+        };
         let mut wide = b.push(Ty::I64, Op::Int(arithmetic, a, c));
         if carry_in {
             let cin = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, ValueId(2)));
@@ -237,23 +400,45 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         (result, flag, Ty::I32)
     };
     let mut results = vec![(Output::Vgpr(dst as u32, ty), result)];
-    if mask != 124 { results.push((Output::Mask(mask as u32), flag)); }
+    if mask != 124 {
+        results.push((Output::Mask(mask as u32), flag));
+    }
     Some(b.finish_many(false, results))
 }
 
 #[cfg(test)]
-pub(super) fn instruction(inst: &InstFormat) -> Lowering { instruction_with_registry(inst, &crate::rdna_spmd::targets::rdna4::registry()) }
+pub(super) fn instruction(inst: &InstFormat) -> Lowering {
+    instruction_with_registry(inst, &crate::rdna_spmd::targets::rdna4::registry())
+}
 
 pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
-    if let Some(action) = wave::instruction(inst) { return Lowering::Wave(action); }
-    if let Some(memory) = memory::instruction(inst) { return Lowering::Memory(memory); }
-    if let Some(image) = image::instruction(inst, registry) { return image; }
-    if let Some(alu) = half::instruction(inst, registry) { return alu; }
-    if let Some(alu) = division::instruction(inst, registry) { return alu; }
-    if let Some(alu) = carry(inst, registry).or_else(|| scalar::instruction(inst, registry)) { return alu; }
-    if let Some(alu) = dual::instruction(inst, registry) { return alu; }
-    if let Some(alu) = compare::instruction(inst, registry) { return alu; }
-    if let Some(alu) = packed::instruction(inst, registry) { return alu; }
+    if let Some(action) = wave::instruction(inst) {
+        return Lowering::Wave(action);
+    }
+    if let Some(memory) = memory::instruction(inst) {
+        return Lowering::Memory(memory);
+    }
+    if let Some(image) = image::instruction(inst, registry) {
+        return image;
+    }
+    if let Some(alu) = half::instruction(inst, registry) {
+        return alu;
+    }
+    if let Some(alu) = division::instruction(inst, registry) {
+        return alu;
+    }
+    if let Some(alu) = carry(inst, registry).or_else(|| scalar::instruction(inst, registry)) {
+        return alu;
+    }
+    if let Some(alu) = dual::instruction(inst, registry) {
+        return alu;
+    }
+    if let Some(alu) = compare::instruction(inst, registry) {
+        return alu;
+    }
+    if let Some(alu) = packed::instruction(inst, registry) {
+        return alu;
+    }
     let alu = Alu::decode(inst);
     let shape = Shape::of(alu.op, registry);
     let inputs = alu.inputs(&shape, registry);
@@ -262,7 +447,14 @@ pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectReg
     for index in 0..shape.arity {
         let input_ty = q.inputs[index].ty;
         values[index] = if input_ty.integer() {
-            let bits = if matches!(alu.op, I::V_ADD_NC_U16 | I::V_LSHLREV_B16 | I::V_LSHRREV_B16) { 16 } else { input_ty.bits() };
+            let bits = if matches!(
+                alu.op,
+                I::V_ADD_NC_U16 | I::V_LSHLREV_B16 | I::V_LSHRREV_B16
+            ) {
+                16
+            } else {
+                input_ty.bits()
+            };
             q.bits_mod(input_ty, bits, values[index], alu.abs, alu.neg, index)
         } else {
             q.float_mod(input_ty, values[index], alu.abs, alu.neg, index)
@@ -274,8 +466,22 @@ pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectReg
         (q.push(to, Op::Convert(kind, to, a)), Output::Vgpr(dst, to))
     } else if let Some(target) = shape.target {
         let to = registry.operation(target).unwrap().outputs[0];
-        let output = if matches!(alu.op, I::V_S_RCP_F32) { Output::Scalar(dst, to) } else { Output::Vgpr(dst, to) };
-        (q.target_one(target, if shape.arity == 1 { Arguments::Unary(a) } else { Arguments::Binary([a, b]) }), output)
+        let output = if matches!(alu.op, I::V_S_RCP_F32) {
+            Output::Scalar(dst, to)
+        } else {
+            Output::Vgpr(dst, to)
+        };
+        (
+            q.target_one(
+                target,
+                if shape.arity == 1 {
+                    Arguments::Unary(a)
+                } else {
+                    Arguments::Binary([a, b])
+                },
+            ),
+            output,
+        )
     } else {
         let mut output = Output::Vgpr(dst, shape.float_ty.unwrap_or(Ty::I32));
         let result = lower_integer(&mut q, alu.op, alu.cm, a, b, c)
@@ -284,8 +490,16 @@ pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectReg
             .unwrap_or_else(|| panic!("instruction has no typed IR lowering: {:?}", inst));
         (result, output)
     };
-    let result = if !output.ty().integer() { q.output_mod(output.ty(), result, alu.cm, alu.omod) } else { result };
-    if matches!(alu.op, I::V_S_RCP_F32) { q.finish_many(true, vec![(output, result)]) } else { q.finish(output, result) }
+    let result = if !output.ty().integer() {
+        q.output_mod(output.ty(), result, alu.cm, alu.omod)
+    } else {
+        result
+    };
+    if matches!(alu.op, I::V_S_RCP_F32) {
+        q.finish_many(true, vec![(output, result)])
+    } else {
+        q.finish(output, result)
+    }
 }
 
 struct Alu {
@@ -302,14 +516,35 @@ struct Alu {
 impl Alu {
     fn decode(inst: &InstFormat) -> Alu {
         match inst {
-            InstFormat::VOP1(i) => Alu { op: i.op, src: vec![i.src0.clone()], dst: i.vdst, abs: 0, neg: 0, cm: 0, omod: 0, literal: None },
+            InstFormat::VOP1(i) => Alu {
+                op: i.op,
+                src: vec![i.src0.clone()],
+                dst: i.vdst,
+                abs: 0,
+                neg: 0,
+                cm: 0,
+                omod: 0,
+                literal: None,
+            },
             InstFormat::VOP2(i) => Alu {
-                op: i.op, src: vec![i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1)], dst: i.vdst,
-                abs: 0, neg: 0, cm: 0, omod: 0, literal: i.literal_constant,
+                op: i.op,
+                src: vec![i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1)],
+                dst: i.vdst,
+                abs: 0,
+                neg: 0,
+                cm: 0,
+                omod: 0,
+                literal: i.literal_constant,
             },
             InstFormat::VOP3(i) => Alu {
-                op: i.op, src: vec![i.src0.clone(), i.src1.clone(), i.src2.clone()], dst: i.vdst,
-                abs: i.abs, neg: i.neg, cm: i.cm, omod: i.omod, literal: None,
+                op: i.op,
+                src: vec![i.src0.clone(), i.src1.clone(), i.src2.clone()],
+                dst: i.vdst,
+                abs: i.abs,
+                neg: i.neg,
+                cm: i.cm,
+                omod: i.omod,
+                literal: None,
             },
             _ => panic!("instruction has no typed IR lowering: {:?}", inst),
         }
@@ -319,9 +554,20 @@ impl Alu {
         if self.src.len() < shape.arity {
             panic!("instruction has no typed IR lowering: {:?}", self.op);
         }
-        let mut inputs: Vec<_> = self.src.iter().take(shape.arity).cloned().map(|s| input(s, shape.ty)).collect();
+        let mut inputs: Vec<_> = self
+            .src
+            .iter()
+            .take(shape.arity)
+            .cloned()
+            .map(|s| input(s, shape.ty))
+            .collect();
         if let Some(target) = shape.target {
-            for (input, &ty) in inputs.iter_mut().zip(registry.operation(target).unwrap().inputs) { input.ty = ty; }
+            for (input, &ty) in inputs
+                .iter_mut()
+                .zip(registry.operation(target).unwrap().inputs)
+            {
+                input.ty = ty;
+            }
         }
         if matches!(self.op, I::V_FMAC_F32) {
             inputs.push(input(SourceOperand::VectorRegister(self.dst), Ty::F32));
@@ -334,9 +580,18 @@ impl Alu {
         }
         if matches!(self.op, I::V_CNDMASK_B32) {
             // I1 inputs are lane-mask projections, not integer conversions.
-            inputs.push(input(self.src.get(2).cloned().unwrap_or(SourceOperand::ScalarRegister(106)), Ty::I1));
+            inputs.push(input(
+                self.src
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(SourceOperand::ScalarRegister(106)),
+                Ty::I1,
+            ));
         }
-        if matches!(self.op, I::V_LSHLREV_B64 | I::V_LSHRREV_B64 | I::V_ASHRREV_I64) {
+        if matches!(
+            self.op,
+            I::V_LSHLREV_B64 | I::V_LSHRREV_B64 | I::V_ASHRREV_I64
+        ) {
             inputs[1].ty = Ty::I64;
         }
         inputs
@@ -358,7 +613,8 @@ impl Shape {
         let cvt = conversion(op);
         let target = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, op)
             .or_else(|| crate::rdna_spmd::targets::rdna4::dialect::binary(registry, op));
-        let float_ty = float_type(op).or_else(|| target.map(|id| registry.operation(id).unwrap().inputs[0]));
+        let float_ty =
+            float_type(op).or_else(|| target.map(|id| registry.operation(id).unwrap().inputs[0]));
         let ty = cvt.map(|x| x.0).or(float_ty).unwrap_or(Ty::I32);
         let arity = if let Some(target) = target {
             registry.operation(target).unwrap().inputs.len()
@@ -367,33 +623,84 @@ impl Shape {
         } else {
             arity(op)
         };
-        Shape { cvt, target, float_ty, ty, arity }
+        Shape {
+            cvt,
+            target,
+            float_ty,
+            ty,
+            arity,
+        }
     }
 }
 
 fn float_type(op: I) -> Option<Ty> {
     match op {
-        I::V_ADD_F64 | I::V_MUL_F64 | I::V_FMA_F64 | I::V_MIN_NUM_F64 | I::V_MAX_NUM_F64
-        | I::V_RCP_F64 | I::V_RSQ_F64 | I::V_SQRT_F64 | I::V_RNDNE_F64 => Some(Ty::F64),
-        I::V_ADD_F32 | I::V_SUB_F32 | I::V_SUBREV_F32 | I::V_MUL_F32
-        | I::V_FMA_F32 | I::V_FMAC_F32 | I::V_FMAMK_F32 | I::V_FMAAK_F32
-        | I::V_MIN_F32 | I::V_MAX_F32 | I::V_MIN_NUM_F32 | I::V_MAX_NUM_F32
-        | I::V_RCP_F32 | I::V_RCP_IFLAG_F32 | I::V_RSQ_F32 | I::V_SQRT_F32
-        | I::V_FLOOR_F32 | I::V_CEIL_F32 | I::V_TRUNC_F32 | I::V_RNDNE_F32 => Some(Ty::F32),
+        I::V_ADD_F64
+        | I::V_MUL_F64
+        | I::V_FMA_F64
+        | I::V_MIN_NUM_F64
+        | I::V_MAX_NUM_F64
+        | I::V_RCP_F64
+        | I::V_RSQ_F64
+        | I::V_SQRT_F64
+        | I::V_RNDNE_F64 => Some(Ty::F64),
+        I::V_ADD_F32
+        | I::V_SUB_F32
+        | I::V_SUBREV_F32
+        | I::V_MUL_F32
+        | I::V_FMA_F32
+        | I::V_FMAC_F32
+        | I::V_FMAMK_F32
+        | I::V_FMAAK_F32
+        | I::V_MIN_F32
+        | I::V_MAX_F32
+        | I::V_MIN_NUM_F32
+        | I::V_MAX_NUM_F32
+        | I::V_RCP_F32
+        | I::V_RCP_IFLAG_F32
+        | I::V_RSQ_F32
+        | I::V_SQRT_F32
+        | I::V_FLOOR_F32
+        | I::V_CEIL_F32
+        | I::V_TRUNC_F32
+        | I::V_RNDNE_F32 => Some(Ty::F32),
         _ => None,
     }
 }
 
 fn arity(op: I) -> usize {
     match op {
-        I::V_MOV_B32 | I::V_NOT_B32 | I::V_BFREV_B32 | I::V_CLZ_I32_U32
-        | I::V_RCP_F32 | I::V_RCP_IFLAG_F32 | I::V_RSQ_F32 | I::V_SQRT_F32
-        | I::V_RCP_F64 | I::V_RSQ_F64 | I::V_SQRT_F64 | I::V_RNDNE_F64
-        | I::V_FLOOR_F32 | I::V_CEIL_F32 | I::V_TRUNC_F32 | I::V_RNDNE_F32 => 1,
-        I::V_ADD3_U32 | I::V_XOR3_B32 | I::V_XAD_U32 | I::V_AND_OR_B32 | I::V_OR3_B32
-        | I::V_LSHL_OR_B32 | I::V_LSHL_ADD_U32 | I::V_ADD_LSHL_U32
-        | I::V_MAD_U32_U24 | I::V_MAD_I32_I24 | I::V_BFE_U32 | I::V_BFI_B32 | I::V_ALIGNBIT_B32
-        | I::V_FMA_F32 | I::V_FMA_F64 => 3,
+        I::V_MOV_B32
+        | I::V_NOT_B32
+        | I::V_BFREV_B32
+        | I::V_CLZ_I32_U32
+        | I::V_RCP_F32
+        | I::V_RCP_IFLAG_F32
+        | I::V_RSQ_F32
+        | I::V_SQRT_F32
+        | I::V_RCP_F64
+        | I::V_RSQ_F64
+        | I::V_SQRT_F64
+        | I::V_RNDNE_F64
+        | I::V_FLOOR_F32
+        | I::V_CEIL_F32
+        | I::V_TRUNC_F32
+        | I::V_RNDNE_F32 => 1,
+        I::V_ADD3_U32
+        | I::V_XOR3_B32
+        | I::V_XAD_U32
+        | I::V_AND_OR_B32
+        | I::V_OR3_B32
+        | I::V_LSHL_OR_B32
+        | I::V_LSHL_ADD_U32
+        | I::V_ADD_LSHL_U32
+        | I::V_MAD_U32_U24
+        | I::V_MAD_I32_I24
+        | I::V_BFE_U32
+        | I::V_BFI_B32
+        | I::V_ALIGNBIT_B32
+        | I::V_FMA_F32
+        | I::V_FMA_F64 => 3,
         _ => 2,
     }
 }
@@ -409,14 +716,31 @@ fn mask_24(q: &mut Builder, value: ValueId) -> ValueId {
     q.int(IntOp::And, value, mask)
 }
 
-fn lower_integer(q: &mut Builder, op: I, cm: u8, a: ValueId, b: ValueId, c: ValueId) -> Option<ValueId> {
+fn lower_integer(
+    q: &mut Builder,
+    op: I,
+    cm: u8,
+    a: ValueId,
+    b: ValueId,
+    c: ValueId,
+) -> Option<ValueId> {
     Some(match op {
         I::V_MOV_B32 => a,
-        I::V_NOT_B32 => { let mask = q.k(Ty::I32, u32::MAX as u64); q.int(IntOp::Xor, a, mask) }
+        I::V_NOT_B32 => {
+            let mask = q.k(Ty::I32, u32::MAX as u64);
+            q.int(IntOp::Xor, a, mask)
+        }
         I::V_BFREV_B32 => q.push(Ty::I32, Op::ReverseBits(a)),
-        I::V_BCNT_U32_B32 => { let count = q.push(Ty::I32, Op::PopulationCount(a)); q.int(IntOp::Add, count, b) }
+        I::V_BCNT_U32_B32 => {
+            let count = q.push(Ty::I32, Op::PopulationCount(a));
+            q.int(IntOp::Add, count, b)
+        }
         I::V_MAD_U32_U24 | I::V_MAD_I32_I24 => {
-            let (a, b) = if matches!(op, I::V_MAD_I32_I24) { (sign_extend_24(q, a), sign_extend_24(q, b)) } else { (mask_24(q, a), mask_24(q, b)) };
+            let (a, b) = if matches!(op, I::V_MAD_I32_I24) {
+                (sign_extend_24(q, a), sign_extend_24(q, b))
+            } else {
+                (mask_24(q, a), mask_24(q, b))
+            };
             let product = q.int(IntOp::Mul, a, b);
             q.int(IntOp::Add, product, c)
         }
@@ -433,7 +757,9 @@ fn lower_integer(q: &mut Builder, op: I, cm: u8, a: ValueId, b: ValueId, c: Valu
                 let overflow = q.push(Ty::I1, Op::Cmp(IntPred::Ult, sum, a));
                 let max = q.k(Ty::I32, u32::MAX as u64);
                 q.push(Ty::I32, Op::Select(overflow, max, sum))
-            } else { sum }
+            } else {
+                sum
+            }
         }
         I::V_ALIGNBIT_B32 => {
             let high = q.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, a));
@@ -455,25 +781,37 @@ fn lower_integer(q: &mut Builder, op: I, cm: u8, a: ValueId, b: ValueId, c: Valu
             if cm != 0 {
                 let overflow = q.push(Ty::I1, Op::Cmp(IntPred::Ugt, sum, mask));
                 q.push(Ty::I32, Op::Select(overflow, mask, sum))
-            } else { q.int(IntOp::And, sum, mask) }
+            } else {
+                q.int(IntOp::And, sum, mask)
+            }
         }
         I::V_LSHLREV_B16 | I::V_LSHRREV_B16 => {
             let mask = q.k(Ty::I32, 0xffff);
             let data = q.int(IntOp::And, b, mask);
             let low_four = q.k(Ty::I32, 15);
             let amount = q.int(IntOp::And, a, low_four);
-            let shift = if matches!(op, I::V_LSHLREV_B16) { IntOp::Shl } else { IntOp::LShr };
+            let shift = if matches!(op, I::V_LSHLREV_B16) {
+                IntOp::Shl
+            } else {
+                IntOp::LShr
+            };
             let value = q.int(shift, data, amount);
             q.int(IntOp::And, value, mask)
         }
         I::V_SUB_NC_U32 | I::V_SUBREV_NC_U32 => {
-            let (a, b) = if matches!(op, I::V_SUBREV_NC_U32) { (b, a) } else { (a, b) };
+            let (a, b) = if matches!(op, I::V_SUBREV_NC_U32) {
+                (b, a)
+            } else {
+                (a, b)
+            };
             let difference = q.int(IntOp::Sub, a, b);
             if cm != 0 {
                 let borrow = q.push(Ty::I1, Op::Cmp(IntPred::Ult, a, b));
                 let zero = q.k(Ty::I32, 0);
                 q.push(Ty::I32, Op::Select(borrow, zero, difference))
-            } else { difference }
+            } else {
+                difference
+            }
         }
         I::V_AND_B32 => q.int(IntOp::And, a, b),
         I::V_OR_B32 => q.int(IntOp::Or, a, b),
@@ -507,8 +845,14 @@ fn lower_integer(q: &mut Builder, op: I, cm: u8, a: ValueId, b: ValueId, c: Valu
             q.push(Ty::I32, Op::Select(cond, a, b))
         }
         I::V_CNDMASK_B32 => q.push(Ty::I32, Op::Select(c, b, a)),
-        I::V_ADD3_U32 | I::V_XOR3_B32 | I::V_XAD_U32 | I::V_AND_OR_B32 | I::V_OR3_B32
-        | I::V_LSHL_OR_B32 | I::V_LSHL_ADD_U32 | I::V_ADD_LSHL_U32 => {
+        I::V_ADD3_U32
+        | I::V_XOR3_B32
+        | I::V_XAD_U32
+        | I::V_AND_OR_B32
+        | I::V_OR3_B32
+        | I::V_LSHL_OR_B32
+        | I::V_LSHL_ADD_U32
+        | I::V_ADD_LSHL_U32 => {
             let (first, second) = match op {
                 I::V_ADD3_U32 => (IntOp::Add, IntOp::Add),
                 I::V_XOR3_B32 => (IntOp::Xor, IntOp::Xor),
@@ -550,7 +894,14 @@ fn lower_integer(q: &mut Builder, op: I, cm: u8, a: ValueId, b: ValueId, c: Valu
     })
 }
 
-fn lower_wide(q: &mut Builder, op: I, a: ValueId, b: ValueId, output: &mut Output, dst: u32) -> Option<ValueId> {
+fn lower_wide(
+    q: &mut Builder,
+    op: I,
+    a: ValueId,
+    b: ValueId,
+    output: &mut Output,
+    dst: u32,
+) -> Option<ValueId> {
     let shift = match op {
         I::V_LSHLREV_B64 => IntOp::Shl,
         I::V_ASHRREV_I64 => IntOp::AShr,
@@ -562,10 +913,27 @@ fn lower_wide(q: &mut Builder, op: I, a: ValueId, b: ValueId, output: &mut Outpu
     Some(q.push(Ty::I64, Op::Int(shift, b, a)))
 }
 
-fn lower_float(q: &mut Builder, op: I, ty: Ty, a: ValueId, b: ValueId, c: ValueId) -> Option<ValueId> {
+fn lower_float(
+    q: &mut Builder,
+    op: I,
+    ty: Ty,
+    a: ValueId,
+    b: ValueId,
+    c: ValueId,
+) -> Option<ValueId> {
     Some(match op {
-        I::V_ADD_F32 | I::V_ADD_F64 | I::V_SUB_F32 | I::V_SUBREV_F32 | I::V_MUL_F32 | I::V_MUL_F64
-        | I::V_MIN_F32 | I::V_MIN_NUM_F32 | I::V_MIN_NUM_F64 | I::V_MAX_F32 | I::V_MAX_NUM_F32 | I::V_MAX_NUM_F64 => {
+        I::V_ADD_F32
+        | I::V_ADD_F64
+        | I::V_SUB_F32
+        | I::V_SUBREV_F32
+        | I::V_MUL_F32
+        | I::V_MUL_F64
+        | I::V_MIN_F32
+        | I::V_MIN_NUM_F32
+        | I::V_MIN_NUM_F64
+        | I::V_MAX_F32
+        | I::V_MAX_NUM_F32
+        | I::V_MAX_NUM_F64 => {
             let f = match op {
                 I::V_ADD_F32 | I::V_ADD_F64 => FloatOp::Add,
                 I::V_SUB_F32 | I::V_SUBREV_F32 => FloatOp::Sub,
@@ -573,7 +941,11 @@ fn lower_float(q: &mut Builder, op: I, ty: Ty, a: ValueId, b: ValueId, c: ValueI
                 I::V_MIN_F32 | I::V_MIN_NUM_F32 | I::V_MIN_NUM_F64 => FloatOp::MinNum,
                 _ => FloatOp::MaxNum,
             };
-            let (a, b) = if matches!(op, I::V_SUBREV_F32) { (b, a) } else { (a, b) };
+            let (a, b) = if matches!(op, I::V_SUBREV_F32) {
+                (b, a)
+            } else {
+                (a, b)
+            };
             let mut result = q.push(ty, Op::Float(f, a, b));
             if matches!(op, I::V_SUB_F32 | I::V_SUBREV_F32) {
                 // Captured subtraction cases preserve the NaN operand's

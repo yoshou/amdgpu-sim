@@ -1,6 +1,6 @@
 //! Memory decoding and address semantics; no LLVM or execution-width knowledge.
-use crate::rdna_spmd::ir::{*};
 use super::input;
+use crate::rdna_spmd::ir::*;
 use crate::{
     instructions::I,
     rdna_instructions::{InstFormat, SourceOperand},
@@ -236,11 +236,17 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         | I::FLAT_LOAD_U16
         | I::SCRATCH_LOAD_U16
         | I::DS_LOAD_U16 => (Load(U16), 1),
-        I::S_LOAD_I16 | I::GLOBAL_LOAD_I16 | I::FLAT_LOAD_I16 | I::SCRATCH_LOAD_I16 | I::DS_LOAD_I16 => {
-            (Load(I16), 1)
+        I::S_LOAD_I16
+        | I::GLOBAL_LOAD_I16
+        | I::FLAT_LOAD_I16
+        | I::SCRATCH_LOAD_I16
+        | I::DS_LOAD_I16 => (Load(I16), 1),
+        I::S_LOAD_U8 | I::GLOBAL_LOAD_U8 | I::FLAT_LOAD_U8 | I::SCRATCH_LOAD_U8 | I::DS_LOAD_U8 => {
+            (Load(U8), 1)
         }
-        I::S_LOAD_U8 | I::GLOBAL_LOAD_U8 | I::FLAT_LOAD_U8 | I::SCRATCH_LOAD_U8 | I::DS_LOAD_U8 => (Load(U8), 1),
-        I::S_LOAD_I8 | I::GLOBAL_LOAD_I8 | I::FLAT_LOAD_I8 | I::SCRATCH_LOAD_I8 | I::DS_LOAD_I8 => (Load(I8), 1),
+        I::S_LOAD_I8 | I::GLOBAL_LOAD_I8 | I::FLAT_LOAD_I8 | I::SCRATCH_LOAD_I8 | I::DS_LOAD_I8 => {
+            (Load(I8), 1)
+        }
         I::S_LOAD_B32
         | I::GLOBAL_LOAD_B32
         | I::FLAT_LOAD_B32
@@ -251,12 +257,16 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         | I::FLAT_LOAD_B64
         | I::SCRATCH_LOAD_B64
         | I::DS_LOAD_B64 => (Load(B32), 2),
-        I::S_LOAD_B96 | I::GLOBAL_LOAD_B96 | I::FLAT_LOAD_B96 | I::SCRATCH_LOAD_B96 | I::DS_LOAD_B96 => {
-            (Load(B32), 3)
-        }
-        I::S_LOAD_B128 | I::GLOBAL_LOAD_B128 | I::FLAT_LOAD_B128 | I::SCRATCH_LOAD_B128 | I::DS_LOAD_B128 => {
-            (Load(B32), 4)
-        }
+        I::S_LOAD_B96
+        | I::GLOBAL_LOAD_B96
+        | I::FLAT_LOAD_B96
+        | I::SCRATCH_LOAD_B96
+        | I::DS_LOAD_B96 => (Load(B32), 3),
+        I::S_LOAD_B128
+        | I::GLOBAL_LOAD_B128
+        | I::FLAT_LOAD_B128
+        | I::SCRATCH_LOAD_B128
+        | I::DS_LOAD_B128 => (Load(B32), 4),
         I::S_LOAD_B256 => (Load(B32), 8),
         I::S_LOAD_B512 => (Load(B32), 16),
         I::DS_LOAD_2ADDR_B32 | I::DS_LOAD_2ADDR_STRIDE64_B32 => (Load(B32), 2),
@@ -275,8 +285,12 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         I::GLOBAL_STORE_B64 | I::FLAT_STORE_B64 | I::SCRATCH_STORE_B64 | I::DS_STORE_B64 => {
             (Store(B32), 2)
         }
-        I::GLOBAL_STORE_B96 | I::FLAT_STORE_B96 | I::SCRATCH_STORE_B96 | I::DS_STORE_B96 => (Store(B32), 3),
-        I::GLOBAL_STORE_B128 | I::FLAT_STORE_B128 | I::SCRATCH_STORE_B128 | I::DS_STORE_B128 => (Store(B32), 4),
+        I::GLOBAL_STORE_B96 | I::FLAT_STORE_B96 | I::SCRATCH_STORE_B96 | I::DS_STORE_B96 => {
+            (Store(B32), 3)
+        }
+        I::GLOBAL_STORE_B128 | I::FLAT_STORE_B128 | I::SCRATCH_STORE_B128 | I::DS_STORE_B128 => {
+            (Store(B32), 4)
+        }
         I::GLOBAL_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => (AtomicAdd, 1),
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
         _ => panic!("unsupported memory lift {:?}", opcode),
@@ -285,15 +299,44 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
     // (4 or 8 bytes); STRIDE64 multiplies that element stride by 64. DATA1
     // supplies the second store's source independently of DATA0.
     // https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content
-    let pair = if matches!(opcode, I::DS_LOAD_2ADDR_B32 | I::DS_LOAD_2ADDR_B64 |
-        I::DS_STORE_2ADDR_B32 | I::DS_STORE_2ADDR_B64 | I::DS_LOAD_2ADDR_STRIDE64_B32 |
-        I::DS_LOAD_2ADDR_STRIDE64_B64 | I::DS_STORE_2ADDR_STRIDE64_B32 | I::DS_STORE_2ADDR_STRIDE64_B64) {
-        let InstFormat::DS(i) = inst else { unreachable!() };
-        let stride = words / 2 * 4 * if matches!(opcode, I::DS_LOAD_2ADDR_STRIDE64_B32 |
-            I::DS_LOAD_2ADDR_STRIDE64_B64 | I::DS_STORE_2ADDR_STRIDE64_B32 | I::DS_STORE_2ADDR_STRIDE64_B64) { 64 } else { 1 };
-        address = Address::Lds { vector: i.addr as u32, offset: 0 };
-        Some(LdsPair { offsets: [i.offset0 as u32 * stride, i.offset1 as u32 * stride], second_data: i.data1 as u32 })
-    } else { None };
+    let pair = if matches!(
+        opcode,
+        I::DS_LOAD_2ADDR_B32
+            | I::DS_LOAD_2ADDR_B64
+            | I::DS_STORE_2ADDR_B32
+            | I::DS_STORE_2ADDR_B64
+            | I::DS_LOAD_2ADDR_STRIDE64_B32
+            | I::DS_LOAD_2ADDR_STRIDE64_B64
+            | I::DS_STORE_2ADDR_STRIDE64_B32
+            | I::DS_STORE_2ADDR_STRIDE64_B64
+    ) {
+        let InstFormat::DS(i) = inst else {
+            unreachable!()
+        };
+        let stride = words / 2
+            * 4
+            * if matches!(
+                opcode,
+                I::DS_LOAD_2ADDR_STRIDE64_B32
+                    | I::DS_LOAD_2ADDR_STRIDE64_B64
+                    | I::DS_STORE_2ADDR_STRIDE64_B32
+                    | I::DS_STORE_2ADDR_STRIDE64_B64
+            ) {
+                64
+            } else {
+                1
+            };
+        address = Address::Lds {
+            vector: i.addr as u32,
+            offset: 0,
+        };
+        Some(LdsPair {
+            offsets: [i.offset0 as u32 * stride, i.offset1 as u32 * stride],
+            second_data: i.data1 as u32,
+        })
+    } else {
+        None
+    };
     let returns = matches!(op, Load(_))
         || op == AtomicAdd && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
     let mut semantics = semantics(scope, th, op, matches!(address, Address::Scalar { .. }));
@@ -332,29 +375,66 @@ impl Memory {
         provenance: &mut u64,
     ) {
         let (base, address, data, mask, ty) = self.operands(f, block, words, views);
-        let flat = matches!(self.address, Address::Flat { .. }).then(|| flat_aperture(f, block, base, address, mask));
+        let flat = matches!(self.address, Address::Flat { .. })
+            .then(|| flat_aperture(f, block, base, address, mask));
         let instruction = *provenance << 8;
         *provenance += 1;
         let mut sub = 0u64;
-        let mut next_provenance = || { let id = instruction | sub; sub += 1; id };
+        let mut next_provenance = || {
+            let id = instruction | sub;
+            sub += 1;
+            id
+        };
         if self.op == MemoryOp::Fence {
             block.insts.push(Inst::Effect {
                 provenance: next_provenance(),
-                op: EffectOp::Memory { space: self.space(), op: self.op, semantics: self.semantics },
+                op: EffectOp::Memory {
+                    space: self.space(),
+                    op: self.op,
+                    semantics: self.semantics,
+                },
                 inputs: vec![],
                 outputs: vec![],
             });
         }
         for k in 0..self.words {
-            let word_address = if self.word_offset(k) == 0 { address } else { offset_by(f, block, ty, address, self.word_offset(k) as u64) };
+            let word_address = if self.word_offset(k) == 0 {
+                address
+            } else {
+                offset_by(f, block, ty, address, self.word_offset(k) as u64)
+            };
             let exec = flat.as_ref().map_or(mask, |aperture| aperture.outside);
-            let mut result = self.effect(f, block, next_provenance(), self.space(), word_address, data.get(k as usize).copied(), exec);
+            let mut result = self.effect(
+                f,
+                block,
+                next_provenance(),
+                self.space(),
+                word_address,
+                data.get(k as usize).copied(),
+                exec,
+            );
             if let Some(aperture) = &flat {
-                let private_address = if k == 0 { aperture.private } else { offset_by(f, block, Ty::I32, aperture.private, k as u64 * 4) };
-                let private = self.effect(f, block, next_provenance(), Space::Scratch, private_address, data.get(k as usize).copied(), aperture.inside_exec);
+                let private_address = if k == 0 {
+                    aperture.private
+                } else {
+                    offset_by(f, block, Ty::I32, aperture.private, k as u64 * 4)
+                };
+                let private = self.effect(
+                    f,
+                    block,
+                    next_provenance(),
+                    Space::Scratch,
+                    private_address,
+                    data.get(k as usize).copied(),
+                    aperture.inside_exec,
+                );
                 if let (Some(global), Some(private)) = (result, private) {
                     let merged = f.value(Ty::I32);
-                    block.insts.push(Inst::Core { value: merged, ty: Ty::I32, op: Op::Select(aperture.inside, private, global) });
+                    block.insts.push(Inst::Core {
+                        value: merged,
+                        ty: Ty::I32,
+                        op: Op::Select(aperture.inside, private, global),
+                    });
                     result = Some(merged);
                 }
             }
@@ -364,24 +444,60 @@ impl Memory {
         }
     }
 
-    fn operands(&self, f: &mut Func, block: &mut Block, words: &mut super::regs::Words, views: &mut super::regs::Views) -> (ValueId, ValueId, Vec<ValueId>, ValueId, Ty) {
+    fn operands(
+        &self,
+        f: &mut Func,
+        block: &mut Block,
+        words: &mut super::regs::Words,
+        views: &mut super::regs::Views,
+    ) -> (ValueId, ValueId, Vec<ValueId>, ValueId, Ty) {
         let mut operands = super::regs::Operands::default();
-        let mut reg = |source: SourceOperand, ty| operands.read(&input(source, ty), self.scalar(), None, f, block, words, views);
+        let mut reg = |source: SourceOperand, ty| {
+            operands.read(
+                &input(source, ty),
+                self.scalar(),
+                None,
+                f,
+                block,
+                words,
+                views,
+            )
+        };
         // Collect register operands first, preserving their ISA widths.
         let (s, v, offset, ty) = match self.address {
-            Address::Global { scalar, vector, offset } | Address::Flat { scalar, vector, offset } => (
+            Address::Global {
+                scalar,
+                vector,
+                offset,
+            }
+            | Address::Flat {
+                scalar,
+                vector,
+                offset,
+            } => (
                 scalar.map(|r| reg(SourceOperand::ScalarRegister(r as u8), Ty::I64)),
-                Some(reg(SourceOperand::VectorRegister(vector as u8), if scalar.is_some() { Ty::I32 } else { Ty::I64 })),
+                Some(reg(
+                    SourceOperand::VectorRegister(vector as u8),
+                    if scalar.is_some() { Ty::I32 } else { Ty::I64 },
+                )),
                 offset,
                 Ty::I64,
             ),
-            Address::Scalar { base, offset, scalar_offset } => (
+            Address::Scalar {
+                base,
+                offset,
+                scalar_offset,
+            } => (
                 Some(reg(SourceOperand::ScalarRegister(base as u8), Ty::I64)),
                 scalar_offset.map(|r| reg(SourceOperand::ScalarRegister(r as u8), Ty::I32)),
                 offset as i64,
                 Ty::I64,
             ),
-            Address::Scratch { scalar, vector, offset } => (
+            Address::Scratch {
+                scalar,
+                vector,
+                offset,
+            } => (
                 scalar.map(|r| reg(SourceOperand::ScalarRegister(r as u8), Ty::I32)),
                 vector.map(|r| reg(SourceOperand::VectorRegister(r as u8), Ty::I32)),
                 offset,
@@ -395,7 +511,14 @@ impl Memory {
             ),
         };
         let data: Vec<_> = if self.stores() || self.op == MemoryOp::AtomicAdd {
-            (0..self.words).map(|k| reg(SourceOperand::VectorRegister(self.data_register(k) as u8), Ty::I32)).collect()
+            (0..self.words)
+                .map(|k| {
+                    reg(
+                        SourceOperand::VectorRegister(self.data_register(k) as u8),
+                        Ty::I32,
+                    )
+                })
+                .collect()
         } else {
             vec![]
         };
@@ -404,54 +527,116 @@ impl Memory {
             super::regs::core(f, &mut core, Ty::I1, Op::Const(Ty::I1, 1))
         } else {
             let exec = words[&super::regs::Word::Mask(126)];
-            super::regs::core(f, &mut core, Ty::I1, Op::Convert(Cvt::Bitcast, Ty::I1, exec))
+            super::regs::core(
+                f,
+                &mut core,
+                Ty::I1,
+                Op::Convert(Cvt::Bitcast, Ty::I1, exec),
+            )
         };
         let mut push = |t, op| {
             let value = f.value(t);
             core.push(Inst::Core { value, ty: t, op });
             value
         };
-        let v = v.map(|v| if ty == Ty::I64 && s.is_some() { push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, v)) } else { v });
+        let v = v.map(|v| {
+            if ty == Ty::I64 && s.is_some() {
+                push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, v))
+            } else {
+                v
+            }
+        });
         let base = match (s, v) {
             (Some(s), Some(v)) => push(ty, Op::Int(IntOp::Add, s, v)),
             (Some(s), None) => s,
             (None, Some(v)) => v,
             _ => push(ty, Op::Const(ty, 0)),
         };
-        let off = push(ty, Op::Const(ty, if ty == Ty::I32 { offset as u32 as u64 } else { offset as u64 }));
+        let off = push(
+            ty,
+            Op::Const(
+                ty,
+                if ty == Ty::I32 {
+                    offset as u32 as u64
+                } else {
+                    offset as u64
+                },
+            ),
+        );
         let address = push(ty, Op::Int(IntOp::Add, base, off));
         block.insts.extend(core);
         (base, address, data, mask, ty)
     }
 
-    fn effect(&self, f: &mut Func, block: &mut Block, provenance: u64, space: Space, address: ValueId, data: Option<ValueId>, exec: ValueId) -> Option<ValueId> {
+    fn effect(
+        &self,
+        f: &mut Func,
+        block: &mut Block,
+        provenance: u64,
+        space: Space,
+        address: ValueId,
+        data: Option<ValueId>,
+        exec: ValueId,
+    ) -> Option<ValueId> {
         let mut inputs = vec![address];
         inputs.extend(data);
         inputs.push(exec);
-        let outputs = if self.stores() { vec![] } else { vec![(f.value(Ty::I32), Ty::I32)] };
+        let outputs = if self.stores() {
+            vec![]
+        } else {
+            vec![(f.value(Ty::I32), Ty::I32)]
+        };
         block.insts.push(Inst::Effect {
             provenance,
-            op: EffectOp::Memory { space, op: self.op, semantics: self.semantics },
+            op: EffectOp::Memory {
+                space,
+                op: self.op,
+                semantics: self.semantics,
+            },
             inputs,
             outputs: outputs.clone(),
         });
         outputs.first().map(|o| o.0)
     }
 
-    fn write_result(&self, f: &mut Func, block: &mut Block, words: &mut super::regs::Words, mask: ValueId, k: u32, result: ValueId) {
-        let word = if self.scalar() { super::regs::Word::scalar(self.dest + k) } else { Some(super::regs::Word::Vgpr(self.dest + k)) };
+    fn write_result(
+        &self,
+        f: &mut Func,
+        block: &mut Block,
+        words: &mut super::regs::Words,
+        mask: ValueId,
+        k: u32,
+        result: ValueId,
+    ) {
+        let word = if self.scalar() {
+            super::regs::Word::scalar(self.dest + k)
+        } else {
+            Some(super::regs::Word::Vgpr(self.dest + k))
+        };
         let Some(word) = word else {
-            if self.dest + k != 124 { panic!("invalid scalar memory destination: {}", self.dest + k); }
+            if self.dest + k != 124 {
+                panic!("invalid scalar memory destination: {}", self.dest + k);
+            }
             return;
         };
         let stored = if matches!(word, super::regs::Word::Mask(_)) {
             super::regs::project(f, &mut block.insts, result)
-        } else if self.scalar() { result } else {
+        } else if self.scalar() {
+            result
+        } else {
             let stored = f.value(Ty::I32);
-            block.insts.push(Inst::Core { value: stored, ty: Ty::I32, op: Op::Select(mask, result, words[&word]) });
+            block.insts.push(Inst::Core {
+                value: stored,
+                ty: Ty::I32,
+                op: Op::Select(mask, result, words[&word]),
+            });
             stored
         };
-        let stored = if word == super::regs::Word::Mask(126) { super::regs::valid_exec(f, &mut block.insts, stored) } else { stored };
+        let stored = if word == super::regs::Word::Mask(126) {
+            super::regs::valid_exec(f, &mut block.insts, stored)
+        } else {
+            stored
+        };
         words.insert(word, stored);
     }
 }
@@ -463,11 +648,25 @@ struct Aperture {
     outside: ValueId,
 }
 
-fn flat_aperture(f: &mut Func, block: &mut Block, base: ValueId, address: ValueId, mask: ValueId) -> Aperture {
+fn flat_aperture(
+    f: &mut Func,
+    block: &mut Block,
+    base: ValueId,
+    address: ValueId,
+    mask: ValueId,
+) -> Aperture {
     let sb = f.value(Ty::I64);
     let size = f.value(Ty::I64);
-    block.insts.push(Inst::Core { value: sb, ty: Ty::I64, op: Op::Env(crate::rdna_spmd::ir::Env::ScratchBase) });
-    block.insts.push(Inst::Core { value: size, ty: Ty::I64, op: Op::Env(crate::rdna_spmd::ir::Env::ScratchSize) });
+    block.insts.push(Inst::Core {
+        value: sb,
+        ty: Ty::I64,
+        op: Op::Env(crate::rdna_spmd::ir::Env::ScratchBase),
+    });
+    block.insts.push(Inst::Core {
+        value: size,
+        ty: Ty::I64,
+        op: Op::Env(crate::rdna_spmd::ir::Env::ScratchSize),
+    });
     let mut push = |t, op| {
         let value = f.value(t);
         block.insts.push(Inst::Core { value, ty: t, op });
@@ -485,13 +684,26 @@ fn flat_aperture(f: &mut Func, block: &mut Block, base: ValueId, address: ValueI
     let outside = push(Ty::I1, Op::Int(IntOp::And, mask, outside_lanes));
     let off = push(Ty::I64, Op::Int(IntOp::Sub, address, sb));
     let private = push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, off));
-    Aperture { inside, private, inside_exec, outside }
+    Aperture {
+        inside,
+        private,
+        inside_exec,
+        outside,
+    }
 }
 
 fn offset_by(f: &mut Func, block: &mut Block, ty: Ty, base: ValueId, offset: u64) -> ValueId {
     let off = f.value(ty);
-    block.insts.push(Inst::Core { value: off, ty, op: Op::Const(ty, offset) });
+    block.insts.push(Inst::Core {
+        value: off,
+        ty,
+        op: Op::Const(ty, offset),
+    });
     let sum = f.value(ty);
-    block.insts.push(Inst::Core { value: sum, ty, op: Op::Int(IntOp::Add, base, off) });
+    block.insts.push(Inst::Core {
+        value: sum,
+        ty,
+        op: Op::Int(IntOp::Add, base, off),
+    });
     sum
 }

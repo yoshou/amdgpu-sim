@@ -8,11 +8,16 @@ pub(crate) trait Idiom: Send + Sync {
 
 pub(crate) struct Idioms;
 impl Pass for Idioms {
-    fn name(&self) -> &str { "idioms" }
+    fn name(&self) -> &str {
+        "idioms"
+    }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        let (predication, constants) = (analyses.get::<Predication>(f), analyses.get::<Constants>(f));
+        let (predication, constants) =
+            (analyses.get::<Predication>(f), analyses.get::<Constants>(f));
         for idiom in analyses.context().registry.idioms() {
-            if idiom.rewrite(f, &predication, &constants) > 0 { return true; }
+            if idiom.rewrite(f, &predication, &constants) > 0 {
+                return true;
+            }
         }
         false
     }

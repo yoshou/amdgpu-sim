@@ -27,7 +27,11 @@ impl Emitter {
             None => base,
         });
     }
-    pub fn new(ir: Builder, width: Option<u32>, registry: std::sync::Arc<super::super::dialect::DialectRegistry>) -> Self {
+    pub fn new(
+        ir: Builder,
+        width: Option<u32>,
+        registry: std::sync::Arc<super::super::dialect::DialectRegistry>,
+    ) -> Self {
         Self {
             registry,
             state: None,
@@ -51,27 +55,43 @@ impl Emitter {
         };
         self.shaped(t)
     }
-    pub(in crate::rdna_spmd) fn wide(&self) -> bool { self.wide.get() }
-    pub(in crate::rdna_spmd) fn set_wide(&mut self, wide: bool) { self.wide.set(wide && self.width.is_some()); }
+    pub(in crate::rdna_spmd) fn wide(&self) -> bool {
+        self.wide.get()
+    }
+    pub(in crate::rdna_spmd) fn set_wide(&mut self, wide: bool) {
+        self.wide.set(wide && self.width.is_some());
+    }
     pub(in crate::rdna_spmd) fn to_bool(&self, v: Value) -> Value {
-        if !self.wide.get() || !v.is_vector() { return v; }
+        if !self.wide.get() || !v.is_vector() {
+            return v;
+        }
         self.ir.icmp(IntPred::Slt, v, v.ty().null())
     }
     pub(in crate::rdna_spmd) fn from_bool(&self, v: Value) -> Value {
-        if !self.wide.get() || !v.is_vector() { return v; }
+        if !self.wide.get() || !v.is_vector() {
+            return v;
+        }
         self.ir.sext(v, self.ty(Ty::I1))
     }
     pub(in crate::rdna_spmd) fn shaped(&self, scalar: Type) -> Type {
         self.width.map_or(scalar, |w| scalar.vector(w))
     }
     pub(in crate::rdna_spmd) fn constant(&self, ty: Ty, bits: u64) -> Value {
-        let (t, bits) = if ty == Ty::I1 && self.wide.get() { (self.ir.i64(), if bits & 1 == 1 { u64::MAX } else { 0 }) } else { (self.ir.int(ty.bits()), bits) };
+        let (t, bits) = if ty == Ty::I1 && self.wide.get() {
+            (self.ir.i64(), if bits & 1 == 1 { u64::MAX } else { 0 })
+        } else {
+            (self.ir.int(ty.bits()), bits)
+        };
         let v = t.const_int(bits);
         let v = match self.width {
             Some(w) => self.ir.const_vector(&vec![v; w as usize]),
             None => v,
         };
-        if ty.integer() { v } else { self.ir.const_bitcast(v, self.ty(ty)) }
+        if ty.integer() {
+            v
+        } else {
+            self.ir.const_bitcast(v, self.ty(ty))
+        }
     }
     pub(in crate::rdna_spmd) fn suffix(&self, t: Ty) -> String {
         let t = match t {
@@ -83,39 +103,71 @@ impl Emitter {
         };
         self.width.map_or_else(|| t.into(), |w| format!("v{w}{t}"))
     }
-    pub(in crate::rdna_spmd) fn width(&self) -> Option<u32> { self.width }
-    pub(in crate::rdna_spmd) fn state<T: 'static>(&self) -> Option<&T> { self.state.as_ref().and_then(|s| s.downcast_ref::<T>()) }
+    pub(in crate::rdna_spmd) fn width(&self) -> Option<u32> {
+        self.width
+    }
+    pub(in crate::rdna_spmd) fn state<T: 'static>(&self) -> Option<&T> {
+        self.state.as_ref().and_then(|s| s.downcast_ref::<T>())
+    }
     pub(in crate::rdna_spmd) fn call(&self, name: &str, ret: Ty, args: &[Value]) -> Value {
         let types: Vec<Type> = args.iter().map(|v| v.ty()).collect();
         self.ir.call_named(name, self.ty(ret), &types, args)
     }
-    pub fn target(&self, op: super::super::dialect::TargetOp, args: super::super::dialect::Arguments, values: &[Value]) -> Vec<Value> {
+    pub fn target(
+        &self,
+        op: super::super::dialect::TargetOp,
+        args: super::super::dialect::Arguments,
+        values: &[Value],
+    ) -> Vec<Value> {
         let spec = self.registry.operation(op).expect("unverified target");
-        let args = args.values().iter().enumerate().map(|(i, id)| if spec.inputs.get(i) == Some(&Ty::I1) { self.to_bool(values[id.0]) } else { values[id.0] }).collect::<Vec<_>>();
+        let args = args
+            .values()
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                if spec.inputs.get(i) == Some(&Ty::I1) {
+                    self.to_bool(values[id.0])
+                } else {
+                    values[id.0]
+                }
+            })
+            .collect::<Vec<_>>();
         let wide = self.wide.replace(false);
         let results = spec.emit(self, &args);
         self.wide.set(wide);
-        results.into_iter().zip(&spec.outputs).map(|(v, &t)| if t == Ty::I1 { self.from_bool(v) } else { v }).collect()
+        results
+            .into_iter()
+            .zip(&spec.outputs)
+            .map(|(v, &t)| if t == Ty::I1 { self.from_bool(v) } else { v })
+            .collect()
     }
     pub fn op(&self, ty: Ty, op: Op, values: &[Value]) -> Value {
         let ir = self.ir;
         let v = |id: ValueId| values[id.0];
         match op {
-            Op::Env(Env::LaneId) => self.lane_id.expect("LaneId requires the invocation environment"),
+            Op::Env(Env::LaneId) => self
+                .lane_id
+                .expect("LaneId requires the invocation environment"),
             Op::Env(Env::PacketLaneId) => match self.width {
                 Some(width) => ir.const_i32_vector(&(0..width).collect::<Vec<u32>>()),
                 None => self.constant(Ty::I32, 0),
             },
             Op::Env(env @ (Env::ScratchBase | Env::ScratchSize)) => {
-                let (base, size) = self.scratch.expect("scratch requires the invocation environment");
+                let (base, size) = self
+                    .scratch
+                    .expect("scratch requires the invocation environment");
                 let value = if env == Env::ScratchBase { base } else { size };
                 match self.width {
                     Some(width) => ir.splat(value, width),
                     None => value,
                 }
             }
-            Op::Env(Env::ValidLane) => self.valid_lane.expect("ValidLane requires the invocation environment"),
-            Op::Env(Env::OutsideLanes) => self.outside_lanes.expect("OutsideLanes requires the invocation environment"),
+            Op::Env(Env::ValidLane) => self
+                .valid_lane
+                .expect("ValidLane requires the invocation environment"),
+            Op::Env(Env::OutsideLanes) => self
+                .outside_lanes
+                .expect("OutsideLanes requires the invocation environment"),
             Op::Const(t, bits) => self.constant(t, bits),
             Op::Pack64(a, c) => {
                 let lo = ir.zext(v(a), self.ty(Ty::I64));
@@ -124,13 +176,29 @@ impl Emitter {
                 ir.or(lo, hi)
             }
             Op::UnpackLo(a) | Op::UnpackHi(a) => {
-                let wide = if matches!(op, Op::UnpackHi(_)) { ir.lshr(v(a), self.constant(Ty::I64, 32)) } else { v(a) };
+                let wide = if matches!(op, Op::UnpackHi(_)) {
+                    ir.lshr(v(a), self.constant(Ty::I64, 32))
+                } else {
+                    v(a)
+                };
                 ir.trunc(wide, self.ty(Ty::I32))
             }
-            Op::TrailingZeros(a) => self.call(&format!("llvm.cttz.{}", self.suffix(ty)), ty, &[v(a), ir.ci1(false)]),
-            Op::LeadingZeros(a) => self.call(&format!("llvm.ctlz.{}", self.suffix(ty)), ty, &[v(a), ir.ci1(false)]),
-            Op::PopulationCount(a) => self.call(&format!("llvm.ctpop.{}", self.suffix(ty)), ty, &[v(a)]),
-            Op::ReverseBits(a) => self.call(&format!("llvm.bitreverse.{}", self.suffix(ty)), ty, &[v(a)]),
+            Op::TrailingZeros(a) => self.call(
+                &format!("llvm.cttz.{}", self.suffix(ty)),
+                ty,
+                &[v(a), ir.ci1(false)],
+            ),
+            Op::LeadingZeros(a) => self.call(
+                &format!("llvm.ctlz.{}", self.suffix(ty)),
+                ty,
+                &[v(a), ir.ci1(false)],
+            ),
+            Op::PopulationCount(a) => {
+                self.call(&format!("llvm.ctpop.{}", self.suffix(ty)), ty, &[v(a)])
+            }
+            Op::ReverseBits(a) => {
+                self.call(&format!("llvm.bitreverse.{}", self.suffix(ty)), ty, &[v(a)])
+            }
             Op::Int(op, a, c) => {
                 let (a, mut c) = (v(a), v(c));
                 if matches!(op, IntOp::Shl | IntOp::LShr | IntOp::AShr) {
@@ -189,17 +257,35 @@ impl Emitter {
                 FloatOp::Mul => ir.fmul(v(a), v(c)),
                 FloatOp::Div => ir.fdiv(v(a), v(c)),
                 FloatOp::MinNum | FloatOp::MaxNum => {
-                    let name = if op == FloatOp::MinNum { "minnum" } else { "maxnum" };
-                    self.call(&format!("llvm.{name}.{}", self.suffix(ty)), ty, &[v(a), v(c)])
+                    let name = if op == FloatOp::MinNum {
+                        "minnum"
+                    } else {
+                        "maxnum"
+                    };
+                    self.call(
+                        &format!("llvm.{name}.{}", self.suffix(ty)),
+                        ty,
+                        &[v(a), v(c)],
+                    )
                 }
             },
             Op::Unary(op, a) => match op {
                 FloatUnary::Neg => ir.fneg(v(a)),
-                FloatUnary::Abs => self.call(&format!("llvm.fabs.{}", self.suffix(ty)), ty, &[v(a)]),
+                FloatUnary::Abs => {
+                    self.call(&format!("llvm.fabs.{}", self.suffix(ty)), ty, &[v(a)])
+                }
             },
             Op::Fma(a, c, d) | Op::MulAdd(a, c, d) => {
-                let name = if matches!(op, Op::Fma(..)) { "fma" } else { "fmuladd" };
-                self.call(&format!("llvm.{name}.{}", self.suffix(ty)), ty, &[v(a), v(c), v(d)])
+                let name = if matches!(op, Op::Fma(..)) {
+                    "fma"
+                } else {
+                    "fmuladd"
+                };
+                self.call(
+                    &format!("llvm.{name}.{}", self.suffix(ty)),
+                    ty,
+                    &[v(a), v(c), v(d)],
+                )
             }
             Op::Convert(op, to, a) => {
                 let a = v(a);
@@ -211,16 +297,38 @@ impl Emitter {
                     Cvt::Trunc => ir.trunc(a, t),
                     Cvt::SignedToFloatRte => ir.sitofp(a, t),
                     Cvt::UnsignedToFloatRte => ir.uitofp(a, t),
-                    Cvt::FloatResizeRte => if to == Ty::F64 { ir.fpext(a, t) } else { ir.fptrunc(a, t) },
+                    Cvt::FloatResizeRte => {
+                        if to == Ty::F64 {
+                            ir.fpext(a, t)
+                        } else {
+                            ir.fptrunc(a, t)
+                        }
+                    }
                     Cvt::FloatToSignedSatRtz | Cvt::FloatToUnsignedSatRtz => {
                         let at = a.ty();
-                        let at = if self.width.is_some() { at.element() } else { at };
+                        let at = if self.width.is_some() {
+                            at.element()
+                        } else {
+                            at
+                        };
                         let from = if at.is_float() { Ty::F32 } else { Ty::F64 };
-                        let name = if op == Cvt::FloatToSignedSatRtz { "fptosi" } else { "fptoui" };
-                        self.call(&format!("llvm.{name}.sat.{}.{}", self.suffix(to), self.suffix(from)), to, &[a])
+                        let name = if op == Cvt::FloatToSignedSatRtz {
+                            "fptosi"
+                        } else {
+                            "fptoui"
+                        };
+                        self.call(
+                            &format!("llvm.{name}.sat.{}.{}", self.suffix(to), self.suffix(from)),
+                            to,
+                            &[a],
+                        )
                     }
                 };
-                if to == Ty::I1 { self.from_bool(converted) } else { converted }
+                if to == Ty::I1 {
+                    self.from_bool(converted)
+                } else {
+                    converted
+                }
             }
         }
     }

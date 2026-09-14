@@ -1,11 +1,19 @@
 //! Comparison semantics shared by VOPC and VOP3, before mask writeback.
 use super::*;
-use crate::instructions::{OP8, OP16};
+use crate::instructions::{OP16, OP8};
 
 #[derive(Clone, Copy)]
-enum Predicate { Float(OP16), Integer(OP8, bool), Class }
+enum Predicate {
+    Float(OP16),
+    Integer(OP8, bool),
+    Class,
+}
 #[derive(Clone, Copy)]
-struct Comparison { bits: u32, predicate: Predicate, exec: bool }
+struct Comparison {
+    bits: u32,
+    predicate: Predicate,
+    exec: bool,
+}
 
 fn decode(op: I) -> Option<Comparison> {
     use Predicate::*;
@@ -162,40 +170,102 @@ fn decode(op: I) -> Option<Comparison> {
         I::V_CMPX_CLASS_F64 => (64, Class, true),
         _ => return None,
     };
-    Some(Comparison { bits, predicate, exec })
+    Some(Comparison {
+        bits,
+        predicate,
+        exec,
+    })
 }
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (op, sources, dst, abs, neg, opsel) = match inst {
-        InstFormat::VOPC(i) => (i.op, [i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1)], 106, 0, 0, 0),
-        InstFormat::VOP3(i) => (i.op, [i.src0.clone(), i.src1.clone()], i.vdst as u32, i.abs, i.neg, i.opsel),
+        InstFormat::VOPC(i) => (
+            i.op,
+            [i.src0.clone(), SourceOperand::VectorRegister(i.vsrc1)],
+            106,
+            0,
+            0,
+            0,
+        ),
+        InstFormat::VOP3(i) => (
+            i.op,
+            [i.src0.clone(), i.src1.clone()],
+            i.vdst as u32,
+            i.abs,
+            i.neg,
+            i.opsel,
+        ),
         _ => return None,
     };
     let comparison = decode(op)?;
     let ty = match comparison.predicate {
-        Predicate::Float(_) => if comparison.bits == 64 { Ty::F64 } else { Ty::F32 },
-        _ => if comparison.bits == 64 { Ty::I64 } else { Ty::I32 },
+        Predicate::Float(_) => {
+            if comparison.bits == 64 {
+                Ty::F64
+            } else {
+                Ty::F32
+            }
+        }
+        _ => {
+            if comparison.bits == 64 {
+                Ty::I64
+            } else {
+                Ty::I32
+            }
+        }
     };
-    let mut b = Builder::new(registry, IntoIterator::into_iter(sources).enumerate().map(|(i, source)| {
-        let ty = if i == 1 && matches!(comparison.predicate, Predicate::Class) { Ty::I32 } else { ty };
-        if matches!(comparison.predicate, Predicate::Integer(_, true)) { signed_input(source, ty) }
-        else { input(source, ty) }
-    }).collect());
+    let mut b = Builder::new(
+        registry,
+        IntoIterator::into_iter(sources)
+            .enumerate()
+            .map(|(i, source)| {
+                let ty = if i == 1 && matches!(comparison.predicate, Predicate::Class) {
+                    Ty::I32
+                } else {
+                    ty
+                };
+                if matches!(comparison.predicate, Predicate::Integer(_, true)) {
+                    signed_input(source, ty)
+                } else {
+                    input(source, ty)
+                }
+            })
+            .collect(),
+    );
     let (mut a, mut c) = (ValueId(0), ValueId(1));
     let result = match comparison.predicate {
         Predicate::Float(p) => {
             a = b.float_mod(ty, a, abs, neg, 0);
             c = b.float_mod(ty, c, abs, neg, 1);
             let pred = match p {
-                OP16::F => { let result = b.k(Ty::I1, 0); return Some(b.finish(Output::Compare(if comparison.exec {126} else {dst}), result)); },
-                OP16::TRU => { let result = b.k(Ty::I1, 1); return Some(b.finish(Output::Compare(if comparison.exec {126} else {dst}), result)); },
-                OP16::LT => FloatPred::Olt, OP16::EQ => FloatPred::Oeq,
-                OP16::LE => FloatPred::Ole, OP16::GT => FloatPred::Ogt,
-                OP16::LG => FloatPred::One, OP16::GE => FloatPred::Oge,
-                OP16::O => FloatPred::Ord, OP16::U => FloatPred::Uno,
-                OP16::NGE => FloatPred::Ult, OP16::NLG => FloatPred::Ueq,
-                OP16::NGT => FloatPred::Ule, OP16::NLE => FloatPred::Ugt,
-                OP16::NEQ => FloatPred::Une, OP16::NLT => FloatPred::Uge,
+                OP16::F => {
+                    let result = b.k(Ty::I1, 0);
+                    return Some(b.finish(
+                        Output::Compare(if comparison.exec { 126 } else { dst }),
+                        result,
+                    ));
+                }
+                OP16::TRU => {
+                    let result = b.k(Ty::I1, 1);
+                    return Some(b.finish(
+                        Output::Compare(if comparison.exec { 126 } else { dst }),
+                        result,
+                    ));
+                }
+                OP16::LT => FloatPred::Olt,
+                OP16::EQ => FloatPred::Oeq,
+                OP16::LE => FloatPred::Ole,
+                OP16::GT => FloatPred::Ogt,
+                OP16::LG => FloatPred::One,
+                OP16::GE => FloatPred::Oge,
+                OP16::O => FloatPred::Ord,
+                OP16::U => FloatPred::Uno,
+                OP16::NGE => FloatPred::Ult,
+                OP16::NLG => FloatPred::Ueq,
+                OP16::NGT => FloatPred::Ule,
+                OP16::NLE => FloatPred::Ugt,
+                OP16::NEQ => FloatPred::Une,
+                OP16::NLT => FloatPred::Uge,
             };
             b.push(Ty::I1, Op::FCmp(pred, a, c))
         }
@@ -212,14 +282,20 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                 c = half_word(&mut b, c, false, signed);
             }
             match p {
-                OP8::F => b.k(Ty::I1, 0), OP8::TRU => b.k(Ty::I1, 1),
+                OP8::F => b.k(Ty::I1, 0),
+                OP8::TRU => b.k(Ty::I1, 1),
                 _ => {
                     let pred = match (p, signed) {
-                        (OP8::EQ, _) => IntPred::Eq, (OP8::LG, _) => IntPred::Ne,
-                        (OP8::LT, true) => IntPred::Slt, (OP8::LE, true) => IntPred::Sle,
-                        (OP8::GT, true) => IntPred::Sgt, (OP8::GE, true) => IntPred::Sge,
-                        (OP8::LT, false) => IntPred::Ult, (OP8::LE, false) => IntPred::Ule,
-                        (OP8::GT, false) => IntPred::Ugt, (OP8::GE, false) => IntPred::Uge,
+                        (OP8::EQ, _) => IntPred::Eq,
+                        (OP8::LG, _) => IntPred::Ne,
+                        (OP8::LT, true) => IntPred::Slt,
+                        (OP8::LE, true) => IntPred::Sle,
+                        (OP8::GT, true) => IntPred::Sgt,
+                        (OP8::GE, true) => IntPred::Sge,
+                        (OP8::LT, false) => IntPred::Ult,
+                        (OP8::LE, false) => IntPred::Ule,
+                        (OP8::GT, false) => IntPred::Ugt,
+                        (OP8::GE, false) => IntPred::Uge,
                         _ => unreachable!(),
                     };
                     b.push(Ty::I1, Op::Cmp(pred, a, c))
@@ -231,19 +307,30 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                 a = half_word(&mut b, a, opsel & 1 != 0, false);
                 classify(&mut b, ty, comparison.bits, a, c)
             } else {
-                let float = if comparison.bits == 32 { Ty::F32 } else { Ty::F64 };
+                let float = if comparison.bits == 32 {
+                    Ty::F32
+                } else {
+                    Ty::F64
+                };
                 let a = b.push(float, Op::Convert(Cvt::Bitcast, float, a));
                 let target = crate::rdna_spmd::targets::rdna4::dialect::comparison(registry, float);
                 b.target_one(target, Arguments::Binary([a, c]))
             }
         }
     };
-    Some(b.finish(Output::Compare(if comparison.exec {126} else {dst}), result))
+    Some(b.finish(
+        Output::Compare(if comparison.exec { 126 } else { dst }),
+        result,
+    ))
 }
 
 fn half_word(b: &mut Builder, value: ValueId, high: bool, signed: bool) -> ValueId {
     let shift = b.k(Ty::I32, 16);
-    let low = if high { b.int(IntOp::LShr, value, shift) } else { value };
+    let low = if high {
+        b.int(IntOp::LShr, value, shift)
+    } else {
+        value
+    };
     if signed {
         let shifted = b.int(IntOp::Shl, low, shift);
         b.int(IntOp::AShr, shifted, shift)
@@ -257,7 +344,12 @@ fn half_word(b: &mut Builder, value: ValueId, high: bool, signed: bool) -> Value
 /// +zero, +subnormal, +normal, +inf. The class selector is a runtime word,
 /// including per-lane selectors; LLVM's immarg fpclass cannot express it.
 fn classify(b: &mut Builder, ty: Ty, bits: u32, value: ValueId, selector: ValueId) -> ValueId {
-    let fraction_bits = match bits { 16 => 10, 32 => 23, 64 => 52, _ => unreachable!() };
+    let fraction_bits = match bits {
+        16 => 10,
+        32 => 23,
+        64 => 52,
+        _ => unreachable!(),
+    };
     let exponent_bits = bits - fraction_bits - 1;
     let mask = b.k(ty, (1u64 << fraction_bits) - 1);
     let fraction = b.push(ty, Op::Int(IntOp::And, value, mask));
@@ -275,8 +367,13 @@ fn classify(b: &mut Builder, ty: Ty, bits: u32, value: ValueId, selector: ValueI
     let quiet = b.push(Ty::I1, Op::Cmp(IntPred::Ne, quiet, zero));
     let negative_class = [2, 3, 4, 5].map(|n| b.k(Ty::I32, 1 << n));
     let positive_class = [9, 8, 7, 6].map(|n| b.k(Ty::I32, 1 << n));
-    let classes: Vec<_> = negative_class.iter().zip(positive_class).map(|(&n, p)| b.push(Ty::I32, Op::Select(negative, n, p))).collect();
-    let snan = b.k(Ty::I32, 1); let qnan = b.k(Ty::I32, 2);
+    let classes: Vec<_> = negative_class
+        .iter()
+        .zip(positive_class)
+        .map(|(&n, p)| b.push(Ty::I32, Op::Select(negative, n, p)))
+        .collect();
+    let snan = b.k(Ty::I32, 1);
+    let qnan = b.k(Ty::I32, 2);
     let nan = b.push(Ty::I32, Op::Select(quiet, qnan, snan));
     let special = b.push(Ty::I32, Op::Select(fraction_zero, classes[0], nan));
     let tiny = b.push(Ty::I32, Op::Select(fraction_zero, classes[3], classes[2]));

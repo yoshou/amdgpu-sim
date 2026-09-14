@@ -2,16 +2,27 @@ use std::thread;
 
 use crate::processor::KernelDescriptor;
 
+use super::super::ir::EffectOp;
 use super::dispatch::{setup_sgprs, GridDims};
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
-use super::kernel::{Code, CoopVecKernel, Kernel, ScalarKernel, Scheduler, VecKernel, COOP_SGPR_BUF, COOP_SPILL_SLOTS};
+use super::kernel::{
+    Code, CoopVecKernel, Kernel, ScalarKernel, Scheduler, VecKernel, COOP_SGPR_BUF,
+    COOP_SPILL_SLOTS,
+};
 use super::yields::YieldValues;
-use super::super::ir::EffectOp;
 
 const WAVE: usize = 32;
 
-fn lanes_mask(width: usize) -> u32 { if width >= 32 { u32::MAX } else { (1u32 << width) - 1 } }
-fn fiber_stack_bytes(width: usize) -> usize { (8 << 10) * width.max(4) }
+fn lanes_mask(width: usize) -> u32 {
+    if width >= 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    }
+}
+fn fiber_stack_bytes(width: usize) -> usize {
+    (8 << 10) * width.max(4)
+}
 const LDS_MIN_BYTES: usize = 128 * 1024;
 const POOL_LIMIT: usize = 64;
 
@@ -37,19 +48,52 @@ pub(crate) struct View<'a> {
 impl<'a> View<'a> {
     pub(crate) fn of(kernel: &'a Kernel) -> Self {
         match &kernel.code {
-            Code::Scalar(k) => Self { invoke: Invoke::Scalar(k), scheduler: kernel.scheduler(), width: 1, num_vgprs: k.num_vgprs, min_private_bytes: 0, workgroup_x: None, yields: &[], exec: 0 },
-            Code::Packet(k) => Self { invoke: Invoke::Packet(k), scheduler: kernel.scheduler(), width: k.width as usize, num_vgprs: k.num_vgprs, min_private_bytes: k.min_private_bytes, workgroup_x: k.workgroup_x, yields: &[], exec: 0 },
+            Code::Scalar(k) => Self {
+                invoke: Invoke::Scalar(k),
+                scheduler: kernel.scheduler(),
+                width: 1,
+                num_vgprs: k.num_vgprs,
+                min_private_bytes: 0,
+                workgroup_x: None,
+                yields: &[],
+                exec: 0,
+            },
+            Code::Packet(k) => Self {
+                invoke: Invoke::Packet(k),
+                scheduler: kernel.scheduler(),
+                width: k.width as usize,
+                num_vgprs: k.num_vgprs,
+                min_private_bytes: k.min_private_bytes,
+                workgroup_x: k.workgroup_x,
+                yields: &[],
+                exec: 0,
+            },
             Code::Cooperative(k) => Self::cooperative(k, kernel.scheduler()),
         }
     }
     pub(crate) fn cooperative(k: &'a CoopVecKernel, scheduler: Scheduler) -> Self {
-        Self { invoke: Invoke::Fiber(k), scheduler, width: k.width as usize, num_vgprs: k.num_vgprs, min_private_bytes: k.min_private_bytes, workgroup_x: k.workgroup_x, yields: &k.yields, exec: k.registers.exec as usize }
+        Self {
+            invoke: Invoke::Fiber(k),
+            scheduler,
+            width: k.width as usize,
+            num_vgprs: k.num_vgprs,
+            min_private_bytes: k.min_private_bytes,
+            workgroup_x: k.workgroup_x,
+            yields: &k.yields,
+            exec: k.registers.exec as usize,
+        }
     }
-    fn fibers(&self) -> bool { matches!(self.invoke, Invoke::Fiber(_)) }
+    fn fibers(&self) -> bool {
+        matches!(self.invoke, Invoke::Fiber(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unit { Packet, Wave, Workgroup }
+enum Unit {
+    Packet,
+    Wave,
+    Workgroup,
+}
 
 struct State {
     sgprs: Vec<[u32; COOP_SGPR_BUF]>,
@@ -68,7 +112,15 @@ struct State {
 unsafe impl Send for State {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct Shape { packets: usize, waves: usize, words: usize, fibers: bool, scratch: usize, lds: usize, stack: usize }
+struct Shape {
+    packets: usize,
+    waves: usize,
+    words: usize,
+    fibers: bool,
+    scratch: usize,
+    lds: usize,
+    stack: usize,
+}
 
 static POOL: std::sync::Mutex<Vec<(Shape, State)>> = std::sync::Mutex::new(Vec::new());
 
@@ -82,9 +134,21 @@ fn acquire(shape: Shape) -> State {
     scratch.resize(shape.scratch, 0u8);
     State {
         sgprs: vec![[0u32; COOP_SGPR_BUF]; shape.packets],
-        vgprs: (0..shape.packets).map(|_| vec![0u32; shape.words]).collect(),
-        spill: if shape.fibers { (0..shape.packets).map(|_| vec![0u32; COOP_SPILL_SLOTS]).collect() } else { Vec::new() },
-        fibers: if shape.fibers { Fiber::batch(shape.packets, shape.stack) } else { Vec::new() },
+        vgprs: (0..shape.packets)
+            .map(|_| vec![0u32; shape.words])
+            .collect(),
+        spill: if shape.fibers {
+            (0..shape.packets)
+                .map(|_| vec![0u32; COOP_SPILL_SLOTS])
+                .collect()
+        } else {
+            Vec::new()
+        },
+        fibers: if shape.fibers {
+            Fiber::batch(shape.packets, shape.stack)
+        } else {
+            Vec::new()
+        },
         resume: vec![0; shape.packets],
         done: vec![true; shape.packets],
         waiting: vec![None; shape.waves],
@@ -97,7 +161,9 @@ fn acquire(shape: Shape) -> State {
 
 fn release(shape: Shape, state: State) {
     let mut pool = POOL.lock().unwrap();
-    if pool.len() < POOL_LIMIT { pool.push((shape, state)); }
+    if pool.len() < POOL_LIMIT {
+        pool.push((shape, state));
+    }
 }
 
 struct Engine<'a> {
@@ -137,14 +203,29 @@ pub(crate) fn run(
     };
     match view.workgroup_x {
         Some(x) => assert_eq!(x, dims.wg_x, "kernel compiled for another workgroup width"),
-        None if unit != Unit::Workgroup => assert!(dims.wg_x as usize % width == 0, "workgroup width {} not divisible by W={}; compile with the workgroup layout", dims.wg_x, width),
+        None if unit != Unit::Workgroup => assert!(
+            dims.wg_x as usize % width == 0,
+            "workgroup width {} not divisible by W={}; compile with the workgroup layout",
+            dims.wg_x,
+            width
+        ),
         None => {}
     }
-    if unit == Unit::Packet { assert!(wg_size % width == 0, "workgroup size {} not divisible by W={}", wg_size, width); }
+    if unit == Unit::Packet {
+        assert!(
+            wg_size % width == 0,
+            "workgroup size {} not divisible by W={}",
+            wg_size,
+            width
+        );
+    }
     let num_wg = dims.num_wg_x as u64 * dims.num_wg_y as u64 * dims.num_wg_z as u64;
     let packets_per_wave = WAVE / width;
     let waves_per_wg = wg_size.div_ceil(WAVE);
-    let packets_per_wg = match unit { Unit::Packet => wg_size / width, _ => waves_per_wg * packets_per_wave };
+    let packets_per_wg = match unit {
+        Unit::Packet => wg_size / width,
+        _ => waves_per_wg * packets_per_wave,
+    };
     let (unit_packets, unit_waves) = match unit {
         Unit::Packet => (1, 1),
         Unit::Wave => (packets_per_wave, 1),
@@ -155,16 +236,60 @@ pub(crate) fn run(
         Unit::Wave => num_wg * waves_per_wg as u64,
         Unit::Workgroup => num_wg,
     };
-    if units == 0 { return; }
+    if units == 0 {
+        return;
+    }
     let stride = match unit {
-        Unit::Workgroup => (private_segment_size as usize).max(view.min_private_bytes).div_ceil(16) * 16,
-        Unit::Wave => (private_segment_size as usize).max(view.min_private_bytes).div_ceil(8) * 8,
-        Unit::Packet => ((private_segment_size as usize / 8 + 2).max(view.min_private_bytes.div_ceil(8))) * 8,
+        Unit::Workgroup => {
+            (private_segment_size as usize)
+                .max(view.min_private_bytes)
+                .div_ceil(16)
+                * 16
+        }
+        Unit::Wave => {
+            (private_segment_size as usize)
+                .max(view.min_private_bytes)
+                .div_ceil(8)
+                * 8
+        }
+        Unit::Packet => {
+            ((private_segment_size as usize / 8 + 2).max(view.min_private_bytes.div_ceil(8))) * 8
+        }
     };
-    let scratch = match unit { Unit::Packet => width * stride, _ => unit_waves * WAVE * stride };
-    let lds = if unit == Unit::Workgroup { group_segment_size.max(LDS_MIN_BYTES) } else { 0 };
-    let shape = Shape { packets: unit_packets, waves: unit_waves, words: view.num_vgprs.max(1) * width, fibers: view.fibers(), scratch, lds, stack: fiber_stack_bytes(width) };
-    let engine = Engine { view, kd, kernarg_ptr, aql_packet_addr, dims, private_segment_size, unit, wg_size, packets_per_wave, waves_per_wg, packets_per_wg, units, stride, shape };
+    let scratch = match unit {
+        Unit::Packet => width * stride,
+        _ => unit_waves * WAVE * stride,
+    };
+    let lds = if unit == Unit::Workgroup {
+        group_segment_size.max(LDS_MIN_BYTES)
+    } else {
+        0
+    };
+    let shape = Shape {
+        packets: unit_packets,
+        waves: unit_waves,
+        words: view.num_vgprs.max(1) * width,
+        fibers: view.fibers(),
+        scratch,
+        lds,
+        stack: fiber_stack_bytes(width),
+    };
+    let engine = Engine {
+        view,
+        kd,
+        kernarg_ptr,
+        aql_packet_addr,
+        dims,
+        private_segment_size,
+        unit,
+        wg_size,
+        packets_per_wave,
+        waves_per_wg,
+        packets_per_wg,
+        units,
+        stride,
+        shape,
+    };
     let threads = num_threads.max(1).min(units as usize);
     thread::scope(|scope| {
         for tid in 0..threads {
@@ -179,10 +304,12 @@ pub(crate) fn run(
                             index += threads as u64;
                         }
                     }
-                    _ => while index < engine.units {
-                        engine.run_unit(index, &mut state);
-                        index += threads as u64;
-                    },
+                    _ => {
+                        while index < engine.units {
+                            engine.run_unit(index, &mut state);
+                            index += threads as u64;
+                        }
+                    }
                 }
                 release(engine.shape, state);
             });
@@ -193,8 +320,14 @@ pub(crate) fn run(
 impl Engine<'_> {
     fn locate(&self, index: u64) -> (u64, usize) {
         match self.unit {
-            Unit::Packet => (index / self.packets_per_wg as u64, (index % self.packets_per_wg as u64) as usize * self.view.width),
-            Unit::Wave => (index / self.waves_per_wg as u64, (index % self.waves_per_wg as u64) as usize * WAVE),
+            Unit::Packet => (
+                index / self.packets_per_wg as u64,
+                (index % self.packets_per_wg as u64) as usize * self.view.width,
+            ),
+            Unit::Wave => (
+                index / self.waves_per_wg as u64,
+                (index % self.waves_per_wg as u64) as usize * WAVE,
+            ),
             Unit::Workgroup => (index, 0),
         }
     }
@@ -205,26 +338,58 @@ impl Engine<'_> {
         let wg_id = (
             (wg % self.dims.num_wg_x as u64) as u32,
             ((wg / self.dims.num_wg_x as u64) % self.dims.num_wg_y as u64) as u32,
-            ((wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64)) % self.dims.num_wg_z as u64) as u32,
+            ((wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64))
+                % self.dims.num_wg_z as u64) as u32,
         );
         let fibers = self.view.fibers();
-        if self.unit != Unit::Packet { state.lds.fill(0); }
+        if self.unit != Unit::Packet {
+            state.lds.fill(0);
+        }
         let width = self.view.width;
         for packet in 0..self.shape.packets {
             let wave = packet / self.packets_per_wave;
-            let wave_base = if self.unit == Unit::Packet { 0 } else { wave * WAVE * self.stride };
-            let scratch_base = if state.scratch.is_empty() { 0 } else { (unsafe { state.scratch.as_ptr().add(wave_base) }) as u64 };
+            let wave_base = if self.unit == Unit::Packet {
+                0
+            } else {
+                wave * WAVE * self.stride
+            };
+            let scratch_base = if state.scratch.is_empty() {
+                0
+            } else {
+                (unsafe { state.scratch.as_ptr().add(wave_base) }) as u64
+            };
             let local = local_base + packet * width;
             let valid_lanes = self.wg_size.saturating_sub(local).min(width);
             let sgprs = &mut state.sgprs[packet];
-            setup_sgprs(&mut sgprs[..], self.kd, self.kernarg_ptr, self.aql_packet_addr, scratch_base, self.private_segment_size, wg_id);
-            let valid_mask = if valid_lanes == 32 { u32::MAX } else { ((1u64 << valid_lanes) - 1) as u32 };
+            setup_sgprs(
+                &mut sgprs[..],
+                self.kd,
+                self.kernarg_ptr,
+                self.aql_packet_addr,
+                scratch_base,
+                self.private_segment_size,
+                wg_id,
+            );
+            let valid_mask = if valid_lanes == 32 {
+                u32::MAX
+            } else {
+                ((1u64 << valid_lanes) - 1) as u32
+            };
             let wave_valid = {
-                let count = self.wg_size.saturating_sub(local_base + (packet / self.packets_per_wave) * WAVE).min(WAVE);
-                if count >= WAVE { u32::MAX } else { ((1u64 << count) - 1) as u32 }
+                let count = self
+                    .wg_size
+                    .saturating_sub(local_base + (packet / self.packets_per_wave) * WAVE)
+                    .min(WAVE);
+                if count >= WAVE {
+                    u32::MAX
+                } else {
+                    ((1u64 << count) - 1) as u32
+                }
             };
             state.lanes[packet] = valid_mask;
-            if fibers { sgprs[self.view.exec] = valid_mask; }
+            if fibers {
+                sgprs[self.view.exec] = valid_mask;
+            }
             let vgprs = &mut state.vgprs[packet];
             vgprs.fill(0);
             for lane in 0..valid_lanes {
@@ -238,7 +403,9 @@ impl Engine<'_> {
             if fibers {
                 state.spill[packet].fill(0);
                 if !state.done[packet] {
-                    let Invoke::Fiber(kernel) = self.view.invoke else { unreachable!() };
+                    let Invoke::Fiber(kernel) = self.view.invoke else {
+                        unreachable!()
+                    };
                     state.fibers[packet].start(KernelArgs {
                         entry: kernel.addr(),
                         sgprs: sgprs.as_mut_ptr(),
@@ -248,7 +415,11 @@ impl Engine<'_> {
                         scratch_stride: self.stride as u64,
                         lane_base: ((packet % self.packets_per_wave) * width) as u64,
                         valid_mask: wave_valid,
-                        lds_base: if state.lds.is_empty() { 0 } else { state.lds.as_mut_ptr() as u64 },
+                        lds_base: if state.lds.is_empty() {
+                            0
+                        } else {
+                            state.lds.as_mut_ptr() as u64
+                        },
                     });
                 }
             }
@@ -256,8 +427,15 @@ impl Engine<'_> {
         if fibers {
             for wave in 0..self.shape.waves {
                 state.waiting[wave] = None;
-                let count = self.wg_size.saturating_sub(local_base + wave * WAVE).min(WAVE);
-                state.valid[wave] = if count == WAVE { u32::MAX } else { (1u32 << count) - 1 };
+                let count = self
+                    .wg_size
+                    .saturating_sub(local_base + wave * WAVE)
+                    .min(WAVE);
+                state.valid[wave] = if count == WAVE {
+                    u32::MAX
+                } else {
+                    (1u32 << count) - 1
+                };
             }
         }
     }
@@ -267,19 +445,47 @@ impl Engine<'_> {
         self.start_unit(index, state);
         match self.view.invoke {
             Invoke::Scalar(kernel) => {
-                let lds_base = if state.lds.is_empty() { 0 } else { state.lds.as_mut_ptr() as u64 };
+                let lds_base = if state.lds.is_empty() {
+                    0
+                } else {
+                    state.lds.as_mut_ptr() as u64
+                };
                 for packet in 0..self.shape.packets {
-                    if state.done[packet] { continue; }
+                    if state.done[packet] {
+                        continue;
+                    }
                     let scratch_base = self.packet_scratch(packet, state);
-                    unsafe { kernel.run(state.sgprs[packet].as_mut_ptr(), state.vgprs[packet].as_mut_ptr(), scratch_base, lds_base); }
+                    unsafe {
+                        kernel.run(
+                            state.sgprs[packet].as_mut_ptr(),
+                            state.vgprs[packet].as_mut_ptr(),
+                            scratch_base,
+                            lds_base,
+                        );
+                    }
                 }
             }
             Invoke::Packet(kernel) => {
-                let lds_base = if state.lds.is_empty() { 0 } else { state.lds.as_mut_ptr() as u64 };
+                let lds_base = if state.lds.is_empty() {
+                    0
+                } else {
+                    state.lds.as_mut_ptr() as u64
+                };
                 for packet in 0..self.shape.packets {
-                    if state.done[packet] { continue; }
+                    if state.done[packet] {
+                        continue;
+                    }
                     let scratch_base = self.packet_scratch(packet, state);
-                    unsafe { kernel.run(state.sgprs[packet].as_mut_ptr(), state.vgprs[packet].as_mut_ptr(), scratch_base, self.stride as u64, state.lanes[packet], lds_base); }
+                    unsafe {
+                        kernel.run(
+                            state.sgprs[packet].as_mut_ptr(),
+                            state.vgprs[packet].as_mut_ptr(),
+                            scratch_base,
+                            self.stride as u64,
+                            state.lanes[packet],
+                            lds_base,
+                        );
+                    }
                 }
             }
             Invoke::Fiber(_) => self.run_fibers(state),
@@ -296,29 +502,53 @@ impl Engine<'_> {
             ((wg / self.dims.num_wg_x as u64) % self.dims.num_wg_y as u64) as u32,
             (wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64)) as u32,
         );
-        let scratch = if state.scratch.is_empty() { 0 } else { state.scratch.as_ptr() as u64 };
+        let scratch = if state.scratch.is_empty() {
+            0
+        } else {
+            state.scratch.as_ptr() as u64
+        };
         let sgprs = &mut state.sgprs[0];
-        setup_sgprs(&mut sgprs[..], self.kd, self.kernarg_ptr, self.aql_packet_addr, scratch, self.private_segment_size, wg_id);
+        setup_sgprs(
+            &mut sgprs[..],
+            self.kd,
+            self.kernarg_ptr,
+            self.aql_packet_addr,
+            scratch,
+            self.private_segment_size,
+            wg_id,
+        );
         let vgprs = &mut state.vgprs[0];
         vgprs.fill(0);
         let item = local as u32;
         vgprs[0] = item % self.dims.wg_x
             | ((item / self.dims.wg_x) % self.dims.wg_y) << 10
             | (item / (self.dims.wg_x * self.dims.wg_y)) << 20;
-        unsafe { kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), scratch, 0); }
+        unsafe {
+            kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), scratch, 0);
+        }
     }
 
     fn packet_scratch(&self, packet: usize, state: &State) -> u64 {
-        if state.scratch.is_empty() { return 0; }
+        if state.scratch.is_empty() {
+            return 0;
+        }
         let base = state.scratch.as_ptr() as u64;
-        if self.unit == Unit::Packet { base } else { base + (packet / self.packets_per_wave * WAVE * self.stride) as u64 }
+        if self.unit == Unit::Packet {
+            base
+        } else {
+            base + (packet / self.packets_per_wave * WAVE * self.stride) as u64
+        }
     }
 
     fn run_wave(&self, state: &mut State) {
         let width = self.view.width;
         let valid = state.valid[0];
         let mut live: u32 = 0;
-        for packet in 0..self.packets_per_wave { if !state.done[packet] { live |= 1 << packet; } }
+        for packet in 0..self.packets_per_wave {
+            if !state.done[packet] {
+                live |= 1 << packet;
+            }
+        }
         while live != 0 {
             let mut boundary = FIBER_DONE;
             let mut remaining = live;
@@ -331,20 +561,42 @@ impl Engine<'_> {
                 } else if boundary == FIBER_DONE {
                     boundary = pc;
                 } else if boundary != pc {
-                    panic!("wave reached a non-uniform boundary (packet {} at {}, others at {})", packet, pc, boundary);
+                    panic!(
+                        "wave reached a non-uniform boundary (packet {} at {}, others at {})",
+                        packet, pc, boundary
+                    );
                 }
             }
-            if boundary == FIBER_DONE { break; }
-            let group = self.view.yields.get(boundary as usize).expect("packet yield lacks a typed effect");
-            let holders: u32 = (0..self.packets_per_wave as u32).filter(|p| valid >> (p * width as u32) & lanes_mask(width) != 0).map(|p| 1 << p).sum();
-            assert_eq!(live & holders, holders, "wave met without all of its packets");
-            for action in group { action.apply_wave(width, valid, &state.fibers); }
+            if boundary == FIBER_DONE {
+                break;
+            }
+            let group = self
+                .view
+                .yields
+                .get(boundary as usize)
+                .expect("packet yield lacks a typed effect");
+            let holders: u32 = (0..self.packets_per_wave as u32)
+                .filter(|p| valid >> (p * width as u32) & lanes_mask(width) != 0)
+                .map(|p| 1 << p)
+                .sum();
+            assert_eq!(
+                live & holders,
+                holders,
+                "wave met without all of its packets"
+            );
+            for action in group {
+                action.apply_wave(width, valid, &state.fibers);
+            }
         }
-        for packet in 0..self.packets_per_wave { state.done[packet] = true; }
+        for packet in 0..self.packets_per_wave {
+            state.done[packet] = true;
+        }
     }
 
     fn run_fibers(&self, state: &mut State) {
-        if self.unit == Unit::Wave { return self.run_wave(state); }
+        if self.unit == Unit::Wave {
+            return self.run_wave(state);
+        }
         let ppw = self.packets_per_wave;
         let width = self.view.width;
         let mut barriers = super::barrier::Barriers::new(self.shape.waves);
@@ -354,16 +606,22 @@ impl Engine<'_> {
             let mut live = false;
             for wave in 0..self.shape.waves {
                 let range = wave * ppw..(wave + 1) * ppw;
-                if range.clone().all(|p| state.done[p]) { continue; }
+                if range.clone().all(|p| state.done[p]) {
+                    continue;
+                }
                 live = true;
                 if let Some(id) = state.waiting[wave] {
-                    if !barriers.wait(wave, id) { continue; }
+                    if !barriers.wait(wave, id) {
+                        continue;
+                    }
                     state.waiting[wave] = None;
                 }
                 progress = true;
                 let mut boundary = None;
                 for p in range.clone() {
-                    if state.done[p] { continue; }
+                    if state.done[p] {
+                        continue;
+                    }
                     let r = state.fibers[p].resume();
                     match boundary {
                         Some(other) => assert_eq!(other, r, "wave reached a non-uniform boundary"),
@@ -373,28 +631,55 @@ impl Engine<'_> {
                     state.done[p] = r == FIBER_DONE;
                 }
                 let pc = boundary.unwrap();
-                if pc == FIBER_DONE { continue; }
-                let group = self.view.yields.get(pc as usize).expect("packet yield lacks a typed effect");
+                if pc == FIBER_DONE {
+                    continue;
+                }
+                let group = self
+                    .view
+                    .yields
+                    .get(pc as usize)
+                    .expect("packet yield lacks a typed effect");
                 let action = &group[0];
                 let valid = state.valid[wave];
                 if action.is_wave() {
-                    assert!(range.clone().enumerate().all(|(p, packet)| state.done[packet] == (valid >> (p * width) & lanes_mask(width) == 0)),
-                        "wave met without all of its packets");
-                    for action in group { action.apply_wave(width, valid, &state.fibers[range.clone()]); }
+                    assert!(
+                        range
+                            .clone()
+                            .enumerate()
+                            .all(|(p, packet)| state.done[packet]
+                                == (valid >> (p * width) & lanes_mask(width) == 0)),
+                        "wave met without all of its packets"
+                    );
+                    for action in group {
+                        action.apply_wave(width, valid, &state.fibers[range.clone()]);
+                    }
                 } else {
-                    assert_eq!(self.unit, Unit::Workgroup, "barrier outside a workgroup scheduler");
+                    assert_eq!(
+                        self.unit,
+                        Unit::Workgroup,
+                        "barrier outside a workgroup scheduler"
+                    );
                     let id = action.uniform_id(width, valid, &state.fibers[range.clone()]) & 31;
                     match action.op {
                         EffectOp::BarrierSignal { is_first } => {
                             let first = barriers.signal(wave, id);
-                            if is_first { action.broadcast_result(width, valid, &state.fibers[range], first as u32); }
+                            if is_first {
+                                action.broadcast_result(
+                                    width,
+                                    valid,
+                                    &state.fibers[range],
+                                    first as u32,
+                                );
+                            }
                         }
                         EffectOp::BarrierWait => state.waiting[wave] = Some(id),
                         _ => unreachable!(),
                     }
                 }
             }
-            if !live { break; }
+            if !live {
+                break;
+            }
             assert!(progress, "workgroup barrier deadlock");
             passes += 1;
             assert!(passes < 100_000, "packet dispatch did not converge");
@@ -413,7 +698,16 @@ pub(crate) fn dispatch_cooperative_vec(
     group_segment_size: usize,
     num_threads: usize,
 ) {
-    run(View::cooperative(kernel, Scheduler::Workgroup), kd, kernarg_ptr, aql_packet_addr, dims, private_segment_size, group_segment_size, num_threads)
+    run(
+        View::cooperative(kernel, Scheduler::Workgroup),
+        kd,
+        kernarg_ptr,
+        aql_packet_addr,
+        dims,
+        private_segment_size,
+        group_segment_size,
+        num_threads,
+    )
 }
 
 #[cfg(test)]
@@ -426,10 +720,26 @@ mod tests {
 
     #[test]
     fn independent_scalar_initializes_reused_state_across_a_three_dimensional_grid() {
-        let mov = |vdst, src0| InstFormat::VOP1(VOP1 { op: I::V_MOV_B32, src0, vdst });
-        let scratch = |op, vdst, vsrc| InstFormat::VSCRATCH(VSCRATCH {
-            op, saddr: 124, vaddr: 0, vsrc, vdst, scope: 0, th: 0, ioffset: 32, sve: 0,
-        });
+        let mov = |vdst, src0| {
+            InstFormat::VOP1(VOP1 {
+                op: I::V_MOV_B32,
+                src0,
+                vdst,
+            })
+        };
+        let scratch = |op, vdst, vsrc| {
+            InstFormat::VSCRATCH(VSCRATCH {
+                op,
+                saddr: 124,
+                vaddr: 0,
+                vsrc,
+                vdst,
+                scope: 0,
+                th: 0,
+                ioffset: 32,
+                sve: 0,
+            })
+        };
         let mut body = vec![
             mov(2, SourceOperand::IntegerConstant(0)),
             mov(3, SourceOperand::ScalarRegister(117)),
@@ -442,13 +752,34 @@ mod tests {
         ];
         // Observe both ABI-provided values and otherwise unwritten registers.
         for (slot, vsrc) in [0, 7, 3, 4, 5, 6, 8, 9].iter().copied().enumerate() {
-            body.push(InstFormat::VGLOBAL(VGLOBAL { op: I::GLOBAL_STORE_B32,
-                saddr: 6, vaddr: 2, vsrc, vdst: 0, scope: 0, th: 0, ioffset: slot as u32 * 4, sve: 0 }));
+            body.push(InstFormat::VGLOBAL(VGLOBAL {
+                op: I::GLOBAL_STORE_B32,
+                saddr: 6,
+                vaddr: 2,
+                vsrc,
+                vdst: 0,
+                scope: 0,
+                th: 0,
+                ioffset: slot as u32 * 4,
+                sve: 0,
+            }));
         }
-        let program = ScalarProgram { entry_pc: 0, blocks: BTreeMap::from([
-            (0, ScalarBlock { pc: 0, body, term: Terminator::Return }),
-        ]) };
-        let kernel = Kernel::new(Code::Scalar(Compiler::default().compile_program(&program, 16)), Scheduler::Independent, 0);
+        let program = ScalarProgram {
+            entry_pc: 0,
+            blocks: BTreeMap::from([(
+                0,
+                ScalarBlock {
+                    pc: 0,
+                    body,
+                    term: Terminator::Return,
+                },
+            )]),
+        };
+        let kernel = Kernel::new(
+            Code::Scalar(Compiler::default().compile_program(&program, 16)),
+            Scheduler::Independent,
+            0,
+        );
         let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
         kd.enable_sgpr_private_segment_buffer = true;
         kd.enable_sgpr_dispatch_ptr = true;
@@ -456,33 +787,100 @@ mod tests {
         kd.enable_sgpr_workgroup_id_x = true;
         kd.enable_sgpr_workgroup_id_y = true;
         kd.enable_sgpr_workgroup_id_z = true;
-        let dims = GridDims { num_wg_x: 2, num_wg_y: 3, num_wg_z: 2, wg_x: 3, wg_y: 2, wg_z: 2 };
+        let dims = GridDims {
+            num_wg_x: 2,
+            num_wg_y: 3,
+            num_wg_z: 2,
+            wg_x: 3,
+            wg_y: 2,
+            wg_z: 2,
+        };
         let view = View::of(&kernel);
-        let shape = Shape { packets: 1, waves: 1, words: view.num_vgprs, fibers: false, scratch: 64, lds: 0, stack: fiber_stack_bytes(1) };
+        let shape = Shape {
+            packets: 1,
+            waves: 1,
+            words: view.num_vgprs,
+            fibers: false,
+            scratch: 64,
+            lds: 0,
+            stack: fiber_stack_bytes(1),
+        };
         let mut output = [u32::MAX; 8];
-        let engine = Engine { view, kd: &kd, kernarg_ptr: output.as_mut_ptr() as u64,
-            aql_packet_addr: 0x01234567_89abcdef, dims, private_segment_size: 48,
-            unit: Unit::Packet, wg_size: 12, packets_per_wave: 32, waves_per_wg: 1,
-            packets_per_wg: 12, units: 144, stride: 64, shape };
+        let engine = Engine {
+            view,
+            kd: &kd,
+            kernarg_ptr: output.as_mut_ptr() as u64,
+            aql_packet_addr: 0x01234567_89abcdef,
+            dims,
+            private_segment_size: 48,
+            unit: Unit::Packet,
+            wg_size: 12,
+            packets_per_wave: 32,
+            waves_per_wg: 1,
+            packets_per_wg: 12,
+            units: 144,
+            stride: 64,
+            shape,
+        };
         let mut state = acquire(shape);
-        let Invoke::Scalar(scalar) = view.invoke else { unreachable!() };
+        let Invoke::Scalar(scalar) = view.invoke else {
+            unreachable!()
+        };
         let mut index = 0;
-        for wz in 0..2 { for wy in 0..3 { for wx in 0..2 {
-            for z in 0..2 { for y in 0..2 { for x in 0..3 {
-                state.sgprs[0].fill(0xdeadbeef);
-                state.vgprs[0].fill(0xdeadbeef);
-                state.scratch.fill(0xa5);
-                output.fill(u32::MAX);
-                engine.run_scalar_packet(index, &mut state, scalar);
-                let item = x | (y << 10) | (z << 20);
-                assert_eq!(output, [item, 0, wx, wy | (wz << 16), item, 0x89abcdef, 0x01234567, 0], "work-item {}", index);
-                index += 1;
-            } } }
-        } } }
+        for wz in 0..2 {
+            for wy in 0..3 {
+                for wx in 0..2 {
+                    for z in 0..2 {
+                        for y in 0..2 {
+                            for x in 0..3 {
+                                state.sgprs[0].fill(0xdeadbeef);
+                                state.vgprs[0].fill(0xdeadbeef);
+                                state.scratch.fill(0xa5);
+                                output.fill(u32::MAX);
+                                engine.run_scalar_packet(index, &mut state, scalar);
+                                let item = x | (y << 10) | (z << 20);
+                                assert_eq!(
+                                    output,
+                                    [
+                                        item,
+                                        0,
+                                        wx,
+                                        wy | (wz << 16),
+                                        item,
+                                        0x89abcdef,
+                                        0x01234567,
+                                        0
+                                    ],
+                                    "work-item {}",
+                                    index
+                                );
+                                index += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         assert_eq!(index, engine.units);
         release(shape, state);
-        let one = GridDims { num_wg_x: 1, num_wg_y: 1, num_wg_z: 1, wg_x: 1, wg_y: 1, wg_z: 1 };
-        run(view, &kd, output.as_mut_ptr() as u64, engine.aql_packet_addr, one, 48, 0, 1);
+        let one = GridDims {
+            num_wg_x: 1,
+            num_wg_y: 1,
+            num_wg_z: 1,
+            wg_x: 1,
+            wg_y: 1,
+            wg_z: 1,
+        };
+        run(
+            view,
+            &kd,
+            output.as_mut_ptr() as u64,
+            engine.aql_packet_addr,
+            one,
+            48,
+            0,
+            1,
+        );
         assert_eq!(output, [0, 0, 0, 0, 0, 0x89abcdef, 0x01234567, 0]);
     }
 }

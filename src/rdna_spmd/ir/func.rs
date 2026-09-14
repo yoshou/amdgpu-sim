@@ -1,6 +1,6 @@
 //! Function SSA with explicit block arguments, including loop backedges.
-use super::{Op, Ty, ValueId};
 use super::effect::EffectOp;
+use super::{Op, Ty, ValueId};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -8,9 +8,17 @@ pub(crate) struct BlockId(pub usize);
 /// Pure mask reductions within the current packet. These are compiler IR
 /// operations, not variants of the runtime's wave-effect protocol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PacketOp { Any, Ballot }
+pub(crate) enum PacketOp {
+    Any,
+    Ballot,
+}
 impl PacketOp {
-    pub fn result_type(self) -> Ty { match self { Self::Any=>Ty::I1,Self::Ballot=>Ty::I32 } }
+    pub fn result_type(self) -> Ty {
+        match self {
+            Self::Any => Ty::I1,
+            Self::Ballot => Ty::I32,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Inst {
@@ -87,7 +95,11 @@ impl Func {
     pub fn definitions(&self) -> Vec<Option<Op>> {
         let mut out = vec![None; self.types.len()];
         for block in self.blocks.values() {
-            for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { out[value.0] = Some(*op); } }
+            for inst in &block.insts {
+                if let Inst::Core { value, op, .. } = inst {
+                    out[value.0] = Some(*op);
+                }
+            }
         }
         out
     }
@@ -96,11 +108,17 @@ impl Func {
         let mut types = Vec::new();
         let mut definitions: Vec<ValueId> = Vec::new();
         for block in self.blocks.values() {
-            for &(p, _) in &block.params { definitions.push(p); }
+            for &(p, _) in &block.params {
+                definitions.push(p);
+            }
             for inst in &block.insts {
                 match inst {
-                    Inst::Core { value, .. } | Inst::Packet { output: value, .. } => definitions.push(*value),
-                    Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => definitions.extend(outputs.iter().map(|o| o.0)),
+                    Inst::Core { value, .. } | Inst::Packet { output: value, .. } => {
+                        definitions.push(*value)
+                    }
+                    Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => {
+                        definitions.extend(outputs.iter().map(|o| o.0))
+                    }
                 }
             }
         }
@@ -110,19 +128,54 @@ impl Func {
         }
         let m = |v: ValueId| map[v.0].expect("use of a removed SSA value");
         for block in self.blocks.values_mut() {
-            for (p, _) in &mut block.params { *p = m(*p); }
+            for (p, _) in &mut block.params {
+                *p = m(*p);
+            }
             for inst in &mut block.insts {
                 match inst {
-                    Inst::Core { value, op, .. } => { *op = op.map(m); *value = m(*value); }
-                    Inst::Packet { input, output, .. } => { *input = m(*input); *output = m(*output); }
-                    Inst::Target { args, outputs, .. } => { *args = args.map(m); for (v, _) in outputs { *v = m(*v); } }
-                    Inst::Effect { inputs, outputs, .. } => { for v in inputs { *v = m(*v); } for (v, _) in outputs { *v = m(*v); } }
+                    Inst::Core { value, op, .. } => {
+                        *op = op.map(m);
+                        *value = m(*value);
+                    }
+                    Inst::Packet { input, output, .. } => {
+                        *input = m(*input);
+                        *output = m(*output);
+                    }
+                    Inst::Target { args, outputs, .. } => {
+                        *args = args.map(m);
+                        for (v, _) in outputs {
+                            *v = m(*v);
+                        }
+                    }
+                    Inst::Effect {
+                        inputs, outputs, ..
+                    } => {
+                        for v in inputs {
+                            *v = m(*v);
+                        }
+                        for (v, _) in outputs {
+                            *v = m(*v);
+                        }
+                    }
                 }
             }
             match &mut block.term {
-                Term::Br(e) => for v in &mut e.args { *v = m(*v); },
-                Term::CondBr { cond, yes, no } => { *cond = m(*cond); for v in yes.args.iter_mut().chain(&mut no.args) { *v = m(*v); } }
-                Term::Ret(args) => for v in args { *v = m(*v); },
+                Term::Br(e) => {
+                    for v in &mut e.args {
+                        *v = m(*v);
+                    }
+                }
+                Term::CondBr { cond, yes, no } => {
+                    *cond = m(*cond);
+                    for v in yes.args.iter_mut().chain(&mut no.args) {
+                        *v = m(*v);
+                    }
+                }
+                Term::Ret(args) => {
+                    for v in args {
+                        *v = m(*v);
+                    }
+                }
             }
         }
         self.types = types;
@@ -131,8 +184,8 @@ impl Func {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::IntOp;
+    use super::*;
     fn loop_func() -> Func {
         Func {
             entry: BlockId(0),

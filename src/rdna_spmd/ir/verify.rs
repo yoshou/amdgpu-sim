@@ -4,12 +4,20 @@ use std::collections::BTreeSet;
 pub(crate) struct VerifiedFunc(Func);
 impl Func {
     #[cfg(test)]
-    pub fn verify(self) -> Result<VerifiedFunc, &'static str> { self.verify_with(&crate::rdna_spmd::targets::rdna4::registry()) }
-    pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedFunc, &'static str> {
+    pub fn verify(self) -> Result<VerifiedFunc, &'static str> {
+        self.verify_with(&crate::rdna_spmd::targets::rdna4::registry())
+    }
+    pub fn verify_with(
+        self,
+        registry: &crate::rdna_spmd::dialect::DialectRegistry,
+    ) -> Result<VerifiedFunc, &'static str> {
         self.check(registry)?;
         Ok(VerifiedFunc(self))
     }
-    pub fn check(&self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<(), &'static str> {
+    pub fn check(
+        &self,
+        registry: &crate::rdna_spmd::dialect::DialectRegistry,
+    ) -> Result<(), &'static str> {
         if !self.blocks.contains_key(&self.entry) {
             return Err("missing entry");
         }
@@ -23,7 +31,11 @@ impl Func {
         for block in self.blocks.values() {
             generation += 1;
             let seen = |id: ValueId, local: &[u32]| id.0 < count && local[id.0] == generation;
-            let define = |id: ValueId, ty: Ty, local: &mut Vec<u32>, defined: &mut Vec<bool>, definitions: &mut usize| {
+            let define = |id: ValueId,
+                          ty: Ty,
+                          local: &mut Vec<u32>,
+                          defined: &mut Vec<bool>,
+                          definitions: &mut usize| {
                 if self.types.get(id.0) != Some(&ty) {
                     return Err("invalid value type");
                 }
@@ -41,29 +53,70 @@ impl Func {
             for inst in &block.insts {
                 match inst {
                     Inst::Packet { op, input, output } => {
-                        if !seen(*input, &local) { return Err("non-dominating packet input"); }
-                        if self.types[input.0] != Ty::I1 { return Err("packet query requires a predicate"); }
-                        define(*output, op.result_type(), &mut local, &mut defined, &mut definitions)?;
+                        if !seen(*input, &local) {
+                            return Err("non-dominating packet input");
+                        }
+                        if self.types[input.0] != Ty::I1 {
+                            return Err("packet query requires a predicate");
+                        }
+                        define(
+                            *output,
+                            op.result_type(),
+                            &mut local,
+                            &mut defined,
+                            &mut definitions,
+                        )?;
                     }
-                    Inst::Target { provenance, op, args, outputs } => {
-                        if args.values().iter().any(|v| !seen(*v, &local)) { return Err("non-dominating target input"); }
+                    Inst::Target {
+                        provenance,
+                        op,
+                        args,
+                        outputs,
+                    } => {
+                        if args.values().iter().any(|v| !seen(*v, &local)) {
+                            return Err("non-dominating target input");
+                        }
                         let spec = registry.operation(*op)?;
                         spec.verify_immediates(*args, |v| constants.get(v.0).copied().flatten())?;
-                        if (spec.effect == crate::rdna_spmd::dialect::Effect::Pure) != provenance.is_none() {
+                        if (spec.effect == crate::rdna_spmd::dialect::Effect::Pure)
+                            != provenance.is_none()
+                        {
                             return Err("target effect provenance mismatch");
                         }
-                        if let Some(id) = provenance { if !effects.insert(*id) { return Err("duplicate effect provenance"); } }
+                        if let Some(id) = provenance {
+                            if !effects.insert(*id) {
+                                return Err("duplicate effect provenance");
+                            }
+                        }
                         let expected = registry.result_types(*op, *args, &self.types)?;
-                        if expected.len() != outputs.len() || outputs.iter().zip(expected).any(|((_, ty), expected)| ty != expected) {
+                        if expected.len() != outputs.len()
+                            || outputs
+                                .iter()
+                                .zip(expected)
+                                .any(|((_, ty), expected)| ty != expected)
+                        {
                             return Err("target result signature mismatch");
                         }
-                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut defined, &mut definitions)?; }
+                        for &(id, ty) in outputs {
+                            define(id, ty, &mut local, &mut defined, &mut definitions)?;
+                        }
                     }
-                    Inst::Effect { provenance, op, inputs, outputs } => {
-                        if !effects.insert(*provenance) { return Err("duplicate effect provenance"); }
-                        if inputs.iter().any(|v| !seen(*v, &local)) { return Err("non-dominating effect input"); }
+                    Inst::Effect {
+                        provenance,
+                        op,
+                        inputs,
+                        outputs,
+                    } => {
+                        if !effects.insert(*provenance) {
+                            return Err("duplicate effect provenance");
+                        }
+                        if inputs.iter().any(|v| !seen(*v, &local)) {
+                            return Err("non-dominating effect input");
+                        }
                         op.verify(inputs, outputs, &self.types)?;
-                        for &(id, ty) in outputs { define(id, ty, &mut local, &mut defined, &mut definitions)?; }
+                        for &(id, ty) in outputs {
+                            define(id, ty, &mut local, &mut defined, &mut definitions)?;
+                        }
                     }
                     Inst::Core { value, ty, op } => {
                         let mut valid = true;
@@ -78,7 +131,9 @@ impl Func {
                             return Err("incorrect core result type");
                         }
                         define(*value, *ty, &mut local, &mut defined, &mut definitions)?;
-                        if let Op::Const(_, bits) = op { constants[value.0] = Some(*bits); }
+                        if let Op::Const(_, bits) = op {
+                            constants[value.0] = Some(*bits);
+                        }
                     }
                 }
             }
@@ -88,7 +143,9 @@ impl Func {
                 }
             }
             if let Term::Ret(args) = &block.term {
-                if args.iter().any(|arg| !seen(*arg, &local)) { return Err("invalid return argument"); }
+                if args.iter().any(|arg| !seen(*arg, &local)) {
+                    return Err("invalid return argument");
+                }
             }
             for e in block.term.edges() {
                 let dst = self.blocks.get(&e.dst).ok_or("missing branch target")?;
@@ -117,20 +174,33 @@ impl VerifiedFunc {
 pub(crate) struct VerifiedExpr(Expr);
 impl Expr {
     #[cfg(test)]
-    pub fn verify(self) -> Result<VerifiedExpr, &'static str> { self.verify_with(&crate::rdna_spmd::targets::rdna4::registry()) }
-    pub fn verify_with(self, registry: &crate::rdna_spmd::dialect::DialectRegistry) -> Result<VerifiedExpr, &'static str> {
+    pub fn verify(self) -> Result<VerifiedExpr, &'static str> {
+        self.verify_with(&crate::rdna_spmd::targets::rdna4::registry())
+    }
+    pub fn verify_with(
+        self,
+        registry: &crate::rdna_spmd::dialect::DialectRegistry,
+    ) -> Result<VerifiedExpr, &'static str> {
         let mut types = self.params.clone();
         let mut constants = std::collections::BTreeMap::new();
         for inst in &self.insts {
             match inst {
                 ExprInst::Core(declared, op) => {
-                    if op.result_type(&types)? != *declared { return Err("result type mismatch"); }
-                    if let Op::Const(_, bits) = op { constants.insert(ValueId(types.len()), *bits); }
-                },
+                    if op.result_type(&types)? != *declared {
+                        return Err("result type mismatch");
+                    }
+                    if let Op::Const(_, bits) = op {
+                        constants.insert(ValueId(types.len()), *bits);
+                    }
+                }
                 ExprInst::Target { op, args, outputs } => {
-                    if registry.result_types(*op, *args, &types)? != outputs { return Err("target result type mismatch"); }
-                    registry.operation(*op)?.verify_immediates(*args, |v| constants.get(&v).copied())?;
-                },
+                    if registry.result_types(*op, *args, &types)? != outputs {
+                        return Err("target result type mismatch");
+                    }
+                    registry
+                        .operation(*op)?
+                        .verify_immediates(*args, |v| constants.get(&v).copied())?;
+                }
             }
             types.extend_from_slice(inst.result_types());
         }
@@ -169,7 +239,10 @@ mod tests {
         for value in [1, 2, 99] {
             assert!(Expr {
                 params: vec![Ty::I32],
-                insts: vec![ExprInst::Core(Ty::I32, Op::Int(IntOp::Add, ValueId(0), ValueId(value)))],
+                insts: vec![ExprInst::Core(
+                    Ty::I32,
+                    Op::Int(IntOp::Add, ValueId(0), ValueId(value))
+                )],
                 results: vec![ValueId(1)]
             }
             .verify()

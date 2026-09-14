@@ -1,5 +1,5 @@
-use super::*;
 use super::super::analysis::memory::Form;
+use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rdna_spmd) enum Lanes {
@@ -23,103 +23,247 @@ pub(super) fn transpose_tile(width: u32) -> u32 {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::rdna_spmd) enum GlobalLoad { Gather, Broadcast, Frame { stride_words: u32, offset_words: u32 } }
+pub(in crate::rdna_spmd) enum GlobalLoad {
+    Gather,
+    Broadcast,
+    Frame {
+        stride_words: u32,
+        offset_words: u32,
+    },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::rdna_spmd) enum Shape {
     Fence,
     ScalarWords,
-    AtomicAdd { grouped: bool },
+    AtomicAdd {
+        grouped: bool,
+    },
     Store(StoreShape),
     NarrowLoad,
-    PrivateTile { tile: u32 },
-    Frame { stride_words: u32, offset_words: u32, group: u32 },
-    Words { lanes: Lanes, pairs: bool },
-    ScalarLoad { pairs: bool },
+    PrivateTile {
+        tile: u32,
+    },
+    Frame {
+        stride_words: u32,
+        offset_words: u32,
+        group: u32,
+    },
+    Words {
+        lanes: Lanes,
+        pairs: bool,
+    },
+    ScalarLoad {
+        pairs: bool,
+    },
     ScalarStore,
     ScalarAtomic,
 }
 
-pub(in crate::rdna_spmd) fn global_load(access: &Access, uniform: &[bool], affine: &BTreeMap<ValueId, u32>) -> GlobalLoad {
-    if std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("gather")) { return GlobalLoad::Gather; }
-    if !matches!(access.form, Form::Global { .. }) { return GlobalLoad::Gather; }
-    if !matches!(access.op, MemoryOp::Load(MemSize::B32 | MemSize::B64)) || !(1..=4).contains(&access.words) { return GlobalLoad::Gather; }
-    if uniform[access.base.0] { return GlobalLoad::Broadcast; }
+pub(in crate::rdna_spmd) fn global_load(
+    access: &Access,
+    uniform: &[bool],
+    affine: &BTreeMap<ValueId, u32>,
+) -> GlobalLoad {
+    if std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("gather")) {
+        return GlobalLoad::Gather;
+    }
+    if !matches!(access.form, Form::Global { .. }) {
+        return GlobalLoad::Gather;
+    }
+    if !matches!(access.op, MemoryOp::Load(MemSize::B32 | MemSize::B64))
+        || !(1..=4).contains(&access.words)
+    {
+        return GlobalLoad::Gather;
+    }
+    if uniform[access.base.0] {
+        return GlobalLoad::Broadcast;
+    }
     if access.form == (Form::Global { scalar_base: false }) {
         if let Some(&stride) = affine.get(&access.base) {
             let words = stride / 4;
             let offset_word = access.offset / 4;
             let span = access.words * (access.size().bytes() / 4);
-            if words >= 1 && access.offset % 4 == 0 && offset_word >= 0 && offset_word as u32 + span <= words {
-                return GlobalLoad::Frame { stride_words: words, offset_words: offset_word as u32 };
+            if words >= 1
+                && access.offset % 4 == 0
+                && offset_word >= 0
+                && offset_word as u32 + span <= words
+            {
+                return GlobalLoad::Frame {
+                    stride_words: words,
+                    offset_words: offset_word as u32,
+                };
             }
         }
     }
     GlobalLoad::Gather
 }
 
-pub(in crate::rdna_spmd) fn shape(access: &Access, width: Option<u32>, load: GlobalLoad, constants: &[Option<u64>]) -> Shape {
-    if access.op == MemoryOp::Fence { return Shape::Fence; }
+pub(in crate::rdna_spmd) fn shape(
+    access: &Access,
+    width: Option<u32>,
+    load: GlobalLoad,
+    constants: &[Option<u64>],
+) -> Shape {
+    if access.op == MemoryOp::Fence {
+        return Shape::Fence;
+    }
     let Some(width) = width else {
-        if access.op == MemoryOp::AtomicAdd { return Shape::ScalarAtomic; }
-        if access.stores() { return Shape::ScalarStore; }
-        return Shape::ScalarLoad { pairs: matches!(access.form, Form::Global { .. }) && access.size() == MemSize::B32 && !access.semantics.volatile };
+        if access.op == MemoryOp::AtomicAdd {
+            return Shape::ScalarAtomic;
+        }
+        if access.stores() {
+            return Shape::ScalarStore;
+        }
+        return Shape::ScalarLoad {
+            pairs: matches!(access.form, Form::Global { .. })
+                && access.size() == MemSize::B32
+                && !access.semantics.volatile,
+        };
     };
-    if access.scalar() { return Shape::ScalarWords; }
+    if access.scalar() {
+        return Shape::ScalarWords;
+    }
     if access.op == MemoryOp::AtomicAdd {
-        let grouped = width >= 4 && access.space == Space::Global && !access.returns() && !access.semantics.volatile;
+        let grouped = width >= 4
+            && access.space == Space::Global
+            && !access.returns()
+            && !access.semantics.volatile;
         return Shape::AtomicAdd { grouped };
     }
     let affine = access.form == (Form::Scratch { uniform: true });
     if access.stores() {
-        return Shape::Store(if access.size().bytes() < 4 { StoreShape::Narrow }
-            else if access.space == Space::Lds { StoreShape::Lds }
-            else if affine && access.words >= 2 && access.static_scratch_end(constants).is_some() { StoreShape::Tile }
-            else if affine { StoreShape::Affine }
-            else { StoreShape::Scatter });
+        return Shape::Store(if access.size().bytes() < 4 {
+            StoreShape::Narrow
+        } else if access.space == Space::Lds {
+            StoreShape::Lds
+        } else if affine && access.words >= 2 && access.static_scratch_end(constants).is_some() {
+            StoreShape::Tile
+        } else if affine {
+            StoreShape::Affine
+        } else {
+            StoreShape::Scatter
+        });
     }
     if access.size() == MemSize::B64 {
         return match load {
-            GlobalLoad::Frame { stride_words, offset_words } => Shape::Frame { stride_words, offset_words, group: width.min(8) },
-            GlobalLoad::Broadcast => Shape::Words { lanes: Lanes::Broadcast, pairs: false },
-            GlobalLoad::Gather => Shape::Words { lanes: Lanes::Gather, pairs: false },
+            GlobalLoad::Frame {
+                stride_words,
+                offset_words,
+            } => Shape::Frame {
+                stride_words,
+                offset_words,
+                group: width.min(8),
+            },
+            GlobalLoad::Broadcast => Shape::Words {
+                lanes: Lanes::Broadcast,
+                pairs: false,
+            },
+            GlobalLoad::Gather => Shape::Words {
+                lanes: Lanes::Gather,
+                pairs: false,
+            },
         };
     }
-    if access.size() != MemSize::B32 { return Shape::NarrowLoad; }
+    if access.size() != MemSize::B32 {
+        return Shape::NarrowLoad;
+    }
     let allocated = access.static_scratch_end(constants).is_some();
-    if allocated && access.words >= 2 && !std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("notile")) {
-        return Shape::PrivateTile { tile: if width % 4 == 0 { 4 } else if width % 2 == 0 { 2 } else { 1 } };
+    if allocated
+        && access.words >= 2
+        && !std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("notile"))
+    {
+        return Shape::PrivateTile {
+            tile: if width % 4 == 0 {
+                4
+            } else if width % 2 == 0 {
+                2
+            } else {
+                1
+            },
+        };
     }
     let global = matches!(access.form, Form::Global { .. });
-    if let (true, GlobalLoad::Frame { stride_words, offset_words }) = (global, load) {
-        return Shape::Frame { stride_words, offset_words, group: width.min(8) };
+    if let (
+        true,
+        GlobalLoad::Frame {
+            stride_words,
+            offset_words,
+        },
+    ) = (global, load)
+    {
+        return Shape::Frame {
+            stride_words,
+            offset_words,
+            group: width.min(8),
+        };
     }
-    let lanes = if global && load == GlobalLoad::Broadcast { Lanes::Broadcast }
-        else if access.space == Space::Lds { Lanes::Lds }
-        else if affine { Lanes::Affine { allocated } }
-        else { Lanes::Gather };
-    Shape::Words { lanes, pairs: global }
+    let lanes = if global && load == GlobalLoad::Broadcast {
+        Lanes::Broadcast
+    } else if access.space == Space::Lds {
+        Lanes::Lds
+    } else if affine {
+        Lanes::Affine { allocated }
+    } else {
+        Lanes::Gather
+    };
+    Shape::Words {
+        lanes,
+        pairs: global,
+    }
 }
 
-pub(in crate::rdna_spmd) fn clusters(f: &Func, accesses: &[Access], width: Option<u32>, uniform: &[bool], affine: &BTreeMap<ValueId, u32>) -> BTreeMap<usize, Cluster> {
+pub(in crate::rdna_spmd) fn clusters(
+    f: &Func,
+    accesses: &[Access],
+    width: Option<u32>,
+    uniform: &[bool],
+    affine: &BTreeMap<ValueId, u32>,
+) -> BTreeMap<usize, Cluster> {
     let mut out = BTreeMap::new();
-    let Some(width) = width else { return out; };
-    if !width.is_power_of_two() || std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("nocluster")) { return out; }
+    let Some(width) = width else {
+        return out;
+    };
+    if !width.is_power_of_two()
+        || std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("nocluster"))
+    {
+        return out;
+    }
     let mut start = 0;
     while start < accesses.len() {
         let first = &accesses[start];
-        let eligible = |a: &Access| a.form == (Form::Global { scalar_base: false }) && a.base == first.base
-            && (a.op == MemoryOp::Load(MemSize::B32) && matches!(a.words, 2 | 4) || a.op == MemoryOp::Load(MemSize::B64) && matches!(a.words, 1 | 2));
-        if !eligible(first) || uniform[first.base.0] || affine.contains_key(&first.base) { start += 1; continue; }
-        let mut ranges = vec![(first.offset, first.offset + (first.size().bytes() * first.words) as i64)];
+        let eligible = |a: &Access| {
+            a.form == (Form::Global { scalar_base: false })
+                && a.base == first.base
+                && (a.op == MemoryOp::Load(MemSize::B32) && matches!(a.words, 2 | 4)
+                    || a.op == MemoryOp::Load(MemSize::B64) && matches!(a.words, 1 | 2))
+        };
+        if !eligible(first) || uniform[first.base.0] || affine.contains_key(&first.base) {
+            start += 1;
+            continue;
+        }
+        let mut ranges = vec![(
+            first.offset,
+            first.offset + (first.size().bytes() * first.words) as i64,
+        )];
         let mut len = 1;
         while start + len < accesses.len() {
             let prev = &accesses[start + len - 1];
             let next = &accesses[start + len];
-            if next.block != prev.block || !eligible(next) { break; }
+            if next.block != prev.block || !eligible(next) {
+                break;
+            }
             let between = &f.blocks[&prev.block].insts[prev.end..next.start];
-            if between.iter().any(|inst| !matches!(inst, Inst::Core { .. })) { break; }
-            ranges.push((next.offset, next.offset + (next.size().bytes() * next.words) as i64));
+            if between
+                .iter()
+                .any(|inst| !matches!(inst, Inst::Core { .. }))
+            {
+                break;
+            }
+            ranges.push((
+                next.offset,
+                next.offset + (next.size().bytes() * next.words) as i64,
+            ));
             len += 1;
         }
         if len >= 3 {
@@ -128,11 +272,25 @@ pub(in crate::rdna_spmd) fn clusters(f: &Func, accesses: &[Access], width: Optio
             let lo = sorted[0].0;
             let mut hi = sorted[0].1;
             let mut contiguous = true;
-            for &(a, b) in &sorted[1..] { if a > hi { contiguous = false; break; } hi = hi.max(b); }
+            for &(a, b) in &sorted[1..] {
+                if a > hi {
+                    contiguous = false;
+                    break;
+                }
+                hi = hi.max(b);
+            }
             if contiguous && sorted.iter().all(|&(a, _)| (a - lo) % 8 == 0) && (hi - lo) % 8 == 0 {
                 let span = ((hi - lo) / 8) as u32;
                 if span >= 4 {
-                    out.insert(start, Cluster { members: len, lo, span, tile: transpose_tile(width) });
+                    out.insert(
+                        start,
+                        Cluster {
+                            members: len,
+                            lo,
+                            span,
+                            tile: transpose_tile(width),
+                        },
+                    );
                     start += len;
                     continue;
                 }
@@ -155,15 +313,30 @@ struct Words {
 }
 
 impl<'a> Cg<'a> {
-    fn masked_call(&self, prefix: &str, overloads: &[Type], args: &[Value], ptr_pos: u32, align: u64) -> Value {
+    fn masked_call(
+        &self,
+        prefix: &str,
+        overloads: &[Type],
+        args: &[Value],
+        ptr_pos: u32,
+        align: u64,
+    ) -> Value {
         let call = self.ir.call_intrinsic(prefix, overloads, args);
         self.ir.set_call_align(call, ptr_pos + 1, align);
         call
     }
-    pub(super) fn vptr(&self) -> Type { self.ir.ptr().vector(self.width()) }
-    pub(super) fn vi32(&self) -> Type { self.ir.i32().vector(self.width()) }
-    pub(super) fn vi64(&self) -> Type { self.ir.i64().vector(self.width()) }
-    pub(super) fn vi1(&self) -> Type { self.ir.i1().vector(self.width()) }
+    pub(super) fn vptr(&self) -> Type {
+        self.ir.ptr().vector(self.width())
+    }
+    pub(super) fn vi32(&self) -> Type {
+        self.ir.i32().vector(self.width())
+    }
+    pub(super) fn vi64(&self) -> Type {
+        self.ir.i64().vector(self.width())
+    }
+    pub(super) fn vi1(&self) -> Type {
+        self.ir.i1().vector(self.width())
+    }
     fn ptr_at_vec(&self, addr: Value, off: u64) -> Value {
         let a = self.ir.add(addr, self.splat(self.ci64(off)));
         self.ir.inttoptr(a, self.vptr())
@@ -171,17 +344,36 @@ impl<'a> Cg<'a> {
     fn masked_gather_ty(&self, ptrs: Value, mask: Value, elem: Type, align: u64) -> Value {
         let velem = elem.vector(self.width());
         let passthru = velem.null();
-        self.masked_call("llvm.masked.gather.", &[velem, self.vptr()], &[ptrs, mask, passthru], 0, align)
+        self.masked_call(
+            "llvm.masked.gather.",
+            &[velem, self.vptr()],
+            &[ptrs, mask, passthru],
+            0,
+            align,
+        )
     }
     fn masked_scatter_ty(&self, val: Value, ptrs: Value, mask: Value, elem: Type, align: u64) {
         let velem = elem.vector(self.width());
-        self.masked_call("llvm.masked.scatter.", &[velem, self.vptr()], &[val, ptrs, mask], 1, align);
+        self.masked_call(
+            "llvm.masked.scatter.",
+            &[velem, self.vptr()],
+            &[val, ptrs, mask],
+            1,
+            align,
+        );
     }
     fn reduce(&self, operation: &str, ret: Type, operand: Value) -> Value {
-        self.ir.call_named(&format!("llvm.vector.reduce.{operation}"), ret, &[operand.ty()], &[operand])
+        self.ir.call_named(
+            &format!("llvm.vector.reduce.{operation}"),
+            ret,
+            &[operand.ty()],
+            &[operand],
+        )
     }
     fn any_active(&self, exec: Value, nonempty: bool) -> Value {
-        if nonempty { self.ir.ci1(true) } else {
+        if nonempty {
+            self.ir.ci1(true)
+        } else {
             self.reduce(&format!("or.v{}i1", self.width()), self.ir.i1(), exec)
         }
     }
@@ -198,7 +390,11 @@ impl<'a> Cg<'a> {
         for l in 0..self.width() {
             let p = ir.extract_at(ptrs, l);
             let active = ir.extract_at(exec, l);
-            let p = if allocated { p } else { ir.select(active, p, self.sink) };
+            let p = if allocated {
+                p
+            } else {
+                ir.select(active, p, self.sink)
+            };
             let ld = ir.load(ir.i32(), p).set_alignment(4);
             v = ir.insert_at(v, ld, l);
         }
@@ -225,7 +421,9 @@ impl<'a> Cg<'a> {
         (lo, hi)
     }
     fn vwiden_i32(&self, value: Value, have: u32, want: u32) -> Value {
-        if have == want { return value; }
+        if have == want {
+            return value;
+        }
         let idx: Vec<u32> = (0..want).map(|k| k.min(have - 1)).collect();
         self.ir.shuffle_by(value, value.ty().poison(), &idx)
     }
@@ -244,7 +442,9 @@ impl<'a> Cg<'a> {
                 next.push(self.ir.shuffle_by(a, b, &idx));
                 i += 2;
             }
-            if i < cur.len() { next.push(cur[i]); }
+            if i < cur.len() {
+                next.push(cur[i]);
+            }
             cur = next;
         }
         cur[0]
@@ -267,7 +467,9 @@ impl<'a> Cg<'a> {
                     let (lo_mask, hi_mask) = transpose_pair_masks(tile, step);
                     let mut next = vec![UNDEFINED; tile as usize];
                     for i in 0..tile {
-                        if i & step != 0 { continue; }
+                        if i & step != 0 {
+                            continue;
+                        }
                         let j = i | step;
                         next[i as usize] = shuf(cur[i as usize], cur[j as usize], &lo_mask);
                         next[j as usize] = shuf(cur[i as usize], cur[j as usize], &hi_mask);
@@ -275,33 +477,42 @@ impl<'a> Cg<'a> {
                     cur = next;
                     step <<= 1;
                 }
-                for cix in 0..tile { cols[(base + cix) as usize].push(cur[cix as usize]); }
+                for cix in 0..tile {
+                    cols[(base + cix) as usize].push(cur[cix as usize]);
+                }
                 base += tile;
             }
             for f in base..span {
                 let mut parts: Vec<Value> = if tile == 1 {
                     vec![shuf(r[0], rowty.poison(), &[f])]
                 } else {
-                    r.chunks(2).map(|pair| shuf(pair[0], pair[1], &[f, span + f])).collect()
+                    r.chunks(2)
+                        .map(|pair| shuf(pair[0], pair[1], &[f, span + f]))
+                        .collect()
                 };
                 let mut n = 2u32;
                 while parts.len() > 1 {
                     let cat: Vec<u32> = (0..2 * n).collect();
-                    parts = parts.chunks(2).map(|pair| shuf(pair[0], pair[1], &cat)).collect();
+                    parts = parts
+                        .chunks(2)
+                        .map(|pair| shuf(pair[0], pair[1], &cat))
+                        .collect();
                     n *= 2;
                 }
                 cols[f as usize].push(parts[0]);
             }
         }
-        cols.into_iter().map(|mut parts| {
-            let mut n = tile;
-            while parts.len() > 1 {
-                let cat: Vec<u32> = (0..2 * n).collect();
-                parts = parts.chunks(2).map(|p| shuf(p[0], p[1], &cat)).collect();
-                n *= 2;
-            }
-            parts[0]
-        }).collect()
+        cols.into_iter()
+            .map(|mut parts| {
+                let mut n = tile;
+                while parts.len() > 1 {
+                    let cat: Vec<u32> = (0..2 * n).collect();
+                    parts = parts.chunks(2).map(|p| shuf(p[0], p[1], &cat)).collect();
+                    n *= 2;
+                }
+                parts[0]
+            })
+            .collect()
     }
 
     pub(super) fn emit_cluster(&mut self, members: &[usize], cluster: &Cluster) {
@@ -321,12 +532,20 @@ impl<'a> Cg<'a> {
             let ins = ir.insert_at(poison, any, 0);
             ir.shuffle(ins, poison, ir.i32().vector(cluster.span).null())
         };
-        let rows: Vec<Value> = (0..self.width()).map(|l| {
-            let a = ir.extract_at(safe, l);
-            let a = ir.add(a, self.ci64(cluster.lo as u64));
-            let p = ir.inttoptr(a, ir.ptr());
-            self.masked_call("llvm.masked.load.", &[rowty, ir.ptr()], &[p, rowmask, rowty.poison()], 0, 4)
-        }).collect();
+        let rows: Vec<Value> = (0..self.width())
+            .map(|l| {
+                let a = ir.extract_at(safe, l);
+                let a = ir.add(a, self.ci64(cluster.lo as u64));
+                let p = ir.inttoptr(a, ir.ptr());
+                self.masked_call(
+                    "llvm.masked.load.",
+                    &[rowty, ir.ptr()],
+                    &[p, rowmask, rowty.poison()],
+                    0,
+                    4,
+                )
+            })
+            .collect();
         let cols = self.transpose_rows(&rows, cluster.span, cluster.tile);
         for &m in members {
             let access = &self.p.accesses[m];
@@ -360,7 +579,12 @@ impl<'a> Cg<'a> {
             return;
         }
         let words = Words {
-            elem: match access.size().bytes() { 1 => self.ir.i8(), 2 => self.ir.i16(), 8 => self.ir.i64(), _ => self.ir.i32() },
+            elem: match access.size().bytes() {
+                1 => self.ir.i8(),
+                2 => self.ir.i16(),
+                8 => self.ir.i64(),
+                _ => self.ir.i32(),
+            },
             size: access.size(),
             count: access.words,
             offsets: access.offsets.clone(),
@@ -371,16 +595,23 @@ impl<'a> Cg<'a> {
         };
         let private: Vec<ValueId> = access.private.clone();
         match shape {
-            Shape::ScalarWords | Shape::ScalarLoad { .. } | Shape::ScalarStore | Shape::ScalarAtomic => self.emit_scalar_access(index, shape, &words),
+            Shape::ScalarWords
+            | Shape::ScalarLoad { .. }
+            | Shape::ScalarStore
+            | Shape::ScalarAtomic => self.emit_scalar_access(index, shape, &words),
             _ => self.emit_vector_access(index, block, at, shape, &words),
         }
-        for (&r, &private) in words.results.iter().zip(&private) { let v = self.values[r.0]; self.define(private, v); }
+        for (&r, &private) in words.results.iter().zip(&private) {
+            let v = self.values[r.0];
+            self.define(private, v);
+        }
     }
 
     fn scalar_address(&mut self, index: usize, shape: Shape) -> (Value, Option<Value>) {
         let ir = self.ir;
         let access = &self.p.accesses[index];
-        let (space, inside, address, mask) = (access.space, access.inside, access.address, access.mask);
+        let (space, inside, address, mask) =
+            (access.space, access.inside, access.address, access.mask);
         let predicated = shape != Shape::ScalarWords && !access.scalar();
         let mut addr = self.scalar(address);
         if self.p.width.is_none() {
@@ -391,8 +622,19 @@ impl<'a> Cg<'a> {
                 addr = ir.select(inside, physical, addr);
             }
             if space != Space::Global {
-                let extended = if space == Space::Scratch { ir.sext(addr, ir.i64()) } else { ir.zext(addr, ir.i64()) };
-                addr = ir.add(if space == Space::Scratch { self.scratch_vec } else { self.lds_base }, extended);
+                let extended = if space == Space::Scratch {
+                    ir.sext(addr, ir.i64())
+                } else {
+                    ir.zext(addr, ir.i64())
+                };
+                addr = ir.add(
+                    if space == Space::Scratch {
+                        self.scratch_vec
+                    } else {
+                        self.lds_base
+                    },
+                    extended,
+                );
             }
         }
         let active = predicated.then(|| self.scalar(mask));
@@ -401,7 +643,10 @@ impl<'a> Cg<'a> {
 
     fn guarded(&self, address: Value, active: Option<Value>) -> Value {
         match active {
-            Some(active) => { let dummy = self.ir.ptrtoint(self.sink, self.ir.i64()); self.ir.select(active, address, dummy) }
+            Some(active) => {
+                let dummy = self.ir.ptrtoint(self.sink, self.ir.i64());
+                self.ir.select(active, address, dummy)
+            }
             None => address,
         }
     }
@@ -414,20 +659,37 @@ impl<'a> Cg<'a> {
                 let p = ir.inttoptr(self.guarded(addr, active), ir.ptr());
                 let d = self.scalar(words.data[0]);
                 let old = ir.atomic_add(p, d, Atomic::SequentiallyConsistent);
-                if let Some(&r) = words.results.first() { self.define(r, old); }
+                if let Some(&r) = words.results.first() {
+                    self.define(r, old);
+                }
             }
             Shape::ScalarStore => {
                 for k in 0..words.count as usize {
                     let value = self.scalar(words.data[k]);
-                    let value = if words.size.bytes() >= 4 { value } else { ir.trunc(value, words.elem) };
+                    let value = if words.size.bytes() >= 4 {
+                        value
+                    } else {
+                        ir.trunc(value, words.elem)
+                    };
                     let a = self.guarded(ir.add(addr, self.ci64(words.offsets[k] as u64)), active);
                     let p = ir.inttoptr(a, ir.ptr());
-                    ir.store(value, p).set_alignment(if words.space == Space::Lds { 1 } else { words.size.bytes() }).set_volatile(words.volatile);
+                    ir.store(value, p)
+                        .set_alignment(if words.space == Space::Lds {
+                            1
+                        } else {
+                            words.size.bytes()
+                        })
+                        .set_volatile(words.volatile);
                 }
             }
             _ => {
                 let load_addr = self.guarded(addr, active);
-                let at = |cg: &Self, k: usize| ir.inttoptr(ir.add(load_addr, cg.ci64(words.offsets[k] as u64)), ir.ptr());
+                let at = |cg: &Self, k: usize| {
+                    ir.inttoptr(
+                        ir.add(load_addr, cg.ci64(words.offsets[k] as u64)),
+                        ir.ptr(),
+                    )
+                };
                 let pairs = matches!(shape, Shape::ScalarLoad { pairs: true });
                 let mut k = 0usize;
                 while k < words.count as usize {
@@ -437,8 +699,20 @@ impl<'a> Cg<'a> {
                         k += 2;
                     } else {
                         let load = ir.load(words.elem, at(self, k));
-                        load.set_alignment(if shape == Shape::ScalarWords { if words.size.bytes() >= 4 { 4 } else { 1 } } else if words.space == Space::Lds || words.size.bytes() < 4 { 1 } else { 4 });
-                        if shape != Shape::ScalarWords { load.set_volatile(words.volatile); }
+                        load.set_alignment(if shape == Shape::ScalarWords {
+                            if words.size.bytes() >= 4 {
+                                4
+                            } else {
+                                1
+                            }
+                        } else if words.space == Space::Lds || words.size.bytes() < 4 {
+                            1
+                        } else {
+                            4
+                        });
+                        if shape != Shape::ScalarWords {
+                            load.set_volatile(words.volatile);
+                        }
                         let value = self.widen_word(load, words.size);
                         self.define(words.results[k], value);
                         k += 1;
@@ -449,7 +723,13 @@ impl<'a> Cg<'a> {
     }
 
     fn widen_word(&self, load: Value, size: MemSize) -> Value {
-        if size.bytes() >= 4 { load } else if size.signed() { self.ir.sext(load, self.ir.i32()) } else { self.ir.zext(load, self.ir.i32()) }
+        if size.bytes() >= 4 {
+            load
+        } else if size.signed() {
+            self.ir.sext(load, self.ir.i32())
+        } else {
+            self.ir.zext(load, self.ir.i32())
+        }
     }
 
     fn define_pair(&mut self, results: &[ValueId], value: Value) {
@@ -462,7 +742,8 @@ impl<'a> Cg<'a> {
     fn vector_address(&mut self, index: usize) -> (Value, Value) {
         let ir = self.ir;
         let access = &self.p.accesses[index];
-        let (space, inside, address, mask) = (access.space, access.inside, access.address, access.mask);
+        let (space, inside, address, mask) =
+            (access.space, access.inside, access.address, access.mask);
         let mut addr = self.vector(address);
         let exec = self.vector(mask);
         let exec = self.em.to_bool(exec);
@@ -482,31 +763,57 @@ impl<'a> Cg<'a> {
         (addr, exec)
     }
 
-    fn emit_vector_access(&mut self, index: usize, block: BlockId, at: usize, shape: Shape, words: &Words) {
+    fn emit_vector_access(
+        &mut self,
+        index: usize,
+        block: BlockId,
+        at: usize,
+        shape: Shape,
+        words: &Words,
+    ) {
         let (addr, exec) = self.vector_address(index);
         let base = self.p.accesses[index].base;
         let nonempty = self.p.exec.nonempty_at(block, at);
         match shape {
             Shape::AtomicAdd { grouped } => {
                 let d = self.vector(words.data[0]);
-                if grouped { self.emit_grouped_atomic_add(addr, d, exec); return; }
+                if grouped {
+                    self.emit_grouped_atomic_add(addr, d, exec);
+                    return;
+                }
                 self.emit_lane_atomic_add(addr, d, exec, words.results.first().copied());
             }
             Shape::Store(StoreShape::Tile) => self.emit_tile_store(addr, exec, words),
             Shape::Store(kind) => self.emit_word_stores(addr, exec, kind, words),
             Shape::NarrowLoad => {
                 let value = self.masked_gather_ty(self.ptr_at_vec(addr, 0), exec, words.elem, 1);
-                let value = if words.size.signed() { self.ir.sext(value, self.vi32()) } else { self.ir.zext(value, self.vi32()) };
+                let value = if words.size.signed() {
+                    self.ir.sext(value, self.vi32())
+                } else {
+                    self.ir.zext(value, self.vi32())
+                };
                 self.define(words.results[0], value);
             }
             Shape::PrivateTile { tile } => self.emit_private_tile(addr, tile, words),
-            Shape::Frame { stride_words, offset_words, group } => self.emit_frame_load(base, stride_words, offset_words, group, words),
-            Shape::Words { lanes, pairs } => self.emit_word_loads(addr, exec, nonempty, lanes, pairs, words),
+            Shape::Frame {
+                stride_words,
+                offset_words,
+                group,
+            } => self.emit_frame_load(base, stride_words, offset_words, group, words),
+            Shape::Words { lanes, pairs } => {
+                self.emit_word_loads(addr, exec, nonempty, lanes, pairs, words)
+            }
             _ => unreachable!(),
         }
     }
 
-    fn emit_lane_atomic_add(&mut self, addr: Value, d: Value, exec: Value, result_id: Option<ValueId>) {
+    fn emit_lane_atomic_add(
+        &mut self,
+        addr: Value,
+        d: Value,
+        exec: Value,
+        result_id: Option<ValueId>,
+    ) {
         let ir = self.ir;
         let packed_exec = self.vec_to_mask(exec);
         let ptrs = self.ptr_at_vec(addr, 0);
@@ -521,12 +828,16 @@ impl<'a> Cg<'a> {
             let old = ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent);
             result = ir.insert_at(result, old, k);
         }
-        if let Some(r) = result_id { self.define(r, result); }
+        if let Some(r) = result_id {
+            self.define(r, result);
+        }
     }
 
     fn emit_tile_store(&mut self, addr: Value, exec: Value, words: &Words) {
         let ir = self.ir;
-        let cols: Vec<Value> = (0..words.count as usize).map(|k| self.vector(words.data[k])).collect();
+        let cols: Vec<Value> = (0..words.count as usize)
+            .map(|k| self.vector(words.data[k]))
+            .collect();
         let base = self.ptr_at_vec(addr, words.offsets[0] as u64);
         let sink = ir.ptrtoint(self.tile_sink, ir.i64());
         let addr_i = ir.ptrtoint(base, self.vi64());
@@ -571,40 +882,72 @@ impl<'a> Cg<'a> {
     fn emit_private_tile(&mut self, addr: Value, tile: u32, words: &Words) {
         let ir = self.ir;
         let rowty = ir.i32().vector(words.count);
-        let rows: Vec<_> = (0..self.width()).map(|l| {
-            let a = ir.extract_at(addr, l);
-            let p = ir.inttoptr(a, ir.ptr());
-            ir.load(rowty, p).set_alignment(4)
-        }).collect();
+        let rows: Vec<_> = (0..self.width())
+            .map(|l| {
+                let a = ir.extract_at(addr, l);
+                let p = ir.inttoptr(a, ir.ptr());
+                ir.load(rowty, p).set_alignment(4)
+            })
+            .collect();
         let cols = self.transpose_rows(&rows, words.count, tile);
-        for k in 0..words.count as usize { self.define(words.results[k], cols[k]); }
+        for k in 0..words.count as usize {
+            self.define(words.results[k], cols[k]);
+        }
     }
 
-    fn emit_frame_load(&mut self, base: ValueId, stride_words: u32, offset_words: u32, group: u32, words: &Words) {
+    fn emit_frame_load(
+        &mut self,
+        base: ValueId,
+        stride_words: u32,
+        offset_words: u32,
+        group: u32,
+        words: &Words,
+    ) {
         let ir = self.ir;
         let base_v = self.vector(base);
         let nblk = self.width() / group;
         let blkty = ir.i32().vector(group * stride_words);
         let poison_blk = blkty.poison();
-        let blocks: Vec<Value> = (0..nblk).map(|g| {
-            let a = ir.extract_at(base_v, g * group);
-            let p = ir.inttoptr(a, ir.ptr());
-            ir.load(blkty, p).set_alignment(4)
-        }).collect();
+        let blocks: Vec<Value> = (0..nblk)
+            .map(|g| {
+                let a = ir.extract_at(base_v, g * group);
+                let p = ir.inttoptr(a, ir.ptr());
+                ir.load(blkty, p).set_alignment(4)
+            })
+            .collect();
         let per = words.size.bytes() / 4;
         for k in 0..words.count as usize {
             let first_word = offset_words + k as u32 * per;
-            let parts: Vec<Value> = blocks.iter().map(|&blk| {
-                let idx: Vec<u32> = (0..group).flat_map(|lane| (0..per).map(move |w| lane * stride_words + first_word + w)).collect();
-                ir.shuffle_by(blk, poison_blk, &idx)
-            }).collect();
+            let parts: Vec<Value> = blocks
+                .iter()
+                .map(|&blk| {
+                    let idx: Vec<u32> = (0..group)
+                        .flat_map(|lane| {
+                            (0..per).map(move |w| lane * stride_words + first_word + w)
+                        })
+                        .collect();
+                    ir.shuffle_by(blk, poison_blk, &idx)
+                })
+                .collect();
             let joined = self.vconcat_i32(&parts);
-            let value = if per == 1 { joined } else { ir.bitcast(joined, self.vi64()) };
+            let value = if per == 1 {
+                joined
+            } else {
+                ir.bitcast(joined, self.vi64())
+            };
             self.define(words.results[k], value);
         }
     }
 
-    fn emit_word_loads(&mut self, addr: Value, exec: Value, nonempty: bool, lanes: Lanes, pairs: bool, words: &Words) {
+    fn emit_word_loads(
+        &mut self,
+        addr: Value,
+        exec: Value,
+        nonempty: bool,
+        lanes: Lanes,
+        pairs: bool,
+        words: &Words,
+    ) {
         let ir = self.ir;
         let mut k = 0usize;
         while k < words.count as usize {
@@ -645,7 +988,12 @@ impl<'a> Cg<'a> {
         let nonempty = ir.icmp(IntPred::Ne, pending, self.ci32(0));
         ir.cond_br(nonempty, body, done);
         ir.position_at_end(body);
-        let lane = ir.call_named("llvm.cttz.i32", ir.i32(), &[ir.i32(), ir.i1()], &[pending, ir.ci1(true)]);
+        let lane = ir.call_named(
+            "llvm.cttz.i32",
+            ir.i32(),
+            &[ir.i32(), ir.i1()],
+            &[pending, ir.ci1(true)],
+        );
         let address = ir.extract(addresses, lane);
         let equal = ir.icmp(IntPred::Eq, addresses, self.splat(address));
         let members = ir.and(self.vec_to_mask(equal), pending);
@@ -664,11 +1012,13 @@ impl<'a> Cg<'a> {
 
 fn transpose_pair_masks(tile: u32, step: u32) -> (Vec<u32>, Vec<u32>) {
     let mask = |high: bool| {
-        (0..tile).map(|position| {
-            let from_second = position & step != 0;
-            let element = (position & !step) | if high { step } else { 0 };
-            element + if from_second { tile } else { 0 }
-        }).collect()
+        (0..tile)
+            .map(|position| {
+                let from_second = position & step != 0;
+                let element = (position & !step) | if high { step } else { 0 };
+                element + if from_second { tile } else { 0 }
+            })
+            .collect()
     };
     (mask(false), mask(true))
 }

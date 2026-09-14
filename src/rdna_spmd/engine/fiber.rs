@@ -60,7 +60,7 @@ type KernelFn = unsafe extern "C" fn(
     u64,           // workgroup LDS base
     u64,           // packet lane base
     *mut FiberCtx, // this context
-    u32,          // valid packet lanes
+    u32,           // valid packet lanes
 ) -> u64;
 
 /// A packet kernel invocation with its own stack. [`Fiber::start`] arms it for
@@ -78,40 +78,71 @@ pub struct Fiber {
 /// A worker's fiber stacks. Released storage returns to a bounded pool so a
 /// dispatch after the first reuses mapped, faulted-in pages; the guard bytes
 /// are verified before the storage is handed back.
-struct Storage { bytes: Vec<std::mem::MaybeUninit<u8>>, count: usize, stack_bytes: usize }
+struct Storage {
+    bytes: Vec<std::mem::MaybeUninit<u8>>,
+    count: usize,
+    stack_bytes: usize,
+}
 
 static POOL: std::sync::Mutex<Vec<Storage>> = std::sync::Mutex::new(Vec::new());
 const POOL_LIMIT: usize = 64;
 
 impl Storage {
     fn acquire(count: usize, stack_bytes: usize) -> Self {
-        let total = count.checked_mul(stack_bytes).expect("fiber stack allocation overflow");
+        let total = count
+            .checked_mul(stack_bytes)
+            .expect("fiber stack allocation overflow");
         let mut pool = POOL.lock().unwrap();
-        let bytes = match pool.iter().position(|s| s.count == count && s.stack_bytes == stack_bytes) {
+        let bytes = match pool
+            .iter()
+            .position(|s| s.count == count && s.stack_bytes == stack_bytes)
+        {
             Some(index) => std::mem::take(&mut pool.swap_remove(index).bytes),
             None => {
                 let mut storage = Vec::<std::mem::MaybeUninit<u8>>::with_capacity(total);
-                unsafe { storage.set_len(total); }
+                unsafe {
+                    storage.set_len(total);
+                }
                 storage
             }
         };
-        let mut storage = Storage { bytes, count, stack_bytes };
+        let mut storage = Storage {
+            bytes,
+            count,
+            stack_bytes,
+        };
         for index in 0..count {
-            storage.bytes[index * stack_bytes..index * stack_bytes + STACK_GUARD_BYTES].fill(std::mem::MaybeUninit::new(STACK_POISON));
+            storage.bytes[index * stack_bytes..index * stack_bytes + STACK_GUARD_BYTES]
+                .fill(std::mem::MaybeUninit::new(STACK_POISON));
         }
         storage
     }
     fn guard_intact(&self, index: usize) -> bool {
-        self.bytes[index * self.stack_bytes..index * self.stack_bytes + STACK_GUARD_BYTES].iter().all(|b| unsafe { b.assume_init() } == STACK_POISON)
+        self.bytes[index * self.stack_bytes..index * self.stack_bytes + STACK_GUARD_BYTES]
+            .iter()
+            .all(|b| unsafe { b.assume_init() } == STACK_POISON)
     }
 }
 
 impl Drop for Storage {
     fn drop(&mut self) {
-        if self.bytes.is_empty() { return; }
-        for index in 0..self.count { assert!(self.guard_intact(index), "fiber stack overflowed: the kernel reached the deepest bytes"); }
+        if self.bytes.is_empty() {
+            return;
+        }
+        for index in 0..self.count {
+            assert!(
+                self.guard_intact(index),
+                "fiber stack overflowed: the kernel reached the deepest bytes"
+            );
+        }
         let mut pool = POOL.lock().unwrap();
-        if pool.len() < POOL_LIMIT { pool.push(Storage { bytes: std::mem::take(&mut self.bytes), count: self.count, stack_bytes: self.stack_bytes }); }
+        if pool.len() < POOL_LIMIT {
+            pool.push(Storage {
+                bytes: std::mem::take(&mut self.bytes),
+                count: self.count,
+                stack_bytes: self.stack_bytes,
+            });
+        }
     }
 }
 
@@ -133,26 +164,33 @@ impl Fiber {
         let stack_bytes = stack_bytes.checked_add(15).unwrap() & !15;
         // Native code initializes saved slots before reading them. Only the
         // overflow guards need initialization by the driver.
-        let stack = std::rc::Rc::new(std::cell::UnsafeCell::new(Storage::acquire(count, stack_bytes)));
-        (0..count).map(|index| Self {
-            ctx: Box::new(FiberCtx {
-                driver_rsp: 0,
-                fiber_rsp: 0,
-                values: std::ptr::null_mut(),
-                args: KernelArgs {
-                    entry: 0,
-                    sgprs: std::ptr::null_mut(),
-                    vgprs: std::ptr::null_mut(),
-                    spill: std::ptr::null_mut(),
-                    lds_base: 0,
-                    valid_mask: u32::MAX,
-                    scratch_base: 0,
-                    scratch_stride: 0,
-                    lane_base: 0,
-                },
-            }),
-            stack: stack.clone(), stack_offset: index * stack_bytes, stack_bytes,
-        }).collect()
+        let stack = std::rc::Rc::new(std::cell::UnsafeCell::new(Storage::acquire(
+            count,
+            stack_bytes,
+        )));
+        (0..count)
+            .map(|index| Self {
+                ctx: Box::new(FiberCtx {
+                    driver_rsp: 0,
+                    fiber_rsp: 0,
+                    values: std::ptr::null_mut(),
+                    args: KernelArgs {
+                        entry: 0,
+                        sgprs: std::ptr::null_mut(),
+                        vgprs: std::ptr::null_mut(),
+                        spill: std::ptr::null_mut(),
+                        lds_base: 0,
+                        valid_mask: u32::MAX,
+                        scratch_base: 0,
+                        scratch_stride: 0,
+                        lane_base: 0,
+                    },
+                }),
+                stack: stack.clone(),
+                stack_offset: index * stack_bytes,
+                stack_bytes,
+            })
+            .collect()
     }
 
     /// Arm the fiber to run `args` from the top of its stack, discarding any
@@ -162,7 +200,12 @@ impl Fiber {
     pub fn start(&mut self, args: KernelArgs) {
         // No Rust reference to a stack range is kept across native execution.
         // The allocation never moves or resizes, and ranges never overlap.
-        let base = unsafe { (*self.stack.get()).bytes.as_mut_ptr().add(self.stack_offset) };
+        let base = unsafe {
+            (*self.stack.get())
+                .bytes
+                .as_mut_ptr()
+                .add(self.stack_offset)
+        };
         assert!(
             (0..STACK_GUARD_BYTES).all(|i| unsafe { (*base.add(i)).assume_init() == STACK_POISON }),
             "fiber stack overflowed: the kernel reached the deepest bytes"
@@ -184,7 +227,10 @@ impl Fiber {
     }
 
     pub(crate) fn yield_values(&self) -> *mut u32 {
-        assert!(!self.ctx.values.is_null(), "fiber has no pending SSA values");
+        assert!(
+            !self.ctx.values.is_null(),
+            "fiber has no pending SSA values"
+        );
         self.ctx.values
     }
 }

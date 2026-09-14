@@ -4,27 +4,68 @@
 use super::*;
 
 fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
-    let InstFormat::SOP2(i) = inst else { return None; };
+    let InstFormat::SOP2(i) = inst else {
+        return None;
+    };
     let ty = match i.op {
-        I::S_ADD_U32 | I::S_ADD_CO_U32 | I::S_ADD_CO_CI_U32 | I::S_SUB_CO_U32 | I::S_SUB_CO_CI_U32
-        | I::S_ADD_CO_I32 | I::S_ADD_I32 | I::S_SUB_CO_I32 | I::S_MUL_I32 | I::S_MUL_HI_U32 | I::S_CSELECT_B32
-        | I::S_LSHL_B32 | I::S_LSHR_B32 | I::S_BFM_B32 | I::S_BFE_U32 | I::S_MAX_U32 => Ty::I32,
-        I::S_ADD_NC_U64 | I::S_MUL_U64 | I::S_LSHL_B64 | I::S_LSHR_B64 | I::S_ASHR_I64
-        | I::S_AND_B64 | I::S_OR_B64 | I::S_XOR_B64 | I::S_CSELECT_B64 => Ty::I64,
+        I::S_ADD_U32
+        | I::S_ADD_CO_U32
+        | I::S_ADD_CO_CI_U32
+        | I::S_SUB_CO_U32
+        | I::S_SUB_CO_CI_U32
+        | I::S_ADD_CO_I32
+        | I::S_ADD_I32
+        | I::S_SUB_CO_I32
+        | I::S_MUL_I32
+        | I::S_MUL_HI_U32
+        | I::S_CSELECT_B32
+        | I::S_LSHL_B32
+        | I::S_LSHR_B32
+        | I::S_BFM_B32
+        | I::S_BFE_U32
+        | I::S_MAX_U32 => Ty::I32,
+        I::S_ADD_NC_U64
+        | I::S_MUL_U64
+        | I::S_LSHL_B64
+        | I::S_LSHR_B64
+        | I::S_ASHR_I64
+        | I::S_AND_B64
+        | I::S_OR_B64
+        | I::S_XOR_B64
+        | I::S_CSELECT_B64 => Ty::I64,
         _ => return None,
     };
     let shift64 = matches!(i.op, I::S_LSHL_B64 | I::S_LSHR_B64 | I::S_ASHR_I64);
-    let mut inputs = vec![if matches!(i.op, I::S_ASHR_I64) { signed_input(i.ssrc0, ty) } else { input(i.ssrc0, ty) },
-        input(i.ssrc1, if shift64 { Ty::I32 } else { ty })];
-    if matches!(i.op, I::S_CSELECT_B32 | I::S_CSELECT_B64 | I::S_ADD_CO_CI_U32 | I::S_SUB_CO_CI_U32) {
-        inputs.push(Input { source: InputSource::Scc, ty: Ty::I1 });
+    let mut inputs = vec![
+        if matches!(i.op, I::S_ASHR_I64) {
+            signed_input(i.ssrc0, ty)
+        } else {
+            input(i.ssrc0, ty)
+        },
+        input(i.ssrc1, if shift64 { Ty::I32 } else { ty }),
+    ];
+    if matches!(
+        i.op,
+        I::S_CSELECT_B32 | I::S_CSELECT_B64 | I::S_ADD_CO_CI_U32 | I::S_SUB_CO_CI_U32
+    ) {
+        inputs.push(Input {
+            source: InputSource::Scc,
+            ty: Ty::I1,
+        });
     }
     let mut b = Builder::new(registry, inputs);
     let (a, mut c) = (ValueId(0), ValueId(1));
-    if shift64 { c = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, c)); }
+    if shift64 {
+        c = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, c));
+    }
     let mut flag = None;
     let result = match i.op {
-        I::S_ADD_U32 | I::S_ADD_CO_U32 | I::S_ADD_CO_CI_U32 | I::S_SUB_CO_U32 | I::S_SUB_CO_CI_U32 | I::S_MUL_HI_U32 => {
+        I::S_ADD_U32
+        | I::S_ADD_CO_U32
+        | I::S_ADD_CO_CI_U32
+        | I::S_SUB_CO_U32
+        | I::S_SUB_CO_CI_U32
+        | I::S_MUL_HI_U32 => {
             let a = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, a));
             let mut c = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, c));
             if matches!(i.op, I::S_ADD_CO_CI_U32 | I::S_SUB_CO_CI_U32) {
@@ -32,7 +73,13 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
                 c = b.push(Ty::I64, Op::Int(IntOp::Add, c, carry));
             }
             let subtract = matches!(i.op, I::S_SUB_CO_U32 | I::S_SUB_CO_CI_U32);
-            let op = if subtract { IntOp::Sub } else if matches!(i.op, I::S_MUL_HI_U32) { IntOp::Mul } else { IntOp::Add };
+            let op = if subtract {
+                IntOp::Sub
+            } else if matches!(i.op, I::S_MUL_HI_U32) {
+                IntOp::Mul
+            } else {
+                IntOp::Add
+            };
             let wide = b.push(Ty::I64, Op::Int(op, a, c));
             let shift = b.k(Ty::I64, 32);
             let high = b.push(Ty::I64, Op::Int(IntOp::LShr, wide, shift));
@@ -40,13 +87,19 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
                 let zero = b.k(Ty::I64, 0);
                 flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, high, zero)));
                 b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, wide))
-            } else { b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, high)) }
+            } else {
+                b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, high))
+            }
         }
         I::S_ADD_CO_I32 | I::S_ADD_I32 | I::S_SUB_CO_I32 => {
             let sub = matches!(i.op, I::S_SUB_CO_I32);
             let result = b.int(if sub { IntOp::Sub } else { IntOp::Add }, a, c);
             let ar = b.int(IntOp::Xor, a, result);
-            let other = b.int(IntOp::Xor, if sub { a } else { c }, if sub { c } else { result });
+            let other = b.int(
+                IntOp::Xor,
+                if sub { a } else { c },
+                if sub { c } else { result },
+            );
             let overflow = b.int(IntOp::And, ar, other);
             let zero = b.k(Ty::I32, 0);
             flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Slt, overflow, zero)));
@@ -56,15 +109,22 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
         I::S_ADD_NC_U64 => b.push(Ty::I64, Op::Int(IntOp::Add, a, c)),
         I::S_CSELECT_B32 | I::S_CSELECT_B64 => b.push(ty, Op::Select(ValueId(2), a, c)),
         I::S_AND_B64 | I::S_OR_B64 | I::S_XOR_B64 => {
-            let op = match i.op { I::S_AND_B64 => IntOp::And, I::S_OR_B64 => IntOp::Or, _ => IntOp::Xor };
+            let op = match i.op {
+                I::S_AND_B64 => IntOp::And,
+                I::S_OR_B64 => IntOp::Or,
+                _ => IntOp::Xor,
+            };
             let value = b.push(ty, Op::Int(op, a, c));
             let zero = b.k(ty, 0);
             flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero)));
             value
         }
         I::S_LSHL_B32 | I::S_LSHR_B32 | I::S_LSHL_B64 | I::S_LSHR_B64 | I::S_ASHR_I64 => {
-            let op = match i.op { I::S_LSHR_B32 | I::S_LSHR_B64 => IntOp::LShr,
-                I::S_ASHR_I64 => IntOp::AShr, _ => IntOp::Shl };
+            let op = match i.op {
+                I::S_LSHR_B32 | I::S_LSHR_B64 => IntOp::LShr,
+                I::S_ASHR_I64 => IntOp::AShr,
+                _ => IntOp::Shl,
+            };
             let value = b.push(ty, Op::Int(op, a, c));
             let zero = b.k(ty, 0);
             flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero)));
@@ -102,12 +162,16 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
         _ => unreachable!(),
     };
     let mut results = vec![(Output::Scalar(i.sdst as u32, ty), result)];
-    if let Some(flag) = flag { results.push((Output::Scc, flag)); }
+    if let Some(flag) = flag {
+        results.push((Output::Scc, flag));
+    }
     Some(b.finish_many(true, results))
 }
 
 fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
-    let InstFormat::SOPC(i) = inst else { return None; };
+    let InstFormat::SOPC(i) = inst else {
+        return None;
+    };
     let (ty, predicate) = match i.op {
         I::S_CMP_EQ_U32 | I::S_CMP_EQ_I32 => (Ty::I32, IntPred::Eq),
         I::S_CMP_LG_U32 | I::S_CMP_LG_I32 => (Ty::I32, IntPred::Ne),
@@ -123,13 +187,18 @@ fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         I::S_CMP_LG_U64 => (Ty::I64, IntPred::Ne),
         _ => return None,
     };
-    let mut b = Builder::new(registry, vec![input(i.ssrc0.clone(), ty), input(i.ssrc1.clone(), ty)]);
+    let mut b = Builder::new(
+        registry,
+        vec![input(i.ssrc0.clone(), ty), input(i.ssrc1.clone(), ty)],
+    );
     let flag = b.push(Ty::I1, Op::Cmp(predicate, ValueId(0), ValueId(1)));
     Some(b.finish_many(true, vec![(Output::Scc, flag)]))
 }
 
 fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
-    let InstFormat::SOP1(i) = inst else { return None; };
+    let InstFormat::SOP1(i) = inst else {
+        return None;
+    };
     let (from, to, cvt) = match i.op {
         I::S_MOV_B32 => (Ty::I32, Ty::I32, None),
         I::S_MOV_B64 => (Ty::I64, Ty::I64, None),
@@ -153,25 +222,41 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         let empty = b.push(Ty::I1, Op::Cmp(IntPred::Eq, ValueId(0), zero));
         let missing = b.k(Ty::I32, u32::MAX as u64);
         b.push(Ty::I32, Op::Select(empty, missing, count))
-    } else { ValueId(0) };
+    } else {
+        ValueId(0)
+    };
     Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, to), result)]))
 }
 
 fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
-    let InstFormat::SOPK(i) = inst else { return None; };
+    let InstFormat::SOPK(i) = inst else {
+        return None;
+    };
     let predicate = match i.op {
         I::S_CMPK_EQ_I32 | I::S_CMPK_EQ_U32 => Some(IntPred::Eq),
         I::S_CMPK_LG_I32 | I::S_CMPK_LG_U32 => Some(IntPred::Ne),
-        I::S_CMPK_GT_I32 => Some(IntPred::Sgt), I::S_CMPK_GE_I32 => Some(IntPred::Sge),
-        I::S_CMPK_LT_I32 => Some(IntPred::Slt), I::S_CMPK_LE_I32 => Some(IntPred::Sle),
-        I::S_CMPK_GT_U32 => Some(IntPred::Ugt), I::S_CMPK_GE_U32 => Some(IntPred::Uge),
-        I::S_CMPK_LT_U32 => Some(IntPred::Ult), I::S_CMPK_LE_U32 => Some(IntPred::Ule),
+        I::S_CMPK_GT_I32 => Some(IntPred::Sgt),
+        I::S_CMPK_GE_I32 => Some(IntPred::Sge),
+        I::S_CMPK_LT_I32 => Some(IntPred::Slt),
+        I::S_CMPK_LE_I32 => Some(IntPred::Sle),
+        I::S_CMPK_GT_U32 => Some(IntPred::Ugt),
+        I::S_CMPK_GE_U32 => Some(IntPred::Uge),
+        I::S_CMPK_LT_U32 => Some(IntPred::Ult),
+        I::S_CMPK_LE_U32 => Some(IntPred::Ule),
         I::S_MOVK_I32 | I::S_CMOVK_I32 | I::S_ADDK_I32 | I::S_MULK_I32 => None,
         _ => return None,
     };
-    let mut inputs = if matches!(i.op, I::S_MOVK_I32) { vec![] }
-        else { vec![input(SourceOperand::ScalarRegister(i.sdst), Ty::I32)] };
-    if matches!(i.op, I::S_CMOVK_I32) { inputs.push(Input { source: InputSource::Scc, ty: Ty::I1 }); }
+    let mut inputs = if matches!(i.op, I::S_MOVK_I32) {
+        vec![]
+    } else {
+        vec![input(SourceOperand::ScalarRegister(i.sdst), Ty::I32)]
+    };
+    if matches!(i.op, I::S_CMOVK_I32) {
+        inputs.push(Input {
+            source: InputSource::Scc,
+            ty: Ty::I1,
+        });
+    }
     let mut b = Builder::new(registry, inputs);
     let imm = b.k(Ty::I32, i.simm16 as i16 as i32 as u32 as u64);
     if let Some(predicate) = predicate {
@@ -195,12 +280,18 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
         _ => unreachable!(),
     };
     let mut outputs = vec![(Output::Scalar(i.sdst as u32, Ty::I32), result)];
-    if let Some(flag) = flag { outputs.push((Output::Scc, flag)); }
+    if let Some(flag) = flag {
+        outputs.push((Output::Scc, flag));
+    }
     Some(b.finish_many(true, outputs))
 }
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
-    masks(inst, registry).or_else(|| arithmetic(inst, registry)).or_else(|| compare(inst, registry)).or_else(|| unary(inst, registry)).or_else(|| immediate(inst, registry))
+    masks(inst, registry)
+        .or_else(|| arithmetic(inst, registry))
+        .or_else(|| compare(inst, registry))
+        .or_else(|| unary(inst, registry))
+        .or_else(|| immediate(inst, registry))
 }
 
 fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
@@ -211,33 +302,59 @@ fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
             I::S_XOR_SAVEEXEC_B32 => IntOp::Xor,
             _ => return None,
         };
-        let mut b = Builder::new(registry,vec![input(i.ssrc0,Ty::I32),
-            input(SourceOperand::ScalarRegister(126),Ty::I32)]);
+        let mut b = Builder::new(
+            registry,
+            vec![
+                input(i.ssrc0, Ty::I32),
+                input(SourceOperand::ScalarRegister(126), Ty::I32),
+            ],
+        );
         let old = ValueId(1);
-        let rhs = if matches!(i.op,I::S_AND_NOT1_SAVEEXEC_B32) {
-            let all = b.k(Ty::I32,u32::MAX as u64);
-            b.push(Ty::I32,Op::Int(IntOp::Xor,old,all))
-        } else { old };
-        let next = b.push(Ty::I32,Op::Int(op,ValueId(0),rhs));
-        let zero=b.k(Ty::I32,0);
-        let flag=b.push(Ty::I1,Op::Cmp(IntPred::Ne,next,zero));
-        return Some(b.finish_many(true,vec![(Output::Scalar(i.sdst as u32,Ty::I32),old),
-            (Output::Scalar(126,Ty::I32),next),(Output::Scc,flag)]));
+        let rhs = if matches!(i.op, I::S_AND_NOT1_SAVEEXEC_B32) {
+            let all = b.k(Ty::I32, u32::MAX as u64);
+            b.push(Ty::I32, Op::Int(IntOp::Xor, old, all))
+        } else {
+            old
+        };
+        let next = b.push(Ty::I32, Op::Int(op, ValueId(0), rhs));
+        let zero = b.k(Ty::I32, 0);
+        let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, next, zero));
+        return Some(b.finish_many(
+            true,
+            vec![
+                (Output::Scalar(i.sdst as u32, Ty::I32), old),
+                (Output::Scalar(126, Ty::I32), next),
+                (Output::Scc, flag),
+            ],
+        ));
     }
-    let InstFormat::SOP2(i) = inst else { return None; };
+    let InstFormat::SOP2(i) = inst else {
+        return None;
+    };
     let op = match i.op {
         I::S_AND_B32 | I::S_AND_NOT1_B32 => IntOp::And,
         I::S_OR_B32 | I::S_OR_NOT1_B32 => IntOp::Or,
         I::S_XOR_B32 => IntOp::Xor,
         _ => return None,
     };
-    let mut b = Builder::new(registry,vec![input(i.ssrc0,Ty::I32),input(i.ssrc1,Ty::I32)]);
-    let rhs = if matches!(i.op,I::S_AND_NOT1_B32|I::S_OR_NOT1_B32) {
-        let all = b.k(Ty::I32,u32::MAX as u64);
-        b.int(IntOp::Xor,ValueId(1),all)
-    } else { ValueId(1) };
-    let value = b.int(op,ValueId(0),rhs);
-    let zero = b.k(Ty::I32,0);
-    let flag = b.push(Ty::I1,Op::Cmp(IntPred::Ne,value,zero));
-    Some(b.finish_many(true,vec![(Output::Scalar(i.sdst as u32,Ty::I32),value),(Output::Scc,flag)]))
+    let mut b = Builder::new(
+        registry,
+        vec![input(i.ssrc0, Ty::I32), input(i.ssrc1, Ty::I32)],
+    );
+    let rhs = if matches!(i.op, I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32) {
+        let all = b.k(Ty::I32, u32::MAX as u64);
+        b.int(IntOp::Xor, ValueId(1), all)
+    } else {
+        ValueId(1)
+    };
+    let value = b.int(op, ValueId(0), rhs);
+    let zero = b.k(Ty::I32, 0);
+    let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero));
+    Some(b.finish_many(
+        true,
+        vec![
+            (Output::Scalar(i.sdst as u32, Ty::I32), value),
+            (Output::Scc, flag),
+        ],
+    ))
 }

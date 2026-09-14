@@ -1,44 +1,103 @@
-use super::super::ir::{*, Cvt, Op, Ty, ValueId};
 use super::super::analysis::{Analyses, Masks};
+use super::super::ir::{Cvt, Op, Ty, ValueId, *};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn count_uses(f: &Func, uses: &mut [usize]) {
     for block in f.blocks.values() {
         for inst in &block.insts {
             match inst {
-                Inst::Core { op, .. } => { op.map(|v| { uses[v.0] += 1; v }); }
+                Inst::Core { op, .. } => {
+                    op.map(|v| {
+                        uses[v.0] += 1;
+                        v
+                    });
+                }
                 Inst::Packet { input, .. } => uses[input.0] += 1,
-                Inst::Target { args, .. } => for v in args.values() { uses[v.0] += 1; },
-                Inst::Effect { inputs, .. } => for v in inputs { uses[v.0] += 1; },
+                Inst::Target { args, .. } => {
+                    for v in args.values() {
+                        uses[v.0] += 1;
+                    }
+                }
+                Inst::Effect { inputs, .. } => {
+                    for v in inputs {
+                        uses[v.0] += 1;
+                    }
+                }
             }
         }
         match &block.term {
-            Term::Br(e) => for v in &e.args { uses[v.0] += 1; },
-            Term::CondBr { cond, yes, no } => { uses[cond.0] += 1; for v in yes.args.iter().chain(&no.args) { uses[v.0] += 1; } }
-            Term::Ret(args) => for v in args { uses[v.0] += 1; },
+            Term::Br(e) => {
+                for v in &e.args {
+                    uses[v.0] += 1;
+                }
+            }
+            Term::CondBr { cond, yes, no } => {
+                uses[cond.0] += 1;
+                for v in yes.args.iter().chain(&no.args) {
+                    uses[v.0] += 1;
+                }
+            }
+            Term::Ret(args) => {
+                for v in args {
+                    uses[v.0] += 1;
+                }
+            }
         }
     }
 }
 
-enum Demand { Active, Overwritten(ValueId) }
+enum Demand {
+    Active,
+    Overwritten(ValueId),
+}
 
 fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
     let entry = &f.blocks[&f.entry];
-    let k = entry.params[..exec_index].iter().filter(|p| p.1 == Ty::I1).count();
-    let exec_of = |block: &Block| block.params.iter().filter(|p| p.1 == Ty::I1).nth(k).map(|p| p.0);
+    let k = entry.params[..exec_index]
+        .iter()
+        .filter(|p| p.1 == Ty::I1)
+        .count();
+    let exec_of = |block: &Block| {
+        block
+            .params
+            .iter()
+            .filter(|p| p.1 == Ty::I1)
+            .nth(k)
+            .map(|p| p.0)
+    };
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut producers: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut incoming: BTreeMap<BlockId, Vec<&Edge>> = BTreeMap::new();
     let mut pending: Vec<(ValueId, Demand)> = Vec::new();
     for (&id, block) in &f.blocks {
-        for (index, &(p, _)) in block.params.iter().enumerate() { params[p.0] = Some((id, index)); }
+        for (index, &(p, _)) in block.params.iter().enumerate() {
+            params[p.0] = Some((id, index));
+        }
         for (index, inst) in block.insts.iter().enumerate() {
             match inst {
-                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => producers[value.0] = Some((id, index)),
-                Inst::Effect { inputs, outputs, .. } => { pending.extend(inputs.iter().map(|&v| (v, Demand::Active))); for &(v, _) in outputs { producers[v.0] = Some((id, index)); } }
-                Inst::Target { provenance, args, outputs, .. } => {
-                    if provenance.is_some() { pending.extend(args.values().iter().map(|&v| (v, Demand::Active))); }
-                    for &(v, _) in outputs { producers[v.0] = Some((id, index)); }
+                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => {
+                    producers[value.0] = Some((id, index))
+                }
+                Inst::Effect {
+                    inputs, outputs, ..
+                } => {
+                    pending.extend(inputs.iter().map(|&v| (v, Demand::Active)));
+                    for &(v, _) in outputs {
+                        producers[v.0] = Some((id, index));
+                    }
+                }
+                Inst::Target {
+                    provenance,
+                    args,
+                    outputs,
+                    ..
+                } => {
+                    if provenance.is_some() {
+                        pending.extend(args.values().iter().map(|&v| (v, Demand::Active)));
+                    }
+                    for &(v, _) in outputs {
+                        producers[v.0] = Some((id, index));
+                    }
                 }
             }
         }
@@ -47,23 +106,50 @@ fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
             Term::Ret(args) => pending.extend(args.iter().map(|&v| (v, Demand::Active))),
             Term::Br(_) => {}
         }
-        for edge in block.term.edges() { incoming.entry(edge.dst).or_default().push(edge); }
+        for edge in block.term.edges() {
+            incoming.entry(edge.dst).or_default().push(edge);
+        }
     }
     let mut needed = vec![false; f.types.len()];
     let mut overwritten: BTreeSet<(ValueId, ValueId)> = BTreeSet::new();
     while let Some((v, demand)) = pending.pop() {
-        if needed[v.0] { continue; }
+        if needed[v.0] {
+            continue;
+        }
         if let Demand::Overwritten(exec) = demand {
-            if !overwritten.insert((v, exec)) { continue; }
+            if !overwritten.insert((v, exec)) {
+                continue;
+            }
             match producers[v.0].map(|(block, index)| &f.blocks[&block].insts[index]) {
-                Some(Inst::Core { op: Op::Select(_, _, old), .. }) if masks.predicated[v.0].is_some_and(|(_, own)| own == exec) => pending.push((*old, Demand::Overwritten(exec))),
-                Some(Inst::Core { op: Op::UnpackLo(x) | Op::UnpackHi(x) | Op::Convert(Cvt::Bitcast, _, x), .. }) => pending.push((*x, Demand::Overwritten(exec))),
-                Some(Inst::Core { op: Op::Pack64(lo, hi), .. }) => { pending.push((*lo, Demand::Overwritten(exec))); pending.push((*hi, Demand::Overwritten(exec))); }
+                Some(Inst::Core {
+                    op: Op::Select(_, _, old),
+                    ..
+                }) if masks.predicated[v.0].is_some_and(|(_, own)| own == exec) => {
+                    pending.push((*old, Demand::Overwritten(exec)))
+                }
+                Some(Inst::Core {
+                    op: Op::UnpackLo(x) | Op::UnpackHi(x) | Op::Convert(Cvt::Bitcast, _, x),
+                    ..
+                }) => pending.push((*x, Demand::Overwritten(exec))),
+                Some(Inst::Core {
+                    op: Op::Pack64(lo, hi),
+                    ..
+                }) => {
+                    pending.push((*lo, Demand::Overwritten(exec)));
+                    pending.push((*hi, Demand::Overwritten(exec)));
+                }
                 Some(_) => pending.push((v, Demand::Active)),
                 None => match params[v.0] {
                     Some((block, index)) if exec_of(&f.blocks[&block]) == Some(exec) => {
-                        let position = f.blocks[&block].params.iter().position(|p| p.0 == exec).unwrap();
-                        for edge in incoming.get(&block).into_iter().flatten() { pending.push((edge.args[index], Demand::Overwritten(edge.args[position]))); }
+                        let position = f.blocks[&block]
+                            .params
+                            .iter()
+                            .position(|p| p.0 == exec)
+                            .unwrap();
+                        for edge in incoming.get(&block).into_iter().flatten() {
+                            pending
+                                .push((edge.args[index], Demand::Overwritten(edge.args[position])));
+                        }
                     }
                     _ => pending.push((v, Demand::Active)),
                 },
@@ -73,17 +159,32 @@ fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
         needed[v.0] = true;
         if let Some((block, index)) = producers[v.0] {
             match &f.blocks[&block].insts[index] {
-                Inst::Core { op: Op::Select(c, new, old), .. } if masks.predicated[v.0].is_some() => {
-                    pending.push((*c, Demand::Active)); pending.push((*new, Demand::Active));
-                    if masks.exposed[v.0] != 0 { pending.push((*old, Demand::Overwritten(masks.predicated[v.0].unwrap().1))); }
+                Inst::Core {
+                    op: Op::Select(c, new, old),
+                    ..
+                } if masks.predicated[v.0].is_some() => {
+                    pending.push((*c, Demand::Active));
+                    pending.push((*new, Demand::Active));
+                    if masks.exposed[v.0] != 0 {
+                        pending.push((*old, Demand::Overwritten(masks.predicated[v.0].unwrap().1)));
+                    }
                 }
-                Inst::Core { op, .. } => { op.map(|a| { pending.push((a, Demand::Active)); a }); }
+                Inst::Core { op, .. } => {
+                    op.map(|a| {
+                        pending.push((a, Demand::Active));
+                        a
+                    });
+                }
                 Inst::Packet { input, .. } => pending.push((*input, Demand::Active)),
-                Inst::Target { args, .. } => pending.extend(args.values().iter().map(|&a| (a, Demand::Active))),
+                Inst::Target { args, .. } => {
+                    pending.extend(args.values().iter().map(|&a| (a, Demand::Active)))
+                }
                 Inst::Effect { .. } => {}
             }
         } else if let Some((block, index)) = params[v.0] {
-            for edge in incoming.get(&block).into_iter().flatten() { pending.push((edge.args[index], Demand::Active)); }
+            for edge in incoming.get(&block).into_iter().flatten() {
+                pending.push((edge.args[index], Demand::Active));
+            }
         }
     }
     needed
@@ -91,7 +192,9 @@ fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
 
 pub(crate) struct DeadWrites;
 impl super::Pass for DeadWrites {
-    fn name(&self) -> &str { "dead_writes" }
+    fn name(&self) -> &str {
+        "dead_writes"
+    }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
         let masks = analyses.get::<Masks>(f);
         dead_writes(f, &masks, analyses.context().exec_index) > 0
@@ -100,14 +203,22 @@ impl super::Pass for DeadWrites {
 
 pub(crate) struct Dce;
 impl super::Pass for Dce {
-    fn name(&self) -> &str { "dce" }
-    fn run(&self, f: &mut Func, _: &Analyses) -> bool { run(f) > 0 }
+    fn name(&self) -> &str {
+        "dce"
+    }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool {
+        run(f) > 0
+    }
 }
 
 pub(crate) struct DeadParams;
 impl super::Pass for DeadParams {
-    fn name(&self) -> &str { "dead_params" }
-    fn run(&self, f: &mut Func, _: &Analyses) -> bool { dead_params(f) > 0 }
+    fn name(&self) -> &str {
+        "dead_params"
+    }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool {
+        dead_params(f) > 0
+    }
 }
 
 pub(crate) fn dead_writes(f: &mut Func, masks: &Masks, exec_index: usize) -> usize {
@@ -115,15 +226,26 @@ pub(crate) fn dead_writes(f: &mut Func, masks: &Masks, exec_index: usize) -> usi
     let mut renames: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     for block in f.blocks.values() {
         for inst in &block.insts {
-            if let Inst::Core { value, op: Op::Select(_, _, old), .. } = inst {
-                if masks.predicated[value.0].is_some() && !needed[value.0] { renames.insert(*value, *old); }
+            if let Inst::Core {
+                value,
+                op: Op::Select(_, _, old),
+                ..
+            } = inst
+            {
+                if masks.predicated[value.0].is_some() && !needed[value.0] {
+                    renames.insert(*value, *old);
+                }
             }
         }
     }
-    if renames.is_empty() { return 0; }
+    if renames.is_empty() {
+        return 0;
+    }
     super::simplify::rename(f, &renames);
     for block in f.blocks.values_mut() {
-        block.insts.retain(|inst| !matches!(inst, Inst::Core { value, .. } if renames.contains_key(value)));
+        block.insts.retain(
+            |inst| !matches!(inst, Inst::Core { value, .. } if renames.contains_key(value)),
+        );
     }
     let count = renames.len();
     run(f);
@@ -141,16 +263,28 @@ pub(crate) fn run(f: &mut Func) -> usize {
             let before = block.insts.len();
             block.insts.retain(|inst| match inst {
                 Inst::Core { value, .. } | Inst::Packet { output: value, .. } => uses[value.0] != 0,
-                Inst::Target { provenance: None, outputs, .. } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
-                Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot), outputs, .. } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
+                Inst::Target {
+                    provenance: None,
+                    outputs,
+                    ..
+                } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot),
+                    outputs,
+                    ..
+                } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
                 _ => true,
             });
             round += before - block.insts.len();
         }
         removed += round;
-        if round == 0 { break; }
+        if round == 0 {
+            break;
+        }
     }
-    if removed != 0 { f.compact(); }
+    if removed != 0 {
+        f.compact();
+    }
     let _ = ValueId(0);
     removed
 }
@@ -163,34 +297,54 @@ fn live_values(f: &Func) -> Vec<bool> {
     for (&id, block) in &f.blocks {
         for (index, &(p, ty)) in block.params.iter().enumerate() {
             parameter[p.0] = Some((id, index));
-            if ty == Ty::I1 || id == f.entry { pending.push(p); }
+            if ty == Ty::I1 || id == f.entry {
+                pending.push(p);
+            }
         }
         for (index, inst) in block.insts.iter().enumerate() {
             let observed = match inst {
-                Inst::Effect { op, .. } => !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot)),
+                Inst::Effect { op, .. } => {
+                    !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot))
+                }
                 Inst::Target { provenance, .. } => provenance.is_some(),
                 _ => false,
             };
             match inst {
-                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => producer[value.0] = Some((id, index)),
-                Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => for &(v, _) in outputs { producer[v.0] = Some((id, index)); },
+                Inst::Core { value, .. } | Inst::Packet { output: value, .. } => {
+                    producer[value.0] = Some((id, index))
+                }
+                Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => {
+                    for &(v, _) in outputs {
+                        producer[v.0] = Some((id, index));
+                    }
+                }
             }
-            if observed { operands(inst, |v| pending.push(v)); }
+            if observed {
+                operands(inst, |v| pending.push(v));
+            }
         }
         match &block.term {
             Term::CondBr { cond, .. } => pending.push(*cond),
             Term::Ret(args) => pending.extend(args.iter().copied()),
             Term::Br(_) => {}
         }
-        for edge in block.term.edges() { incoming.entry(edge.dst).or_default().push(edge); }
+        for edge in block.term.edges() {
+            incoming.entry(edge.dst).or_default().push(edge);
+        }
     }
     let mut live = vec![false; f.types.len()];
     while let Some(value) = pending.pop() {
-        if live[value.0] { continue; }
+        if live[value.0] {
+            continue;
+        }
         live[value.0] = true;
-        if let Some((block, index)) = producer[value.0] { operands(&f.blocks[&block].insts[index], |v| pending.push(v)); }
+        if let Some((block, index)) = producer[value.0] {
+            operands(&f.blocks[&block].insts[index], |v| pending.push(v));
+        }
         if let Some((block, index)) = parameter[value.0] {
-            for edge in incoming.get(&block).into_iter().flatten() { pending.push(edge.args[index]); }
+            for edge in incoming.get(&block).into_iter().flatten() {
+                pending.push(edge.args[index]);
+            }
         }
     }
     live
@@ -198,10 +352,23 @@ fn live_values(f: &Func) -> Vec<bool> {
 
 pub(crate) fn operands(inst: &Inst, mut f: impl FnMut(ValueId)) {
     match inst {
-        Inst::Core { op, .. } => { op.map(|v| { f(v); v }); }
+        Inst::Core { op, .. } => {
+            op.map(|v| {
+                f(v);
+                v
+            });
+        }
         Inst::Packet { input, .. } => f(*input),
-        Inst::Effect { inputs, .. } => for &v in inputs { f(v) },
-        Inst::Target { args, .. } => for &v in args.values() { f(v) },
+        Inst::Effect { inputs, .. } => {
+            for &v in inputs {
+                f(v)
+            }
+        }
+        Inst::Target { args, .. } => {
+            for &v in args.values() {
+                f(v)
+            }
+        }
     }
 }
 
@@ -213,33 +380,64 @@ pub(crate) fn dead_params(f: &mut Func) -> usize {
             let before = block.insts.len();
             block.insts.retain(|inst| match inst {
                 Inst::Core { value, .. } | Inst::Packet { output: value, .. } => live[value.0],
-                Inst::Effect { op, outputs, .. } => !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot))
-                    || outputs.iter().any(|(v, _)| live[v.0]),
-                Inst::Target { provenance, outputs, .. } => provenance.is_some() || outputs.iter().any(|(v, _)| live[v.0]),
+                Inst::Effect { op, outputs, .. } => {
+                    !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot))
+                        || outputs.iter().any(|(v, _)| live[v.0])
+                }
+                Inst::Target {
+                    provenance,
+                    outputs,
+                    ..
+                } => provenance.is_some() || outputs.iter().any(|(v, _)| live[v.0]),
             });
             removed += before - block.insts.len();
         }
         let mut dead: BTreeMap<BlockId, Vec<usize>> = BTreeMap::new();
         for (&id, block) in &f.blocks {
-            if id == f.entry { continue; }
-            let indices: Vec<usize> = block.params.iter().enumerate().filter(|(_, &(v, ty))| ty != Ty::I1 && !live[v.0]).map(|(i, _)| i).collect();
-            if !indices.is_empty() { dead.insert(id, indices); }
+            if id == f.entry {
+                continue;
+            }
+            let indices: Vec<usize> = block
+                .params
+                .iter()
+                .enumerate()
+                .filter(|(_, &(v, ty))| ty != Ty::I1 && !live[v.0])
+                .map(|(i, _)| i)
+                .collect();
+            if !indices.is_empty() {
+                dead.insert(id, indices);
+            }
         }
-        if dead.is_empty() { break; }
+        if dead.is_empty() {
+            break;
+        }
         for (id, indices) in &dead {
             let block = f.blocks.get_mut(id).unwrap();
-            for &index in indices.iter().rev() { block.params.remove(index); }
+            for &index in indices.iter().rev() {
+                block.params.remove(index);
+            }
             removed += indices.len();
         }
         for block in f.blocks.values_mut() {
-            let edit = |edge: &mut Edge| if let Some(indices) = dead.get(&edge.dst) { for &index in indices.iter().rev() { edge.args.remove(index); } };
+            let edit = |edge: &mut Edge| {
+                if let Some(indices) = dead.get(&edge.dst) {
+                    for &index in indices.iter().rev() {
+                        edge.args.remove(index);
+                    }
+                }
+            };
             match &mut block.term {
                 Term::Br(e) => edit(e),
-                Term::CondBr { yes, no, .. } => { edit(yes); edit(no); }
+                Term::CondBr { yes, no, .. } => {
+                    edit(yes);
+                    edit(no);
+                }
                 Term::Ret(_) => {}
             }
         }
     }
-    if removed != 0 { f.compact(); }
+    if removed != 0 {
+        f.compact();
+    }
     removed
 }
