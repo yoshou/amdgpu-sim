@@ -173,6 +173,46 @@ impl<'a, 'f, S: Lattice> Backward<'a, 'f, S> {
     }
 }
 
+pub(super) struct Forward<'a, 'f, S: Lattice> {
+    pub cfg: &'a Cfg<'f>,
+    pub start: S,
+    pub edge: &'a dyn Fn(usize, &Edge, &S) -> S,
+    pub transfer: &'a dyn Fn(usize, &S) -> S,
+}
+
+impl<'a, 'f, S: Lattice> Forward<'a, 'f, S> {
+    pub fn solve(&self) -> (Vec<S>, Vec<S>) {
+        let cfg = self.cfg;
+        let n = cfg.blocks.len();
+        let mut entry: Vec<S> = vec![self.start.clone(); n];
+        let mut exit: Vec<S> = vec![self.start.clone(); n];
+        for round in 0.. {
+            assert!(round < ROUND_LIMIT, "dataflow solver did not converge");
+            let mut changed = false;
+            for &at in &cfg.order {
+                let mut inn = self.start.clone();
+                for &(src, edge) in &cfg.incoming[at] {
+                    inn = inn.meet(&(self.edge)(src, edge, &exit[src]));
+                }
+                let inn = entry[at].meet(&inn);
+                if entry[at] != inn {
+                    entry[at] = inn;
+                    changed = true;
+                }
+                let out = exit[at].meet(&(self.transfer)(at, &entry[at]));
+                if exit[at] != out {
+                    exit[at] = out;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        (entry, exit)
+    }
+}
+
 pub(super) fn for_each_output(inst: &Inst, mut f: impl FnMut(ValueId)) {
     match inst {
         Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
@@ -188,6 +228,68 @@ pub(super) fn for_each_output(inst: &Inst, mut f: impl FnMut(ValueId)) {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_forward_state_meets_every_reached_predecessor_and_unreached_blocks_keep_the_start() {
+        let mut f = Func {
+            entry: BlockId(0),
+            blocks: BTreeMap::new(),
+            types: vec![],
+        };
+        let cond = f.value(Ty::I1);
+        let to = |dst: usize| Edge {
+            dst: BlockId(dst),
+            args: vec![],
+        };
+        let terms = vec![
+            Term::CondBr {
+                cond,
+                yes: to(1),
+                no: to(2),
+            },
+            Term::Br(to(3)),
+            Term::Br(to(3)),
+            Term::Ret(vec![]),
+            Term::Br(to(3)),
+        ];
+        for (id, term) in terms.into_iter().enumerate() {
+            let params = if id == 0 {
+                vec![(cond, Ty::I1)]
+            } else {
+                vec![]
+            };
+            f.blocks.insert(
+                BlockId(id),
+                Block {
+                    params,
+                    insts: vec![],
+                    term,
+                },
+            );
+        }
+        let cfg = Cfg::new(&f);
+        let edge = |_: usize, _: &Edge, exit: &bool| *exit;
+        let transfer = |at: usize, entry: &bool| *entry && cfg.ids[at] != BlockId(1);
+        let (entry, exit) = Forward {
+            cfg: &cfg,
+            start: true,
+            edge: &edge,
+            transfer: &transfer,
+        }
+        .solve();
+        assert!(
+            !exit[cfg.index[1]] && exit[cfg.index[2]],
+            "the transfer runs on the block's entry state"
+        );
+        assert!(
+            !entry[cfg.index[3]],
+            "the false predecessor reaches the meet even though another carries true"
+        );
+        assert!(
+            entry[cfg.index[4]],
+            "a block without reached predecessors keeps the start"
+        );
+    }
 
     #[test]
     fn a_parameter_meets_every_incoming_edge_and_unconstrained_values_keep_the_start() {

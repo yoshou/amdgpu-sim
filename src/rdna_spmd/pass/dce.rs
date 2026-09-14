@@ -165,7 +165,7 @@ fn needed(f: &Func, masks: &Masks, exec_index: usize) -> Vec<bool> {
                 } if masks.predicated[v.0].is_some() => {
                     pending.push((*c, Demand::Active));
                     pending.push((*new, Demand::Active));
-                    if masks.exposed[v.0] != 0 {
+                    if masks.observed[v.0] {
                         pending.push((*old, Demand::Overwritten(masks.predicated[v.0].unwrap().1)));
                     }
                 }

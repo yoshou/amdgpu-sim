@@ -1,5 +1,6 @@
 pub(super) mod constant;
 pub(super) mod dataflow;
+pub(super) mod lanes;
 pub(super) mod mask_cost;
 pub(in crate::rdna_spmd) mod masks;
 pub(super) mod memory;
