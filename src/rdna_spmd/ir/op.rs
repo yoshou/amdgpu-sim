@@ -76,7 +76,14 @@ pub(crate) enum Cvt {
     Bitcast,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Env { LaneId, PacketLaneId, ValidLane, OutsideLanes, ScratchBase, ScratchSize }
+pub(crate) enum Env {
+    LaneId,
+    PacketLaneId,
+    ValidLane,
+    OutsideLanes,
+    ScratchBase,
+    ScratchSize,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
@@ -145,16 +152,25 @@ impl Op {
             Self::Env(Env::ValidLane) => Ok(Ty::I1),
             Self::Env(Env::ScratchBase | Env::ScratchSize) => Ok(Ty::I64),
             Self::Pack64(a, b) => {
-                if pair(a, b)? != Ty::I32 { return Err("pack64 requires two i32 words"); }
+                if pair(a, b)? != Ty::I32 {
+                    return Err("pack64 requires two i32 words");
+                }
                 Ok(Ty::I64)
             }
             Self::UnpackLo(a) | Self::UnpackHi(a) => {
-                if ty(a)? != Ty::I64 { return Err("unpack requires i64"); }
+                if ty(a)? != Ty::I64 {
+                    return Err("unpack requires i64");
+                }
                 Ok(Ty::I32)
             }
-            Self::TrailingZeros(a) | Self::LeadingZeros(a) | Self::PopulationCount(a) | Self::ReverseBits(a) => {
+            Self::TrailingZeros(a)
+            | Self::LeadingZeros(a)
+            | Self::PopulationCount(a)
+            | Self::ReverseBits(a) => {
                 let t = ty(a)?;
-                if !matches!(t, Ty::I32 | Ty::I64) { return Err("bit count requires an integer word"); }
+                if !matches!(t, Ty::I32 | Ty::I64) {
+                    return Err("bit count requires an integer word");
+                }
                 Ok(t)
             }
             Self::Int(op, a, b) => {

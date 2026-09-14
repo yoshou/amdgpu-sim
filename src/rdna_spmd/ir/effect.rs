@@ -164,14 +164,10 @@ impl EffectOp {
             if matches!(op, MemoryOp::Store(MemSize::I8 | MemSize::I16)) {
                 return Err("signed store size");
             }
-            if matches!(op, MemoryOp::Load(_))
-                && matches!(semantics.ordering, Ordering::Release)
-            {
+            if matches!(op, MemoryOp::Load(_)) && matches!(semantics.ordering, Ordering::Release) {
                 return Err("release load");
             }
-            if matches!(op, MemoryOp::Store(_))
-                && matches!(semantics.ordering, Ordering::Acquire)
-            {
+            if matches!(op, MemoryOp::Store(_)) && matches!(semantics.ordering, Ordering::Acquire) {
                 return Err("acquire store");
             }
         }

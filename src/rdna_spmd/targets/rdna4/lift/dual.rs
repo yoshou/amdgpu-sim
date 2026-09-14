@@ -3,16 +3,27 @@ use super::*;
 use crate::rdna_instructions::{VOP1, VOP2, VOP3P};
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
-    let InstFormat::VOPD(i) = inst else { return None; };
+    let InstFormat::VOPD(i) = inst else {
+        return None;
+    };
     let destinations = [i.vdstx, (i.vdsty << 1) | ((i.vdstx & 1) ^ 1)];
     let mut halves = Vec::new();
     for (op, source, reg, dst) in [
         (i.opx, &i.src0x, i.vsrc1x, destinations[0]),
         (i.opy, &i.src0y, i.vsrc1y, destinations[1]),
     ] {
-        if matches!(op, I::V_DUAL_DOT2ACC_F32_F16 | I::V_DUAL_DOT2ACC_F32_BF16 | I::V_DUAL_MUL_DX9_ZERO_F32) {
+        if matches!(
+            op,
+            I::V_DUAL_DOT2ACC_F32_F16 | I::V_DUAL_DOT2ACC_F32_BF16 | I::V_DUAL_MUL_DX9_ZERO_F32
+        ) {
             let lowering = if matches!(op, I::V_DUAL_MUL_DX9_ZERO_F32) {
-                let mut b = Builder::new(registry, vec![input(*source, Ty::F32), input(SourceOperand::VectorRegister(reg), Ty::F32)]);
+                let mut b = Builder::new(
+                    registry,
+                    vec![
+                        input(*source, Ty::F32),
+                        input(SourceOperand::VectorRegister(reg), Ty::F32),
+                    ],
+                );
                 let zero = b.k(Ty::F32, 0);
                 let az = b.push(Ty::I1, Op::FCmp(FloatPred::Oeq, ValueId(0), zero));
                 let bz = b.push(Ty::I1, Op::FCmp(FloatPred::Oeq, ValueId(1), zero));
@@ -25,8 +36,11 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                 // §7.7.2 DOT2ACC inlines replicate the short-format constant.
                 let source = match *source {
                     SourceOperand::FloatConstant(x) => {
-                        let bits = if bf16 { (x as f32).to_bits() >> 16 }
-                            else { ::half::f16::from_f32(x as f32).to_bits() as u32 };
+                        let bits = if bf16 {
+                            (x as f32).to_bits() >> 16
+                        } else {
+                            ::half::f16::from_f32(x as f32).to_bits() as u32
+                        };
                         SourceOperand::LiteralConstant(bits | bits << 16)
                     }
                     SourceOperand::IntegerConstant(x) => {
@@ -36,13 +50,33 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                     s => s,
                 };
                 let packed = InstFormat::VOP3P(VOP3P {
-                    op: if bf16 { I::V_DOT2_F32_BF16 } else { I::V_DOT2_F32_F16 },
-                    src0: source, src1: SourceOperand::VectorRegister(reg), src2: SourceOperand::VectorRegister(dst),
-                    vdst: dst, opsel: 0, opsel_hi: 3, opsel_hi2: 1, neg: 0, neg_hi: 0, cm: 0,
+                    op: if bf16 {
+                        I::V_DOT2_F32_BF16
+                    } else {
+                        I::V_DOT2_F32_F16
+                    },
+                    src0: source,
+                    src1: SourceOperand::VectorRegister(reg),
+                    src2: SourceOperand::VectorRegister(dst),
+                    vdst: dst,
+                    opsel: 0,
+                    opsel_hi: 3,
+                    opsel_hi2: 1,
+                    neg: 0,
+                    neg_hi: 0,
+                    cm: 0,
                 });
                 super::packed::instruction(&packed, registry).unwrap()
             };
-            let Lowering::TypedAlu { inputs, outputs, expr, .. } = lowering else { unreachable!() };
+            let Lowering::TypedAlu {
+                inputs,
+                outputs,
+                expr,
+                ..
+            } = lowering
+            else {
+                unreachable!()
+            };
             halves.push((inputs, outputs, expr));
             continue;
         }
@@ -66,16 +100,35 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         // Normalize the format at the ISA boundary; the arithmetic semantics
         // are the same shared lift used for individually encoded operations.
         let single = if matches!(op, I::V_MOV_B32) {
-            InstFormat::VOP1(VOP1 { op, src0: source.clone(), vdst: dst })
+            InstFormat::VOP1(VOP1 {
+                op,
+                src0: source.clone(),
+                vdst: dst,
+            })
         } else {
-            InstFormat::VOP2(VOP2 { op, src0: source.clone(), vsrc1: reg,
-                vdst: dst, literal_constant: i.literal_constant })
+            InstFormat::VOP2(VOP2 {
+                op,
+                src0: source.clone(),
+                vsrc1: reg,
+                vdst: dst,
+                literal_constant: i.literal_constant,
+            })
         };
-        let Lowering::TypedAlu { inputs, outputs, expr, scalar: false } = super::instruction_with_registry(&single, registry)
-            else { return None; };
+        let Lowering::TypedAlu {
+            inputs,
+            outputs,
+            expr,
+            scalar: false,
+        } = super::instruction_with_registry(&single, registry)
+        else {
+            return None;
+        };
         halves.push((inputs, outputs, expr));
     }
-    let mut b = Builder::new(registry, halves.iter().flat_map(|h| h.0.iter().cloned()).collect());
+    let mut b = Builder::new(
+        registry,
+        halves.iter().flat_map(|h| h.0.iter().cloned()).collect(),
+    );
     let mut base = 0;
     let mut outputs = Vec::new();
     for (inputs, destinations, expr) in halves {
@@ -88,7 +141,11 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
             };
             values.extend(results);
         }
-        outputs.extend(destinations.into_iter().zip(expr.expr().results.iter().map(|v| values[v.0])));
+        outputs.extend(
+            destinations
+                .into_iter()
+                .zip(expr.expr().results.iter().map(|v| values[v.0])),
+        );
     }
     Some(b.finish_many(false, outputs))
 }

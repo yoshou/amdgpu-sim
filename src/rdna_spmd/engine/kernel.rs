@@ -9,15 +9,29 @@ pub struct ScalarKernel {
 }
 
 impl ScalarKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::native::jit::NativeCode, num_vgprs: usize, group: bool) -> Self { Self { code, num_vgprs, group } }
+    pub(in crate::rdna_spmd) fn from_code(
+        code: super::super::native::jit::NativeCode,
+        num_vgprs: usize,
+        group: bool,
+    ) -> Self {
+        Self {
+            code,
+            num_vgprs,
+            group,
+        }
+    }
     /// Run one work-item. `sgprs` points to 128 u32 slots, `vgprs` to
     /// `num_vgprs` u32 slots (both set up by the dispatcher).
     pub unsafe fn run(&self, sgprs: *mut u32, vgprs: *mut u32, scratch_base: u64, lds_base: u64) {
         if self.group {
-            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(self.code.address());
+            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(
+                self.code.address(),
+            );
             f(sgprs, vgprs, scratch_base, lds_base);
         } else {
-            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64)>(self.code.address());
+            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64)>(
+                self.code.address(),
+            );
             f(sgprs, vgprs, scratch_base);
         }
     }
@@ -52,20 +66,53 @@ pub struct VecKernel {
     pub(crate) group: bool,
 }
 impl VecKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::native::jit::NativeCode, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, group: bool) -> Self {
-        Self { code, num_vgprs, width, min_private_bytes, workgroup_x, group }
+    pub(in crate::rdna_spmd) fn from_code(
+        code: super::super::native::jit::NativeCode,
+        num_vgprs: usize,
+        width: u32,
+        min_private_bytes: usize,
+        workgroup_x: Option<u32>,
+        group: bool,
+    ) -> Self {
+        Self {
+            code,
+            num_vgprs,
+            width,
+            min_private_bytes,
+            workgroup_x,
+            group,
+        }
     }
     /// Run W work-items. `sgprs` -> 128 u32 (shared/uniform); `vgprs` ->
     /// `num_vgprs * W` u32 in SoA layout (register r, lanes 0..W at `r*W`);
     /// `scratch_base` = base of W contiguous per-lane private segments of
     /// `scratch_stride` bytes each, at least `min_private_bytes`. All W segments
     /// must be allocated even if EXEC disables a lane.
-    pub unsafe fn run(&self, sgprs: *mut u32, vgprs: *mut u32, scratch_base: u64, scratch_stride: u64, valid_mask: u32, lds_base: u64) {
+    pub unsafe fn run(
+        &self,
+        sgprs: *mut u32,
+        vgprs: *mut u32,
+        scratch_base: u64,
+        scratch_stride: u64,
+        valid_mask: u32,
+        lds_base: u64,
+    ) {
         if self.group {
-            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64, u32, u64)>(self.code.address());
-            f(sgprs, vgprs, scratch_base, scratch_stride, valid_mask, lds_base);
+            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64, u32, u64)>(
+                self.code.address(),
+            );
+            f(
+                sgprs,
+                vgprs,
+                scratch_base,
+                scratch_stride,
+                valid_mask,
+                lds_base,
+            );
         } else {
-            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(self.code.address());
+            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(
+                self.code.address(),
+            );
             f(sgprs, vgprs, scratch_base, scratch_stride);
         }
     }
@@ -86,9 +133,25 @@ pub struct CoopVecKernel {
 }
 
 impl CoopVecKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::native::jit::NativeCode, yields: Vec<Vec<super::yields::YieldValues>>, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, registers: super::super::dialect::Registers) -> Self {
+    pub(in crate::rdna_spmd) fn from_code(
+        code: super::super::native::jit::NativeCode,
+        yields: Vec<Vec<super::yields::YieldValues>>,
+        num_vgprs: usize,
+        width: u32,
+        min_private_bytes: usize,
+        workgroup_x: Option<u32>,
+        registers: super::super::dialect::Registers,
+    ) -> Self {
         assert_eq!(registers.scc_slot as usize + 1, COOP_SGPR_BUF);
-        Self { yields, registers, code, num_vgprs, width, min_private_bytes, workgroup_x }
+        Self {
+            yields,
+            registers,
+            code,
+            num_vgprs,
+            width,
+            min_private_bytes,
+            workgroup_x,
+        }
     }
     /// Entry address of the compiled packet kernel. It is not callable
     /// directly: the kernel yields by switching stacks, so it has to be
@@ -100,9 +163,17 @@ impl CoopVecKernel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scheduler { Independent, Wave, Workgroup }
+pub enum Scheduler {
+    Independent,
+    Wave,
+    Workgroup,
+}
 
-pub(crate) enum Code { Scalar(ScalarKernel), Packet(VecKernel), Cooperative(CoopVecKernel) }
+pub(crate) enum Code {
+    Scalar(ScalarKernel),
+    Packet(VecKernel),
+    Cooperative(CoopVecKernel),
+}
 
 pub struct Kernel {
     pub(crate) code: Code,
@@ -111,7 +182,17 @@ pub struct Kernel {
 }
 
 impl Kernel {
-    pub(crate) fn new(code: Code, scheduler: Scheduler, width: u32) -> Self { Self { code, scheduler, width } }
-    pub fn width(&self) -> u32 { self.width }
-    pub fn scheduler(&self) -> Scheduler { self.scheduler }
+    pub(crate) fn new(code: Code, scheduler: Scheduler, width: u32) -> Self {
+        Self {
+            code,
+            scheduler,
+            width,
+        }
+    }
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+    pub fn scheduler(&self) -> Scheduler {
+        self.scheduler
+    }
 }

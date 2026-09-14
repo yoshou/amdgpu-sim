@@ -5,9 +5,15 @@ use std::collections::BTreeSet;
 
 pub(crate) struct Adjacency;
 impl Pass for Adjacency {
-    fn name(&self) -> &str { "adjacency" }
-    fn run(&self, f: &mut Func, _: &Analyses) -> bool { run(f) > 0 }
-    fn preserves(&self) -> Preserved { Preserved::of::<Constants>().and::<DispatchConstants>() }
+    fn name(&self) -> &str {
+        "adjacency"
+    }
+    fn run(&self, f: &mut Func, _: &Analyses) -> bool {
+        run(f) > 0
+    }
+    fn preserves(&self) -> Preserved {
+        Preserved::of::<Constants>().and::<DispatchConstants>()
+    }
 }
 
 fn member(inst: &Inst) -> bool {
@@ -26,7 +32,9 @@ fn movable(inst: &Inst) -> bool {
 fn outputs(inst: &Inst) -> Vec<ValueId> {
     match inst {
         Inst::Core { value, .. } | Inst::Packet { output: value, .. } => vec![*value],
-        Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => outputs.iter().map(|o| o.0).collect(),
+        Inst::Effect { outputs, .. } | Inst::Target { outputs, .. } => {
+            outputs.iter().map(|o| o.0).collect()
+        }
     }
 }
 
@@ -49,19 +57,30 @@ pub(crate) fn run(f: &mut Func) -> usize {
             let mut end = index + 1;
             while scan < old.len() {
                 if member(&old[scan]) {
-                    let Inst::Effect { inputs, .. } = &old[scan] else { unreachable!() };
+                    let Inst::Effect { inputs, .. } = &old[scan] else {
+                        unreachable!()
+                    };
                     let mut needs = BTreeSet::new();
                     let mut pending: Vec<ValueId> = inputs.to_vec();
                     let span: Vec<&Inst> = old[index..scan].iter().collect();
                     while let Some(v) = pending.pop() {
-                        if !needs.insert(v.0) { continue; }
+                        if !needs.insert(v.0) {
+                            continue;
+                        }
                         if let Some(def) = span.iter().find(|i| outputs(i).contains(&v)) {
-                            if !movable(def) { needs.insert(usize::MAX); }
+                            if !movable(def) {
+                                needs.insert(usize::MAX);
+                            }
                             super::dce::operands(def, |o| pending.push(o));
                         }
                     }
-                    if needs.contains(&usize::MAX) || inputs.iter().any(|v| produced.contains(&v.0)) { break; }
-                    for v in outputs(&old[scan]) { produced.insert(v.0); }
+                    if needs.contains(&usize::MAX) || inputs.iter().any(|v| produced.contains(&v.0))
+                    {
+                        break;
+                    }
+                    for v in outputs(&old[scan]) {
+                        produced.insert(v.0);
+                    }
                     members.push(scan);
                     end = scan + 1;
                 } else if barrier(&old[scan]) {
@@ -75,23 +94,41 @@ pub(crate) fn run(f: &mut Func) -> usize {
                 continue;
             }
             let mut needed: BTreeSet<usize> = BTreeSet::new();
-            let mut pending: Vec<ValueId> = members.iter()
-                .flat_map(|&m| match &old[m] { Inst::Effect { inputs, .. } => inputs.clone(), _ => Vec::new() })
+            let mut pending: Vec<ValueId> = members
+                .iter()
+                .flat_map(|&m| match &old[m] {
+                    Inst::Effect { inputs, .. } => inputs.clone(),
+                    _ => Vec::new(),
+                })
                 .collect();
             while let Some(v) = pending.pop() {
-                if !needed.insert(v.0) { continue; }
-                if let Some(def) = old[index..end].iter().filter(|i| movable(i)).find(|i| outputs(i).contains(&v)) {
+                if !needed.insert(v.0) {
+                    continue;
+                }
+                if let Some(def) = old[index..end]
+                    .iter()
+                    .filter(|i| movable(i))
+                    .find(|i| outputs(i).contains(&v))
+                {
                     super::dce::operands(def, |o| pending.push(o));
                 }
             }
             let member: BTreeSet<usize> = members.iter().copied().collect();
             let mut after = Vec::new();
             for slot in index..end {
-                if member.contains(&slot) { continue; }
-                if movable(&old[slot]) && outputs(&old[slot]).iter().any(|v| needed.contains(&v.0)) { out.push(old[slot].clone()); }
-                else { after.push(old[slot].clone()); }
+                if member.contains(&slot) {
+                    continue;
+                }
+                if movable(&old[slot]) && outputs(&old[slot]).iter().any(|v| needed.contains(&v.0))
+                {
+                    out.push(old[slot].clone());
+                } else {
+                    after.push(old[slot].clone());
+                }
             }
-            for &slot in &members { out.push(old[slot].clone()); }
+            for &slot in &members {
+                out.push(old[slot].clone());
+            }
             moved += members.len() - 1;
             out.extend(after);
             index = end;

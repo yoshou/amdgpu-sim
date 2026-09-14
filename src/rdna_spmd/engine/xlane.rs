@@ -29,9 +29,9 @@ use crate::rdna_spmd::targets::rdna4::lift::regs::RegSet;
 const WAVE: usize = 32;
 
 #[cfg(test)]
-use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, Operand, YieldAction};
-#[cfg(test)]
 use super::super::ir::{EffectOp, WaveOp};
+#[cfg(test)]
+use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, Operand, YieldAction};
 
 #[cfg(test)]
 mod tests {
@@ -40,7 +40,11 @@ mod tests {
         let lanes = vgprs.len().min(WAVE);
         let frag_f16 = |lane: usize, base: usize, m: usize| -> f32 {
             let word = vgprs[lane][base + m / 2];
-            let bits = if m % 2 == 0 { (word & 0xffff) as u16 } else { (word >> 16) as u16 };
+            let bits = if m % 2 == 0 {
+                (word & 0xffff) as u16
+            } else {
+                (word >> 16) as u16
+            };
             f16::from_bits(bits).to_f32()
         };
 
@@ -88,26 +92,17 @@ mod tests {
         }
     }
 
-
-
     fn packet_vgpr(vgprs: &[Vec<u32>], width: usize, lane: usize, reg: usize) -> u32 {
         let packet = lane / width;
         let packet_lane = lane % width;
         vgprs[packet][reg * width + packet_lane]
     }
 
-    fn set_packet_vgpr(
-        vgprs: &mut [Vec<u32>],
-        width: usize,
-        lane: usize,
-        reg: usize,
-        value: u32,
-    ) {
+    fn set_packet_vgpr(vgprs: &mut [Vec<u32>], width: usize, lane: usize, reg: usize, value: u32) {
         let packet = lane / width;
         let packet_lane = lane % width;
         vgprs[packet][reg * width + packet_lane] = value;
     }
-
 
     #[test]
     fn packet_wmma_matches_scalar_lane_layout_at_every_supported_width() {
@@ -148,7 +143,14 @@ mod tests {
                         set_packet_vgpr(&mut packets, width, lane, reg, state[lane][reg]);
                     }
                 }
-                crate::rdna_spmd::engine::wmma::apply(VDST as u32, A as u32, B as u32, C as u32, width, &mut packets);
+                crate::rdna_spmd::engine::wmma::apply(
+                    VDST as u32,
+                    A as u32,
+                    B as u32,
+                    C as u32,
+                    width,
+                    &mut packets,
+                );
                 for lane in 0..WAVE {
                     for reg in VDST..VDST + 8 {
                         let actual = packet_vgpr(&packets, width, lane, reg);
@@ -166,7 +168,12 @@ mod tests {
                                 && f32::from_bits(expected).is_nan(),
                             "width={}, lane={}, reg={}: \
                              {:#010x} != {:#010x} (finite inputs: {})",
-                            width, lane, reg, actual, expected, finite
+                            width,
+                            lane,
+                            reg,
+                            actual,
+                            expected,
+                            finite
                         );
                     }
                 }
@@ -179,15 +186,41 @@ mod tests {
         let ops = BTreeMap::from([
             (
                 10,
-                YieldAction::new(EffectOp::Wave(WaveOp::WriteLane),vec![Operand::Source(SourceOperand::ScalarRegister(5)),Operand::Source(SourceOperand::IntegerConstant(3)),Operand::Source(SourceOperand::VectorRegister(7)),Operand::Source(SourceOperand::IntegerConstant(7))],vec![Destination::Vgpr(7)]),
+                YieldAction::new(
+                    EffectOp::Wave(WaveOp::WriteLane),
+                    vec![
+                        Operand::Source(SourceOperand::ScalarRegister(5)),
+                        Operand::Source(SourceOperand::IntegerConstant(3)),
+                        Operand::Source(SourceOperand::VectorRegister(7)),
+                        Operand::Source(SourceOperand::IntegerConstant(7)),
+                    ],
+                    vec![Destination::Vgpr(7)],
+                ),
             ),
-            (20, YieldAction::new(EffectOp::Wave(WaveOp::Wmma),(0..16).map(|r|Operand::Source(SourceOperand::VectorRegister(r))).collect(),(32..40).map(Destination::Vgpr).collect())),
+            (
+                20,
+                YieldAction::new(
+                    EffectOp::Wave(WaveOp::Wmma),
+                    (0..16)
+                        .map(|r| Operand::Source(SourceOperand::VectorRegister(r)))
+                        .collect(),
+                    (32..40).map(Destination::Vgpr).collect(),
+                ),
+            ),
             (
                 30,
-                YieldAction::new(EffectOp::Wave(WaveOp::ReadLane),vec![Operand::Source(SourceOperand::VectorRegister(1)),Operand::Source(SourceOperand::IntegerConstant(0)),Operand::Source(SourceOperand::IntegerConstant(1))],vec![Destination::Sgpr(2)]),
+                YieldAction::new(
+                    EffectOp::Wave(WaveOp::ReadLane),
+                    vec![
+                        Operand::Source(SourceOperand::VectorRegister(1)),
+                        Operand::Source(SourceOperand::IntegerConstant(0)),
+                        Operand::Source(SourceOperand::IntegerConstant(1)),
+                    ],
+                    vec![Destination::Sgpr(2)],
+                ),
             ),
         ]);
-        let io: BTreeMap<_,_> = ops.iter().map(|(&pc,action)|(pc,action.io())).collect();
+        let io: BTreeMap<_, _> = ops.iter().map(|(&pc, action)| (pc, action.io())).collect();
         let vgprs = |set: &RegSet| set.vgprs().collect::<Vec<_>>();
 
         // writelane: a scalar value in, one lane of vdst out — and vdst is

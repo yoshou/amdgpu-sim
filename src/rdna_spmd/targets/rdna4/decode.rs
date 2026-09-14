@@ -44,7 +44,10 @@ pub enum Terminator {
     /// [`split_at_barriers`]; the non-cooperative backends never see it.
     Barrier { resume: usize },
     /// A typed wave or workgroup effect, with its continuation.
-    Yield { resume: usize, action: Box<super::lift::wave::YieldAction> },
+    Yield {
+        resume: usize,
+        action: Box<super::lift::wave::YieldAction>,
+    },
 }
 
 /// A basic block lowered for scalar execution.
@@ -200,7 +203,12 @@ fn successors(pc: usize, inst: &InstFormat) -> Vec<usize> {
     let target = |simm16: u16| ((pc as i64) + (simm16 as i16 as i64) * 4) as usize;
     match inst {
         InstFormat::SOPP(i) => match i.op {
-            I::S_CBRANCH_EXECZ | I::S_CBRANCH_EXECNZ | I::S_CBRANCH_VCCZ | I::S_CBRANCH_VCCNZ | I::S_CBRANCH_SCC0 | I::S_CBRANCH_SCC1 => vec![pc, target(i.simm16)],
+            I::S_CBRANCH_EXECZ
+            | I::S_CBRANCH_EXECNZ
+            | I::S_CBRANCH_VCCZ
+            | I::S_CBRANCH_VCCNZ
+            | I::S_CBRANCH_SCC0
+            | I::S_CBRANCH_SCC1 => vec![pc, target(i.simm16)],
             I::S_BRANCH => vec![target(i.simm16)],
             I::S_ENDPGM => vec![],
             _ => vec![pc],
@@ -210,8 +218,15 @@ fn successors(pc: usize, inst: &InstFormat) -> Vec<usize> {
 }
 
 fn decode_at(memory: &[u8], pc: usize) -> Result<(InstFormat, usize), String> {
-    if pc + 8 > memory.len() { return Err(format!("instruction at {pc:#x} is outside the loaded object")); }
-    decode_rdna4(InstStream { insts: &memory[pc..] }).map_err(|_| format!("undecodable instruction at {pc:#x}"))
+    if pc + 8 > memory.len() {
+        return Err(format!(
+            "instruction at {pc:#x} is outside the loaded object"
+        ));
+    }
+    decode_rdna4(InstStream {
+        insts: &memory[pc..],
+    })
+    .map_err(|_| format!("undecodable instruction at {pc:#x}"))
 }
 
 struct Search<'a> {
@@ -221,7 +236,10 @@ struct Search<'a> {
 
 impl Search<'_> {
     fn containing(&self, pc: usize) -> Option<(usize, usize)> {
-        self.ranges.iter().copied().find(|&(start, end)| pc >= start && pc < end)
+        self.ranges
+            .iter()
+            .copied()
+            .find(|&(start, end)| pc >= start && pc < end)
     }
     fn walk(&mut self, start: usize) -> Result<(), String> {
         let mut pc = start;
@@ -229,9 +247,13 @@ impl Search<'_> {
         loop {
             let (inst, size) = decode_at(self.memory, pc)?;
             pc += size;
-            let stop = is_terminator(&inst) || self.containing(pc).is_some() || super::lift::control::writes_exec(&inst);
+            let stop = is_terminator(&inst)
+                || self.containing(pc).is_some()
+                || super::lift::control::writes_exec(&inst);
             last = inst;
-            if stop { break; }
+            if stop {
+                break;
+            }
         }
         let next = successors(pc, &last);
         self.ranges.insert((start, pc));
@@ -251,12 +273,18 @@ impl Search<'_> {
 }
 
 pub(crate) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
-    let mut search = Search { memory, ranges: BTreeSet::new() };
+    let mut search = Search {
+        memory,
+        ranges: BTreeSet::new(),
+    };
     search.walk(entry_pc)?;
     let ranges: Vec<_> = search.ranges.into_iter().collect();
     for pair in ranges.windows(2) {
         if pair[0].1 != pair[1].0 {
-            return Err(format!("decoded ranges are not contiguous: {:#x}..{:#x} and {:#x}..{:#x}", pair[0].0, pair[0].1, pair[1].0, pair[1].1));
+            return Err(format!(
+                "decoded ranges are not contiguous: {:#x}..{:#x} and {:#x}..{:#x}",
+                pair[0].0, pair[0].1, pair[1].0, pair[1].1
+            ));
         }
     }
     let mut blocks = BTreeMap::new();
@@ -268,7 +296,12 @@ pub(crate) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String>
             insts.push(inst);
             pc += size;
         }
-        let next_pcs = successors(end, insts.last().ok_or_else(|| format!("empty range at {start:#x}"))?);
+        let next_pcs = successors(
+            end,
+            insts
+                .last()
+                .ok_or_else(|| format!("empty range at {start:#x}"))?,
+        );
         blocks.insert(start, DecodedBlock { insts, next_pcs });
     }
     Ok(Decoded { entry_pc, blocks })
@@ -285,22 +318,52 @@ pub(crate) fn load_object(path: &str, descriptor_symbol: &str) -> (usize, Vec<u8
         let size = segment.size() as usize;
         memory.resize(memory.len().max(offset + size), 0);
         let bytes = segment.data();
-        memory[offset..offset + bytes.len().min(size)].copy_from_slice(&bytes[..bytes.len().min(size)]);
+        memory[offset..offset + bytes.len().min(size)]
+            .copy_from_slice(&bytes[..bytes.len().min(size)]);
     }
-    let descriptor_address = elf.symbols().find(|symbol| symbol.name() == Some(descriptor_symbol)).unwrap().address() as usize;
-    let descriptor = crate::processor::decode_kernel_desc(&memory[descriptor_address..descriptor_address + 64]);
-    (descriptor_address + descriptor.kernel_code_entry_byte_offset, memory)
+    let descriptor_address = elf
+        .symbols()
+        .find(|symbol| symbol.name() == Some(descriptor_symbol))
+        .unwrap()
+        .address() as usize;
+    let descriptor =
+        crate::processor::decode_kernel_desc(&memory[descriptor_address..descriptor_address + 64]);
+    (
+        descriptor_address + descriptor.kernel_code_entry_byte_offset,
+        memory,
+    )
 }
 
 #[cfg(test)]
 pub(crate) const OBJECTS: &[(&str, &str)] = &[
-    ("examples/smallpt/kernel_gfx1200.o", "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd"),
-    ("examples/raytracing/kernel_gfx1200.o", "_Z24ambient_occlusion_kernelP14_hiprtGeometryPh15HIP_vector_typeIiLj2EEf.kd"),
-    ("examples/texture/kernel_gfx1200.o", "_Z16histogram_kernelPjjjjP13__hip_texture.kd"),
-    ("examples/histogram/kernel_gfx1200.o", "_Z18histogram256_blockPhPji.kd"),
-    ("examples/simple_hgemm/kernel_gfx1200.o", "_Z15hgemm_rocwmma_djjjPKDF16_S0_S0_PDF16_jjjjff.kd"),
-    ("examples/warp_shuffle/kernel_gfx1200.o", "_Z23matrix_transpose_kernelPfPKfj.kd"),
-    ("examples/bitonic_sort/kernel_gfx1200.o", "_Z19bitonic_sort_kernelPjjjb.kd"),
+    (
+        "examples/smallpt/kernel_gfx1200.o",
+        "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd",
+    ),
+    (
+        "examples/raytracing/kernel_gfx1200.o",
+        "_Z24ambient_occlusion_kernelP14_hiprtGeometryPh15HIP_vector_typeIiLj2EEf.kd",
+    ),
+    (
+        "examples/texture/kernel_gfx1200.o",
+        "_Z16histogram_kernelPjjjjP13__hip_texture.kd",
+    ),
+    (
+        "examples/histogram/kernel_gfx1200.o",
+        "_Z18histogram256_blockPhPji.kd",
+    ),
+    (
+        "examples/simple_hgemm/kernel_gfx1200.o",
+        "_Z15hgemm_rocwmma_djjjPKDF16_S0_S0_PDF16_jjjjff.kd",
+    ),
+    (
+        "examples/warp_shuffle/kernel_gfx1200.o",
+        "_Z23matrix_transpose_kernelPfPKfj.kd",
+    ),
+    (
+        "examples/bitonic_sort/kernel_gfx1200.o",
+        "_Z19bitonic_sort_kernelPjjjb.kd",
+    ),
 ];
 
 #[cfg(test)]
@@ -316,11 +379,19 @@ mod tests {
             assert_eq!(ours.entry_pc, theirs.entry_pc(), "{path}");
             let mut expected: Vec<_> = theirs.blocks().keys().copied().collect();
             expected.sort_unstable();
-            assert_eq!(ours.blocks.keys().copied().collect::<Vec<_>>(), expected, "{path}");
+            assert_eq!(
+                ours.blocks.keys().copied().collect::<Vec<_>>(),
+                expected,
+                "{path}"
+            );
             for (pc, block) in &ours.blocks {
                 let other = &theirs.blocks()[pc];
                 assert_eq!(block.next_pcs, other.next_pcs(), "{path} block {pc:#x}");
-                assert_eq!(format!("{:?}", block.insts), format!("{:?}", other.insts()), "{path} block {pc:#x}");
+                assert_eq!(
+                    format!("{:?}", block.insts),
+                    format!("{:?}", other.insts()),
+                    "{path} block {pc:#x}"
+                );
             }
         }
     }

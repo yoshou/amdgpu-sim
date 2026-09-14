@@ -4,16 +4,18 @@ pub(super) mod wave;
 
 use std::collections::BTreeMap;
 
-use std::rc::Rc;
 use super::analysis::{Access, Exec};
-use super::ir::{*, Cvt, Env, IntOp, Op, Ty, ValueId};
+use super::ir::{Cvt, Env, IntOp, Op, Ty, ValueId, *};
 use super::native::{Atomic, BasicBlock, Builder, Type, Value};
 use super::program::{Parameter, ParameterSource};
 use ops::Emitter;
-
+use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Abi { Whole, Cooperative }
+pub(super) enum Abi {
+    Whole,
+    Cooperative,
+}
 
 pub(super) struct Cluster {
     pub members: usize,
@@ -42,20 +44,33 @@ pub(super) struct Prepared {
     pub num_vgprs: usize,
 }
 
-pub(super) fn resume_key(provenance: u64) -> usize { (provenance & !crate::rdna_spmd::ir::SCHEDULED) as usize }
+pub(super) fn resume_key(provenance: u64) -> usize {
+    (provenance & !crate::rdna_spmd::ir::SCHEDULED) as usize
+}
 
 impl Prepared {
     pub fn group(&self) -> bool {
-        self.accesses.iter().any(|a| a.space == super::ir::Space::Lds)
+        self.accesses
+            .iter()
+            .any(|a| a.space == super::ir::Space::Lds)
     }
     pub fn resume_layouts(&self) -> Vec<Vec<super::engine::yields::YieldValues>> {
-        self.groups.iter().map(|g| g.iter().map(|p| self.yields[p].clone()).collect()).collect()
+        self.groups
+            .iter()
+            .map(|g| g.iter().map(|p| self.yields[p].clone()).collect())
+            .collect()
     }
     pub fn resume_index(&self, provenance: u64) -> usize {
-        self.groups.iter().position(|g| g[0] == provenance).expect("scheduled effect lacks a yield layout")
+        self.groups
+            .iter()
+            .position(|g| g[0] == provenance)
+            .expect("scheduled effect lacks a yield layout")
     }
     pub fn group_at(&self, provenance: u64) -> Option<&[u64]> {
-        self.groups.iter().find(|g| g[0] == provenance).map(|g| g.as_slice())
+        self.groups
+            .iter()
+            .find(|g| g[0] == provenance)
+            .map(|g| g.as_slice())
     }
 }
 
@@ -69,14 +84,20 @@ pub(super) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
         if *next < edges.len() {
             let dst = edges[*next].dst;
             *next += 1;
-            if visited.insert(dst) { stack.push((dst, 0)); }
+            if visited.insert(dst) {
+                stack.push((dst, 0));
+            }
         } else {
             order.push(*id);
             stack.pop();
         }
     }
     order.reverse();
-    for &id in f.blocks.keys() { if visited.insert(id) { order.push(id); } }
+    for &id in f.blocks.keys() {
+        if visited.insert(id) {
+            order.push(id);
+        }
+    }
     order
 }
 
@@ -116,14 +137,21 @@ pub(super) struct Cg<'a> {
     tile_sink: Value,
 }
 
-pub(super) fn compile(p: &Prepared, name: &str, mode: super::native::jit::Mode) -> super::native::jit::NativeCode {
+pub(super) fn compile(
+    p: &Prepared,
+    name: &str,
+    mode: super::native::jit::Mode,
+) -> super::native::jit::NativeCode {
     let native = super::native::jit::Module::new(name);
     let ir = native.builder();
     let (i32t, i64t, ptr, void) = (ir.i32(), ir.i64(), ir.ptr(), ir.void());
     let coop = p.abi == Abi::Cooperative;
     let group = p.group();
     let func = if coop {
-        ir.add_function("kernel", i64t.function(&[ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t]))
+        ir.add_function(
+            "kernel",
+            i64t.function(&[ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t]),
+        )
     } else if p.width.is_some() {
         let params = [ptr, ptr, i64t, i64t, i32t, i64t];
         ir.add_function("kernel", void.function(&params[..4 + 2 * group as usize]))
@@ -136,23 +164,49 @@ pub(super) fn compile(p: &Prepared, name: &str, mode: super::native::jit::Mode) 
     let sgprs_p = func.param(0);
     let vgprs_p = func.param(1);
     let scratch_base = func.param(2);
-    let scratch_stride = if coop || p.width.is_some() { func.param(3) } else { ir.ci64(0) };
+    let scratch_stride = if coop || p.width.is_some() {
+        func.param(3)
+    } else {
+        ir.ci64(0)
+    };
     let lane_base = if coop { func.param(6) } else { ir.ci64(0) };
-    let lds_base = if coop { func.param(5) }
-        else if group { func.param(3 + 2 * p.width.is_some() as u32) }
-        else if p.width.is_some() { ir.ci64(0) } else { i64t.undef() };
+    let lds_base = if coop {
+        func.param(5)
+    } else if group {
+        func.param(3 + 2 * p.width.is_some() as u32)
+    } else if p.width.is_some() {
+        ir.ci64(0)
+    } else {
+        i64t.undef()
+    };
     let width_lanes = p.width.unwrap_or(1);
-    let valid_mask = if coop { func.param(8) }
-        else if group && p.width.is_some() { func.param(4) }
-        else { ir.ci32(if p.width.is_some() { ((1u64 << width_lanes) - 1) as u32 } else { u32::MAX }) };
-    let spill_base = if coop { func.param(4) } else {
-        ir.array_alloca(i32t, ir.ci32(super::engine::kernel::COOP_SPILL_SLOTS as u32), "")
+    let valid_mask = if coop {
+        func.param(8)
+    } else if group && p.width.is_some() {
+        func.param(4)
+    } else {
+        ir.ci32(if p.width.is_some() {
+            ((1u64 << width_lanes) - 1) as u32
+        } else {
+            u32::MAX
+        })
+    };
+    let spill_base = if coop {
+        func.param(4)
+    } else {
+        ir.array_alloca(
+            i32t,
+            ir.ci32(super::engine::kernel::COOP_SPILL_SLOTS as u32),
+            "",
+        )
     };
     let scratch_base_scalar = if coop || p.width.is_none() {
         let aperture = ir.and(scratch_base, ir.ci64(0xffff_ffff_0000_0000));
         let sized = ir.icmp(IntPred::Ne, scratch_stride, ir.ci64(0));
         ir.select(sized, aperture, scratch_base)
-    } else { scratch_base };
+    } else {
+        scratch_base
+    };
     let sink = ir.array_alloca(i32t, ir.ci32(10), "");
     let mut em = Emitter::new(ir, p.width, p.registry.clone());
     em.state = p.registry.lowering_state(&em, sink);
@@ -160,37 +214,90 @@ pub(super) fn compile(p: &Prepared, name: &str, mode: super::native::jit::Mode) 
     let mut sem = Emitter::new(ir, None, p.registry.clone());
     sem.state = p.registry.lowering_state(&sem, sink);
     let lane_offset = (p.width.is_none() && coop).then(|| ir.mul(scratch_stride, lane_base));
-    em.scratch = Some((scratch_base_scalar, if coop || p.width.is_some() { scratch_stride } else { ir.ci64(0) }));
+    em.scratch = Some((
+        scratch_base_scalar,
+        if coop || p.width.is_some() {
+            scratch_stride
+        } else {
+            ir.ci64(0)
+        },
+    ));
     sem.scratch = em.scratch;
-    let cells = p.yields.values().map(|l| l.base + l.cells()).max().unwrap_or(0);
-    let yield_frame = if cells == 0 { ptr.null() } else {
-        ir.alloca(i32t.array(cells as u64 * width_lanes as u64), "yield.values").set_alignment(64)
+    let cells = p
+        .yields
+        .values()
+        .map(|l| l.base + l.cells())
+        .max()
+        .unwrap_or(0);
+    let yield_frame = if cells == 0 {
+        ptr.null()
+    } else {
+        ir.alloca(
+            i32t.array(cells as u64 * width_lanes as u64),
+            "yield.values",
+        )
+        .set_alignment(64)
     };
     let f = p.ir.func();
     let mut definitions = vec![None; f.types.len()];
-    for block in f.blocks.values() { for inst in &block.insts { if let Inst::Core { value, op, .. } = inst { definitions[value.0] = Some(*op); } } }
+    for block in f.blocks.values() {
+        for inst in &block.insts {
+            if let Inst::Core { value, op, .. } = inst {
+                definitions[value.0] = Some(*op);
+            }
+        }
+    }
     let mut access_at = BTreeMap::new();
     let mut skip = std::collections::BTreeSet::new();
     for (index, access) in p.accesses.iter().enumerate() {
         access_at.insert((access.block, access.effects[0]), index);
-        for &e in &access.effects[1..] { skip.insert((access.block, e)); }
+        for &e in &access.effects[1..] {
+            skip.insert((access.block, e));
+        }
     }
     for (&start, cluster) in &p.clusters {
-        for member in start + 1..start + cluster.members { for &e in &p.accesses[member].effects { skip.insert((p.accesses[member].block, e)); } }
+        for member in start + 1..start + cluster.members {
+            for &e in &p.accesses[member].effects {
+                skip.insert((p.accesses[member].block, e));
+            }
+        }
     }
     let mut cg = Cg {
-        p, ir, func, em, sem,
+        p,
+        ir,
+        func,
+        em,
+        sem,
         values: vec![UNDEFINED; f.types.len()],
         vectors: vec![UNDEFINED; f.types.len()],
         scalars: vec![UNDEFINED; f.types.len()],
-        bbs: BTreeMap::new(), phis: BTreeMap::new(), incoming: BTreeMap::new(),
-        param_scalar: (0..f.types.len()).map(|v| p.width.is_none() || (p.uniform[v] && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1"))).collect(),
-        types: f.types.clone(), definitions, access_at, skip,
+        bbs: BTreeMap::new(),
+        phis: BTreeMap::new(),
+        incoming: BTreeMap::new(),
+        param_scalar: (0..f.types.len())
+            .map(|v| {
+                p.width.is_none()
+                    || (p.uniform[v]
+                        && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1"))
+            })
+            .collect(),
+        types: f.types.clone(),
+        definitions,
+        access_at,
+        skip,
         current: f.entry,
-        sgprs_p, vgprs_p, scratch_base_scalar, scratch_vec: scratch_base, lds_base, spill_base,
+        sgprs_p,
+        vgprs_p,
+        scratch_base_scalar,
+        scratch_vec: scratch_base,
+        lds_base,
+        spill_base,
         spill: std::cell::RefCell::new(BTreeMap::new()),
         loaded_pairs: BTreeMap::new(),
-        valid_mask, lane_base: coop.then(|| ir.trunc(lane_base, i32t)), yield_frame, sink,
+        valid_mask,
+        lane_base: coop.then(|| ir.trunc(lane_base, i32t)),
+        yield_frame,
+        sink,
         store_sink: ir.alloca(i64t, "store_sink"),
         tile_sink: ir.array_alloca(i32t, ir.ci32(64), "tile_sink"),
     };
@@ -204,7 +311,10 @@ pub(super) fn compile(p: &Prepared, name: &str, mode: super::native::jit::Mode) 
         let off = ir.mul(scratch_lane, stride_v);
         cg.scratch_vec = ir.add(base_v, off);
     } else {
-        cg.scratch_vec = match lane_offset { Some(offset) => ir.add(scratch_base, offset), None => scratch_base };
+        cg.scratch_vec = match lane_offset {
+            Some(offset) => ir.add(scratch_base, offset),
+            None => scratch_base,
+        };
     }
     let packet_valid = cg.lane_base_word(valid_mask);
     let valid_vec = cg.mask_to_vec(packet_valid);
@@ -216,17 +326,31 @@ pub(super) fn compile(p: &Prepared, name: &str, mode: super::native::jit::Mode) 
     cg.em.outside_lanes = Some(outside_lanes);
     cg.sem.outside_lanes = Some(outside_lanes);
     for &id in f.blocks.keys() {
-        cg.bbs.insert(id, ir.append_block(func, &format!("b{:x}", id.0)));
+        cg.bbs
+            .insert(id, ir.append_block(func, &format!("b{:x}", id.0)));
     }
     cg.load_entry();
     ir.br(cg.bbs[&f.entry]);
-    let order: Vec<BlockId> = if std::env::var("AMDGPU_SIM_RPO").map_or(true, |v| v != "0") { reverse_postorder(f) } else { f.blocks.keys().copied().collect() };
+    let order: Vec<BlockId> = if std::env::var("AMDGPU_SIM_RPO").map_or(true, |v| v != "0") {
+        reverse_postorder(f)
+    } else {
+        f.blocks.keys().copied().collect()
+    };
     let counts = std::env::var("AMDGPU_SIM_BLOCK_COUNTS").ok().map(|path| {
         let ty = i64t.array(f.blocks.len() as u64);
         let global = ir.add_global("block_counts", ty);
         global.set_initializer(ty.null());
-        let index: BTreeMap<BlockId, usize> = f.blocks.keys().enumerate().map(|(i, &id)| (id, i)).collect();
-        let text: String = f.blocks.keys().map(|id| format!("{} b{:x}\n", index[id], id.0)).collect();
+        let index: BTreeMap<BlockId, usize> = f
+            .blocks
+            .keys()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+        let text: String = f
+            .blocks
+            .keys()
+            .map(|id| format!("{} b{:x}\n", index[id], id.0))
+            .collect();
         std::fs::write(format!("{path}.blocks"), text).unwrap();
         (path, global, index)
     });
@@ -240,35 +364,57 @@ pub(super) fn compile(p: &Prepared, name: &str, mode: super::native::jit::Mode) 
             ir.atomic_add(slot, ir.ci64(1), Atomic::Monotonic);
         }
         for (index, inst) in block.insts.iter().enumerate() {
-            if cg.skip.contains(&(id, index)) { continue; }
+            if cg.skip.contains(&(id, index)) {
+                continue;
+            }
             cg.emit_inst(id, index, inst);
         }
         cg.emit_term(id, block);
     }
     cg.finish_phis();
     let mut code = native.finish(mode);
-    if let Some((path, _, index)) = counts { code.block_counts = Some((path, index.len())); }
+    if let Some((path, _, index)) = counts {
+        code.block_counts = Some((path, index.len()));
+    }
     code
 }
 
 impl<'a> Cg<'a> {
-    fn regs(&self) -> super::dialect::Registers { self.p.registry.registers() }
+    fn regs(&self) -> super::dialect::Registers {
+        self.p.registry.registers()
+    }
 
-    fn mask_words(&self) -> bool { self.p.width.is_some() && std::env::var("AMDGPU_SIM_MASK_WORDS").map_or(false, |v| v == "1") }
-    fn width(&self) -> u32 { self.p.width.unwrap_or(1) }
-    fn ci32(&self, v: u32) -> Value { self.ir.ci32(v) }
-    fn ci64(&self, v: u64) -> Value { self.ir.ci64(v) }
-    fn vec_ty(&self, scalar: Type) -> Type { self.p.width.map_or(scalar, |w| scalar.vector(w)) }
+    fn mask_words(&self) -> bool {
+        self.p.width.is_some() && std::env::var("AMDGPU_SIM_MASK_WORDS").map_or(false, |v| v == "1")
+    }
+    fn width(&self) -> u32 {
+        self.p.width.unwrap_or(1)
+    }
+    fn ci32(&self, v: u32) -> Value {
+        self.ir.ci32(v)
+    }
+    fn ci64(&self, v: u64) -> Value {
+        self.ir.ci64(v)
+    }
+    fn vec_ty(&self, scalar: Type) -> Type {
+        self.p.width.map_or(scalar, |w| scalar.vector(w))
+    }
     fn splat(&self, v: Value) -> Value {
-        match self.p.width { Some(w) => self.ir.splat(v, w), None => v }
+        match self.p.width {
+            Some(w) => self.ir.splat(v, w),
+            None => v,
+        }
     }
     fn mask_to_vec(&self, word: Value) -> Value {
         match self.p.width {
             Some(w) => {
                 let bits = self.ir.trunc(word, self.ir.int(w));
-                self.em.from_bool(self.ir.bitcast(bits, self.ir.i1().vector(w)))
+                self.em
+                    .from_bool(self.ir.bitcast(bits, self.ir.i1().vector(w)))
             }
-            None => self.ir.icmp(IntPred::Ne, self.ir.and(word, self.ci32(1)), self.ci32(0)),
+            None => self
+                .ir
+                .icmp(IntPred::Ne, self.ir.and(word, self.ci32(1)), self.ci32(0)),
         }
     }
     fn vec_to_mask(&self, v: Value) -> Value {
@@ -283,16 +429,44 @@ impl<'a> Cg<'a> {
     fn describe(&self, v: ValueId) -> String {
         let f = self.p.ir.func();
         for (&id, block) in &f.blocks {
-            if let Some(index) = block.params.iter().position(|p| p.0 == v) { return format!("parameter {index} of b{:x}", id.0); }
+            if let Some(index) = block.params.iter().position(|p| p.0 == v) {
+                return format!("parameter {index} of b{:x}", id.0);
+            }
             for (index, inst) in block.insts.iter().enumerate() {
                 let defined = match inst {
                     Inst::Core { value, .. } | Inst::Packet { output: value, .. } => *value == v,
-                    Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => outputs.iter().any(|o| o.0 == v),
+                    Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => {
+                        outputs.iter().any(|o| o.0 == v)
+                    }
                 };
                 if defined {
-                    let accesses: Vec<String> = self.p.accesses.iter().enumerate().filter(|(_, a)| a.block == id && a.effects.contains(&index) || a.block == id && (a.start..a.end).contains(&index))
-                        .map(|(k, a)| format!("access {k} effects {:?} shape {:?} cluster {:?} results {:?}", a.effects, self.p.shapes[k], self.p.clusters.get(&k).map(|c| c.members), a.results)).collect();
-                    return format!("b{:x}:{index} {} (current b{:x}, skipped {}) {:?}", id.0, super::ir::print::inst(&self.p.registry, &f.types, inst), self.current.0, self.skip.contains(&(id, index)), accesses);
+                    let accesses: Vec<String> = self
+                        .p
+                        .accesses
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| {
+                            a.block == id && a.effects.contains(&index)
+                                || a.block == id && (a.start..a.end).contains(&index)
+                        })
+                        .map(|(k, a)| {
+                            format!(
+                                "access {k} effects {:?} shape {:?} cluster {:?} results {:?}",
+                                a.effects,
+                                self.p.shapes[k],
+                                self.p.clusters.get(&k).map(|c| c.members),
+                                a.results
+                            )
+                        })
+                        .collect();
+                    return format!(
+                        "b{:x}:{index} {} (current b{:x}, skipped {}) {:?}",
+                        id.0,
+                        super::ir::print::inst(&self.p.registry, &f.types, inst),
+                        self.current.0,
+                        self.skip.contains(&(id, index)),
+                        accesses
+                    );
                 }
             }
         }
@@ -300,25 +474,57 @@ impl<'a> Cg<'a> {
     }
     fn vector(&mut self, v: ValueId) -> Value {
         let value = self.values[v.0];
-        assert!(!value.is_null(), "undefined SSA value v{}: {}", v.0, self.describe(v));
-        if self.p.width.is_none() || value.is_vector() { return value; }
-        if !self.vectors[v.0].is_null() { return self.vectors[v.0]; }
+        assert!(
+            !value.is_null(),
+            "undefined SSA value v{}: {}",
+            v.0,
+            self.describe(v)
+        );
+        if self.p.width.is_none() || value.is_vector() {
+            return value;
+        }
+        if !self.vectors[v.0].is_null() {
+            return self.vectors[v.0];
+        }
         let out = self.splat(value);
-        let out = if self.types[v.0] == Ty::I1 { self.em.from_bool(out) } else { out };
+        let out = if self.types[v.0] == Ty::I1 {
+            self.em.from_bool(out)
+        } else {
+            out
+        };
         self.vectors[v.0] = out;
         out
     }
     fn scalar(&mut self, v: ValueId) -> Value {
         let value = self.values[v.0];
-        assert!(!value.is_null(), "undefined SSA value v{}: {}", v.0, self.describe(v));
-        if !value.is_vector() { return value; }
-        if !self.scalars[v.0].is_null() { return self.scalars[v.0]; }
+        assert!(
+            !value.is_null(),
+            "undefined SSA value v{}: {}",
+            v.0,
+            self.describe(v)
+        );
+        if !value.is_vector() {
+            return value;
+        }
+        if !self.scalars[v.0].is_null() {
+            return self.scalars[v.0];
+        }
         let out = self.ir.extract_at(value, 0);
-        let out = if self.em.wide() && self.types[v.0] == Ty::I1 { self.ir.icmp(IntPred::Ne, out, self.ci64(0)) } else { out };
+        let out = if self.em.wide() && self.types[v.0] == Ty::I1 {
+            self.ir.icmp(IntPred::Ne, out, self.ci64(0))
+        } else {
+            out
+        };
         self.scalars[v.0] = out;
         out
     }
-    fn shaped(&mut self, v: ValueId, scalar: bool) -> Value { if scalar { self.scalar(v) } else { self.vector(v) } }
+    fn shaped(&mut self, v: ValueId, scalar: bool) -> Value {
+        if scalar {
+            self.scalar(v)
+        } else {
+            self.vector(v)
+        }
+    }
     fn define(&mut self, v: ValueId, value: Value) {
         self.values[v.0] = value;
         self.vectors[v.0] = UNDEFINED;
@@ -339,30 +545,46 @@ impl<'a> Cg<'a> {
             let value = match input.source {
                 ParameterSource::Vgpr(r) => {
                     if let Some(w) = self.p.width {
-                        ir.load(ir.i32().vector(w), self.register_slot(self.vgprs_p, r * w)).set_alignment(4)
+                        ir.load(ir.i32().vector(w), self.register_slot(self.vgprs_p, r * w))
+                            .set_alignment(4)
                     } else {
                         ir.load(ir.i32(), self.register_slot(self.vgprs_p, r))
                     }
                 }
                 ParameterSource::Sgpr(r) => {
-                    if r == self.regs().null { self.ci32(0) } else {
+                    if r == self.regs().null {
+                        self.ci32(0)
+                    } else {
                         ir.load(ir.i32(), self.register_slot(self.sgprs_p, r))
                     }
                 }
                 ParameterSource::MaskBit(r) => {
                     let word = if r == self.regs().exec && self.p.abi == Abi::Whole {
-                        if self.p.width.is_some() { self.lane_base_word(self.valid_mask) } else { self.ci32(1) }
+                        if self.p.width.is_some() {
+                            self.lane_base_word(self.valid_mask)
+                        } else {
+                            self.ci32(1)
+                        }
                     } else {
                         let word = ir.load(ir.i32(), self.register_slot(self.sgprs_p, r));
-                        if r == self.regs().exec && coop { ir.and(word, self.lane_base_word(self.valid_mask)) } else { word }
+                        if r == self.regs().exec && coop {
+                            ir.and(word, self.lane_base_word(self.valid_mask))
+                        } else {
+                            word
+                        }
                     };
                     self.mask_to_vec(word)
                 }
                 ParameterSource::Scc => {
                     if coop {
-                        let word = ir.load(ir.i32(), self.register_slot(self.sgprs_p, self.regs().scc_slot));
+                        let word = ir.load(
+                            ir.i32(),
+                            self.register_slot(self.sgprs_p, self.regs().scc_slot),
+                        );
                         ir.icmp(IntPred::Ne, word, self.ci32(0))
-                    } else { ir.ci1(false) }
+                    } else {
+                        ir.ci1(false)
+                    }
                 }
             };
             assert_eq!(ty, input.ty);
@@ -372,12 +594,20 @@ impl<'a> Cg<'a> {
 
     fn begin_block(&mut self, id: BlockId, block: &Block) {
         let f = self.p.ir.func();
-        if id == f.entry { return; }
+        if id == f.entry {
+            return;
+        }
         let mut phis = Vec::new();
         let words = self.mask_words();
         for &(v, ty) in &block.params {
             let scalar = self.param_scalar[v.0];
-            let t = if scalar { self.sem.ty(ty) } else if ty == Ty::I1 && words { self.ir.int(self.width()) } else { self.em.ty(ty) };
+            let t = if scalar {
+                self.sem.ty(ty)
+            } else if ty == Ty::I1 && words {
+                self.ir.int(self.width())
+            } else {
+                self.em.ty(ty)
+            };
             let phi = self.ir.phi(t);
             phis.push(phi);
             self.define(v, phi);
@@ -395,7 +625,10 @@ impl<'a> Cg<'a> {
         for (&id, phis) in &self.phis {
             let incoming = self.incoming.get(&id).cloned().unwrap_or_default();
             for (index, &phi) in phis.iter().enumerate() {
-                let edges: Vec<(Value, BasicBlock)> = incoming.iter().map(|(bb, args)| (args[index], *bb)).collect();
+                let edges: Vec<(Value, BasicBlock)> = incoming
+                    .iter()
+                    .map(|(bb, args)| (args[index], *bb))
+                    .collect();
                 if edges.is_empty() {
                     phi.replace_all_uses_with(phi.ty().undef());
                     phi.erase();
@@ -410,25 +643,37 @@ impl<'a> Cg<'a> {
         let f = self.p.ir.func();
         let params: Vec<_> = f.blocks[&edge.dst].params.iter().map(|p| p.0).collect();
         let words = self.mask_words();
-        edge.args.iter().zip(params).map(|(&arg, param)| {
-            let scalar = self.param_scalar[param.0];
-            let value = self.shaped(arg, scalar);
-            if !scalar && words && self.types[param.0] == Ty::I1 {
-                self.ir.bitcast(value, self.ir.int(self.width()))
-            } else { value }
-        }).collect()
+        edge.args
+            .iter()
+            .zip(params)
+            .map(|(&arg, param)| {
+                let scalar = self.param_scalar[param.0];
+                let value = self.shaped(arg, scalar);
+                if !scalar && words && self.types[param.0] == Ty::I1 {
+                    self.ir.bitcast(value, self.ir.int(self.width()))
+                } else {
+                    value
+                }
+            })
+            .collect()
     }
 
     fn branch_to(&mut self, edge: &Edge) -> BasicBlock {
         let args = self.edge_args(edge);
         let from = self.ir.insert_block();
-        self.incoming.entry(edge.dst).or_default().push((from, args));
+        self.incoming
+            .entry(edge.dst)
+            .or_default()
+            .push((from, args));
         self.bbs[&edge.dst]
     }
 
     fn emit_term(&mut self, _id: BlockId, block: &Block) {
         match &block.term {
-            Term::Br(edge) => { let bb = self.branch_to(edge); self.ir.br(bb); }
+            Term::Br(edge) => {
+                let bb = self.branch_to(edge);
+                self.ir.br(bb);
+            }
             Term::CondBr { cond, yes, no } => {
                 let c = self.scalar(*cond);
                 let yes_bb = self.branch_to(yes);
@@ -437,8 +682,14 @@ impl<'a> Cg<'a> {
             }
             Term::Ret(args) => {
                 let coop = self.p.abi == Abi::Cooperative;
-                if coop && self.p.observable_return { self.store_return(args); }
-                if coop { self.ir.ret(self.ci64(super::engine::kernel::COOP_DONE)); } else { self.ir.ret_void(); }
+                if coop && self.p.observable_return {
+                    self.store_return(args);
+                }
+                if coop {
+                    self.ir.ret(self.ci64(super::engine::kernel::COOP_DONE));
+                } else {
+                    self.ir.ret_void();
+                }
             }
         }
     }
@@ -451,19 +702,40 @@ impl<'a> Cg<'a> {
     }
 
     fn any_of_word(&mut self, input: ValueId) -> Option<Value> {
-        let Some(w) = self.p.width else { return None; };
+        let Some(w) = self.p.width else {
+            return None;
+        };
         let (bit, valid) = match self.definitions[input.0] {
-            Some(Op::Int(IntOp::And, a, b)) if matches!(self.definitions[b.0], Some(Op::Env(Env::ValidLane))) => (a, true),
-            Some(Op::Int(IntOp::And, a, b)) if matches!(self.definitions[a.0], Some(Op::Env(Env::ValidLane))) => (b, true),
+            Some(Op::Int(IntOp::And, a, b))
+                if matches!(self.definitions[b.0], Some(Op::Env(Env::ValidLane))) =>
+            {
+                (a, true)
+            }
+            Some(Op::Int(IntOp::And, a, b))
+                if matches!(self.definitions[a.0], Some(Op::Env(Env::ValidLane))) =>
+            {
+                (b, true)
+            }
             _ => (input, false),
         };
-        let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = self.definitions[bit.0] else { return None; };
-        let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shifted.0] else { return None; };
-        if !matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId))) || !self.p.uniform[word.0] { return None; }
+        let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = self.definitions[bit.0] else {
+            return None;
+        };
+        let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shifted.0] else {
+            return None;
+        };
+        if !matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId)))
+            || !self.p.uniform[word.0]
+        {
+            return None;
+        }
         let word = self.scalar(word);
         let word = self.lane_base_word(word);
         let mut bits = self.ir.and(word, self.ci32(((1u64 << w) - 1) as u32));
-        if valid { let packet = self.lane_base_word(self.valid_mask); bits = self.ir.and(bits, packet); }
+        if valid {
+            let packet = self.lane_base_word(self.valid_mask);
+            bits = self.ir.and(bits, packet);
+        }
         Some(self.ir.icmp(IntPred::Ne, bits, self.ci32(0)))
     }
 
@@ -472,15 +744,22 @@ impl<'a> Cg<'a> {
         let ir = self.ir;
         for (index, &arg) in args.iter().enumerate() {
             let input = &self.p.inputs[index];
-            if arg == entry.params[index].0 { continue; }
+            if arg == entry.params[index].0 {
+                continue;
+            }
             match input.source {
                 ParameterSource::Vgpr(r) => {
-                    if r as usize >= self.p.num_vgprs { continue; }
+                    if r as usize >= self.p.num_vgprs {
+                        continue;
+                    }
                     let value = self.vector(arg);
-                    ir.store(value, self.register_slot(self.vgprs_p, r * self.width())).set_alignment(4);
+                    ir.store(value, self.register_slot(self.vgprs_p, r * self.width()))
+                        .set_alignment(4);
                 }
                 ParameterSource::Sgpr(r) => {
-                    if r == self.regs().null { continue; }
+                    if r == self.regs().null {
+                        continue;
+                    }
                     let value = self.scalar(arg);
                     ir.store(value, self.register_slot(self.sgprs_p, r));
                 }
@@ -501,27 +780,51 @@ impl<'a> Cg<'a> {
     fn emit_inst(&mut self, id: BlockId, index: usize, inst: &Inst) {
         match inst {
             Inst::Core { value, ty, op } => self.emit_core(*value, *ty, *op),
-            Inst::Target { op, args, outputs, .. } => {
+            Inst::Target {
+                op, args, outputs, ..
+            } => {
                 let values: Vec<ValueId> = args.values().to_vec();
                 let scalar = self.p.width.is_none();
                 let mut table = self.values.clone();
-                for a in &values { table[a.0] = self.shaped(*a, scalar); }
+                for a in &values {
+                    table[a.0] = self.shaped(*a, scalar);
+                }
                 let emitter = if scalar { &self.sem } else { &self.em };
                 let results = emitter.target(*op, *args, &table);
-                for (&(out, _), result) in outputs.iter().zip(results) { self.define(out, result); }
+                for (&(out, _), result) in outputs.iter().zip(results) {
+                    self.define(out, result);
+                }
             }
             Inst::Packet { op, input, output } => {
                 if *op == PacketOp::Any {
-                    if let Some(result) = self.any_of_word(*input) { self.define(*output, result); return; }
+                    if let Some(result) = self.any_of_word(*input) {
+                        self.define(*output, result);
+                        return;
+                    }
                 }
                 let bits = match self.p.width {
-                    Some(_) => { let v = self.vector(*input); self.vec_to_mask(v) }
-                    None => { let v = self.scalar(*input); self.ir.zext(v, self.ir.i32()) }
+                    Some(_) => {
+                        let v = self.vector(*input);
+                        self.vec_to_mask(v)
+                    }
+                    None => {
+                        let v = self.scalar(*input);
+                        self.ir.zext(v, self.ir.i32())
+                    }
                 };
-                let result = if *op == PacketOp::Any { self.ir.icmp(IntPred::Ne, bits, self.ci32(0)) } else { bits };
+                let result = if *op == PacketOp::Any {
+                    self.ir.icmp(IntPred::Ne, bits, self.ci32(0))
+                } else {
+                    bits
+                };
                 self.define(*output, result);
             }
-            Inst::Effect { provenance, op, inputs, outputs } => match op {
+            Inst::Effect {
+                provenance,
+                op,
+                inputs,
+                outputs,
+            } => match op {
                 EffectOp::Memory { .. } => {
                     let access = self.access_at[&(id, index)];
                     if let Some(cluster) = self.p.clusters.get(&access) {
@@ -532,15 +835,29 @@ impl<'a> Cg<'a> {
                     }
                 }
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
-                    if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0 || !matches!(op, EffectOp::Wave(_)) {
-                        let Some(group) = self.p.group_at(*provenance) else { return };
+                    if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0
+                        || !matches!(op, EffectOp::Wave(_))
+                    {
+                        let Some(group) = self.p.group_at(*provenance) else {
+                            return;
+                        };
                         let mut members = Vec::with_capacity(group.len());
                         let mut wanted = group.iter();
                         let mut next = wanted.next();
                         for inst in &self.p.ir.func().blocks[&id].insts[index..] {
                             let Some(&want) = next else { break };
-                            let Inst::Effect { provenance: at, inputs, outputs, .. } = inst else { continue };
-                            if *at != want { continue; }
+                            let Inst::Effect {
+                                provenance: at,
+                                inputs,
+                                outputs,
+                                ..
+                            } = inst
+                            else {
+                                continue;
+                            };
+                            if *at != want {
+                                continue;
+                            }
                             members.push((want, inputs.clone(), outputs.clone()));
                             next = wanted.next();
                         }
@@ -564,7 +881,9 @@ impl<'a> Cg<'a> {
         }
         if let Op::Convert(Cvt::Trunc, Ty::I1, shift) = op {
             if let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shift.0] {
-                if matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId))) && self.p.uniform[word.0] {
+                if matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId)))
+                    && self.p.uniform[word.0]
+                {
                     let w = self.scalar(word);
                     let w = self.lane_base_word(w);
                     let out = self.mask_to_vec(w);
@@ -574,18 +893,44 @@ impl<'a> Cg<'a> {
             }
         }
         if let Op::Select(_, a, b) = op {
-            if a == b { let v = self.values[a.0]; self.define(value, v); return; }
+            if a == b {
+                let v = self.values[a.0];
+                self.define(value, v);
+                return;
+            }
         }
         let mut args = vec![];
-        op.map(|id| { if !args.contains(&id) { args.push(id); } id });
-        let scalar = self.p.width.is_none() || (!matches!(op, Op::Env(Env::PacketLaneId | Env::LaneId | Env::ValidLane))
-            && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1")
-            && args.iter().all(|a| !self.values[a.0].is_vector()));
+        op.map(|id| {
+            if !args.contains(&id) {
+                args.push(id);
+            }
+            id
+        });
+        let scalar = self.p.width.is_none()
+            || (!matches!(
+                op,
+                Op::Env(Env::PacketLaneId | Env::LaneId | Env::ValidLane)
+            ) && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1")
+                && args.iter().all(|a| !self.values[a.0].is_vector()));
         let mut table = self.values.clone();
-        for a in &args { table[a.0] = self.shaped(*a, scalar); }
-        if let Op::Convert(Cvt::ZExt | Cvt::SExt, _, a) = op { if self.types[a.0] == Ty::I1 { table[a.0] = self.em.to_bool(table[a.0]); } }
-        let result = if scalar { self.sem.op(ty, op, &table) } else { self.em.op(ty, op, &table) };
-        let result = if matches!(op, Op::Convert(Cvt::Trunc, Ty::I1, _)) { self.em.from_bool(result) } else { result };
+        for a in &args {
+            table[a.0] = self.shaped(*a, scalar);
+        }
+        if let Op::Convert(Cvt::ZExt | Cvt::SExt, _, a) = op {
+            if self.types[a.0] == Ty::I1 {
+                table[a.0] = self.em.to_bool(table[a.0]);
+            }
+        }
+        let result = if scalar {
+            self.sem.op(ty, op, &table)
+        } else {
+            self.em.op(ty, op, &table)
+        };
+        let result = if matches!(op, Op::Convert(Cvt::Trunc, Ty::I1, _)) {
+            self.em.from_bool(result)
+        } else {
+            result
+        };
         self.define(value, result);
     }
 }

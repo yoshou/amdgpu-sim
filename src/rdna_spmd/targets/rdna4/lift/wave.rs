@@ -1,6 +1,6 @@
 //! Lift wave and synchronization operations once, including their boundary values.
 use super::regs::BoundaryIo;
-use crate::rdna_spmd::ir::{*, Ty};
+use crate::rdna_spmd::ir::{Ty, *};
 use crate::{
     instructions::I,
     rdna_instructions::{InstFormat, SourceOperand},
@@ -96,9 +96,11 @@ impl YieldAction {
             EffectOp::Wave(op) => op,
             _ => panic!("workgroup barrier requires round state"),
         };
-        [crate::rdna_spmd::engine::yields::evaluate(op, valid, |index, lane| {
-            self.inputs[index].eval(lane, &read, &exec)
-        })]
+        [crate::rdna_spmd::engine::yields::evaluate(
+            op,
+            valid,
+            |index, lane| self.inputs[index].eval(lane, &read, &exec),
+        )]
     }
 }
 fn src(s: SourceOperand) -> Operand {
@@ -117,12 +119,24 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
         ),
         InstFormat::VOP3(i) if matches!(i.op, I::V_READLANE_B32) => YieldAction::new(
             EffectOp::Wave(WaveOp::ReadLane),
-            vec![src(i.src0.clone()), src(i.src1.clone()), src(SourceOperand::IntegerConstant(match i.src0 { SourceOperand::VectorRegister(r) => r as u64, _ => u64::MAX }))],
+            vec![
+                src(i.src0.clone()),
+                src(i.src1.clone()),
+                src(SourceOperand::IntegerConstant(match i.src0 {
+                    SourceOperand::VectorRegister(r) => r as u64,
+                    _ => u64::MAX,
+                })),
+            ],
             vec![Sgpr(i.vdst as u32)],
         ),
         InstFormat::VOP3(i) if matches!(i.op, I::V_WRITELANE_B32) => YieldAction::new(
             EffectOp::Wave(WaveOp::WriteLane),
-            vec![src(i.src0.clone()), src(i.src1.clone()), v(i.vdst as u32), src(SourceOperand::IntegerConstant(i.vdst as u64))],
+            vec![
+                src(i.src0.clone()),
+                src(i.src1.clone()),
+                v(i.vdst as u32),
+                src(SourceOperand::IntegerConstant(i.vdst as u64)),
+            ],
             vec![Vgpr(i.vdst as u32)],
         ),
         InstFormat::DS(i) if matches!(i.op, I::DS_BPERMUTE_B32 | I::DS_BPERMUTE_FI_B32) => {
@@ -174,11 +188,16 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     })
 }
 
-
 pub(in crate::rdna_spmd) fn mark_scheduled(insts: &mut [crate::rdna_spmd::ir::Inst]) {
     for inst in insts {
         if let crate::rdna_spmd::ir::Inst::Effect { provenance, op, .. } = inst {
-            if matches!(op, EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait) && *provenance & (1 << 63) == 0 { *provenance |= crate::rdna_spmd::ir::SCHEDULED; }
+            if matches!(
+                op,
+                EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait
+            ) && *provenance & (1 << 63) == 0
+            {
+                *provenance |= crate::rdna_spmd::ir::SCHEDULED;
+            }
         }
     }
 }
@@ -227,8 +246,15 @@ impl YieldAction {
                 Operand::Add(..) => unreachable!(),
             };
             let mut operands = super::regs::Operands::default();
-            let value = operands.read(&super::input(source, ty), false, None,
-                f, block, words, &mut super::regs::Views::new());
+            let value = operands.read(
+                &super::input(source, ty),
+                false,
+                None,
+                f,
+                block,
+                words,
+                &mut super::regs::Views::new(),
+            );
             block.insts.extend(operands.core);
             value
         }
@@ -241,8 +267,11 @@ impl YieldAction {
             .map(|(a, t)| operand(a, t, f, block, words))
             .collect();
         let outputs: Vec<_> = results.into_iter().map(|t| (f.value(t), t)).collect();
-        let predicate = matches!(self.op, EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi))
-            .then(|| inputs[2]);
+        let predicate = matches!(
+            self.op,
+            EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi)
+        )
+        .then(|| inputs[2]);
         let end = block.insts.len();
         block.insts.push(Inst::Effect {
             provenance: *provenance << 8,
@@ -262,26 +291,36 @@ impl YieldAction {
             if let Some(mask) = predicate {
                 let old = words[&word.expect("predicated wave destination must be a word")];
                 stored = f.value(t);
-                block.insts.push(Inst::Core { value: stored, ty: t, op: Op::Select(mask, v, old) });
+                block.insts.push(Inst::Core {
+                    value: stored,
+                    ty: t,
+                    op: Op::Select(mask, v, old),
+                });
             }
             if matches!(dest, Destination::Sgpr(_)) && t == Ty::I1 {
                 let value = f.value(Ty::I32);
-                block.insts.push(Inst::Core { value, ty: Ty::I32,
-                    op: Op::Convert(crate::rdna_spmd::ir::Cvt::ZExt, Ty::I32, stored) });
+                block.insts.push(Inst::Core {
+                    value,
+                    ty: Ty::I32,
+                    op: Op::Convert(crate::rdna_spmd::ir::Cvt::ZExt, Ty::I32, stored),
+                });
                 stored = value;
             }
             if t == Ty::F32 && word.is_some() {
                 let value = f.value(Ty::I32);
-                block.insts.push(Inst::Core { value, ty: Ty::I32,
-                    op: Op::Convert(crate::rdna_spmd::ir::Cvt::Bitcast, Ty::I32, stored) });
+                block.insts.push(Inst::Core {
+                    value,
+                    ty: Ty::I32,
+                    op: Op::Convert(crate::rdna_spmd::ir::Cvt::Bitcast, Ty::I32, stored),
+                });
                 stored = value;
             }
             if let Some(word) = word {
-                if matches!(word,super::regs::Word::Mask(_)) {
-                    stored = super::regs::project(f,&mut block.insts,stored);
+                if matches!(word, super::regs::Word::Mask(_)) {
+                    stored = super::regs::project(f, &mut block.insts, stored);
                 }
-                if word==super::regs::Word::Mask(126) {
-                    stored=super::regs::valid_exec(f,&mut block.insts,stored);
+                if word == super::regs::Word::Mask(126) {
+                    stored = super::regs::valid_exec(f, &mut block.insts, stored);
                 }
                 words.insert(word, stored);
             } else if matches!(dest, Destination::Sgpr(r) if *r != 124) {
@@ -289,7 +328,11 @@ impl YieldAction {
             }
             definitions.push((*dest, stored));
         }
-        Plan { core: start..end, end: block.insts.len(), definitions }
+        Plan {
+            core: start..end,
+            end: block.insts.len(),
+            definitions,
+        }
     }
 }
 
@@ -393,7 +436,12 @@ mod tests {
         }
         assert!(std::panic::catch_unwind(|| YieldAction::new(
             EffectOp::Wave(WaveOp::WriteLane),
-            vec![v(0), src(SourceOperand::IntegerConstant(0)), v(1), src(SourceOperand::IntegerConstant(1))],
+            vec![
+                v(0),
+                src(SourceOperand::IntegerConstant(0)),
+                v(1),
+                src(SourceOperand::IntegerConstant(1))
+            ],
             vec![Destination::Vgpr(1)]
         ))
         .is_err());
