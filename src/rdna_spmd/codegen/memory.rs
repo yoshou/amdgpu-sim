@@ -143,6 +143,17 @@ pub(in crate::rdna_spmd) fn clusters(f: &Func, accesses: &[Access], width: Optio
     out
 }
 
+struct Words {
+    elem: Type,
+    size: MemSize,
+    count: u32,
+    offsets: Vec<u32>,
+    results: Vec<ValueId>,
+    data: Vec<ValueId>,
+    space: Space,
+    volatile: bool,
+}
+
 impl<'a> Cg<'a> {
     fn masked_call(&self, prefix: &str, overloads: &[Type], args: &[Value], ptr_pos: u32, align: u64) -> Value {
         let call = self.ir.call_intrinsic(prefix, overloads, args);
@@ -337,7 +348,6 @@ impl<'a> Cg<'a> {
     }
 
     pub(super) fn emit_memory(&mut self, index: usize, block: BlockId, at: usize) {
-        let ir = self.ir;
         let access = &self.p.accesses[index];
         let shape = self.p.shapes[index];
         if shape == Shape::Fence {
@@ -346,86 +356,113 @@ impl<'a> Cg<'a> {
                 Ordering::Release => Atomic::Release,
                 _ => Atomic::SequentiallyConsistent,
             };
-            ir.fence(order);
+            self.ir.fence(order);
             return;
         }
-        let elem = match access.size().bytes() { 1 => ir.i8(), 2 => ir.i16(), 8 => ir.i64(), _ => ir.i32() };
-        let size = access.size();
-        let words = access.words;
-        let offsets = access.offsets.clone();
-        let results = access.results.clone();
-        let data = access.data.clone();
-        let (space, volatile) = (access.space, access.semantics.volatile);
-        let flat_private: Vec<ValueId> = access.private.clone();
-        let inside = access.inside;
-        let address = access.address;
-        let mask = access.mask;
-        let base = access.base;
-        let nonempty = self.p.exec.nonempty_at(block, at);
+        let words = Words {
+            elem: match access.size().bytes() { 1 => self.ir.i8(), 2 => self.ir.i16(), 8 => self.ir.i64(), _ => self.ir.i32() },
+            size: access.size(),
+            count: access.words,
+            offsets: access.offsets.clone(),
+            results: access.results.clone(),
+            data: access.data.clone(),
+            space: access.space,
+            volatile: access.semantics.volatile,
+        };
+        let private: Vec<ValueId> = access.private.clone();
         match shape {
-            Shape::ScalarWords | Shape::ScalarLoad { .. } | Shape::ScalarStore | Shape::ScalarAtomic => {
-                let mut addr = self.scalar(address);
-                if self.p.width.is_none() {
-                    if let Some(inside) = inside {
-                        let offset = ir.sub(self.scratch_vec, self.scratch_base_scalar);
-                        let physical = ir.add(addr, offset);
-                        let inside = self.scalar(inside);
-                        addr = ir.select(inside, physical, addr);
-                    }
-                    if space != Space::Global {
-                        let extended = if space == Space::Scratch { ir.sext(addr, ir.i64()) } else { ir.zext(addr, ir.i64()) };
-                        addr = ir.add(if space == Space::Scratch { self.scratch_vec } else { self.lds_base }, extended);
-                    }
+            Shape::ScalarWords | Shape::ScalarLoad { .. } | Shape::ScalarStore | Shape::ScalarAtomic => self.emit_scalar_access(index, shape, &words),
+            _ => self.emit_vector_access(index, block, at, shape, &words),
+        }
+        for (&r, &private) in words.results.iter().zip(&private) { let v = self.values[r.0]; self.define(private, v); }
+    }
+
+    fn scalar_address(&mut self, index: usize, shape: Shape) -> (Value, Option<Value>) {
+        let ir = self.ir;
+        let access = &self.p.accesses[index];
+        let (space, inside, address, mask) = (access.space, access.inside, access.address, access.mask);
+        let predicated = shape != Shape::ScalarWords && !access.scalar();
+        let mut addr = self.scalar(address);
+        if self.p.width.is_none() {
+            if let Some(inside) = inside {
+                let offset = ir.sub(self.scratch_vec, self.scratch_base_scalar);
+                let physical = ir.add(addr, offset);
+                let inside = self.scalar(inside);
+                addr = ir.select(inside, physical, addr);
+            }
+            if space != Space::Global {
+                let extended = if space == Space::Scratch { ir.sext(addr, ir.i64()) } else { ir.zext(addr, ir.i64()) };
+                addr = ir.add(if space == Space::Scratch { self.scratch_vec } else { self.lds_base }, extended);
+            }
+        }
+        let active = predicated.then(|| self.scalar(mask));
+        (addr, active)
+    }
+
+    fn guarded(&self, address: Value, active: Option<Value>) -> Value {
+        match active {
+            Some(active) => { let dummy = self.ir.ptrtoint(self.sink, self.ir.i64()); self.ir.select(active, address, dummy) }
+            None => address,
+        }
+    }
+
+    fn emit_scalar_access(&mut self, index: usize, shape: Shape, words: &Words) {
+        let ir = self.ir;
+        let (addr, active) = self.scalar_address(index, shape);
+        match shape {
+            Shape::ScalarAtomic => {
+                let p = ir.inttoptr(self.guarded(addr, active), ir.ptr());
+                let d = self.scalar(words.data[0]);
+                let old = ir.atomic_add(p, d, Atomic::SequentiallyConsistent);
+                if let Some(&r) = words.results.first() { self.define(r, old); }
+            }
+            Shape::ScalarStore => {
+                for k in 0..words.count as usize {
+                    let value = self.scalar(words.data[k]);
+                    let value = if words.size.bytes() >= 4 { value } else { ir.trunc(value, words.elem) };
+                    let a = self.guarded(ir.add(addr, self.ci64(words.offsets[k] as u64)), active);
+                    let p = ir.inttoptr(a, ir.ptr());
+                    ir.store(value, p).set_alignment(if words.space == Space::Lds { 1 } else { words.size.bytes() }).set_volatile(words.volatile);
                 }
-                let predicated = shape != Shape::ScalarWords && !access.scalar();
-                let active = if predicated { Some(self.scalar(mask)) } else { None };
-                let guard = |cg: &Self, a: Value| -> Value {
-                    match active { Some(active) => { let dummy = ir.ptrtoint(cg.sink, ir.i64()); ir.select(active, a, dummy) } None => a }
-                };
-                if shape == Shape::ScalarAtomic {
-                    let p = ir.inttoptr(guard(self, addr), ir.ptr());
-                    let d = self.scalar(data[0]);
-                    let old = ir.atomic_add(p, d, Atomic::SequentiallyConsistent);
-                    if let Some(&r) = results.first() { self.define(r, old); }
-                    return;
-                }
-                if shape == Shape::ScalarStore {
-                    for k in 0..words as usize {
-                        let value = self.scalar(data[k]);
-                        let value = if size.bytes() >= 4 { value } else { ir.trunc(value, elem) };
-                        let a = guard(self, ir.add(addr, self.ci64(offsets[k] as u64)));
-                        let p = ir.inttoptr(a, ir.ptr());
-                        ir.store(value, p).set_alignment(if space == Space::Lds { 1 } else { size.bytes() }).set_volatile(volatile);
-                    }
-                    return;
-                }
-                let load_addr = guard(self, addr);
+            }
+            _ => {
+                let load_addr = self.guarded(addr, active);
+                let at = |cg: &Self, k: usize| ir.inttoptr(ir.add(load_addr, cg.ci64(words.offsets[k] as u64)), ir.ptr());
                 let pairs = matches!(shape, Shape::ScalarLoad { pairs: true });
                 let mut k = 0usize;
-                while k < words as usize {
-                    if pairs && k + 1 < words as usize {
-                        let p = ir.inttoptr(ir.add(load_addr, self.ci64(offsets[k] as u64)), ir.ptr());
-                        let value = ir.load(ir.f64(), p).set_alignment(4);
-                        let (lo, hi) = self.split_pair(value);
-                        self.define(results[k], lo);
-                        self.define(results[k + 1], hi);
-                        self.loaded_pairs.insert((results[k], results[k + 1]), value);
+                while k < words.count as usize {
+                    if pairs && k + 1 < words.count as usize {
+                        let value = ir.load(ir.f64(), at(self, k)).set_alignment(4);
+                        self.define_pair(&words.results[k..k + 2], value);
                         k += 2;
                     } else {
-                        let p = ir.inttoptr(ir.add(load_addr, self.ci64(offsets[k] as u64)), ir.ptr());
-                        let load = ir.load(elem, p);
-                        load.set_alignment(if shape == Shape::ScalarWords { if size.bytes() >= 4 { 4 } else { 1 } } else if space == Space::Lds || size.bytes() < 4 { 1 } else { 4 });
-                        if shape != Shape::ScalarWords { load.set_volatile(volatile); }
-                        let value = if size.bytes() >= 4 { load } else if size.signed() { ir.sext(load, ir.i32()) } else { ir.zext(load, ir.i32()) };
-                        self.define(results[k], value);
+                        let load = ir.load(words.elem, at(self, k));
+                        load.set_alignment(if shape == Shape::ScalarWords { if words.size.bytes() >= 4 { 4 } else { 1 } } else if words.space == Space::Lds || words.size.bytes() < 4 { 1 } else { 4 });
+                        if shape != Shape::ScalarWords { load.set_volatile(words.volatile); }
+                        let value = self.widen_word(load, words.size);
+                        self.define(words.results[k], value);
                         k += 1;
                     }
                 }
-                for (&r, &private) in results.iter().zip(&flat_private) { let v = self.values[r.0]; self.define(private, v); }
-                return;
             }
-            _ => {}
         }
+    }
+
+    fn widen_word(&self, load: Value, size: MemSize) -> Value {
+        if size.bytes() >= 4 { load } else if size.signed() { self.ir.sext(load, self.ir.i32()) } else { self.ir.zext(load, self.ir.i32()) }
+    }
+
+    fn define_pair(&mut self, results: &[ValueId], value: Value) {
+        let (lo, hi) = self.split_pair(value);
+        self.define(results[0], lo);
+        self.define(results[1], hi);
+        self.loaded_pairs.insert((results[0], results[1]), value);
+    }
+
+    fn vector_address(&mut self, index: usize) -> (Value, Value) {
+        let ir = self.ir;
+        let access = &self.p.accesses[index];
+        let (space, inside, address, mask) = (access.space, access.inside, access.address, access.mask);
         let mut addr = self.vector(address);
         let exec = self.vector(mask);
         let exec = self.em.to_bool(exec);
@@ -442,132 +479,154 @@ impl<'a> Cg<'a> {
             let inside = self.em.to_bool(inside);
             addr = ir.select(inside, physical, addr);
         }
+        (addr, exec)
+    }
+
+    fn emit_vector_access(&mut self, index: usize, block: BlockId, at: usize, shape: Shape, words: &Words) {
+        let (addr, exec) = self.vector_address(index);
+        let base = self.p.accesses[index].base;
+        let nonempty = self.p.exec.nonempty_at(block, at);
         match shape {
             Shape::AtomicAdd { grouped } => {
-                let d = self.vector(data[0]);
+                let d = self.vector(words.data[0]);
                 if grouped { self.emit_grouped_atomic_add(addr, d, exec); return; }
-                let packed_exec = self.vec_to_mask(exec);
-                let ptrs = self.ptr_at_vec(addr, 0);
-                let mut result = self.vi32().poison();
-                for k in 0..self.width() {
-                    let bit = ir.and(ir.lshr(packed_exec, self.ci32(k)), self.ci32(1));
-                    let active = ir.icmp(IntPred::Ne, bit, self.ci32(0));
-                    let ptr = ir.extract_at(ptrs, k);
-                    let ptr = ir.select(active, ptr, self.sink);
-                    let value = ir.extract_at(d, k);
-                    let value = ir.select(active, value, self.ci32(0));
-                    let old = ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent);
-                    result = ir.insert_at(result, old, k);
-                }
-                if let Some(&r) = results.first() { self.define(r, result); }
+                self.emit_lane_atomic_add(addr, d, exec, words.results.first().copied());
             }
-            Shape::Store(StoreShape::Tile) => {
-                let cols: Vec<Value> = (0..words as usize).map(|k| self.vector(data[k])).collect();
-                let base = self.ptr_at_vec(addr, offsets[0] as u64);
-                let sink = ir.ptrtoint(self.tile_sink, ir.i64());
-                let addr_i = ir.ptrtoint(base, self.vi64());
-                let safe = ir.select(exec, addr_i, self.splat(sink));
-                let w = self.width();
-                for l in 0..w {
-                    let mut parts = Vec::new();
-                    let mut k = 0usize;
-                    while k < words as usize {
-                        if k + 1 < words as usize {
-                            parts.push(ir.shuffle_by(cols[k], cols[k + 1], &[l, w + l]));
-                            k += 2;
-                        } else {
-                            parts.push(ir.shuffle_by(cols[k], cols[k].ty().poison(), &[l]));
-                            k += 1;
-                        }
-                    }
-                    let row = self.vconcat_i32(&parts);
-                    let a = ir.extract_at(safe, l);
-                    let p = ir.inttoptr(a, ir.ptr());
-                    ir.store(row, p).set_alignment(4);
-                }
-            }
-            Shape::Store(kind) => {
-                for k in 0..words as usize {
-                    let ptrs = self.ptr_at_vec(addr, offsets[k] as u64);
-                    let value = self.vector(data[k]);
-                    match kind {
-                        StoreShape::Narrow => {
-                            let value = ir.trunc(value, elem.vector(self.width()));
-                            self.masked_scatter_ty(value, ptrs, exec, elem, 1);
-                        }
-                        StoreShape::Lds => self.masked_scatter_ty(value, ptrs, exec, ir.i32(), 1),
-                        StoreShape::Affine => self.affine_store(value, ptrs, exec),
-                        StoreShape::Tile => unreachable!("tile stores are emitted as rows"),
-                        StoreShape::Scatter => self.masked_scatter_ty(value, ptrs, exec, elem, 4),
-                    }
-                }
-            }
+            Shape::Store(StoreShape::Tile) => self.emit_tile_store(addr, exec, words),
+            Shape::Store(kind) => self.emit_word_stores(addr, exec, kind, words),
             Shape::NarrowLoad => {
-                let value = self.masked_gather_ty(self.ptr_at_vec(addr, 0), exec, elem, 1);
-                let value = if size.signed() { ir.sext(value, self.vi32()) } else { ir.zext(value, self.vi32()) };
-                self.define(results[0], value);
+                let value = self.masked_gather_ty(self.ptr_at_vec(addr, 0), exec, words.elem, 1);
+                let value = if words.size.signed() { self.ir.sext(value, self.vi32()) } else { self.ir.zext(value, self.vi32()) };
+                self.define(words.results[0], value);
             }
-            Shape::PrivateTile { tile } => {
-                let rowty = ir.i32().vector(words);
-                let rows: Vec<_> = (0..self.width()).map(|l| {
-                    let a = ir.extract_at(addr, l);
-                    let p = ir.inttoptr(a, ir.ptr());
-                    ir.load(rowty, p).set_alignment(4)
-                }).collect();
-                let cols = self.transpose_rows(&rows, words, tile);
-                for k in 0..words as usize { self.define(results[k], cols[k]); }
-            }
-            Shape::Frame { stride_words: sp4, offset_words: ioff_w, group: grp } => {
-                let base_v = self.vector(base);
-                let nblk = self.width() / grp;
-                let blkty = ir.i32().vector(grp * sp4);
-                let poison_blk = blkty.poison();
-                let blocks: Vec<Value> = (0..nblk).map(|g| {
-                    let a = ir.extract_at(base_v, g * grp);
-                    let p = ir.inttoptr(a, ir.ptr());
-                    ir.load(blkty, p).set_alignment(4)
-                }).collect();
-                let per = size.bytes() / 4;
-                let extract = |cg: &Self, fw: u32| -> Value {
-                    let parts: Vec<Value> = blocks.iter().map(|&blk| {
-                        let idx: Vec<u32> = (0..grp).flat_map(|lane| (0..per).map(move |w| lane * sp4 + fw + w)).collect();
-                        ir.shuffle_by(blk, poison_blk, &idx)
-                    }).collect();
-                    let joined = cg.vconcat_i32(&parts);
-                    if per == 1 { joined } else { ir.bitcast(joined, cg.vi64()) }
-                };
-                for k in 0..words as usize { let v = extract(self, ioff_w + k as u32 * per); self.define(results[k], v); }
-            }
-            Shape::Words { lanes, pairs } => {
-                let mut k = 0usize;
-                while k < words as usize {
-                    if pairs && k + 1 < words as usize {
-                        let ptrs = self.ptr_at_vec(addr, offsets[k] as u64);
-                        let d = match lanes {
-                            Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, ir.f64()),
-                            _ => self.masked_gather_ty(ptrs, exec, ir.f64(), 4),
-                        };
-                        let (lo, hi) = self.split_pair(d);
-                        self.define(results[k], lo);
-                        self.define(results[k + 1], hi);
-                        self.loaded_pairs.insert((results[k], results[k + 1]), d);
-                        k += 2;
-                    } else {
-                        let ptrs = self.ptr_at_vec(addr, offsets[k] as u64);
-                        let d = match lanes {
-                            Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, elem),
-                            Lanes::Lds => self.masked_gather_ty(ptrs, exec, ir.i32(), 1),
-                            Lanes::Affine { allocated } => self.affine_load(ptrs, exec, allocated),
-                            Lanes::Gather => self.masked_gather_ty(ptrs, exec, elem, 4),
-                        };
-                        self.define(results[k], d);
-                        k += 1;
-                    }
-                }
-            }
+            Shape::PrivateTile { tile } => self.emit_private_tile(addr, tile, words),
+            Shape::Frame { stride_words, offset_words, group } => self.emit_frame_load(base, stride_words, offset_words, group, words),
+            Shape::Words { lanes, pairs } => self.emit_word_loads(addr, exec, nonempty, lanes, pairs, words),
             _ => unreachable!(),
         }
-        for (&r, &private) in results.iter().zip(&flat_private) { let v = self.values[r.0]; self.define(private, v); }
+    }
+
+    fn emit_lane_atomic_add(&mut self, addr: Value, d: Value, exec: Value, result_id: Option<ValueId>) {
+        let ir = self.ir;
+        let packed_exec = self.vec_to_mask(exec);
+        let ptrs = self.ptr_at_vec(addr, 0);
+        let mut result = self.vi32().poison();
+        for k in 0..self.width() {
+            let bit = ir.and(ir.lshr(packed_exec, self.ci32(k)), self.ci32(1));
+            let active = ir.icmp(IntPred::Ne, bit, self.ci32(0));
+            let ptr = ir.extract_at(ptrs, k);
+            let ptr = ir.select(active, ptr, self.sink);
+            let value = ir.extract_at(d, k);
+            let value = ir.select(active, value, self.ci32(0));
+            let old = ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent);
+            result = ir.insert_at(result, old, k);
+        }
+        if let Some(r) = result_id { self.define(r, result); }
+    }
+
+    fn emit_tile_store(&mut self, addr: Value, exec: Value, words: &Words) {
+        let ir = self.ir;
+        let cols: Vec<Value> = (0..words.count as usize).map(|k| self.vector(words.data[k])).collect();
+        let base = self.ptr_at_vec(addr, words.offsets[0] as u64);
+        let sink = ir.ptrtoint(self.tile_sink, ir.i64());
+        let addr_i = ir.ptrtoint(base, self.vi64());
+        let safe = ir.select(exec, addr_i, self.splat(sink));
+        let w = self.width();
+        for l in 0..w {
+            let mut parts = Vec::new();
+            let mut k = 0usize;
+            while k < words.count as usize {
+                if k + 1 < words.count as usize {
+                    parts.push(ir.shuffle_by(cols[k], cols[k + 1], &[l, w + l]));
+                    k += 2;
+                } else {
+                    parts.push(ir.shuffle_by(cols[k], cols[k].ty().poison(), &[l]));
+                    k += 1;
+                }
+            }
+            let row = self.vconcat_i32(&parts);
+            let a = ir.extract_at(safe, l);
+            let p = ir.inttoptr(a, ir.ptr());
+            ir.store(row, p).set_alignment(4);
+        }
+    }
+
+    fn emit_word_stores(&mut self, addr: Value, exec: Value, kind: StoreShape, words: &Words) {
+        for k in 0..words.count as usize {
+            let ptrs = self.ptr_at_vec(addr, words.offsets[k] as u64);
+            let value = self.vector(words.data[k]);
+            match kind {
+                StoreShape::Narrow => {
+                    let value = self.ir.trunc(value, words.elem.vector(self.width()));
+                    self.masked_scatter_ty(value, ptrs, exec, words.elem, 1);
+                }
+                StoreShape::Lds => self.masked_scatter_ty(value, ptrs, exec, self.ir.i32(), 1),
+                StoreShape::Affine => self.affine_store(value, ptrs, exec),
+                StoreShape::Tile => unreachable!("tile stores are emitted as rows"),
+                StoreShape::Scatter => self.masked_scatter_ty(value, ptrs, exec, words.elem, 4),
+            }
+        }
+    }
+
+    fn emit_private_tile(&mut self, addr: Value, tile: u32, words: &Words) {
+        let ir = self.ir;
+        let rowty = ir.i32().vector(words.count);
+        let rows: Vec<_> = (0..self.width()).map(|l| {
+            let a = ir.extract_at(addr, l);
+            let p = ir.inttoptr(a, ir.ptr());
+            ir.load(rowty, p).set_alignment(4)
+        }).collect();
+        let cols = self.transpose_rows(&rows, words.count, tile);
+        for k in 0..words.count as usize { self.define(words.results[k], cols[k]); }
+    }
+
+    fn emit_frame_load(&mut self, base: ValueId, stride_words: u32, offset_words: u32, group: u32, words: &Words) {
+        let ir = self.ir;
+        let base_v = self.vector(base);
+        let nblk = self.width() / group;
+        let blkty = ir.i32().vector(group * stride_words);
+        let poison_blk = blkty.poison();
+        let blocks: Vec<Value> = (0..nblk).map(|g| {
+            let a = ir.extract_at(base_v, g * group);
+            let p = ir.inttoptr(a, ir.ptr());
+            ir.load(blkty, p).set_alignment(4)
+        }).collect();
+        let per = words.size.bytes() / 4;
+        for k in 0..words.count as usize {
+            let first_word = offset_words + k as u32 * per;
+            let parts: Vec<Value> = blocks.iter().map(|&blk| {
+                let idx: Vec<u32> = (0..group).flat_map(|lane| (0..per).map(move |w| lane * stride_words + first_word + w)).collect();
+                ir.shuffle_by(blk, poison_blk, &idx)
+            }).collect();
+            let joined = self.vconcat_i32(&parts);
+            let value = if per == 1 { joined } else { ir.bitcast(joined, self.vi64()) };
+            self.define(words.results[k], value);
+        }
+    }
+
+    fn emit_word_loads(&mut self, addr: Value, exec: Value, nonempty: bool, lanes: Lanes, pairs: bool, words: &Words) {
+        let ir = self.ir;
+        let mut k = 0usize;
+        while k < words.count as usize {
+            let ptrs = self.ptr_at_vec(addr, words.offsets[k] as u64);
+            if pairs && k + 1 < words.count as usize {
+                let d = match lanes {
+                    Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, ir.f64()),
+                    _ => self.masked_gather_ty(ptrs, exec, ir.f64(), 4),
+                };
+                self.define_pair(&words.results[k..k + 2], d);
+                k += 2;
+            } else {
+                let d = match lanes {
+                    Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, words.elem),
+                    Lanes::Lds => self.masked_gather_ty(ptrs, exec, ir.i32(), 1),
+                    Lanes::Affine { allocated } => self.affine_load(ptrs, exec, allocated),
+                    Lanes::Gather => self.masked_gather_ty(ptrs, exec, words.elem, 4),
+                };
+                self.define(words.results[k], d);
+                k += 1;
+            }
+        }
     }
 
     fn emit_grouped_atomic_add(&self, addresses: Value, values: Value, exec: Value) {

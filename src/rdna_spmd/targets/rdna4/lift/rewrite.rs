@@ -116,289 +116,175 @@ fn vop1_widths(op: &I) -> Option<(u32, u32)> {
     }
 }
 
-pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
-    match inst {
-        InstFormat::SOPP(inst) => match inst.op {
-            I::S_DELAY_ALU
-            | I::S_WAIT_ALU
-            | I::S_WAIT_LOADCNT
-            | I::S_WAIT_LOADCNT_DSCNT
-            | I::S_WAIT_DSCNT
-            | I::S_WAIT_KMCNT
-            | I::S_WAIT_STORECNT
-            | I::S_WAIT_BVHCNT
-            | I::S_WAIT_SAMPLECNT
-            | I::S_CLAUSE
-            | I::S_NOP
-            | I::S_BRANCH
-            | I::S_ENDPGM => InstEffects::known(Vec::new(), Vec::new()),
-            I::S_CBRANCH_VCCZ | I::S_CBRANCH_VCCNZ => {
-                InstEffects::known(vec![106], Vec::new())
-            }
-            I::S_CBRANCH_EXECZ | I::S_CBRANCH_EXECNZ => {
-                InstEffects::known(vec![126], Vec::new())
-            }
-            I::S_CBRANCH_SCC0 | I::S_CBRANCH_SCC1 => {
-                InstEffects::known(Vec::new(), Vec::new())
-            }
-            _ => InstEffects::unknown(),
-        },
-        InstFormat::SOP1(inst) => match inst.op {
-            I::S_MOV_B32 => {
-                let mut reads = Vec::new();
-                read_src(&inst.ssrc0, 1, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            I::S_MOV_B64 => {
-                let mut reads = Vec::new();
-                read_src(&inst.ssrc0, 2, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(inst.sdst as u32, 2, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 | I::S_OR_SAVEEXEC_B32 => {
-                let mut reads = Vec::new();
-                read_src(&inst.ssrc0, 1, &mut reads);
-                read_sgpr(126, 1, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                kill_sgpr(126, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            _ => InstEffects::unknown(),
-        },
-        InstFormat::SOP2(inst) => match inst.op {
-            I::S_AND_B32
-            | I::S_OR_B32
-            | I::S_XOR_B32
-            | I::S_AND_NOT1_B32
-            | I::S_CSELECT_B32
-            | I::S_LSHL_B32
-            | I::S_LSHR_B32
-            | I::S_MUL_I32 => {
-                let mut reads = Vec::new();
-                read_src(&inst.ssrc0, 1, &mut reads);
-                read_src(&inst.ssrc1, 1, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            I::S_ADD_NC_U64 => {
-                let mut reads = Vec::new();
-                read_src(&inst.ssrc0, 2, &mut reads);
-                read_src(&inst.ssrc1, 2, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(inst.sdst as u32, 2, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            _ => InstEffects::unknown(),
-        },
-        InstFormat::SOPC(inst) => {
-            // SOPC compares only write SCC, which this pass does not model.
-            let mut reads = Vec::new();
-            read_src(&inst.ssrc0, 2, &mut reads);
-            read_src(&inst.ssrc1, 2, &mut reads);
-            InstEffects::known(reads, Vec::new())
+#[derive(Default)]
+struct Effects { reads: Vec<u32>, kills: Vec<u32> }
+
+impl Effects {
+    fn read(mut self, op: &SourceOperand, words: u32) -> Self { read_src(op, words, &mut self.reads); self }
+    fn read_sgpr(mut self, reg: u32, words: u32) -> Self { read_sgpr(reg, words, &mut self.reads); self }
+    fn read_vgpr(mut self, reg: u32, words: u32) -> Self { read_vgpr(reg, words, &mut self.reads); self }
+    fn read_exec(self) -> Self { self.read_sgpr(126, 1) }
+    fn read_vcc(self) -> Self { self.read_sgpr(106, 1) }
+    fn kill_sgpr(mut self, reg: u32, words: u32) -> Self { kill_sgpr(reg, words, &mut self.kills); self }
+    fn kill_vgpr(mut self, reg: u32, words: u32) -> Self { kill_vgpr(reg, words, &mut self.kills); self }
+    fn known(self) -> InstEffects { InstEffects::known(self.reads, self.kills) }
+}
+
+fn sopp_effects(op: I) -> InstEffects {
+    match op {
+        I::S_DELAY_ALU | I::S_WAIT_ALU | I::S_WAIT_LOADCNT | I::S_WAIT_LOADCNT_DSCNT | I::S_WAIT_DSCNT
+        | I::S_WAIT_KMCNT | I::S_WAIT_STORECNT | I::S_WAIT_BVHCNT | I::S_WAIT_SAMPLECNT | I::S_CLAUSE
+        | I::S_NOP | I::S_BRANCH | I::S_ENDPGM => Effects::default().known(),
+        I::S_CBRANCH_VCCZ | I::S_CBRANCH_VCCNZ => Effects::default().read_vcc().known(),
+        I::S_CBRANCH_EXECZ | I::S_CBRANCH_EXECNZ => Effects::default().read_exec().known(),
+        I::S_CBRANCH_SCC0 | I::S_CBRANCH_SCC1 => Effects::default().known(),
+        _ => InstEffects::unknown(),
+    }
+}
+
+fn sop1_effects(inst: &crate::rdna_instructions::SOP1) -> InstEffects {
+    match inst.op {
+        I::S_MOV_B32 => Effects::default().read(&inst.ssrc0, 1).kill_sgpr(inst.sdst as u32, 1).known(),
+        I::S_MOV_B64 => Effects::default().read(&inst.ssrc0, 2).kill_sgpr(inst.sdst as u32, 2).known(),
+        I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 | I::S_OR_SAVEEXEC_B32 => {
+            Effects::default().read(&inst.ssrc0, 1).read_exec().kill_sgpr(inst.sdst as u32, 1).kill_sgpr(126, 1).known()
         }
-        InstFormat::SOPK(inst) => {
-            // Conservatively treat the destination as read.
-            let mut reads = Vec::new();
-            read_sgpr(inst.sdst as u32, 2, &mut reads);
-            InstEffects::known(reads, Vec::new())
+        _ => InstEffects::unknown(),
+    }
+}
+
+fn sop2_effects(inst: &crate::rdna_instructions::SOP2) -> InstEffects {
+    match inst.op {
+        I::S_AND_B32 | I::S_OR_B32 | I::S_XOR_B32 | I::S_AND_NOT1_B32 | I::S_CSELECT_B32
+        | I::S_LSHL_B32 | I::S_LSHR_B32 | I::S_MUL_I32 => {
+            Effects::default().read(&inst.ssrc0, 1).read(&inst.ssrc1, 1).kill_sgpr(inst.sdst as u32, 1).known()
         }
-        InstFormat::VOPC(inst) => {
-            let name = format!("{:?}", inst.op);
-            let mut reads = Vec::new();
-            read_src(&inst.src0, 2, &mut reads);
-            read_vgpr(inst.vsrc1 as u32, 2, &mut reads);
-            read_sgpr(126, 1, &mut reads);
-            let mut kills = Vec::new();
-            if name.starts_with("V_CMPX_") {
-                kill_sgpr(126, 1, &mut kills);
-            } else {
-                kill_sgpr(106, 1, &mut kills);
-            }
+        I::S_ADD_NC_U64 => Effects::default().read(&inst.ssrc0, 2).read(&inst.ssrc1, 2).kill_sgpr(inst.sdst as u32, 2).known(),
+        _ => InstEffects::unknown(),
+    }
+}
+
+fn vopc_effects(inst: &crate::rdna_instructions::VOPC) -> InstEffects {
+    let name = format!("{:?}", inst.op);
+    let effects = Effects::default().read(&inst.src0, 2).read_vgpr(inst.vsrc1 as u32, 2).read_exec();
+    if name.starts_with("V_CMPX_") { effects.kill_sgpr(126, 1).known() } else { effects.kill_sgpr(106, 1).known() }
+}
+
+fn vop1_effects(inst: &crate::rdna_instructions::VOP1) -> InstEffects {
+    match vop1_widths(&inst.op) {
+        Some((src_words, dst_words)) => Effects::default().read(&inst.src0, src_words).kill_vgpr(inst.vdst as u32, dst_words).known(),
+        None => InstEffects::unknown(),
+    }
+}
+
+fn vop2_effects(inst: &crate::rdna_instructions::VOP2) -> InstEffects {
+    match vop3_arith_widths(&inst.op) {
+        Some((src_words, dst_words)) => {
+            let mut effects = Effects::default().read(&inst.src0, src_words).read_vgpr(inst.vsrc1 as u32, src_words);
+            if let I::V_CNDMASK_B32 = inst.op { effects = effects.read_vcc(); }
+            effects.kill_vgpr(inst.vdst as u32, dst_words).known()
+        }
+        None => InstEffects::unknown(),
+    }
+}
+
+fn vop3_effects(inst: &crate::rdna_instructions::VOP3) -> InstEffects {
+    let name = format!("{:?}", inst.op);
+    if name.starts_with("V_CMPX_") {
+        return Effects::default().read(&inst.src0, 2).read(&inst.src1, 2).read_exec().kill_sgpr(126, 1).known();
+    }
+    if name.starts_with("V_CMP_") {
+        // VOP3-encoded compare: vdst is the destination SGPR.
+        return Effects::default().read(&inst.src0, 2).read(&inst.src1, 2).kill_sgpr(inst.vdst as u32, 1).known();
+    }
+    match vop3_arith_widths(&inst.op) {
+        Some((src_words, dst_words)) => {
+            let src1_words = match inst.op {
+                I::V_LDEXP_F64 | I::V_TRIG_PREOP_F64 => 1,
+                _ => src_words,
+            };
+            let mut effects = Effects::default().read(&inst.src0, src_words).read(&inst.src1, src1_words).read(&inst.src2, src_words);
+            if let I::V_DIV_FMAS_F64 = inst.op { effects = effects.read_vcc(); }
+            effects.kill_vgpr(inst.vdst as u32, dst_words).known()
+        }
+        None => InstEffects::unknown(),
+    }
+}
+
+fn vop3sd_effects(inst: &crate::rdna_instructions::VOP3SD) -> InstEffects {
+    let words = match inst.op {
+        I::V_DIV_SCALE_F64 => [2, 2, 2, 2],
+        I::V_MAD_CO_U64_U32 => [1, 1, 2, 2],
+        I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 => [1, 1, 1, 1],
+        _ => return InstEffects::unknown(),
+    };
+    Effects::default().read(&inst.src0, words[0]).read(&inst.src1, words[1]).read(&inst.src2, words[2])
+        .kill_vgpr(inst.vdst as u32, words[3]).kill_sgpr(inst.sdst as u32, 1).known()
+}
+
+fn vglobal_effects(inst: &crate::rdna_instructions::VGLOBAL) -> InstEffects {
+    let name = format!("{:?}", inst.op);
+    let data_words = if name.ends_with("_B128") { 4 } else if name.ends_with("_B96") { 3 } else if name.ends_with("_B64") { 2 } else { 1 };
+    let mut effects = Effects::default().read_vgpr(inst.vaddr as u32, 2);
+    if inst.saddr != SGPR_NULL as u8 { effects = effects.read_sgpr(inst.saddr as u32, 2); }
+    let effects = effects.read_exec();
+    if name.starts_with("GLOBAL_LOAD") {
+        // Loads only write lanes with EXEC set, so the destination is
+        // a partial write: model it as a read, never a kill.
+        effects.read_vgpr(inst.vdst as u32, data_words).known()
+    } else if name.starts_with("GLOBAL_STORE") {
+        effects.read_vgpr(inst.vsrc as u32, data_words).known()
+    } else {
+        InstEffects::unknown()
+    }
+}
+
+fn vopd_half(op: &I, src0: &SourceOperand, vsrc1: u8, vdst: u32) -> Option<Effects> {
+    let effects = match op {
+        I::V_DUAL_MOV_B32 => Effects::default().read(src0, 1),
+        I::V_DUAL_CNDMASK_B32 => Effects::default().read(src0, 1).read_vgpr(vsrc1 as u32, 1).read_vcc(),
+        I::V_DUAL_ADD_F32 | I::V_DUAL_MUL_F32 | I::V_DUAL_AND_B32 | I::V_DUAL_ADD_NC_U32 | I::V_DUAL_LSHLREV_B32 => {
+            Effects::default().read(src0, 1).read_vgpr(vsrc1 as u32, 1)
+        }
+        I::V_DUAL_FMAC_F32 => Effects::default().read(src0, 1).read_vgpr(vsrc1 as u32, 1).read_vgpr(vdst, 1),
+        _ => return None,
+    };
+    Some(effects.kill_vgpr(vdst, 1))
+}
+
+fn vopd_effects(inst: &crate::rdna_instructions::VOPD) -> InstEffects {
+    // VOPD Y-op's real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1) — opposite
+    // parity of X — not vdsty directly. Using vdsty here made the DCE treat
+    // the wrong register as killed and drop live producers of the real one.
+    let dy = ((inst.vdsty as u32) << 1) | (((inst.vdstx as u32) & 1) ^ 1);
+    match (vopd_half(&inst.opx, &inst.src0x, inst.vsrc1x, inst.vdstx as u32), vopd_half(&inst.opy, &inst.src0y, inst.vsrc1y, dy)) {
+        (Some(x), Some(y)) => {
+            let mut reads = x.reads;
+            reads.extend(y.reads);
+            let mut kills = x.kills;
+            kills.extend(y.kills);
             InstEffects::known(reads, kills)
         }
-        InstFormat::VOP1(inst) => match vop1_widths(&inst.op) {
-            Some((src_words, dst_words)) => {
-                let mut reads = Vec::new();
-                read_src(&inst.src0, src_words, &mut reads);
-                let mut kills = Vec::new();
-                kill_vgpr(inst.vdst as u32, dst_words, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            None => InstEffects::unknown(),
-        },
-        InstFormat::VOP2(inst) => match vop3_arith_widths(&inst.op) {
-            Some((src_words, dst_words)) => {
-                let mut reads = Vec::new();
-                read_src(&inst.src0, src_words, &mut reads);
-                read_vgpr(inst.vsrc1 as u32, src_words, &mut reads);
-                if let I::V_CNDMASK_B32 = inst.op {
-                    read_sgpr(106, 1, &mut reads);
-                }
-                let mut kills = Vec::new();
-                kill_vgpr(inst.vdst as u32, dst_words, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            None => InstEffects::unknown(),
-        },
-        InstFormat::VOP3(inst) => {
-            let name = format!("{:?}", inst.op);
-            if name.starts_with("V_CMPX_") {
-                let mut reads = Vec::new();
-                read_src(&inst.src0, 2, &mut reads);
-                read_src(&inst.src1, 2, &mut reads);
-                read_sgpr(126, 1, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(126, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            } else if name.starts_with("V_CMP_") {
-                // VOP3-encoded compare: vdst is the destination SGPR.
-                let mut reads = Vec::new();
-                read_src(&inst.src0, 2, &mut reads);
-                read_src(&inst.src1, 2, &mut reads);
-                let mut kills = Vec::new();
-                kill_sgpr(inst.vdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            } else {
-                match vop3_arith_widths(&inst.op) {
-                    Some((src_words, dst_words)) => {
-                        let mut reads = Vec::new();
-                        let src1_words = match inst.op {
-                            I::V_LDEXP_F64 | I::V_TRIG_PREOP_F64 => 1,
-                            _ => src_words,
-                        };
-                        read_src(&inst.src0, src_words, &mut reads);
-                        read_src(&inst.src1, src1_words, &mut reads);
-                        read_src(&inst.src2, src_words, &mut reads);
-                        if let I::V_DIV_FMAS_F64 = inst.op {
-                            read_sgpr(106, 1, &mut reads);
-                        }
-                        let mut kills = Vec::new();
-                        kill_vgpr(inst.vdst as u32, dst_words, &mut kills);
-                        InstEffects::known(reads, kills)
-                    }
-                    None => InstEffects::unknown(),
-                }
-            }
-        }
-        InstFormat::VOP3SD(inst) => match inst.op {
-            I::V_DIV_SCALE_F64 => {
-                let mut reads = Vec::new();
-                read_src(&inst.src0, 2, &mut reads);
-                read_src(&inst.src1, 2, &mut reads);
-                read_src(&inst.src2, 2, &mut reads);
-                let mut kills = Vec::new();
-                kill_vgpr(inst.vdst as u32, 2, &mut kills);
-                kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            I::V_MAD_CO_U64_U32 => {
-                let mut reads = Vec::new();
-                read_src(&inst.src0, 1, &mut reads);
-                read_src(&inst.src1, 1, &mut reads);
-                read_src(&inst.src2, 2, &mut reads);
-                let mut kills = Vec::new();
-                kill_vgpr(inst.vdst as u32, 2, &mut kills);
-                kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 => {
-                let mut reads = Vec::new();
-                read_src(&inst.src0, 1, &mut reads);
-                read_src(&inst.src1, 1, &mut reads);
-                read_src(&inst.src2, 1, &mut reads);
-                let mut kills = Vec::new();
-                kill_vgpr(inst.vdst as u32, 1, &mut kills);
-                kill_sgpr(inst.sdst as u32, 1, &mut kills);
-                InstEffects::known(reads, kills)
-            }
-            _ => InstEffects::unknown(),
-        },
-        InstFormat::VGLOBAL(inst) => {
-            let name = format!("{:?}", inst.op);
-            let data_words = if name.ends_with("_B128") {
-                4
-            } else if name.ends_with("_B96") {
-                3
-            } else if name.ends_with("_B64") {
-                2
-            } else {
-                1
-            };
-            let mut reads = Vec::new();
-            read_vgpr(inst.vaddr as u32, 2, &mut reads);
-            if inst.saddr != SGPR_NULL as u8 {
-                read_sgpr(inst.saddr as u32, 2, &mut reads);
-            }
-            read_sgpr(126, 1, &mut reads);
-            if name.starts_with("GLOBAL_LOAD") {
-                // Loads only write lanes with EXEC set, so the destination is
-                // a partial write: model it as a read, never a kill.
-                read_vgpr(inst.vdst as u32, data_words, &mut reads);
-                InstEffects::known(reads, Vec::new())
-            } else if name.starts_with("GLOBAL_STORE") {
-                read_vgpr(inst.vsrc as u32, data_words, &mut reads);
-                InstEffects::known(reads, Vec::new())
-            } else {
-                InstEffects::unknown()
-            }
-        }
-        InstFormat::VOPD(inst) => {
-            let half =
-                |op: &I, src0: &SourceOperand, vsrc1: u8, vdst: u32| -> Option<(Vec<u32>, Vec<u32>)> {
-                    let mut reads = Vec::new();
-                    let mut kills = Vec::new();
-                    match op {
-                        I::V_DUAL_MOV_B32 => {
-                            read_src(src0, 1, &mut reads);
-                        }
-                        I::V_DUAL_CNDMASK_B32 => {
-                            read_src(src0, 1, &mut reads);
-                            read_vgpr(vsrc1 as u32, 1, &mut reads);
-                            read_sgpr(106, 1, &mut reads);
-                        }
-                        I::V_DUAL_ADD_F32
-                        | I::V_DUAL_MUL_F32
-                        | I::V_DUAL_AND_B32
-                        | I::V_DUAL_ADD_NC_U32
-                        | I::V_DUAL_LSHLREV_B32 => {
-                            read_src(src0, 1, &mut reads);
-                            read_vgpr(vsrc1 as u32, 1, &mut reads);
-                        }
-                        I::V_DUAL_FMAC_F32 => {
-                            read_src(src0, 1, &mut reads);
-                            read_vgpr(vsrc1 as u32, 1, &mut reads);
-                            read_vgpr(vdst as u32, 1, &mut reads);
-                        }
-                        _ => return None,
-                    }
-                    kill_vgpr(vdst as u32, 1, &mut kills);
-                    Some((reads, kills))
-                };
+        _ => InstEffects::unknown(),
+    }
+}
 
-            // VOPD Y-op's real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1) — opposite
-            // parity of X — not vdsty directly. Using vdsty here made the DCE treat
-            // the wrong register as killed and drop live producers of the real one.
-            let dy = ((inst.vdsty as u32) << 1) | (((inst.vdstx as u32) & 1) ^ 1);
-            match (
-                half(&inst.opx, &inst.src0x, inst.vsrc1x, inst.vdstx as u32),
-                half(&inst.opy, &inst.src0y, inst.vsrc1y, dy),
-            ) {
-                (Some((rx, kx)), Some((ry, ky))) => {
-                    let mut reads = rx;
-                    reads.extend(ry);
-                    let mut kills = kx;
-                    kills.extend(ky);
-                    InstEffects::known(reads, kills)
-                }
-                _ => InstEffects::unknown(),
-            }
-        }
+pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
+    match inst {
+        InstFormat::SOPP(inst) => sopp_effects(inst.op),
+        InstFormat::SOP1(inst) => sop1_effects(inst),
+        InstFormat::SOP2(inst) => sop2_effects(inst),
+        // SOPC compares only write SCC, which this pass does not model.
+        InstFormat::SOPC(inst) => Effects::default().read(&inst.ssrc0, 2).read(&inst.ssrc1, 2).known(),
+        // Conservatively treat the destination as read.
+        InstFormat::SOPK(inst) => Effects::default().read_sgpr(inst.sdst as u32, 2).known(),
+        InstFormat::VOPC(inst) => vopc_effects(inst),
+        InstFormat::VOP1(inst) => vop1_effects(inst),
+        InstFormat::VOP2(inst) => vop2_effects(inst),
+        InstFormat::VOP3(inst) => vop3_effects(inst),
+        InstFormat::VOP3SD(inst) => vop3sd_effects(inst),
+        InstFormat::VGLOBAL(inst) => vglobal_effects(inst),
+        InstFormat::VOPD(inst) => vopd_effects(inst),
         _ => InstEffects::unknown(),
     }
 }

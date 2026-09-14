@@ -175,32 +175,51 @@ fn located(defs: &[Option<Op>], constants: &[Option<u64>], mut v: ValueId) -> (V
     (v, offset)
 }
 
+struct WordAccess {
+    index: usize,
+    provenance: u64,
+    semantics: MemorySemantics,
+    root: ValueId,
+    offset: i64,
+    exec: ValueId,
+    value: ValueId,
+}
+
+impl WordAccess {
+    fn precedes(&self, other: &WordAccess) -> bool {
+        self.provenance >> 8 == other.provenance >> 8 && self.semantics == other.semantics
+            && self.root == other.root && self.offset + 4 == other.offset && self.exec == other.exec
+    }
+}
+
+fn word_effect(inst: &Inst, expected: MemoryOp) -> Option<(u64, MemorySemantics, &[ValueId], &[(ValueId, Ty)])> {
+    match inst {
+        Inst::Effect { provenance, op: EffectOp::Memory { space: Space::Global, op, semantics }, inputs, outputs } if *op == expected && !semantics.volatile => {
+            Some((*provenance, *semantics, inputs, outputs))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn wide_stores(f: &mut Func, constants: &[Option<u64>]) -> usize {
     let defs = f.definitions();
-    let word_store = |inst: &Inst| -> Option<(u64, MemorySemantics, ValueId, ValueId, ValueId)> {
-        match inst {
-            Inst::Effect { provenance, op: EffectOp::Memory { space: Space::Global, op: MemoryOp::Store(MemSize::B32), semantics }, inputs, .. } if !semantics.volatile => {
-                Some((*provenance, *semantics, inputs[0], inputs[1], inputs[2]))
-            }
-            _ => None,
-        }
-    };
     let half = |v: ValueId| match defs[v.0] { Some(Op::UnpackLo(x)) => Some((x, false)), Some(Op::UnpackHi(x)) => Some((x, true)), _ => None };
     let mut count = 0;
     for block in f.blocks.values_mut() {
-        let mut pending: Vec<(usize, u64, MemorySemantics, ValueId, i64, ValueId, ValueId)> = Vec::new();
+        let mut pending: Vec<WordAccess> = Vec::new();
         let mut removed: Vec<usize> = Vec::new();
         for index in 0..block.insts.len() {
-            let Some((provenance, semantics, address, data, exec)) = word_store(&block.insts[index]) else {
+            let Some((provenance, semantics, inputs, _)) = word_effect(&block.insts[index], MemoryOp::Store(MemSize::B32)) else {
                 if matches!(block.insts[index], Inst::Effect { .. }) { pending.clear(); }
                 continue;
             };
-            let (root, offset) = located(&defs, constants, address);
-            let Some((x, true)) = half(data) else { pending.push((index, provenance, semantics, root, offset, exec, data)); continue };
-            let partner = pending.iter().position(|&(_, p, m, r, o, e, d)| p >> 8 == provenance >> 8 && m == semantics && r == root && o + 4 == offset && e == exec && half(d) == Some((x, false)));
+            let (root, offset) = located(&defs, constants, inputs[0]);
+            let store = WordAccess { index, provenance, semantics, root, offset, exec: inputs[2], value: inputs[1] };
+            let Some((x, true)) = half(store.value) else { pending.push(store); continue };
+            let partner = pending.iter().position(|first| first.precedes(&store) && half(first.value) == Some((x, false)));
             match partner {
                 Some(k) => {
-                    let first = pending.remove(k).0;
+                    let first = pending.remove(k).index;
                     if let Inst::Effect { op: EffectOp::Memory { op, .. }, inputs, .. } = &mut block.insts[first] {
                         *op = MemoryOp::Store(MemSize::B64);
                         inputs[1] = x;
@@ -208,7 +227,7 @@ pub(crate) fn wide_stores(f: &mut Func, constants: &[Option<u64>]) -> usize {
                     removed.push(index);
                     count += 1;
                 }
-                None => pending.push((index, provenance, semantics, root, offset, exec, data)),
+                None => pending.push(store),
             }
         }
         for &index in removed.iter().rev() { block.insts.remove(index); }
@@ -230,46 +249,39 @@ pub(crate) fn wide_loads(f: &mut Func, constants: &[Option<u64>]) -> usize {
         for edge in block.term.edges() { for &v in &edge.args { uses[v.0].push(ValueId(usize::MAX)); } }
         if let Term::CondBr { cond, .. } = &block.term { uses[cond.0].push(ValueId(usize::MAX)); }
     }
-    let word_load = |inst: &Inst| -> Option<(u64, MemorySemantics, ValueId, ValueId, ValueId)> {
-        match inst {
-            Inst::Effect { provenance, op: EffectOp::Memory { space: Space::Global, op: MemoryOp::Load(MemSize::B32), semantics }, inputs, outputs } if !semantics.volatile => {
-                Some((*provenance, *semantics, inputs[0], inputs[1], outputs[0].0))
-            }
-            _ => None,
-        }
+    let only_packed_together = |lo: ValueId, hi: ValueId| {
+        !uses[lo.0].is_empty() && uses[lo.0].iter().chain(&uses[hi.0]).all(|u| packs.get(u).is_some_and(|&(a, b)| a == lo && b == hi))
     };
     let mut renames: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     let mut count = 0;
     let mut next = f.types.len();
     let mut fresh: Vec<Ty> = Vec::new();
     for block in f.blocks.values_mut() {
-        let mut pending: Vec<(usize, u64, MemorySemantics, ValueId, i64, ValueId, ValueId)> = Vec::new();
+        let mut pending: Vec<WordAccess> = Vec::new();
         let mut removed: Vec<usize> = Vec::new();
         for index in 0..block.insts.len() {
-            let Some((provenance, semantics, address, exec, hi)) = word_load(&block.insts[index]) else {
+            let Some((provenance, semantics, inputs, outputs)) = word_effect(&block.insts[index], MemoryOp::Load(MemSize::B32)) else {
                 if matches!(block.insts[index], Inst::Effect { .. }) { pending.clear(); }
                 continue;
             };
-            let (root, offset) = located(&defs, constants, address);
-            let partner = pending.iter().position(|&(_, p, m, r, o, e, _)| p >> 8 == provenance >> 8 && m == semantics && r == root && o + 4 == offset && e == exec);
-            let joined = partner.map(|k| pending[k]).filter(|&(_, _, _, _, _, _, lo)| {
-                !uses[lo.0].is_empty() && uses[lo.0].iter().chain(&uses[hi.0]).all(|u| packs.get(u).is_some_and(|&(a, b)| a == lo && b == hi))
-            });
-            match joined {
-                Some((first, _, _, _, _, _, lo)) => {
+            let (root, offset) = located(&defs, constants, inputs[0]);
+            let load = WordAccess { index, provenance, semantics, root, offset, exec: inputs[1], value: outputs[0].0 };
+            let partner = pending.iter().position(|first| first.precedes(&load)).filter(|&k| only_packed_together(pending[k].value, load.value));
+            match partner {
+                Some(k) => {
+                    let first = pending.remove(k);
                     let wide = ValueId(next);
                     next += 1;
                     fresh.push(Ty::I64);
-                    if let Inst::Effect { op: EffectOp::Memory { op, .. }, outputs, .. } = &mut block.insts[first] {
+                    if let Inst::Effect { op: EffectOp::Memory { op, .. }, outputs, .. } = &mut block.insts[first.index] {
                         *op = MemoryOp::Load(MemSize::B64);
                         *outputs = vec![(wide, Ty::I64)];
                     }
                     removed.push(index);
-                    for &u in &uses[lo.0] { renames.insert(u, wide); }
-                    pending.remove(partner.unwrap());
+                    for &u in &uses[first.value.0] { renames.insert(u, wide); }
                     count += 1;
                 }
-                None => pending.push((index, provenance, semantics, root, offset, exec, hi)),
+                None => pending.push(load),
             }
         }
         for &index in removed.iter().rev() { block.insts.remove(index); }
