@@ -3,12 +3,19 @@
 //! Ray operands are explicit bit-pattern values. Form their floating-point
 //! views where each native path consumes them, preserving the original order.
 use super::*;
-use crate::rdna_spmd::native::{Builder, Type};
+use crate::rdna_spmd::native::{BasicBlock, Builder, Type};
 
 #[derive(Clone, Copy)]
 pub(in crate::rdna_spmd) struct Storage {
     pub scratch: Value,
     pub packet: Option<(Value, Type)>,
+}
+
+struct Ray {
+    addr: Value,
+    extent: Value,
+    origin: [Value; 3],
+    inv: [Value; 3],
 }
 
 struct Native {
@@ -178,18 +185,20 @@ impl Native {
         };
         let sorts_boxes = resource_bit(31);
         let sorts_triangles_first = resource_bit(20);
-        let addr = a[2];
-        let extent = self.vf32_of(a[3]);
-        let origin: Vec<Value> = (0..3).map(|k| self.vf32_of(a[4 + k])).collect();
-        let inv: Vec<Value> = (0..3).map(|k| self.vf32_of(a[10 + k])).collect();
+        let ray = Ray {
+            addr: a[2],
+            extent: self.vf32_of(a[3]),
+            origin: [self.vf32_of(a[4]), self.vf32_of(a[5]), self.vf32_of(a[6])],
+            inv: [self.vf32_of(a[10]), self.vf32_of(a[11]), self.vf32_of(a[12])],
+        };
 
         // Representative node address over the active lanes, the same
         // umax idiom `emit_vglobal_cluster` uses (the block only runs
         // with EXEC != 0, so at least one lane contributes).
         let exec = a[13];
-        let masked = ir.select(exec, addr, self.vi64.null());
+        let masked = ir.select(exec, ray.addr, self.vi64.null());
         let rep = self.reduce(&format!("umax.v{}i64", self.w), ir.i64(), masked);
-        let same = ir.icmp(IntPred::Eq, addr, self.splat(rep, self.vi64));
+        let same = ir.icmp(IntPred::Eq, ray.addr, self.splat(rep, self.vi64));
         let same_or_off = ir.or(same, ir.not(exec));
         let uniform = self.reduce(&format!("and.v{}i1", self.w), ir.i1(), same_or_off);
         let ntype = ir.and(rep, self.ci64(7));
@@ -212,8 +221,25 @@ impl Native {
         ir.position_at_end(uni_bb);
         ir.cond_br(is_box, fast, tri_bb);
 
-        // ---- every active lane at the same box node ----------------
         ir.position_at_end(fast);
+        let (child, fast_end) = self.box_path(bvh_base, rep, &ray, slow, join);
+        ir.position_at_end(tri_bb);
+        let (tri_bits, tri_end) = self.triangle_path(a, bvh_base, rep, &ray, join);
+        ir.position_at_end(slow);
+        let (slow_res, slow_end) = self.general_path(a, resource, mask, &ray, join);
+
+        ir.position_at_end(join);
+        // All phis must sit at the top of the block, so build them
+        // before any of the register writes.
+        (0..4).map(|k| {
+            let phi = ir.phi(self.vi32);
+            phi.add_incoming(&[(child[k], fast_end), (tri_bits[k], tri_end), (slow_res[k], slow_end)]);
+            phi
+        }).collect()
+    }
+
+    fn box_path(&self, bvh_base: Value, rep: Value, ray: &Ray, slow: BasicBlock, join: BasicBlock) -> ([Value; 4], BasicBlock) {
+        let ir = self.ir;
         let node_ptr = self.node_address(bvh_base, rep);
         // Box4Node: child_index[4], then aabb[4] of { min[3], max[3] }.
         let field = |off: u64, ty: Type| self.node_field(node_ptr, off, ty);
@@ -228,8 +254,8 @@ impl Native {
                 let base = 16 + c * 24 + axis * 4;
                 let bhi = self.splat(field(base + 12, ir.f32()), self.vf32);
                 let blo = self.splat(field(base, ir.f32()), self.vf32);
-                let f = self.vfmul(self.vfsub(bhi, origin[axis as usize]), inv[axis as usize]);
-                let g = self.vfmul(self.vfsub(blo, origin[axis as usize]), inv[axis as usize]);
+                let f = self.vfmul(self.vfsub(bhi, ray.origin[axis as usize]), ray.inv[axis as usize]);
+                let g = self.vfmul(self.vfsub(blo, ray.origin[axis as usize]), ray.inv[axis as usize]);
                 for v in [f, g] {
                     let u = ir.fcmp(FloatPred::Uno, v, v);
                     nan_acc = Some(match nan_acc {
@@ -240,7 +266,7 @@ impl Native {
                 hi3[axis as usize] = self.vmaxnum_raw(f, g);
                 lo3[axis as usize] = self.vminnum_raw(f, g);
             }
-            let t1 = self.vminnum_raw(hi3[0], self.vminnum_raw(hi3[1], self.vminnum_raw(hi3[2], extent)));
+            let t1 = self.vminnum_raw(hi3[0], self.vminnum_raw(hi3[1], self.vminnum_raw(hi3[2], ray.extent)));
             let t0 = self.vmaxnum_raw(lo3[0], self.vmaxnum_raw(lo3[1], self.vmaxnum_raw(lo3[2], vzero)));
             let hit = ir.fcmp(FloatPred::Ole, t0, t1);
             let ci = self.splat(field(c * 4, ir.i32()), self.vi32);
@@ -272,10 +298,11 @@ impl Native {
         // minNum; that lane set is rare enough to redo in the helper.
         let any_nan = self.reduce(&format!("or.v{}i1", self.w), ir.i1(), nan_acc.unwrap());
         ir.cond_br(any_nan, slow, join);
-        let fast_end = ir.insert_block();
+        (child, ir.insert_block())
+    }
 
-        // ---- every active lane at the same triangle-pair node ------
-        ir.position_at_end(tri_bb);
+    fn triangle_path(&self, a: &[Value], bvh_base: Value, rep: Value, ray: &Ray, join: BasicBlock) -> ([Value; 4], BasicBlock) {
+        let ir = self.ir;
         let tnode = self.node_address(bvh_base, rep);
         let tfield = |off: u64, ty: Type| self.node_field(tnode, off, ty);
         // TrianglePairNode: v0,v1,v2,v3 (3 f32 each), pad, prim_index[2], flags.
@@ -308,7 +335,7 @@ impl Native {
         let e2 = sub3(&t2v, &t0v);
         let s1 = cross(&dir, &e2);
         let denom = dot(&s1, &e1);
-        let dv = sub3(&origin, &t0v);
+        let dv = sub3(&ray.origin, &t0v);
         let b_y = dot(&dv, &s1);
         let s2 = cross(&dv, &e1);
         let b_z = dot(&dir, &s2);
@@ -358,18 +385,19 @@ impl Native {
             sel(is1, b_y, sel(is2, b_z, b_x))
         };
         let tri_res = [sel(miss, missed, t_hit), denom, bary(0), bary(2)];
-        let tri_bits: Vec<Value> = tri_res.iter().map(|&v| self.vf32_bits(v)).collect();
+        let tri_bits = [self.vf32_bits(tri_res[0]), self.vf32_bits(tri_res[1]), self.vf32_bits(tri_res[2]), self.vf32_bits(tri_res[3])];
         ir.br(join);
-        let tri_end = ir.insert_block();
+        (tri_bits, ir.insert_block())
+    }
 
-        // ---- divergent nodes, triangle nodes, or NaN --------------
-        ir.position_at_end(slow);
+    fn general_path(&self, a: &[Value], resource: [Value; 2], mask: Value, ray: &Ray, join: BasicBlock) -> ([Value; 4], BasicBlock) {
+        let ir = self.ir;
         let (bvh_packet, bvh_packet_ty) = self.bvh_packet.expect("packet lowering requires the ray packet frame");
         let field_ptr = |f: u32| ir.struct_gep(bvh_packet_ty, bvh_packet, f);
         let inputs = [
-            addr, extent, origin[0], origin[1], origin[2],
+            ray.addr, ray.extent, ray.origin[0], ray.origin[1], ray.origin[2],
             self.vf32_of(a[7]), self.vf32_of(a[8]), self.vf32_of(a[9]),
-            inv[0], inv[1], inv[2],
+            ray.inv[0], ray.inv[1], ray.inv[2],
         ];
         let step = self.w.min(crate::rdna_translator::bvh::BVH_RAY_PACKET_LANES as u32);
         let slice = |v: Value, off: u32, len: u32| -> Value {
@@ -393,7 +421,7 @@ impl Native {
             chunks.push((0..4).map(|k| ir.load(ir.i32().vector(len), field_ptr(11 + k)).set_alignment(4)).collect());
             off += len;
         }
-        let slow_res: Vec<Value> = (0..4).map(|k| {
+        let joined = |k: usize| {
             let mut value = chunks[0][k];
             let mut have = value.ty().vector_size();
             for chunk in &chunks[1..] {
@@ -410,17 +438,9 @@ impl Native {
                 have += more;
             }
             value
-        }).collect();
+        };
+        let slow_res = [joined(0), joined(1), joined(2), joined(3)];
         ir.br(join);
-        let slow_end = ir.insert_block();
-
-        ir.position_at_end(join);
-        // All phis must sit at the top of the block, so build them
-        // before any of the register writes.
-        (0..4).map(|k| {
-            let phi = ir.phi(self.vi32);
-            phi.add_incoming(&[(child[k], fast_end), (tri_bits[k], tri_end), (slow_res[k], slow_end)]);
-            phi
-        }).collect()
+        (slow_res, ir.insert_block())
     }
 }

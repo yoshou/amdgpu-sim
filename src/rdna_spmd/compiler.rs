@@ -154,7 +154,17 @@ fn prepared(mut ir: Func, an: &mut Analyses, registry: &Arc<DialectRegistry>, wi
     }
 }
 
-pub(super) fn prepare_packet(f: LiftedFunction, width: u32, wide_masks: bool, cooperative: bool, observe_return: bool, num_vgprs: usize, aligned: bool) -> Prepared {
+pub(super) struct PacketOptions {
+    pub width: u32,
+    pub wide_masks: bool,
+    pub cooperative: bool,
+    pub observe_return: bool,
+    pub num_vgprs: usize,
+    pub aligned: bool,
+}
+
+pub(super) fn prepare_packet(f: LiftedFunction, options: PacketOptions) -> Prepared {
+    let PacketOptions { width, wide_masks, cooperative, observe_return, num_vgprs, aligned } = options;
     let Bare { mut ir, inputs, registry } = bare(f);
     let driver = Driver::new();
     let base = context(&registry, &inputs, width);
@@ -207,7 +217,7 @@ pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel
 pub(crate) fn compile_packet(program: Program, num_vgprs: usize, width: u32, workgroup_x: Option<u32>) -> VecKernel {
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
     let wide = wide_masks(&program.function.ir, width);
-    let p = prepare_packet(program.function, width, wide, false, false, num_vgprs.max(256), aligned);
+    let p = prepare_packet(program.function, PacketOptions { width, wide_masks: wide, cooperative: false, observe_return: false, num_vgprs: num_vgprs.max(256), aligned });
     let group = p.group();
     let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
     VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x, group)
@@ -220,7 +230,7 @@ pub(crate) fn compile_cooperative_packet(program: Program, num_vgprs: usize, wid
     let aligned = workgroup_x.map_or(true, |x| x % width == 0);
     let num_vgprs = program.vgpr_count(num_vgprs);
     let wide = wide_masks(&program.function.ir, width);
-    let p = prepare_packet(program.function, width, wide, true, true, num_vgprs, aligned);
+    let p = prepare_packet(program.function, PacketOptions { width, wide_masks: wide, cooperative: true, observe_return: true, num_vgprs, aligned });
     let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
     let yields = p.resume_layouts();
     if yields.iter().flatten().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
@@ -377,7 +387,7 @@ mod tests {
         assert!(constants(&p.function.ir, 4).contains(&2));
         assert!(matches!(p.function.ir.blocks[&BlockId(4)].term, Term::Ret(_)));
         assert!(constants(&p.function.ir, 4).contains(&1));
-        let packet = prepare_packet(p.function, 16, false, false, false, 256, true);
+        let packet = prepare_packet(p.function, PacketOptions { width: 16, wide_masks: false, cooperative: false, observe_return: false, num_vgprs: 256, aligned: true });
         assert!(constants(packet.ir.func(), 4).is_empty());
     }
 
