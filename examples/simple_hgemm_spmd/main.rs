@@ -341,10 +341,10 @@ fn main() -> Result<()> {
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
                 .unwrap_or(0);
-            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16));
+            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16 | 32));
             let verify_widths = matches.opt_present("verify_widths");
             let widths: Vec<u32> = if verify_widths {
-                vec![0, 1, 2, 4, 8, 16]
+                vec![0, 1, 2, 4, 8, 16, 32]
             } else {
                 vec![vec_width]
             };

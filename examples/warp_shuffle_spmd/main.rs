@@ -285,7 +285,7 @@ fn main() -> Result<()> {
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
                 .unwrap_or(0);
-            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16));
+            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16 | 32));
 
             set_u64(&mut arg_buffer, 0, output_ptr);
             set_u64(&mut arg_buffer, 8, input_ptr);

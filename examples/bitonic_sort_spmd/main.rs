@@ -295,7 +295,7 @@ fn main() -> Result<()> {
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
                 .unwrap_or(0);
-            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16));
+            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16 | 32));
             let mut kernels: std::collections::BTreeMap<u32, Kernel> = std::collections::BTreeMap::new();
 
             for i in 0..steps {
