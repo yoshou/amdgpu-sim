@@ -42,7 +42,10 @@ pub(crate) fn candidates(f: &Func, masks: &Masks, exec_index: usize) -> Vec<Bloc
                     value,
                     op: Op::Select(..),
                     ..
-                } => masks.predicated[value.0].is_some_and(|(_, e)| e == exec),
+                } => {
+                    masks.predicated[value.0].is_some_and(|(_, e)| e == exec)
+                        && masks.observed[value.0]
+                }
                 _ => false,
             })
             .count();

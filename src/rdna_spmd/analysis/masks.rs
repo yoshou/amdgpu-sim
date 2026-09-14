@@ -1,5 +1,6 @@
 use super::super::ir::{Cvt, EffectOp, Env, IntOp, Op, Ty, ValueId, WaveOp, *};
 use super::dataflow::{for_each_output, Backward, Cfg, Lattice, Sparse};
+use super::lanes::{ballot_of, lane_word, valid_masked, Lanes, Region};
 use super::{Analyses, Analysis, Constants};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -10,10 +11,10 @@ pub(crate) struct Masks {
     pub reactivation: Rc<Vec<(BlockId, usize)>>,
     pub full: Vec<bool>,
     pub guarded: Vec<bool>,
+    pub observed: Vec<bool>,
     pub predicated: Rc<Vec<Option<(ValueId, ValueId)>>>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub masked: Rc<Vec<bool>>,
-    pub exposed: Vec<u8>,
     pub chain: Rc<BTreeMap<BlockId, Vec<(usize, ValueId)>>>,
 }
 
@@ -116,17 +117,9 @@ pub(crate) fn all_active_guard(
     let Some(inactive) = any[cond.0] else {
         return false;
     };
-    let Some(Op::Int(IntOp::And, a, b)) = defs[inactive.0] else {
+    let Some(negated) = valid_masked(defs, inactive) else {
         return false;
     };
-    let (negated, valid) = if matches!(defs[b.0], Some(Op::Env(Env::ValidLane))) {
-        (a, b)
-    } else {
-        (b, a)
-    };
-    if !matches!(defs[valid.0], Some(Op::Env(Env::ValidLane))) {
-        return false;
-    }
     let Some(Op::Int(IntOp::Xor, x, one)) = defs[negated.0] else {
         return false;
     };
@@ -154,29 +147,6 @@ fn exec_param(block: &Block, exec_index: usize, f: &Func) -> ValueId {
         .nth(k)
         .expect("block lacks its EXEC parameter")
         .0
-}
-
-fn ballot_of(f: &Func) -> Vec<Option<ValueId>> {
-    let mut out = vec![None; f.types.len()];
-    for block in f.blocks.values() {
-        for inst in &block.insts {
-            match inst {
-                Inst::Packet {
-                    op: PacketOp::Ballot,
-                    input,
-                    output,
-                } => out[output.0] = Some(*input),
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Ballot),
-                    inputs,
-                    outputs,
-                    ..
-                } => out[outputs[0].0 .0] = Some(inputs[0]),
-                _ => {}
-            }
-        }
-    }
-    out
 }
 
 fn block_index(f: &Func) -> Vec<usize> {
@@ -237,9 +207,6 @@ impl Bits {
     fn new(values: usize) -> Self {
         Self(vec![0; values.div_ceil(64)])
     }
-    fn clear(&mut self) {
-        self.0.fill(0);
-    }
     fn insert(&mut self, v: ValueId) {
         self.0[v.0 / 64] |= 1 << (v.0 % 64);
     }
@@ -274,41 +241,6 @@ fn same_bit(value: ValueId, exec: ValueId, defs: &[Option<Op>]) -> bool {
     }
 }
 
-fn subset(
-    bit: ValueId,
-    exec: ValueId,
-    defs: &[Option<Op>],
-    ballots: &[Option<ValueId>],
-    constants: &[Option<u64>],
-) -> bool {
-    if same_bit(bit, exec, defs) {
-        return true;
-    }
-    if constants[bit.0] == Some(0) {
-        return true;
-    }
-    match defs[bit.0].as_ref() {
-        Some(Op::Int(IntOp::And, a, b)) => same_bit(*a, exec, defs) || same_bit(*b, exec, defs),
-        Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match defs[shifted.0].as_ref() {
-            Some(Op::Int(IntOp::LShr, word, lane))
-                if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) =>
-            {
-                if constants[word.0] == Some(0) {
-                    return true;
-                }
-                match defs[word.0].as_ref() {
-                    Some(Op::Int(IntOp::And, a, b)) => [a, b]
-                        .iter()
-                        .any(|w| ballots[w.0].is_some_and(|bit| same_bit(bit, exec, defs))),
-                    _ => ballots[word.0].is_some_and(|bit| same_bit(bit, exec, defs)),
-                }
-            }
-            _ => false,
-        },
-        _ => false,
-    }
-}
-
 #[derive(PartialEq)]
 pub(crate) struct Predication {
     pub reactivation: Rc<Vec<(BlockId, usize)>>,
@@ -317,13 +249,12 @@ pub(crate) struct Predication {
     pub masked_result: Vec<Option<ValueId>>,
     pub chain: Rc<BTreeMap<BlockId, Vec<(usize, ValueId)>>>,
     updates: Vec<(ValueId, ValueId, ValueId)>,
-    defs: Vec<Option<Op>>,
-    ballots: Vec<Option<ValueId>>,
+    lanes: Lanes,
 }
 
 fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predication {
-    let defs = f.definitions();
-    let ballots = ballot_of(f);
+    let lanes = Lanes::new(f, constants);
+    let defs = &lanes.defs;
     let mut reactivation = Vec::new();
     let mut updates: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
     let mut predicated: Vec<Option<(ValueId, ValueId)>> = vec![None; f.types.len()];
@@ -355,41 +286,28 @@ fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predic
             _ => None,
         };
         for (index, inst) in block.insts.iter().enumerate() {
-            match inst {
-                Inst::Core {
-                    value,
-                    op: Op::Int(IntOp::And, a, b),
-                    ..
-                } if query != Some(*value)
-                    && matches!(defs[b.0].as_ref(), Some(Op::Env(Env::ValidLane)))
-                    || query != Some(*value)
-                        && matches!(defs[a.0].as_ref(), Some(Op::Env(Env::ValidLane))) =>
-                {
-                    let bit = if matches!(defs[b.0].as_ref(), Some(Op::Env(Env::ValidLane))) {
-                        *a
-                    } else {
-                        *b
-                    };
-                    if !subset(bit, current, &defs, &ballots, constants) {
-                        reactivation.push((id, index));
-                    }
-                    updates.push((*value, current, bit));
-                    current = *value;
-                    entries.push((index + 1, current));
+            let Inst::Core { value, ty, op } = inst else {
+                continue;
+            };
+            if let Some(bit) = lanes.valid_masked(*value).filter(|_| query != Some(*value)) {
+                if !lanes.within(bit, &lanes.class(current)) {
+                    reactivation.push((id, index));
                 }
-                Inst::Core {
-                    value,
-                    op: Op::Select(c, new, _),
-                    ..
-                } if same_bit(*c, current, &defs) => predicated[value.0] = Some((*new, current)),
-                Inst::Core {
-                    value,
-                    ty: Ty::I1,
-                    op: Op::Int(IntOp::And, a, b),
-                } if same_bit(*a, current, &defs) || same_bit(*b, current, &defs) => {
+                updates.push((*value, current, bit));
+                current = *value;
+                entries.push((index + 1, current));
+                continue;
+            }
+            match *op {
+                Op::Select(c, new, _) if same_bit(c, current, defs) => {
+                    predicated[value.0] = Some((new, current))
+                }
+                Op::Int(IntOp::And, a, b)
+                    if *ty == Ty::I1
+                        && (same_bit(a, current, defs) || same_bit(b, current, defs)) =>
+                {
                     masked[value.0] = true;
-                    masked_result[value.0] =
-                        Some(if same_bit(*b, current, &defs) { *a } else { *b });
+                    masked_result[value.0] = Some(if same_bit(b, current, defs) { a } else { b });
                 }
                 _ => {}
             }
@@ -403,8 +321,7 @@ fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predic
         masked_result,
         chain: Rc::new(chain),
         updates,
-        defs,
-        ballots,
+        lanes,
     }
 }
 
@@ -443,7 +360,7 @@ fn analyze_from(
             o.effect == super::super::dialect::Effect::ReadGlobal { every_lane: true }
         })
     };
-    let defs = &p.defs;
+    let defs = &p.lanes.defs;
     let any = any_of(f);
     let lane_mask = if width >= 64 {
         u64::MAX
@@ -530,14 +447,9 @@ fn analyze_from(
             Inst::Core { op, .. } => match *op {
                 Op::Env(Env::ValidLane) => true,
                 Op::Convert(Cvt::Bitcast, _, a) => facts[a.0],
-                Op::Convert(Cvt::Trunc, Ty::I1, shifted) => match defs[shifted.0].as_ref() {
-                    Some(Op::Int(IntOp::LShr, word, lane))
-                        if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) =>
-                    {
-                        facts[word.0]
-                    }
-                    _ => false,
-                },
+                Op::Convert(Cvt::Trunc, Ty::I1, _) => {
+                    lane_word(defs, v).is_some_and(|word| facts[word.0])
+                }
                 Op::Int(IntOp::And, a, b) => facts[a.0] && facts[b.0],
                 Op::Int(IntOp::Or, a, b) => facts[a.0] || facts[b.0],
                 _ => false,
@@ -554,23 +466,75 @@ fn analyze_from(
     }
     .solve(f.types.len());
     let live = live_across(f, &reactivation, &predicated, &layout);
-    let internal = exposure(f, &predicated, &masked, &live, false, &every_lane, &layout);
-    let exposed = exposure(f, &predicated, &masked, &live, true, &every_lane, &layout);
+    let sets = exposure_sets(f, &predicated, &masked, &live, &every_lane, &layout);
+    let current = defining_execs(f, &chain);
+    let region = Region::new(f, &p.lanes, &cfg, &chain);
+    let mut settled: BTreeMap<ValueId, bool> = BTreeMap::new();
+    let residual: Vec<u8> = sets
+        .iter()
+        .zip(&current)
+        .map(|(&[low, high], exec)| {
+            let roots = low | high;
+            let Some(exec) = *exec else {
+                return roots;
+            };
+            if full[exec.0] {
+                return 0;
+            }
+            if roots & POINT == 0 || roots & STATIC != 0 {
+                return roots;
+            }
+            let never_widens = *settled
+                .entry(exec)
+                .or_insert_with(|| region.never_widens(exec));
+            if never_widens {
+                roots & !POINT
+            } else {
+                roots
+            }
+        })
+        .collect();
     let guarded = predicated
         .iter()
-        .enumerate()
-        .map(|(id, p)| p.is_some_and(|(_, exec)| full[exec.0] || internal[id] == 0))
+        .zip(&residual)
+        .map(|(p, roots)| p.is_some() && roots & (POINT | STATIC) == 0)
         .collect();
+    let observed = residual.iter().map(|&roots| roots != 0).collect();
     Masks {
         reactivation,
         full,
         guarded,
+        observed,
         predicated,
         masked,
-        exposed,
         chain,
     }
 }
+
+fn defining_execs(
+    f: &Func,
+    chain: &BTreeMap<BlockId, Vec<(usize, ValueId)>>,
+) -> Vec<Option<ValueId>> {
+    let mut out = vec![None; f.types.len()];
+    for (id, block) in &f.blocks {
+        let entries = &chain[id];
+        for &(param, _) in &block.params {
+            out[param.0] = Some(entries[0].1);
+        }
+        let mut next = 0;
+        for (index, inst) in block.insts.iter().enumerate() {
+            while next + 1 < entries.len() && entries[next + 1].0 <= index {
+                next += 1;
+            }
+            for_each_output(inst, |value| out[value.0] = Some(entries[next].1));
+        }
+    }
+    out
+}
+
+const POINT: u8 = 1;
+const RET: u8 = 2;
+const STATIC: u8 = 4;
 
 fn for_each_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
     match inst {
@@ -612,22 +576,25 @@ fn for_each_read(
     }
 }
 
-fn exposure(
+fn exposure_sets(
     f: &Func,
     predicated: &[Option<(ValueId, ValueId)>],
     masked: &[bool],
     live: &[bool],
-    returns: bool,
     every_lane: &dyn Fn(super::super::dialect::TargetOp) -> bool,
     layout: &Layout,
-) -> Vec<u8> {
-    let words = |v: ValueId| if f.types[v.0].bits() == 64 { 3u8 } else { 1u8 };
+) -> Vec<[u8; 2]> {
+    let wide = |v: ValueId| f.types[v.0].bits() == 64;
     let (producers, params) = (&layout.producers, &layout.params);
-    let mut pending: Vec<(ValueId, u8)> = live
-        .iter()
-        .enumerate()
-        .filter_map(|(id, &live)| live.then_some((ValueId(id), 3)))
-        .collect();
+    let mut seeds = vec![[0u8; 2]; f.types.len()];
+    let seed = |seeds: &mut Vec<[u8; 2]>, v: ValueId, root: u8| {
+        seeds[v.0] = [seeds[v.0][0] | root, seeds[v.0][1] | root];
+    };
+    for (id, &live) in live.iter().enumerate() {
+        if live {
+            seed(&mut seeds, ValueId(id), POINT);
+        }
+    }
     for block in &layout.blocks {
         for inst in block.insts.iter() {
             match inst {
@@ -644,81 +611,108 @@ fn exposure(
                         ),
                     inputs,
                     ..
-                } => pending.extend(inputs.iter().map(|&v| (v, 3))),
-                Inst::Packet { input, .. } => pending.push((*input, 3)),
+                } => {
+                    for &v in inputs {
+                        seed(&mut seeds, v, STATIC);
+                    }
+                }
+                Inst::Packet { input, .. } => seed(&mut seeds, *input, STATIC),
                 Inst::Target {
                     op,
                     args,
                     provenance: Some(_),
                     ..
-                } if every_lane(*op) => pending.extend(args.values().iter().map(|&v| (v, 3))),
+                } if every_lane(*op) => {
+                    for &v in args.values() {
+                        seed(&mut seeds, v, STATIC);
+                    }
+                }
                 _ => {}
             }
         }
-        if let (true, Term::Ret(args)) = (returns, &block.term) {
-            pending.extend(args.iter().map(|&v| (v, 3)));
+        if let Term::Ret(args) = &block.term {
+            for &v in args {
+                seed(&mut seeds, v, RET);
+            }
         }
     }
-    let mut exposed = vec![0u8; f.types.len()];
-    while let Some((v, mask)) = pending.pop() {
-        let added = mask & words(v) & !exposed[v.0];
-        if added == 0 {
+    let mut pending: Vec<(ValueId, [u8; 2])> = seeds
+        .iter()
+        .enumerate()
+        .filter(|(_, &roots)| roots != [0, 0])
+        .map(|(id, &roots)| (ValueId(id), roots))
+        .collect();
+    let mut sets = vec![[0u8; 2]; f.types.len()];
+    while let Some((v, want)) = pending.pop() {
+        let mut added = [0u8; 2];
+        for (half, slot) in added.iter_mut().enumerate() {
+            if half == 0 || wide(v) {
+                *slot = want[half] & !sets[v.0][half];
+                sets[v.0][half] |= *slot;
+            }
+        }
+        if added == [0, 0] {
             continue;
         }
-        exposed[v.0] |= added;
+        let both = added[0] | added[1];
+        let mut push = |target: ValueId, roots: [u8; 2]| {
+            if roots != [0, 0] {
+                pending.push((target, roots));
+            }
+        };
         if let Some((block, index)) = producers[v.0] {
             match &layout.blocks[block].insts[index] {
                 Inst::Core {
                     op: Op::Select(_, _, old),
                     ..
-                } if predicated[v.0].is_some() => pending.push((*old, added)),
+                } if predicated[v.0].is_some() => push(*old, added),
                 Inst::Core {
                     op: Op::Int(..), ..
                 } if masked[v.0] => {}
                 Inst::Core {
                     op: Op::UnpackLo(x),
                     ..
-                } => pending.push((*x, 1)),
+                } => push(*x, [both, 0]),
                 Inst::Core {
                     op: Op::UnpackHi(x),
                     ..
-                } => pending.push((*x, 2)),
+                } => push(*x, [0, both]),
                 Inst::Core {
                     op: Op::Pack64(lo, hi),
                     ..
                 } => {
-                    if added & 1 != 0 {
-                        pending.push((*lo, 1));
-                    }
-                    if added & 2 != 0 {
-                        pending.push((*hi, 1));
-                    }
+                    push(*lo, [added[0], 0]);
+                    push(*hi, [added[1], 0]);
                 }
                 Inst::Core {
                     op: Op::Convert(Cvt::Bitcast, _, a),
                     ..
-                } => pending.push((*a, added)),
+                } => push(*a, added),
                 Inst::Core {
                     op: Op::Convert(Cvt::Trunc | Cvt::ZExt | Cvt::SExt, _, a),
                     ..
-                } => pending.push((*a, 1)),
+                } => push(*a, [both, 0]),
                 Inst::Core { op, .. } => {
                     op.map(|a| {
-                        pending.push((a, 3));
+                        push(a, [both, both]);
                         a
                     });
                 }
-                Inst::Target { args, .. } => pending.extend(args.values().iter().map(|&a| (a, 3))),
-                Inst::Packet { input, .. } => pending.push((*input, 3)),
+                Inst::Target { args, .. } => {
+                    for &a in args.values() {
+                        push(a, [both, both]);
+                    }
+                }
+                Inst::Packet { input, .. } => push(*input, [both, both]),
                 Inst::Effect { .. } => {}
             }
         } else if let Some((block, index)) = params[v.0] {
             for edge in &layout.incoming[block] {
-                pending.push((edge.args[index], added));
+                push(edge.args[index], added);
             }
         }
     }
-    exposed
+    sets
 }
 
 fn needed(f: &Func, predicated: &[Option<(ValueId, ValueId)>], layout: &Layout) -> Vec<bool> {
@@ -822,7 +816,6 @@ fn live_across(
     }
     .solve();
     let mut across = vec![false; values];
-    let mut defined_after = Bits::new(values);
     for &(id, position) in points {
         let at = cfg.index[id.0];
         let block = cfg.blocks[at];
@@ -833,15 +826,10 @@ fn live_across(
                 for_each_read(inst, predicated, |v| live.insert(v));
             }
         }
-        defined_after.clear();
         for inst in &block.insts[position..] {
-            for_each_output(inst, |v| defined_after.insert(v));
+            for_each_output(inst, |v| live.remove(v));
         }
-        live.for_each(|v| {
-            if !defined_after.contains(v) {
-                across[v.0] = true;
-            }
-        });
+        live.for_each(|v| across[v.0] = true);
     }
     across
 }
@@ -849,6 +837,443 @@ fn live_across(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Builder {
+        f: Func,
+        insts: Vec<Inst>,
+    }
+
+    impl Builder {
+        fn new() -> Self {
+            Builder {
+                f: Func {
+                    entry: BlockId(0),
+                    blocks: BTreeMap::new(),
+                    types: vec![],
+                },
+                insts: vec![],
+            }
+        }
+
+        fn param(&mut self, ty: Ty) -> ValueId {
+            self.f.value(ty)
+        }
+
+        fn core(&mut self, ty: Ty, op: Op) -> ValueId {
+            let value = self.f.value(ty);
+            self.insts.push(Inst::Core { value, ty, op });
+            value
+        }
+
+        fn packet(&mut self, op: PacketOp, input: ValueId) -> ValueId {
+            let ty = if op == PacketOp::Ballot {
+                Ty::I32
+            } else {
+                Ty::I1
+            };
+            let output = self.f.value(ty);
+            self.insts.push(Inst::Packet { op, input, output });
+            output
+        }
+
+        fn lane_bit(&mut self, word: ValueId) -> ValueId {
+            let lane = self.core(Ty::I32, Op::Env(Env::LaneId));
+            let shifted = self.core(Ty::I32, Op::Int(IntOp::LShr, word, lane));
+            self.core(Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
+        }
+
+        fn restore(&mut self, bit: ValueId) -> ValueId {
+            let valid = self.core(Ty::I1, Op::Env(Env::ValidLane));
+            self.core(Ty::I1, Op::Int(IntOp::And, bit, valid))
+        }
+
+        fn block(&mut self, id: usize, params: Vec<(ValueId, Ty)>, term: Term) {
+            let insts = std::mem::take(&mut self.insts);
+            self.f.blocks.insert(
+                BlockId(id),
+                Block {
+                    params,
+                    insts,
+                    term,
+                },
+            );
+        }
+
+        fn masks(&self) -> Masks {
+            let constants = super::super::constant::constants(&self.f);
+            analyze(
+                &crate::rdna_spmd::targets::rdna4::registry(),
+                &self.f,
+                0,
+                &constants,
+                4,
+                false,
+            )
+        }
+    }
+
+    #[test]
+    fn a_restore_rebuilt_from_a_word_the_loop_changes_keeps_the_predicate() {
+        let mut b = Builder::new();
+        let (e0, x, m0) = (b.param(Ty::I1), b.param(Ty::I32), b.param(Ty::I32));
+        b.block(
+            0,
+            vec![(e0, Ty::I1), (x, Ty::I32), (m0, Ty::I32)],
+            Term::Br(Edge {
+                dst: BlockId(1),
+                args: vec![e0, x, m0],
+            }),
+        );
+        let (e1, previous, m) = (b.param(Ty::I1), b.param(Ty::I32), b.param(Ty::I32));
+        let bit = b.lane_bit(m);
+        let restored = b.restore(bit);
+        let one = b.core(Ty::I32, Op::Const(Ty::I32, 1));
+        let next = b.core(Ty::I32, Op::Int(IntOp::Add, previous, one));
+        let written = b.core(Ty::I32, Op::Select(restored, next, previous));
+        let eight = b.core(Ty::I32, Op::Const(Ty::I32, 8));
+        let below = b.core(Ty::I1, Op::Cmp(IntPred::Ult, written, eight));
+        let taken = b.core(Ty::I1, Op::Int(IntOp::And, below, restored));
+        let narrowed = b.restore(taken);
+        let flip = b.core(Ty::I32, Op::Const(Ty::I32, 0xf));
+        let flipped = b.core(Ty::I32, Op::Int(IntOp::Xor, m, flip));
+        let again = b.packet(PacketOp::Any, narrowed);
+        b.block(
+            1,
+            vec![(e1, Ty::I1), (previous, Ty::I32), (m, Ty::I32)],
+            Term::CondBr {
+                cond: again,
+                yes: Edge {
+                    dst: BlockId(1),
+                    args: vec![narrowed, written, flipped],
+                },
+                no: Edge {
+                    dst: BlockId(2),
+                    args: vec![narrowed],
+                },
+            },
+        );
+        let e2 = b.param(Ty::I1);
+        b.block(2, vec![(e2, Ty::I1)], Term::Ret(vec![]));
+        let masks = b.masks();
+        assert!(masks.predicated[written.0].is_some());
+        assert!(masks.observed[written.0]);
+        assert!(!masks.guarded[written.0]);
+    }
+
+    #[test]
+    fn a_restore_from_a_bit_saved_in_the_previous_iteration_keeps_the_predicate() {
+        let mut b = Builder::new();
+        let (e0, x) = (b.param(Ty::I1), b.param(Ty::I32));
+        let zero = b.core(Ty::I32, Op::Const(Ty::I32, 0));
+        b.block(
+            0,
+            vec![(e0, Ty::I1), (x, Ty::I32)],
+            Term::Br(Edge {
+                dst: BlockId(1),
+                args: vec![e0, x, zero],
+            }),
+        );
+        let (e1, previous, earlier) = (b.param(Ty::I1), b.param(Ty::I32), b.param(Ty::I32));
+        let one = b.core(Ty::I32, Op::Const(Ty::I32, 1));
+        let next = b.core(Ty::I32, Op::Int(IntOp::Add, previous, one));
+        let written = b.core(Ty::I32, Op::Select(e1, next, previous));
+        let eight = b.core(Ty::I32, Op::Const(Ty::I32, 8));
+        let below = b.core(Ty::I1, Op::Cmp(IntPred::Ult, written, eight));
+        let taken = b.core(Ty::I1, Op::Int(IntOp::And, below, e1));
+        let narrowed = b.restore(taken);
+        let saved = b.packet(PacketOp::Ballot, e1);
+        let bit = b.lane_bit(earlier);
+        b.restore(bit);
+        let read = b.core(Ty::I32, Op::Int(IntOp::Add, written, one));
+        let again = b.packet(PacketOp::Any, narrowed);
+        b.block(
+            1,
+            vec![(e1, Ty::I1), (previous, Ty::I32), (earlier, Ty::I32)],
+            Term::CondBr {
+                cond: again,
+                yes: Edge {
+                    dst: BlockId(1),
+                    args: vec![narrowed, read, saved],
+                },
+                no: Edge {
+                    dst: BlockId(2),
+                    args: vec![narrowed],
+                },
+            },
+        );
+        let e2 = b.param(Ty::I1);
+        b.block(2, vec![(e2, Ty::I1)], Term::Ret(vec![]));
+        let masks = b.masks();
+        assert!(masks.predicated[written.0].is_some());
+        assert!(masks.observed[written.0]);
+        assert!(!masks.guarded[written.0]);
+    }
+
+    fn loop_restoring_from(saved_from_loop: bool) -> (Func, ValueId, ValueId, ValueId) {
+        let mut f = Func {
+            entry: BlockId(0),
+            blocks: BTreeMap::new(),
+            types: vec![],
+        };
+        let exec = f.value(Ty::I1);
+        let x = f.value(Ty::I32);
+        let outer = f.value(Ty::I32);
+        let core = |f: &mut Func, insts: &mut Vec<Inst>, ty, op| {
+            let v = f.value(ty);
+            insts.push(Inst::Core { value: v, ty, op });
+            v
+        };
+        let mut entry = Vec::new();
+        let bound = core(&mut f, &mut entry, Ty::I32, Op::Const(Ty::I32, 8));
+        let inside = core(&mut f, &mut entry, Ty::I1, Op::Cmp(IntPred::Ult, x, bound));
+        let checked = core(
+            &mut f,
+            &mut entry,
+            Ty::I1,
+            Op::Int(IntOp::And, inside, exec),
+        );
+        let word = f.value(Ty::I32);
+        entry.push(Inst::Packet {
+            op: PacketOp::Ballot,
+            input: checked,
+            output: word,
+        });
+        let exec_word = f.value(Ty::I32);
+        entry.push(Inst::Packet {
+            op: PacketOp::Ballot,
+            input: exec,
+            output: exec_word,
+        });
+        let both = core(
+            &mut f,
+            &mut entry,
+            Ty::I32,
+            Op::Int(IntOp::And, word, exec_word),
+        );
+        let lane = core(&mut f, &mut entry, Ty::I32, Op::Env(Env::LaneId));
+        let shifted = core(
+            &mut f,
+            &mut entry,
+            Ty::I32,
+            Op::Int(IntOp::LShr, both, lane),
+        );
+        let bit = core(
+            &mut f,
+            &mut entry,
+            Ty::I1,
+            Op::Convert(Cvt::Trunc, Ty::I1, shifted),
+        );
+        let valid = core(&mut f, &mut entry, Ty::I1, Op::Env(Env::ValidLane));
+        let narrowed = core(&mut f, &mut entry, Ty::I1, Op::Int(IntOp::And, bit, valid));
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![(exec, Ty::I1), (x, Ty::I32), (outer, Ty::I32)],
+                insts: entry,
+                term: Term::Br(Edge {
+                    dst: BlockId(1),
+                    args: vec![narrowed, x, outer],
+                }),
+            },
+        );
+        let e1 = f.value(Ty::I1);
+        let y = f.value(Ty::I32);
+        let o1 = f.value(Ty::I32);
+        let mut header = Vec::new();
+        let k = core(&mut f, &mut header, Ty::I32, Op::Const(Ty::I32, 5));
+        let written = core(&mut f, &mut header, Ty::I32, Op::Select(e1, k, y));
+        let saved = f.value(Ty::I32);
+        header.push(Inst::Packet {
+            op: PacketOp::Ballot,
+            input: e1,
+            output: saved,
+        });
+        let odd = core(
+            &mut f,
+            &mut header,
+            Ty::I32,
+            Op::Int(IntOp::And, written, k),
+        );
+        let cond = core(&mut f, &mut header, Ty::I1, Op::Cmp(IntPred::Ne, odd, k));
+        let taken = core(&mut f, &mut header, Ty::I1, Op::Int(IntOp::And, cond, e1));
+        let body_word = f.value(Ty::I32);
+        header.push(Inst::Packet {
+            op: PacketOp::Ballot,
+            input: taken,
+            output: body_word,
+        });
+        let both1 = core(
+            &mut f,
+            &mut header,
+            Ty::I32,
+            Op::Int(IntOp::And, body_word, saved),
+        );
+        let lane1 = core(&mut f, &mut header, Ty::I32, Op::Env(Env::LaneId));
+        let sh1 = core(
+            &mut f,
+            &mut header,
+            Ty::I32,
+            Op::Int(IntOp::LShr, both1, lane1),
+        );
+        let bit1 = core(
+            &mut f,
+            &mut header,
+            Ty::I1,
+            Op::Convert(Cvt::Trunc, Ty::I1, sh1),
+        );
+        let valid1 = core(&mut f, &mut header, Ty::I1, Op::Env(Env::ValidLane));
+        let body_exec = core(
+            &mut f,
+            &mut header,
+            Ty::I1,
+            Op::Int(IntOp::And, bit1, valid1),
+        );
+        let restore_word = if saved_from_loop { saved } else { o1 };
+        f.blocks.insert(
+            BlockId(1),
+            Block {
+                params: vec![(e1, Ty::I1), (y, Ty::I32), (o1, Ty::I32)],
+                insts: header,
+                term: Term::Br(Edge {
+                    dst: BlockId(2),
+                    args: vec![body_exec, written, restore_word],
+                }),
+            },
+        );
+        let e2 = f.value(Ty::I1);
+        let z = f.value(Ty::I32);
+        let s2 = f.value(Ty::I32);
+        let mut body = Vec::new();
+        let k2 = core(&mut f, &mut body, Ty::I32, Op::Const(Ty::I32, 9));
+        let written2 = core(&mut f, &mut body, Ty::I32, Op::Select(e2, k2, z));
+        let done = core(
+            &mut f,
+            &mut body,
+            Ty::I1,
+            Op::Cmp(IntPred::Eq, written2, k2),
+        );
+        let done_masked = core(&mut f, &mut body, Ty::I1, Op::Int(IntOp::And, done, e2));
+        let done_word = f.value(Ty::I32);
+        body.push(Inst::Packet {
+            op: PacketOp::Ballot,
+            input: done_masked,
+            output: done_word,
+        });
+        let joined = core(
+            &mut f,
+            &mut body,
+            Ty::I32,
+            Op::Int(IntOp::Or, done_word, s2),
+        );
+        let lane2 = core(&mut f, &mut body, Ty::I32, Op::Env(Env::LaneId));
+        let sh2 = core(
+            &mut f,
+            &mut body,
+            Ty::I32,
+            Op::Int(IntOp::LShr, joined, lane2),
+        );
+        let bit2 = core(
+            &mut f,
+            &mut body,
+            Ty::I1,
+            Op::Convert(Cvt::Trunc, Ty::I1, sh2),
+        );
+        let valid2 = core(&mut f, &mut body, Ty::I1, Op::Env(Env::ValidLane));
+        let restored = core(&mut f, &mut body, Ty::I1, Op::Int(IntOp::And, bit2, valid2));
+        let again = f.value(Ty::I1);
+        body.push(Inst::Packet {
+            op: PacketOp::Any,
+            input: restored,
+            output: again,
+        });
+        f.blocks.insert(
+            BlockId(2),
+            Block {
+                params: vec![(e2, Ty::I1), (z, Ty::I32), (s2, Ty::I32)],
+                insts: body,
+                term: Term::CondBr {
+                    cond: again,
+                    yes: Edge {
+                        dst: BlockId(1),
+                        args: vec![restored, written2, s2],
+                    },
+                    no: Edge {
+                        dst: BlockId(3),
+                        args: vec![restored, written2],
+                    },
+                },
+            },
+        );
+        let e3 = f.value(Ty::I1);
+        let w3 = f.value(Ty::I32);
+        let mut exit = Vec::new();
+        let addr = core(&mut f, &mut exit, Ty::I32, Op::Const(Ty::I32, 64));
+        let semantics = super::super::super::ir::MemorySemantics {
+            scope: super::super::super::ir::Scope::WorkItem,
+            ordering: super::super::super::ir::Ordering::Relaxed,
+            cache_policy: super::super::super::ir::CachePolicy::Temporal,
+            volatile: false,
+            deferred_scope: false,
+        };
+        exit.push(Inst::Effect {
+            provenance: 0,
+            op: EffectOp::Memory {
+                space: super::super::super::ir::Space::Lds,
+                op: super::super::super::ir::MemoryOp::Store(super::super::super::ir::MemSize::B32),
+                semantics,
+            },
+            inputs: vec![addr, w3, e3],
+            outputs: vec![],
+        });
+        f.blocks.insert(
+            BlockId(3),
+            Block {
+                params: vec![(e3, Ty::I1), (w3, Ty::I32)],
+                insts: exit,
+                term: Term::Ret(vec![]),
+            },
+        );
+        (f, written, written2, e1)
+    }
+
+    #[test]
+    fn a_write_under_an_exec_that_every_later_restore_stays_within_needs_no_predicate() {
+        let (f, written, written2, e1) = loop_restoring_from(true);
+        let constants = super::super::constant::constants(&f);
+        let masks = analyze(
+            &crate::rdna_spmd::targets::rdna4::registry(),
+            &f,
+            0,
+            &constants,
+            4,
+            false,
+        );
+        assert_eq!(masks.reactivation.len(), 1);
+        assert!(!masks.full[e1.0]);
+        assert!(masks.guarded[written.0]);
+        assert!(!masks.observed[written.0]);
+        assert!(!masks.guarded[written2.0]);
+        assert!(masks.observed[written2.0]);
+    }
+
+    #[test]
+    fn a_restore_from_a_mask_saved_before_the_exec_keeps_the_predicate() {
+        let (f, written, written2, e1) = loop_restoring_from(false);
+        let constants = super::super::constant::constants(&f);
+        let masks = analyze(
+            &crate::rdna_spmd::targets::rdna4::registry(),
+            &f,
+            0,
+            &constants,
+            4,
+            false,
+        );
+        assert_eq!(masks.reactivation.len(), 1);
+        assert!(!masks.full[e1.0]);
+        assert!(!masks.guarded[written.0]);
+        assert!(masks.observed[written.0]);
+        assert!(!masks.guarded[written2.0]);
+    }
 
     #[test]
     fn wave_level_queries_never_prove_a_lane_active_and_empty_exec_edges_carry() {
@@ -1195,17 +1620,12 @@ fn update_of(bit: ValueId, defs: &[Option<Op>], constants: &[Option<u64>]) -> Up
     }
     match defs[bit.0].as_ref() {
         Some(Op::Convert(Cvt::Bitcast, Ty::I1, inner)) => update_of(*inner, defs, constants),
-        Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match defs[shifted.0].as_ref() {
-            Some(Op::Int(IntOp::LShr, word, lane))
-                if matches!(defs[lane.0].as_ref(), Some(Op::Env(Env::LaneId))) =>
-            {
-                if let Some(k) = constants[word.0] {
-                    Update::Constant(k)
-                } else {
-                    Update::Word(*word)
-                }
-            }
-            _ => Update::Unknown,
+        Some(Op::Convert(Cvt::Trunc, Ty::I1, _)) => match lane_word(defs, bit) {
+            Some(word) => match constants[word.0] {
+                Some(k) => Update::Constant(k),
+                None => Update::Word(word),
+            },
+            None => Update::Unknown,
         },
         Some(Op::Int(IntOp::And, ..)) => Update::Bit,
         _ => {
@@ -1244,23 +1664,17 @@ fn exec(f: &Func, exec_index: usize, constants: &[Option<u64>], width: u32, init
         let mut current = exec_param(block, exec_index, f);
         let mut entries = vec![(0usize, current)];
         for (index, inst) in block.insts.iter().enumerate() {
+            let update = match inst {
+                Inst::Core { value, .. } => valid_masked(&defs, *value).map(|bit| (*value, bit)),
+                _ => None,
+            };
+            if let Some((value, bit)) = update {
+                updates.push((value, current, update_of(bit, &defs, constants)));
+                current = value;
+                entries.push((index + 1, current));
+                continue;
+            }
             match inst {
-                Inst::Core {
-                    value,
-                    op: Op::Int(IntOp::And, a, b),
-                    ..
-                } if matches!(defs[b.0].as_ref(), Some(Op::Env(Env::ValidLane)))
-                    || matches!(defs[a.0].as_ref(), Some(Op::Env(Env::ValidLane))) =>
-                {
-                    let bit = if matches!(defs[b.0].as_ref(), Some(Op::Env(Env::ValidLane))) {
-                        *a
-                    } else {
-                        *b
-                    };
-                    updates.push((*value, current, update_of(bit, &defs, constants)));
-                    current = *value;
-                    entries.push((index + 1, current));
-                }
                 Inst::Core {
                     value,
                     ty: Ty::I1,

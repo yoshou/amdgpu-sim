@@ -25,9 +25,7 @@ fn apply(f: &mut Func, masks: &Masks) -> (Vec<bool>, usize) {
         for inst in &mut block.insts {
             if let Inst::Core { value, ty, op } = inst {
                 if let Op::Select(_, new, _) = *op {
-                    if masks.predicated[value.0]
-                        .is_some_and(|(_, exec)| masks.exposed[value.0] == 0 || masks.full[exec.0])
-                    {
+                    if masks.predicated[value.0].is_some() && !masks.observed[value.0] {
                         narrowed[value.0] = true;
                         *op = Op::Convert(Cvt::Bitcast, *ty, new);
                     }
@@ -123,7 +121,7 @@ fn forward(f: &mut Func, masks: &Masks, narrowed: &[bool]) -> usize {
             };
             match inst {
                 Inst::Core { value, op, .. } => {
-                    if masks.exposed.get(value.0).copied().unwrap_or(0) == 0 {
+                    if !masks.observed.get(value.0).copied().unwrap_or(false) {
                         let before = *op;
                         match *op {
                             Op::Select(c, new, old)
@@ -146,7 +144,7 @@ fn forward(f: &mut Func, masks: &Masks, narrowed: &[bool]) -> usize {
                 } => {
                     if outputs
                         .iter()
-                        .all(|(v, _)| masks.exposed.get(v.0).copied().unwrap_or(0) == 0)
+                        .all(|(v, _)| !masks.observed.get(v.0).copied().unwrap_or(false))
                     {
                         let before = *args;
                         *args = args.map(|v| substitute(v, f, &mut fresh));
@@ -320,7 +318,7 @@ mod tests {
         );
         let masks = masks(&f);
         assert!(masks.masked[masked.0]);
-        assert_eq!(masks.exposed[written.0], 0);
+        assert!(!masks.observed[written.0]);
         let narrowed = run(&mut f, &masks);
         assert!(narrowed[written.0]);
     }
