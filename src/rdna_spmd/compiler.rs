@@ -199,7 +199,7 @@ impl Compiler {
 pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel {
     let p = prepare_scalar(program.function, ScalarMode::Whole, num_vgprs.max(256));
     let group = p.group();
-    let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
+    let code = super::codegen::compile(&p, "scalar_kernel", super::native::jit::Mode::Scalar);
     ScalarKernel::from_code(code, p.num_vgprs, group)
 }
 
@@ -209,7 +209,7 @@ pub(crate) fn compile_packet(program: Program, num_vgprs: usize, width: u32, wor
     let wide = wide_masks(&program.function.ir, width);
     let p = prepare_packet(program.function, width, wide, false, false, num_vgprs.max(256), aligned);
     let group = p.group();
-    let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
+    let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
     VecKernel::from_code(code, p.num_vgprs, width, p.min_private_bytes, workgroup_x, group)
 }
 
@@ -221,7 +221,7 @@ pub(crate) fn compile_cooperative_packet(program: Program, num_vgprs: usize, wid
     let num_vgprs = program.vgpr_count(num_vgprs);
     let wide = wide_masks(&program.function.ir, width);
     let p = prepare_packet(program.function, width, wide, true, true, num_vgprs, aligned);
-    let code = unsafe { super::codegen::compile(&p, "vec_kernel", super::jit::Mode::Packet) };
+    let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
     let yields = p.resume_layouts();
     if yields.iter().flatten().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(width as usize); }
     CoopVecKernel::from_code(code, yields, p.num_vgprs, width, p.min_private_bytes, workgroup_x, p.registry.registers())
@@ -232,7 +232,7 @@ pub(crate) fn compile_cooperative_scalar(program: Program, num_vgprs: usize) -> 
     let program = super::program::split_at_effects(program, false);
     let num_vgprs = program.vgpr_count(num_vgprs);
     let p = prepare_scalar(program.function, ScalarMode::Cooperative, num_vgprs);
-    let code = unsafe { super::codegen::compile(&p, "scalar_kernel", super::jit::Mode::Scalar) };
+    let code = super::codegen::compile(&p, "scalar_kernel", super::native::jit::Mode::Scalar);
     let yields = p.resume_layouts();
     if yields.iter().flatten().any(|l| l.op == super::ir::EffectOp::Wave(super::ir::WaveOp::Wmma)) { super::engine::wmma::warm(1); }
     CoopKernel::from_code(code, yields, p.num_vgprs, 1, p.min_private_bytes, None, p.registry.registers())

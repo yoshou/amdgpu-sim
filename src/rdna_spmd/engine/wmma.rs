@@ -22,20 +22,20 @@
 
 use std::sync::OnceLock;
 
-use llvm_sys as llvm;
+use super::super::native::Value;
 
 /// Dense effect frames: A at 0, B at 4, C/results at 8. No ISA registers
 /// cross the wave/native boundary.
 type ApplyFn = unsafe extern "C" fn(*const *mut u32);
 
 /// One compiled function per supported width, indexed by `log2(width)`.
-static APPLY: [OnceLock<super::super::jit::NativeCode>; 6] =
+static APPLY: [OnceLock<super::super::native::jit::NativeCode>; 6] =
     [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
 
 fn apply_fn(width: usize) -> ApplyFn {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32), "unsupported packet width {}", width);
     let addr = APPLY[width.trailing_zeros() as usize]
-        .get_or_init(|| unsafe { compile(width as u32) }).address();
+        .get_or_init(|| compile(width as u32)).address();
     unsafe { std::mem::transmute::<u64, ApplyFn>(addr) }
 }
 
@@ -78,42 +78,25 @@ pub(in crate::rdna_spmd) fn apply(vdst: u32, a: u32, b: u32, c: u32, width: usiz
 /// `col = e + (e / 4) * 4 + (l / 16) * 4`; B uses the same formula transposed;
 /// accumulator register `c + m` holds `C[m + 8 * (l / 16)][l % 16]`, and D is
 /// written in the same shape.
-unsafe fn compile(w: u32) -> super::super::jit::NativeCode {
-    use llvm::core::*;
-
+fn compile(w: u32) -> super::super::native::jit::NativeCode {
     // Keep width-specific symbols visible to native profilers.
     let name = format!("wmma_apply_w{w}");
-    let symbol = std::ffi::CString::new(name.as_str()).unwrap();
-    let native = super::super::jit::Module::new(&name);
-    let ctx = native.ctx;
-    let module = native.module;
-    let b = native.builder;
-    let anon = b"\0".as_ptr() as *const _;
+    let native = super::super::native::jit::Module::new(&name);
+    let ir = native.builder();
 
-    let i16t = LLVMInt16TypeInContext(ctx);
-    let i32t = LLVMInt32TypeInContext(ctx);
-    let f16t = LLVMHalfTypeInContext(ctx);
-    let f32t = LLVMFloatTypeInContext(ctx);
-    let void = LLVMVoidTypeInContext(ctx);
-    let ptr = LLVMPointerTypeInContext(ctx, 0);
-    let packet_i32 = LLVMVectorType(i32t, w);
-    let wave_i32 = LLVMVectorType(i32t, 32);
-    let wave_i16 = LLVMVectorType(i16t, 32);
-    let wave_f16 = LLVMVectorType(f16t, 32);
-    let wave_f32 = LLVMVectorType(f32t, 32);
+    let (i32t, ptr) = (ir.i32(), ir.ptr());
+    let packet_i32 = i32t.vector(w);
+    let wave_i32 = i32t.vector(32);
+    let wave_i16 = ir.i16().vector(32);
+    let wave_f16 = ir.f16().vector(32);
+    let wave_f32 = ir.f32().vector(32);
 
-    let mut params = [ptr];
-    let fty = LLVMFunctionType(void, params.as_mut_ptr(), 1, 0);
-    let func = LLVMAddFunction(module, symbol.as_ptr(), fty);
-    LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, func, anon));
+    let func = ir.add_function(&name, ir.void().function(&[ptr]));
+    ir.position_at_end(ir.append_block(func, ""));
 
-    let konst = |v: u32| LLVMConstInt(i32t, v as u64, 0);
-    let packets: Vec<llvm::prelude::LLVMValueRef> = (0..32 / w)
-        .map(|p| {
-            let gep =
-                LLVMBuildGEP2(b, ptr, LLVMGetParam(func, 0), [konst(p)].as_mut_ptr(), 1, anon);
-            LLVMBuildLoad2(b, ptr, gep, anon)
-        })
+    let konst = |v: u32| ir.ci32(v);
+    let packets: Vec<Value> = (0..32 / w)
+        .map(|p| ir.load(ptr, ir.gep(ptr, func.param(0), &[konst(p)])))
         .collect();
     // Typed frame slot offset by fragment word, fixed before native emission.
     let reg_of = |n: u32, k: u32| konst(n + k);
@@ -121,25 +104,19 @@ unsafe fn compile(w: u32) -> super::super::jit::NativeCode {
     // One register across the whole wave as <32 x i32>: each packet holds its
     // W lanes contiguously at `packet + reg * W`, and packet order is lane
     // order (global lane = packet * W + lane within packet).
-    let load_reg = |reg: llvm::prelude::LLVMValueRef| {
-        let offset = LLVMBuildMul(b, reg, konst(w), anon);
-        let mut parts: Vec<llvm::prelude::LLVMValueRef> = packets
+    let load_reg = |reg: Value| {
+        let offset = ir.mul(reg, konst(w));
+        let mut parts: Vec<Value> = packets
             .iter()
-            .map(|&p| {
-                let gep = LLVMBuildGEP2(b, i32t, p, [offset].as_mut_ptr(), 1, anon);
-                let load = LLVMBuildLoad2(b, packet_i32, gep, anon);
-                LLVMSetAlignment(load, 4);
-                load
-            })
+            .map(|&p| ir.load(packet_i32, ir.gep(i32t, p, &[offset])).set_alignment(4))
             .collect();
         let mut size = w;
         while size < 32 {
             parts = parts
                 .chunks(2)
                 .map(|pair| {
-                    let mut mask: Vec<_> = (0..2 * size).map(konst).collect();
-                    let mask = LLVMConstVector(mask.as_mut_ptr(), 2 * size);
-                    LLVMBuildShuffleVector(b, pair[0], pair[1], mask, anon)
+                    let mask: Vec<u32> = (0..2 * size).collect();
+                    ir.shuffle_by(pair[0], pair[1], &mask)
                 })
                 .collect();
             size *= 2;
@@ -149,17 +126,16 @@ unsafe fn compile(w: u32) -> super::super::jit::NativeCode {
 
     // Fragment element `e` of the operand starting at argument `n`, as f32 per
     // lane. The f16 -> f32 widening is exact.
-    let fragments = |n: u32| -> Vec<llvm::prelude::LLVMValueRef> {
+    let fragments = |n: u32| -> Vec<Value> {
         (0..8u32)
             .map(|e| {
                 let mut bits = load_reg(reg_of(n, e / 2));
                 if e % 2 == 1 {
-                    let mut sh: Vec<_> = (0..32).map(|_| konst(16)).collect();
-                    bits = LLVMBuildLShr(b, bits, LLVMConstVector(sh.as_mut_ptr(), 32), anon);
+                    let shift = ir.const_vector(&vec![konst(16); 32]);
+                    bits = ir.lshr(bits, shift);
                 }
-                let half =
-                    LLVMBuildBitCast(b, LLVMBuildTrunc(b, bits, wave_i16, anon), wave_f16, anon);
-                LLVMBuildFPExt(b, half, wave_f32, anon)
+                let half = ir.bitcast(ir.trunc(bits, wave_i16), wave_f16);
+                ir.fpext(half, wave_f32)
             })
             .collect()
     };
@@ -167,16 +143,15 @@ unsafe fn compile(w: u32) -> super::super::jit::NativeCode {
     // registers in rocwmma's accumulate loop.
     let a_frag = fragments(0);
     let b_frag = fragments(4);
-    let mut acc: Vec<llvm::prelude::LLVMValueRef> = (0..8u32)
-        .map(|m| LLVMBuildBitCast(b, load_reg(reg_of(8, m)), wave_f32, anon))
+    let mut acc: Vec<Value> = (0..8u32)
+        .map(|m| ir.bitcast(load_reg(reg_of(8, m)), wave_f32))
         .collect();
 
     // Gather a value held by another lane: `pick(v, f)` puts lane `f(l)`'s
     // element of `v` in lane `l`. This is where the fragment swizzle goes.
-    let pick = |v: llvm::prelude::LLVMValueRef, from: &dyn Fn(u32) -> u32| {
-        let mut mask: Vec<_> = (0..32).map(|lane| konst(from(lane))).collect();
-        let mask = LLVMConstVector(mask.as_mut_ptr(), 32);
-        LLVMBuildShuffleVector(b, v, LLVMGetPoison(wave_f32), mask, anon)
+    let pick = |v: Value, from: &dyn Fn(u32) -> u32| {
+        let mask: Vec<u32> = (0..32).map(|lane| from(lane)).collect();
+        ir.shuffle_by(v, wave_f32.poison(), &mask)
     };
 
     for k in 0..16u32 {
@@ -190,22 +165,20 @@ unsafe fn compile(w: u32) -> super::super::jit::NativeCode {
             // a_mk lane l = A[m + 8 * (l / 16)][k]; the product joins the
             // accumulator in ascending k, as the interpreter sums it.
             let a_mk = pick(a_frag[e], &|lane| m + 8 * (lane / 16) + 16 * g);
-            let product = LLVMBuildFMul(b, a_mk, b_k, anon);
-            acc[m as usize] = LLVMBuildFAdd(b, acc[m as usize], product, anon);
+            let product = ir.fmul(a_mk, b_k);
+            acc[m as usize] = ir.fadd(acc[m as usize], product);
         }
     }
 
     for m in 0..8u32 {
-        let value = LLVMBuildBitCast(b, acc[m as usize], wave_i32, anon);
-        let offset = LLVMBuildMul(b, reg_of(8, m), konst(w), anon);
+        let value = ir.bitcast(acc[m as usize], wave_i32);
+        let offset = ir.mul(reg_of(8, m), konst(w));
         for (p, &packet) in packets.iter().enumerate() {
-            let mut mask: Vec<_> = (0..w).map(|lane| konst(p as u32 * w + lane)).collect();
-            let mask = LLVMConstVector(mask.as_mut_ptr(), w);
-            let lanes = LLVMBuildShuffleVector(b, value, LLVMGetPoison(wave_i32), mask, anon);
-            let gep = LLVMBuildGEP2(b, i32t, packet, [offset].as_mut_ptr(), 1, anon);
-            LLVMSetAlignment(LLVMBuildStore(b, lanes, gep), 4);
+            let mask: Vec<u32> = (0..w).map(|lane| p as u32 * w + lane).collect();
+            let lanes = ir.shuffle_by(value, wave_i32.poison(), &mask);
+            ir.store(lanes, ir.gep(i32t, packet, &[offset])).set_alignment(4);
         }
     }
-    LLVMBuildRetVoid(b);
-    native.optimize(super::super::jit::Mode::Packet).compile(&name)
+    ir.ret_void();
+    native.optimize(super::super::native::jit::Mode::Packet).compile(&name)
 }

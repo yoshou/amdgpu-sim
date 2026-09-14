@@ -2,7 +2,6 @@
 //! floor((2/pi) * 2^1201), then scale according to the input's biased exponent.
 //! The table is immutable provider data, independent of architectural memory.
 use super::*;
-use llvm_sys::{LLVMIntPredicate::*, LLVMTypeKind};
 
 // Little-endian words of floor((2/pi) * 2^1201), with a sentinel word.
 const FRACTION: [u64; 20] = [
@@ -15,60 +14,62 @@ const FRACTION: [u64; 20] = [
     0x000145F306DC9C88, 0,
 ];
 
-unsafe fn table(e: &Emitter) -> LLVMValueRef {
-    let module = LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInsertBlock(e.b)));
-    let name = b"rdna4.two_over_pi\0".as_ptr().cast();
-    let mut global = LLVMGetNamedGlobal(module, name);
-    if global.is_null() {
-        let i64 = LLVMInt64TypeInContext(e.ctx);
-        global = LLVMAddGlobal(module, LLVMArrayType2(i64, FRACTION.len() as u64), name);
-        let mut values = FRACTION.iter().map(|&v| LLVMConstInt(i64, v, 0)).collect::<Vec<_>>();
-        LLVMSetInitializer(global, LLVMConstArray2(i64, values.as_mut_ptr(), values.len() as u64));
-        LLVMSetGlobalConstant(global, 1); LLVMSetAlignment(global, 8);
-        LLVMSetLinkage(global, llvm_sys::LLVMLinkage::LLVMPrivateLinkage);
+fn table(e: &Emitter) -> Value {
+    let ir = e.ir;
+    let name = "rdna4.two_over_pi";
+    match ir.global(name) {
+        Some(global) => global,
+        None => {
+            let i64 = ir.i64();
+            let global = ir.add_global(name, i64.array(FRACTION.len() as u64));
+            let values = FRACTION.iter().map(|&v| i64.const_int(v)).collect::<Vec<_>>();
+            global.set_initializer(ir.const_array(i64, &values));
+            global.set_constant();
+            global.set_alignment(8);
+            global.set_private();
+            global
+        }
     }
-    global
 }
 
-pub(super) unsafe fn lower(e: &Emitter, args: &[LLVMValueRef]) -> LLVMValueRef {
-    let n = b"\0".as_ptr().cast();
+pub(super) fn lower(e: &Emitter, args: &[Value]) -> Value {
+    let ir = e.ir;
     let k = |v: i32| e.constant(Ty::I32, v as u32 as u64);
-    let bits = LLVMBuildBitCast(e.b, args[0], e.ty(Ty::I64), n);
-    let exp = LLVMBuildLShr(e.b, bits, e.constant(Ty::I64, 52), n);
-    let exp = LLVMBuildAnd(e.b, exp, e.constant(Ty::I64, 0x7ff), n);
-    let exp = LLVMBuildTrunc(e.b, exp, e.ty(Ty::I32), n);
-    let segment = LLVMBuildAnd(e.b, args[1], k(31), n);
-    let segment = LLVMBuildMul(e.b, segment, k(53), n);
-    let extra = LLVMBuildSub(e.b, exp, k(1077), n);
-    let over = LLVMBuildICmp(e.b, LLVMIntSGT, extra, k(0), n);
-    let shift = LLVMBuildAdd(e.b, segment, LLVMBuildSelect(e.b, over, extra, k(0), n), n);
-    let offset = LLVMBuildSub(e.b, k(1148), shift, n);
-    let valid = LLVMBuildICmp(e.b, LLVMIntSGE, offset, k(0), n);
-    let safe_offset = LLVMBuildSelect(e.b, valid, offset, k(0), n);
-    let word = LLVMBuildLShr(e.b, safe_offset, k(6), n);
-    let bit = LLVMBuildAnd(e.b, safe_offset, k(63), n);
-    let bit = LLVMBuildZExt(e.b, bit, e.ty(Ty::I64), n);
+    let bits = ir.bitcast(args[0], e.ty(Ty::I64));
+    let exp = ir.lshr(bits, e.constant(Ty::I64, 52));
+    let exp = ir.and(exp, e.constant(Ty::I64, 0x7ff));
+    let exp = ir.trunc(exp, e.ty(Ty::I32));
+    let segment = ir.and(args[1], k(31));
+    let segment = ir.mul(segment, k(53));
+    let extra = ir.sub(exp, k(1077));
+    let over = ir.icmp(IntPred::Sgt, extra, k(0));
+    let shift = ir.add(segment, ir.select(over, extra, k(0)));
+    let offset = ir.sub(k(1148), shift);
+    let valid = ir.icmp(IntPred::Sge, offset, k(0));
+    let safe_offset = ir.select(valid, offset, k(0));
+    let word = ir.lshr(safe_offset, k(6));
+    let bit = ir.and(safe_offset, k(63));
+    let bit = ir.zext(bit, e.ty(Ty::I64));
     let table = table(e);
-    let read = |index| {
-        let ptr = LLVMBuildGEP2(e.b, LLVMInt64TypeInContext(e.ctx), table, [index].as_mut_ptr(), 1, n);
-        if LLVMGetTypeKind(LLVMTypeOf(index)) == LLVMTypeKind::LLVMVectorTypeKind {
-            let w = LLVMGetVectorSize(LLVMTypeOf(index));
+    let read = |index: Value| {
+        let ptr = ir.gep(ir.i64(), table, &[index]);
+        if index.is_vector() {
+            let w = index.ty().vector_size();
             let call = e.call(&format!("llvm.masked.gather.v{w}i64.v{w}p0"), Ty::I64,
                 &[ptr, e.constant(Ty::I1, 1), e.constant(Ty::I64, 0)]);
-            let align = LLVMGetEnumAttributeKindForName(b"align".as_ptr().cast(), 5);
-            LLVMAddCallSiteAttribute(call, 1, LLVMCreateEnumAttribute(e.ctx, align, 8));
+            ir.set_call_align(call, 1, 8);
             call
-        } else { let value = LLVMBuildLoad2(e.b, e.ty(Ty::I64), ptr, n); LLVMSetAlignment(value, 8); value }
+        } else { ir.load(e.ty(Ty::I64), ptr).set_alignment(8) }
     };
-    let lo = read(word); let hi = read(LLVMBuildAdd(e.b, word, k(1), n));
+    let lo = read(word); let hi = read(ir.add(word, k(1)));
     let fraction = e.call(&format!("llvm.fshr.{}", e.suffix(Ty::I64)), Ty::I64, &[hi, lo, bit]);
-    let fraction = LLVMBuildAnd(e.b, fraction, e.constant(Ty::I64, (1 << 53) - 1), n);
-    let fraction = LLVMBuildUIToFP(e.b, fraction, e.ty(Ty::F64), n);
-    let large = LLVMBuildICmp(e.b, LLVMIntSGE, exp, k(1968), n);
-    let base = LLVMBuildSelect(e.b, large, k(75), k(-53), n);
-    let exponent = LLVMBuildSub(e.b, base, shift, n);
+    let fraction = ir.and(fraction, e.constant(Ty::I64, (1 << 53) - 1));
+    let fraction = ir.uitofp(fraction, e.ty(Ty::F64));
+    let large = ir.icmp(IntPred::Sge, exp, k(1968));
+    let base = ir.select(large, k(75), k(-53));
+    let exponent = ir.sub(base, shift);
     let result = scale::f64(e, &[fraction, exponent]);
-    LLVMBuildSelect(e.b, valid, result, e.constant(Ty::F64, 0), n)
+    ir.select(valid, result, e.constant(Ty::F64, 0))
 }
 
 #[cfg(test)]

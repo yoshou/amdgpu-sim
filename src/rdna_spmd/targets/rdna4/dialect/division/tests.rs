@@ -1,5 +1,5 @@
 use super::*;
-use crate::rdna_spmd::{dialect::Arguments, ir::ValueId, jit};
+use crate::rdna_spmd::{dialect::Arguments, ir::ValueId, native::jit};
 use std::sync::Arc;
 
 struct Case { inputs: [u64; 4], result: u64, flag: u32 }
@@ -69,17 +69,16 @@ fn proven_quotient_matches_general_fixup_and_other_quotients_keep_isa_correction
     for width in [0, 1, 2, 4, 8, 16, 32] {
         unsafe {
             let module = jit::Module::new("fixup_quotients");
-            let b = module.builder; let ctx = module.ctx; let n = b"\0".as_ptr().cast();
-            let ptr = LLVMPointerTypeInContext(ctx, 0);
-            let ft = LLVMFunctionType(LLVMVoidTypeInContext(ctx), [ptr; 4].as_mut_ptr(), 4, 0);
-            let f = LLVMAddFunction(module.module, b"kernel\0".as_ptr().cast(), ft);
-            LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, f, n));
+            let b = module.builder();
+            let ptr = b.ptr();
+            let f = b.add_function("kernel", b.void().function(&[ptr; 4]));
+            b.position_at_end(b.append_block(f, ""));
             let e = Emitter::new(b, (width != 0).then_some(width), registry.clone());
-            let den = LLVMBuildLoad2(b, e.ty(Ty::F64), LLVMGetParam(f, 0), n); LLVMSetAlignment(den, 4);
-            let num = LLVMBuildLoad2(b, e.ty(Ty::F64), LLVMGetParam(f, 1), n); LLVMSetAlignment(num, 4);
+            let den = b.load(e.ty(Ty::F64), f.param(0)).set_alignment(4);
+            let num = b.load(e.ty(Ty::F64), f.param(1)).set_alignment(4);
             let lanes = width.max(1) as usize;
             for (index, ir) in programs.iter().enumerate() {
-                let mut values = vec![std::ptr::null_mut(); ir.types.len()];
+                let mut values = vec![Value::from_raw(std::ptr::null_mut()); ir.types.len()];
                 values[0] = den; values[1] = num;
                 let block = &ir.blocks[&ir.entry];
                 for inst in &block.insts {
@@ -95,12 +94,11 @@ fn proven_quotient_matches_general_fixup_and_other_quotients_keep_isa_correction
                 let Term::Ret(returned) = &block.term else { unreachable!() };
                 let args = [values[returned[0].0], values[returned[1].0], values[returned[2].0]];
                 for (output, value) in [(2, fixup(&e, Ty::F64, &args)), (3, values[returned[3].0])] {
-                    let mut offset = LLVMConstInt(LLVMInt64TypeInContext(ctx), (index * lanes) as u64, 0);
-                    let dest = LLVMBuildGEP2(b, LLVMDoubleTypeInContext(ctx), LLVMGetParam(f, output), &mut offset, 1, n);
-                    LLVMSetAlignment(LLVMBuildStore(b, value, dest), 4);
+                    let dest = b.gep(b.f64(), f.param(output), &[b.ci64((index * lanes) as u64)]);
+                    b.store(value, dest).set_alignment(4);
                 }
             }
-            LLVMBuildRetVoid(b);
+            b.ret_void();
             let code = module.finish(if width == 0 { jit::Mode::Scalar } else { jit::Mode::Packet });
             let run: unsafe extern "C" fn(*const u64, *const u64, *mut u64, *mut u64) = std::mem::transmute(code.address());
             let mut den = vec![0; lanes]; let mut num = vec![0; lanes];
@@ -124,28 +122,26 @@ fn check(opcode: I, cases: &[Case]) {
     for width in [0, 1, 2, 4, 8, 16] {
         unsafe {
             let module = jit::Module::new("division_capture");
-            let b = module.builder; let ctx = module.ctx; let n = b"\0".as_ptr().cast();
-            let pointer = LLVMPointerTypeInContext(ctx, 0);
-            let ft = LLVMFunctionType(LLVMVoidTypeInContext(ctx), [pointer; 6].as_mut_ptr(), 6, 0);
-            let f = LLVMAddFunction(module.module, b"kernel\0".as_ptr().cast(), ft);
-            LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(ctx, f, n));
+            let b = module.builder();
+            let pointer = b.ptr();
+            let f = b.add_function("kernel", b.void().function(&[pointer; 6]));
+            b.position_at_end(b.append_block(f, ""));
             let e = Emitter::new(b, (width != 0).then_some(width), registry.clone());
             let mut values = Vec::new();
             for (index, &input_ty) in spec.inputs.iter().enumerate() {
                 let storage_ty = if input_ty == Ty::I1 { Ty::I32 } else { input_ty };
-                let value = LLVMBuildLoad2(b, e.ty(storage_ty), LLVMGetParam(f, index as u32), n);
-                LLVMSetAlignment(value, 4);
-                values.push(if input_ty == Ty::I1 { LLVMBuildTrunc(b, value, e.ty(Ty::I1), n) } else { value });
+                let value = b.load(e.ty(storage_ty), f.param(index as u32)).set_alignment(4);
+                values.push(if input_ty == Ty::I1 { b.trunc(value, e.ty(Ty::I1)) } else { value });
             }
             let args = if values.len() == 4 { Arguments::Quaternary([ValueId(0), ValueId(1), ValueId(2), ValueId(3)]) }
                 else { Arguments::Ternary([ValueId(0), ValueId(1), ValueId(2)]) };
             assert_eq!(registry.result_types(target, args, spec.inputs).unwrap(), spec.outputs);
             let results = e.target(target, args, &values);
             for (index, &value) in results.iter().enumerate() {
-                let value = if index == 1 { LLVMBuildZExt(b, value, e.ty(Ty::I32), n) } else { value };
-                LLVMSetAlignment(LLVMBuildStore(b, value, LLVMGetParam(f, 4 + index as u32)), 4);
+                let value = if index == 1 { b.zext(value, e.ty(Ty::I32)) } else { value };
+                b.store(value, f.param(4 + index as u32)).set_alignment(4);
             }
-            LLVMBuildRetVoid(b);
+            b.ret_void();
             let code = module.finish(if width == 0 { jit::Mode::Scalar } else { jit::Mode::Packet });
             let run: unsafe extern "C" fn(*const u32, *const u32, *const u32, *const u32, *mut u32, *mut u32) =
                 std::mem::transmute(code.address() as usize);

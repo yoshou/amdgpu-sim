@@ -144,109 +144,93 @@ pub(in crate::rdna_spmd) fn clusters(f: &Func, accesses: &[Access], width: Optio
 }
 
 impl<'a> Cg<'a> {
-    unsafe fn call(&self, name: &str, ret: LLVMTypeRef, params: &[LLVMTypeRef], args: &[LLVMValueRef]) -> LLVMValueRef {
-        let cname = cstr(name);
-        let mut f = LLVMGetNamedFunction(self.module, cname.as_ptr());
-        let fty = LLVMFunctionType(ret, params.as_ptr() as *mut _, params.len() as u32, 0);
-        if f.is_null() { f = LLVMAddFunction(self.module, cname.as_ptr(), fty); }
-        LLVMBuildCall2(self.b, fty, f, args.as_ptr() as *mut _, args.len() as u32, self.n())
-    }
-    unsafe fn masked_call(&self, prefix: &str, overloads: &[LLVMTypeRef], args: &[LLVMValueRef], ptr_pos: u32, align: u64) -> LLVMValueRef {
-        let id = LLVMLookupIntrinsicID(prefix.as_ptr() as *const _, prefix.len());
-        let mut overloads = overloads.to_vec();
-        let f = LLVMGetIntrinsicDeclaration(self.module, id, overloads.as_mut_ptr(), overloads.len());
-        let fty = LLVMGlobalGetValueType(f);
-        let mut args = args.to_vec();
-        let call = LLVMBuildCall2(self.b, fty, f, args.as_mut_ptr(), args.len() as u32, self.n());
-        let name = b"align";
-        let kind = LLVMGetEnumAttributeKindForName(name.as_ptr() as *const _, name.len());
-        let attr = LLVMCreateEnumAttribute(self.ctx, kind, align);
-        LLVMAddCallSiteAttribute(call, ptr_pos + 1, attr);
+    fn masked_call(&self, prefix: &str, overloads: &[Type], args: &[Value], ptr_pos: u32, align: u64) -> Value {
+        let call = self.ir.call_intrinsic(prefix, overloads, args);
+        self.ir.set_call_align(call, ptr_pos + 1, align);
         call
     }
-    pub(super) unsafe fn vptr(&self) -> LLVMTypeRef { LLVMVectorType(self.ptr, self.width()) }
-    pub(super) unsafe fn vi32(&self) -> LLVMTypeRef { LLVMVectorType(self.i32t, self.width()) }
-    pub(super) unsafe fn vi64(&self) -> LLVMTypeRef { LLVMVectorType(self.i64t, self.width()) }
-    pub(super) unsafe fn vi1(&self) -> LLVMTypeRef { LLVMVectorType(self.i1, self.width()) }
-    unsafe fn ptr_at_vec(&self, addr: LLVMValueRef, off: u64) -> LLVMValueRef {
-        let a = LLVMBuildAdd(self.b, addr, self.splat(self.ci64(off)), self.n());
-        LLVMBuildIntToPtr(self.b, a, self.vptr(), self.n())
+    pub(super) fn vptr(&self) -> Type { self.ir.ptr().vector(self.width()) }
+    pub(super) fn vi32(&self) -> Type { self.ir.i32().vector(self.width()) }
+    pub(super) fn vi64(&self) -> Type { self.ir.i64().vector(self.width()) }
+    pub(super) fn vi1(&self) -> Type { self.ir.i1().vector(self.width()) }
+    fn ptr_at_vec(&self, addr: Value, off: u64) -> Value {
+        let a = self.ir.add(addr, self.splat(self.ci64(off)));
+        self.ir.inttoptr(a, self.vptr())
     }
-    unsafe fn masked_gather_ty(&self, ptrs: LLVMValueRef, mask: LLVMValueRef, elem: LLVMTypeRef, align: u64) -> LLVMValueRef {
-        let velem = LLVMVectorType(elem, self.width());
-        let passthru = LLVMConstNull(velem);
+    fn masked_gather_ty(&self, ptrs: Value, mask: Value, elem: Type, align: u64) -> Value {
+        let velem = elem.vector(self.width());
+        let passthru = velem.null();
         self.masked_call("llvm.masked.gather.", &[velem, self.vptr()], &[ptrs, mask, passthru], 0, align)
     }
-    unsafe fn masked_scatter_ty(&self, val: LLVMValueRef, ptrs: LLVMValueRef, mask: LLVMValueRef, elem: LLVMTypeRef, align: u64) {
-        let velem = LLVMVectorType(elem, self.width());
+    fn masked_scatter_ty(&self, val: Value, ptrs: Value, mask: Value, elem: Type, align: u64) {
+        let velem = elem.vector(self.width());
         self.masked_call("llvm.masked.scatter.", &[velem, self.vptr()], &[val, ptrs, mask], 1, align);
     }
-    unsafe fn any_active(&self, exec: LLVMValueRef, nonempty: bool) -> LLVMValueRef {
-        if nonempty { LLVMConstInt(self.i1, 1, 0) } else {
-            self.call(&format!("llvm.vector.reduce.or.v{}i1", self.width()), self.i1, &[self.vi1()], &[exec])
+    fn reduce(&self, operation: &str, ret: Type, operand: Value) -> Value {
+        self.ir.call_named(&format!("llvm.vector.reduce.{operation}"), ret, &[operand.ty()], &[operand])
+    }
+    fn any_active(&self, exec: Value, nonempty: bool) -> Value {
+        if nonempty { self.ir.ci1(true) } else {
+            self.reduce(&format!("or.v{}i1", self.width()), self.ir.i1(), exec)
         }
     }
-    unsafe fn bcast_load(&self, ptrs: LLVMValueRef, exec: LLVMValueRef, nonempty: bool, elem: LLVMTypeRef) -> LLVMValueRef {
-        let p0 = LLVMBuildExtractElement(self.b, ptrs, self.ci32(0), self.n());
+    fn bcast_load(&self, ptrs: Value, exec: Value, nonempty: bool, elem: Type) -> Value {
+        let p0 = self.ir.extract_at(ptrs, 0);
         let any = self.any_active(exec, nonempty);
-        let p0 = LLVMBuildSelect(self.b, any, p0, self.sink, self.n());
-        let v = LLVMBuildLoad2(self.b, elem, p0, self.n());
+        let p0 = self.ir.select(any, p0, self.sink);
+        let v = self.ir.load(elem, p0);
         self.splat(v)
     }
-    unsafe fn affine_load(&self, ptrs: LLVMValueRef, exec: LLVMValueRef, allocated: bool) -> LLVMValueRef {
-        let n = self.n();
-        let mut v = LLVMGetPoison(self.vi32());
+    fn affine_load(&self, ptrs: Value, exec: Value, allocated: bool) -> Value {
+        let ir = self.ir;
+        let mut v = self.vi32().poison();
         for l in 0..self.width() {
-            let p = LLVMBuildExtractElement(self.b, ptrs, self.ci32(l), n);
-            let active = LLVMBuildExtractElement(self.b, exec, self.ci32(l), n);
-            let p = if allocated { p } else { LLVMBuildSelect(self.b, active, p, self.sink, n) };
-            let ld = LLVMBuildLoad2(self.b, self.i32t, p, n);
-            LLVMSetAlignment(ld, 4);
-            v = LLVMBuildInsertElement(self.b, v, ld, self.ci32(l), n);
+            let p = ir.extract_at(ptrs, l);
+            let active = ir.extract_at(exec, l);
+            let p = if allocated { p } else { ir.select(active, p, self.sink) };
+            let ld = ir.load(ir.i32(), p).set_alignment(4);
+            v = ir.insert_at(v, ld, l);
         }
         v
     }
-    unsafe fn affine_store(&self, val: LLVMValueRef, ptrs: LLVMValueRef, exec: LLVMValueRef) {
-        let n = self.n();
-        let sink = LLVMBuildPtrToInt(self.b, self.store_sink, self.i64t, n);
-        let addr_i = LLVMBuildPtrToInt(self.b, ptrs, self.vi64(), n);
-        let safe = LLVMBuildSelect(self.b, exec, addr_i, self.splat(sink), n);
+    fn affine_store(&self, val: Value, ptrs: Value, exec: Value) {
+        let ir = self.ir;
+        let sink = ir.ptrtoint(self.store_sink, ir.i64());
+        let addr_i = ir.ptrtoint(ptrs, self.vi64());
+        let safe = ir.select(exec, addr_i, self.splat(sink));
         for l in 0..self.width() {
-            let a = LLVMBuildExtractElement(self.b, safe, self.ci32(l), n);
-            let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
-            let d = LLVMBuildExtractElement(self.b, val, self.ci32(l), n);
-            let st = LLVMBuildStore(self.b, d, p);
-            LLVMSetAlignment(st, 4);
+            let a = ir.extract_at(safe, l);
+            let p = ir.inttoptr(a, ir.ptr());
+            let d = ir.extract_at(val, l);
+            ir.store(d, p).set_alignment(4);
         }
     }
-    unsafe fn split_pair(&self, d: LLVMValueRef) -> (LLVMValueRef, LLVMValueRef) {
-        let n = self.n();
-        let bits = LLVMBuildBitCast(self.b, d, self.vec_ty(self.i64t), n);
-        let lo = LLVMBuildTrunc(self.b, bits, self.vec_ty(self.i32t), n);
-        let shifted = LLVMBuildLShr(self.b, bits, self.splat(self.ci64(32)), n);
-        let hi = LLVMBuildTrunc(self.b, shifted, self.vec_ty(self.i32t), n);
+    fn split_pair(&self, d: Value) -> (Value, Value) {
+        let ir = self.ir;
+        let bits = ir.bitcast(d, self.vec_ty(ir.i64()));
+        let lo = ir.trunc(bits, self.vec_ty(ir.i32()));
+        let shifted = ir.lshr(bits, self.splat(self.ci64(32)));
+        let hi = ir.trunc(shifted, self.vec_ty(ir.i32()));
         (lo, hi)
     }
-    unsafe fn vwiden_i32(&self, value: LLVMValueRef, have: u32, want: u32) -> LLVMValueRef {
+    fn vwiden_i32(&self, value: Value, have: u32, want: u32) -> Value {
         if have == want { return value; }
-        let mut idx: Vec<LLVMValueRef> = (0..want).map(|k| self.ci32(k.min(have - 1))).collect();
-        let mask = LLVMConstVector(idx.as_mut_ptr(), idx.len() as u32);
-        LLVMBuildShuffleVector(self.b, value, LLVMGetPoison(LLVMTypeOf(value)), mask, self.n())
+        let idx: Vec<u32> = (0..want).map(|k| k.min(have - 1)).collect();
+        self.ir.shuffle_by(value, value.ty().poison(), &idx)
     }
-    unsafe fn vconcat_i32(&self, parts: &[LLVMValueRef]) -> LLVMValueRef {
+    fn vconcat_i32(&self, parts: &[Value]) -> Value {
         let mut cur = parts.to_vec();
         while cur.len() > 1 {
             let mut next = Vec::with_capacity((cur.len() + 1) / 2);
             let mut i = 0;
             while i + 1 < cur.len() {
                 let (a, b) = (cur[i], cur[i + 1]);
-                let na = LLVMGetVectorSize(LLVMTypeOf(a));
-                let nb = LLVMGetVectorSize(LLVMTypeOf(b));
+                let na = a.ty().vector_size();
+                let nb = b.ty().vector_size();
                 let wide = na.max(nb);
                 let (a, b) = (self.vwiden_i32(a, na, wide), self.vwiden_i32(b, nb, wide));
-                let mut idx: Vec<LLVMValueRef> = (0..na).chain(wide..wide + nb).map(|k| self.ci32(k)).collect();
-                let mask = LLVMConstVector(idx.as_mut_ptr(), idx.len() as u32);
-                next.push(LLVMBuildShuffleVector(self.b, a, b, mask, self.n()));
+                let idx: Vec<u32> = (0..na).chain(wide..wide + nb).collect();
+                next.push(self.ir.shuffle_by(a, b, &idx));
                 i += 2;
             }
             if i < cur.len() { next.push(cur[i]); }
@@ -254,27 +238,23 @@ impl<'a> Cg<'a> {
         }
         cur[0]
     }
-    unsafe fn transpose_rows(&self, rows: &[LLVMValueRef], span: u32, tile: u32) -> Vec<LLVMValueRef> {
-        let rowty = LLVMTypeOf(rows[0]);
-        let shuf = |x: LLVMValueRef, y: LLVMValueRef, m: &[u32]| -> LLVMValueRef {
-            let mut mv: Vec<LLVMValueRef> = m.iter().map(|&i| self.ci32(i)).collect();
-            let mask = LLVMConstVector(mv.as_mut_ptr(), mv.len() as u32);
-            LLVMBuildShuffleVector(self.b, x, y, mask, self.n())
-        };
+    fn transpose_rows(&self, rows: &[Value], span: u32, tile: u32) -> Vec<Value> {
+        let rowty = rows[0].ty();
+        let shuf = |x: Value, y: Value, m: &[u32]| -> Value { self.ir.shuffle_by(x, y, m) };
         let nblk = (self.width() / tile) as usize;
-        let mut cols: Vec<Vec<LLVMValueRef>> = vec![Vec::with_capacity(nblk); span as usize];
+        let mut cols: Vec<Vec<Value>> = vec![Vec::with_capacity(nblk); span as usize];
         for blk in 0..nblk {
             let begin = blk * tile as usize;
             let r = &rows[begin..begin + tile as usize];
             let mut base = 0u32;
             while base + tile <= span {
                 let idx: Vec<u32> = (base..base + tile).collect();
-                let poison = LLVMGetPoison(rowty);
-                let mut cur: Vec<LLVMValueRef> = r.iter().map(|&row| shuf(row, poison, &idx)).collect();
+                let poison = rowty.poison();
+                let mut cur: Vec<Value> = r.iter().map(|&row| shuf(row, poison, &idx)).collect();
                 let mut step = 1u32;
                 while step < tile {
                     let (lo_mask, hi_mask) = transpose_pair_masks(tile, step);
-                    let mut next = vec![std::ptr::null_mut(); tile as usize];
+                    let mut next = vec![UNDEFINED; tile as usize];
                     for i in 0..tile {
                         if i & step != 0 { continue; }
                         let j = i | step;
@@ -288,8 +268,8 @@ impl<'a> Cg<'a> {
                 base += tile;
             }
             for f in base..span {
-                let mut parts: Vec<LLVMValueRef> = if tile == 1 {
-                    vec![shuf(r[0], LLVMGetPoison(rowty), &[f])]
+                let mut parts: Vec<Value> = if tile == 1 {
+                    vec![shuf(r[0], rowty.poison(), &[f])]
                 } else {
                     r.chunks(2).map(|pair| shuf(pair[0], pair[1], &[f, span + f])).collect()
                 };
@@ -313,24 +293,28 @@ impl<'a> Cg<'a> {
         }).collect()
     }
 
-    pub(super) unsafe fn emit_cluster(&mut self, members: &[usize], cluster: &Cluster) {
-        let n = self.n();
+    pub(super) fn emit_cluster(&mut self, members: &[usize], cluster: &Cluster) {
+        let ir = self.ir;
         let first = &self.p.accesses[members[0]];
         let exec = self.vector(first.mask);
         let exec = self.em.to_bool(exec);
         let addr = self.vector(first.base);
-        let zero = LLVMConstNull(self.vi64());
-        let masked = LLVMBuildSelect(self.b, exec, addr, zero, n);
-        let p_any = self.call(&format!("llvm.vector.reduce.umax.v{}i64", self.width()), self.i64t, &[self.vi64()], &[masked]);
-        let safe = LLVMBuildSelect(self.b, exec, addr, self.splat(p_any), n);
-        let rowty = LLVMVectorType(self.f64t, cluster.span);
-        let any = self.call(&format!("llvm.vector.reduce.or.v{}i1", self.width()), self.i1, &[self.vi1()], &[exec]);
-        let rowmask = { let poison = LLVMGetPoison(LLVMVectorType(self.i1, cluster.span)); let ins = LLVMBuildInsertElement(self.b, poison, any, self.ci32(0), n); LLVMBuildShuffleVector(self.b, ins, poison, LLVMConstNull(LLVMVectorType(self.i32t, cluster.span)), n) };
-        let rows: Vec<LLVMValueRef> = (0..self.width()).map(|l| {
-            let a = LLVMBuildExtractElement(self.b, safe, self.ci32(l), n);
-            let a = LLVMBuildAdd(self.b, a, self.ci64(cluster.lo as u64), n);
-            let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
-            self.masked_call("llvm.masked.load.", &[rowty, self.ptr], &[p, rowmask, LLVMGetPoison(rowty)], 0, 4)
+        let zero = self.vi64().null();
+        let masked = ir.select(exec, addr, zero);
+        let p_any = self.reduce(&format!("umax.v{}i64", self.width()), ir.i64(), masked);
+        let safe = ir.select(exec, addr, self.splat(p_any));
+        let rowty = ir.f64().vector(cluster.span);
+        let any = self.reduce(&format!("or.v{}i1", self.width()), ir.i1(), exec);
+        let rowmask = {
+            let poison = ir.i1().vector(cluster.span).poison();
+            let ins = ir.insert_at(poison, any, 0);
+            ir.shuffle(ins, poison, ir.i32().vector(cluster.span).null())
+        };
+        let rows: Vec<Value> = (0..self.width()).map(|l| {
+            let a = ir.extract_at(safe, l);
+            let a = ir.add(a, self.ci64(cluster.lo as u64));
+            let p = ir.inttoptr(a, ir.ptr());
+            self.masked_call("llvm.masked.load.", &[rowty, ir.ptr()], &[p, rowmask, rowty.poison()], 0, 4)
         }).collect();
         let cols = self.transpose_rows(&rows, cluster.span, cluster.tile);
         for &m in members {
@@ -339,7 +323,7 @@ impl<'a> Cg<'a> {
             let results = access.results.clone();
             if access.size() == MemSize::B64 {
                 for j in 0..access.words as usize {
-                    let wide = LLVMBuildBitCast(self.b, cols[f0 + j], self.vi64(), n);
+                    let wide = ir.bitcast(cols[f0 + j], self.vi64());
                     self.define(results[j], wide);
                 }
                 continue;
@@ -352,20 +336,20 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) unsafe fn emit_memory(&mut self, index: usize, block: BlockId, at: usize) {
+    pub(super) fn emit_memory(&mut self, index: usize, block: BlockId, at: usize) {
+        let ir = self.ir;
         let access = &self.p.accesses[index];
         let shape = self.p.shapes[index];
-        let n = self.n();
         if shape == Shape::Fence {
             let order = match access.semantics.ordering {
-                Ordering::Acquire => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingAcquire,
-                Ordering::Release => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingRelease,
-                _ => llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent,
+                Ordering::Acquire => Atomic::Acquire,
+                Ordering::Release => Atomic::Release,
+                _ => Atomic::SequentiallyConsistent,
             };
-            LLVMBuildFence(self.b, order, 0, n);
+            ir.fence(order);
             return;
         }
-        let elem = match access.size().bytes() { 1 => LLVMInt8TypeInContext(self.ctx), 2 => LLVMInt16TypeInContext(self.ctx), 8 => self.i64t, _ => self.i32t };
+        let elem = match access.size().bytes() { 1 => ir.i8(), 2 => ir.i16(), 8 => ir.i64(), _ => ir.i32() };
         let size = access.size();
         let words = access.words;
         let offsets = access.offsets.clone();
@@ -383,37 +367,35 @@ impl<'a> Cg<'a> {
                 let mut addr = self.scalar(address);
                 if self.p.width.is_none() {
                     if let Some(inside) = inside {
-                        let offset = LLVMBuildSub(self.b, self.scratch_vec, self.scratch_base_scalar, n);
-                        let physical = LLVMBuildAdd(self.b, addr, offset, n);
+                        let offset = ir.sub(self.scratch_vec, self.scratch_base_scalar);
+                        let physical = ir.add(addr, offset);
                         let inside = self.scalar(inside);
-                        addr = LLVMBuildSelect(self.b, inside, physical, addr, n);
+                        addr = ir.select(inside, physical, addr);
                     }
                     if space != Space::Global {
-                        let extended = if space == Space::Scratch { LLVMBuildSExt(self.b, addr, self.i64t, n) } else { LLVMBuildZExt(self.b, addr, self.i64t, n) };
-                        addr = LLVMBuildAdd(self.b, if space == Space::Scratch { self.scratch_vec } else { self.lds_base }, extended, n);
+                        let extended = if space == Space::Scratch { ir.sext(addr, ir.i64()) } else { ir.zext(addr, ir.i64()) };
+                        addr = ir.add(if space == Space::Scratch { self.scratch_vec } else { self.lds_base }, extended);
                     }
                 }
                 let predicated = shape != Shape::ScalarWords && !access.scalar();
                 let active = if predicated { Some(self.scalar(mask)) } else { None };
-                let guard = |cg: &Self, a: LLVMValueRef| -> LLVMValueRef {
-                    match active { Some(active) => { let dummy = LLVMBuildPtrToInt(cg.b, cg.sink, cg.i64t, n); LLVMBuildSelect(cg.b, active, a, dummy, n) } None => a }
+                let guard = |cg: &Self, a: Value| -> Value {
+                    match active { Some(active) => { let dummy = ir.ptrtoint(cg.sink, ir.i64()); ir.select(active, a, dummy) } None => a }
                 };
                 if shape == Shape::ScalarAtomic {
-                    let p = LLVMBuildIntToPtr(self.b, guard(self, addr), self.ptr, n);
+                    let p = ir.inttoptr(guard(self, addr), ir.ptr());
                     let d = self.scalar(data[0]);
-                    let old = LLVMBuildAtomicRMW(self.b, llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd, p, d, llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent, 0);
+                    let old = ir.atomic_add(p, d, Atomic::SequentiallyConsistent);
                     if let Some(&r) = results.first() { self.define(r, old); }
                     return;
                 }
                 if shape == Shape::ScalarStore {
                     for k in 0..words as usize {
                         let value = self.scalar(data[k]);
-                        let value = if size.bytes() >= 4 { value } else { LLVMBuildTrunc(self.b, value, elem, n) };
-                        let a = guard(self, LLVMBuildAdd(self.b, addr, self.ci64(offsets[k] as u64), n));
-                        let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
-                        let store = LLVMBuildStore(self.b, value, p);
-                        LLVMSetAlignment(store, if space == Space::Lds { 1 } else { size.bytes() });
-                        LLVMSetVolatile(store, volatile as i32);
+                        let value = if size.bytes() >= 4 { value } else { ir.trunc(value, elem) };
+                        let a = guard(self, ir.add(addr, self.ci64(offsets[k] as u64)));
+                        let p = ir.inttoptr(a, ir.ptr());
+                        ir.store(value, p).set_alignment(if space == Space::Lds { 1 } else { size.bytes() }).set_volatile(volatile);
                     }
                     return;
                 }
@@ -422,20 +404,19 @@ impl<'a> Cg<'a> {
                 let mut k = 0usize;
                 while k < words as usize {
                     if pairs && k + 1 < words as usize {
-                        let p = LLVMBuildIntToPtr(self.b, LLVMBuildAdd(self.b, load_addr, self.ci64(offsets[k] as u64), n), self.ptr, n);
-                        let value = LLVMBuildLoad2(self.b, self.f64t, p, n);
-                        LLVMSetAlignment(value, 4);
+                        let p = ir.inttoptr(ir.add(load_addr, self.ci64(offsets[k] as u64)), ir.ptr());
+                        let value = ir.load(ir.f64(), p).set_alignment(4);
                         let (lo, hi) = self.split_pair(value);
                         self.define(results[k], lo);
                         self.define(results[k + 1], hi);
                         self.loaded_pairs.insert((results[k], results[k + 1]), value);
                         k += 2;
                     } else {
-                        let p = LLVMBuildIntToPtr(self.b, LLVMBuildAdd(self.b, load_addr, self.ci64(offsets[k] as u64), n), self.ptr, n);
-                        let load = LLVMBuildLoad2(self.b, elem, p, n);
-                        LLVMSetAlignment(load, if shape == Shape::ScalarWords { if size.bytes() >= 4 { 4 } else { 1 } } else if space == Space::Lds || size.bytes() < 4 { 1 } else { 4 });
-                        if shape != Shape::ScalarWords { LLVMSetVolatile(load, volatile as i32); }
-                        let value = if size.bytes() >= 4 { load } else if size.signed() { LLVMBuildSExt(self.b, load, self.i32t, n) } else { LLVMBuildZExt(self.b, load, self.i32t, n) };
+                        let p = ir.inttoptr(ir.add(load_addr, self.ci64(offsets[k] as u64)), ir.ptr());
+                        let load = ir.load(elem, p);
+                        load.set_alignment(if shape == Shape::ScalarWords { if size.bytes() >= 4 { 4 } else { 1 } } else if space == Space::Lds || size.bytes() < 4 { 1 } else { 4 });
+                        if shape != Shape::ScalarWords { load.set_volatile(volatile); }
+                        let value = if size.bytes() >= 4 { load } else if size.signed() { ir.sext(load, ir.i32()) } else { ir.zext(load, ir.i32()) };
                         self.define(results[k], value);
                         k += 1;
                     }
@@ -449,17 +430,17 @@ impl<'a> Cg<'a> {
         let exec = self.vector(mask);
         let exec = self.em.to_bool(exec);
         if space == Space::Scratch {
-            addr = LLVMBuildAdd(self.b, self.scratch_vec, LLVMBuildSExt(self.b, addr, self.vi64(), n), n);
+            addr = ir.add(self.scratch_vec, ir.sext(addr, self.vi64()));
         }
         if space == Space::Lds {
-            addr = LLVMBuildAdd(self.b, self.splat(self.lds_base), LLVMBuildZExt(self.b, addr, self.vi64(), n), n);
+            addr = ir.add(self.splat(self.lds_base), ir.zext(addr, self.vi64()));
         }
         if let Some(inside) = inside {
-            let lane_offset = LLVMBuildSub(self.b, self.scratch_vec, self.splat(self.scratch_base_scalar), n);
-            let physical = LLVMBuildAdd(self.b, addr, lane_offset, n);
+            let lane_offset = ir.sub(self.scratch_vec, self.splat(self.scratch_base_scalar));
+            let physical = ir.add(addr, lane_offset);
             let inside = self.vector(inside);
             let inside = self.em.to_bool(inside);
-            addr = LLVMBuildSelect(self.b, inside, physical, addr, n);
+            addr = ir.select(inside, physical, addr);
         }
         match shape {
             Shape::AtomicAdd { grouped } => {
@@ -467,45 +448,42 @@ impl<'a> Cg<'a> {
                 if grouped { self.emit_grouped_atomic_add(addr, d, exec); return; }
                 let packed_exec = self.vec_to_mask(exec);
                 let ptrs = self.ptr_at_vec(addr, 0);
-                let mut result = LLVMGetPoison(self.vi32());
+                let mut result = self.vi32().poison();
                 for k in 0..self.width() {
-                    let bit = LLVMBuildAnd(self.b, LLVMBuildLShr(self.b, packed_exec, self.ci32(k), n), self.ci32(1), n);
-                    let active = LLVMBuildICmp(self.b, llvm::LLVMIntPredicate::LLVMIntNE, bit, self.ci32(0), n);
-                    let ptr = LLVMBuildExtractElement(self.b, ptrs, self.ci32(k), n);
-                    let ptr = LLVMBuildSelect(self.b, active, ptr, self.sink, n);
-                    let value = LLVMBuildExtractElement(self.b, d, self.ci32(k), n);
-                    let value = LLVMBuildSelect(self.b, active, value, self.ci32(0), n);
-                    let old = LLVMBuildAtomicRMW(self.b, llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd, ptr, value, llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent, 0);
-                    result = LLVMBuildInsertElement(self.b, result, old, self.ci32(k), n);
+                    let bit = ir.and(ir.lshr(packed_exec, self.ci32(k)), self.ci32(1));
+                    let active = ir.icmp(IntPred::Ne, bit, self.ci32(0));
+                    let ptr = ir.extract_at(ptrs, k);
+                    let ptr = ir.select(active, ptr, self.sink);
+                    let value = ir.extract_at(d, k);
+                    let value = ir.select(active, value, self.ci32(0));
+                    let old = ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent);
+                    result = ir.insert_at(result, old, k);
                 }
                 if let Some(&r) = results.first() { self.define(r, result); }
             }
             Shape::Store(StoreShape::Tile) => {
-                let cols: Vec<LLVMValueRef> = (0..words as usize).map(|k| self.vector(data[k])).collect();
+                let cols: Vec<Value> = (0..words as usize).map(|k| self.vector(data[k])).collect();
                 let base = self.ptr_at_vec(addr, offsets[0] as u64);
-                let sink = LLVMBuildPtrToInt(self.b, self.tile_sink, self.i64t, n);
-                let addr_i = LLVMBuildPtrToInt(self.b, base, self.vi64(), n);
-                let safe = LLVMBuildSelect(self.b, exec, addr_i, self.splat(sink), n);
+                let sink = ir.ptrtoint(self.tile_sink, ir.i64());
+                let addr_i = ir.ptrtoint(base, self.vi64());
+                let safe = ir.select(exec, addr_i, self.splat(sink));
                 let w = self.width();
                 for l in 0..w {
                     let mut parts = Vec::new();
                     let mut k = 0usize;
                     while k < words as usize {
                         if k + 1 < words as usize {
-                            let mut mask = [self.ci32(l), self.ci32(w + l)];
-                            parts.push(LLVMBuildShuffleVector(self.b, cols[k], cols[k + 1], LLVMConstVector(mask.as_mut_ptr(), 2), n));
+                            parts.push(ir.shuffle_by(cols[k], cols[k + 1], &[l, w + l]));
                             k += 2;
                         } else {
-                            let mut mask = [self.ci32(l)];
-                            parts.push(LLVMBuildShuffleVector(self.b, cols[k], LLVMGetPoison(LLVMTypeOf(cols[k])), LLVMConstVector(mask.as_mut_ptr(), 1), n));
+                            parts.push(ir.shuffle_by(cols[k], cols[k].ty().poison(), &[l]));
                             k += 1;
                         }
                     }
                     let row = self.vconcat_i32(&parts);
-                    let a = LLVMBuildExtractElement(self.b, safe, self.ci32(l), n);
-                    let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
-                    let st = LLVMBuildStore(self.b, row, p);
-                    LLVMSetAlignment(st, 4);
+                    let a = ir.extract_at(safe, l);
+                    let p = ir.inttoptr(a, ir.ptr());
+                    ir.store(row, p).set_alignment(4);
                 }
             }
             Shape::Store(kind) => {
@@ -514,10 +492,10 @@ impl<'a> Cg<'a> {
                     let value = self.vector(data[k]);
                     match kind {
                         StoreShape::Narrow => {
-                            let value = LLVMBuildTrunc(self.b, value, LLVMVectorType(elem, self.width()), n);
+                            let value = ir.trunc(value, elem.vector(self.width()));
                             self.masked_scatter_ty(value, ptrs, exec, elem, 1);
                         }
-                        StoreShape::Lds => self.masked_scatter_ty(value, ptrs, exec, self.i32t, 1),
+                        StoreShape::Lds => self.masked_scatter_ty(value, ptrs, exec, ir.i32(), 1),
                         StoreShape::Affine => self.affine_store(value, ptrs, exec),
                         StoreShape::Tile => unreachable!("tile stores are emitted as rows"),
                         StoreShape::Scatter => self.masked_scatter_ty(value, ptrs, exec, elem, 4),
@@ -526,17 +504,15 @@ impl<'a> Cg<'a> {
             }
             Shape::NarrowLoad => {
                 let value = self.masked_gather_ty(self.ptr_at_vec(addr, 0), exec, elem, 1);
-                let value = if size.signed() { LLVMBuildSExt(self.b, value, self.vi32(), n) } else { LLVMBuildZExt(self.b, value, self.vi32(), n) };
+                let value = if size.signed() { ir.sext(value, self.vi32()) } else { ir.zext(value, self.vi32()) };
                 self.define(results[0], value);
             }
             Shape::PrivateTile { tile } => {
-                let rowty = LLVMVectorType(self.i32t, words);
+                let rowty = ir.i32().vector(words);
                 let rows: Vec<_> = (0..self.width()).map(|l| {
-                    let a = LLVMBuildExtractElement(self.b, addr, self.ci32(l), n);
-                    let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
-                    let load = LLVMBuildLoad2(self.b, rowty, p, n);
-                    LLVMSetAlignment(load, 4);
-                    load
+                    let a = ir.extract_at(addr, l);
+                    let p = ir.inttoptr(a, ir.ptr());
+                    ir.load(rowty, p).set_alignment(4)
                 }).collect();
                 let cols = self.transpose_rows(&rows, words, tile);
                 for k in 0..words as usize { self.define(results[k], cols[k]); }
@@ -544,24 +520,21 @@ impl<'a> Cg<'a> {
             Shape::Frame { stride_words: sp4, offset_words: ioff_w, group: grp } => {
                 let base_v = self.vector(base);
                 let nblk = self.width() / grp;
-                let blkty = LLVMVectorType(self.i32t, grp * sp4);
-                let poison_blk = LLVMGetPoison(blkty);
-                let blocks: Vec<LLVMValueRef> = (0..nblk).map(|g| {
-                    let a = LLVMBuildExtractElement(self.b, base_v, self.ci32(g * grp), n);
-                    let p = LLVMBuildIntToPtr(self.b, a, self.ptr, n);
-                    let ld = LLVMBuildLoad2(self.b, blkty, p, n);
-                    LLVMSetAlignment(ld, 4);
-                    ld
+                let blkty = ir.i32().vector(grp * sp4);
+                let poison_blk = blkty.poison();
+                let blocks: Vec<Value> = (0..nblk).map(|g| {
+                    let a = ir.extract_at(base_v, g * grp);
+                    let p = ir.inttoptr(a, ir.ptr());
+                    ir.load(blkty, p).set_alignment(4)
                 }).collect();
                 let per = size.bytes() / 4;
-                let extract = |cg: &Self, fw: u32| -> LLVMValueRef {
-                    let parts: Vec<LLVMValueRef> = blocks.iter().map(|&blk| {
-                        let mut idx: Vec<LLVMValueRef> = (0..grp).flat_map(|lane| (0..per).map(move |w| lane * sp4 + fw + w)).map(|i| cg.ci32(i)).collect();
-                        let mask = LLVMConstVector(idx.as_mut_ptr(), grp * per);
-                        LLVMBuildShuffleVector(cg.b, blk, poison_blk, mask, n)
+                let extract = |cg: &Self, fw: u32| -> Value {
+                    let parts: Vec<Value> = blocks.iter().map(|&blk| {
+                        let idx: Vec<u32> = (0..grp).flat_map(|lane| (0..per).map(move |w| lane * sp4 + fw + w)).collect();
+                        ir.shuffle_by(blk, poison_blk, &idx)
                     }).collect();
                     let joined = cg.vconcat_i32(&parts);
-                    if per == 1 { joined } else { LLVMBuildBitCast(cg.b, joined, cg.vi64(), n) }
+                    if per == 1 { joined } else { ir.bitcast(joined, cg.vi64()) }
                 };
                 for k in 0..words as usize { let v = extract(self, ioff_w + k as u32 * per); self.define(results[k], v); }
             }
@@ -571,8 +544,8 @@ impl<'a> Cg<'a> {
                     if pairs && k + 1 < words as usize {
                         let ptrs = self.ptr_at_vec(addr, offsets[k] as u64);
                         let d = match lanes {
-                            Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, self.f64t),
-                            _ => self.masked_gather_ty(ptrs, exec, self.f64t, 4),
+                            Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, ir.f64()),
+                            _ => self.masked_gather_ty(ptrs, exec, ir.f64(), 4),
                         };
                         let (lo, hi) = self.split_pair(d);
                         self.define(results[k], lo);
@@ -583,7 +556,7 @@ impl<'a> Cg<'a> {
                         let ptrs = self.ptr_at_vec(addr, offsets[k] as u64);
                         let d = match lanes {
                             Lanes::Broadcast => self.bcast_load(ptrs, exec, nonempty, elem),
-                            Lanes::Lds => self.masked_gather_ty(ptrs, exec, self.i32t, 1),
+                            Lanes::Lds => self.masked_gather_ty(ptrs, exec, ir.i32(), 1),
                             Lanes::Affine { allocated } => self.affine_load(ptrs, exec, allocated),
                             Lanes::Gather => self.masked_gather_ty(ptrs, exec, elem, 4),
                         };
@@ -597,32 +570,36 @@ impl<'a> Cg<'a> {
         for (&r, &private) in results.iter().zip(&flat_private) { let v = self.values[r.0]; self.define(private, v); }
     }
 
-    unsafe fn emit_grouped_atomic_add(&self, addresses: LLVMValueRef, values: LLVMValueRef, exec: LLVMValueRef) {
-        let b = self.b; let n = self.n();
-        let addresses = LLVMBuildFreeze(b, addresses, n);
-        let entry = LLVMGetInsertBlock(b); let function = LLVMGetBasicBlockParent(entry);
-        let header = LLVMAppendBasicBlockInContext(self.ctx, function, cstr("atomic.groups").as_ptr());
-        let body = LLVMAppendBasicBlockInContext(self.ctx, function, cstr("atomic.group").as_ptr());
-        let done = LLVMAppendBasicBlockInContext(self.ctx, function, cstr("atomic.done").as_ptr());
+    fn emit_grouped_atomic_add(&self, addresses: Value, values: Value, exec: Value) {
+        let ir = self.ir;
+        let addresses = ir.freeze(addresses);
+        let entry = ir.insert_block();
+        let function = entry.function();
+        let header = ir.append_block(function, "atomic.groups");
+        let body = ir.append_block(function, "atomic.group");
+        let done = ir.append_block(function, "atomic.done");
         let initial = self.vec_to_mask(exec);
-        LLVMBuildBr(b, header); LLVMPositionBuilderAtEnd(b, header);
-        let pending = LLVMBuildPhi(b, self.i32t, n);
-        LLVMAddIncoming(pending, [initial].as_mut_ptr(), [entry].as_mut_ptr(), 1);
-        let nonempty = LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntNE, pending, self.ci32(0), n);
-        LLVMBuildCondBr(b, nonempty, body, done); LLVMPositionBuilderAtEnd(b, body);
-        let lane = self.call("llvm.cttz.i32", self.i32t, &[self.i32t, self.i1], &[pending, LLVMConstInt(self.i1, 1, 0)]);
-        let address = LLVMBuildExtractElement(b, addresses, lane, n);
-        let equal = LLVMBuildICmp(b, llvm::LLVMIntPredicate::LLVMIntEQ, addresses, self.splat(address), n);
-        let members = LLVMBuildAnd(b, self.vec_to_mask(equal), pending, n);
+        ir.br(header);
+        ir.position_at_end(header);
+        let pending = ir.phi(ir.i32());
+        pending.add_incoming(&[(initial, entry)]);
+        let nonempty = ir.icmp(IntPred::Ne, pending, self.ci32(0));
+        ir.cond_br(nonempty, body, done);
+        ir.position_at_end(body);
+        let lane = ir.call_named("llvm.cttz.i32", ir.i32(), &[ir.i32(), ir.i1()], &[pending, ir.ci1(true)]);
+        let address = ir.extract(addresses, lane);
+        let equal = ir.icmp(IntPred::Eq, addresses, self.splat(address));
+        let members = ir.and(self.vec_to_mask(equal), pending);
         let mask = self.mask_to_vec(members);
-        let addends = LLVMBuildSelect(b, mask, values, LLVMConstNull(self.vi32()), n);
-        let sum = self.call(&format!("llvm.vector.reduce.add.v{}i32", self.width()), self.i32t, &[self.vi32()], &[addends]);
-        let pointer = LLVMBuildIntToPtr(b, address, self.ptr, n);
-        LLVMBuildAtomicRMW(b, llvm::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpAdd, pointer, sum, llvm::LLVMAtomicOrdering::LLVMAtomicOrderingSequentiallyConsistent, 0);
-        let remaining = LLVMBuildAnd(b, pending, LLVMBuildNot(b, members, n), n);
-        let backedge = LLVMGetInsertBlock(b);
-        LLVMBuildBr(b, header); LLVMAddIncoming(pending, [remaining].as_mut_ptr(), [backedge].as_mut_ptr(), 1);
-        LLVMPositionBuilderAtEnd(b, done);
+        let addends = ir.select(mask, values, self.vi32().null());
+        let sum = self.reduce(&format!("add.v{}i32", self.width()), ir.i32(), addends);
+        let pointer = ir.inttoptr(address, ir.ptr());
+        ir.atomic_add(pointer, sum, Atomic::SequentiallyConsistent);
+        let remaining = ir.and(pending, ir.not(members));
+        let backedge = ir.insert_block();
+        ir.br(header);
+        pending.add_incoming(&[(remaining, backedge)]);
+        ir.position_at_end(done);
     }
 }
 
