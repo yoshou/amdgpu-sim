@@ -92,8 +92,8 @@ mod ir;
 mod compiler;
 mod codegen;
 mod program;
-mod jit;
 mod dialect;
+mod native;
 
 
 pub use program::{Program, CompilationInput};

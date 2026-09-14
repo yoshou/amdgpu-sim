@@ -3,13 +3,13 @@
 /// A JIT-compiled single-work-item kernel owning its executable memory.
 /// Concurrent calls borrow the kernel and use disjoint dispatch state.
 pub struct ScalarKernel {
-    code: super::super::jit::NativeCode,
+    code: super::super::native::jit::NativeCode,
     pub num_vgprs: usize,
     pub(crate) group: bool,
 }
 
 impl ScalarKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::jit::NativeCode, num_vgprs: usize, group: bool) -> Self { Self { code, num_vgprs, group } }
+    pub(in crate::rdna_spmd) fn from_code(code: super::super::native::jit::NativeCode, num_vgprs: usize, group: bool) -> Self { Self { code, num_vgprs, group } }
     /// Run one work-item. `sgprs` points to 128 u32 slots, `vgprs` to
     /// `num_vgprs` u32 slots (both set up by the dispatcher).
     pub unsafe fn run(&self, sgprs: *mut u32, vgprs: *mut u32, scratch_base: u64, lds_base: u64) {
@@ -43,7 +43,7 @@ pub const COOP_SPILL_SLOTS: usize = 256;
 
 /// A JIT-compiled width-W kernel. Processes W work-items per `run` call.
 pub struct VecKernel {
-    code: super::super::jit::NativeCode,
+    code: super::super::native::jit::NativeCode,
     pub num_vgprs: usize,
     pub width: u32,
     /// Per-lane allocation required by statically addressed private loads.
@@ -52,7 +52,7 @@ pub struct VecKernel {
     pub(crate) group: bool,
 }
 impl VecKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::jit::NativeCode, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, group: bool) -> Self {
+    pub(in crate::rdna_spmd) fn from_code(code: super::super::native::jit::NativeCode, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, group: bool) -> Self {
         Self { code, num_vgprs, width, min_private_bytes, workgroup_x, group }
     }
     /// Run W work-items. `sgprs` -> 128 u32 (shared/uniform); `vgprs` ->
@@ -77,7 +77,7 @@ impl VecKernel {
 pub struct CoopVecKernel {
     pub(crate) yields: Vec<Vec<super::yields::YieldValues>>,
     pub(crate) registers: super::super::dialect::Registers,
-    pub(in crate::rdna_spmd) code: super::super::jit::NativeCode,
+    pub(in crate::rdna_spmd) code: super::super::native::jit::NativeCode,
     pub num_vgprs: usize,
     pub width: u32,
     /// Per-lane allocation required by statically addressed private loads.
@@ -86,7 +86,7 @@ pub struct CoopVecKernel {
 }
 
 impl CoopVecKernel {
-    pub(in crate::rdna_spmd) fn from_code(code: super::super::jit::NativeCode, yields: Vec<Vec<super::yields::YieldValues>>, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, registers: super::super::dialect::Registers) -> Self {
+    pub(in crate::rdna_spmd) fn from_code(code: super::super::native::jit::NativeCode, yields: Vec<Vec<super::yields::YieldValues>>, num_vgprs: usize, width: u32, min_private_bytes: usize, workgroup_x: Option<u32>, registers: super::super::dialect::Registers) -> Self {
         assert_eq!(registers.scc_slot as usize + 1, COOP_SGPR_BUF);
         Self { yields, registers, code, num_vgprs, width, min_private_bytes, workgroup_x }
     }

@@ -5,7 +5,8 @@
 use crate::rdna_spmd::dialect::{DialectRegistry, Effect, Implementation, Operation, TargetOp};
 use crate::instructions::I;
 use crate::rdna_spmd::{ir::Ty, codegen::ops::Emitter};
-use llvm_sys::{core::*, prelude::*};
+use crate::rdna_spmd::native::{Type, Value};
+use crate::rdna_spmd::ir::{FloatPred, IntPred};
 mod scale;
 mod reduction;
 mod division;
@@ -24,7 +25,7 @@ pub(crate) fn register(registry: &mut DialectRegistry) -> Result<(), &'static st
             Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I1, Ty::F32, Ty::F32],
         outputs: vec![Ty::I32], lower: Implementation::Single(image::sample) })?;
     for (id, name, ty, lower) in [
-        (1, "rcp.f32", Ty::F32, rcp_f32 as unsafe fn(&Emitter, &[LLVMValueRef]) -> LLVMValueRef),
+        (1, "rcp.f32", Ty::F32, rcp_f32 as fn(&Emitter, &[Value]) -> Value),
         (2, "rcp.f64", Ty::F64, rcp_f64),
         (3, "rsq.f32", Ty::F32, rsq_f32),
         (4, "rsq.f64", Ty::F64, rsq_f64),
@@ -46,7 +47,7 @@ pub(crate) fn register(registry: &mut DialectRegistry) -> Result<(), &'static st
         registry.register(ID, id, Operation { effect: Effect::Pure, immediates: &[], name, inputs: if ty == Ty::F32 { &[Ty::F32] } else { &[Ty::F64] }, outputs: vec![ty], lower: Implementation::Single(lower) })?;
     }
     for (id, name, input, output, lower) in [
-        (9, "frexp_mant.f32", Ty::F32, Ty::F32, mant_f32 as unsafe fn(&Emitter, &[LLVMValueRef]) -> LLVMValueRef),
+        (9, "frexp_mant.f32", Ty::F32, Ty::F32, mant_f32 as fn(&Emitter, &[Value]) -> Value),
         (10, "frexp_mant.f64", Ty::F64, Ty::F64, mant_f64),
         (11, "frexp_exp.f32", Ty::F32, Ty::I32, exp_f32),
         (12, "frexp_exp.f64", Ty::F64, Ty::I32, exp_f64),
@@ -83,20 +84,19 @@ pub(in crate::rdna_spmd) fn comparison(registry: &DialectRegistry, ty: Ty) -> Ta
 // §16.9/§16.12 CMP_CLASS: the ten ISA class bits are the IEEE categories in
 // the same order as LLVM's class immediate. The selector itself is a runtime
 // lane value, so it must never occupy that intrinsic's immediate argument.
-unsafe fn classify(e: &Emitter, ty: Ty, value: LLVMValueRef, selector: LLVMValueRef) -> LLVMValueRef {
-    let n = b"\0".as_ptr().cast();
+fn classify(e: &Emitter, ty: Ty, value: Value, selector: Value) -> Value {
+    let ir = e.ir;
     let mut result = e.constant(Ty::I1, 0);
     for index in 0..10 {
-        let class = e.call(&format!("llvm.is.fpclass.{}", e.suffix(ty)), Ty::I1,
-            &[value, LLVMConstInt(LLVMInt32TypeInContext(e.ctx), 1 << index, 0)]);
-        let requested = LLVMBuildAnd(e.b, selector, e.constant(Ty::I32, 1 << index), n);
-        let requested = LLVMBuildICmp(e.b, llvm_sys::LLVMIntPredicate::LLVMIntNE, requested, e.constant(Ty::I32, 0), n);
-        result = LLVMBuildOr(e.b, result, LLVMBuildAnd(e.b, class, requested, n), n);
+        let class = e.call(&format!("llvm.is.fpclass.{}", e.suffix(ty)), Ty::I1, &[value, ir.ci32(1 << index)]);
+        let requested = ir.and(selector, e.constant(Ty::I32, 1 << index));
+        let requested = ir.icmp(IntPred::Ne, requested, e.constant(Ty::I32, 0));
+        result = ir.or(result, ir.and(class, requested));
     }
     result
 }
-unsafe fn class_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { classify(e, Ty::F32, a[0], a[1]) }
-unsafe fn class_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { classify(e, Ty::F64, a[0], a[1]) }
+fn class_f32(e: &Emitter, a: &[Value]) -> Value { classify(e, Ty::F32, a[0], a[1]) }
+fn class_f64(e: &Emitter, a: &[Value]) -> Value { classify(e, Ty::F64, a[0], a[1]) }
 
 #[cfg(test)]
 pub(in crate::rdna_spmd) fn reference_class(ty: Ty, bits: u64, selector: u32) -> bool {
@@ -148,47 +148,45 @@ pub(in crate::rdna_spmd) fn division(registry: &DialectRegistry, op: I) -> Optio
     Some(registry.lookup(ID, name).expect("missing RDNA4 provider"))
 }
 
-unsafe fn flush(e: &Emitter, value: LLVMValueRef) -> LLVMValueRef {
-    let n = b"\0".as_ptr().cast();
+fn flush(e: &Emitter, value: Value) -> Value {
+    let ir = e.ir;
     // is.fpclass has a scalar immediate even for vector operands. Selecting
     // the sign bit preserves negative zero and all NaN/Inf payloads.
-    let tiny = e.call(&format!("llvm.is.fpclass.{}", e.suffix(Ty::F32)), Ty::I1,
-        &[value, LLVMConstInt(LLVMInt32TypeInContext(e.ctx), 0x90, 0)]);
-    let bits = LLVMBuildBitCast(e.b, value, e.ty(Ty::I32), n);
-    let sign = LLVMBuildAnd(e.b, bits, e.constant(Ty::I32, 0x8000_0000), n);
-    LLVMBuildBitCast(e.b, LLVMBuildSelect(e.b, tiny, sign, bits, n), e.ty(Ty::F32), n)
+    let tiny = e.call(&format!("llvm.is.fpclass.{}", e.suffix(Ty::F32)), Ty::I1, &[value, ir.ci32(0x90)]);
+    let bits = ir.bitcast(value, e.ty(Ty::I32));
+    let sign = ir.and(bits, e.constant(Ty::I32, 0x8000_0000));
+    ir.bitcast(ir.select(tiny, sign, bits), e.ty(Ty::F32))
 }
 
-unsafe fn math(e: &Emitter, ty: Ty, mut value: LLVMValueRef, sqrt: bool, reciprocal: bool) -> LLVMValueRef {
+fn math(e: &Emitter, ty: Ty, mut value: Value, sqrt: bool, reciprocal: bool) -> Value {
     if ty == Ty::F32 { value = flush(e, value); }
     if sqrt { value = e.call(&format!("llvm.sqrt.{}", e.suffix(ty)), ty, &[value]); }
     if reciprocal {
         let one = e.constant(ty, if ty == Ty::F32 { 1f32.to_bits() as u64 } else { 1f64.to_bits() });
-        value = LLVMBuildFDiv(e.b, one, value, b"\0".as_ptr().cast());
+        value = e.ir.fdiv(one, value);
     }
     if ty == Ty::F32 { value = flush(e, value); }
     value
 }
-unsafe fn rcp_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { math(e, Ty::F32, a[0], false, true) }
-unsafe fn rcp_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { math(e, Ty::F64, a[0], false, true) }
-unsafe fn rsq_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { math(e, Ty::F32, a[0], true, true) }
-unsafe fn rsq_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { math(e, Ty::F64, a[0], true, true) }
-unsafe fn sqrt_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { math(e, Ty::F32, a[0], true, false) }
-unsafe fn sqrt_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { math(e, Ty::F64, a[0], true, false) }
+fn rcp_f32(e: &Emitter, a: &[Value]) -> Value { math(e, Ty::F32, a[0], false, true) }
+fn rcp_f64(e: &Emitter, a: &[Value]) -> Value { math(e, Ty::F64, a[0], false, true) }
+fn rsq_f32(e: &Emitter, a: &[Value]) -> Value { math(e, Ty::F32, a[0], true, true) }
+fn rsq_f64(e: &Emitter, a: &[Value]) -> Value { math(e, Ty::F64, a[0], true, true) }
+fn sqrt_f32(e: &Emitter, a: &[Value]) -> Value { math(e, Ty::F32, a[0], true, false) }
+fn sqrt_f64(e: &Emitter, a: &[Value]) -> Value { math(e, Ty::F64, a[0], true, false) }
 
 // §16.8/§16.12 EXP/LOG allow 1 ULP and flush input/output denormals.
 // Use host exp2/log2 with explicit ISA flushing, without approximate fast-math.
-unsafe fn exp2_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
+fn exp2_f32(e: &Emitter, a: &[Value]) -> Value {
     flush(e, e.call(&format!("llvm.exp2.{}", e.suffix(Ty::F32)), Ty::F32, &[flush(e, a[0])]))
 }
-unsafe fn log2_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
+fn log2_f32(e: &Emitter, a: &[Value]) -> Value {
     let input = flush(e, a[0]);
     let result = flush(e, e.call(&format!("llvm.log2.{}", e.suffix(Ty::F32)), Ty::F32, &[input]));
     // ISA special-value table: negative nonzero inputs produce -qNaN.
     // LLVM constant folding and the host library choose different NaN signs.
-    let negative = LLVMBuildFCmp(e.b, llvm_sys::LLVMRealPredicate::LLVMRealOLT,
-        input, e.constant(Ty::F32, 0), b"\0".as_ptr().cast());
-    LLVMBuildSelect(e.b, negative, e.constant(Ty::F32, 0xffc0_0000), result, b"\0".as_ptr().cast())
+    let negative = e.ir.fcmp(FloatPred::Olt, input, e.constant(Ty::F32, 0));
+    e.ir.select(negative, e.constant(Ty::F32, 0xffc0_0000), result)
 }
 
 // §16.8/§16.12 SIN/COS consume revolutions and support the full finite
@@ -197,110 +195,106 @@ unsafe fn log2_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
 // are already integers. Evaluate the reduced angle in f64 to avoid a rounded
 // f32 multiple of PI. Quarter/half turns have exact results. The named
 // hardware fixtures additionally pin signed zero and NaN payload behavior.
-unsafe fn trig(e: &Emitter, value: LLVMValueRef, cosine: bool) -> LLVMValueRef {
-    use llvm_sys::LLVMRealPredicate::*;
-    let n = b"\0".as_ptr().cast();
+fn trig(e: &Emitter, value: Value, cosine: bool) -> Value {
+    let ir = e.ir;
     let rounded = e.call(&format!("llvm.roundeven.{}", e.suffix(Ty::F32)), Ty::F32, &[value]);
-    let reduced = LLVMBuildFSub(e.b, value, rounded, n);
-    let wide = LLVMBuildFPExt(e.b, reduced, e.ty(Ty::F64), n);
-    let angle = LLVMBuildFMul(e.b, wide, e.constant(Ty::F64, std::f64::consts::TAU.to_bits()), n);
+    let reduced = ir.fsub(value, rounded);
+    let wide = ir.fpext(reduced, e.ty(Ty::F64));
+    let angle = ir.fmul(wide, e.constant(Ty::F64, std::f64::consts::TAU.to_bits()));
     let op = if cosine { "cos" } else { "sin" };
     let result = e.call(&format!("llvm.{op}.{}", e.suffix(Ty::F64)), Ty::F64, &[angle]);
-    let mut result = LLVMBuildFPTrunc(e.b, result, e.ty(Ty::F32), n);
+    let mut result = ir.fptrunc(result, e.ty(Ty::F32));
     let abs = e.call(&format!("llvm.fabs.{}", e.suffix(Ty::F32)), Ty::F32, &[reduced]);
     let zero = e.constant(Ty::F32, 0);
-    let exact_zero = LLVMBuildFCmp(e.b, LLVMRealOEQ, abs,
-        e.constant(Ty::F32, if cosine { 0.25f32 } else { 0.5f32 }.to_bits() as u64), n);
-    result = LLVMBuildSelect(e.b, exact_zero, zero, result, n);
+    let exact_zero = ir.fcmp(FloatPred::Oeq, abs, e.constant(Ty::F32, if cosine { 0.25f32 } else { 0.5f32 }.to_bits() as u64));
+    result = ir.select(exact_zero, zero, result);
     if !cosine {
-        let integral = LLVMBuildFCmp(e.b, LLVMRealOEQ, abs, zero, n);
-        result = LLVMBuildSelect(e.b, integral, zero, result, n);
-        let input_zero = LLVMBuildFCmp(e.b, LLVMRealOEQ, value, zero, n);
-        result = LLVMBuildSelect(e.b, input_zero, value, result, n);
+        let integral = ir.fcmp(FloatPred::Oeq, abs, zero);
+        result = ir.select(integral, zero, result);
+        let input_zero = ir.fcmp(FloatPred::Oeq, value, zero);
+        result = ir.select(input_zero, value, result);
     }
     result
 }
-unsafe fn sin_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { trig(e, a[0], false) }
-unsafe fn cos_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { trig(e, a[0], true) }
+fn sin_f32(e: &Emitter, a: &[Value]) -> Value { trig(e, a[0], false) }
+fn cos_f32(e: &Emitter, a: &[Value]) -> Value { trig(e, a[0], true) }
 
 // §16.8/§16.12 fixed rounding operations preserve subnormals and signed zero.
-unsafe fn rounding(e: &Emitter, ty: Ty, op: &str, a: LLVMValueRef) -> LLVMValueRef {
+fn rounding(e: &Emitter, ty: Ty, op: &str, a: Value) -> Value {
     e.call(&format!("llvm.{op}.{}", e.suffix(ty)), ty, &[a])
 }
-unsafe fn floor_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F32, "floor", a[0]) }
-unsafe fn floor_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F64, "floor", a[0]) }
-unsafe fn ceil_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F32, "ceil", a[0]) }
-unsafe fn trunc_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F32, "trunc", a[0]) }
-unsafe fn trunc_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F64, "trunc", a[0]) }
-unsafe fn round_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F32, "roundeven", a[0]) }
-unsafe fn round_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { rounding(e, Ty::F64, "roundeven", a[0]) }
-unsafe fn fract_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
-    let n = b"\0".as_ptr().cast();
+fn floor_f32(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F32, "floor", a[0]) }
+fn floor_f64(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F64, "floor", a[0]) }
+fn ceil_f32(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F32, "ceil", a[0]) }
+fn trunc_f32(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F32, "trunc", a[0]) }
+fn trunc_f64(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F64, "trunc", a[0]) }
+fn round_f32(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F32, "roundeven", a[0]) }
+fn round_f64(e: &Emitter, a: &[Value]) -> Value { rounding(e, Ty::F64, "roundeven", a[0]) }
+fn fract_f64(e: &Emitter, a: &[Value]) -> Value {
     let floor = floor_f64(e, a);
-    let value = LLVMBuildFSub(e.b, a[0], floor, n);
+    let value = e.ir.fsub(a[0], floor);
     // §16.8 V_FRACT_F64 clamps to the largest representable number below 1.
     // Ordered comparison retains NaNs (minnum would replace them by the cap).
     let cap = e.constant(Ty::F64, 0x3fef_ffff_ffff_ffff);
-    let over = LLVMBuildFCmp(e.b, llvm_sys::LLVMRealPredicate::LLVMRealOGT, value, cap, n);
-    LLVMBuildSelect(e.b, over, cap, value, n)
+    let over = e.ir.fcmp(FloatPred::Ogt, value, cap);
+    e.ir.select(over, cap, value)
 }
 
 // §16.8 frexp: normalize the significand using integer shifts, so a host's
 // floating-point denormal mode cannot erase the smallest input values.
-unsafe fn frexp(e: &Emitter, ty: Ty, input: LLVMValueRef) -> (LLVMValueRef, LLVMValueRef) {
-    use llvm_sys::LLVMIntPredicate::*;
-    let n = b"\0".as_ptr().cast();
+fn frexp(e: &Emitter, ty: Ty, input: Value) -> (Value, Value) {
+    let ir = e.ir;
     let (word, fraction_bits, exponent_bits, bias) = if ty == Ty::F32 { (Ty::I32, 23, 8, 127) } else { (Ty::I64, 52, 11, 1023) };
     let k = |x| e.constant(word, x);
-    let bits = LLVMBuildBitCast(e.b, input, e.ty(word), n);
-    let sign = LLVMBuildAnd(e.b, bits, k(1u64 << (word.bits() - 1)), n);
-    let fraction = LLVMBuildAnd(e.b, bits, k((1u64 << fraction_bits) - 1), n);
-    let exponent = LLVMBuildAnd(e.b, LLVMBuildLShr(e.b, bits, k(fraction_bits), n), k((1 << exponent_bits) - 1), n);
-    let exp_zero = LLVMBuildICmp(e.b, LLVMIntEQ, exponent, k(0), n);
-    let special = LLVMBuildICmp(e.b, LLVMIntEQ, exponent, k((1 << exponent_bits) - 1), n);
-    let fraction_zero = LLVMBuildICmp(e.b, LLVMIntEQ, fraction, k(0), n);
-    let zero = LLVMBuildAnd(e.b, exp_zero, fraction_zero, n);
-    let lz = e.call(&format!("llvm.ctlz.{}", e.suffix(word)), word,
-        &[fraction, LLVMConstInt(LLVMInt1TypeInContext(e.ctx), 0, 0)]);
-    let shift = LLVMBuildSub(e.b, lz, k(exponent_bits), n);
+    let eq = |a, b| ir.icmp(IntPred::Eq, a, b);
+    let bits = ir.bitcast(input, e.ty(word));
+    let sign = ir.and(bits, k(1u64 << (word.bits() - 1)));
+    let fraction = ir.and(bits, k((1u64 << fraction_bits) - 1));
+    let exponent = ir.and(ir.lshr(bits, k(fraction_bits)), k((1 << exponent_bits) - 1));
+    let exp_zero = eq(exponent, k(0));
+    let special = eq(exponent, k((1 << exponent_bits) - 1));
+    let fraction_zero = eq(fraction, k(0));
+    let zero = ir.and(exp_zero, fraction_zero);
+    let lz = e.call(&format!("llvm.ctlz.{}", e.suffix(word)), word, &[fraction, ir.ci1(false)]);
+    let shift = ir.sub(lz, k(exponent_bits));
     // The non-selected normal-input path also remains free of poison shifts.
-    let safe_shift = LLVMBuildAnd(e.b, shift, k(word.bits() as u64 - 1), n);
-    let normalized = LLVMBuildAnd(e.b, LLVMBuildShl(e.b, fraction, safe_shift, n), k((1u64 << fraction_bits) - 1), n);
-    let mantissa = LLVMBuildSelect(e.b, exp_zero, normalized, fraction, n);
-    let mantissa = LLVMBuildOr(e.b, LLVMBuildOr(e.b, sign, mantissa, n), k((bias - 1) << fraction_bits), n);
-    let nan = LLVMBuildAnd(e.b, special, LLVMBuildNot(e.b, fraction_zero, n), n);
-    let quiet = LLVMBuildOr(e.b, bits, k(1 << (fraction_bits - 1)), n);
-    let special_bits = LLVMBuildSelect(e.b, nan, quiet, bits, n);
-    let mantissa = LLVMBuildSelect(e.b, LLVMBuildOr(e.b, zero, special, n), special_bits, mantissa, n);
-    let normal_exp = LLVMBuildSub(e.b, exponent, k(bias - 1), n);
-    let sub_exp = LLVMBuildSub(e.b, LLVMBuildSub(e.b, k(2), k(bias), n), shift, n);
-    let exp = LLVMBuildSelect(e.b, exp_zero, sub_exp, normal_exp, n);
-    let exp = LLVMBuildSelect(e.b, LLVMBuildOr(e.b, zero, special, n), k(0), exp, n);
-    let exp = if word == Ty::I64 { LLVMBuildTrunc(e.b, exp, e.ty(Ty::I32), n) } else { exp };
-    (LLVMBuildBitCast(e.b, mantissa, e.ty(ty), n), exp)
+    let safe_shift = ir.and(shift, k(word.bits() as u64 - 1));
+    let normalized = ir.and(ir.shl(fraction, safe_shift), k((1u64 << fraction_bits) - 1));
+    let mantissa = ir.select(exp_zero, normalized, fraction);
+    let mantissa = ir.or(ir.or(sign, mantissa), k((bias - 1) << fraction_bits));
+    let nan = ir.and(special, ir.not(fraction_zero));
+    let quiet = ir.or(bits, k(1 << (fraction_bits - 1)));
+    let special_bits = ir.select(nan, quiet, bits);
+    let mantissa = ir.select(ir.or(zero, special), special_bits, mantissa);
+    let normal_exp = ir.sub(exponent, k(bias - 1));
+    let sub_exp = ir.sub(ir.sub(k(2), k(bias)), shift);
+    let exp = ir.select(exp_zero, sub_exp, normal_exp);
+    let exp = ir.select(ir.or(zero, special), k(0), exp);
+    let exp = if word == Ty::I64 { ir.trunc(exp, e.ty(Ty::I32)) } else { exp };
+    (ir.bitcast(mantissa, e.ty(ty)), exp)
 }
-unsafe fn mant_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { frexp(e, Ty::F32, a[0]).0 }
-unsafe fn mant_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { frexp(e, Ty::F64, a[0]).0 }
-unsafe fn exp_f32(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { frexp(e, Ty::F32, a[0]).1 }
-unsafe fn exp_f64(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef { frexp(e, Ty::F64, a[0]).1 }
+fn mant_f32(e: &Emitter, a: &[Value]) -> Value { frexp(e, Ty::F32, a[0]).0 }
+fn mant_f64(e: &Emitter, a: &[Value]) -> Value { frexp(e, Ty::F64, a[0]).0 }
+fn exp_f32(e: &Emitter, a: &[Value]) -> Value { frexp(e, Ty::F32, a[0]).1 }
+fn exp_f64(e: &Emitter, a: &[Value]) -> Value { frexp(e, Ty::F64, a[0]).1 }
 
 // §16.8/§16.12 CVT_F32_F16 and CVT_F16_F32, default RNE rounding with
 // subnormal support. Half types remain local to the provider, never core IR.
-unsafe fn from_half(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
-    let n = b"\0".as_ptr().cast();
-    let i16 = e.shaped(LLVMInt16TypeInContext(e.ctx));
-    let f16 = e.shaped(LLVMHalfTypeInContext(e.ctx));
-    let bits = LLVMBuildTrunc(e.b, a[0], i16, n);
-    let value = LLVMBuildBitCast(e.b, bits, f16, n);
-    LLVMBuildFPExt(e.b, value, e.ty(Ty::F32), n)
+fn from_half(e: &Emitter, a: &[Value]) -> Value {
+    let ir = e.ir;
+    let i16 = e.shaped(ir.i16());
+    let f16 = e.shaped(ir.f16());
+    let bits = ir.trunc(a[0], i16);
+    let value = ir.bitcast(bits, f16);
+    ir.fpext(value, e.ty(Ty::F32))
 }
-unsafe fn to_half(e: &Emitter, a: &[LLVMValueRef]) -> LLVMValueRef {
-    let n = b"\0".as_ptr().cast();
-    let i16 = e.shaped(LLVMInt16TypeInContext(e.ctx));
-    let f16 = e.shaped(LLVMHalfTypeInContext(e.ctx));
-    let value = LLVMBuildFPTrunc(e.b, a[0], f16, n);
-    let bits = LLVMBuildBitCast(e.b, value, i16, n);
-    LLVMBuildZExt(e.b, bits, e.ty(Ty::I32), n)
+fn to_half(e: &Emitter, a: &[Value]) -> Value {
+    let ir = e.ir;
+    let i16 = e.shaped(ir.i16());
+    let f16 = e.shaped(ir.f16());
+    let value = ir.fptrunc(a[0], f16);
+    let bits = ir.bitcast(value, i16);
+    ir.zext(bits, e.ty(Ty::I32))
 }
 
 #[cfg(test)]
@@ -364,5 +358,5 @@ pub(in crate::rdna_spmd) fn reference(op: I, bits: u64) -> u64 {
     }
 }
 
-pub(in crate::rdna_spmd) fn bvh(registry:&DialectRegistry)->TargetOp {registry.lookup(ID,"image_bvh64_intersect_ray").expect("missing BVH provider")}
-pub(in crate::rdna_spmd) fn bvh8(registry:&DialectRegistry)->TargetOp {registry.lookup(ID,"image_bvh8_intersect_ray").expect("missing BVH8 provider")}
+pub(in crate::rdna_spmd) fn bvh(registry: &DialectRegistry) -> TargetOp { registry.lookup(ID, "image_bvh64_intersect_ray").expect("missing BVH provider") }
+pub(in crate::rdna_spmd) fn bvh8(registry: &DialectRegistry) -> TargetOp { registry.lookup(ID, "image_bvh8_intersect_ray").expect("missing BVH8 provider") }

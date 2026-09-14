@@ -2,7 +2,7 @@
 //! stable opaque IDs; signatures and lowering belong to the provider.
 use super::ir::{Ty, ValueId};
 use std::collections::BTreeMap;
-use llvm_sys::prelude::LLVMValueRef;
+use super::native::Value;
 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -48,8 +48,8 @@ pub(crate) struct Operation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Effect { Pure, ReadGlobal { every_lane: bool } }
 pub(crate) enum Implementation {
-    Single(unsafe fn(&super::codegen::ops::Emitter, &[LLVMValueRef]) -> LLVMValueRef),
-    Multiple(unsafe fn(&super::codegen::ops::Emitter, &[LLVMValueRef]) -> Vec<LLVMValueRef>),
+    Single(fn(&super::codegen::ops::Emitter, &[Value]) -> Value),
+    Multiple(fn(&super::codegen::ops::Emitter, &[Value]) -> Vec<Value>),
 }
 impl Operation {
     pub fn verify_immediates(&self, args: Arguments, constant: impl Fn(ValueId) -> Option<u64>) -> Result<(), &'static str> {
@@ -60,7 +60,7 @@ impl Operation {
         }
         Ok(())
     }
-    pub unsafe fn emit(&self, emitter: &super::codegen::ops::Emitter, args: &[LLVMValueRef]) -> Vec<LLVMValueRef> {
+    pub fn emit(&self, emitter: &super::codegen::ops::Emitter, args: &[Value]) -> Vec<Value> {
         let values = match self.lower {
             Implementation::Single(lower) => vec![lower(emitter, args)],
             Implementation::Multiple(lower) => lower(emitter, args),
@@ -85,7 +85,7 @@ pub(crate) struct DialectRegistry {
     operations: BTreeMap<TargetOp, Operation>,
     dialects: BTreeMap<u32, &'static str>,
     registers: Registers,
-    state: Option<unsafe fn(&super::codegen::ops::Emitter, LLVMValueRef) -> Box<dyn std::any::Any>>,
+    state: Option<fn(&super::codegen::ops::Emitter, Value) -> Box<dyn std::any::Any>>,
     idioms: Vec<Box<dyn super::pass::idioms::Idiom>>,
 }
 impl TargetOp {
@@ -95,11 +95,11 @@ impl DialectRegistry {
     pub fn new() -> Self { Self::default() }
     pub fn add_dialect(&mut self, id: u32, name: &'static str) { self.dialects.insert(id, name); }
     pub fn set_registers(&mut self, registers: Registers) { self.registers = registers; }
-    pub fn set_lowering_state(&mut self, prepare: unsafe fn(&super::codegen::ops::Emitter, LLVMValueRef) -> Box<dyn std::any::Any>) { self.state = Some(prepare); }
+    pub fn set_lowering_state(&mut self, prepare: fn(&super::codegen::ops::Emitter, Value) -> Box<dyn std::any::Any>) { self.state = Some(prepare); }
     pub fn add_idiom(&mut self, idiom: Box<dyn super::pass::idioms::Idiom>) { self.idioms.push(idiom); }
     pub fn registers(&self) -> Registers { self.registers }
     pub fn idioms(&self) -> &[Box<dyn super::pass::idioms::Idiom>] { &self.idioms }
-    pub unsafe fn lowering_state(&self, emitter: &super::codegen::ops::Emitter, sink: LLVMValueRef) -> Option<Box<dyn std::any::Any>> {
+    pub fn lowering_state(&self, emitter: &super::codegen::ops::Emitter, sink: Value) -> Option<Box<dyn std::any::Any>> {
         self.state.map(|prepare| prepare(emitter, sink))
     }
     pub fn dialect_name(&self, dialect: u32) -> Option<&'static str> { self.dialects.get(&dialect).copied() }
@@ -153,8 +153,7 @@ mod tests {
     #[test]
     fn target_provider_matches_reference_at_all_widths() {
         use crate::instructions::I;
-        use crate::rdna_spmd::{jit, codegen::ops::Emitter};
-        use llvm_sys::core::*;
+        use crate::rdna_spmd::{native::jit, codegen::ops::Emitter};
         use std::sync::Arc;
         let registry = Arc::new(crate::rdna_spmd::targets::rdna4::registry());
         for opcode in [I::V_RCP_F32, I::V_RCP_F64, I::V_RSQ_F32, I::V_RSQ_F64,
@@ -190,26 +189,23 @@ mod tests {
             for width in [0, 1, 2, 4, 8, 16] {
                 unsafe {
                     let module = jit::Module::new("target_reference");
-                    let b = module.builder; let ctx = module.ctx; let n = b"\0".as_ptr().cast();
-                    let pointer = LLVMPointerTypeInContext(ctx, 0);
-                    let ft = LLVMFunctionType(LLVMVoidTypeInContext(ctx), [pointer, pointer, pointer].as_mut_ptr(), 3, 0);
-                    let f = LLVMAddFunction(module.module, b"kernel\0".as_ptr().cast(), ft);
-                    let entry = LLVMAppendBasicBlockInContext(ctx, f, n);
-                    LLVMPositionBuilderAtEnd(b, entry);
-                    let emitter = Emitter::new(b, (width != 0).then_some(width), registry.clone());
-                    let input = LLVMBuildLoad2(b, emitter.ty(input_ty), LLVMGetParam(f, 0), n);
-                    LLVMSetAlignment(input, 4);
+                    let ir = module.builder();
+                    let pointer = ir.ptr();
+                    let f = ir.add_function("kernel", ir.void().function(&[pointer, pointer, pointer]));
+                    ir.position_at_end(ir.append_block(f, ""));
+                    let emitter = Emitter::new(ir, (width != 0).then_some(width), registry.clone());
+                    let input = ir.load(emitter.ty(input_ty), f.param(0)).set_alignment(4);
                     let mut args = Arguments::Unary(ValueId(0));
                     let mut values = vec![input]; let mut types = vec![input_ty];
                     if binary {
-                        let exponent = LLVMBuildLoad2(b, emitter.ty(Ty::I32), LLVMGetParam(f, 1), n);
-                        LLVMSetAlignment(exponent, 4); values.push(exponent); types.push(Ty::I32);
+                        let exponent = ir.load(emitter.ty(Ty::I32), f.param(1)).set_alignment(4);
+                        values.push(exponent); types.push(Ty::I32);
                         args = Arguments::Binary([ValueId(0), ValueId(1)]);
                     }
                     assert_eq!(registry.result_type(target, args, &types), Ok(output_ty));
                     let output = emitter.target(target, args, &values)[0];
-                    let store = LLVMBuildStore(b, output, LLVMGetParam(f, 2)); LLVMSetAlignment(store, 4);
-                    LLVMBuildRetVoid(b);
+                    ir.store(output, f.param(2)).set_alignment(4);
+                    ir.ret_void();
                     let code = module.finish(if width == 0 { jit::Mode::Scalar } else { jit::Mode::Packet });
                     let run: unsafe extern "C" fn(*const u32, *const i32, *mut u32) = std::mem::transmute(code.address() as usize);
                     let w = width.max(1) as usize;

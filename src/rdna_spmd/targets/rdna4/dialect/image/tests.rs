@@ -1,5 +1,5 @@
 use super::*;
-use crate::rdna_spmd::{dialect::Arguments, ir::ValueId, jit};
+use crate::rdna_spmd::{dialect::Arguments, ir::ValueId, native::jit};
 use std::sync::Arc;
 
 // ISA Tables 60–62: R8 resource layout, point sampler addressing and numeric
@@ -75,27 +75,27 @@ fn native_sampler_matches_reference_with_lane_distinct_descriptors_and_coordinat
         [false, true].iter().copied().flat_map(move |unrm| (0..coordinates.len()).map(move |j| (format, mode, unrm, j))))).collect::<Vec<_>>();
     for width in [0, 1, 2, 4, 8, 16] { for component in 0..4 {
         unsafe {
-            let module = jit::Module::new("image_reference"); let b = module.builder; let n = b"\0".as_ptr().cast();
-            let pointer = LLVMPointerTypeInContext(module.ctx, 0);
-            let ft = LLVMFunctionType(LLVMVoidTypeInContext(module.ctx), [pointer, pointer].as_mut_ptr(), 2, 0);
-            let f = LLVMAddFunction(module.module, b"kernel\0".as_ptr().cast(), ft);
-            LLVMPositionBuilderAtEnd(b, LLVMAppendBasicBlockInContext(module.ctx, f, n));
+            let module = jit::Module::new("image_reference");
+            let b = module.builder();
+            let pointer = b.ptr();
+            let f = b.add_function("kernel", b.void().function(&[pointer, pointer]));
+            b.position_at_end(b.append_block(f, ""));
             let e = Emitter::new(b, (width != 0).then_some(width), registry.clone());
             let w = width.max(1) as usize;
             let mut values = vec![];
             for index in 0..16 {
-                let offset = LLVMConstInt(LLVMInt32TypeInContext(module.ctx), (index * w) as u64, 0);
-                let ptr = LLVMBuildGEP2(b, LLVMInt32TypeInContext(module.ctx), LLVMGetParam(f, 0), [offset].as_mut_ptr(), 1, n);
-                let value = LLVMBuildLoad2(b, e.ty(Ty::I32), ptr, n); LLVMSetAlignment(value, 4);
+                let ptr = b.gep(b.i32(), f.param(0), &[b.ci32((index * w) as u32)]);
+                let value = b.load(e.ty(Ty::I32), ptr).set_alignment(4);
                 values.push(match index {
                     12 => e.constant(Ty::I32, component),
-                    13 => LLVMBuildICmp(b, LLVMIntNE, value, e.constant(Ty::I32, 0), n),
-                    14 | 15 => LLVMBuildBitCast(b, value, e.ty(Ty::F32), n),
+                    13 => b.icmp(IntPred::Ne, value, e.constant(Ty::I32, 0)),
+                    14 | 15 => b.bitcast(value, e.ty(Ty::F32)),
                     _ => value,
                 });
             }
             let result = e.target(target, Arguments::Sixteen(std::array::from_fn(ValueId)), &values)[0];
-            let store = LLVMBuildStore(b, result, LLVMGetParam(f, 1)); LLVMSetAlignment(store, 4); LLVMBuildRetVoid(b);
+            b.store(result, f.param(1)).set_alignment(4);
+            b.ret_void();
             let code = module.finish(if width == 0 { jit::Mode::Scalar } else { jit::Mode::Packet });
             let run: unsafe extern "C" fn(*const u32, *mut u32) = std::mem::transmute(code.address() as usize);
             let mut input = vec![0u32; 16 * w]; let mut output = vec![0u32; w];
