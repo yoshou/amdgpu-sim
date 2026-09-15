@@ -93,11 +93,13 @@ fn native_scale(e: &Emitter, ty: Ty, value: Value, exponent: Value, w: u32, nati
         let types = args.iter().map(|a| a.ty()).collect::<Vec<_>>();
         parts.push(ir.call_named(&name, chunk_ty, &types, &args));
     }
-    if parts.len() == 1 {
-        parts[0]
-    } else {
-        assert_eq!(parts.len(), 2);
-        let mask: Vec<u32> = (0..w).collect();
-        ir.shuffle_by(parts[0], parts[1], &mask)
+    // W / lanes is a power of two: join neighbouring chunks until one remains.
+    while parts.len() > 1 {
+        let mask: Vec<u32> = (0..2 * parts[0].ty().vector_size()).collect();
+        parts = parts
+            .chunks(2)
+            .map(|pair| ir.shuffle_by(pair[0], pair[1], &mask))
+            .collect();
     }
+    parts[0]
 }
