@@ -431,9 +431,19 @@ pub(super) fn define(
                 value
             }
             Output::Scalar(..) | Output::Scc => result,
-            Output::Compare(_) | Output::Mask(_) => {
-                core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec))
-            }
+            // The ISA writes a mask bit only in the lanes EXEC selects; the
+            // other lanes keep the bit they held.
+            Output::Compare(reg) | Output::Mask(reg) => match Word::scalar(reg) {
+                Some(word) => {
+                    let old = if matches!(word, Word::Mask(_)) {
+                        words[&word]
+                    } else {
+                        project(f, insts, words[&word])
+                    };
+                    core(f, insts, Ty::I1, Op::Select(exec, result, old))
+                }
+                None => core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec)),
+            },
         };
         stored.push((value, ty));
         if let Output::Compare(reg) | Output::Mask(reg) = output {
@@ -441,7 +451,15 @@ pub(super) fn define(
                 let raw = if matches!(word, Word::Mask(_)) {
                     value
                 } else {
-                    query(f, insts, WaveOp::Ballot, value)
+                    // A ballot clears invalid lanes, so the word keeps its old
+                    // bits wherever EXEC is clear rather than balloting `value`.
+                    let active = query(f, insts, WaveOp::Ballot, exec);
+                    let taken = core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec));
+                    let written = query(f, insts, WaveOp::Ballot, taken);
+                    let ones = core(f, insts, Ty::I32, Op::Const(Ty::I32, 0xffff_ffff));
+                    let idle = core(f, insts, Ty::I32, Op::Int(IntOp::Xor, active, ones));
+                    let kept = core(f, insts, Ty::I32, Op::Int(IntOp::And, words[&word], idle));
+                    core(f, insts, Ty::I32, Op::Int(IntOp::Or, kept, written))
                 };
                 let raw = if word == Word::Mask(126) {
                     valid_exec(f, insts, raw)

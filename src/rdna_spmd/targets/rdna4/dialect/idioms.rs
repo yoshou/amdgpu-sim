@@ -419,6 +419,12 @@ fn scale_flag(
     exec: ValueId,
     ops: &DivisionIdioms,
 ) -> bool {
+    // A select keeps the old bit in the lanes its mask leaves out, so it
+    // carries the scale's flag only when FMAS runs under that same mask.
+    if let Some((new, mask)) = view.masks.predicated[view.alias(v).0] {
+        return view.same(mask, exec)
+            && scale_flag(view, new, denominator, numerator, exec, ops);
+    }
     if let Some(args) = view.result(v, ops.scale, 1) {
         return (view.same(args[0], denominator) || view.same(args[0], numerator))
             && view.same(args[1], denominator)
