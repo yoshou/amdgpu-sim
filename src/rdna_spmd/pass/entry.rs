@@ -117,11 +117,11 @@ fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
     local
 }
 
+/// A wave query answers over all 32 lanes. Only a packet that holds the whole
+/// wave answers every query from its own lanes; a narrower packet answers
+/// locally only the queries whose answers nothing observes.
 pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
-    let scheduled = f.blocks.values().flat_map(|b| &b.insts).any(
-        |inst| matches!(inst, Inst::Effect { provenance, .. } if *provenance & SCHEDULED != 0),
-    );
-    let all = !scheduled || whole_wave;
+    let all = whole_wave;
     let mut count = 0;
     loop {
         let local = if all {

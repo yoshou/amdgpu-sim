@@ -596,8 +596,8 @@ fn sharing(program: &Program, whole_wave: bool) -> Sharing {
                     space: Space::Lds, ..
                 } => out.group = true,
                 EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => out.barrier = true,
-                EffectOp::Wave(WaveOp::Any) => {}
-                EffectOp::Wave(WaveOp::Ballot | WaveOp::ReadFirstLane) if whole_wave => {}
+                EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane)
+                    if whole_wave => {}
                 _ => out.exchange |= super::program::exchange(op, inputs, &constants),
             }
         }
