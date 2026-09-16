@@ -3,7 +3,7 @@
 
 use super::{Ty, ValueId};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum IntOp {
     Add,
     Sub,
@@ -15,7 +15,7 @@ pub(crate) enum IntOp {
     LShr,
     AShr,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum IntPred {
     Eq,
     Ne,
@@ -28,7 +28,7 @@ pub(crate) enum IntPred {
     Sle,
     Sge,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FloatOp {
     Add,
     Sub,
@@ -37,12 +37,12 @@ pub(crate) enum FloatOp {
     MinNum,
     MaxNum,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FloatUnary {
     Neg,
     Abs,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)] // Complete predicate set, including forms not used by current ISA input.
 pub(crate) enum FloatPred {
     Oeq,
@@ -62,7 +62,7 @@ pub(crate) enum FloatPred {
 }
 /// The current ISA lift uses rte for integer -> float and saturating rtz for
 /// float -> integer (including NaN -> 0), retaining those semantics explicitly.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)] // Core conversion forms are independent of the initial ISA coverage.
 pub(crate) enum Cvt {
     SignedToFloatRte,
@@ -75,7 +75,7 @@ pub(crate) enum Cvt {
     Trunc,
     Bitcast,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Env {
     LaneId,
     PacketLaneId,
@@ -85,7 +85,7 @@ pub(crate) enum Env {
     ScratchSize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Op {
     Env(Env),
     Int(IntOp, ValueId, ValueId),

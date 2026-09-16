@@ -637,6 +637,27 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
         options.width
     );
     let program = program.to_ssa();
+    let decompiled = super::decompile::decompile(&program.function);
+    if Driver::new().trace {
+        match &decompiled {
+            Ok(_) => eprintln!("; decompiled into a lane program"),
+            Err(refusal) => eprintln!("; kept as a wave program, {refusal}"),
+        }
+    }
+    if let Ok(lane) = decompiled {
+        let code = if options.width == 0 {
+            Code::Scalar(compile_scalar(Program { function: lane }, options.num_vgprs))
+        } else {
+            let packet = super::decompile::relock(&lane);
+            Code::Packet(compile_packet(
+                Program { function: packet },
+                options.num_vgprs,
+                options.width,
+                options.workgroup_x,
+            ))
+        };
+        return Kernel::new(code, Scheduler::Independent, options.width);
+    }
     let mut folded = program.clone();
     dispatch_passes_ir(&mut folded.function, true);
     let sharing = sharing(&folded, false);

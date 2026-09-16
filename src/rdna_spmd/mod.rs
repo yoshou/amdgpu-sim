@@ -84,6 +84,7 @@
 mod analysis;
 mod codegen;
 mod compiler;
+mod decompile;
 mod dialect;
 mod engine;
 mod host;

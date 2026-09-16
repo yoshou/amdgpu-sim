@@ -3,7 +3,7 @@ use super::{Ty, ValueId};
 
 pub(crate) const SCHEDULED: u64 = 1 << 62;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Space {
     Global,
     Scratch,
@@ -18,7 +18,7 @@ impl Space {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum MemSize {
     U8,
     I8,
@@ -40,7 +40,7 @@ impl MemSize {
         matches!(self, Self::I8 | Self::I16)
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Scope {
     WorkItem,
     ComputeUnit,
@@ -49,14 +49,14 @@ pub(crate) enum Scope {
     System,
     Workgroup,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Ordering {
     Relaxed,
     Acquire,
     Release,
     Sequential,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum CachePolicy {
     Temporal,
     NonTemporal,
@@ -68,7 +68,7 @@ pub(crate) enum CachePolicy {
     NearNonTemporalFarHigh,
     NearNonTemporalFarWriteBack,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MemorySemantics {
     pub scope: Scope,
     pub ordering: Ordering,
@@ -76,14 +76,14 @@ pub(crate) struct MemorySemantics {
     pub volatile: bool,
     pub deferred_scope: bool,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum MemoryOp {
     Load(MemSize),
     Store(MemSize),
     AtomicAdd,
     Fence,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum WaveOp {
     Any,
     Ballot,
@@ -94,7 +94,7 @@ pub(crate) enum WaveOp {
     BpermuteFi,
     Wmma,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum EffectOp {
     Memory {
         space: Space,
