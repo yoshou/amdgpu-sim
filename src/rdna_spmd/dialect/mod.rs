@@ -4,7 +4,7 @@ use super::ir::{Ty, ValueId};
 use super::native::Value;
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct TargetOp {
     dialect: u32,
     operation: u32,

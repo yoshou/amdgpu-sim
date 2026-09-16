@@ -8,6 +8,7 @@ pub(in crate::rdna_spmd) struct SqrtIdioms {
     sqrt: TargetOp,
     rsq: TargetOp,
     ldexp: TargetOp,
+    class: TargetOp,
 }
 impl SqrtIdioms {
     pub(in crate::rdna_spmd) fn new(registry: &DialectRegistry) -> Self {
@@ -20,6 +21,7 @@ impl SqrtIdioms {
             sqrt: op("sqrt.f64"),
             rsq: op("rsq.f64"),
             ldexp: op("ldexp.f64"),
+            class: op("cmp_class.f64"),
         }
     }
 }
@@ -34,6 +36,7 @@ struct View<'a> {
     defs: Vec<Option<Op>>,
     targets: Vec<Option<(TargetOp, usize, Vec<ValueId>)>>,
     ballots: Vec<Option<ValueId>>,
+    anys: Vec<Option<ValueId>>,
     masks: &'a Predication,
     constants: &'a [Option<u64>],
 }
@@ -43,17 +46,23 @@ impl<'a> View<'a> {
         let mut defs = vec![None; f.types.len()];
         let mut targets = vec![None; f.types.len()];
         let mut ballots = vec![None; f.types.len()];
+        let mut anys = vec![None; f.types.len()];
         for block in f.blocks.values() {
             for inst in &block.insts {
                 match inst {
                     Inst::Core { value, op, .. } => defs[value.0] = Some(*op),
                     Inst::Effect {
-                        op: EffectOp::Wave(WaveOp::Ballot),
+                        op: EffectOp::Wave(query @ (WaveOp::Ballot | WaveOp::Any)),
                         inputs,
                         outputs,
                         ..
                     } => {
-                        ballots[outputs[0].0 .0] = Some(inputs[0]);
+                        let asked = if *query == WaveOp::Ballot {
+                            &mut ballots
+                        } else {
+                            &mut anys
+                        };
+                        asked[outputs[0].0 .0] = Some(inputs[0]);
                     }
                     Inst::Target {
                         op, args, outputs, ..
@@ -71,6 +80,7 @@ impl<'a> View<'a> {
             defs,
             targets,
             ballots,
+            anys,
             masks,
             constants,
         }
@@ -241,6 +251,74 @@ fn scaled_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> {
     }
     let halves = |e: i32, e2: i32| e % 2 == 0 && e2 == -(e / 2) && e.abs() <= 1022;
     if !(halves(a1, a2) && halves(b1, b2)) {
+        return None;
+    }
+    Some(view.raw(x))
+}
+
+/// LLVM class bits, in the ISA's order, of the zeros, positive infinity and
+/// the quiet NaNs: the classes a square root maps to themselves.
+const ROOT_FIXED_CLASSES: u64 = (1 << 1) | (1 << 5) | (1 << 6) | (1 << 9);
+
+/// The value a bit pattern reinterprets, through the casts that change how it
+/// is read but not what it holds.
+fn bits_of(view: &View, v: ValueId) -> ValueId {
+    let mut v = view.raw(v);
+    while let Some(Op::Convert(Cvt::Bitcast, _, a)) = view.defs[v.0] {
+        v = view.raw(a);
+    }
+    v
+}
+
+/// Whether two conditions ask the same question: the same value, or a
+/// wave-wide query of the same value.
+fn same_question(view: &View, a: ValueId, b: ValueId) -> bool {
+    if a == b {
+        return true;
+    }
+    if a.0 >= view.f.types.len() || b.0 >= view.f.types.len() {
+        return false;
+    }
+    match (view.anys[view.raw(a).0], view.anys[view.raw(b).0]) {
+        (Some(x), Some(y)) => view.same(x, y),
+        _ => false,
+    }
+}
+
+/// A square root whose operand the compiler scaled out of the subnormal range,
+/// keeping the scaled operand itself where a root maps its class to itself.
+///
+/// Scaling by an even power of two and halving it after the root is exact, so
+/// the sequence is the square root of the operand, except where the scale
+/// overflows it: at `2^(1023 - up)` and above the sequence yields infinity.
+/// The scale is chosen once for the whole wave when the compiler tests it with
+/// a scalar instruction, so the sequence reads the other lanes there; the
+/// square root the source asked for does not, and the target computes that,
+/// within the accuracy the ISA allows it.
+fn guarded_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> {
+    let Some(Op::Select(c, fixed, rescaled)) = view.defs[view.raw(out).0] else {
+        return None;
+    };
+    let class = view.target(c, ops.class)?;
+    let selector = view.constants[view.raw(class[1]).0]?;
+    if selector & !ROOT_FIXED_CLASSES != 0 {
+        return None;
+    }
+    let scaled = bits_of(view, class[0]);
+    if bits_of(view, fixed) != scaled {
+        return None;
+    }
+    let (root, (down, d1, d2)) = scale(view, bits_of(view, rescaled), ops)?;
+    let radicand = view.target(root, ops.sqrt)?;
+    if bits_of(view, radicand[0]) != scaled {
+        return None;
+    }
+    let (x, (up, u1, u2)) = scale(view, scaled, ops)?;
+    if !same_question(view, up, down) {
+        return None;
+    }
+    let halves = |e: i32, e2: i32| e % 2 == 0 && e2 == -(e / 2) && e.abs() <= 1022;
+    if !(halves(u1, d1) && halves(u2, d2)) {
         return None;
     }
     Some(view.raw(x))
@@ -567,6 +645,12 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
                     Inst::Core {
                         value, ty: Ty::F64, ..
                     } => *value,
+                    // A guarded root selects between bit patterns.
+                    Inst::Core {
+                        value,
+                        ty: Ty::I64,
+                        op: Op::Select(..),
+                    } => *value,
                     Inst::Target { outputs, .. }
                         if outputs.len() == 1 && outputs[0].1 == Ty::F64 =>
                     {
@@ -579,7 +663,8 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
                 }
                 let replacement = sqrt_chain(&view, value, ops)
                     .filter(|&x| scale(&view, x, ops).is_some())
-                    .or_else(|| scaled_sqrt(&view, value, ops));
+                    .or_else(|| scaled_sqrt(&view, value, ops))
+                    .or_else(|| guarded_sqrt(&view, value, ops));
                 if let Some(x) = replacement {
                     rewrites.push((id, index, value, x));
                 }
@@ -593,6 +678,21 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
     let mut inserted: BTreeMap<BlockId, Vec<(usize, Inst)>> = BTreeMap::new();
     for &(block, index, value, x) in &rewrites {
         let root = f.value(Ty::F64);
+        let mut replacement = root;
+        // The instructions are inserted one after another at the same place,
+        // so a bit pattern's cast is queued before the root it casts.
+        if f.types[value.0] == Ty::I64 {
+            let bits = f.value(Ty::I64);
+            inserted.entry(block).or_default().push((
+                index,
+                Inst::Core {
+                    value: bits,
+                    ty: Ty::I64,
+                    op: Op::Convert(Cvt::Bitcast, Ty::I64, root),
+                },
+            ));
+            replacement = bits;
+        }
         inserted.entry(block).or_default().push((
             index,
             Inst::Target {
@@ -602,7 +702,7 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
                 outputs: vec![(root, Ty::F64)],
             },
         ));
-        renames.insert(value, root);
+        renames.insert(value, replacement);
     }
     for (block, mut insts) in inserted {
         insts.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
@@ -784,6 +884,88 @@ mod tests {
             ),
             (0, 1, 0)
         );
+    }
+
+    /// A root whose operand is scaled when the wave answers that any lane
+    /// needs it, with the classes a root fixes taken from the scaled operand.
+    fn guarded(up: u32, down: u32) -> String {
+        format!(
+            "func entry b0
+             b0(v0: i32, v1: i32, v2: i1):
+               v3: i64 = pack64 v0, v1
+               v4: f64 = convert bitcast f64 v3
+               v5: i32 = const i32 0x0
+               v6: i1 = cmp ne v0, v5
+               v7: i1 = effect !p0 wave any (v6)
+               v8: i32 = const i32 {up:#x}
+               v9: i32 = select v7, v8, v5
+               v10: f64 = target rdna4.ldexp.f64(v4, v9)
+               v11: i32 = const i32 0x260
+               v12: i1 = target rdna4.cmp_class.f64(v10, v11)
+               v13: f64 = target rdna4.sqrt.f64(v10)
+               v14: i1 = effect !p1 wave any (v6)
+               v15: i32 = const i32 {down:#x}
+               v16: i32 = select v14, v15, v5
+               v17: f64 = target rdna4.ldexp.f64(v13, v16)
+               v18: i64 = convert bitcast i64 v10
+               v19: i64 = convert bitcast i64 v17
+               v20: i64 = select v12, v18, v19
+               ret v20"
+        )
+    }
+
+    fn fold(text: &str) -> (Func, usize, SqrtIdioms) {
+        let registry = crate::rdna_spmd::targets::rdna4::registry();
+        let mut ir = crate::rdna_spmd::ir::parse::func(&registry, text).unwrap();
+        let input = |source, ty| crate::rdna_spmd::program::Parameter { source, ty };
+        let inputs = vec![
+            input(crate::rdna_spmd::program::ParameterSource::Vgpr(0), Ty::I32),
+            input(crate::rdna_spmd::program::ParameterSource::Vgpr(1), Ty::I32),
+            input(
+                crate::rdna_spmd::program::ParameterSource::MaskBit(126),
+                Ty::I1,
+            ),
+        ];
+        let analyses = || Analyses::new(Context::new(&registry, &inputs, 2, 32));
+        let (constants, masks) = (
+            analyses().get::<Constants>(&ir),
+            analyses().get::<Predication>(&ir),
+        );
+        let ops = SqrtIdioms::new(&registry);
+        let count = run(&mut ir, &masks, &constants, &ops);
+        (ir, count, ops)
+    }
+
+    #[test]
+    fn a_scale_the_wave_chooses_around_a_root_folds_to_the_root_of_the_operand() {
+        let (ir, count, ops) = fold(&guarded(0x100, 0xffff_ff80));
+        assert_eq!(count, 1);
+        let block = &ir.blocks[&ir.entry];
+        let Term::Ret(returned) = &block.term else {
+            panic!("the block returns")
+        };
+        let defs = ir.definitions();
+        let Some(Op::Convert(Cvt::Bitcast, Ty::I64, root)) = defs[returned[0].0] else {
+            panic!("the result is a bit pattern")
+        };
+        let operand = block
+            .insts
+            .iter()
+            .find_map(|inst| match inst {
+                Inst::Target {
+                    op, args, outputs, ..
+                } if *op == ops.sqrt && outputs[0].0 == root => Some(args.values()[0]),
+                _ => None,
+            })
+            .expect("the bit pattern is a root");
+        // The root is taken of the operand itself, before any scaling.
+        assert!(matches!(defs[operand.0], Some(Op::Convert(Cvt::Bitcast, Ty::F64, p)) if matches!(defs[p.0], Some(Op::Pack64(..)))));
+    }
+
+    #[test]
+    fn a_rescale_that_does_not_halve_the_scale_is_left_alone() {
+        let (_, count, _) = fold(&guarded(0x100, 0xffff_ffc0));
+        assert_eq!(count, 0);
     }
 
     fn division_body(flag: u8) -> Vec<InstFormat> {
