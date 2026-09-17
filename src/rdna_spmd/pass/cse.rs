@@ -256,7 +256,7 @@ mod tests {
             super::super::mask_projection::run(&mut f, &constants);
             super::super::simplify::run(&mut f);
             super::super::dce::run(&mut f);
-            super::super::dce::dead_params(&mut f);
+            super::super::dce::dead_params::<crate::rdna_spmd::analysis::ExecRegister>(&mut f);
         }
         f.check(&registry).unwrap();
         assert!(!f

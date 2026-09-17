@@ -2,6 +2,7 @@ pub(super) mod constant;
 pub(super) mod dataflow;
 pub(super) mod lanes;
 pub(super) mod mask_cost;
+pub(in crate::rdna_spmd) mod masking;
 pub(in crate::rdna_spmd) mod masks;
 pub(super) mod memory;
 pub(in crate::rdna_spmd) mod uniformity;
@@ -14,6 +15,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) use constant::{Constants, DispatchConstants};
+pub(crate) use masking::{ExecRegister, MaskValues, Masking};
 pub(crate) use masks::{Exec, Masks, Predication};
 pub(crate) use memory::{Access, Accesses};
 pub(crate) use uniformity::Uniformity;

@@ -1,14 +1,14 @@
 mod bdd;
 mod facts;
 mod fold;
+mod lockstep;
 mod logic;
 mod loops;
 mod proof;
-mod relock;
 mod rewrite;
 
 pub(crate) use proof::Refusal;
-pub(crate) use relock::relock;
+pub(crate) use lockstep::{lockstep, Packing};
 
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::LiftedFunction;
@@ -95,7 +95,7 @@ mod tests {
     use super::*;
     use crate::instructions::I;
     use crate::rdna_instructions::{InstFormat, SourceOperand, SOP1, VGLOBAL, VOP2, VOPC};
-    use crate::rdna_spmd::compiler::{compile_packet, compile_scalar};
+    use crate::rdna_spmd::compiler::{compile_lockstep, compile_scalar};
     use crate::rdna_spmd::program::{Parameter, ParameterSource, Program};
     use crate::rdna_spmd::targets::rdna4::decode::{Cond, ScalarBlock, ScalarProgram, Terminator};
     use crate::rdna_spmd::targets::rdna4::lift::wave::{Destination, Operand, YieldAction};
@@ -207,7 +207,6 @@ mod tests {
                 );
             }
         }
-        let packet = relock(&lane);
         for width in [0u32, 1, 2, 4, 8, 16, 32] {
             let lanes = width.max(1) as usize;
             let mut output = vec![0u32; lanes];
@@ -228,7 +227,7 @@ mod tests {
                         0,
                     );
                 } else {
-                    compile_packet(Program { function: packet.clone() }, 256, width, None).run(
+                    compile_lockstep(&lane, 256, width, None).run(
                         sgprs.as_mut_ptr(),
                         vgprs.as_mut_ptr(),
                         0,

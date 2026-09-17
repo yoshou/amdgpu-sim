@@ -1,6 +1,7 @@
 //! Decode/lift once, prepare typed SSA, then emit LLVM from the IR alone.
 
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use super::target::Target;
@@ -15,7 +16,9 @@ use super::program::{CompilationInput, Program};
 use crate::rdna_spmd::targets::rdna4::decode::{self as ir, ScalarBlock, ScalarProgram};
 
 use super::analysis::uniformity::Fact;
-use super::analysis::{Accesses, Analyses, Constants, Context, Exec, Packet, Uniformity};
+use super::analysis::{
+    Accesses, Analyses, Constants, Context, ExecRegister, MaskValues, Masking, Packet, Uniformity,
+};
 use super::codegen::{Abi, Prepared};
 use super::dialect::DialectRegistry;
 #[cfg(test)]
@@ -103,7 +106,11 @@ pub(super) fn dispatch_passes_ir(f: &mut LiftedFunction, fold_masks: bool) {
             &MaskProjection,
         ]);
     }
-    passes.extend([&Simplify as &dyn Pass, &Dce, &DeadParams]);
+    passes.extend([
+        &Simplify as &dyn Pass,
+        &Dce,
+        &DeadParams::<ExecRegister>(PhantomData),
+    ]);
     driver
         .pipeline(&mut f.ir, &mut an, &[&DiscardReturn])
         .unwrap();
@@ -206,7 +213,9 @@ fn bare(f: LiftedFunction) -> Bare {
     }
 }
 
-fn prepared(
+/// The passes and analyses every prepared program goes through, for a program
+/// that carries its masks as `M` does.
+fn prepared<M: Masking>(
     mut ir: Func,
     an: &mut Analyses,
     registry: &Arc<DialectRegistry>,
@@ -230,7 +239,9 @@ fn prepared(
     driver.pipeline(&mut ir, an, &passes).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
         driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
-        driver.pipeline(&mut ir, an, &[&Pairs]).unwrap();
+        driver
+            .pipeline(&mut ir, an, &[&Pairs::<M>(PhantomData)])
+            .unwrap();
         let limit = 1 + ir.types.len();
         driver
             .fixpoint(
@@ -238,15 +249,15 @@ fn prepared(
                 an,
                 "simplify",
                 limit,
-                &[&Simplify, &Dce, &DeadParams, &WideMemory],
+                &[&Simplify, &Dce, &DeadParams::<M>(PhantomData), &WideMemory],
             )
             .unwrap();
     }
     driver.pipeline(&mut ir, an, &[&Adjacency]).unwrap();
     let constants = an.get::<Constants>(&ir);
-    let exec = an.get::<Exec>(&ir);
-    let uniformity = an.get::<Uniformity>(&ir);
-    let accesses = an.get::<Accesses>(&ir);
+    let uniformity = an.get::<Uniformity<M>>(&ir);
+    let accesses = an.get::<Accesses<M>>(&ir);
+    let holds_a_lane = M::holds_a_lane(&ir, an, &accesses);
     let uniform = uniformity.uniform();
     let affine: BTreeMap<ValueId, u32> = uniformity
         .facts
@@ -292,7 +303,7 @@ fn prepared(
         abi,
         observable_return,
         uniform,
-        exec,
+        holds_a_lane,
         constants,
         accesses,
         shapes,
@@ -355,7 +366,7 @@ pub(super) fn prepare_packet(f: LiftedFunction, options: PacketOptions) -> Prepa
     } else {
         Abi::Whole
     };
-    prepared(
+    prepared::<ExecRegister>(
         ir,
         &mut an,
         &registry,
@@ -363,6 +374,46 @@ pub(super) fn prepare_packet(f: LiftedFunction, options: PacketOptions) -> Prepa
         wide_masks,
         abi,
         observe_return,
+        num_vgprs,
+    )
+}
+
+/// Prepares a packet program the lockstep lowering made. The lowering settled
+/// every mask, so nothing here narrows or specialises one, and every mask
+/// stays a single bit per lane.
+pub(super) fn prepare_lockstep(
+    f: LiftedFunction,
+    packing: super::decompile::Packing,
+    num_vgprs: usize,
+) -> Prepared {
+    let Bare {
+        mut ir,
+        inputs,
+        registry,
+    } = bare(f);
+    let driver = Driver::new();
+    let mut an = Analyses::new(Context {
+        exec_initial: true,
+        packet: Some(Packet {
+            aligned: packing.aligned,
+        }),
+        ..context(&registry, &inputs, packing.lanes)
+    });
+    driver
+        .pipeline(&mut ir, &mut an, &[&DiscardReturn])
+        .unwrap();
+    let limit = 1 + ir.types.len();
+    driver
+        .fixpoint(&mut ir, &mut an, "simplify", limit, &[&Simplify, &Dce])
+        .unwrap();
+    prepared::<MaskValues>(
+        ir,
+        &mut an,
+        &registry,
+        Some(packing.lanes),
+        false,
+        Abi::Whole,
+        false,
         num_vgprs,
     )
 }
@@ -393,7 +444,7 @@ pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usi
         exec_initial: true,
         ..base
     });
-    prepared(
+    prepared::<ExecRegister>(
         ir,
         &mut an,
         &registry,
@@ -421,13 +472,17 @@ pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel
     ScalarKernel::from_code(code, p.num_vgprs, group)
 }
 
+/// Whether every packet of `width` lanes lies within one row of work items.
+pub(crate) fn aligned(workgroup_x: Option<u32>, width: u32) -> bool {
+    workgroup_x.map_or(true, |x| x % width == 0)
+}
+
 pub(crate) fn compile_packet(
     program: Program,
     num_vgprs: usize,
     width: u32,
     workgroup_x: Option<u32>,
 ) -> VecKernel {
-    let aligned = workgroup_x.map_or(true, |x| x % width == 0);
     let wide = wide_masks(&program.function.ir, width);
     let p = prepare_packet(
         program.function,
@@ -437,9 +492,29 @@ pub(crate) fn compile_packet(
             cooperative: false,
             observe_return: false,
             num_vgprs: num_vgprs.max(256),
-            aligned,
+            aligned: aligned(workgroup_x, width),
         },
     );
+    packet_kernel(p, width, workgroup_x)
+}
+
+/// Compiles a packet program the lockstep lowering makes from a lane program.
+pub(crate) fn compile_lockstep(
+    lane: &LiftedFunction,
+    num_vgprs: usize,
+    width: u32,
+    workgroup_x: Option<u32>,
+) -> VecKernel {
+    let packing = super::decompile::Packing {
+        lanes: width,
+        aligned: aligned(workgroup_x, width),
+    };
+    let packet = super::decompile::lockstep(lane, packing);
+    let p = prepare_lockstep(packet, packing, num_vgprs.max(256));
+    packet_kernel(p, width, workgroup_x)
+}
+
+fn packet_kernel(p: Prepared, width: u32, workgroup_x: Option<u32>) -> VecKernel {
     let group = p.group();
     let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
     VecKernel::from_code(
@@ -460,7 +535,7 @@ pub(crate) fn compile_cooperative_packet(
 ) -> CoopVecKernel {
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32));
     let program = super::program::split_at_effects(program, width >= 32);
-    let aligned = workgroup_x.map_or(true, |x| x % width == 0);
+    let aligned = aligned(workgroup_x, width);
     let num_vgprs = program.vgpr_count(num_vgprs);
     let wide = wide_masks(&program.function.ir, width);
     let p = prepare_packet(
@@ -648,9 +723,8 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
         let code = if options.width == 0 {
             Code::Scalar(compile_scalar(Program { function: lane }, options.num_vgprs))
         } else {
-            let packet = super::decompile::relock(&lane);
-            Code::Packet(compile_packet(
-                Program { function: packet },
+            Code::Packet(compile_lockstep(
+                &lane,
                 options.num_vgprs,
                 options.width,
                 options.workgroup_x,

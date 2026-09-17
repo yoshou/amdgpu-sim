@@ -3,11 +3,12 @@ use super::super::ir::{
 };
 use super::super::program::{Parameter, ParameterSource};
 use super::dataflow::{Cfg, Lattice, Sparse};
-use super::{Analyses, Analysis, Constants, Masks, Packet};
+use super::{Analyses, Analysis, Constants, Masking, Packet};
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
 
-impl Analysis for Uniformity {
-    type Result = Uniformity;
+impl<M: Masking> Analysis for Uniformity<M> {
+    type Result = Uniformity<M>;
     const NAME: &'static str = "uniformity";
     fn compute(f: &Func, analyses: &Analyses) -> Self {
         let ctx = analyses.context();
@@ -15,14 +16,15 @@ impl Analysis for Uniformity {
             return Uniformity {
                 facts: vec![Fact::Uniform; f.types.len()],
                 pairs: BTreeMap::new(),
+                masking: PhantomData,
             };
         };
-        let (constants, masks) = (analyses.get::<Constants>(f), analyses.get::<Masks>(f));
+        let constants = analyses.get::<Constants>(f);
         packet(
             f,
             &entry(f, ctx.inputs, aligned),
             &constants,
-            &masks.guarded,
+            &M::guarded(f, analyses),
         )
     }
 }
@@ -90,11 +92,20 @@ impl Fact {
             (Self::Uniform, Self::Uniform) => Self::Uniform,
             (Self::Affine { stride, .. }, Self::Uniform) => Self::Affine { stride, span: None },
             (Self::Uniform, Self::Affine { stride, .. }) => Self::Affine {
-                stride: if negate { -stride } else { stride },
+                stride: if negate {
+                    stride.wrapping_neg()
+                } else {
+                    stride
+                },
                 span: None,
             },
             (Self::Affine { stride: a, .. }, Self::Affine { stride: b, .. }) => {
-                let stride = if negate { a - b } else { a + b };
+                // Steps are words, so they add modulo the word as the values do.
+                let stride = if negate {
+                    a.wrapping_sub(b)
+                } else {
+                    a.wrapping_add(b)
+                };
                 if stride == 0 {
                     Self::Uniform
                 } else {
@@ -117,7 +128,24 @@ impl Fact {
         };
         end & !start
     }
-    fn masked(self, mask: u64) -> Self {
+    /// The fact of `value & mask` for a word of `bits` bits.
+    ///
+    /// An affine fact without a span says only that the lanes' words step by
+    /// the stride modulo 2^bits, so they may wrap anywhere in the word. Keeping
+    /// the whole word, or clearing low bits the stride never sets, keeps that
+    /// progression; keeping only the low bits keeps one only where every lane
+    /// agrees on them, since a wrap in the kept bits is no step at all.
+    fn masked(self, mask: u64, bits: u32) -> Self {
+        let whole = if bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let mask = mask & whole;
+        if mask == whole {
+            return self;
+        }
+        let cleared = whole & !mask;
         match self {
             Self::Uniform => Self::Uniform,
             Self::Affine {
@@ -136,20 +164,32 @@ impl Fact {
                     Self::Varying
                 }
             }
-            Self::Affine { span: None, .. } if mask != 0 && (mask + 1).is_power_of_two() => {
-                self.word(mask.count_ones())
+            Self::Affine { stride, span: None }
+                if mask != 0
+                    && (mask + 1).is_power_of_two()
+                    && stride.trailing_zeros() >= mask.count_ones() =>
+            {
+                Self::Uniform
             }
             Self::Affine { stride, span: None }
                 if mask != 0
-                    && (!mask + 1).is_power_of_two()
-                    && stride.trailing_zeros() >= (!mask).count_ones() =>
+                    && (cleared + 1).is_power_of_two()
+                    && stride.trailing_zeros() >= cleared.count_ones() =>
             {
                 Self::Affine { stride, span: None }
             }
             _ => Self::Varying,
         }
     }
-    fn shifted_right(self, amount: u64) -> Self {
+    /// The fact of `value >> amount` for a word of `bits` bits, which shifts by
+    /// the amount modulo the word as every shift in the IR does. Without a span
+    /// the lanes may wrap at the top of the word, and a wrapped step shifts to
+    /// no step.
+    fn shifted_right(self, amount: u64, bits: u32) -> Self {
+        let amount = amount & (bits as u64 - 1);
+        if amount == 0 {
+            return self;
+        }
         match self {
             Self::Uniform => Self::Uniform,
             Self::Affine {
@@ -165,25 +205,34 @@ impl Fact {
                     span: Some((start - amount as u32, end - amount as u32)),
                 }
             }
-            Self::Affine { stride, span: None }
-                if amount < 64 && stride.trailing_zeros() as u64 >= amount =>
-            {
-                Self::Affine {
-                    stride: stride >> amount,
-                    span: None,
-                }
-            }
             _ => Self::Varying,
         }
     }
-    fn shifted_left(self, amount: u64) -> Self {
+    /// The fact of `value << amount` for a word of `bits` bits, which shifts by
+    /// the amount modulo the word: a step modulo the word stays one, and a span
+    /// stays one while it stays in the word.
+    fn shifted_left(self, amount: u64, bits: u32) -> Self {
+        let amount = amount & (bits as u64 - 1);
         match self {
-            Self::Uniform => Self::Uniform,
-            Self::Affine { stride, span } if amount < 63 => Self::Affine {
+            Self::Affine { stride, span } => Self::Affine {
                 stride: stride.wrapping_shl(amount as u32),
-                span: span.map(|(start, end)| (start + amount as u32, end + amount as u32)),
+                span: span
+                    .map(|(start, end)| (start + amount as u32, end + amount as u32))
+                    .filter(|&(_, end)| end <= bits),
             },
-            _ => Self::Varying,
+            other => other,
+        }
+    }
+    /// The fact of widening a word of `bits` bits. Without a span the lanes'
+    /// words may have wrapped, and a widened wrap is no step.
+    fn widened(self, bits: u32, signed: bool) -> Self {
+        match self {
+            Self::Affine {
+                span: Some((_, end)),
+                ..
+            } if end < bits || !signed && end <= bits => self,
+            Self::Affine { .. } => Self::Varying,
+            other => other,
         }
     }
     fn word(self, bits: u32) -> Self {
@@ -204,14 +253,22 @@ struct Entry {
     varying: Vec<ValueId>,
 }
 
-#[derive(PartialEq)]
-pub(crate) struct Uniformity {
+/// Which values the lanes of a packet agree on, in a program that carries its
+/// masks as `M` does.
+pub(crate) struct Uniformity<M> {
     pub facts: Vec<Fact>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub pairs: BTreeMap<(ValueId, ValueId), Fact>,
+    masking: PhantomData<fn() -> M>,
 }
 
-impl Uniformity {
+impl<M> PartialEq for Uniformity<M> {
+    fn eq(&self, other: &Self) -> bool {
+        self.facts == other.facts && self.pairs == other.pairs
+    }
+}
+
+impl<M> Uniformity<M> {
     pub fn uniform(&self) -> Vec<bool> {
         self.facts
             .iter()
@@ -221,7 +278,7 @@ impl Uniformity {
 }
 
 #[cfg(test)]
-impl Uniformity {
+impl<M> Uniformity<M> {
     pub fn fact(&self, value: ValueId) -> Fact {
         self.facts[value.0]
     }
@@ -304,7 +361,12 @@ impl Lattice for Lane {
     }
 }
 
-fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) -> Uniformity {
+fn packet<M>(
+    f: &Func,
+    entry: &Entry,
+    constants: &[Option<u64>],
+    guarded: &[bool],
+) -> Uniformity<M> {
     let definitions = f.definitions();
     let mut high_of: Vec<Option<ValueId>> = vec![None; f.types.len()];
     for block in f.blocks.values() {
@@ -395,7 +457,7 @@ fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) 
                         (fact @ Fact::Affine { .. }, _, _, Some(c))
                         | (_, fact @ Fact::Affine { .. }, Some(c), _) => {
                             if c != 0 && c.is_power_of_two() {
-                                fact.shifted_left(c.trailing_zeros() as u64)
+                                fact.shifted_left(c.trailing_zeros() as u64, ty.bits())
                             } else if let Fact::Affine { stride, .. } = fact {
                                 Fact::Affine {
                                     stride: stride.wrapping_mul(c as i64),
@@ -408,21 +470,24 @@ fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) 
                         _ => Fact::Varying,
                     },
                     Op::Int(IntOp::Shl, a, b) => match constants[b.0] {
-                        Some(c) => v(a).shifted_left(c),
+                        Some(c) => v(a).shifted_left(c, ty.bits()),
                         None => Fact::join_all(v(a), v(b)),
                     },
                     Op::Int(IntOp::LShr, a, b) => match constants[b.0] {
-                        Some(c) => v(a).shifted_right(c),
+                        Some(c) => v(a).shifted_right(c, ty.bits()),
                         None => Fact::join_all(v(a), v(b)),
                     },
                     Op::Int(IntOp::And, a, b) => match (constants[a.0], constants[b.0]) {
-                        (_, Some(m)) => v(a).masked(m),
-                        (Some(m), _) => v(b).masked(m),
+                        (_, Some(m)) => v(a).masked(m, ty.bits()),
+                        (Some(m), _) => v(b).masked(m, ty.bits()),
                         _ => Fact::join_all(v(a), v(b)),
                     },
                     Op::Int(_, a, b) => Fact::join_all(v(a), v(b)),
                     Op::Convert(Cvt::Trunc, to, a) => v(a).word(to.bits()),
-                    Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Bitcast, _, a) => v(a),
+                    Op::Convert(Cvt::Bitcast, _, a) => v(a),
+                    Op::Convert(cvt @ (Cvt::ZExt | Cvt::SExt), _, a) => {
+                        v(a).widened(f.types[a.0].bits(), cvt == Cvt::SExt)
+                    }
                     Op::Convert(_, _, a) => {
                         if v(a) == Fact::Uniform {
                             Fact::Uniform
@@ -433,9 +498,17 @@ fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) 
                     Op::Pack64(lo, hi) => match facts[lo.0].pair {
                         Pair::Of(h, fact) if h == hi => fact,
                         _ => match (v(lo), v(hi)) {
-                            (Fact::Affine { stride, span }, Fact::Uniform) => Fact::Affine {
+                            // A low word that may wrap does not carry into the
+                            // high word, so only a span keeps the pair a step.
+                            (
+                                Fact::Affine {
+                                    stride,
+                                    span: Some(span),
+                                },
+                                Fact::Uniform,
+                            ) => Fact::Affine {
                                 stride,
-                                span: span.filter(|&(_, end)| end <= 32),
+                                span: Some(span),
                             },
                             (Fact::Uniform, Fact::Affine { stride, span }) => Fact::Affine {
                                 stride: stride.wrapping_shl(32),
@@ -551,12 +624,14 @@ fn packet(f: &Func, entry: &Entry, constants: &[Option<u64>], guarded: &[bool]) 
     Uniformity {
         facts: lanes.iter().map(|lane| lane.fact.get()).collect(),
         pairs,
+        masking: PhantomData,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::super::ir::IntPred;
+    use super::super::ExecRegister;
     use super::*;
     use crate::instructions::I;
     use crate::rdna_instructions::{InstFormat, SourceOperand, VGLOBAL, VOP3SD, VSCRATCH};
@@ -570,7 +645,7 @@ mod tests {
         program: &ScalarProgram,
     ) -> (
         crate::rdna_spmd::program::LiftedFunction,
-        std::rc::Rc<Uniformity>,
+        std::rc::Rc<Uniformity<ExecRegister>>,
     ) {
         let f = program.to_ssa().function;
         let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &f.registry);
@@ -579,7 +654,7 @@ mod tests {
             packet: Some(Packet { aligned: true }),
             ..super::super::Context::new(&f.registry, &f.parameter_inputs, exec_index, 16)
         };
-        let u = Analyses::new(ctx).get::<Uniformity>(&f.ir);
+        let u = Analyses::new(ctx).get::<Uniformity<ExecRegister>>(&f.ir);
         (f, u)
     }
     fn slot(f: &crate::rdna_spmd::program::LiftedFunction, slot: u32) -> usize {
@@ -775,7 +850,7 @@ mod tests {
             },
         );
         let constants = super::super::constant::constants(&f);
-        let u = packet(
+        let u = packet::<ExecRegister>(
             &f,
             &Entry {
                 uniform: vec![base],
@@ -865,7 +940,7 @@ mod tests {
             },
         );
         let constants = super::super::constant::constants(&f);
-        let u = packet(
+        let u = packet::<ExecRegister>(
             &f,
             &Entry {
                 uniform: vec![other],
@@ -1012,7 +1087,7 @@ mod tests {
             },
         );
         let constants = super::super::constant::constants(&f);
-        let u = packet(
+        let u = packet::<ExecRegister>(
             &f,
             &Entry {
                 uniform: vec![base],
@@ -1038,5 +1113,146 @@ mod tests {
         );
         assert_eq!(u.fact(p_base), Fact::Uniform);
         assert_eq!(u.fact(p_mixed), Fact::Varying);
+    }
+
+    #[test]
+    fn a_step_that_may_wrap_is_no_step_once_narrowed_widened_or_shifted_down() {
+        let (mut f, params) = func();
+        let (lane, base) = (params[0], params[1]);
+        let mut insts = Vec::new();
+        let mut core = |f: &mut Func, ty, op| {
+            let v = f.value(ty);
+            insts.push(Inst::Core { value: v, ty, op });
+            v
+        };
+        let three = core(&mut f, Ty::I32, Op::Const(Ty::I32, 3));
+        let tripled = core(&mut f, Ty::I32, Op::Int(IntOp::Mul, lane, three));
+        let low = core(&mut f, Ty::I32, Op::Const(Ty::I32, 31));
+        let wrapped = core(&mut f, Ty::I32, Op::Int(IntOp::And, tripled, low));
+        let whole = core(&mut f, Ty::I32, Op::Const(Ty::I32, 0xffff_ffff));
+        let kept = core(&mut f, Ty::I32, Op::Int(IntOp::And, tripled, whole));
+        let four = core(&mut f, Ty::I32, Op::Const(Ty::I32, 4));
+        let quadrupled = core(&mut f, Ty::I32, Op::Int(IntOp::Mul, lane, four));
+        let two_bits = core(&mut f, Ty::I32, Op::Const(Ty::I32, 3));
+        let agreed = core(&mut f, Ty::I32, Op::Int(IntOp::And, quadrupled, two_bits));
+        let offset = core(&mut f, Ty::I32, Op::Int(IntOp::Add, tripled, base));
+        let widened = core(&mut f, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, offset));
+        let one = core(&mut f, Ty::I32, Op::Const(Ty::I32, 1));
+        let halved = core(&mut f, Ty::I32, Op::Int(IntOp::LShr, quadrupled, one));
+        let paired = core(&mut f, Ty::I64, Op::Pack64(offset, base));
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![(lane, Ty::I32), (base, Ty::I32), (params[2], Ty::I1)],
+                insts,
+                term: Term::Ret(vec![]),
+            },
+        );
+        let constants = super::super::constant::constants(&f);
+        let u = packet::<ExecRegister>(
+            &f,
+            &Entry {
+                uniform: vec![base],
+                affine: vec![(lane, 1, None)],
+                varying: vec![],
+            },
+            &constants,
+            &vec![false; f.types.len()],
+        );
+        let step = |stride| Fact::Affine { stride, span: None };
+        assert_eq!(u.fact(tripled), step(3));
+        assert_eq!(
+            u.fact(wrapped),
+            Fact::Varying,
+            "(3 l) & 31 wraps back to 1 at lane 11"
+        );
+        assert_eq!(
+            u.fact(kept),
+            step(3),
+            "keeping the whole word keeps the step"
+        );
+        assert_eq!(
+            u.fact(agreed),
+            Fact::Uniform,
+            "4 l never sets the low two bits"
+        );
+        assert_eq!(u.fact(offset), step(3));
+        assert_eq!(
+            u.fact(widened),
+            Fact::Varying,
+            "a wrap in 32 bits is no step in 64"
+        );
+        assert_eq!(
+            u.fact(halved),
+            Fact::Varying,
+            "a wrap at the top shifts to no step"
+        );
+        assert_eq!(
+            u.fact(paired),
+            Fact::Varying,
+            "a wrapping low word does not carry"
+        );
+    }
+
+    #[test]
+    fn a_shift_by_the_word_or_more_shifts_by_what_is_left_over() {
+        let mut f = Func {
+            entry: BlockId(0),
+            blocks: BTreeMap::new(),
+            types: vec![],
+        };
+        let ids = f.value(Ty::I32);
+        let base = f.value(Ty::I32);
+        let mut insts = Vec::new();
+        let mut core = |f: &mut Func, ty, op| {
+            let v = f.value(ty);
+            insts.push(Inst::Core { value: v, ty, op });
+            v
+        };
+        let word = core(&mut f, Ty::I32, Op::Const(Ty::I32, 32));
+        let right = core(&mut f, Ty::I32, Op::Int(IntOp::LShr, ids, word));
+        let left = core(&mut f, Ty::I32, Op::Int(IntOp::Shl, ids, word));
+        let top = core(&mut f, Ty::I32, Op::Const(Ty::I32, 31));
+        let high = core(&mut f, Ty::I32, Op::Int(IntOp::Shl, ids, top));
+        let pair = core(&mut f, Ty::I64, Op::Pack64(base, high));
+        let zero = core(&mut f, Ty::I64, Op::Const(Ty::I64, 0));
+        let negated = core(&mut f, Ty::I64, Op::Int(IntOp::Sub, zero, pair));
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![(ids, Ty::I32), (base, Ty::I32)],
+                insts,
+                term: Term::Ret(vec![]),
+            },
+        );
+        let constants = super::super::constant::constants(&f);
+        let u = packet::<ExecRegister>(
+            &f,
+            &Entry {
+                uniform: vec![base],
+                affine: vec![(ids, 1, Some((0, 10)))],
+                varying: vec![],
+            },
+            &constants,
+            &vec![false; f.types.len()],
+        );
+        let ids_fact = Fact::Affine {
+            stride: 1,
+            span: Some((0, 10)),
+        };
+        assert_eq!(
+            u.fact(right),
+            ids_fact,
+            "a shift by 32 of a word shifts by 0"
+        );
+        assert_eq!(u.fact(left), ids_fact);
+        assert_eq!(
+            u.fact(negated),
+            Fact::Affine {
+                stride: i64::MIN,
+                span: None
+            },
+            "a step of 2^63 negates to itself modulo the word"
+        );
     }
 }

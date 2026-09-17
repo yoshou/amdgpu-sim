@@ -28,6 +28,7 @@ pub(super) struct Manager {
     nodes: Vec<Node>,
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
     ite: HashMap<(Bdd, Bdd, Bdd), Bdd>,
+    restrict: HashMap<(Bdd, Bdd), Bdd>,
 }
 
 impl Manager {
@@ -41,7 +42,48 @@ impl Manager {
             nodes: vec![terminal(0), terminal(1)],
             unique: HashMap::new(),
             ite: HashMap::new(),
+            restrict: HashMap::new(),
         }
+    }
+
+    /// The variable a function tests first and its two cofactors on it.
+    pub fn decompose(&self, f: Bdd) -> Option<(u32, Bdd, Bdd)> {
+        let node = self.nodes[f.0 as usize];
+        (node.var != TERMINAL).then_some((node.var, node.low, node.high))
+    }
+
+    pub fn cofactor(&mut self, f: Bdd, var: u32, value: bool) -> Bdd {
+        let constant = Manager::constant(value);
+        self.compose(f, &|v| (v == var).then_some(constant))
+    }
+
+    /// A function that agrees with `f` wherever `care` holds, found by
+    /// dropping every test that `care` already decides (Coudert and Madre's
+    /// restrict). Outside `care` the result is unspecified.
+    pub fn restrict(&mut self, f: Bdd, care: Bdd) -> Bdd {
+        if care == Bdd::FALSE || care == Bdd::TRUE || f.constant().is_some() {
+            return f;
+        }
+        if let Some(&r) = self.restrict.get(&(f, care)) {
+            return r;
+        }
+        let var = self.top(f).min(self.top(care));
+        let (f0, f1) = self.cofactors(f, var);
+        let (c0, c1) = self.cofactors(care, var);
+        let r = if c0 == Bdd::FALSE {
+            self.restrict(f1, c1)
+        } else if c1 == Bdd::FALSE {
+            self.restrict(f0, c0)
+        } else if f0 == f1 {
+            let merged = self.or(c0, c1);
+            self.restrict(f0, merged)
+        } else {
+            let low = self.restrict(f0, c0);
+            let high = self.restrict(f1, c1);
+            self.node(var, low, high)
+        };
+        self.restrict.insert((f, care), r);
+        r
     }
 
     fn top(&self, f: Bdd) -> u32 {
@@ -265,6 +307,28 @@ mod tests {
         assert!(!m.support(e).contains(&1));
         let u = m.forall(f, &|v| v == 1);
         assert_eq!(u, c);
+    }
+
+    #[test]
+    fn restricting_to_a_care_set_drops_the_tests_the_care_set_decides() {
+        let mut m = Manager::new();
+        let (mask, c, d) = (m.var(0), m.var(1), m.var(2));
+        let nc = m.not(c);
+        let taken = m.and(mask, c);
+        let other = m.and(mask, nc);
+        assert_eq!(m.restrict(taken, mask), c, "the two arms of a branch differ only in c");
+        assert_eq!(m.restrict(other, mask), nc);
+        let cd = m.and(c, d);
+        let inner = m.and(mask, cd);
+        let rest = m.not(inner);
+        let care = m.and(mask, rest);
+        let outer = m.and(mask, nc);
+        let chosen = m.restrict(outer, care);
+        let agreed = m.and(chosen, care);
+        let expected = m.and(outer, care);
+        assert_eq!(agreed, expected, "restrict agrees with the function on the care set");
+        assert!(!m.support(chosen).contains(&0));
+        assert_eq!(m.restrict(taken, Bdd::FALSE), taken);
     }
 
     #[test]
