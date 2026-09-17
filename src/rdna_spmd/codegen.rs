@@ -4,7 +4,7 @@ pub(super) mod wave;
 
 use std::collections::BTreeMap;
 
-use super::analysis::{Access, Exec};
+use super::analysis::Access;
 use super::ir::{Cvt, Env, IntOp, Op, Ty, ValueId, *};
 use super::native::{Atomic, BasicBlock, Builder, Type, Value};
 use super::program::{Parameter, ParameterSource};
@@ -33,7 +33,8 @@ pub(super) struct Prepared {
     pub abi: Abi,
     pub observable_return: bool,
     pub uniform: Vec<bool>,
-    pub exec: Rc<Exec>,
+    /// For each access, whether the mask it runs under always holds a lane.
+    pub holds_a_lane: Vec<bool>,
     pub constants: Rc<Vec<Option<u64>>>,
     pub accesses: Rc<Vec<Access>>,
     pub shapes: Vec<memory::Shape>,
@@ -831,7 +832,7 @@ impl<'a> Cg<'a> {
                         let members: Vec<usize> = (access..access + cluster.members).collect();
                         self.emit_cluster(&members, cluster);
                     } else {
-                        self.emit_memory(access, id, index);
+                        self.emit_memory(access);
                     }
                 }
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {

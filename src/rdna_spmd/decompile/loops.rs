@@ -111,44 +111,24 @@ impl Loops {
         })
     }
 
-    pub fn layout(&self, n: usize) -> (Vec<usize>, Vec<(usize, usize)>) {
-        let mut order = Vec::with_capacity(n);
-        let mut ranges = vec![(0, 0); self.header.len()];
-        self.place(None, n, &mut order, &mut ranges);
-        (order, ranges)
+    pub fn count(&self) -> usize {
+        self.header.len()
     }
 
-    fn place(
-        &self,
-        within: Option<usize>,
-        n: usize,
-        order: &mut Vec<usize>,
-        ranges: &mut Vec<(usize, usize)>,
-    ) {
-        let mut units: Vec<(usize, Option<usize>)> = (0..n)
-            .filter(|&x| self.innermost[x] == within)
-            .map(|x| (x, None))
-            .collect();
-        units.extend(
-            (0..self.header.len())
-                .filter(|&l| self.parent[l] == within)
-                .map(|l| (self.header[l], Some(l))),
-        );
-        if let Some(l) = within {
-            units.retain(|&(x, nested)| !(nested.is_none() && x == self.header[l]));
-            order.push(self.header[l]);
-        }
-        units.sort();
-        for (x, nested) in units {
-            match nested {
-                None => order.push(x),
-                Some(l) => {
-                    let first = order.len();
-                    self.place(Some(l), n, order, ranges);
-                    ranges[l] = (first, order.len() - 1);
-                }
-            }
-        }
+    pub fn header(&self, l: usize) -> usize {
+        self.header[l]
+    }
+
+    pub fn parent(&self, l: usize) -> Option<usize> {
+        self.parent[l]
+    }
+
+    pub fn innermost(&self, rank: usize) -> Option<usize> {
+        self.innermost[rank]
+    }
+
+    pub fn contains(&self, l: usize, rank: usize) -> bool {
+        self.chain(rank).contains(&Some(l))
     }
 
     fn chain(&self, x: usize) -> Vec<Option<usize>> {
@@ -216,49 +196,6 @@ mod tests {
         assert!(loops.before(r(2), r(4)));
         assert!(loops.before(r(4), r(5)), "the outer latch precedes the exit");
         assert!(!loops.before(r(4), r(3)));
-    }
-
-    #[test]
-    fn a_layout_keeps_every_loop_contiguous_and_every_other_edge_forward() {
-        for (yes, no) in [("b3(v2)", "b4(v2)"), ("b4(v2)", "b3(v2)")] {
-            let (f, facts, loops) = loops(&format!(
-                "func entry b0
-                 b0(v0: i1):
-                   br b1(v0)
-                 b1(v1: i1):
-                   br b2(v1)
-                 b2(v2: i1):
-                   condbr v2, {yes}, {no}
-                 b3(v3: i1):
-                   br b2(v3)
-                 b4(v4: i1):
-                   condbr v4, b1(v4), b5(v4)
-                 b5(v5: i1):
-                   ret"
-            ));
-            let loops = loops.unwrap();
-            let n = facts.order.len();
-            let (order, ranges) = loops.layout(n);
-            let position = |rank: usize| order.iter().position(|&r| r == rank).unwrap();
-            for (l, &(first, last)) in ranges.iter().enumerate() {
-                assert_eq!(order[first], loops.header[l], "a loop starts at its header");
-                for rank in 0..n {
-                    let inside = loops.chain(rank).contains(&Some(l));
-                    let p = position(rank);
-                    assert_eq!(inside, (first..=last).contains(&p), "rank {rank} and loop {l}");
-                }
-            }
-            let rank = |b: BlockId| facts.order.iter().position(|&x| x == b).unwrap();
-            for (&id, block) in &f.blocks {
-                for edge in block.term.edges() {
-                    let (u, v) = (rank(id), rank(edge.dst));
-                    if position(v) <= position(u) {
-                        let header_of_u = loops.chain(u).into_iter().flatten().any(|l| loops.header[l] == v);
-                        assert!(header_of_u, "b{} -> b{} goes backward", id.0, edge.dst.0);
-                    }
-                }
-            }
-        }
     }
 
     #[test]

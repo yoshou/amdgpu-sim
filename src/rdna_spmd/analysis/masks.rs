@@ -85,7 +85,7 @@ fn wave_any_of(f: &Func) -> Vec<bool> {
     out
 }
 
-fn any_of(f: &Func) -> Vec<Option<ValueId>> {
+pub(super) fn any_of(f: &Func) -> Vec<Option<ValueId>> {
     let mut out = vec![None; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts {

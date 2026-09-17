@@ -1,14 +1,16 @@
 use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
-use super::{Analyses, Analysis, Constants, Uniformity};
+use super::{Analyses, Analysis, Constants, Masking, Uniformity};
+use std::marker::PhantomData;
 
-pub(crate) struct Accesses;
-impl Analysis for Accesses {
+/// The memory accesses of a program that carries its masks as `M` does.
+pub(crate) struct Accesses<M>(PhantomData<fn() -> M>);
+impl<M: Masking> Analysis for Accesses<M> {
     type Result = Vec<Access>;
     const NAME: &'static str = "accesses";
     fn compute(f: &Func, analyses: &Analyses) -> Self::Result {
         let constants = analyses.get::<Constants>(f);
-        let uniform = analyses.get::<Uniformity>(f).uniform();
-        accesses(f, &constants, &uniform)
+        let uniform = analyses.get::<Uniformity<M>>(f).uniform();
+        accesses::<M>(f, &constants, &uniform)
     }
 }
 
@@ -145,7 +147,7 @@ fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
     }
 }
 
-fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
+fn accesses<M: Masking>(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
     let mut uses = vec![false; f.types.len()];
     for b in f.blocks.values() {
         for inst in &b.insts {
@@ -306,7 +308,7 @@ fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access
                 }
             } else if words
                 .first()
-                .is_some_and(|w| constants[w.mask.0] == Some(1))
+                .is_some_and(|w| M::scalar_word(constants[w.mask.0]))
             {
                 Form::Scalar
             } else {
@@ -403,7 +405,7 @@ mod tests {
         ];
         let analyses = Analyses::new(super::super::Context::new(&registry, &inputs, 2, 8));
         let runs: Vec<(u32, Vec<u32>)> = analyses
-            .get::<Accesses>(&f)
+            .get::<Accesses<super::super::ExecRegister>>(&f)
             .iter()
             .map(|a| (a.words, a.offsets.clone()))
             .collect();

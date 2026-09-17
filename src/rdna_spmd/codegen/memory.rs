@@ -65,19 +65,23 @@ pub(in crate::rdna_spmd) fn global_load(
     uniform: &[bool],
     affine: &BTreeMap<ValueId, u32>,
 ) -> GlobalLoad {
-    if std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("gather")) {
-        return GlobalLoad::Gather;
-    }
-    if !matches!(access.form, Form::Global { .. }) {
-        return GlobalLoad::Gather;
-    }
-    if !matches!(access.op, MemoryOp::Load(MemSize::B32 | MemSize::B64))
-        || !(1..=4).contains(&access.words)
+    if !matches!(access.form, Form::Global { .. })
+        || !matches!(access.op, MemoryOp::Load(MemSize::B32 | MemSize::B64))
     {
         return GlobalLoad::Gather;
     }
+    // The uniformity analysis holds every lane of a global word load from an
+    // address the lanes share to one value, and the packet program keeps such
+    // a value as one scalar. Only a broadcast reads it as one value: a gather
+    // would give a lane outside the mask a zero, and that lane can be the one
+    // the scalar is read from.
     if uniform[access.base.0] {
         return GlobalLoad::Broadcast;
+    }
+    if std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("gather"))
+        || !(1..=4).contains(&access.words)
+    {
+        return GlobalLoad::Gather;
     }
     if access.form == (Form::Global { scalar_base: false }) {
         if let Some(&stride) = affine.get(&access.base) {
@@ -566,7 +570,7 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn emit_memory(&mut self, index: usize, block: BlockId, at: usize) {
+    pub(super) fn emit_memory(&mut self, index: usize) {
         let access = &self.p.accesses[index];
         let shape = self.p.shapes[index];
         if shape == Shape::Fence {
@@ -599,7 +603,7 @@ impl<'a> Cg<'a> {
             | Shape::ScalarLoad { .. }
             | Shape::ScalarStore
             | Shape::ScalarAtomic => self.emit_scalar_access(index, shape, &words),
-            _ => self.emit_vector_access(index, block, at, shape, &words),
+            _ => self.emit_vector_access(index, shape, &words),
         }
         for (&r, &private) in words.results.iter().zip(&private) {
             let v = self.values[r.0];
@@ -763,17 +767,10 @@ impl<'a> Cg<'a> {
         (addr, exec)
     }
 
-    fn emit_vector_access(
-        &mut self,
-        index: usize,
-        block: BlockId,
-        at: usize,
-        shape: Shape,
-        words: &Words,
-    ) {
+    fn emit_vector_access(&mut self, index: usize, shape: Shape, words: &Words) {
         let (addr, exec) = self.vector_address(index);
         let base = self.p.accesses[index].base;
-        let nonempty = self.p.exec.nonempty_at(block, at);
+        let nonempty = self.p.holds_a_lane[index];
         match shape {
             Shape::AtomicAdd { grouped } => {
                 let d = self.vector(words.data[0]);
