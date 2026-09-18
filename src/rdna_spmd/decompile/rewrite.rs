@@ -1,4 +1,5 @@
 use super::facts::Facts;
+use super::logic::Kept;
 use crate::rdna_spmd::ir::*;
 
 struct Block<'a> {
@@ -95,7 +96,10 @@ fn projection(p: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
     }
 }
 
-pub(super) fn lane_program(p: &Func, facts: &Facts) -> Func {
+/// The lane program: the wave program with every query answered from the
+/// lane's own bit, except the queries and words in `kept`, which stay wave
+/// operations over the lanes that are at them.
+pub(super) fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
     let reachable: std::collections::BTreeSet<BlockId> = facts.order.iter().copied().collect();
     let mut q = Func {
         entry: p.entry,
@@ -120,7 +124,7 @@ pub(super) fn lane_program(p: &Func, facts: &Facts) -> Func {
             lane: None,
         };
         for inst in old {
-            rewrite_inst(p, facts, &mut b, inst);
+            rewrite_inst(p, facts, kept, &mut b, inst);
         }
         let mut term = b.q.blocks[&id].term.clone();
         for edge in term.edges_mut() {
@@ -146,22 +150,28 @@ pub(super) fn lane_program(p: &Func, facts: &Facts) -> Func {
     q
 }
 
-fn rewrite_inst(p: &Func, facts: &Facts, b: &mut Block, inst: Inst) {
+fn rewrite_inst(p: &Func, facts: &Facts, kept: &Kept, b: &mut Block, inst: Inst) {
     match inst {
         Inst::Effect {
             op: EffectOp::Wave(WaveOp::Any),
-            inputs,
-            outputs,
+            ref inputs,
+            ref outputs,
             ..
-        } => b.insts.push(Inst::Core {
-            value: outputs[0].0,
-            ty: Ty::I1,
-            op: Op::Convert(Cvt::Bitcast, Ty::I1, inputs[0]),
-        }),
+        } => {
+            if kept.queries.contains(&outputs[0].0) {
+                b.insts.push(inst);
+            } else {
+                b.insts.push(Inst::Core {
+                    value: outputs[0].0,
+                    ty: Ty::I1,
+                    op: Op::Convert(Cvt::Bitcast, Ty::I1, inputs[0]),
+                });
+            }
+        }
         Inst::Effect {
             op: EffectOp::Wave(WaveOp::Ballot),
-            inputs,
-            outputs,
+            ref inputs,
+            ref outputs,
             ..
         } => {
             let value = outputs[0].0;
@@ -172,25 +182,26 @@ fn rewrite_inst(p: &Func, facts: &Facts, b: &mut Block, inst: Inst) {
                     op: Op::Convert(Cvt::Bitcast, Ty::I1, inputs[0]),
                 });
             } else {
-                let word = b.core(Ty::I32, Op::Convert(Cvt::ZExt, Ty::I32, inputs[0]));
-                let lane = b.lane_id();
-                b.insts.push(Inst::Core {
-                    value,
-                    ty: Ty::I32,
-                    op: Op::Int(IntOp::Shl, word, lane),
-                });
+                // A word read whole stays the word the wave computes.
+                b.insts.push(inst);
             }
         }
         Inst::Effect {
             op: EffectOp::Wave(WaveOp::ReadFirstLane),
-            inputs,
-            outputs,
+            ref inputs,
+            ref outputs,
             ..
-        } => b.insts.push(Inst::Core {
-            value: outputs[0].0,
-            ty: Ty::I32,
-            op: Op::Convert(Cvt::Bitcast, Ty::I32, inputs[0]),
-        }),
+        } => {
+            if facts.uniform[inputs[0].0] {
+                b.insts.push(Inst::Core {
+                    value: outputs[0].0,
+                    ty: Ty::I32,
+                    op: Op::Convert(Cvt::Bitcast, Ty::I32, inputs[0]),
+                });
+            } else {
+                b.insts.push(inst);
+            }
+        }
         Inst::Core {
             value,
             op: Op::Env(Env::ValidLane),
@@ -218,7 +229,7 @@ fn rewrite_inst(p: &Func, facts: &Facts, b: &mut Block, inst: Inst) {
             value,
             op: Op::Cmp(pred @ (IntPred::Eq | IntPred::Ne), x, y),
             ..
-        } if super::logic::lane_test(p, facts, x, y).is_some() => {
+        } if super::logic::lane_test(p, facts, x, y).is_some_and(|w| converted(facts, w)) => {
             let w = super::logic::lane_test(p, facts, x, y).unwrap();
             let bit = b.bit(p, facts, w);
             let op = if pred == IntPred::Ne {

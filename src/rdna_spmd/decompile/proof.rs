@@ -1,6 +1,6 @@
 use super::bdd::{Bdd, Manager};
 use super::facts::{operands, outputs, Facts};
-use super::logic::{lane_test, Atom, Logic};
+use super::logic::{lane_test, Atom, Kept, Logic};
 use crate::rdna_spmd::dialect::TargetOp;
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, HashMap};
@@ -10,6 +10,21 @@ pub(crate) struct Refusal {
     pub block: BlockId,
     pub index: Option<usize>,
     pub reason: &'static str,
+    /// Queries the lane program answered from the lane's own bit that the
+    /// refusal names: kept over the lanes at them instead, the refusal falls.
+    /// Empty where no such query is at fault.
+    pub keep: Vec<ValueId>,
+}
+
+impl Refusal {
+    pub(super) fn at(block: BlockId, index: Option<usize>, reason: &'static str) -> Self {
+        Self {
+            block,
+            index,
+            reason,
+            keep: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Display for Refusal {
@@ -21,24 +36,45 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// Proves that the lane program stores what the wave program stores for
+/// each lane, with the wave queries in `kept` answered by the wave and every
+/// other answered from the lane's own bit. A refusal that names queries is
+/// one those queries cause: kept, the proof is run again.
+/// Proven, it returns the provenances of the kept queries that read a lane
+/// that may not be at them: those the lowering must run with every lane of
+/// the wave at them.
 pub(super) fn prove(
     f: &Func,
     facts: &Facts,
     logic: &mut Logic,
-    exec: Option<ValueId>,
-) -> Result<(), Refusal> {
+    inputs: &[crate::rdna_spmd::program::Parameter],
+    exec_index: Option<usize>,
+    kept: &Kept,
+) -> Result<std::collections::BTreeSet<u64>, Refusal> {
+    let exec = exec_index.map(|index| f.blocks[&f.entry].params[index].0);
     let mut proof = Proof {
         f,
         facts,
         logic,
+        kept,
+        demands: std::collections::BTreeSet::new(),
+        masked: vec![false; f.types.len()],
+        faithful: vec![false; f.types.len()],
         h: vec![Bdd::FALSE; f.types.len()],
         arrivals: BTreeMap::new(),
         reach: BTreeMap::new(),
-        rank: facts.order.iter().enumerate().map(|(r, &b)| (b, r)).collect(),
-        loops: super::loops::Loops::new(f, facts).map_err(|block| Refusal {
-            block,
-            index: None,
-            reason: "control flow enters a cycle other than through its header",
+        rank: facts
+            .order
+            .iter()
+            .enumerate()
+            .map(|(r, &b)| (b, r))
+            .collect(),
+        loops: super::loops::Loops::new(f, facts).map_err(|block| {
+            Refusal::at(
+                block,
+                None,
+                "control flow enters a cycle other than through its header",
+            )
         })?,
     };
     let start = match exec {
@@ -46,6 +82,7 @@ pub(super) fn prove(
         None => Bdd::TRUE,
     };
     proof.reach = proof.logic.reach(f, facts, f.entry, start);
+    proof.solve_masked(inputs, exec_index);
     loop {
         proof.settle()?;
         let arrivals = proof.detours()?;
@@ -64,7 +101,7 @@ pub(super) fn prove(
             }
         }
         if !changed {
-            return Ok(());
+            return Ok(proof.demands);
         }
     }
 }
@@ -73,6 +110,17 @@ struct Proof<'a> {
     f: &'a Func,
     facts: &'a Facts,
     logic: &'a mut Logic,
+    kept: &'a Kept,
+    /// Kept queries over a bit that lanes not at them may hold, which answer
+    /// what the wave answers only with every lane at them.
+    demands: std::collections::BTreeSet<u64>,
+    /// Bits and lane words that hold nothing for a lane that is not active at
+    /// their block, so a wave operation over the lanes at the block reads
+    /// them as the wave does.
+    masked: Vec<bool>,
+    /// Lane words a ballot over the lanes at the block computes as the wave
+    /// does: ballots of masked bits, and what such words make.
+    faithful: Vec<bool>,
     h: Vec<Bdd>,
     arrivals: BTreeMap<BlockId, Vec<Bdd>>,
     reach: BTreeMap<BlockId, Bdd>,
@@ -100,11 +148,211 @@ impl Proof<'_> {
         self.logic.m.not(a)
     }
 
+    /// How a value read whole differs: a lane word the lane program keeps
+    /// whole is the word the wave computes where the lanes that are not at
+    /// the block hold no bit of it, and otherwise holds their bits too.
     fn whole(&self, v: ValueId) -> Bdd {
-        if self.facts.lane_word[v.0] && self.facts.materialized[v.0] {
+        if self.facts.lane_word[v.0] && self.facts.materialized[v.0] && !self.faithful[v.0] {
             Bdd::TRUE
         } else {
             self.h[v.0]
+        }
+    }
+
+    /// Settles which bits and lane words hold nothing for a lane that is not
+    /// active at their block: those that imply the block's EXEC bit or a
+    /// parameter known to, and parameters every arrival brings such a value
+    /// to. A ballot of such a bit over the lanes at the block is the word the
+    /// wave computes, and a word made of such words and parameters every
+    /// arrival brings one to is too; those words are faithful. Both facts
+    /// are inductive, so a parameter is taken to hold them until an arrival
+    /// refutes it. Without an EXEC register every lane is active everywhere.
+    fn solve_masked(
+        &mut self,
+        inputs: &[crate::rdna_spmd::program::Parameter],
+        exec_index: Option<usize>,
+    ) {
+        use crate::rdna_spmd::program::ParameterSource;
+        let (f, facts) = (self.f, self.facts);
+        let word = |v: ValueId| f.types[v.0] == Ty::I32 && facts.lane_word[v.0];
+        let Some(exec_index) = exec_index else {
+            self.masked = vec![true; f.types.len()];
+            self.faithful = (0..f.types.len()).map(|v| word(ValueId(v))).collect();
+            return;
+        };
+        for (&id, block) in &f.blocks {
+            let exec = block.params[exec_index].0;
+            for (index, &(param, ty)) in block.params.iter().enumerate() {
+                // The dispatch clears every mask register but EXEC, so a
+                // mask bit the program starts with holds nothing for any lane.
+                let cleared = matches!(
+                    inputs.get(index).map(|p| p.source),
+                    Some(ParameterSource::MaskBit(_))
+                );
+                let assumed = id != f.entry || param == exec || cleared;
+                self.masked[param.0] = assumed && (ty == Ty::I1 || word(param));
+                self.faithful[param.0] = assumed && word(param);
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &id in &facts.order {
+                let block = &f.blocks[&id];
+                let exec = block.params[exec_index].0;
+                let mut active = self.logic.atom(Atom::Bit(exec));
+                for &(param, ty) in &block.params {
+                    if param != exec && self.masked[param.0] {
+                        let atom = if ty == Ty::I1 {
+                            Atom::Bit(param)
+                        } else {
+                            Atom::View(param)
+                        };
+                        let known = self.logic.atom(atom);
+                        active = self.or(active, known);
+                    }
+                }
+                let mut lockstep: HashMap<ValueId, Option<Bdd>> = HashMap::new();
+                for inst in &block.insts {
+                    for v in outputs(inst) {
+                        let bit = f.types[v.0] == Ty::I1;
+                        if !bit && f.types[v.0] != Ty::I32 {
+                            continue;
+                        }
+                        let formula = if bit { self.bit(v) } else { self.view(v) };
+                        let masked = self.logic.m.implies(formula, active);
+                        if self.masked[v.0] != masked {
+                            self.masked[v.0] = masked;
+                            changed = true;
+                        }
+                        if word(v) {
+                            let faithful = self
+                                .lockstep_view(v, active, &mut lockstep)
+                                .is_some_and(|l| self.logic.m.iff(l, formula) == Bdd::TRUE);
+                            if self.faithful[v.0] != faithful {
+                                self.faithful[v.0] = faithful;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            for &id in &facts.order {
+                if id == f.entry {
+                    continue;
+                }
+                let block = &f.blocks[&id];
+                let exec = block.params[exec_index].0;
+                for (index, &(param, _)) in block.params.iter().enumerate() {
+                    if param == exec {
+                        continue;
+                    }
+                    let mut arguments = facts.arguments(f, id, index);
+                    if self.masked[param.0] && !arguments.all(|a| self.masked[a.0]) {
+                        self.masked[param.0] = false;
+                        changed = true;
+                    }
+                    // A value that is no lane word is what the wave computes.
+                    let mut arguments = facts.arguments(f, id, index);
+                    if self.faithful[param.0] && !arguments.all(|a| !word(a) || self.faithful[a.0])
+                    {
+                        self.faithful[param.0] = false;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bit a lane holds of a word the lane program computes, where a
+    /// ballot holds nothing for a lane that is not at it; `None` where the
+    /// word takes a parameter the arrivals do not agree on.
+    fn lockstep_view(
+        &mut self,
+        w: ValueId,
+        active: Bdd,
+        memo: &mut HashMap<ValueId, Option<Bdd>>,
+    ) -> Option<Bdd> {
+        if let Some(&l) = memo.get(&w) {
+            return l;
+        }
+        let (f, facts) = (self.f, self.facts);
+        let l = if !facts.lane_word[w.0] {
+            Some(self.view(w))
+        } else {
+            match facts.inst(f, w) {
+                None => self.faithful[w.0].then(|| self.view(w)),
+                Some(Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Ballot),
+                    inputs,
+                    ..
+                }) => {
+                    let x = self.bit(inputs[0]);
+                    Some(self.and(x, active))
+                }
+                Some(Inst::Core { op, .. }) => match *op {
+                    Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
+                        let a = self.lockstep_view(a, active, memo)?;
+                        let b = self.lockstep_view(b, active, memo)?;
+                        Some(match k {
+                            IntOp::And => self.and(a, b),
+                            IntOp::Or => self.or(a, b),
+                            _ => self.logic.m.xor(a, b),
+                        })
+                    }
+                    Op::Select(c, a, b) => {
+                        let c = self.bit(c);
+                        let a = self.lockstep_view(a, active, memo)?;
+                        let b = self.lockstep_view(b, active, memo)?;
+                        Some(self.logic.m.ite(c, a, b))
+                    }
+                    Op::Convert(Cvt::Bitcast, Ty::I32, a) => self.lockstep_view(a, active, memo),
+                    _ => Some(self.view(w)),
+                },
+                Some(_) => None,
+            }
+        };
+        memo.insert(w, l);
+        l
+    }
+
+    /// The queries a refusal names: those whose lane answers, kept as wave
+    /// answers, make the refusing condition false. One that suffices alone is
+    /// named alone; otherwise the earliest query the condition depends on is,
+    /// and the proof runs again for whatever remains, since keeping one query
+    /// changes what the others answer.
+    fn named(&mut self, condition: Bdd) -> Vec<ValueId> {
+        let markers = self.logic.markers(condition);
+        let mut matter = Vec::new();
+        for &m in &markers {
+            let settled = self.logic.settled(condition, &[m]);
+            if settled == Bdd::FALSE {
+                return vec![m];
+            }
+            if settled != condition {
+                matter.push(m);
+            }
+        }
+        let place = |v: ValueId| match self.facts.site[v.0] {
+            super::facts::Site::Inst { block, index } => (self.rank[&block], index),
+            _ => unreachable!("a query is an instruction"),
+        };
+        matter.into_iter().min_by_key(|&m| place(m)).into_iter().collect()
+    }
+
+    /// A refusal at a store, naming the queries it comes from.
+    fn refuse(
+        &mut self,
+        block: BlockId,
+        index: usize,
+        reason: &'static str,
+        condition: Bdd,
+    ) -> Refusal {
+        Refusal {
+            block,
+            index: Some(index),
+            reason,
+            keep: self.named(condition),
         }
     }
 
@@ -159,7 +407,10 @@ impl Proof<'_> {
         Ok(changed)
     }
 
-    fn query(&mut self, x: Bdd, hx: Bdd) -> Bdd {
+    /// How the lane's answer to a query it answers itself differs from the
+    /// wave's: the lane holds no bit and another lane may. The difference is
+    /// conditioned on the query's marker.
+    fn query(&mut self, v: ValueId, x: Bdd, hx: Bdd) -> Bdd {
         let (logic, facts) = (&mut *self.logic, self.facts);
         let set = logic.m.or(x, hx);
         let support = logic.support(set);
@@ -170,15 +421,13 @@ impl Proof<'_> {
         let others = logic.m.exists(set, &|var| varying.contains(&var));
         let absent = logic.m.not(x);
         let differs = logic.m.and(absent, others);
-        logic.m.or(hx, differs)
+        let marker = logic.atom(Atom::Marker(v));
+        let marked = logic.m.and(marker, differs);
+        logic.m.or(hx, marked)
     }
 
     fn inst(&mut self, id: BlockId, index: usize, inst: &Inst) -> Result<Bdd, Refusal> {
-        let refuse = |reason| Refusal {
-            block: id,
-            index: Some(index),
-            reason,
-        };
+        let refuse = |reason| Refusal::at(id, Some(index), reason);
         let any_of = |p: &mut Self, values: &[ValueId]| {
             let mut h = Bdd::FALSE;
             for &v in values {
@@ -249,26 +498,46 @@ impl Proof<'_> {
                     if lane_test(self.f, self.facts, a, b).is_some() =>
                 {
                     let w = lane_test(self.f, self.facts, a, b).unwrap();
-                    let fw = self.view(w);
-                    let hw = self.h[w.0];
-                    self.query(fw, hw)
+                    if self.facts.materialized[w.0] {
+                        // A test of a word kept whole is the wave's test.
+                        self.whole(w)
+                    } else {
+                        let fw = self.view(w);
+                        let hw = self.h[w.0];
+                        self.query(*value, fw, hw)
+                    }
                 }
                 _ => any_of(self, &operands(inst)),
             },
             Inst::Target { args, .. } => any_of(self, args.values()),
             Inst::Packet { .. } => return Err(refuse("a packet query in a wave program")),
-            Inst::Effect { op, inputs, .. } => match op {
+            Inst::Effect {
+                provenance,
+                op,
+                inputs,
+                outputs,
+            } => match op {
                 EffectOp::Wave(WaveOp::Any) => {
-                    let fx = self.bit(inputs[0]);
-                    let hx = self.h[inputs[0].0];
-                    self.query(fx, hx)
+                    if self.kept.queries.contains(&outputs[0].0) {
+                        if !self.masked[inputs[0].0] {
+                            self.demands.insert(*provenance);
+                        }
+                        self.h[inputs[0].0]
+                    } else {
+                        let fx = self.bit(inputs[0]);
+                        let hx = self.h[inputs[0].0];
+                        self.query(outputs[0].0, fx, hx)
+                    }
                 }
                 EffectOp::Wave(WaveOp::Ballot) => self.h[inputs[0].0],
                 EffectOp::Wave(WaveOp::ReadFirstLane) => {
                     if self.facts.uniform[inputs[0].0] {
                         self.whole(inputs[0])
                     } else {
-                        Bdd::TRUE
+                        if !self.masked[inputs[1].0] {
+                            self.demands.insert(*provenance);
+                        }
+                        self.h[inputs[0].0]
                     }
                 }
                 EffectOp::Memory {
@@ -286,21 +555,40 @@ impl Proof<'_> {
                 } => {
                     let pred = inputs[2];
                     let reachable = self.reachable(id);
-                    if self.and(self.h[pred.0], reachable) != Bdd::FALSE {
-                        return Err(refuse(
+                    let happens = self.and(self.h[pred.0], reachable);
+                    if happens != Bdd::FALSE {
+                        return Err(self.refuse(
+                            id,
+                            index,
                             "whether a store happens depends on the other lanes",
+                            happens,
                         ));
                     }
                     let fp = self.bit(pred);
                     let operands = any_of(self, &inputs[..2]);
                     let performed = self.and(fp, reachable);
-                    if self.and(performed, operands) != Bdd::FALSE {
-                        return Err(refuse("what a store writes depends on the other lanes"));
+                    let writes = self.and(performed, operands);
+                    if writes != Bdd::FALSE {
+                        return Err(self.refuse(
+                            id,
+                            index,
+                            "what a store writes depends on the other lanes",
+                            writes,
+                        ));
                     }
                     let absent = self.not(fp);
                     self.or(operands, absent)
                 }
-                _ => return Err(refuse("an operation that exchanges values between lanes")),
+                EffectOp::Memory {
+                    op: MemoryOp::Fence,
+                    ..
+                } => Bdd::FALSE,
+                // An exchange between lanes or a barrier runs with every lane
+                // at it, which the lowering sees to, so it answers what the
+                // wave answers wherever its inputs are what the wave holds.
+                EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
+                    any_of(self, inputs)
+                }
             },
         })
     }
@@ -399,7 +687,13 @@ impl Explore<'_, '_> {
     }
 
     fn intern(&mut self, ty: Ty, form: Form) -> usize {
-        let ones = |ty: Ty| if ty == Ty::I64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
+        let ones = |ty: Ty| {
+            if ty == Ty::I64 {
+                u64::MAX
+            } else {
+                (1u64 << ty.bits()) - 1
+            }
+        };
         match &form {
             Form::Core(_, Op::Convert(Cvt::Bitcast, _, a)) => {
                 let a = a.0;
@@ -415,7 +709,11 @@ impl Explore<'_, '_> {
             Form::Core(_, Op::UnpackLo(p) | Op::UnpackHi(p)) => {
                 let low = matches!(form, Form::Core(_, Op::UnpackLo(_)));
                 let half = |e: &mut Self, x: ValueId| {
-                    let op = if low { Op::UnpackLo(x) } else { Op::UnpackHi(x) };
+                    let op = if low {
+                        Op::UnpackLo(x)
+                    } else {
+                        Op::UnpackHi(x)
+                    };
                     e.intern(Ty::I32, Form::Core(Ty::I32, op))
                 };
                 match self.terms[p.0].clone() {
@@ -448,7 +746,9 @@ impl Explore<'_, '_> {
                         };
                         return match other {
                             Some(op) => self.intern(Ty::I32, Form::Core(Ty::I32, op)),
-                            None => self.intern(Ty::I32, Form::Core(Ty::I32, Op::Const(Ty::I32, 0))),
+                            None => {
+                                self.intern(Ty::I32, Form::Core(Ty::I32, Op::Const(Ty::I32, 0)))
+                            }
                         };
                     }
                     _ => {}
@@ -539,7 +839,7 @@ impl Explore<'_, '_> {
             return u;
         }
         let u = match self.proof.logic.atom_of(var) {
-            Atom::Fresh(..) | Atom::Term(..) | Atom::Constant(_) => false,
+            Atom::Fresh(..) | Atom::Term(..) | Atom::Constant(_) | Atom::Marker(_) => false,
             Atom::Bit(v) | Atom::View(v) => {
                 let h = self.proof.h[v.0];
                 let assume = self.assume;
@@ -693,8 +993,13 @@ impl Explore<'_, '_> {
                         for s in [WAVE, LANE] {
                             let Some(block) = next[s] else { continue };
                             for (k, &(param, _)) in f.blocks[&block].params.iter().enumerate() {
-                                sides[s][k] =
-                                    self.merge(s, param, cond, old.sides[s][k], incoming.sides[s][k]);
+                                sides[s][k] = self.merge(
+                                    s,
+                                    param,
+                                    cond,
+                                    old.sides[s][k],
+                                    incoming.sides[s][k],
+                                );
                             }
                         }
                         let merged = Pair { cond, sides };
@@ -771,10 +1076,11 @@ impl Explore<'_, '_> {
         for (&(v, _), &d) in block.params.iter().zip(params) {
             descs.insert(v, d);
         }
-        let bits_of = |e: &mut Self, descs: &HashMap<ValueId, Desc>, v: ValueId| match descs[&v].bits {
-            Some(g) => g,
-            None => e.fresh(side, v),
-        };
+        let bits_of =
+            |e: &mut Self, descs: &HashMap<ValueId, Desc>, v: ValueId| match descs[&v].bits {
+                Some(g) => g,
+                None => e.fresh(side, v),
+            };
         let formed = |e: &mut Self, v: ValueId, t: Option<usize>| -> Desc {
             let ty = f.types[v.0];
             let bits = match (ty, t) {
@@ -827,7 +1133,9 @@ impl Explore<'_, '_> {
                                 None => {
                                     let same = form(self, &descs);
                                     let bits = match (descs[&a].bits, descs[&b].bits) {
-                                        (Some(ga), Some(gb)) => Some(self.logic().m.ite(gc, ga, gb)),
+                                        (Some(ga), Some(gb)) => {
+                                            Some(self.logic().m.ite(gc, ga, gb))
+                                        }
                                         _ => formed(self, *value, same).bits,
                                     };
                                     Desc { same, bits }
@@ -851,8 +1159,7 @@ impl Explore<'_, '_> {
                             }
                         }
                         Op::Convert(Cvt::Bitcast, to, a) if f.types[a.0] == to => descs[&a],
-                        Op::Convert(Cvt::Trunc, Ty::I1, s)
-                            if matches!(facts.op(f, s), Some(Op::Int(IntOp::LShr, _, lane)) if facts.is_lane_id(f, lane)) =>
+                        Op::Convert(Cvt::Trunc, Ty::I1, s) if matches!(facts.op(f, s), Some(Op::Int(IntOp::LShr, _, lane)) if facts.is_lane_id(f, lane)) =>
                         {
                             let Some(Op::Int(IntOp::LShr, w, _)) = facts.op(f, s) else {
                                 unreachable!()
@@ -862,7 +1169,9 @@ impl Explore<'_, '_> {
                                 bits: Some(bits_of(self, &descs, w)),
                             }
                         }
-                        Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) if f.types[a.0] == Ty::I1 => {
+                        Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b)
+                            if f.types[a.0] == Ty::I1 =>
+                        {
                             let ga = bits_of(self, &descs, a);
                             let gb = bits_of(self, &descs, b);
                             let m = &mut self.proof.logic.m;
@@ -877,7 +1186,8 @@ impl Explore<'_, '_> {
                             }
                         }
                         Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b)
-                            if lane_test(f, facts, a, b).is_some() =>
+                            if lane_test(f, facts, a, b)
+                                .is_some_and(|w| !facts.materialized[w.0]) =>
                         {
                             let w = lane_test(f, facts, a, b).unwrap();
                             let bit = bits_of(self, &descs, w);
@@ -905,8 +1215,14 @@ impl Explore<'_, '_> {
                     outputs,
                     ..
                 } => {
-                    let bit = bits_of(self, &descs, inputs[0]);
-                    let g = self.answer(side, outputs[0].0, bit, cond);
+                    let g = if self.proof.kept.queries.contains(&outputs[0].0) {
+                        // Kept, the query answers over whichever lanes are at
+                        // it, which the programs apart do not agree on.
+                        self.fresh(side, outputs[0].0)
+                    } else {
+                        let bit = bits_of(self, &descs, inputs[0]);
+                        self.answer(side, outputs[0].0, bit, cond)
+                    };
                     descs.insert(
                         outputs[0].0,
                         Desc {
@@ -965,15 +1281,17 @@ impl Explore<'_, '_> {
                 } => {
                     let pred = bits_of(self, &descs, inputs[2]);
                     if self.decide(pred, cond, side) != Some(false) {
-                        return Err(Refusal {
-                            block: x,
-                            index: Some(index),
-                            reason: if side == WAVE {
+                        let assume = self.assume;
+                        return Err(self.proof.refuse(
+                            x,
+                            index,
+                            if side == WAVE {
                                 "the wave program may store while the programs are apart"
                             } else {
                                 "the lane program may store while the programs are apart"
                             },
-                        });
+                            assume,
+                        ));
                     }
                     for &(v, _) in outputs {
                         let d = formed(self, v, None);
@@ -1036,7 +1354,8 @@ impl Explore<'_, '_> {
         let mut contributions = Vec::with_capacity(dst.params.len());
         for (k, &(param, ty)) in dst.params.iter().enumerate() {
             let (w, l) = (pair.sides[WAVE][k], pair.sides[LANE][k]);
-            let boolean = ty == Ty::I1 || (facts.lane_word[param.0] && !facts.materialized[param.0]);
+            let boolean =
+                ty == Ty::I1 || (facts.lane_word[param.0] && !facts.materialized[param.0]);
             let differs = if w.same.is_some() && w.same == l.same {
                 let leaves = self.leaves[w.same.unwrap()];
                 self.logic().m.and(cond, leaves)

@@ -1,6 +1,6 @@
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::{Parameter, ParameterSource};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Site {
@@ -77,7 +77,9 @@ pub(super) struct Facts {
 }
 
 impl Facts {
-    pub fn new(f: &Func, inputs: &[Parameter]) -> Self {
+    /// `kept` names lane words the lane program keeps whole, as the wave
+    /// computes them, whatever their uses.
+    pub fn new(f: &Func, inputs: &[Parameter], kept: &BTreeSet<ValueId>) -> Self {
         let n = f.types.len();
         let order = reverse_postorder(f);
         let mut site = vec![Site::Unreached; n];
@@ -130,7 +132,7 @@ impl Facts {
         };
         facts.solve_uniform(f, inputs);
         facts.solve_lane_words(f);
-        facts.solve_materialized(f);
+        facts.solve_materialized(f, kept);
         facts.solve_saturated(f);
         facts.solve_viewed(f);
         facts
@@ -361,9 +363,9 @@ impl Facts {
         }
     }
 
-    fn solve_materialized(&mut self, f: &Func) {
+    fn solve_materialized(&mut self, f: &Func, kept: &BTreeSet<ValueId>) {
         let n = f.types.len();
-        let mut pending: Vec<ValueId> = Vec::new();
+        let mut pending: Vec<ValueId> = kept.iter().copied().collect();
         for v in 0..n {
             if self.lane_word[v]
                 && self.uses[v]

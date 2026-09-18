@@ -168,7 +168,7 @@ mod tests {
             source: ParameterSource::MaskBit(126),
             ty: Ty::I1,
         }];
-        let facts = Facts::new(&f, &inputs);
+        let facts = Facts::new(&f, &inputs, &Default::default());
         let loops = Loops::new(&f, &facts);
         (f, facts, loops)
     }

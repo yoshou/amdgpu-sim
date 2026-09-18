@@ -10,6 +10,23 @@ pub(super) enum Atom {
     Constant(u32),
     Fresh(usize, ValueId, u32),
     Term(usize, usize, bool),
+    /// The lane program answers the wave query defining this value from the
+    /// lane's own bit. Every difference the answer makes is conditioned on the
+    /// marker, so a difference that reaches a store names the queries it came
+    /// from.
+    Marker(ValueId),
+}
+
+/// The wave operations the lane program keeps as operations over the lanes
+/// that are at them, instead of answering from the lane's own values.
+#[derive(Clone, Default, PartialEq)]
+pub(super) struct Kept {
+    /// Queries -- `any` and tests of a lane word against zero -- kept as
+    /// queries over the lanes at them.
+    pub queries: BTreeSet<ValueId>,
+    /// Lane words kept as the words the wave computes, because a query kept
+    /// over them or an operation reads them whole.
+    pub words: BTreeSet<ValueId>,
 }
 
 pub(super) struct Logic {
@@ -18,7 +35,9 @@ pub(super) struct Logic {
     atoms: HashMap<u32, Atom>,
     params: HashMap<ValueId, (usize, usize)>,
     constants: HashMap<u32, u32>,
+    markers: HashMap<ValueId, u32>,
     fresh: HashMap<(usize, ValueId, u32), u32>,
+    kept: BTreeSet<ValueId>,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
     supports: HashMap<Bdd, BTreeSet<u32>>,
@@ -27,7 +46,9 @@ pub(super) struct Logic {
 }
 
 impl Logic {
-    pub fn new(f: &Func, facts: &Facts) -> Self {
+    /// `kept` holds the `any` queries the lane program keeps, by the value
+    /// each defines; a test of a lane word is kept with the word.
+    pub fn new(f: &Func, facts: &Facts, kept: &BTreeSet<ValueId>) -> Self {
         let mut params = HashMap::new();
         for (rank, id) in facts.order.iter().enumerate() {
             for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
@@ -40,7 +61,9 @@ impl Logic {
             atoms: HashMap::new(),
             params,
             constants: HashMap::new(),
+            markers: HashMap::new(),
             fresh: HashMap::new(),
+            kept: kept.clone(),
             bits: HashMap::new(),
             views: HashMap::new(),
             supports: HashMap::new(),
@@ -58,7 +81,10 @@ impl Logic {
                         let view = matches!(atom, Atom::View(_)) as u32;
                         match self.params.get(&v) {
                             Some(&(rank, index)) => {
-                                assert!(index < 1 << 13 && rank < 1 << 16, "register layout too large");
+                                assert!(
+                                    index < 1 << 13 && rank < 1 << 16,
+                                    "register layout too large"
+                                );
                                 ((index as u32) << 17) | (view << 16) | rank as u32
                             }
                             None => {
@@ -68,8 +94,12 @@ impl Logic {
                         }
                     }
                     Atom::Constant(k) => {
-                        let next = self.constants.len() as u32;
+                        let next = (self.constants.len() + self.markers.len()) as u32;
                         (2 << 30) | *self.constants.entry(k).or_insert(next)
+                    }
+                    Atom::Marker(v) => {
+                        let next = (self.constants.len() + self.markers.len()) as u32;
+                        (2 << 30) | *self.markers.entry(v).or_insert(next)
                     }
                     Atom::Fresh(d, v, position) => {
                         let next = self.fresh.len() as u32;
@@ -108,8 +138,37 @@ impl Logic {
         match self.atoms[&var] {
             Atom::Bit(v) => facts.uniform[v.0],
             Atom::View(v) => facts.saturated[v.0],
+            Atom::Marker(_) => true,
             Atom::Constant(_) | Atom::Fresh(..) | Atom::Term(..) => false,
         }
+    }
+
+    /// The markers a formula tests.
+    pub fn markers(&mut self, f: Bdd) -> Vec<ValueId> {
+        self.support(f)
+            .into_iter()
+            .filter_map(|var| match self.atoms[&var] {
+                Atom::Marker(v) => Some(v),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A formula with every marker settled: the queries in `kept` answered by
+    /// the wave, every other query by the lane.
+    pub fn settled(&mut self, f: Bdd, kept: &[ValueId]) -> Bdd {
+        let markers: HashMap<u32, Bdd> = self
+            .support(f)
+            .into_iter()
+            .filter_map(|var| match self.atoms[&var] {
+                Atom::Marker(v) => Some((var, Manager::constant(!kept.contains(&v)))),
+                _ => None,
+            })
+            .collect();
+        if markers.is_empty() {
+            return f;
+        }
+        self.m.compose(f, &|var| markers.get(&var).copied())
     }
 
     pub fn scope(&self, facts: &Facts, var: u32) -> Option<BlockId> {
@@ -118,7 +177,7 @@ impl Logic {
                 Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),
                 Site::Unreached => None,
             },
-            Atom::Constant(_) | Atom::Fresh(..) | Atom::Term(..) => None,
+            Atom::Constant(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) => None,
         }
     }
 
@@ -140,8 +199,15 @@ impl Logic {
             Inst::Effect {
                 op: EffectOp::Wave(WaveOp::Any),
                 inputs,
+                outputs,
                 ..
-            } => self.bit(f, facts, inputs[0]),
+            } => {
+                if self.kept.contains(&outputs[0].0) {
+                    self.atom(opaque)
+                } else {
+                    self.bit(f, facts, inputs[0])
+                }
+            }
             Inst::Core { op, .. } => match *op {
                 Op::Const(_, k) => Manager::constant(k != 0),
                 Op::Env(Env::ValidLane) => Bdd::TRUE,
@@ -176,6 +242,7 @@ impl Logic {
                         };
                     }
                     match lane_test(f, facts, a, b) {
+                        Some(w) if facts.materialized[w.0] => self.atom(opaque),
                         Some(w) => {
                             let bit = self.view(f, facts, w);
                             if p == IntPred::Ne {
@@ -242,7 +309,13 @@ impl Logic {
         }
     }
 
-    fn edge_index(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> std::rc::Rc<EdgeIndex> {
+    fn edge_index(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        src: BlockId,
+        slot: usize,
+    ) -> std::rc::Rc<EdgeIndex> {
         if let Some(index) = self.edges.get(&(src, slot)) {
             return index.clone();
         }
@@ -270,7 +343,14 @@ impl Logic {
         index
     }
 
-    pub fn image(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
+    pub fn image(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        src: BlockId,
+        slot: usize,
+        formula: Bdd,
+    ) -> Bdd {
         if formula.constant().is_some() {
             return formula;
         }
@@ -463,7 +543,13 @@ struct Binding {
 }
 
 impl Logic {
-    fn bindings(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> std::rc::Rc<Vec<Binding>> {
+    fn bindings(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        src: BlockId,
+        slot: usize,
+    ) -> std::rc::Rc<Vec<Binding>> {
         if let Some(b) = self.relations.get(&(src, slot)) {
             return b.clone();
         }
@@ -490,8 +576,12 @@ impl Logic {
         start: BlockId,
         formula: Bdd,
     ) -> std::collections::BTreeMap<BlockId, Bdd> {
-        let rank: std::collections::BTreeMap<BlockId, usize> =
-            facts.order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
+        let rank: std::collections::BTreeMap<BlockId, usize> = facts
+            .order
+            .iter()
+            .enumerate()
+            .map(|(r, &b)| (b, r))
+            .collect();
         let mut reach = std::collections::BTreeMap::from([(start, formula)]);
         let mut worklist: BTreeSet<(usize, BlockId)> = BTreeSet::from([(rank[&start], start)]);
         while let Some((_, x)) = worklist.pop_first() {
@@ -523,7 +613,14 @@ impl Logic {
         reach
     }
 
-    pub fn post(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
+    pub fn post(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        src: BlockId,
+        slot: usize,
+        formula: Bdd,
+    ) -> Bdd {
         if formula == Bdd::FALSE {
             return formula;
         }

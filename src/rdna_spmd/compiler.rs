@@ -20,10 +20,11 @@ use super::analysis::{
     Accesses, Analyses, Constants, Context, ExecRegister, MaskValues, Masking, Packet, Uniformity,
 };
 use super::codegen::{Abi, Prepared};
+use super::decompile::Refusal;
 use super::dialect::DialectRegistry;
 #[cfg(test)]
 use super::ir::BlockId;
-use super::ir::{Func, ValueId};
+use super::ir::{EffectOp, Func, Inst, ValueId};
 use super::pass::cse::Cse;
 use super::pass::uniform_queries::UniformQueries;
 use super::pass::{
@@ -378,14 +379,35 @@ pub(super) fn prepare_packet(f: LiftedFunction, options: PacketOptions) -> Prepa
     )
 }
 
+/// Whether a program holds an operation over the whole wave.
+fn keeps_wave_ops(f: &Func) -> bool {
+    f.blocks.values().flat_map(|b| &b.insts).any(|inst| {
+        matches!(
+            inst,
+            Inst::Effect {
+                op: EffectOp::Wave(_),
+                ..
+            }
+        )
+    })
+}
+
 /// Prepares a packet program the lockstep lowering made. The lowering settled
 /// every mask, so nothing here narrows or specialises one, and every mask
-/// stays a single bit per lane.
+/// stays a single bit per lane. A cooperative packet yields at each wave
+/// operation for the scheduler to answer over the wave's packets.
 pub(super) fn prepare_lockstep(
     f: LiftedFunction,
     packing: super::decompile::Packing,
     num_vgprs: usize,
+    cooperative: bool,
 ) -> Prepared {
+    let f = if cooperative {
+        let program = Program { function: f };
+        super::program::split_at_effects(program, packing.lanes >= WAVE).function
+    } else {
+        f
+    };
     let Bare {
         mut ir,
         inputs,
@@ -406,14 +428,19 @@ pub(super) fn prepare_lockstep(
     driver
         .fixpoint(&mut ir, &mut an, "simplify", limit, &[&Simplify, &Dce])
         .unwrap();
+    let abi = if cooperative {
+        Abi::Cooperative
+    } else {
+        Abi::Whole
+    };
     prepared::<MaskValues>(
         ir,
         &mut an,
         &registry,
         Some(packing.lanes),
         false,
-        Abi::Whole,
-        false,
+        abi,
+        cooperative,
         num_vgprs,
     )
 }
@@ -498,20 +525,96 @@ pub(crate) fn compile_packet(
     packet_kernel(p, width, workgroup_x)
 }
 
-/// Compiles a packet program the lockstep lowering makes from a lane program.
-pub(crate) fn compile_lockstep(
-    lane: &LiftedFunction,
+/// Compiles a lane program for a width: alone at width 0, and otherwise in
+/// packets the lockstep lowering makes. Where the program keeps operations
+/// over the wave, the packets of a wave run cooperatively; a lane run alone
+/// is then a packet of one, since a lane that branches past a wave operation
+/// must still meet it with the others.
+pub(crate) fn compile_lane(
+    lane: &super::decompile::Lane,
     num_vgprs: usize,
     width: u32,
     workgroup_x: Option<u32>,
-) -> VecKernel {
+) -> Result<(Code, Scheduler), Refusal> {
+    if width != 0 {
+        return compile_lockstep(lane, num_vgprs, width, workgroup_x);
+    }
+    if keeps_wave_ops(&lane.function.ir) {
+        return compile_lockstep(lane, num_vgprs, 1, workgroup_x);
+    }
+    let program = Program {
+        function: lane.function.clone(),
+    };
+    let scheduler = if program_shares_a_group(&program) {
+        Scheduler::Workgroup
+    } else {
+        Scheduler::Independent
+    };
+    let kernel = compile_scalar(program, num_vgprs);
+    Ok((Code::Scalar(kernel), scheduler))
+}
+
+/// Whether a program reads or writes memory the work group shares.
+fn program_shares_a_group(program: &Program) -> bool {
+    sharing(program, true).group
+}
+
+/// Compiles a packet program the lockstep lowering makes from a lane program.
+/// The packets of a work group run cooperatively where the program holds a
+/// barrier, and those of a wave where it exchanges values between lanes or
+/// queries the wave from a packet that holds less than it; a program that
+/// only shares the group's memory runs its packets one by one within the
+/// group.
+pub(crate) fn compile_lockstep(
+    lane: &super::decompile::Lane,
+    num_vgprs: usize,
+    width: u32,
+    workgroup_x: Option<u32>,
+) -> Result<(Code, Scheduler), Refusal> {
     let packing = super::decompile::Packing {
         lanes: width,
         aligned: aligned(workgroup_x, width),
     };
-    let packet = super::decompile::lockstep(lane, packing);
-    let p = prepare_lockstep(packet, packing, num_vgprs.max(256));
-    packet_kernel(p, width, workgroup_x)
+    let packet = super::decompile::lockstep(lane, packing)?;
+    let program = Program { function: packet };
+    let shares = sharing(&program, width >= WAVE);
+    let scheduler = if shares.barrier {
+        Scheduler::Workgroup
+    } else if shares.exchange {
+        Scheduler::Wave
+    } else if shares.group {
+        Scheduler::Workgroup
+    } else {
+        Scheduler::Independent
+    };
+    let cooperative = shares.barrier || shares.exchange;
+    let p = prepare_lockstep(program.function, packing, num_vgprs.max(256), cooperative);
+    if cooperative {
+        let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
+        let yields = p.resume_layouts();
+        if yields
+            .iter()
+            .flatten()
+            .any(|l| l.op == EffectOp::Wave(super::ir::WaveOp::Wmma))
+        {
+            super::engine::wmma::warm(width as usize);
+        }
+        let kernel = CoopVecKernel::from_code(
+            code,
+            yields,
+            p.num_vgprs,
+            width,
+            p.min_private_bytes,
+            workgroup_x,
+            p.registry.registers(),
+        );
+        Ok((Code::Cooperative(kernel), scheduler))
+    } else {
+        Ok((
+            Code::Packet(packet_kernel(p, width, workgroup_x)),
+            scheduler,
+        ))
+    }
 }
 
 fn packet_kernel(p: Prepared, width: u32, workgroup_x: Option<u32>) -> VecKernel {
@@ -720,17 +823,14 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
         }
     }
     if let Ok(lane) = decompiled {
-        let code = if options.width == 0 {
-            Code::Scalar(compile_scalar(Program { function: lane }, options.num_vgprs))
-        } else {
-            Code::Packet(compile_lockstep(
-                &lane,
-                options.num_vgprs,
-                options.width,
-                options.workgroup_x,
-            ))
-        };
-        return Kernel::new(code, Scheduler::Independent, options.width);
+        match compile_lane(&lane, options.num_vgprs, options.width, options.workgroup_x) {
+            Ok((code, scheduler)) => return Kernel::new(code, scheduler, options.width),
+            Err(refusal) => {
+                if Driver::new().trace {
+                    eprintln!("; kept as a wave program, {refusal}");
+                }
+            }
+        }
     }
     let mut folded = program.clone();
     dispatch_passes_ir(&mut folded.function, true);
