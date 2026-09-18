@@ -1,5 +1,5 @@
-use super::bdd::Bdd;
-use super::facts::{operands, outputs, Facts};
+use crate::rdna_spmd::analysis::bdd::Bdd;
+use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
 use super::logic::{Atom, Logic};
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::Parameter;
@@ -199,7 +199,7 @@ fn simplify(q: &mut Func) {
 }
 
 fn remove_unreachable(q: &mut Func) {
-    let reachable: BTreeSet<BlockId> = super::facts::reverse_postorder(q).into_iter().collect();
+    let reachable: BTreeSet<BlockId> = crate::rdna_spmd::analysis::facts::reverse_postorder(q).into_iter().collect();
     q.blocks.retain(|id, _| reachable.contains(id));
 }
 

@@ -3,21 +3,21 @@ use crate::rdna_spmd::program::{Parameter, ParameterSource};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Site {
+pub(crate) enum Site {
     Param { block: BlockId, index: usize },
     Inst { block: BlockId, index: usize },
     Unreached,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Use {
+pub(crate) enum Use {
     Inst { block: BlockId, index: usize },
     Arg { block: BlockId, edge: usize, index: usize },
     Cond(BlockId),
     Ret(BlockId),
 }
 
-pub(super) fn operands(inst: &Inst) -> Vec<ValueId> {
+pub(crate) fn operands(inst: &Inst) -> Vec<ValueId> {
     match inst {
         Inst::Core { op, .. } => {
             let mut out = Vec::new();
@@ -33,7 +33,7 @@ pub(super) fn operands(inst: &Inst) -> Vec<ValueId> {
     }
 }
 
-pub(super) fn outputs(inst: &Inst) -> Vec<ValueId> {
+pub(crate) fn outputs(inst: &Inst) -> Vec<ValueId> {
     match inst {
         Inst::Core { value, .. } => vec![*value],
         Inst::Packet { output, .. } => vec![*output],
@@ -43,7 +43,7 @@ pub(super) fn outputs(inst: &Inst) -> Vec<ValueId> {
     }
 }
 
-pub(super) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
+pub(crate) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
     let mut order = Vec::new();
     let mut visited = std::collections::BTreeSet::from([f.entry]);
     let mut stack: Vec<(BlockId, usize)> = vec![(f.entry, 0)];
@@ -64,7 +64,7 @@ pub(super) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
     order
 }
 
-pub(super) struct Facts {
+pub(crate) struct Facts {
     pub site: Vec<Site>,
     pub uses: Vec<Vec<Use>>,
     pub incoming: BTreeMap<BlockId, Vec<(BlockId, usize)>>,

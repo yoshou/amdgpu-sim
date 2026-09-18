@@ -8,7 +8,7 @@
 //! Constants are defined again where they are read instead, so an operand a
 //! target operation requires to be constant stays one.
 
-use super::super::facts::{operands, outputs};
+use crate::rdna_spmd::analysis::facts::{operands, outputs};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 

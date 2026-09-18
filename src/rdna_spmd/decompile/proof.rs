@@ -1,40 +1,10 @@
-use super::bdd::{Bdd, Manager};
-use super::facts::{operands, outputs, Facts};
+use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
+use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
 use super::logic::{lane_test, Atom, Kept, Logic};
 use crate::rdna_spmd::dialect::TargetOp;
 use crate::rdna_spmd::ir::*;
+use crate::rdna_spmd::refusal::Refusal;
 use std::collections::{BTreeMap, HashMap};
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Refusal {
-    pub block: BlockId,
-    pub index: Option<usize>,
-    pub reason: &'static str,
-    /// Queries the lane program answered from the lane's own bit that the
-    /// refusal names: kept over the lanes at them instead, the refusal falls.
-    /// Empty where no such query is at fault.
-    pub keep: Vec<ValueId>,
-}
-
-impl Refusal {
-    pub(super) fn at(block: BlockId, index: Option<usize>, reason: &'static str) -> Self {
-        Self {
-            block,
-            index,
-            reason,
-            keep: Vec::new(),
-        }
-    }
-}
-
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, out: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self.index {
-            Some(index) => write!(out, "b{}:{}: {}", self.block.0, index, self.reason),
-            None => write!(out, "b{}: {}", self.block.0, self.reason),
-        }
-    }
-}
 
 /// Proves that the lane program stores what the wave program stores for
 /// each lane, with the wave queries in `kept` answered by the wave and every
@@ -69,7 +39,7 @@ pub(super) fn prove(
             .enumerate()
             .map(|(r, &b)| (b, r))
             .collect(),
-        loops: super::loops::Loops::new(f, facts).map_err(|block| {
+        loops: crate::rdna_spmd::analysis::loops::Loops::new(f, facts).map_err(|block| {
             Refusal::at(
                 block,
                 None,
@@ -125,7 +95,7 @@ struct Proof<'a> {
     arrivals: BTreeMap<BlockId, Vec<Bdd>>,
     reach: BTreeMap<BlockId, Bdd>,
     rank: BTreeMap<BlockId, usize>,
-    loops: super::loops::Loops,
+    loops: crate::rdna_spmd::analysis::loops::Loops,
 }
 
 impl Proof<'_> {
@@ -334,7 +304,7 @@ impl Proof<'_> {
             }
         }
         let place = |v: ValueId| match self.facts.site[v.0] {
-            super::facts::Site::Inst { block, index } => (self.rank[&block], index),
+            crate::rdna_spmd::analysis::facts::Site::Inst { block, index } => (self.rank[&block], index),
             _ => unreachable!("a query is an instruction"),
         };
         matter.into_iter().min_by_key(|&m| place(m)).into_iter().collect()

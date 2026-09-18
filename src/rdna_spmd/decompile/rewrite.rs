@@ -1,4 +1,4 @@
-use super::facts::Facts;
+use crate::rdna_spmd::analysis::facts::Facts;
 use super::logic::Kept;
 use crate::rdna_spmd::ir::*;
 

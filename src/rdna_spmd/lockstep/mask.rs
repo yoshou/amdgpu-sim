@@ -17,7 +17,7 @@
 //! - `nonempty`: masks at least one lane is known to be in, which is what
 //!   makes a query over them answer yes without a reduction.
 
-use super::super::bdd::{Bdd, Manager};
+use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::ir::ValueId;
 
 pub(super) struct Atom {

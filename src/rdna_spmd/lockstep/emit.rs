@@ -17,8 +17,8 @@
 //! case every lane leaves on the last iteration and the values it computed
 //! there are what leaves.
 
-use super::super::bdd::Bdd;
-use super::super::Refusal;
+use crate::rdna_spmd::analysis::bdd::Bdd;
+use crate::rdna_spmd::refusal::Refusal;
 use super::cost::Costs;
 use super::mask::Masks;
 use super::structure::{Structure, Unit};

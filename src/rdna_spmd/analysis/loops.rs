@@ -2,7 +2,7 @@ use super::facts::Facts;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeMap;
 
-pub(super) struct Loops {
+pub(crate) struct Loops {
     innermost: Vec<Option<usize>>,
     parent: Vec<Option<usize>>,
     header: Vec<usize>,
