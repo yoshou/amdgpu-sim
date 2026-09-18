@@ -17,24 +17,19 @@
 //! kept as they are; the lowering refuses a program where lanes may be
 //! elsewhere at one of them, and the program then runs as a wave program.
 //!
-//! [`lockstep`] lowers the lane program into packets, with the kept
+//! [`super::lockstep`] lowers the lane program into packets, with the kept
 //! operations answered over the wave -- inside the packet where it holds the
 //! wave, and through the cooperative scheduler otherwise.
 
-mod bdd;
-mod facts;
 mod fold;
-mod lockstep;
 mod logic;
-mod loops;
 mod proof;
 mod rewrite;
 
-pub(crate) use lockstep::{lockstep, Packing};
-pub(crate) use proof::Refusal;
-
+use crate::rdna_spmd::analysis::facts;
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::LiftedFunction;
+use crate::rdna_spmd::refusal::Refusal;
 use logic::Kept;
 use std::collections::BTreeSet;
 

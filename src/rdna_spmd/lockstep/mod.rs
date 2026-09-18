@@ -38,10 +38,11 @@ mod structure;
 mod tests;
 mod uniform;
 
-use super::facts::Facts;
-use super::Refusal;
+use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::compiler::exec_index;
+use crate::rdna_spmd::decompile::Lane;
 use crate::rdna_spmd::program::LiftedFunction;
+use crate::rdna_spmd::refusal::Refusal;
 
 /// How the packets a program is lowered for are laid out.
 #[derive(Clone, Copy, Debug)]
@@ -96,7 +97,7 @@ fn represent(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
     }
 }
 
-pub(crate) fn lockstep(lane: &super::Lane, packing: Packing) -> Result<LiftedFunction, Refusal> {
+pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Result<LiftedFunction, Refusal> {
     let everyone = &lane.everyone;
     let lane = &represent(&lane.function, packing);
     let facts = Facts::new(&lane.ir, &lane.parameter_inputs, &Default::default());

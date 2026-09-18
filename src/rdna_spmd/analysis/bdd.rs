@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct Bdd(u32);
+pub(crate) struct Bdd(u32);
 
 impl Bdd {
     pub const FALSE: Bdd = Bdd(0);
@@ -24,7 +24,7 @@ struct Node {
 
 const TERMINAL: u32 = u32::MAX;
 
-pub(super) struct Manager {
+pub(crate) struct Manager {
     nodes: Vec<Node>,
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
     ite: HashMap<(Bdd, Bdd, Bdd), Bdd>,

@@ -1,5 +1,5 @@
-use super::bdd::{Bdd, Manager};
-use super::facts::{Facts, Site};
+use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
+use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeSet, HashMap};
 

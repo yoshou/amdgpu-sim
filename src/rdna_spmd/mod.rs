@@ -89,9 +89,11 @@ mod dialect;
 mod engine;
 mod host;
 mod ir;
+mod lockstep;
 mod native;
 mod pass;
 mod program;
+mod refusal;
 mod target;
 mod targets;
 

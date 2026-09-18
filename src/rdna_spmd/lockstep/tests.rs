@@ -72,7 +72,7 @@ fn check_over(
                 )
                 .run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0, 0);
             } else {
-                let alone = super::super::Lane::from(lane.clone());
+                let alone = Lane::from(lane.clone());
                 let (Code::Packet(kernel), _) = compile_lockstep(&alone, 256, width, None)
                     .expect("every lane is at each operation over the wave")
                 else {
@@ -90,7 +90,7 @@ fn check_over(
 
 fn lowered(lane: &LiftedFunction) -> Func {
     lockstep(
-        &super::super::Lane::from(lane.clone()),
+        &Lane::from(lane.clone()),
         Packing {
             lanes: 16,
             aligned: true,
@@ -971,7 +971,7 @@ fn check_wave(
             continue;
         }
         let mut output = vec![UNTOUCHED; count as usize];
-        let alone = super::super::Lane::from(lane.clone());
+        let alone = Lane::from(lane.clone());
         let (code, scheduler) = compile_lane(&alone, 256, width, Some(count))
             .expect("every lane is at each operation over the wave");
         let kernel = Kernel::new(code, scheduler, width);
@@ -1152,7 +1152,7 @@ fn an_exchange_where_lanes_may_be_elsewhere_is_refused() {
            ret"
     ));
     for width in [0u32, 8, 32] {
-        let refusal = compile_lane(&super::super::Lane::from(lane.clone()), 256, width, None)
+        let refusal = compile_lane(&Lane::from(lane.clone()), 256, width, None)
             .err()
             .expect("the read needs every lane at it");
         assert_eq!(
@@ -1224,7 +1224,7 @@ fn an_exchange_in_a_loop_the_lanes_leave_apart_is_refused() {
     // Each lane makes as many trips as its index, so lanes leave the loop
     // while others still read lane 3 in it.
     let lane = summing_a_lane_over("v0");
-    let refusal = compile_lane(&super::super::Lane::from(lane), 256, 8, None)
+    let refusal = compile_lane(&Lane::from(lane), 256, 8, None)
         .err()
         .expect("lanes leave the loop apart");
     assert_eq!(

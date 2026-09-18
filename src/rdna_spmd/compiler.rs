@@ -20,7 +20,7 @@ use super::analysis::{
     Accesses, Analyses, Constants, Context, ExecRegister, MaskValues, Masking, Packet, Uniformity,
 };
 use super::codegen::{Abi, Prepared};
-use super::decompile::Refusal;
+use super::refusal::Refusal;
 use super::dialect::DialectRegistry;
 #[cfg(test)]
 use super::ir::BlockId;
@@ -398,7 +398,7 @@ fn keeps_wave_ops(f: &Func) -> bool {
 /// operation for the scheduler to answer over the wave's packets.
 pub(super) fn prepare_lockstep(
     f: LiftedFunction,
-    packing: super::decompile::Packing,
+    packing: super::lockstep::Packing,
     num_vgprs: usize,
     cooperative: bool,
 ) -> Prepared {
@@ -571,11 +571,11 @@ pub(crate) fn compile_lockstep(
     width: u32,
     workgroup_x: Option<u32>,
 ) -> Result<(Code, Scheduler), Refusal> {
-    let packing = super::decompile::Packing {
+    let packing = super::lockstep::Packing {
         lanes: width,
         aligned: aligned(workgroup_x, width),
     };
-    let packet = super::decompile::lockstep(lane, packing)?;
+    let packet = super::lockstep::lockstep(lane, packing)?;
     let program = Program { function: packet };
     let shares = sharing(&program, width >= WAVE);
     let scheduler = if shares.barrier {

@@ -9,8 +9,8 @@
 //! subtree -- the arm of a branch, or what follows a loop -- can be skipped as
 //! one span.
 
-use super::super::facts::{operands, Facts, Site};
-use super::super::loops::Loops;
+use crate::rdna_spmd::analysis::facts::{operands, Facts, Site};
+use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeMap;
 
