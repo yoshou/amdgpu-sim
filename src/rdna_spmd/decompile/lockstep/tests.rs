@@ -1,6 +1,7 @@
 use super::*;
 use crate::rdna_spmd::compiler::{compile_lockstep, compile_scalar};
-use crate::rdna_spmd::ir::{parse, Func, Inst, IntPred, Op, PacketOp, Term, Ty, ValueId};
+use crate::rdna_spmd::engine::kernel::Code;
+use crate::rdna_spmd::ir::{parse, Func, Inst, IntOp, IntPred, Op, PacketOp, Term, Ty, ValueId};
 use crate::rdna_spmd::program::{Parameter, ParameterSource, Program};
 use std::sync::Arc;
 
@@ -71,14 +72,13 @@ fn check_over(
                 )
                 .run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0, 0);
             } else {
-                compile_lockstep(lane, 256, width, None).run(
-                    sgprs.as_mut_ptr(),
-                    vgprs.as_mut_ptr(),
-                    0,
-                    0,
-                    u32::MAX,
-                    0,
-                );
+                let alone = super::super::Lane::from(lane.clone());
+                let (Code::Packet(kernel), _) = compile_lockstep(&alone, 256, width, None)
+                    .expect("every lane is at each operation over the wave")
+                else {
+                    panic!("a lane program that keeps no wave operation runs alone")
+                };
+                kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0, 0, u32::MAX, 0);
             }
         }
         let wanted: Vec<u32> = (0..lanes as u32)
@@ -90,12 +90,13 @@ fn check_over(
 
 fn lowered(lane: &LiftedFunction) -> Func {
     lockstep(
-        lane,
+        &super::super::Lane::from(lane.clone()),
         Packing {
             lanes: 16,
             aligned: true,
         },
     )
+    .expect("every lane is at each operation over the wave")
     .ir
 }
 
@@ -126,6 +127,16 @@ fn source(f: &Func, v: ValueId) -> ValueId {
 
 fn insts(f: &Func) -> impl Iterator<Item = &Inst> {
     f.blocks.values().flat_map(|b| &b.insts)
+}
+
+/// Whether a bit is `condition` held to the lanes with work items: the
+/// condition itself, or the condition and the EXEC the packet started with.
+fn holds_under_valid(f: &Func, defs: &[Option<Op>], bit: ValueId, condition: ValueId) -> bool {
+    let valid = f.blocks[&f.entry].params[4].0;
+    let same = |v: ValueId| source(f, v) == condition;
+    same(bit)
+        || matches!(defs[source(f, bit).0], Some(Op::Int(IntOp::And, a, b))
+            if (source(f, a) == valid && same(b)) || (source(f, b) == valid && same(a)))
 }
 
 fn queries(f: &Func) -> usize {
@@ -578,7 +589,8 @@ fn an_operation_that_reads_for_every_lane_reads_nothing_for_a_lane_outside_the_m
         .unwrap();
     for (index, arg) in sample.iter().enumerate() {
         let suppressed = matches!(defs[arg.0], Some(Op::Select(c, _, zero))
-            if source(&packet, c) == condition && matches!(defs[zero.0], Some(Op::Const(_, 0))));
+            if holds_under_valid(&packet, &defs, c, condition)
+                && matches!(defs[zero.0], Some(Op::Const(_, 0))));
         assert_eq!(
             suppressed,
             !matches!(index, 12 | 13),
@@ -739,11 +751,18 @@ fn an_operation_with_a_lane_predicate_reads_only_for_the_lanes_in_the_mask() {
             _ => None,
         })
         .unwrap();
+    let condition = insts(&packet)
+        .find_map(|inst| match inst {
+            Inst::Core {
+                value,
+                op: Op::Cmp(IntPred::Ult, ..),
+                ..
+            } => Some(*value),
+            _ => None,
+        })
+        .unwrap();
     assert!(
-        matches!(
-            defs[source(&packet, predicate).0],
-            Some(Op::Cmp(IntPred::Ult, ..))
-        ),
+        holds_under_valid(&packet, &defs, predicate, condition),
         "the traversal runs for the lanes the branch holds and no others"
     );
 }
@@ -900,4 +919,316 @@ fn a_shift_by_the_whole_word_leaves_each_lane_its_own_entry() {
         }
     };
     check_over(&lane, 0, 128, table, |l| Some(1000 + l));
+}
+
+/// A lane program dispatched as a wave: one workgroup of `count` work items,
+/// run alone and in packets of every width, with `shared` in SGPR 0 (where
+/// the dispatch puts the packet's address) and the output buffer's address
+/// in SGPRs 2 and 3 (where it puts the kernarg segment's).
+fn wave(text: &str) -> LiftedFunction {
+    let registry = crate::rdna_spmd::targets::rdna4::registry();
+    let ir = parse::func(&registry, text).unwrap();
+    let input = |source, ty| Parameter { source, ty };
+    LiftedFunction {
+        registry: Arc::new(registry),
+        ir,
+        parameter_inputs: vec![
+            input(ParameterSource::Vgpr(0), Ty::I32),
+            input(ParameterSource::Sgpr(0), Ty::I32),
+            input(ParameterSource::Sgpr(1), Ty::I32),
+            input(ParameterSource::Sgpr(2), Ty::I32),
+            input(ParameterSource::Sgpr(3), Ty::I32),
+            input(ParameterSource::MaskBit(126), Ty::I1),
+        ],
+        revision: 0,
+    }
+}
+
+fn check_wave(
+    lane: &LiftedFunction,
+    count: u32,
+    shared: u32,
+    expected: impl Fn(u32) -> Option<u32>,
+) {
+    use crate::rdna_spmd::compiler::compile_lane;
+    use crate::rdna_spmd::engine::kernel::Kernel;
+    use crate::rdna_spmd::{dispatch, GridDims};
+    let mut kd = crate::processor::decode_kernel_desc(&[0; 64]);
+    kd.enable_sgpr_dispatch_ptr = true;
+    kd.enable_sgpr_kernarg_segment_ptr = true;
+    let dims = GridDims {
+        num_wg_x: 1,
+        num_wg_y: 1,
+        num_wg_z: 1,
+        wg_x: count,
+        wg_y: 1,
+        wg_z: 1,
+    };
+    for width in [0u32, 1, 2, 4, 8, 16, 32] {
+        // A packet that holds the whole wave runs alone, and packets that run
+        // alone must hold whole packets of the workgroup.
+        if width == 32 && count % width != 0 {
+            continue;
+        }
+        let mut output = vec![UNTOUCHED; count as usize];
+        let alone = super::super::Lane::from(lane.clone());
+        let (code, scheduler) = compile_lane(&alone, 256, width, Some(count))
+            .expect("every lane is at each operation over the wave");
+        let kernel = Kernel::new(code, scheduler, width);
+        dispatch(
+            &kernel,
+            &kd,
+            output.as_mut_ptr() as u64,
+            shared as u64,
+            dims,
+            0,
+            0,
+            1,
+        );
+        let wanted: Vec<u32> = (0..count)
+            .map(|l| expected(l).unwrap_or(UNTOUCHED))
+            .collect();
+        assert_eq!(output, wanted, "width {} with {} lanes", width, count);
+    }
+}
+
+/// The slot of the lane's own word in the output, from the address in SGPRs
+/// 2 and 3, as `v10`.
+const SLOT: &str = "v6: i32 = const i32 0x2
+                    v7: i32 = int shl v0, v6
+                    v8: i64 = convert zext i64 v7
+                    v9: i64 = pack64 v3, v4
+                    v10: i64 = int add v9, v8";
+
+#[test]
+fn a_query_kept_in_an_arm_asks_every_lane_of_the_wave_at_the_arm() {
+    // Lanes below 16 take the arm; there, whether the lane `shared` names is
+    // among them is asked of the wave, so packets holding no lane of the arm
+    // still meet the query, and a lane the arm leaves out is not counted.
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x10
+           v12: i1 = cmp ult v0, v11
+           condbr v12, b1(v0, v1, v10, v5), b2(v5)
+         b1(v13: i32, v14: i32, v15: i64, v16: i1):
+           v17: i1 = cmp eq v13, v14
+           v18: i1 = int and v17, v16
+           v19: i1 = effect !p0 wave any (v18)
+           v20: i1 = int and v19, v16
+           v21: i32 = const i32 0x1
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v15, v21, v20)
+           ret
+         b2(v22: i1):
+           ret"
+    ));
+    check_wave(&lane, 32, 3, |l| (l < 16).then_some(1));
+    check_wave(&lane, 32, 20, |_| None);
+    check_wave(&lane, 20, 15, |l| (l < 16).then_some(1));
+}
+
+#[test]
+fn a_ballot_kept_holds_the_bits_of_every_lane_of_the_wave() {
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x1
+           v12: i32 = int and v0, v11
+           v13: i1 = cmp eq v12, v11
+           v14: i1 = int and v13, v5
+           v15: i32 = effect !p0 wave ballot (v14)
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v10, v15, v5)
+           ret"
+    ));
+    check_wave(&lane, 32, 0, |_| Some(0xaaaa_aaaa));
+    check_wave(&lane, 20, 0, |_| Some(0x000a_aaaa));
+}
+
+#[test]
+fn a_read_of_the_first_lane_kept_reads_the_first_lane_of_the_wave() {
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x3
+           v12: i32 = int mul v0, v11
+           v13: i32 = int add v12, v1
+           v14: i32 = effect !p0 wave readfirstlane (v13, v5)
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v10, v14, v5)
+           ret"
+    ));
+    check_wave(&lane, 32, 7, |_| Some(7));
+    check_wave(&lane, 20, 100, |_| Some(100));
+}
+
+#[test]
+fn a_loop_holding_a_query_kept_goes_around_while_any_lane_of_the_wave_does() {
+    // Each lane counts down from its index; the loop goes around while any
+    // lane of the wave has a count left, and every lane stores the trips
+    // the wave made: one more than the highest index, for the trip that
+    // finds no lane left.
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x0
+           br b1(v0, v11, v10, v5)
+         b1(v12: i32, v13: i32, v14: i64, v15: i1):
+           v16: i32 = const i32 0x0
+           v17: i1 = cmp ugt v12, v16
+           v18: i32 = const i32 0x1
+           v19: i32 = int sub v12, v18
+           v20: i32 = select v17, v19, v12
+           v21: i32 = int add v13, v18
+           v22: i1 = int and v17, v15
+           v23: i1 = effect !p0 wave any (v22)
+           condbr v23, b1(v20, v21, v14, v15), b2(v21, v14, v15)
+         b2(v24: i32, v25: i64, v26: i1):
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v25, v24, v26)
+           ret"
+    ));
+    check_wave(&lane, 32, 0, |_| Some(32));
+    check_wave(&lane, 20, 0, |_| Some(20));
+}
+
+#[test]
+fn a_read_of_a_lane_kept_reads_that_lane_of_the_wave() {
+    // The lane `shared` names is read by every lane, whichever packet holds
+    // it.
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x3
+           v12: i32 = int mul v0, v11
+           v13: i32 = const i32 0x64
+           v14: i32 = int add v12, v13
+           v15: i32 = const i32 0x0
+           v16: i32 = effect !p0 wave readlane (v14, v1, v15)
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v10, v16, v5)
+           ret"
+    ));
+    check_wave(&lane, 32, 17, |_| Some(3 * 17 + 100));
+    check_wave(&lane, 20, 19, |_| Some(3 * 19 + 100));
+}
+
+#[test]
+fn a_write_into_a_lane_kept_is_read_back_from_that_lane() {
+    // A value stashed in lane 5 of register 3 is read back by every lane.
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x309
+           v12: i32 = const i32 0x5
+           v13: i32 = const i32 0x3
+           v14: i32 = effect !p0 wave writelane (v11, v12, v0, v13)
+           v15: i32 = effect !p1 wave readlane (v14, v12, v13)
+           effect !p2 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v10, v15, v5)
+           ret"
+    ));
+    check_wave(&lane, 32, 0, |_| Some(0x309));
+}
+
+#[test]
+fn an_exchange_where_lanes_may_be_elsewhere_is_refused() {
+    use crate::rdna_spmd::compiler::compile_lane;
+    // Lanes below 16 read a lane of the wave while the others have left.
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x10
+           v12: i1 = cmp ult v0, v11
+           condbr v12, b1(v0, v1, v10, v5), b2(v5)
+         b1(v13: i32, v14: i32, v15: i64, v16: i1):
+           v17: i32 = const i32 0x0
+           v18: i32 = effect !p0 wave readlane (v13, v14, v17)
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v15, v18, v16)
+           ret
+         b2(v19: i1):
+           ret"
+    ));
+    for width in [0u32, 8, 32] {
+        let refusal = compile_lane(&super::super::Lane::from(lane.clone()), 256, width, None)
+            .err()
+            .expect("the read needs every lane at it");
+        assert_eq!(
+            refusal.reason, "an operation over every lane where lanes may be elsewhere",
+            "width {width}"
+        );
+    }
+}
+
+#[test]
+fn a_wave_operation_in_a_span_every_lane_takes_or_leaves_runs_only_when_taken() {
+    // Whether `shared` is set decides for every lane whether the read of
+    // the lane it names happens, so the packets branch together and the
+    // read, kept, runs with every lane at it.
+    let lane = wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x0
+           v12: i1 = cmp ne v1, v11
+           condbr v12, b1(v0, v1, v10, v5), b2(v5)
+         b1(v13: i32, v16: i32, v14: i64, v15: i1):
+           v17: i32 = const i32 0x0
+           v18: i32 = effect !p0 wave readlane (v13, v16, v17)
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v14, v18, v15)
+           ret
+         b2(v19: i1):
+           ret"
+    ));
+    check_wave(&lane, 32, 5, |_| Some(5));
+    check_wave(&lane, 32, 0, |_| None);
+}
+
+/// A loop of `trips` trips summing what the lane `shared` names holds each
+/// trip, where each lane holds ten times its index plus the trip.
+fn summing_a_lane_over(trips: &str) -> LiftedFunction {
+    wave(&format!(
+        "func entry b0
+         b0(v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i1):
+           {SLOT}
+           v11: i32 = const i32 0x0
+           br b1(v0, v11, v11, {trips}, v1, v10, v5)
+         b1(v12: i32, v13: i32, v14: i32, v15: i32, v21: i32, v16: i64, v17: i1):
+           v18: i32 = const i32 0xa
+           v19: i32 = int mul v12, v18
+           v20: i32 = int add v19, v13
+           v22: i32 = const i32 0x0
+           v23: i32 = effect !p0 wave readlane (v20, v21, v22)
+           v24: i32 = int add v14, v23
+           v25: i32 = const i32 0x1
+           v26: i32 = int add v13, v25
+           v27: i1 = cmp ult v26, v15
+           condbr v27, b1(v12, v26, v24, v15, v21, v16, v17), b2(v24, v16, v17)
+         b2(v28: i32, v29: i64, v30: i1):
+           effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v29, v28, v30)
+           ret"
+    ))
+}
+
+#[test]
+fn an_exchange_in_a_loop_the_lanes_go_around_together_reads_the_wave_each_trip() {
+    let lane = summing_a_lane_over("v1");
+    check_wave(&lane, 32, 4, |_| Some(40 + 41 + 42 + 43));
+}
+
+#[test]
+fn an_exchange_in_a_loop_the_lanes_leave_apart_is_refused() {
+    use crate::rdna_spmd::compiler::compile_lane;
+    // Each lane makes as many trips as its index, so lanes leave the loop
+    // while others still read lane 3 in it.
+    let lane = summing_a_lane_over("v0");
+    let refusal = compile_lane(&super::super::Lane::from(lane), 256, 8, None)
+        .err()
+        .expect("lanes leave the loop apart");
+    assert_eq!(
+        refusal.reason,
+        "an operation over every lane in a loop the lanes leave apart"
+    );
 }

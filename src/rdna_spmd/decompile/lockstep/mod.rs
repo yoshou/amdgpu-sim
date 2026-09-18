@@ -39,6 +39,7 @@ mod tests;
 mod uniform;
 
 use super::facts::Facts;
+use super::Refusal;
 use crate::rdna_spmd::compiler::exec_index;
 use crate::rdna_spmd::program::LiftedFunction;
 
@@ -95,15 +96,24 @@ fn represent(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
     }
 }
 
-pub(crate) fn lockstep(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
-    let lane = &represent(lane, packing);
-    let facts = Facts::new(&lane.ir, &lane.parameter_inputs);
+pub(crate) fn lockstep(lane: &super::Lane, packing: Packing) -> Result<LiftedFunction, Refusal> {
+    let everyone = &lane.everyone;
+    let lane = &represent(&lane.function, packing);
+    let facts = Facts::new(&lane.ir, &lane.parameter_inputs, &Default::default());
     let shape = structure::Structure::new(&lane.ir, facts);
     let costs = cost::Costs::new(packing.lanes, &crate::rdna_spmd::host::Vectors::detect());
     let exec = exec_index(&lane.parameter_inputs, &lane.registry);
     let mut uniform = uniform::assume(lane, packing);
     loop {
-        let lowered = emit::lower(&lane.ir, &shape, &lane.registry, &uniform, exec, &costs);
+        let lowered = emit::lower(
+            &lane.ir,
+            &shape,
+            &lane.registry,
+            &uniform,
+            exec,
+            &costs,
+            everyone,
+        )?;
         let mut ir = lowered.ir;
         let folded = localize::fold_forwarding(&mut ir);
         localize::localize(&mut ir);
@@ -122,12 +132,12 @@ pub(crate) fn lockstep(lane: &LiftedFunction, packing: Packing) -> LiftedFunctio
                     e
                 );
             }
-            return LiftedFunction {
+            return Ok(LiftedFunction {
                 registry: lane.registry.clone(),
                 ir,
                 parameter_inputs: lane.parameter_inputs.clone(),
                 revision: lane.revision + 1,
-            };
+            });
         }
         for v in refuted {
             uniform[v.0] = false;

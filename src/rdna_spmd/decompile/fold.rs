@@ -7,8 +7,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {
     let decided = {
-        let facts = Facts::new(q, inputs);
-        let mut logic = Logic::new(q, &facts);
+        let facts = Facts::new(q, inputs, &BTreeSet::new());
+        // Every query the lane program still holds is one it keeps.
+        let kept: BTreeSet<ValueId> = q
+            .blocks
+            .values()
+            .flat_map(|b| &b.insts)
+            .filter_map(|inst| match inst {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any),
+                    outputs,
+                    ..
+                } => Some(outputs[0].0),
+                _ => None,
+            })
+            .collect();
+        let mut logic = Logic::new(q, &facts, &kept);
         let start = match exec {
             Some(index) => logic.atom(Atom::Bit(q.blocks[&q.entry].params[index].0)),
             None => Bdd::TRUE,
@@ -26,7 +40,12 @@ struct Decided {
     reachable: BTreeSet<BlockId>,
 }
 
-fn decisions(q: &Func, facts: &Facts, logic: &mut Logic, reach: &BTreeMap<BlockId, Bdd>) -> Decided {
+fn decisions(
+    q: &Func,
+    facts: &Facts,
+    logic: &mut Logic,
+    reach: &BTreeMap<BlockId, Bdd>,
+) -> Decided {
     let mut constant = BTreeMap::new();
     for &id in &facts.order {
         let r = reach.get(&id).copied().unwrap_or(Bdd::FALSE);
@@ -99,9 +118,9 @@ fn apply(q: &mut Func, decided: &Decided) {
                         op: Op::Const(Ty::I1, decided.constant[&value] as u64),
                     });
                 }
-                Inst::Effect {
-                    outputs, ..
-                } if outputs.len() == 1 && decided.constant.contains_key(&outputs[0].0) => {
+                Inst::Effect { outputs, .. }
+                    if outputs.len() == 1 && decided.constant.contains_key(&outputs[0].0) =>
+                {
                     let value = outputs[0].0;
                     insts.push(Inst::Core {
                         value,
