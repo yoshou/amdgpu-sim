@@ -101,16 +101,14 @@ fn projection(p: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
 /// operations over the lanes that are at them.
 pub(super) fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
     let reachable: std::collections::BTreeSet<BlockId> = facts.order.iter().copied().collect();
-    let mut q = Func {
-        entry: p.entry,
-        blocks: p
-            .blocks
-            .iter()
-            .filter(|(id, _)| reachable.contains(id))
-            .map(|(&id, b)| (id, b.clone()))
-            .collect(),
-        types: p.types.clone(),
-    };
+    let mut q = Func::new(p.entry, Presence::Wave);
+    q.blocks = p
+        .blocks
+        .iter()
+        .filter(|(id, _)| reachable.contains(id))
+        .map(|(&id, b)| (id, b.clone()))
+        .collect();
+    q.types = p.types.clone();
     for v in 0..q.types.len() {
         if converted(facts, ValueId(v)) {
             q.types[v] = Ty::I1;
@@ -147,6 +145,7 @@ pub(super) fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
             *ty = q.types[v.0];
         }
     }
+    q.one_region(q.presence_needed());
     q
 }
 

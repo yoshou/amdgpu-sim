@@ -339,6 +339,7 @@ pub(super) fn prepare_packet(f: LiftedFunction, options: PacketOptions) -> Prepa
         inputs,
         registry,
     } = bare(f);
+    ir.lowered_to_packets();
     let driver = Driver::new();
     let base = context(&registry, &inputs, width);
     {
@@ -413,6 +414,7 @@ pub(super) fn prepare_lockstep(
         inputs,
         registry,
     } = bare(f);
+    ir.lowered_to_packets();
     let driver = Driver::new();
     let mut an = Analyses::new(Context {
         exec_initial: true,

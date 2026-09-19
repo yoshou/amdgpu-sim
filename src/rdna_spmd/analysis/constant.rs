@@ -289,15 +289,10 @@ fn evaluate(ty: Ty, op: Op, types: &[Ty], facts: &[Fact]) -> Fact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
     fn loop_backedge_can_disprove_a_constant_without_losing_invariants() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let initial = f.value(Ty::I32);
         let a = f.value(Ty::I32);
         let invariant = f.value(Ty::I32);

@@ -174,14 +174,9 @@ mod tests {
     use super::super::super::ir::{Block, BlockId, Env, IntOp, Term, Ty};
     use super::super::super::program::{Parameter, ParameterSource};
     use super::*;
-    use std::collections::BTreeMap;
 
     fn folded(shape: u8) -> Option<Op> {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let exec = f.value(Ty::I1);
         let old = f.value(Ty::I32);
         let upper = f.value(Ty::I1);

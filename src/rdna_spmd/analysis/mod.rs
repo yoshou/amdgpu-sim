@@ -187,14 +187,9 @@ impl<'r> Analyses<'r> {
 mod tests {
     use super::super::ir::{Block, BlockId, Inst, IntOp, Op, Term, Ty, ValueId};
     use super::*;
-    use std::collections::BTreeMap;
 
     fn func() -> (Func, ValueId) {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), crate::rdna_spmd::ir::Presence::Wave);
         let exec = f.value(Ty::I1);
         let two = f.value(Ty::I32);
         let four = f.value(Ty::I32);

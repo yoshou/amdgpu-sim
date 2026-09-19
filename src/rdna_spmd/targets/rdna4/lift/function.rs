@@ -67,11 +67,7 @@ pub(in crate::rdna_spmd) fn lift(
     }
     regs.extend([Word::Mask(106), Word::Mask(126)]);
     let regs: Vec<_> = regs.into_iter().collect();
-    let mut f = Func {
-        entry: BlockId(program.entry_pc),
-        blocks: BTreeMap::new(),
-        types: vec![],
-    };
+    let mut f = Func::new(BlockId(program.entry_pc), crate::rdna_spmd::ir::Presence::Wave);
     // Block parameters make all incoming definitions, including backedges,
     // explicit before any block body is lifted.
     for &pc in program.blocks.keys() {
@@ -194,6 +190,7 @@ pub(in crate::rdna_spmd) fn lift(
             source: ParameterSource::Scc,
         }))
         .collect();
+    f.one_region(f.presence_needed());
     LiftedFunction {
         registry,
         ir: f,

@@ -227,15 +227,10 @@ pub(super) fn for_each_output(inst: &Inst, mut f: impl FnMut(ValueId)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
     fn a_forward_state_meets_every_reached_predecessor_and_unreached_blocks_keep_the_start() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let cond = f.value(Ty::I1);
         let to = |dst: usize| Edge {
             dst: BlockId(dst),
@@ -293,11 +288,7 @@ mod tests {
 
     #[test]
     fn a_parameter_meets_every_incoming_edge_and_unconstrained_values_keep_the_start() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let a = f.value(Ty::I1);
         let b = f.value(Ty::I1);
         let p = f.value(Ty::I1);

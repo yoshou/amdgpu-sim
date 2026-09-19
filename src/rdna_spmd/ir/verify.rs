@@ -162,7 +162,63 @@ impl Func {
         if definitions != count {
             return Err("undefined SSA value");
         }
+        self.check_regions()
+    }
+
+    /// The regions: each is entered at a block the function reaches, the lanes
+    /// present do not grow as they nest, and every operation is in a region
+    /// with at least the lanes it reads present. See [`super::scope`].
+    fn check_regions(&self) -> Result<(), &'static str> {
+        let doms = Dominators::of(self);
+        if self.regions.get(&self.entry).is_none() {
+            return Err("no region is entered at the function's entry");
+        }
+        let reached: BTreeSet<BlockId> = doms.order.iter().copied().collect();
+        for (&entry, &present) in &self.regions {
+            if !reached.contains(&entry) {
+                return Err("a region is entered at a block the function does not reach");
+            }
+            let enclosing = self
+                .regions
+                .iter()
+                .filter(|&(&other, _)| self.encloses(&doms, other, entry))
+                .map(|(_, &p)| p)
+                .min();
+            if enclosing.is_some_and(|outer| present > outer) {
+                return Err("a region has more lanes present than the one enclosing it");
+            }
+        }
+        let held = self.regions_of(&doms);
+        for &id in &doms.order {
+            let present = self.regions[&held[&id]];
+            for inst in &self.blocks[&id].insts {
+                if lanes_read(inst) > Some(present) {
+                    return Err("an operation reads lanes its region does not have present");
+                }
+            }
+        }
         Ok(())
+    }
+}
+
+/// The lanes an operation reads beyond the one running it, and so the least a
+/// region holding it must have present. `None` where it reads no other lane.
+pub(super) fn lanes_read(inst: &Inst) -> Option<Presence> {
+    match inst {
+        Inst::Packet { .. }
+        | Inst::Core {
+            op: Op::Env(Env::OutsideLanes | Env::PacketLaneId),
+            ..
+        } => Some(Presence::Packet),
+        Inst::Effect {
+            op: EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait,
+            ..
+        } => Some(Presence::Workgroup),
+        Inst::Effect {
+            op: EffectOp::Wave(_),
+            ..
+        } => Some(Presence::Wave),
+        _ => None,
     }
 }
 impl VerifiedFunc {

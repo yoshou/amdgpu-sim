@@ -1159,6 +1159,7 @@ mod tests {
             collapsed,
             "each recognized macro gets its SSA correction"
         );
+        ir.one_region(ir.presence_needed());
         ir.clone().verify_with(&registry).unwrap();
         collapsed
     }

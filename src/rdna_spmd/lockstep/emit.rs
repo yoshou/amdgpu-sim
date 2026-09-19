@@ -117,11 +117,7 @@ pub(super) fn lower(
         registry,
         uniform,
         costs,
-        out: Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: Vec::new(),
-        },
+        out: Func::new(BlockId(0), crate::rdna_spmd::ir::Presence::Wave),
         cur: BlockId(0),
         masks: Masks::new(),
         lane: vec![None; q.types.len()],
@@ -185,8 +181,10 @@ pub(super) fn lower(
     if let Some(refusal) = e.refused {
         return Err(refusal);
     }
+    let mut ir = e.out;
+    ir.one_region(ir.presence_needed());
     Ok(Lowering {
-        ir: e.out,
+        ir,
         masks: e.masks,
     })
 }

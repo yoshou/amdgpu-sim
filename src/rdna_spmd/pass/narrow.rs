@@ -239,11 +239,7 @@ mod tests {
     #[test]
     fn unobserved_predicated_writes_lose_their_select_and_exposed_ones_keep_it() {
         let mut b = Builder {
-            f: Func {
-                entry: BlockId(0),
-                blocks: BTreeMap::new(),
-                types: vec![],
-            },
+            f: Func::new(BlockId(0), Presence::Wave),
             insts: vec![],
         };
         let exec = b.f.value(Ty::I1);
@@ -283,11 +279,7 @@ mod tests {
     #[test]
     fn masked_compare_words_do_not_expose_their_operands() {
         let mut b = Builder {
-            f: Func {
-                entry: BlockId(0),
-                blocks: BTreeMap::new(),
-                types: vec![],
-            },
+            f: Func::new(BlockId(0), Presence::Wave),
             insts: vec![],
         };
         let exec = b.f.value(Ty::I1);
