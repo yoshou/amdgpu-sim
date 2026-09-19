@@ -78,7 +78,17 @@ fn context<'r>(registry: &'r DialectRegistry, inputs: &'r [Parameter], lanes: u3
     Context::new(registry, inputs, exec_index(inputs, registry), lanes)
 }
 
-pub(super) fn input_passes_ir(f: &mut LiftedFunction) {
+/// The passes that are right on a program whose every region has the whole wave
+/// present, which is what the lifter makes. Every rewrite that removes a
+/// dependence on the other lanes belongs here: it must run before anything
+/// decides which regions can do without them, since a rewrite that leaves such
+/// a dependence in place forces the region to keep the wave together and so
+/// undoes its own purpose. `Idioms` recognises the sequences the ISA expands a
+/// square root and a division into, whose scale the wave chooses together, and
+/// collapses each to the operation the source asked for. `UniformQueries`
+/// answers a query whose input every lane agrees on from that input, which
+/// holds lane by lane whatever is present.
+pub(super) fn wave_passes(f: &mut LiftedFunction) {
     let driver = Driver::new();
     let limit = 1 + f.ir.types.len();
     let mut an = Analyses::new(context(&f.registry, &f.parameter_inputs, 32));
@@ -86,9 +96,9 @@ pub(super) fn input_passes_ir(f: &mut LiftedFunction) {
         .fixpoint(
             &mut f.ir,
             &mut an,
-            "input",
+            "wave",
             limit,
-            &[&Idioms, &Simplify, &Dce],
+            &[&Idioms, &UniformQueries, &Simplify, &Dce],
         )
         .unwrap();
     f.revision += 1;
@@ -100,12 +110,7 @@ pub(super) fn dispatch_passes_ir(f: &mut LiftedFunction, fold_masks: bool) {
     let mut an = Analyses::new(context(&f.registry, &f.parameter_inputs, 32));
     let mut passes: Vec<&dyn Pass> = Vec::new();
     if fold_masks {
-        passes.extend([
-            &DeadWrites as &dyn Pass,
-            &Cse,
-            &UniformQueries,
-            &MaskProjection,
-        ]);
+        passes.extend([&DeadWrites as &dyn Pass, &Cse, &MaskProjection]);
     }
     passes.extend([
         &Simplify as &dyn Pass,
@@ -488,7 +493,7 @@ pub(super) fn prepare_scalar(f: LiftedFunction, mode: ScalarMode, num_vgprs: usi
 impl Compiler {
     pub fn decode_program(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
         let mut function = self.target.decode(entry_pc, memory)?;
-        input_passes_ir(&mut function);
+        wave_passes(&mut function);
         Ok(Program { function })
     }
 }
@@ -921,7 +926,7 @@ mod tests {
             blocks,
         };
         let mut program = source.to_ssa();
-        input_passes_ir(&mut program.function);
+        wave_passes(&mut program.function);
         program
             .function
             .ir
