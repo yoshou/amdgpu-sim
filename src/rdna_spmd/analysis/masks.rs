@@ -846,11 +846,7 @@ mod tests {
     impl Builder {
         fn new() -> Self {
             Builder {
-                f: Func {
-                    entry: BlockId(0),
-                    blocks: BTreeMap::new(),
-                    types: vec![],
-                },
+                f: Func::new(BlockId(0), Presence::Wave),
                 insts: vec![],
             }
         }
@@ -1010,11 +1006,7 @@ mod tests {
     }
 
     fn loop_restoring_from(saved_from_loop: bool) -> (Func, ValueId, ValueId, ValueId) {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let exec = f.value(Ty::I1);
         let x = f.value(Ty::I32);
         let outer = f.value(Ty::I32);
@@ -1278,11 +1270,7 @@ mod tests {
     #[test]
     fn wave_level_queries_never_prove_a_lane_active_and_empty_exec_edges_carry() {
         fn build(wave: bool) -> (Func, ValueId) {
-            let mut f = Func {
-                entry: BlockId(0),
-                blocks: BTreeMap::new(),
-                types: vec![],
-            };
+            let mut f = Func::new(BlockId(0), Presence::Wave);
             let exec = f.value(Ty::I1);
             let saved = f.value(Ty::I1);
             let flag = f.value(Ty::I1);
@@ -1392,11 +1380,7 @@ mod tests {
 
     #[test]
     fn a_bit_saved_from_the_entry_exec_restores_an_active_lane() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let e0 = f.value(Ty::I1);
         let saved = f.value(Ty::I1);
         f.blocks.insert(
@@ -1447,11 +1431,7 @@ mod tests {
 
     #[test]
     fn narrowing_exec_keeps_predicated_writes_guarded_and_widening_does_not() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let exec = f.value(Ty::I1);
         let x = f.value(Ty::I32);
         let saved = f.value(Ty::I32);

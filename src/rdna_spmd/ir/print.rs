@@ -313,9 +313,21 @@ pub(crate) fn term(t: &Term) -> String {
     }
 }
 
+fn presence(p: Presence) -> &'static str {
+    match p {
+        Presence::Own => "own",
+        Presence::Packet => "packet",
+        Presence::Wave => "wave",
+        Presence::Workgroup => "workgroup",
+    }
+}
+
 pub(crate) fn func(registry: &DialectRegistry, f: &Func) -> String {
     let mut out = String::new();
     writeln!(out, "func entry b{}", f.entry.0).unwrap();
+    for (&entry, &present) in &f.regions {
+        writeln!(out, "region b{} {}", entry.0, presence(present)).unwrap();
+    }
     for (id, block) in &f.blocks {
         let params = block
             .params

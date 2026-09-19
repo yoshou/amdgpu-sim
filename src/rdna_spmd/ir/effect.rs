@@ -224,10 +224,9 @@ mod tests {
             },
         };
         assert!(invalid_order.verify(&inputs, &outputs, &types).is_err());
-        let mut f = Func {
-            entry: BlockId(0),
-            types: vec![Ty::I64, Ty::I1, Ty::I32, Ty::I32],
-            blocks: BTreeMap::from([(
+        let mut f = Func::new(BlockId(0), crate::rdna_spmd::ir::Presence::Wave);
+        f.types = vec![Ty::I64, Ty::I1, Ty::I32, Ty::I32];
+        f.blocks = BTreeMap::from([(
                 BlockId(0),
                 Block {
                     params: vec![(ValueId(0), Ty::I64), (ValueId(1), Ty::I1)],
@@ -247,8 +246,7 @@ mod tests {
                     ],
                     term: Term::Ret(vec![]),
                 },
-            )]),
-        };
+        )]);
         assert!(f.clone().verify().is_err());
         if let Inst::Effect { provenance, .. } =
             &mut f.blocks.get_mut(&BlockId(0)).unwrap().insts[1]

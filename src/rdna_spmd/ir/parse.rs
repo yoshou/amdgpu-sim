@@ -530,9 +530,25 @@ pub(crate) fn func(registry: &DialectRegistry, text: &str) -> Result<Func> {
         }
         Ok(())
     };
+    let mut regions = BTreeMap::new();
     let mut current: Option<(BlockId, Block)> = None;
     for (line, text) in lines {
         let mut t = Tokens::new(line, text);
+        if text.starts_with("region ") {
+            t.expect("region")?;
+            let at = t.block()?;
+            let lanes = t.word(&[
+                ("own", Presence::Own),
+                ("packet", Presence::Packet),
+                ("wave", Presence::Wave),
+                ("workgroup", Presence::Workgroup),
+            ])?;
+            t.done()?;
+            if regions.insert(at, lanes).is_some() {
+                return Err(format!("line {line}: duplicate region at b{}", at.0));
+            }
+            continue;
+        }
         if text.starts_with('b') && text.ends_with("):") {
             if let Some((id, block)) = current.take() {
                 blocks.insert(id, block);
@@ -619,11 +635,17 @@ pub(crate) fn func(registry: &DialectRegistry, text: &str) -> Result<Func> {
     for (id, ty) in types {
         all[id.0] = ty;
     }
-    Ok(Func {
-        entry,
-        blocks,
-        types: all,
-    })
+    let mut f = Func::new(entry, Presence::Wave);
+    f.blocks = blocks;
+    f.types = all;
+    f.regions = regions;
+    // Text that names no region means the whole function in one at what its
+    // body reads, which is what every producer starts from; the printer always
+    // names them, so a printed function parses back to itself.
+    if f.regions.is_empty() {
+        f.one_region(f.presence_needed());
+    }
+    Ok(f)
 }
 
 #[cfg(test)]
@@ -648,11 +670,7 @@ mod tests {
             volatile: true,
             deferred_scope: false,
         };
-        let mut f = Func {
-            entry: BlockId(4),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(4), Presence::Wave);
         let p0 = f.value(Ty::I32);
         let p1 = f.value(Ty::I64);
         let p2 = f.value(Ty::I1);
@@ -774,6 +792,7 @@ mod tests {
                 term: Term::Ret(vec![q, q]),
             },
         );
+        f.one_region(f.presence_needed());
         f.clone().verify_with(&registry).unwrap();
         let text = print::func(&registry, &f);
         let parsed = func(&registry, &text).unwrap();

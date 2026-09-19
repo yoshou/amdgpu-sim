@@ -13,11 +13,7 @@ fn quotient_ir(
     kind: u8,
 ) -> crate::rdna_spmd::ir::Func {
     use crate::rdna_spmd::ir::*;
-    let mut f = Func {
-        entry: BlockId(0),
-        blocks: std::collections::BTreeMap::new(),
-        types: vec![],
-    };
+    let mut f = Func::new(BlockId(0), Presence::Wave);
     let den = f.value(Ty::F64);
     let num = f.value(Ty::F64);
     let mut insts = Vec::new();

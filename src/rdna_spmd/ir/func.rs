@@ -1,5 +1,6 @@
 //! Function SSA with explicit block arguments, including loop backedges.
 use super::effect::EffectOp;
+use super::scope::Presence;
 use super::{Op, Ty, ValueId};
 use std::collections::BTreeMap;
 
@@ -85,8 +86,25 @@ pub(crate) struct Func {
     pub entry: BlockId,
     pub blocks: BTreeMap<BlockId, Block>,
     pub types: Vec<Ty>,
+    /// Each region's entry block and the lanes it keeps together. A block
+    /// belongs to the innermost region whose entry dominates it; see
+    /// [`super::scope`].
+    pub regions: BTreeMap<BlockId, Presence>,
 }
 impl Func {
+    /// An empty function entered at `entry`, all of it in one region with
+    /// `presence` there. Blocks and values are added to it;
+    /// [`Func::one_region`] relabels the region once what the body reads is
+    /// known, and narrowing replaces the one region with a tree.
+    pub fn new(entry: BlockId, presence: Presence) -> Self {
+        Self {
+            entry,
+            blocks: BTreeMap::new(),
+            types: Vec::new(),
+            regions: BTreeMap::from([(entry, presence)]),
+        }
+    }
+
     pub fn value(&mut self, ty: Ty) -> ValueId {
         let v = ValueId(self.types.len());
         self.types.push(ty);
@@ -187,10 +205,9 @@ mod tests {
     use super::super::IntOp;
     use super::*;
     fn loop_func() -> Func {
-        Func {
-            entry: BlockId(0),
-            types: vec![Ty::I32, Ty::I32, Ty::I32, Ty::I1],
-            blocks: BTreeMap::from([
+        let mut f = Func::new(BlockId(0), Presence::Wave);
+        f.types = vec![Ty::I32, Ty::I32, Ty::I32, Ty::I1];
+        f.blocks = BTreeMap::from([
                 (
                     BlockId(0),
                     Block {
@@ -239,8 +256,8 @@ mod tests {
                         term: Term::Ret(vec![]),
                     },
                 ),
-            ]),
-        }
+        ]);
+        f
     }
     #[test]
     fn verifies_loop_block_arguments() {

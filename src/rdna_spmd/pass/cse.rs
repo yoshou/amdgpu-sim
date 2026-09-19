@@ -62,11 +62,7 @@ mod tests {
 
     #[test]
     fn reuses_answers_without_conflating_sources_masks_or_blocks() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let params: Vec<_> = [Ty::I1, Ty::I1, Ty::I32, Ty::I32]
             .iter()
             .copied()
@@ -176,11 +172,7 @@ mod tests {
 
     #[test]
     fn a_reused_ballot_crossing_a_block_edge_still_projects_to_its_lane_bit() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let predicate = f.value(Ty::I1);
         let first = f.value(Ty::I32);
         let second = f.value(Ty::I32);

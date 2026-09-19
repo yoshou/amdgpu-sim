@@ -807,11 +807,7 @@ mod tests {
     }
 
     fn func() -> (Func, Vec<ValueId>) {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let lane = f.value(Ty::I32);
         let base = f.value(Ty::I32);
         let flag = f.value(Ty::I1);
@@ -898,11 +894,7 @@ mod tests {
 
     #[test]
     fn packed_work_item_ids_split_into_an_affine_x_and_uniform_y() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let ids = f.value(Ty::I32);
         let other = f.value(Ty::I32);
         let mut insts = Vec::new();
@@ -1008,11 +1000,7 @@ mod tests {
 
     #[test]
     fn block_arguments_meet_incoming_facts_including_split_pairs() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let lane = f.value(Ty::I32);
         let base = f.value(Ty::I32);
         let mut insts = Vec::new();
@@ -1196,11 +1184,7 @@ mod tests {
 
     #[test]
     fn a_shift_by_the_word_or_more_shifts_by_what_is_left_over() {
-        let mut f = Func {
-            entry: BlockId(0),
-            blocks: BTreeMap::new(),
-            types: vec![],
-        };
+        let mut f = Func::new(BlockId(0), Presence::Wave);
         let ids = f.value(Ty::I32);
         let base = f.value(Ty::I32);
         let mut insts = Vec::new();

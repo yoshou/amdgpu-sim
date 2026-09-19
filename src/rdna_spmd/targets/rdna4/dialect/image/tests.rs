@@ -65,10 +65,9 @@ fn image_ir_requires_constant_component_and_unique_effect_provenance() {
     let mut types = registry.operation(op).unwrap().inputs.to_vec();
     types.push(Ty::I32);
     let args = Arguments::Sixteen(std::array::from_fn(ValueId));
-    let f = Func {
-        entry: BlockId(0),
-        types: types.clone(),
-        blocks: std::collections::BTreeMap::from([(
+    let mut f = Func::new(BlockId(0), Presence::Wave);
+    f.types = types.clone();
+    f.blocks = std::collections::BTreeMap::from([(
             BlockId(0),
             Block {
                 params: types[..16]
@@ -92,8 +91,7 @@ fn image_ir_requires_constant_component_and_unique_effect_provenance() {
                 ],
                 term: Term::Ret(vec![]),
             },
-        )]),
-    };
+    )]);
     f.clone().verify_with(&registry).unwrap();
     for case in 0..4 {
         let mut bad = f.clone();
