@@ -90,7 +90,6 @@ pub(crate) fn env(e: Env) -> &'static str {
         Env::LaneId => "lane_id",
         Env::PacketLaneId => "packet_lane_id",
         Env::ValidLane => "valid_lane",
-        Env::OutsideLanes => "outside_lanes",
         Env::ScratchBase => "scratch_base",
         Env::ScratchSize => "scratch_size",
     }

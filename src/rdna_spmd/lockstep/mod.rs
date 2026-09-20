@@ -42,7 +42,6 @@ use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::compiler::exec_index;
 use crate::rdna_spmd::decompile::Lane;
 use crate::rdna_spmd::program::LiftedFunction;
-use crate::rdna_spmd::refusal::Refusal;
 
 /// How the packets a program is lowered for are laid out.
 #[derive(Clone, Copy, Debug)]
@@ -97,7 +96,7 @@ fn represent(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
     }
 }
 
-pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Result<LiftedFunction, Refusal> {
+pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> LiftedFunction {
     let everyone = &lane.everyone;
     let lane = &represent(&lane.function, packing);
     let facts = Facts::new(&lane.ir, &lane.parameter_inputs, &Default::default());
@@ -114,7 +113,7 @@ pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Result<LiftedFunction, 
             exec,
             &costs,
             everyone,
-        )?;
+        );
         let mut ir = lowered.ir;
         let folded = localize::fold_forwarding(&mut ir);
         localize::localize(&mut ir);
@@ -133,12 +132,12 @@ pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Result<LiftedFunction, 
                     e
                 );
             }
-            return Ok(LiftedFunction {
+            return LiftedFunction {
                 registry: lane.registry.clone(),
                 ir,
                 parameter_inputs: lane.parameter_inputs.clone(),
                 revision: lane.revision + 1,
-            });
+            };
         }
         for v in refuted {
             uniform[v.0] = false;

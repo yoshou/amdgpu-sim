@@ -74,7 +74,6 @@ fn check_over(
             } else {
                 let alone = Lane::from(lane.clone());
                 let (Code::Packet(kernel), _) = compile_lockstep(&alone, 256, width, None)
-                    .expect("every lane is at each operation over the wave")
                 else {
                     panic!("a lane program that keeps no wave operation runs alone")
                 };
@@ -96,7 +95,6 @@ fn lowered(lane: &LiftedFunction) -> Func {
             aligned: true,
         },
     )
-    .expect("every lane is at each operation over the wave")
     .ir
 }
 
@@ -972,8 +970,7 @@ fn check_wave(
         }
         let mut output = vec![UNTOUCHED; count as usize];
         let alone = Lane::from(lane.clone());
-        let (code, scheduler) = compile_lane(&alone, 256, width, Some(count))
-            .expect("every lane is at each operation over the wave");
+        let (code, scheduler) = compile_lane(&alone, 256, width, Some(count));
         let kernel = Kernel::new(code, scheduler, width);
         dispatch(
             &kernel,
@@ -1132,8 +1129,10 @@ fn a_write_into_a_lane_kept_is_read_back_from_that_lane() {
     check_wave(&lane, 32, 0, |_| Some(0x309));
 }
 
+/// The lowering holds a lane program to what the decompiler promises of it.
 #[test]
-fn an_exchange_where_lanes_may_be_elsewhere_is_refused() {
+#[should_panic(expected = "an operation over every lane where lanes may be elsewhere")]
+fn an_exchange_where_lanes_may_be_elsewhere_is_not_a_lane_program() {
     use crate::rdna_spmd::compiler::compile_lane;
     // Lanes below 16 read a lane of the wave while the others have left.
     let lane = wave(&format!(
@@ -1151,15 +1150,7 @@ fn an_exchange_where_lanes_may_be_elsewhere_is_refused() {
          b2(v19: i1):
            ret"
     ));
-    for width in [0u32, 8, 32] {
-        let refusal = compile_lane(&Lane::from(lane.clone()), 256, width, None)
-            .err()
-            .expect("the read needs every lane at it");
-        assert_eq!(
-            refusal.reason, "an operation over every lane where lanes may be elsewhere",
-            "width {width}"
-        );
-    }
+    compile_lane(&Lane::from(lane), 256, 8, None);
 }
 
 #[test]
@@ -1219,16 +1210,11 @@ fn an_exchange_in_a_loop_the_lanes_go_around_together_reads_the_wave_each_trip()
 }
 
 #[test]
-fn an_exchange_in_a_loop_the_lanes_leave_apart_is_refused() {
+#[should_panic(expected = "an operation over every lane in a loop the lanes leave apart")]
+fn an_exchange_in_a_loop_the_lanes_leave_apart_is_not_a_lane_program() {
     use crate::rdna_spmd::compiler::compile_lane;
     // Each lane makes as many trips as its index, so lanes leave the loop
     // while others still read lane 3 in it.
     let lane = summing_a_lane_over("v0");
-    let refusal = compile_lane(&Lane::from(lane), 256, 8, None)
-        .err()
-        .expect("lanes leave the loop apart");
-    assert_eq!(
-        refusal.reason,
-        "an operation over every lane in a loop the lanes leave apart"
-    );
+    compile_lane(&Lane::from(lane), 256, 8, None);
 }

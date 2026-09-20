@@ -18,7 +18,6 @@
 //! there are what leaves.
 
 use crate::rdna_spmd::analysis::bdd::Bdd;
-use crate::rdna_spmd::refusal::Refusal;
 use super::cost::Costs;
 use super::mask::Masks;
 use super::structure::{Structure, Unit};
@@ -96,12 +95,10 @@ pub(super) struct Lowering {
     pub masks: Masks,
 }
 
-/// Lowers a lane program to a packet program, or refuses it where an
-/// operation that needs every lane of the wave sits where lanes may be
-/// elsewhere.
-
 /// Lowers a lane program for packets every lane of which runs it, as the
-/// independent dispatch runs them.
+/// independent dispatch runs them. An operation that needs every lane of the
+/// wave sits where the lanes are together: the decompiler keeps such an
+/// operation only there, so anywhere else is a lane program it did not make.
 pub(super) fn lower(
     q: &Func,
     s: &Structure,
@@ -110,7 +107,7 @@ pub(super) fn lower(
     exec: usize,
     costs: &Costs,
     everyone: &BTreeSet<u64>,
-) -> Result<Lowering, Refusal> {
+) -> Lowering {
     let mut e = Emit {
         q,
         s,
@@ -131,7 +128,6 @@ pub(super) fn lower(
         full: Vec::new(),
         wanted: Vec::new(),
         demanded: everyone,
-        refused: None,
         provenance: q
             .blocks
             .values()
@@ -178,15 +174,12 @@ pub(super) fn lower(
         "the lowering left lanes waiting at a block it never ran"
     );
     e.terminate(Term::Ret(vec![]));
-    if let Some(refusal) = e.refused {
-        return Err(refusal);
-    }
     let mut ir = e.out;
     ir.one_region(ir.presence_needed());
-    Ok(Lowering {
+    Lowering {
         ir,
         masks: e.masks,
-    })
+    }
 }
 
 #[derive(Default)]
@@ -232,9 +225,6 @@ struct Emit<'a> {
     wanted: Vec<usize>,
     /// Provenances of the kept queries that need every lane at them.
     demanded: &'a BTreeSet<u64>,
-    /// The first operation found where every lane of the wave has to be and
-    /// lanes may be elsewhere.
-    refused: Option<Refusal>,
 }
 
 impl Emit<'_> {
@@ -993,13 +983,11 @@ impl Emit<'_> {
         let depth = self.full.len() - 1;
         self.full.pop();
         if self.wanted.iter().any(|&d| d >= depth) {
-            if !self.go_around_together(mask, continuing) {
-                self.refused.get_or_insert(Refusal::at(
-                    header,
-                    None,
-                    "an operation over every lane in a loop the lanes leave apart",
-                ));
-            }
+            assert!(
+                self.go_around_together(mask, continuing),
+                "b{}: an operation over every lane in a loop the lanes leave apart",
+                header.0
+            );
             self.wanted.retain(|&d| d < depth);
         }
         let answer = if wave {
@@ -1562,24 +1550,18 @@ impl Emit<'_> {
         })
     }
 
-    /// Notes a refusal unless every lane of the wave is at the block: an
-    /// operation that reads or writes the lanes' registers across lanes, or
-    /// holds them at a barrier, reads a lane that is elsewhere as something
-    /// it is not.
+    /// Every lane of the wave is at the block: an operation that reads or
+    /// writes the lanes' registers across lanes, or holds them at a barrier,
+    /// reads a lane that is elsewhere as something it is not, so a lane
+    /// program holds one only where its lanes are together.
     fn everyone(&mut self, mask: Bdd) {
         let full = *self.full.last().unwrap();
-        if self.refused.is_some() {
-            return;
-        }
-        if full != Bdd::FALSE && self.masks.exact(mask) == full {
-            self.wanted.push(self.full.len() - 1);
-            return;
-        }
-        self.refused = Some(Refusal::at(
-            self.at,
-            None,
-            "an operation over every lane where lanes may be elsewhere",
-        ));
+        assert!(
+            full != Bdd::FALSE && self.masks.exact(mask) == full,
+            "b{}: an operation over every lane where lanes may be elsewhere",
+            self.at.0
+        );
+        self.wanted.push(self.full.len() - 1);
     }
 
     /// Whether the lanes that go around a loop are all of the lanes in it or

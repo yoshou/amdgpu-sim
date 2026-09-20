@@ -80,7 +80,6 @@ pub(crate) enum Env {
     LaneId,
     PacketLaneId,
     ValidLane,
-    OutsideLanes,
     ScratchBase,
     ScratchSize,
 }
@@ -148,7 +147,7 @@ impl Op {
             }
         };
         match self {
-            Self::Env(Env::LaneId | Env::PacketLaneId | Env::OutsideLanes) => Ok(Ty::I32),
+            Self::Env(Env::LaneId | Env::PacketLaneId) => Ok(Ty::I32),
             Self::Env(Env::ValidLane) => Ok(Ty::I1),
             Self::Env(Env::ScratchBase | Env::ScratchSize) => Ok(Ty::I64),
             Self::Pack64(a, b) => {

@@ -83,10 +83,7 @@ mod tests {
     use super::*;
 
     fn avx512() -> Vectors {
-        Vectors {
-            bits: 512,
-            native_masks: true,
-        }
+        Vectors { bits: 512 }
     }
 
     #[test]

@@ -48,7 +48,6 @@ impl<'a> Cg<'a> {
                 let result = if let Some(w) = self.p.width {
                     let src = self.vector(inputs[0]);
                     let exec = self.vector(inputs[1]);
-                    let exec = self.em.to_bool(exec);
                     let word = self.vec_to_mask(exec);
                     let tz = ir.call_named(
                         "llvm.cttz.i32",
@@ -111,7 +110,7 @@ impl<'a> Cg<'a> {
                     self.vi32()
                 };
                 let bits = match ty {
-                    Ty::I1 => ir.zext(self.em.to_bool(value), int_ty),
+                    Ty::I1 => ir.zext(value, int_ty),
                     Ty::F32 => ir.bitcast(value, int_ty),
                     Ty::I32 => value,
                     _ => unreachable!("wide wave operand"),
@@ -151,7 +150,7 @@ impl<'a> Cg<'a> {
                     self.vec_ty(ir.f32())
                 };
                 let result = match ty {
-                    Ty::I1 => self.em.from_bool(ir.trunc(bits, bool_ty)),
+                    Ty::I1 => ir.trunc(bits, bool_ty),
                     Ty::F32 => ir.bitcast(bits, f32_ty),
                     Ty::I32 => bits,
                     _ => unreachable!("wide wave result"),

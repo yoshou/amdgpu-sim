@@ -1,14 +1,14 @@
 //! Semantic rewrites of typed SSA, independent of ISA operands and width.
 pub(crate) mod active;
 pub(crate) mod adjacency;
-pub(crate) mod cse;
 pub(crate) mod dce;
 pub(crate) mod entry;
 pub(crate) mod idioms;
-pub(crate) mod mask_projection;
+#[cfg(test)]
 pub(crate) mod narrow;
 pub(crate) mod pairs;
 pub(crate) mod simplify;
+#[cfg(test)]
 pub(crate) mod specialise;
 pub(crate) mod uniform_queries;
 

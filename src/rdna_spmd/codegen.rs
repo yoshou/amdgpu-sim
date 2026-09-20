@@ -29,7 +29,6 @@ pub(super) struct Prepared {
     pub ir: VerifiedFunc,
     pub inputs: Vec<Parameter>,
     pub width: Option<u32>,
-    pub wide_masks: bool,
     pub abi: Abi,
     pub observable_return: bool,
     pub uniform: Vec<bool>,
@@ -211,7 +210,6 @@ pub(super) fn compile(
     let sink = ir.array_alloca(i32t, ir.ci32(10), "");
     let mut em = Emitter::new(ir, p.width, p.registry.clone());
     em.state = p.registry.lowering_state(&em, sink);
-    em.set_wide(p.wide_masks);
     let mut sem = Emitter::new(ir, None, p.registry.clone());
     sem.state = p.registry.lowering_state(&sem, sink);
     let lane_offset = (p.width.is_none() && coop).then(|| ir.mul(scratch_stride, lane_base));
@@ -323,9 +321,6 @@ pub(super) fn compile(
     cg.em.set_lane_id(lane_base);
     cg.sem.set_lane_id(lane_base);
     cg.sem.valid_lane = Some(ir.icmp(IntPred::Ne, ir.and(packet_valid, ir.ci32(1)), ir.ci32(0)));
-    let outside_lanes = if coop { ir.not(valid_mask) } else { ir.ci32(0) };
-    cg.em.outside_lanes = Some(outside_lanes);
-    cg.sem.outside_lanes = Some(outside_lanes);
     for &id in f.blocks.keys() {
         cg.bbs
             .insert(id, ir.append_block(func, &format!("b{:x}", id.0)));
@@ -410,8 +405,7 @@ impl<'a> Cg<'a> {
         match self.p.width {
             Some(w) => {
                 let bits = self.ir.trunc(word, self.ir.int(w));
-                self.em
-                    .from_bool(self.ir.bitcast(bits, self.ir.i1().vector(w)))
+                self.ir.bitcast(bits, self.ir.i1().vector(w))
             }
             None => self
                 .ir
@@ -421,7 +415,7 @@ impl<'a> Cg<'a> {
     fn vec_to_mask(&self, v: Value) -> Value {
         match self.p.width {
             Some(w) => {
-                let bits = self.ir.bitcast(self.em.to_bool(v), self.ir.int(w));
+                let bits = self.ir.bitcast(v, self.ir.int(w));
                 self.ir.zext(bits, self.ir.i32())
             }
             None => self.ir.zext(v, self.ir.i32()),
@@ -489,7 +483,7 @@ impl<'a> Cg<'a> {
         }
         let out = self.splat(value);
         let out = if self.types[v.0] == Ty::I1 {
-            self.em.from_bool(out)
+            out
         } else {
             out
         };
@@ -511,11 +505,6 @@ impl<'a> Cg<'a> {
             return self.scalars[v.0];
         }
         let out = self.ir.extract_at(value, 0);
-        let out = if self.em.wide() && self.types[v.0] == Ty::I1 {
-            self.ir.icmp(IntPred::Ne, out, self.ci64(0))
-        } else {
-            out
-        };
         self.scalars[v.0] = out;
         out
     }
@@ -917,18 +906,13 @@ impl<'a> Cg<'a> {
         for a in &args {
             table[a.0] = self.shaped(*a, scalar);
         }
-        if let Op::Convert(Cvt::ZExt | Cvt::SExt, _, a) = op {
-            if self.types[a.0] == Ty::I1 {
-                table[a.0] = self.em.to_bool(table[a.0]);
-            }
-        }
         let result = if scalar {
             self.sem.op(ty, op, &table)
         } else {
             self.em.op(ty, op, &table)
         };
         let result = if matches!(op, Op::Convert(Cvt::Trunc, Ty::I1, _)) {
-            self.em.from_bool(result)
+            result
         } else {
             result
         };

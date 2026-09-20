@@ -19,6 +19,7 @@ pub(crate) struct Masks {
 }
 
 impl Masks {
+    #[cfg(test)]
     pub fn at(&self, block: BlockId, index: usize) -> ValueId {
         let chain = &self.chain[&block];
         chain

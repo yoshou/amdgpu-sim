@@ -8,9 +8,7 @@ pub(crate) struct Emitter {
     registry: std::sync::Arc<super::super::dialect::DialectRegistry>,
     pub(in crate::rdna_spmd) ir: Builder,
     width: Option<u32>,
-    wide: std::cell::Cell<bool>,
     pub(in crate::rdna_spmd) valid_lane: Option<Value>,
-    pub(in crate::rdna_spmd) outside_lanes: Option<Value>,
     pub(in crate::rdna_spmd) scratch: Option<(Value, Value)>,
     pub(in crate::rdna_spmd) lane_id: Option<Value>,
 }
@@ -36,17 +34,14 @@ impl Emitter {
             registry,
             state: None,
             ir,
-            wide: std::cell::Cell::new(false),
             width,
             valid_lane: None,
-            outside_lanes: None,
             scratch: None,
             lane_id: None,
         }
     }
     pub(in crate::rdna_spmd) fn ty(&self, t: Ty) -> Type {
         let t = match t {
-            Ty::I1 if self.wide.get() => self.ir.i64(),
             Ty::I1 => self.ir.i1(),
             Ty::I32 => self.ir.i32(),
             Ty::I64 => self.ir.i64(),
@@ -55,33 +50,11 @@ impl Emitter {
         };
         self.shaped(t)
     }
-    pub(in crate::rdna_spmd) fn wide(&self) -> bool {
-        self.wide.get()
-    }
-    pub(in crate::rdna_spmd) fn set_wide(&mut self, wide: bool) {
-        self.wide.set(wide && self.width.is_some());
-    }
-    pub(in crate::rdna_spmd) fn to_bool(&self, v: Value) -> Value {
-        if !self.wide.get() || !v.is_vector() {
-            return v;
-        }
-        self.ir.icmp(IntPred::Slt, v, v.ty().null())
-    }
-    pub(in crate::rdna_spmd) fn from_bool(&self, v: Value) -> Value {
-        if !self.wide.get() || !v.is_vector() {
-            return v;
-        }
-        self.ir.sext(v, self.ty(Ty::I1))
-    }
     pub(in crate::rdna_spmd) fn shaped(&self, scalar: Type) -> Type {
         self.width.map_or(scalar, |w| scalar.vector(w))
     }
     pub(in crate::rdna_spmd) fn constant(&self, ty: Ty, bits: u64) -> Value {
-        let (t, bits) = if ty == Ty::I1 && self.wide.get() {
-            (self.ir.i64(), if bits & 1 == 1 { u64::MAX } else { 0 })
-        } else {
-            (self.ir.int(ty.bits()), bits)
-        };
+        let t = self.ir.int(ty.bits());
         let v = t.const_int(bits);
         let v = match self.width {
             Some(w) => self.ir.const_vector(&vec![v; w as usize]),
@@ -123,23 +96,9 @@ impl Emitter {
         let args = args
             .values()
             .iter()
-            .enumerate()
-            .map(|(i, id)| {
-                if spec.inputs.get(i) == Some(&Ty::I1) {
-                    self.to_bool(values[id.0])
-                } else {
-                    values[id.0]
-                }
-            })
+            .map(|id| values[id.0])
             .collect::<Vec<_>>();
-        let wide = self.wide.replace(false);
-        let results = spec.emit(self, &args);
-        self.wide.set(wide);
-        results
-            .into_iter()
-            .zip(&spec.outputs)
-            .map(|(v, &t)| if t == Ty::I1 { self.from_bool(v) } else { v })
-            .collect()
+        spec.emit(self, &args)
     }
     pub fn op(&self, ty: Ty, op: Op, values: &[Value]) -> Value {
         let ir = self.ir;
@@ -165,9 +124,6 @@ impl Emitter {
             Op::Env(Env::ValidLane) => self
                 .valid_lane
                 .expect("ValidLane requires the invocation environment"),
-            Op::Env(Env::OutsideLanes) => self
-                .outside_lanes
-                .expect("OutsideLanes requires the invocation environment"),
             Op::Const(t, bits) => self.constant(t, bits),
             Op::Pack64(a, c) => {
                 let lo = ir.zext(v(a), self.ty(Ty::I64));
@@ -229,7 +185,7 @@ impl Emitter {
                     IntPred::Sle => IntPred::Sle,
                     IntPred::Sge => IntPred::Sge,
                 };
-                self.from_bool(ir.icmp(predicate, v(a), v(c)))
+                ir.icmp(predicate, v(a), v(c))
             }
             Op::FCmp(p, a, c) => {
                 let predicate = match p {
@@ -248,9 +204,9 @@ impl Emitter {
                     FloatPred::Ule => FloatPred::Ule,
                     FloatPred::Une => FloatPred::Une,
                 };
-                self.from_bool(ir.fcmp(predicate, v(a), v(c)))
+                ir.fcmp(predicate, v(a), v(c))
             }
-            Op::Select(c, a, d) => ir.select(self.to_bool(v(c)), v(a), v(d)),
+            Op::Select(c, a, d) => ir.select(v(c), v(a), v(d)),
             Op::Float(op, a, c) => match op {
                 FloatOp::Add => ir.fadd(v(a), v(c)),
                 FloatOp::Sub => ir.fsub(v(a), v(c)),
@@ -325,7 +281,7 @@ impl Emitter {
                     }
                 };
                 if to == Ty::I1 {
-                    self.from_bool(converted)
+                    converted
                 } else {
                     converted
                 }

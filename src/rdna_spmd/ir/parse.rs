@@ -203,7 +203,6 @@ const ENVS: &[(&str, Env)] = &[
     ("lane_id", Env::LaneId),
     ("packet_lane_id", Env::PacketLaneId),
     ("valid_lane", Env::ValidLane),
-    ("outside_lanes", Env::OutsideLanes),
     ("scratch_base", Env::ScratchBase),
     ("scratch_size", Env::ScratchSize),
 ];

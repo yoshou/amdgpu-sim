@@ -178,6 +178,15 @@ impl Func {
             .unwrap_or(Presence::Own)
     }
 
+    /// Whether an operation reads the packet running it, which only a program
+    /// lowered to packets does.
+    pub fn reads_the_packet(&self) -> bool {
+        self.blocks
+            .values()
+            .flat_map(|b| b.insts.iter())
+            .any(|inst| super::verify::lanes_read(inst) == Some(Presence::Packet))
+    }
+
     /// Which region each block belongs to, named by the region's entry: the
     /// innermost region whose entry dominates the block. Blocks the function's
     /// entry does not reach are left out.

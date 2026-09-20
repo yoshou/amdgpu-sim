@@ -8,8 +8,9 @@
 //!
 //! Pipeline:
 //! ```text
-//! decode_program: shared decoder -> CFG -> lift -> typed SSA
-//! compile:        passes and analyses -> LLVM IR -> JIT (width 0 = scalar lanes, 1..16 = packets)
+//! decode_program: shared decoder -> CFG -> lift -> wave passes -> wave program
+//! compile:        decompile -> lane program -> lockstep lowering -> packet program
+//!                 -> LLVM IR -> JIT (width 0 = a lane alone, 1..32 = packets)
 //! dispatch:       independent, wave-cooperative or workgroup-cooperative scheduler
 //! ```
 //!
@@ -93,7 +94,6 @@ mod lockstep;
 mod native;
 mod pass;
 mod program;
-mod refusal;
 mod target;
 mod targets;
 
