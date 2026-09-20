@@ -10,19 +10,17 @@ pub(super) enum Atom {
     Constant(u32),
     Fresh(usize, ValueId, u32),
     Term(usize, usize, bool),
-    /// The lane program answers the wave query defining this value from the
-    /// lane's own bit. Every difference the answer makes is conditioned on the
-    /// marker, so a difference that reaches a store names the queries it came
-    /// from.
+    /// A conversion choice: true answers an `any` locally, or allows a
+    /// lane word to be represented by its own bit. False keeps the query or
+    /// requires the word to remain whole.
     Marker(ValueId),
 }
 
 /// The wave operations the lane program keeps as operations over the lanes
 /// that are at them, instead of answering from the lane's own values.
-#[derive(Clone, Default, PartialEq)]
+#[derive(Default)]
 pub(super) struct Kept {
-    /// Queries -- `any` and tests of a lane word against zero -- kept as
-    /// queries over the lanes at them.
+    /// `any` queries kept as operations over the lanes at them.
     pub queries: BTreeSet<ValueId>,
     /// Lane words kept as the words the wave computes, because a query kept
     /// over them or an operation reads them whole.
@@ -41,6 +39,10 @@ pub(super) struct Logic {
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
     supports: HashMap<Bdd, BTreeSet<u32>>,
+    policy: Option<Vec<Bdd>>,
+    choices: Vec<(ValueId, bool)>,
+    abstract_queries: bool,
+    pub all_local: Bdd,
     edges: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<EdgeIndex>>,
     relations: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<Vec<Binding>>>,
 }
@@ -67,9 +69,180 @@ impl Logic {
             bits: HashMap::new(),
             views: HashMap::new(),
             supports: HashMap::new(),
+            policy: None,
+            choices: Vec::new(),
+            abstract_queries: false,
+            all_local: Bdd::TRUE,
             edges: std::collections::BTreeMap::new(),
             relations: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Interpret every conversion policy in the same formulas. A marker is
+    /// true when a query is answered locally; word materialization propagates
+    /// backwards from the tests that choose to read the whole word.
+    pub fn policies(f: &Func, facts: &Facts) -> Self {
+        let mut logic = Self::new(f, facts, &BTreeSet::new());
+        let mut whole: Vec<Bdd> = facts
+            .materialized
+            .iter()
+            .map(|&v| Manager::constant(v))
+            .collect();
+        let live = super::policy::live_values(f, facts);
+        let mut pending = Vec::new();
+        let mut words = BTreeSet::new();
+        for &id in &facts.order {
+            for inst in &f.blocks[&id].insts {
+                match inst {
+                    Inst::Effect {
+                        op: EffectOp::Wave(WaveOp::Any),
+                        outputs,
+                        ..
+                    } if live[outputs[0].0 .0] => {
+                        let selector = outputs[0].0;
+                        logic.atom(Atom::Marker(selector));
+                        logic.choices.push((outputs[0].0, false));
+                    }
+                    Inst::Core {
+                        value,
+                        op: Op::Cmp(IntPred::Eq | IntPred::Ne, a, b),
+                        ..
+                    } if live[value.0] => {
+                        if let Some(w) = lane_test(f, facts, *a, *b) {
+                            if !facts.materialized[w.0] && words.insert(w) {
+                                let selector = w;
+                                let local = logic.atom(Atom::Marker(selector));
+                                let kept = logic.m.not(local);
+                                whole[w.0] = logic.m.or(whole[w.0], kept);
+                                logic.choices.push((w, true));
+                                pending.push(w);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        while let Some(v) = pending.pop() {
+            let sources: Vec<ValueId> = match facts.site[v.0] {
+                Site::Param { block, index } if block != f.entry => {
+                    facts.arguments(f, block, index).collect()
+                }
+                Site::Inst { .. } => match facts.op(f, v) {
+                    Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) => vec![a, b],
+                    Some(Op::Convert(_, _, a)) => vec![a],
+                    _ => vec![],
+                },
+                _ => vec![],
+            };
+            for a in sources.into_iter().filter(|a| facts.lane_word[a.0]) {
+                let next = logic.m.or(whole[a.0], whole[v.0]);
+                if next != whole[a.0] {
+                    whole[a.0] = next;
+                    pending.push(a);
+                }
+            }
+        }
+        for &(v, _) in &logic.choices.clone() {
+            let local = logic.atom(Atom::Marker(v));
+            logic.all_local = logic.m.and(logic.all_local, local);
+        }
+        logic.policy = Some(whole);
+        logic
+    }
+
+    pub fn materialized(&self, facts: &Facts, v: ValueId) -> Bdd {
+        self.policy
+            .as_ref()
+            .map_or_else(|| Manager::constant(facts.materialized[v.0]), |p| p[v.0])
+    }
+
+    pub fn local(&mut self, v: ValueId) -> Bdd {
+        if self.policy.is_some() {
+            if self.markers.contains_key(&v) {
+                self.atom(Atom::Marker(v))
+            } else {
+                Bdd::TRUE
+            }
+        } else {
+            Manager::constant(!self.kept.contains(&v))
+        }
+    }
+
+    /// Eliminate execution-state variables, retaining only policy choices.
+    pub fn possible_policies(&mut self, condition: Bdd) -> Bdd {
+        let varying: BTreeSet<_> = self
+            .support(condition)
+            .into_iter()
+            .filter(|&var| !matches!(self.atom_of(var), Atom::Marker(_)))
+            .collect();
+        self.m.exists(condition, &|var| varying.contains(&var))
+    }
+
+    /// Prefer a local answer whenever the remaining safety conditions allow
+    /// it. This chooses a model of an already proved formula, not another
+    /// invocation of the program proof.
+    pub fn choose(&mut self, mut safe: Bdd) -> Kept {
+        assert_ne!(safe, Bdd::FALSE);
+        let mut kept = Kept::default();
+        for &(v, word) in &self.choices {
+            let var = self.vars[&Atom::Marker(v)];
+            let local = self.m.cofactor(safe, var, true);
+            let local = if local != Bdd::FALSE {
+                safe = local;
+                true
+            } else {
+                safe = self.m.cofactor(safe, var, false);
+                false
+            };
+            if !local {
+                if word {
+                    kept.words.insert(v);
+                } else {
+                    kept.queries.insert(v);
+                }
+            }
+        }
+        assert_eq!(safe, Bdd::TRUE);
+        kept
+    }
+
+    fn clear_values(&mut self) {
+        self.bits.clear();
+        self.views.clear();
+        self.edges.clear();
+        self.relations.clear();
+    }
+
+    /// Keep exact reachability for the all-local policy. For the other
+    /// policies, unconstrained query results safely overapproximate reach.
+    /// This avoids enumerating combinations of unrelated branch choices in
+    /// the reachability relation; value differences still carry their choices.
+    pub fn policy_reach(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        start: BlockId,
+        initial: Bdd,
+    ) -> std::collections::BTreeMap<BlockId, Bdd> {
+        let policy = self.policy.take();
+        self.clear_values();
+        let local = self.reach(f, facts, start, initial);
+        self.clear_values();
+        self.abstract_queries = true;
+        let general = self.reach(f, facts, start, initial);
+        self.abstract_queries = false;
+        self.policy = policy;
+        self.clear_values();
+        facts
+            .order
+            .iter()
+            .map(|&id| {
+                let a = local.get(&id).copied().unwrap_or(Bdd::FALSE);
+                let b = general.get(&id).copied().unwrap_or(Bdd::FALSE);
+                (id, self.m.ite(self.all_local, a, b))
+            })
+            .collect()
     }
 
     pub fn atom(&mut self, atom: Atom) -> Bdd {
@@ -94,24 +267,32 @@ impl Logic {
                         }
                     }
                     Atom::Constant(k) => {
-                        let next = (self.constants.len() + self.markers.len()) as u32;
+                        let next = self.constants.len() as u32;
                         (2 << 30) | *self.constants.entry(k).or_insert(next)
                     }
                     Atom::Marker(v) => {
-                        let next = (self.constants.len() + self.markers.len()) as u32;
-                        (2 << 30) | *self.markers.entry(v).or_insert(next)
+                        let next = self.markers.len() as u32;
+                        assert!(next < 1 << 16, "too many conversion choices");
+                        *self.markers.entry(v).or_insert(next)
                     }
                     Atom::Fresh(d, v, position) => {
                         let next = self.fresh.len() as u32;
-                        assert!(next < (1 << 30) - 1, "too many detour values");
+                        assert!(next < (1 << 30) - (1 << 16) - 1, "too many detour values");
                         (3 << 30) | *self.fresh.entry((d, v, position)).or_insert(next)
                     }
                     Atom::Term(d, t, view) => {
                         let next = self.fresh.len() as u32;
-                        assert!(next < (1 << 30) - 1, "too many detour values");
+                        assert!(next < (1 << 30) - (1 << 16) - 1, "too many detour values");
                         let key = (usize::MAX - d, ValueId(t), view as u32);
                         (3 << 30) | *self.fresh.entry(key).or_insert(next)
                     }
+                };
+                // Put policy choices before the execution-state variables:
+                // mux selectors after their inputs duplicate large subgraphs.
+                let var = if matches!(atom, Atom::Marker(_)) {
+                    var
+                } else {
+                    var.checked_add(1 << 16).expect("too many BDD variables")
                 };
                 self.atoms.insert(var, atom);
                 self.vars.insert(atom, var);
@@ -141,17 +322,6 @@ impl Logic {
             Atom::Marker(_) => true,
             Atom::Constant(_) | Atom::Fresh(..) | Atom::Term(..) => false,
         }
-    }
-
-    /// The markers a formula tests.
-    pub fn markers(&mut self, f: Bdd) -> Vec<ValueId> {
-        self.support(f)
-            .into_iter()
-            .filter_map(|var| match self.atoms[&var] {
-                Atom::Marker(v) => Some(v),
-                _ => None,
-            })
-            .collect()
     }
 
     /// A formula with every marker settled: the queries in `kept` answered by
@@ -202,11 +372,13 @@ impl Logic {
                 outputs,
                 ..
             } => {
-                if self.kept.contains(&outputs[0].0) {
-                    self.atom(opaque)
-                } else {
-                    self.bit(f, facts, inputs[0])
+                if self.abstract_queries {
+                    return self.atom(opaque);
                 }
+                let local = self.local(outputs[0].0);
+                let bit = self.bit(f, facts, inputs[0]);
+                let wave = self.atom(opaque);
+                self.m.ite(local, bit, wave)
             }
             Inst::Core { op, .. } => match *op {
                 Op::Const(_, k) => Manager::constant(k != 0),
@@ -254,6 +426,19 @@ impl Logic {
         opaque: Atom,
         memo: &mut HashMap<(ValueId, ValueId), Bdd>,
     ) -> Bdd {
+        if self.abstract_queries && lane_test(f, facts, a, b).is_some() {
+            return self.atom(opaque);
+        }
+        if let Some(w) = lane_test(f, facts, a, b) {
+            if self.materialized(facts, w) == Bdd::FALSE {
+                let bit = self.view(f, facts, w);
+                return if pred == IntPred::Ne {
+                    bit
+                } else {
+                    self.m.not(bit)
+                };
+            }
+        }
         if let Some(&g) = memo.get(&(a, b)) {
             return g;
         }
@@ -268,13 +453,6 @@ impl Logic {
             } else {
                 self.m.iff(a, b)
             }
-        } else if let Some(w) = lane_test(f, facts, a, b).filter(|w| !facts.materialized[w.0]) {
-            let bit = self.view(f, facts, w);
-            if pred == IntPred::Ne {
-                bit
-            } else {
-                self.m.not(bit)
-            }
         } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
             let c = self.bit(f, facts, c);
             let yes = self.compare(f, facts, pred, yes, b, opaque, memo);
@@ -287,6 +465,22 @@ impl Logic {
             self.m.ite(c, yes, no)
         } else {
             self.atom(opaque)
+        };
+        let g = if let Some(w) = lane_test(f, facts, a, b) {
+            let mode = self.materialized(facts, w);
+            if mode == Bdd::TRUE {
+                g
+            } else {
+                let bit = self.view(f, facts, w);
+                let lane = if pred == IntPred::Ne {
+                    bit
+                } else {
+                    self.m.not(bit)
+                };
+                self.m.ite(mode, g, lane)
+            }
+        } else {
+            g
         };
         memo.insert((a, b), g);
         g
