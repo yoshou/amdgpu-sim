@@ -523,7 +523,6 @@ impl<'a> Cg<'a> {
         let ir = self.ir;
         let first = &self.p.accesses[members[0]];
         let exec = self.vector(first.mask);
-        let exec = self.em.to_bool(exec);
         let addr = self.vector(first.base);
         let zero = self.vi64().null();
         let masked = ir.select(exec, addr, zero);
@@ -750,7 +749,6 @@ impl<'a> Cg<'a> {
             (access.space, access.inside, access.address, access.mask);
         let mut addr = self.vector(address);
         let exec = self.vector(mask);
-        let exec = self.em.to_bool(exec);
         if space == Space::Scratch {
             addr = ir.add(self.scratch_vec, ir.sext(addr, self.vi64()));
         }
@@ -761,7 +759,6 @@ impl<'a> Cg<'a> {
             let lane_offset = ir.sub(self.scratch_vec, self.splat(self.scratch_base_scalar));
             let physical = ir.add(addr, lane_offset);
             let inside = self.vector(inside);
-            let inside = self.em.to_bool(inside);
             addr = ir.select(inside, physical, addr);
         }
         (addr, exec)

@@ -4,7 +4,6 @@ pub(super) mod dataflow;
 pub(in crate::rdna_spmd) mod facts;
 pub(super) mod lanes;
 pub(in crate::rdna_spmd) mod loops;
-pub(super) mod mask_cost;
 pub(in crate::rdna_spmd) mod masking;
 pub(in crate::rdna_spmd) mod masks;
 pub(super) mod memory;

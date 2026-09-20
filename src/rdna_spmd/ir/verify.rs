@@ -207,7 +207,7 @@ pub(super) fn lanes_read(inst: &Inst) -> Option<Presence> {
     match inst {
         Inst::Packet { .. }
         | Inst::Core {
-            op: Op::Env(Env::OutsideLanes | Env::PacketLaneId),
+            op: Op::Env(Env::PacketLaneId),
             ..
         } => Some(Presence::Packet),
         Inst::Effect {

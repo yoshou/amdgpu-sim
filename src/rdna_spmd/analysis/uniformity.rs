@@ -447,7 +447,6 @@ fn packet<M>(
                         stride: 1,
                         span: None,
                     },
-                    Op::Env(Env::OutsideLanes) => Fact::Uniform,
                     Op::Env(Env::ValidLane | Env::ScratchBase | Env::ScratchSize) => Fact::Varying,
                     Op::Int(IntOp::Add, a, b) => v(a).add(v(b), false),
                     Op::Int(IntOp::Sub, a, b) => v(a).add(v(b), true),

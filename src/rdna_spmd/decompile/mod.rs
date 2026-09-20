@@ -10,8 +10,8 @@
 //! The [`proof`] interprets keeping and localizing each choice conditionally,
 //! checks observable effects once, and selects a safe policy that prefers
 //! local answers. No failed candidate restarts the proof. Exchanges, barriers
-//! and fences remain collective operations; their participation requirements
-//! also pass to the lowering, which may refuse and use the wave program.
+//! and fences remain collective operations; the lowering runs each where the
+//! lanes are together, which the participation requirements passed to it say.
 //!
 //! [`super::lockstep`] lowers the lane program into packets, with the kept
 //! operations answered over the wave -- inside the packet where it holds the
@@ -24,9 +24,9 @@ mod proof;
 mod rewrite;
 
 use crate::rdna_spmd::analysis::facts;
+#[cfg(test)]
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::LiftedFunction;
-use crate::rdna_spmd::refusal::Refusal;
 use std::collections::BTreeSet;
 
 /// A lane program and the provenances of collective operations the lowering
@@ -46,26 +46,14 @@ impl From<LiftedFunction> for Lane {
     }
 }
 
-fn supported(f: &Func) -> Result<(), Refusal> {
-    for (&id, block) in &f.blocks {
-        for (index, inst) in block.insts.iter().enumerate() {
-            let refuse = |reason| Err(Refusal::at(id, Some(index), reason));
-            match inst {
-                Inst::Packet { .. } => return refuse("a packet query in a wave program"),
-                Inst::Core {
-                    op: Op::Env(Env::OutsideLanes | Env::PacketLaneId),
-                    ..
-                } => return refuse("a packet environment value in a wave program"),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn decompile(function: &LiftedFunction) -> Result<Lane, Refusal> {
-    supported(&function.ir)?;
+/// Reads the lane program off a wave program. The wave program is what the
+/// lifter makes, so it holds nothing of the packets the lowering makes later.
+pub(crate) fn decompile(function: &LiftedFunction) -> Lane {
     let f = &function.ir;
+    assert!(
+        !f.reads_the_packet(),
+        "a wave program holds no packet operation"
+    );
     let exec = function.registry.registers().exec;
     let exec_index = function.parameter_inputs.iter().position(
         |p| matches!(p.source, crate::rdna_spmd::program::ParameterSource::MaskBit(r) if r == exec),
@@ -78,7 +66,7 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Result<Lane, Refusal> {
         &mut logic,
         &function.parameter_inputs,
         exec_index,
-    )?;
+    );
     drop(logic);
     let facts = facts::Facts::new(f, &function.parameter_inputs, &kept.words);
     if std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() {
@@ -92,19 +80,12 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Result<Lane, Refusal> {
     fold::fold(&mut lane, &function.parameter_inputs, exec_index);
     lane.compact();
     if let Err(e) = lane.check(&function.registry) {
-        if cfg!(test) {
-            panic!(
-                "the lane program read off a proven wave program is invalid: {}",
-                e
-            );
-        }
-        return Err(Refusal::at(
-            f.entry,
-            None,
-            "the lane program did not verify",
-        ));
+        panic!(
+            "the lane program read off a proven wave program is invalid: {}",
+            e
+        );
     }
-    Ok(Lane {
+    Lane {
         function: LiftedFunction {
             registry: function.registry.clone(),
             ir: lane,
@@ -112,7 +93,7 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Result<Lane, Refusal> {
             revision: function.revision + 1,
         },
         everyone,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +208,7 @@ mod tests {
             ),
             (vec![mov(EXEC, 20), store(8)], Terminator::Return),
         ]);
-        let lane = decompile(&wave).expect("a lane's trips depend on that lane alone");
+        let lane = decompile(&wave);
         for block in lane.function.ir.blocks.values() {
             for inst in &block.insts {
                 assert!(
@@ -268,7 +249,6 @@ mod tests {
                     .run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), 0, 0);
                 } else {
                     let (Code::Packet(kernel), _) = compile_lockstep(&lane, 256, width, None)
-                        .expect("every lane is at each operation over the wave")
                     else {
                         panic!("a lane program that keeps no wave operation runs alone")
                     };
@@ -379,7 +359,7 @@ mod tests {
             (vec![mov(EXEC, 20), store(0)], Terminator::Return),
             (vec![], Terminator::Return),
         ]);
-        let lane = decompile(&wave).expect("the query the store follows is kept");
+        let lane = decompile(&wave);
         assert_eq!(
             kept_wave_ops(&lane.function),
             vec![WaveOp::Any],
@@ -422,7 +402,7 @@ mod tests {
                effect !p3 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v11, v10, v12)
                ret",
         );
-        let lane = decompile(&wave).expect("one query needs the wave, the guarded query does not");
+        let lane = decompile(&wave);
         assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Any]);
         assert!(lane
             .function
@@ -458,7 +438,7 @@ mod tests {
                effect !p2 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v11, v10, v3)
                ret",
         );
-        let lane = decompile(&wave).expect("dependent queries remain collective");
+        let lane = decompile(&wave);
         assert_eq!(
             kept_wave_ops(&lane.function),
             vec![WaveOp::Any, WaveOp::Any]
@@ -482,8 +462,7 @@ mod tests {
                    effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v9, v8, v3)
                    ret"
             ));
-            decompile(&wave)
-                .unwrap_or_else(|e| panic!("the active store always writes 7: {:?}", e));
+            decompile(&wave);
             let mut used = wave.clone();
             for inst in &mut used.ir.blocks.get_mut(&used.ir.entry).unwrap().insts {
                 if let Inst::Effect {
@@ -499,7 +478,7 @@ mod tests {
                     inputs[1] = ValueId(6);
                 }
             }
-            let used = decompile(&used).expect("the raw ballot requires every lane");
+            let used = decompile(&used);
             assert!(used.everyone.contains(&0));
             assert_eq!(kept_wave_ops(&used.function), vec![WaveOp::Ballot]);
         }
@@ -515,7 +494,7 @@ mod tests {
             .unwrap();
         let (entry, memory) = load_object(path, symbol);
         let program = crate::rdna_spmd::decode_program("gfx1200", entry, &memory).unwrap();
-        let lane = decompile(&program.to_ssa().function).expect("smallpt decompiles");
+        let lane = decompile(&program.to_ssa().function);
         assert!(
             kept_wave_ops(&lane.function).is_empty(),
             "smallpt must keep no wave operation"
@@ -533,11 +512,9 @@ mod tests {
         for &(path, symbol) in OBJECTS {
             let (entry, memory) = load_object(path, symbol);
             let program = crate::rdna_spmd::decode_program("gfx1200", entry, &memory).unwrap();
-            let lane =
-                decompile(&program.to_ssa().function).unwrap_or_else(|e| panic!("{}: {}", path, e));
+            let lane = decompile(&program.to_ssa().function);
             if path == "examples/raytracing/kernel_gfx1200.o" {
-                compile_lockstep(&lane, 256, 8, Some(8))
-                    .unwrap_or_else(|e| panic!("raytracing lane lowering: {}", e));
+                compile_lockstep(&lane, 256, 8, Some(8));
             }
         }
     }
@@ -582,7 +559,7 @@ mod tests {
                effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v14, v10, v13)
                ret",
         );
-        decompile(&wave).expect("the edge excludes the inactive load result");
+        decompile(&wave);
     }
 
     #[test]
@@ -606,13 +583,14 @@ mod tests {
                effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v34, v30, v33)
                ret",
         );
-        let lane = decompile(&wave).expect("the difference at the join names the original query");
+        let lane = decompile(&wave);
         assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Any]);
     }
 
-    #[test]
-    fn a_ballot_of_absent_lanes_requires_a_rendezvous() {
-        let wave = parsed(
+    /// A ballot only the lanes a query lets through reach, over a bit the
+    /// lanes it leaves out may hold.
+    fn a_ballot_of_absent_lanes() -> LiftedFunction {
+        parsed(
             "func entry b0
              b0(v0: i32, v1: i32, v2: i32, v3: i1):
                v4: i32 = const i32 0x0
@@ -631,12 +609,22 @@ mod tests {
                ret
              b2(v20: i32, v21: i32, v22: i32, v23: i1):
                ret",
-        );
-        let proven = decompile(&wave).expect("a whole-wave ballot carries a lowering obligation");
+        )
+    }
+
+    #[test]
+    fn a_ballot_of_absent_lanes_requires_a_rendezvous() {
+        let proven = decompile(&a_ballot_of_absent_lanes());
         assert!(proven.everyone.contains(&1));
-        // Check the lowering obligation independently of the proof's choice
-        // to retain the controlling any. This lane branch leaves lanes out.
-        let mut lane = Lane::from(wave);
+    }
+
+    /// The lowering holds a lane program to what the decompiler promises of
+    /// it: this one branches on the lane's own bit, which leaves lanes out
+    /// of a ballot over every lane.
+    #[test]
+    #[should_panic(expected = "an operation over every lane where lanes may be elsewhere")]
+    fn a_subset_of_the_wave_does_not_answer_a_whole_wave_ballot() {
+        let mut lane = Lane::from(a_ballot_of_absent_lanes());
         lane.everyone.insert(1);
         let entry = lane
             .function
@@ -663,10 +651,7 @@ mod tests {
             .ir
             .one_region(lane.function.ir.presence_needed());
         lane.function.ir.compact();
-        assert!(
-            compile_lockstep(&lane, 256, 8, None).is_err(),
-            "a subset of the wave must not silently answer a whole-wave ballot"
-        );
+        compile_lockstep(&lane, 256, 8, None);
     }
 
     /// A store every active lane makes when any lane holds a bit: the test
@@ -674,7 +659,7 @@ mod tests {
     /// only active lanes hold, a ballot over the lanes at it is the word the
     /// wave computes; over a raw compare, the wave's word holds bits of lanes
     /// that are not at it, so the lowering must bring every lane to the ballot.
-    fn store_when_any_lane_holds(masked: bool) -> Result<Lane, Refusal> {
+    fn store_when_any_lane_holds(masked: bool) -> Lane {
         let balloted = if masked { "v9" } else { "v5" };
         decompile(&parsed(&format!(
             "func entry b0
@@ -696,14 +681,13 @@ mod tests {
 
     #[test]
     fn a_store_when_any_lane_holds_a_bit_keeps_the_word() {
-        let lane = store_when_any_lane_holds(true).expect("the word the test reads is kept");
+        let lane = store_when_any_lane_holds(true);
         assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Ballot]);
     }
 
     #[test]
     fn a_store_when_inactive_lanes_may_hold_a_bit_requires_every_lane() {
-        let lane = store_when_any_lane_holds(false)
-            .expect("the ballot must gather even the inactive lanes");
+        let lane = store_when_any_lane_holds(false);
         assert!(lane.everyone.contains(&0));
         assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Ballot]);
     }
@@ -732,8 +716,7 @@ mod tests {
                v18: i32 = const i32 0x7
                effect !p2 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v17, v18, v14)
                ret",
-        ))
-        .expect("the words the store's test reads are kept");
+        ));
         assert_eq!(
             kept_wave_ops(&lane.function),
             vec![WaveOp::Ballot, WaveOp::Ballot],
@@ -763,7 +746,7 @@ mod tests {
             ),
             (vec![], Terminator::Return),
         ]);
-        let lane = decompile(&wave).expect("every lane is at the write");
+        let lane = decompile(&wave);
         assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::WriteLane]);
     }
 }

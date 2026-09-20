@@ -49,6 +49,7 @@ impl CompilationInput for Program {
     }
 }
 impl Program {
+    #[cfg(test)]
     pub(super) fn vgpr_count(&self, declared: usize) -> usize {
         let needed = self
             .function

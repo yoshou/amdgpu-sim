@@ -37,10 +37,6 @@ impl ScalarKernel {
     }
 }
 
-/// Scalar-shaped native code uses the same resumable kernel and fiber ABI as
-/// packet code. Width one describes its scheduler layout, not its LLVM shape.
-pub type CoopKernel = CoopVecKernel;
-
 /// Return sentinel meaning the work-item reached `s_endpgm`.
 pub const COOP_DONE: u64 = u64::MAX;
 

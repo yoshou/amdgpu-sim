@@ -3,7 +3,6 @@ use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
 use crate::rdna_spmd::dialect::TargetOp;
 use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::refusal::Refusal;
 use std::collections::{BTreeMap, HashMap};
 
 /// Prove all candidate conversion policies in one conditional analysis.
@@ -16,7 +15,7 @@ pub(super) fn prove(
     logic: &mut Logic,
     inputs: &[crate::rdna_spmd::program::Parameter],
     exec_index: Option<usize>,
-) -> Result<(Kept, std::collections::BTreeSet<u64>), Refusal> {
+) -> (Kept, std::collections::BTreeSet<u64>) {
     let exec = exec_index.map(|index| f.blocks[&f.entry].params[index].0);
     let mut proof = Proof {
         f,
@@ -36,13 +35,12 @@ pub(super) fn prove(
             .enumerate()
             .map(|(r, &b)| (b, r))
             .collect(),
-        loops: crate::rdna_spmd::analysis::loops::Loops::new(f, facts).map_err(|block| {
-            Refusal::at(
-                block,
-                None,
-                "control flow enters a cycle other than through its header",
+        loops: crate::rdna_spmd::analysis::loops::Loops::new(f, facts).unwrap_or_else(|block| {
+            panic!(
+                "b{}: control flow enters a cycle other than through its header",
+                block.0
             )
-        })?,
+        }),
     };
     let start = match exec {
         Some(e) => proof.logic.atom(Atom::Bit(e)),
@@ -51,8 +49,8 @@ pub(super) fn prove(
     proof.reach = proof.logic.policy_reach(f, facts, f.entry, start);
     proof.solve_masked(inputs, exec_index);
     loop {
-        proof.settle()?;
-        let arrivals = proof.detours()?;
+        proof.settle();
+        let arrivals = proof.detours();
         let mut changed = false;
         for (block, contributions) in arrivals {
             let old = proof
@@ -79,7 +77,7 @@ pub(super) fn prove(
                     (proof.logic.settled(condition, &disabled) == Bdd::TRUE).then_some(p)
                 })
                 .collect();
-            return Ok((kept, everyone));
+            return (kept, everyone);
         }
     }
 }
@@ -305,10 +303,10 @@ impl Proof<'_> {
         index: usize,
         reason: &'static str,
         difference: Bdd,
-    ) -> Result<(), Refusal> {
+    ) {
         let difference = self.and(difference, self.safe);
         if difference == Bdd::FALSE {
-            return Ok(());
+            return;
         }
         let bad = self.logic.possible_policies(difference);
         let good = self.not(bad);
@@ -324,11 +322,13 @@ impl Proof<'_> {
                 *h = self.logic.m.and(*h, self.safe);
             }
         }
-        if self.safe == Bdd::FALSE {
-            Err(Refusal::at(block, Some(index), reason))
-        } else {
-            Ok(())
-        }
+        assert!(
+            self.safe != Bdd::FALSE,
+            "b{}:{}: {} under every conversion policy",
+            block.0,
+            index,
+            reason
+        );
     }
 
     fn demand(&mut self, provenance: u64, condition: Bdd) {
@@ -337,15 +337,15 @@ impl Proof<'_> {
         self.demands.insert(provenance, condition);
     }
 
-    fn settle(&mut self) -> Result<(), Refusal> {
+    fn settle(&mut self) {
         loop {
             let mut changed = false;
             for index in 0..self.facts.order.len() {
                 let id = self.facts.order[index];
-                changed |= self.transfer(id)?;
+                changed |= self.transfer(id);
             }
             if !changed {
-                return Ok(());
+                return;
             }
         }
     }
@@ -426,7 +426,7 @@ impl Proof<'_> {
         self.logic.image(self.f, self.facts, pred, slot, difference)
     }
 
-    fn transfer(&mut self, id: BlockId) -> Result<bool, Refusal> {
+    fn transfer(&mut self, id: BlockId) -> bool {
         let (f, facts) = (self.f, self.facts);
         let block = &f.blocks[&id];
         let mut changed = false;
@@ -459,7 +459,7 @@ impl Proof<'_> {
             }
         }
         for (index, inst) in block.insts.iter().enumerate() {
-            let h = self.inst(id, index, inst)?;
+            let h = self.inst(id, index, inst);
             for v in outputs(inst) {
                 changed |= self.raise(v, h);
                 if facts.lane_word[v.0] {
@@ -474,7 +474,7 @@ impl Proof<'_> {
                 }
             }
         }
-        Ok(changed)
+        changed
     }
 
     /// How the lane's answer to a query it answers itself differs from the
@@ -494,8 +494,7 @@ impl Proof<'_> {
         logic.m.or(hx, differs)
     }
 
-    fn inst(&mut self, id: BlockId, index: usize, inst: &Inst) -> Result<Bdd, Refusal> {
-        let refuse = |reason| Refusal::at(id, Some(index), reason);
+    fn inst(&mut self, id: BlockId, index: usize, inst: &Inst) -> Bdd {
         let any_of = |p: &mut Self, values: &[ValueId]| {
             let mut h = Bdd::FALSE;
             for &v in values {
@@ -504,7 +503,7 @@ impl Proof<'_> {
             }
             h
         };
-        Ok(match inst {
+        match inst {
             Inst::Core { value, ty, op } => match *op {
                 Op::Const(..) | Op::Env(_) => Bdd::FALSE,
                 Op::Select(c, a, b) => {
@@ -578,7 +577,7 @@ impl Proof<'_> {
                 _ => any_of(self, &operands(inst)),
             },
             Inst::Target { args, .. } => any_of(self, args.values()),
-            Inst::Packet { .. } => return Err(refuse("a packet query in a wave program")),
+            Inst::Packet { .. } => unreachable!("a packet query in a wave program"),
             Inst::Effect {
                 provenance,
                 op,
@@ -629,7 +628,7 @@ impl Proof<'_> {
                             index,
                             "whether a store happens depends on the other lanes",
                             happens,
-                        )?;
+                        );
                     }
                     let fp = self.bit(pred);
                     let operands = any_of(self, &inputs[..2]);
@@ -641,7 +640,7 @@ impl Proof<'_> {
                             index,
                             "what a store writes depends on the other lanes",
                             writes,
-                        )?;
+                        );
                     }
                     let absent = self.not(fp);
                     self.or(operands, absent)
@@ -657,10 +656,10 @@ impl Proof<'_> {
                     any_of(self, inputs)
                 }
             },
-        })
+        }
     }
 
-    fn detours(&mut self) -> Result<BTreeMap<BlockId, Vec<Bdd>>, Refusal> {
+    fn detours(&mut self) -> BTreeMap<BlockId, Vec<Bdd>> {
         let (f, facts) = (self.f, self.facts);
         let mut arrivals: BTreeMap<BlockId, Vec<Bdd>> = BTreeMap::new();
         for (position, &b) in facts.order.iter().enumerate() {
@@ -702,11 +701,11 @@ impl Proof<'_> {
                         leaves: Vec::new(),
                         index: HashMap::new(),
                     }
-                    .run(wave, lane, &mut arrivals)?;
+                    .run(wave, lane, &mut arrivals);
                 }
             }
         }
-        Ok(arrivals)
+        arrivals
     }
 }
 
@@ -1016,7 +1015,7 @@ impl Explore<'_, '_> {
         wave: usize,
         lane: usize,
         arrivals: &mut BTreeMap<BlockId, Vec<Bdd>>,
-    ) -> Result<(), Refusal> {
+    ) {
         let f = self.proof.f;
         let branch = &f.blocks[&self.branch];
         let edges = [
@@ -1060,7 +1059,7 @@ impl Explore<'_, '_> {
                 [None, Some(_)] => LANE,
             };
             let block = key[side].unwrap();
-            for (dst, descs, constraint) in self.step(side, block, &pair.sides[side], pair.cond)? {
+            for (dst, descs, constraint) in self.step(side, block, &pair.sides[side], pair.cond) {
                 let cond = self.logic().m.and(pair.cond, constraint);
                 let cond = self.proof.and(cond, self.proof.safe);
                 if cond == Bdd::FALSE {
@@ -1101,7 +1100,6 @@ impl Explore<'_, '_> {
                 }
             }
         }
-        Ok(())
     }
 
     fn step(
@@ -1110,13 +1108,13 @@ impl Explore<'_, '_> {
         x: BlockId,
         params: &[Desc],
         cond: Bdd,
-    ) -> Result<Vec<(Option<BlockId>, Vec<Desc>, Bdd)>, Refusal> {
+    ) -> Vec<(Option<BlockId>, Vec<Desc>, Bdd)> {
         let f = self.proof.f;
-        let descs = self.evaluate(side, x, params, cond)?;
+        let descs = self.evaluate(side, x, params, cond);
         let block = &f.blocks[&x];
         let mut out = Vec::new();
         let followed: Vec<(usize, Bdd)> = match &block.term {
-            Term::Ret(_) => return Ok(vec![(None, vec![], Bdd::TRUE)]),
+            Term::Ret(_) => return vec![(None, vec![], Bdd::TRUE)],
             Term::Br(_) => vec![(0, Bdd::TRUE)],
             Term::CondBr { cond: c, .. } => {
                 let g = match descs[c].bits {
@@ -1146,7 +1144,7 @@ impl Explore<'_, '_> {
             }
             out.push((Some(edge.dst), args, constraint));
         }
-        Ok(out)
+        out
     }
 
     fn evaluate(
@@ -1155,7 +1153,7 @@ impl Explore<'_, '_> {
         x: BlockId,
         params: &[Desc],
         cond: Bdd,
-    ) -> Result<HashMap<ValueId, Desc>, Refusal> {
+    ) -> HashMap<ValueId, Desc> {
         let (f, facts) = (self.proof.f, self.proof.facts);
         let block = &f.blocks[&x];
         let mut descs: HashMap<ValueId, Desc> = HashMap::new();
@@ -1213,7 +1211,7 @@ impl Explore<'_, '_> {
                     index,
                     "a retained collective may have different participating lanes",
                     differs,
-                )?;
+                );
             }
             match inst {
                 Inst::Core { value, ty, op } => {
@@ -1419,7 +1417,7 @@ impl Explore<'_, '_> {
                                 "the lane program may store while the programs are apart"
                             },
                             cond,
-                        )?;
+                        );
                     }
                     for &(v, _) in outputs {
                         let d = formed(self, v, None);
@@ -1448,7 +1446,7 @@ impl Explore<'_, '_> {
                 }
             }
         }
-        Ok(descs)
+        descs
     }
 
     fn answer(&mut self, side: usize, v: ValueId, bit: Bdd, cond: Bdd) -> Bdd {

@@ -3716,7 +3716,7 @@ fn packed_rounding_cancellation_and_uniform_partial_writes() {
 }
 
 unsafe fn run_scalar_fiber(
-    kernel: &crate::rdna_spmd::engine::kernel::CoopKernel,
+    kernel: &crate::rdna_spmd::engine::kernel::CoopVecKernel,
     sgprs: *mut u32,
     vgprs: *mut u32,
     scratch_base: u64,
