@@ -33,9 +33,9 @@ use crate::rdna_spmd::refusal::Refusal;
 use logic::Kept;
 use std::collections::BTreeSet;
 
-/// A lane program and the provenances of the kept queries the lowering must
-/// run with every lane of the wave at them, since lanes that are not at them
-/// may hold the bit they ask about.
+/// A lane program and the provenances of collective operations the lowering
+/// must run with every lane of the wave at them, since absent lanes may
+/// contribute to their result.
 pub(crate) struct Lane {
     pub function: LiftedFunction,
     pub everyone: BTreeSet<u64>,
@@ -74,13 +74,6 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Result<Lane, Refusal> {
     let exec_index = function.parameter_inputs.iter().position(
         |p| matches!(p.source, crate::rdna_spmd::program::ParameterSource::MaskBit(r) if r == exec),
     );
-    if let Some(path) = std::env::var_os("AMDGPU_SIM_DUMP_WAVE") {
-        std::fs::write(
-            path,
-            crate::rdna_spmd::ir::print::func(&function.registry, f),
-        )
-        .unwrap();
-    }
     // Every query is answered from the lane's own bit until the proof names
     // one whose answer the wave must give; each round keeps more, so the
     // rounds end.
@@ -446,11 +439,176 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_materialized_mask_in_an_unselected_arm_does_not_change_a_store() {
+        for arms in ["v3, v7, v6", "v10, v6, v7"] {
+            let wave = parsed(&format!(
+                "func entry b0
+                 b0(v0: i32, v1: i32, v2: i32, v3: i1):
+                   v4: i32 = const i32 0x0
+                   v5: i1 = cmp ne v0, v4
+                   v6: i32 = effect !p0 wave ballot (v5)
+                   v7: i32 = const i32 0x7
+                   v11: i1 = const i1 0x1
+                   v10: i1 = int xor v3, v11
+                   v8: i32 = select {arms}
+                   v9: i64 = pack64 v1, v2
+                   effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v9, v8, v3)
+                   ret"
+            ));
+            decompile(&wave).unwrap_or_else(|e| panic!("the active store always writes 7: {:?}", e));
+            let mut used = wave.clone();
+            for inst in &mut used.ir.blocks.get_mut(&used.ir.entry).unwrap().insts {
+                if let Inst::Effect {
+                    op: EffectOp::Memory { op: MemoryOp::Store(_), .. },
+                    inputs,
+                    ..
+                } = inst {
+                    inputs[1] = ValueId(6);
+                }
+            }
+            let used = decompile(&used).expect("the raw ballot requires every lane");
+            assert!(used.everyone.contains(&0));
+            assert_eq!(kept_wave_ops(&used.function), vec![WaveOp::Ballot]);
+        }
+    }
+
+    #[test]
+    #[ignore = "whole-kernel proof; run explicitly with --release --ignored"]
+    fn shipped_kernels_decompile() {
+        use crate::rdna_spmd::targets::rdna4::decode::{load_object, OBJECTS};
+        for &(path, symbol) in OBJECTS {
+            let (entry, memory) = load_object(path, symbol);
+            let program = crate::rdna_spmd::decode_program("gfx1200", entry, &memory).unwrap();
+            let lane = decompile(&program.to_ssa().function)
+                .unwrap_or_else(|e| panic!("{}: {}", path, e));
+            if path == "examples/raytracing/kernel_gfx1200.o" {
+                compile_lockstep(&lane, 256, 8, Some(8))
+                    .unwrap_or_else(|e| panic!("raytracing lane lowering: {}", e));
+            }
+        }
+    }
+
+    #[test]
+    fn integer_encoded_booleans_preserve_the_select_condition() {
+        for comparison in ["cmp ne v8, v4", "cmp ne v4, v8"] {
+            let wave = parsed(&format!(
+                "func entry b0
+                 b0(v0: i32, v1: i32, v2: i32, v3: i1):
+                   v4: i32 = const i32 0x0
+                   v5: i32 = const i32 0x1
+                   v6: i1 = cmp ne v0, v4
+                   v7: i32 = select v6, v5, v4
+                   v8: i32 = select v3, v7, v0
+                   v9: i1 = {comparison}
+                   v10: i1 = select v3, v9, v6
+                   ret"
+            ));
+            let facts = facts::Facts::new(&wave.ir, &wave.parameter_inputs, &BTreeSet::new());
+            let mut logic = logic::Logic::new(&wave.ir, &facts, &BTreeSet::new());
+            assert_eq!(
+                logic.bit(&wave.ir, &facts, ValueId(10)),
+                logic.bit(&wave.ir, &facts, ValueId(6))
+            );
+        }
+    }
+
+    #[test]
+    fn a_loaded_value_is_used_only_on_the_edge_where_it_was_loaded() {
+        let wave = parsed(
+            "func entry b0
+             b0(v0: i32, v1: i32, v2: i32, v3: i1):
+               v4: i64 = pack64 v1, v2
+               v5: i32 = const i32 0x0
+               v6: i1 = cmp ne v0, v5
+               v7: i32 = effect !p0 memory load.b32 global cu relaxed temporal volatile=0 deferred=0 (v4, v6)
+               v8: i32 = const i32 0x7
+               condbr v6, b1(v7, v1, v2, v3), b1(v8, v1, v2, v3)
+             b1(v10: i32, v11: i32, v12: i32, v13: i1):
+               v14: i64 = pack64 v11, v12
+               effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v14, v10, v13)
+               ret",
+        );
+        decompile(&wave).expect("the edge excludes the inactive load result");
+    }
+
+    #[test]
+    fn a_query_keeps_its_identity_when_paths_rejoin_with_different_values() {
+        let wave = parsed(
+            "func entry b0
+             b0(v0: i32, v1: i32, v2: i32, v3: i1):
+               v4: i32 = const i32 0x0
+               v5: i1 = cmp ne v0, v4
+               v6: i1 = int and v5, v3
+               v7: i1 = effect !p0 wave any (v6)
+               condbr v7, b1(v0, v1, v2, v3), b2(v0, v1, v2, v3)
+             b1(v10: i32, v11: i32, v12: i32, v13: i1):
+               v14: i32 = const i32 0x7
+               br b3(v14, v11, v12, v13)
+             b2(v20: i32, v21: i32, v22: i32, v23: i1):
+               v24: i32 = const i32 0x9
+               br b3(v24, v21, v22, v23)
+             b3(v30: i32, v31: i32, v32: i32, v33: i1):
+               v34: i64 = pack64 v31, v32
+               effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v34, v30, v33)
+               ret",
+        );
+        let lane = decompile(&wave).expect("the difference at the join names the original query");
+        assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Any]);
+    }
+
+    #[test]
+    fn a_ballot_of_absent_lanes_requires_a_rendezvous() {
+        let wave = parsed(
+            "func entry b0
+             b0(v0: i32, v1: i32, v2: i32, v3: i1):
+               v4: i32 = const i32 0x0
+               v5: i1 = cmp ne v0, v4
+               v6: i1 = int and v5, v3
+               v7: i1 = effect !p0 wave any (v6)
+               condbr v7, b1(v0, v1, v2, v3), b2(v0, v1, v2, v3)
+             b1(v10: i32, v11: i32, v12: i32, v13: i1):
+               v14: i32 = const i32 0x0
+               v15: i1 = cmp eq v10, v14
+               v16: i32 = effect !p1 wave ballot (v15)
+               v17: i1 = cmp ne v10, v14
+               v18: i1 = int and v17, v13
+               v19: i64 = pack64 v11, v12
+               effect !p2 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v19, v16, v18)
+               ret
+             b2(v20: i32, v21: i32, v22: i32, v23: i1):
+               ret",
+        );
+        let proven = decompile(&wave).expect("a whole-wave ballot carries a lowering obligation");
+        assert!(proven.everyone.contains(&1));
+        // Check the lowering obligation independently of the proof's choice
+        // to retain the controlling any. This lane branch leaves lanes out.
+        let mut lane = Lane::from(wave);
+        lane.everyone.insert(1);
+        let entry = lane.function.ir.blocks
+            .get_mut(&lane.function.ir.entry).unwrap();
+        let bit = entry.insts.iter().find_map(|inst| match inst {
+            Inst::Effect {
+                op: EffectOp::Wave(WaveOp::Any), inputs, ..
+            } => Some(inputs[0]),
+            _ => None,
+        }).unwrap();
+        if let Term::CondBr { cond, .. } = &mut entry.term {
+            *cond = bit;
+        }
+        lane.function.ir.one_region(lane.function.ir.presence_needed());
+        lane.function.ir.compact();
+        assert!(
+            compile_lockstep(&lane, 256, 8, None).is_err(),
+            "a subset of the wave must not silently answer a whole-wave ballot"
+        );
+    }
+
     /// A store every active lane makes when any lane holds a bit: the test
     /// of the ballot is the wave's, so the word stays a ballot. Over a bit
     /// only active lanes hold, a ballot over the lanes at it is the word the
     /// wave computes; over a raw compare, the wave's word holds bits of lanes
-    /// that are not at it, which the lane program cannot read.
+    /// that are not at it, so the lowering must bring every lane to the ballot.
     fn store_when_any_lane_holds(masked: bool) -> Result<Lane, Refusal> {
         let balloted = if masked { "v9" } else { "v5" };
         decompile(&parsed(&format!(
@@ -478,14 +636,11 @@ mod tests {
     }
 
     #[test]
-    fn a_store_when_any_lane_holds_a_bit_lanes_exec_leaves_out_may_hold_is_refused() {
-        let refusal = store_when_any_lane_holds(false)
-            .err()
-            .expect("the ballot holds bits of lanes that are not at it");
-        assert_eq!(
-            refusal.reason,
-            "whether a store happens depends on the other lanes"
-        );
+    fn a_store_when_inactive_lanes_may_hold_a_bit_requires_every_lane() {
+        let lane = store_when_any_lane_holds(false)
+            .expect("the ballot must gather even the inactive lanes");
+        assert!(lane.everyone.contains(&0));
+        assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Ballot]);
     }
 
     #[test]
