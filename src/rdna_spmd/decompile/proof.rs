@@ -10,9 +10,8 @@ use std::collections::{BTreeMap, HashMap};
 /// each lane, with the wave queries in `kept` answered by the wave and every
 /// other answered from the lane's own bit. A refusal that names queries is
 /// one those queries cause: kept, the proof is run again.
-/// Proven, it returns the provenances of the kept queries that read a lane
-/// that may not be at them: those the lowering must run with every lane of
-/// the wave at them.
+/// Proven, it returns the provenances of collective operations that may read
+/// absent lanes: the lowering must run those with every lane of the wave.
 pub(super) fn prove(
     f: &Func,
     facts: &Facts,
@@ -31,6 +30,7 @@ pub(super) fn prove(
         masked: vec![false; f.types.len()],
         faithful: vec![false; f.types.len()],
         h: vec![Bdd::FALSE; f.types.len()],
+        words: vec![Bdd::FALSE; f.types.len()],
         arrivals: BTreeMap::new(),
         reach: BTreeMap::new(),
         rank: facts
@@ -81,8 +81,7 @@ struct Proof<'a> {
     facts: &'a Facts,
     logic: &'a mut Logic,
     kept: &'a Kept,
-    /// Kept queries over a bit that lanes not at them may hold, which answer
-    /// what the wave answers only with every lane at them.
+    /// Collective operations whose results require every lane to be present.
     demands: std::collections::BTreeSet<u64>,
     /// Bits and lane words that hold nothing for a lane that is not active at
     /// their block, so a wave operation over the lanes at the block reads
@@ -92,6 +91,10 @@ struct Proof<'a> {
     /// does: ballots of masked bits, and what such words make.
     faithful: Vec<bool>,
     h: Vec<Bdd>,
+    /// Difference of a materialized word, distinct from its own lane's bit.
+    /// In particular, selecting a word does not make its difference hold on
+    /// the path that selects the other arm.
+    words: Vec<Bdd>,
     arrivals: BTreeMap<BlockId, Vec<Bdd>>,
     reach: BTreeMap<BlockId, Bdd>,
     rank: BTreeMap<BlockId, usize>,
@@ -118,12 +121,11 @@ impl Proof<'_> {
         self.logic.m.not(a)
     }
 
-    /// How a value read whole differs: a lane word the lane program keeps
-    /// whole is the word the wave computes where the lanes that are not at
-    /// the block hold no bit of it, and otherwise holds their bits too.
+    /// Difference of the value actually consumed, rather than a classification
+    /// of whether any definition reaching it may contain a ballot.
     fn whole(&self, v: ValueId) -> Bdd {
-        if self.facts.lane_word[v.0] && self.facts.materialized[v.0] && !self.faithful[v.0] {
-            Bdd::TRUE
+        if self.facts.lane_word[v.0] && self.facts.materialized[v.0] {
+            self.words[v.0]
         } else {
             self.h[v.0]
         }
@@ -288,9 +290,9 @@ impl Proof<'_> {
 
     /// The queries a refusal names: those whose lane answers, kept as wave
     /// answers, make the refusing condition false. One that suffices alone is
-    /// named alone; otherwise the earliest query the condition depends on is,
-    /// and the proof runs again for whatever remains, since keeping one query
-    /// changes what the others answer.
+    /// named alone; otherwise the queries that affect the condition are kept
+    /// together. The proof must still run again, since keeping a query changes
+    /// what subsequent queries answer.
     fn named(&mut self, condition: Bdd) -> Vec<ValueId> {
         let markers = self.logic.markers(condition);
         let mut matter = Vec::new();
@@ -307,7 +309,8 @@ impl Proof<'_> {
             crate::rdna_spmd::analysis::facts::Site::Inst { block, index } => (self.rank[&block], index),
             _ => unreachable!("a query is an instruction"),
         };
-        matter.into_iter().min_by_key(|&m| place(m)).into_iter().collect()
+        matter.sort_by_key(|&m| place(m));
+        matter
     }
 
     /// A refusal at a store, naming the queries it comes from.
@@ -348,6 +351,64 @@ impl Proof<'_> {
         true
     }
 
+    fn raise_word(&mut self, v: ValueId, h: Bdd) -> bool {
+        let joined = self.or(self.words[v.0], h);
+        if joined == self.words[v.0] {
+            return false;
+        }
+        self.words[v.0] = joined;
+        true
+    }
+
+    fn word_difference(&mut self, inst: &Inst, value: ValueId) -> Bdd {
+        match inst {
+            Inst::Effect {
+                provenance,
+                op: EffectOp::Wave(WaveOp::Ballot),
+                inputs,
+                ..
+            } => {
+                if !self.faithful[value.0] {
+                    self.demands.insert(*provenance);
+                }
+                // A changed bit in any lane can change the gathered word.
+                let h = self.h[inputs[0].0];
+                let varying: Vec<_> = self.logic.support(h).into_iter()
+                    .filter(|&var| !self.logic.uniform_atom(self.facts, var))
+                    .collect();
+                self.logic.m.exists(h, &|var| varying.contains(&var))
+            }
+            Inst::Core { op: Op::Select(c, a, b), .. } => {
+                let cbit = self.bit(*c);
+                let arms = self.logic.m.ite(cbit, self.whole(*a), self.whole(*b));
+                self.or(self.h[c.0], arms)
+            }
+            _ => {
+                let mut h = Bdd::FALSE;
+                for a in operands(inst) {
+                    h = self.or(h, self.whole(a));
+                }
+                h
+            }
+        }
+    }
+
+    /// Restrict a difference before eliminating the predecessor's local
+    /// variables. A value undefined off this edge need not differ on it.
+    fn edge_difference(&mut self, pred: BlockId, slot: usize, difference: Bdd) -> Bdd {
+        if difference == Bdd::FALSE {
+            return difference;
+        }
+        let mut guard = self.reachable(pred);
+        if let Term::CondBr { cond, .. } = self.f.blocks[&pred].term {
+            let bit = self.bit(cond);
+            let taken = if slot == 0 { bit } else { self.not(bit) };
+            guard = self.and(guard, taken);
+        }
+        let difference = self.and(difference, guard);
+        self.logic.image(self.f, self.facts, pred, slot, difference)
+    }
+
     fn transfer(&mut self, id: BlockId) -> Result<bool, Refusal> {
         let (f, facts) = (self.f, self.facts);
         let block = &f.blocks[&id];
@@ -356,22 +417,36 @@ impl Proof<'_> {
             let reachable = self.reachable(id);
             for (k, &(param, _)) in block.params.iter().enumerate() {
                 let mut h = self.arrivals.get(&id).map_or(Bdd::FALSE, |a| a[k]);
+                let mut word = h;
                 for &(pred, slot) in &facts.incoming[&id] {
                     let arg = f.blocks[&pred].term.edges().nth(slot).unwrap().args[k];
                     let d = self.h[arg.0];
                     if d != Bdd::FALSE {
-                        let image = self.logic.image(f, facts, pred, slot, d);
+                        let image = self.edge_difference(pred, slot, d);
                         h = self.or(h, image);
+                    }
+                    if facts.lane_word[param.0] && facts.materialized[param.0] {
+                        let d = self.whole(arg);
+                        if d != Bdd::FALSE {
+                            let image = self.edge_difference(pred, slot, d);
+                            word = self.or(word, image);
+                        }
                     }
                 }
                 let h = self.and(h, reachable);
                 changed |= self.raise(param, h);
+                let word = self.and(word, reachable);
+                changed |= self.raise_word(param, word);
             }
         }
         for (index, inst) in block.insts.iter().enumerate() {
             let h = self.inst(id, index, inst)?;
             for v in outputs(inst) {
                 changed |= self.raise(v, h);
+                if facts.lane_word[v.0] && facts.materialized[v.0] {
+                    let word = self.word_difference(inst, v);
+                    changed |= self.raise_word(v, word);
+                }
             }
         }
         Ok(changed)
@@ -423,8 +498,7 @@ impl Proof<'_> {
                     self.or(hc, arms)
                 }
                 Op::Int(k @ (IntOp::And | IntOp::Or), a, b)
-                    if *ty == Ty::I1
-                        || (self.facts.lane_word[value.0] && !self.facts.materialized[value.0]) =>
+                    if *ty == Ty::I1 || self.facts.lane_word[value.0] =>
                 {
                     let (fa, fb) = if *ty == Ty::I1 {
                         (self.bit(a), self.bit(b))
@@ -566,6 +640,7 @@ impl Proof<'_> {
     fn detours(&mut self) -> Result<BTreeMap<BlockId, Vec<Bdd>>, Refusal> {
         let (f, facts) = (self.f, self.facts);
         let mut arrivals: BTreeMap<BlockId, Vec<Bdd>> = BTreeMap::new();
+        let mut refusal: Option<Refusal> = None;
         for (position, &b) in facts.order.iter().enumerate() {
             let Term::CondBr { cond, yes, no } = &f.blocks[&b].term else {
                 continue;
@@ -583,7 +658,7 @@ impl Proof<'_> {
                 if assume == Bdd::FALSE {
                     continue;
                 }
-                Explore {
+                let result = Explore {
                     proof: self,
                     id: position * 2 + wave,
                     branch: b,
@@ -594,8 +669,25 @@ impl Proof<'_> {
                     leaves: Vec::new(),
                     index: HashMap::new(),
                 }
-                .run(wave, lane, &mut arrivals)?;
+                .run(wave, lane, &mut arrivals);
+                if let Err(next) = result {
+                    if next.keep.is_empty() {
+                        return Err(next);
+                    }
+                    // Independent detours can name their queries in one
+                    // round; retaining them still requires a fresh proof.
+                    if let Some(ref mut first) = refusal {
+                        first.keep.extend(next.keep);
+                    } else {
+                        refusal = Some(next);
+                    }
+                }
             }
+        }
+        if let Some(mut refusal) = refusal {
+            refusal.keep.sort();
+            refusal.keep.dedup();
+            return Err(refusal);
         }
         Ok(arrivals)
     }
@@ -1061,6 +1153,43 @@ impl Explore<'_, '_> {
             Desc { same: t, bits }
         };
         for (index, inst) in block.insts.iter().enumerate() {
+            // A retained collective observes the lanes at this point. While
+            // the two executions are apart, their participating sets need not
+            // agree. Keep the controlling query rather than treating the two
+            // collective answers as unrelated values all the way to a store.
+            let collective = match inst {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any), outputs, ..
+                } => {
+                    self.proof.kept.queries.contains(&outputs[0].0)
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Ballot), outputs, ..
+                } => {
+                    facts.materialized[outputs[0].0.0]
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::ReadFirstLane), inputs, ..
+                } => {
+                    !facts.uniform[inputs[0].0]
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(_)
+                        | EffectOp::BarrierSignal { .. }
+                        | EffectOp::BarrierWait,
+                    ..
+                } => true,
+                _ => false,
+            };
+            if collective {
+                let assume = self.assume;
+                return Err(self.proof.refuse(
+                    x,
+                    index,
+                    "a retained collective may have different participating lanes",
+                    assume,
+                ));
+            }
             match inst {
                 Inst::Core { value, ty, op } => {
                     let mut children = Vec::new();
@@ -1359,10 +1488,15 @@ impl Explore<'_, '_> {
             }
             let joint = self.logic().m.and(c, relation);
             let logic = &mut *self.proof.logic;
+            // Query markers identify the transformation, not a block-local
+            // value. Quantifying them would lose the cause of the difference.
             let foreign: Vec<u32> = logic
                 .support(joint)
                 .into_iter()
-                .filter(|&v| logic.scope(facts, v) != Some(block))
+                .filter(|&v| {
+                    !matches!(logic.atom_of(v), Atom::Marker(_))
+                        && logic.scope(facts, v) != Some(block)
+                })
                 .collect();
             let restated = logic.m.exists(joint, &|v| foreign.contains(&v));
             entry[k] = self.proof.logic.m.or(entry[k], restated);

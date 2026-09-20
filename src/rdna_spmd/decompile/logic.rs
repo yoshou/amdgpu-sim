@@ -233,31 +233,63 @@ impl Logic {
                     _ => self.atom(opaque),
                 },
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
-                    if f.types[a.0] == Ty::I1 {
-                        let (a, b) = (self.bit(f, facts, a), self.bit(f, facts, b));
-                        return if p == IntPred::Ne {
-                            self.m.xor(a, b)
-                        } else {
-                            self.m.iff(a, b)
-                        };
-                    }
-                    match lane_test(f, facts, a, b) {
-                        Some(w) if facts.materialized[w.0] => self.atom(opaque),
-                        Some(w) => {
-                            let bit = self.view(f, facts, w);
-                            if p == IntPred::Ne {
-                                bit
-                            } else {
-                                self.m.not(bit)
-                            }
-                        }
-                        None => self.atom(opaque),
-                    }
+                    self.compare(f, facts, p, a, b, opaque, &mut HashMap::new())
                 }
                 _ => self.atom(opaque),
             },
             _ => self.atom(opaque),
         }
+    }
+
+    /// Interpret equality through selects rather than inventing an unrelated
+    /// bit for a boolean encoded as an integer. On arms we cannot interpret,
+    /// the original comparison's bit remains an unknown answer.
+    fn compare(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        pred: IntPred,
+        a: ValueId,
+        b: ValueId,
+        opaque: Atom,
+        memo: &mut HashMap<(ValueId, ValueId), Bdd>,
+    ) -> Bdd {
+        if let Some(&g) = memo.get(&(a, b)) {
+            return g;
+        }
+        let g = if a == b {
+            Manager::constant(pred == IntPred::Eq)
+        } else if let (Some(a), Some(b)) = (facts.constant(f, a), facts.constant(f, b)) {
+            Manager::constant((a == b) == (pred == IntPred::Eq))
+        } else if f.types[a.0] == Ty::I1 {
+            let (a, b) = (self.bit(f, facts, a), self.bit(f, facts, b));
+            if pred == IntPred::Ne {
+                self.m.xor(a, b)
+            } else {
+                self.m.iff(a, b)
+            }
+        } else if let Some(w) = lane_test(f, facts, a, b).filter(|w| !facts.materialized[w.0]) {
+            let bit = self.view(f, facts, w);
+            if pred == IntPred::Ne {
+                bit
+            } else {
+                self.m.not(bit)
+            }
+        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
+            let c = self.bit(f, facts, c);
+            let yes = self.compare(f, facts, pred, yes, b, opaque, memo);
+            let no = self.compare(f, facts, pred, no, b, opaque, memo);
+            self.m.ite(c, yes, no)
+        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, b) {
+            let c = self.bit(f, facts, c);
+            let yes = self.compare(f, facts, pred, a, yes, opaque, memo);
+            let no = self.compare(f, facts, pred, a, no, opaque, memo);
+            self.m.ite(c, yes, no)
+        } else {
+            self.atom(opaque)
+        };
+        memo.insert((a, b), g);
+        g
     }
 
     pub fn view(&mut self, f: &Func, facts: &Facts, w: ValueId) -> Bdd {

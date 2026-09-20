@@ -1661,6 +1661,9 @@ impl Emit<'_> {
                 self.lane[lane.0] = Some(Val::Bit(answer));
             }
             WaveOp::Ballot => {
+                if self.demanded.contains(&provenance) {
+                    self.everyone(mask);
+                }
                 let x = self.bit(inputs[0]);
                 let held = self.masks.and(mask, x);
                 let input = self.materialize(held);
