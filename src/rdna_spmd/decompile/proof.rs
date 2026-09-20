@@ -1,32 +1,29 @@
+use super::logic::{lane_test, Atom, Kept, Logic};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
-use super::logic::{lane_test, Atom, Kept, Logic};
 use crate::rdna_spmd::dialect::TargetOp;
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::refusal::Refusal;
 use std::collections::{BTreeMap, HashMap};
 
-/// Proves that the lane program stores what the wave program stores for
-/// each lane, with the wave queries in `kept` answered by the wave and every
-/// other answered from the lane's own bit. A refusal that names queries is
-/// one those queries cause: kept, the proof is run again.
-/// Proven, it returns the provenances of collective operations that may read
-/// absent lanes: the lowering must run those with every lane of the wave.
+/// Prove all candidate conversion policies in one conditional analysis.
+/// Observable differences exclude unsafe policies; a model of the final
+/// condition selects the queries and words to keep. Collective participation
+/// requirements are evaluated under that same model.
 pub(super) fn prove(
     f: &Func,
     facts: &Facts,
     logic: &mut Logic,
     inputs: &[crate::rdna_spmd::program::Parameter],
     exec_index: Option<usize>,
-    kept: &Kept,
-) -> Result<std::collections::BTreeSet<u64>, Refusal> {
+) -> Result<(Kept, std::collections::BTreeSet<u64>), Refusal> {
     let exec = exec_index.map(|index| f.blocks[&f.entry].params[index].0);
     let mut proof = Proof {
         f,
         facts,
         logic,
-        kept,
-        demands: std::collections::BTreeSet::new(),
+        safe: Bdd::TRUE,
+        demands: BTreeMap::new(),
         masked: vec![false; f.types.len()],
         faithful: vec![false; f.types.len()],
         h: vec![Bdd::FALSE; f.types.len()],
@@ -51,7 +48,7 @@ pub(super) fn prove(
         Some(e) => proof.logic.atom(Atom::Bit(e)),
         None => Bdd::TRUE,
     };
-    proof.reach = proof.logic.reach(f, facts, f.entry, start);
+    proof.reach = proof.logic.policy_reach(f, facts, f.entry, start);
     proof.solve_masked(inputs, exec_index);
     loop {
         proof.settle()?;
@@ -63,6 +60,9 @@ pub(super) fn prove(
                 .entry(block)
                 .or_insert_with(|| vec![Bdd::FALSE; contributions.len()]);
             for (slot, c) in contributions.into_iter().enumerate() {
+                // A later detour may have excluded a policy after an earlier
+                // detour recorded this contribution. Do not reintroduce it.
+                let c = proof.logic.m.and(c, proof.safe);
                 let joined = proof.logic.m.or(old[slot], c);
                 if joined != old[slot] {
                     old[slot] = joined;
@@ -71,7 +71,15 @@ pub(super) fn prove(
             }
         }
         if !changed {
-            return Ok(proof.demands);
+            let kept = proof.logic.choose(proof.safe);
+            let disabled: Vec<_> = kept.queries.iter().chain(&kept.words).copied().collect();
+            let everyone = std::mem::take(&mut proof.demands)
+                .into_iter()
+                .filter_map(|(p, condition)| {
+                    (proof.logic.settled(condition, &disabled) == Bdd::TRUE).then_some(p)
+                })
+                .collect();
+            return Ok((kept, everyone));
         }
     }
 }
@@ -80,9 +88,9 @@ struct Proof<'a> {
     f: &'a Func,
     facts: &'a Facts,
     logic: &'a mut Logic,
-    kept: &'a Kept,
+    safe: Bdd,
     /// Collective operations whose results require every lane to be present.
-    demands: std::collections::BTreeSet<u64>,
+    demands: BTreeMap<u64, Bdd>,
     /// Bits and lane words that hold nothing for a lane that is not active at
     /// their block, so a wave operation over the lanes at the block reads
     /// them as the wave does.
@@ -124,7 +132,7 @@ impl Proof<'_> {
     /// Difference of the value actually consumed, rather than a classification
     /// of whether any definition reaching it may contain a ballot.
     fn whole(&self, v: ValueId) -> Bdd {
-        if self.facts.lane_word[v.0] && self.facts.materialized[v.0] {
+        if self.facts.lane_word[v.0] {
             self.words[v.0]
         } else {
             self.h[v.0]
@@ -288,45 +296,45 @@ impl Proof<'_> {
         l
     }
 
-    /// The queries a refusal names: those whose lane answers, kept as wave
-    /// answers, make the refusing condition false. One that suffices alone is
-    /// named alone; otherwise the queries that affect the condition are kept
-    /// together. The proof must still run again, since keeping a query changes
-    /// what subsequent queries answer.
-    fn named(&mut self, condition: Bdd) -> Vec<ValueId> {
-        let markers = self.logic.markers(condition);
-        let mut matter = Vec::new();
-        for &m in &markers {
-            let settled = self.logic.settled(condition, &[m]);
-            if settled == Bdd::FALSE {
-                return vec![m];
-            }
-            if settled != condition {
-                matter.push(m);
-            }
-        }
-        let place = |v: ValueId| match self.facts.site[v.0] {
-            crate::rdna_spmd::analysis::facts::Site::Inst { block, index } => (self.rank[&block], index),
-            _ => unreachable!("a query is an instruction"),
-        };
-        matter.sort_by_key(|&m| place(m));
-        matter
-    }
-
-    /// A refusal at a store, naming the queries it comes from.
-    fn refuse(
+    /// Remove policies under which an observable difference is possible.
+    /// The formulas for every other policy remain valid; no program state or
+    /// proof is rebuilt after imposing this constraint.
+    fn require(
         &mut self,
         block: BlockId,
         index: usize,
         reason: &'static str,
-        condition: Bdd,
-    ) -> Refusal {
-        Refusal {
-            block,
-            index: Some(index),
-            reason,
-            keep: self.named(condition),
+        difference: Bdd,
+    ) -> Result<(), Refusal> {
+        let difference = self.and(difference, self.safe);
+        if difference == Bdd::FALSE {
+            return Ok(());
         }
+        let bad = self.logic.possible_policies(difference);
+        let good = self.not(bad);
+        self.safe = self.and(self.safe, good);
+        for h in self.h.iter_mut().chain(&mut self.words) {
+            *h = self.logic.m.and(*h, self.safe);
+        }
+        for r in self.reach.values_mut() {
+            *r = self.logic.m.and(*r, self.safe);
+        }
+        for incoming in self.arrivals.values_mut() {
+            for h in incoming {
+                *h = self.logic.m.and(*h, self.safe);
+            }
+        }
+        if self.safe == Bdd::FALSE {
+            Err(Refusal::at(block, Some(index), reason))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn demand(&mut self, provenance: u64, condition: Bdd) {
+        let old = self.demands.get(&provenance).copied().unwrap_or(Bdd::FALSE);
+        let condition = self.or(old, condition);
+        self.demands.insert(provenance, condition);
     }
 
     fn settle(&mut self) -> Result<(), Refusal> {
@@ -343,6 +351,7 @@ impl Proof<'_> {
     }
 
     fn raise(&mut self, v: ValueId, h: Bdd) -> bool {
+        let h = self.and(h, self.safe);
         let joined = self.or(self.h[v.0], h);
         if joined == self.h[v.0] {
             return false;
@@ -352,6 +361,7 @@ impl Proof<'_> {
     }
 
     fn raise_word(&mut self, v: ValueId, h: Bdd) -> bool {
+        let h = self.and(h, self.safe);
         let joined = self.or(self.words[v.0], h);
         if joined == self.words[v.0] {
             return false;
@@ -369,16 +379,23 @@ impl Proof<'_> {
                 ..
             } => {
                 if !self.faithful[value.0] {
-                    self.demands.insert(*provenance);
+                    let whole = self.logic.materialized(self.facts, value);
+                    self.demand(*provenance, whole);
                 }
                 // A changed bit in any lane can change the gathered word.
                 let h = self.h[inputs[0].0];
-                let varying: Vec<_> = self.logic.support(h).into_iter()
+                let varying: Vec<_> = self
+                    .logic
+                    .support(h)
+                    .into_iter()
                     .filter(|&var| !self.logic.uniform_atom(self.facts, var))
                     .collect();
                 self.logic.m.exists(h, &|var| varying.contains(&var))
             }
-            Inst::Core { op: Op::Select(c, a, b), .. } => {
+            Inst::Core {
+                op: Op::Select(c, a, b),
+                ..
+            } => {
                 let cbit = self.bit(*c);
                 let arms = self.logic.m.ite(cbit, self.whole(*a), self.whole(*b));
                 self.or(self.h[c.0], arms)
@@ -416,6 +433,7 @@ impl Proof<'_> {
         if id != f.entry {
             let reachable = self.reachable(id);
             for (k, &(param, _)) in block.params.iter().enumerate() {
+                let mode = self.logic.materialized(facts, param);
                 let mut h = self.arrivals.get(&id).map_or(Bdd::FALSE, |a| a[k]);
                 let mut word = h;
                 for &(pred, slot) in &facts.incoming[&id] {
@@ -425,7 +443,7 @@ impl Proof<'_> {
                         let image = self.edge_difference(pred, slot, d);
                         h = self.or(h, image);
                     }
-                    if facts.lane_word[param.0] && facts.materialized[param.0] {
+                    if facts.lane_word[param.0] && mode != Bdd::FALSE {
                         let d = self.whole(arg);
                         if d != Bdd::FALSE {
                             let image = self.edge_difference(pred, slot, d);
@@ -436,6 +454,7 @@ impl Proof<'_> {
                 let h = self.and(h, reachable);
                 changed |= self.raise(param, h);
                 let word = self.and(word, reachable);
+                let word = self.logic.m.ite(mode, word, h);
                 changed |= self.raise_word(param, word);
             }
         }
@@ -443,8 +462,14 @@ impl Proof<'_> {
             let h = self.inst(id, index, inst)?;
             for v in outputs(inst) {
                 changed |= self.raise(v, h);
-                if facts.lane_word[v.0] && facts.materialized[v.0] {
-                    let word = self.word_difference(inst, v);
+                if facts.lane_word[v.0] {
+                    let mode = self.logic.materialized(facts, v);
+                    let word = if mode == Bdd::FALSE {
+                        h
+                    } else {
+                        let word = self.word_difference(inst, v);
+                        self.logic.m.ite(mode, word, h)
+                    };
                     changed |= self.raise_word(v, word);
                 }
             }
@@ -455,7 +480,7 @@ impl Proof<'_> {
     /// How the lane's answer to a query it answers itself differs from the
     /// wave's: the lane holds no bit and another lane may. The difference is
     /// conditioned on the query's marker.
-    fn query(&mut self, v: ValueId, x: Bdd, hx: Bdd) -> Bdd {
+    fn query(&mut self, x: Bdd, hx: Bdd) -> Bdd {
         let (logic, facts) = (&mut *self.logic, self.facts);
         let set = logic.m.or(x, hx);
         let support = logic.support(set);
@@ -466,9 +491,7 @@ impl Proof<'_> {
         let others = logic.m.exists(set, &|var| varying.contains(&var));
         let absent = logic.m.not(x);
         let differs = logic.m.and(absent, others);
-        let marker = logic.atom(Atom::Marker(v));
-        let marked = logic.m.and(marker, differs);
-        logic.m.or(hx, marked)
+        logic.m.or(hx, differs)
     }
 
     fn inst(&mut self, id: BlockId, index: usize, inst: &Inst) -> Result<Bdd, Refusal> {
@@ -542,13 +565,14 @@ impl Proof<'_> {
                     if lane_test(self.f, self.facts, a, b).is_some() =>
                 {
                     let w = lane_test(self.f, self.facts, a, b).unwrap();
-                    if self.facts.materialized[w.0] {
-                        // A test of a word kept whole is the wave's test.
+                    let mode = self.logic.materialized(self.facts, w);
+                    if mode == Bdd::TRUE {
                         self.whole(w)
                     } else {
                         let fw = self.view(w);
                         let hw = self.h[w.0];
-                        self.query(*value, fw, hw)
+                        let local = self.query(fw, hw);
+                        self.logic.m.ite(mode, self.whole(w), local)
                     }
                 }
                 _ => any_of(self, &operands(inst)),
@@ -562,16 +586,15 @@ impl Proof<'_> {
                 outputs,
             } => match op {
                 EffectOp::Wave(WaveOp::Any) => {
-                    if self.kept.queries.contains(&outputs[0].0) {
-                        if !self.masked[inputs[0].0] {
-                            self.demands.insert(*provenance);
-                        }
-                        self.h[inputs[0].0]
-                    } else {
-                        let fx = self.bit(inputs[0]);
-                        let hx = self.h[inputs[0].0];
-                        self.query(outputs[0].0, fx, hx)
+                    let local = self.logic.local(outputs[0].0);
+                    if !self.masked[inputs[0].0] {
+                        let kept = self.not(local);
+                        self.demand(*provenance, kept);
                     }
+                    let fx = self.bit(inputs[0]);
+                    let hx = self.h[inputs[0].0];
+                    let query = self.query(fx, hx);
+                    self.logic.m.ite(local, query, hx)
                 }
                 EffectOp::Wave(WaveOp::Ballot) => self.h[inputs[0].0],
                 EffectOp::Wave(WaveOp::ReadFirstLane) => {
@@ -579,7 +602,7 @@ impl Proof<'_> {
                         self.whole(inputs[0])
                     } else {
                         if !self.masked[inputs[1].0] {
-                            self.demands.insert(*provenance);
+                            self.demand(*provenance, Bdd::TRUE);
                         }
                         self.h[inputs[0].0]
                     }
@@ -601,24 +624,24 @@ impl Proof<'_> {
                     let reachable = self.reachable(id);
                     let happens = self.and(self.h[pred.0], reachable);
                     if happens != Bdd::FALSE {
-                        return Err(self.refuse(
+                        self.require(
                             id,
                             index,
                             "whether a store happens depends on the other lanes",
                             happens,
-                        ));
+                        )?;
                     }
                     let fp = self.bit(pred);
                     let operands = any_of(self, &inputs[..2]);
                     let performed = self.and(fp, reachable);
                     let writes = self.and(performed, operands);
                     if writes != Bdd::FALSE {
-                        return Err(self.refuse(
+                        self.require(
                             id,
                             index,
                             "what a store writes depends on the other lanes",
                             writes,
-                        ));
+                        )?;
                     }
                     let absent = self.not(fp);
                     self.or(operands, absent)
@@ -640,7 +663,6 @@ impl Proof<'_> {
     fn detours(&mut self) -> Result<BTreeMap<BlockId, Vec<Bdd>>, Refusal> {
         let (f, facts) = (self.f, self.facts);
         let mut arrivals: BTreeMap<BlockId, Vec<Bdd>> = BTreeMap::new();
-        let mut refusal: Option<Refusal> = None;
         for (position, &b) in facts.order.iter().enumerate() {
             let Term::CondBr { cond, yes, no } = &f.blocks[&b].term else {
                 continue;
@@ -655,39 +677,34 @@ impl Proof<'_> {
             for (wave, lane, taken) in [(0, 1, nfc), (1, 0, fc)] {
                 let assume = self.and(hc, taken);
                 let assume = self.and(assume, reachable);
+                let assume = self.and(assume, self.safe);
                 if assume == Bdd::FALSE {
                     continue;
                 }
-                let result = Explore {
-                    proof: self,
-                    id: position * 2 + wave,
-                    branch: b,
-                    assume,
-                    unreliable: HashMap::new(),
-                    terms: Vec::new(),
-                    types: Vec::new(),
-                    leaves: Vec::new(),
-                    index: HashMap::new(),
-                }
-                .run(wave, lane, &mut arrivals);
-                if let Err(next) = result {
-                    if next.keep.is_empty() {
-                        return Err(next);
+                let all_local = self.logic.all_local;
+                let other = self.not(all_local);
+                // Desc merges intentionally forget some value correlations.
+                // Keep the all-local policy separate so alternatives cannot
+                // weaken an otherwise valid per-lane loop proof.
+                for (part, slice) in [all_local, other].iter().enumerate() {
+                    let assume = self.and(assume, *slice);
+                    if assume == Bdd::FALSE {
+                        continue;
                     }
-                    // Independent detours can name their queries in one
-                    // round; retaining them still requires a fresh proof.
-                    if let Some(ref mut first) = refusal {
-                        first.keep.extend(next.keep);
-                    } else {
-                        refusal = Some(next);
+                    Explore {
+                        proof: self,
+                        id: (position * 2 + wave) * 2 + part,
+                        branch: b,
+                        assume,
+                        unreliable: HashMap::new(),
+                        terms: Vec::new(),
+                        types: Vec::new(),
+                        leaves: Vec::new(),
+                        index: HashMap::new(),
                     }
+                    .run(wave, lane, &mut arrivals)?;
                 }
             }
-        }
-        if let Some(mut refusal) = refusal {
-            refusal.keep.sort();
-            refusal.keep.dedup();
-            return Err(refusal);
         }
         Ok(arrivals)
     }
@@ -883,7 +900,8 @@ impl Explore<'_, '_> {
     }
 
     fn reliable(&mut self, t: usize) -> bool {
-        let (assume, leaves) = (self.assume, self.leaves[t]);
+        let assume = self.proof.and(self.assume, self.proof.safe);
+        let leaves = self.leaves[t];
         self.logic().m.and(assume, leaves) == Bdd::FALSE
     }
 
@@ -925,6 +943,7 @@ impl Explore<'_, '_> {
     }
 
     fn decide(&mut self, g: Bdd, cond: Bdd, side: usize) -> Option<bool> {
+        let cond = self.proof.and(cond, self.proof.safe);
         if let Some(k) = g.constant() {
             return Some(k);
         }
@@ -1018,7 +1037,11 @@ impl Explore<'_, '_> {
         )]);
         let mut worklist = vec![first];
         while let Some(key) = worklist.pop() {
-            let pair = pairs[&key].clone();
+            let mut pair = pairs[&key].clone();
+            pair.cond = self.proof.and(pair.cond, self.proof.safe);
+            if pair.cond == Bdd::FALSE {
+                continue;
+            }
             let side = match key {
                 [None, None] => continue,
                 [Some(a), Some(b)] if a == b => {
@@ -1039,6 +1062,7 @@ impl Explore<'_, '_> {
             let block = key[side].unwrap();
             for (dst, descs, constraint) in self.step(side, block, &pair.sides[side], pair.cond)? {
                 let cond = self.logic().m.and(pair.cond, constraint);
+                let cond = self.proof.and(cond, self.proof.safe);
                 if cond == Bdd::FALSE {
                     continue;
                 }
@@ -1159,36 +1183,37 @@ impl Explore<'_, '_> {
             // collective answers as unrelated values all the way to a store.
             let collective = match inst {
                 Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Any), outputs, ..
-                } => {
-                    self.proof.kept.queries.contains(&outputs[0].0)
-                }
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Ballot), outputs, ..
-                } => {
-                    facts.materialized[outputs[0].0.0]
-                }
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::ReadFirstLane), inputs, ..
-                } => {
-                    !facts.uniform[inputs[0].0]
-                }
-                Inst::Effect {
-                    op: EffectOp::Wave(_)
-                        | EffectOp::BarrierSignal { .. }
-                        | EffectOp::BarrierWait,
+                    op: EffectOp::Wave(WaveOp::Any),
+                    outputs,
                     ..
-                } => true,
-                _ => false,
+                } => {
+                    let local = self.logic().local(outputs[0].0);
+                    self.logic().m.not(local)
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Ballot),
+                    outputs,
+                    ..
+                } => self.logic().materialized(facts, outputs[0].0),
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::ReadFirstLane),
+                    inputs,
+                    ..
+                } => Manager::constant(!facts.uniform[inputs[0].0]),
+                Inst::Effect {
+                    op: EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait,
+                    ..
+                } => Bdd::TRUE,
+                _ => Bdd::FALSE,
             };
-            if collective {
-                let assume = self.assume;
-                return Err(self.proof.refuse(
+            if collective != Bdd::FALSE {
+                let differs = self.proof.and(cond, collective);
+                self.proof.require(
                     x,
                     index,
                     "a retained collective may have different participating lanes",
-                    assume,
-                ));
+                    differs,
+                )?;
             }
             match inst {
                 Inst::Core { value, ty, op } => {
@@ -1296,6 +1321,14 @@ impl Explore<'_, '_> {
                             } else {
                                 self.logic().m.not(set)
                             };
+                            let mode = self.logic().materialized(facts, w);
+                            let g = if mode == Bdd::FALSE {
+                                g
+                            } else {
+                                let t = form(self, &descs);
+                                let full = formed(self, *value, t).bits.unwrap();
+                                self.logic().m.ite(mode, full, g)
+                            };
                             Desc {
                                 same: None,
                                 bits: Some(g),
@@ -1314,14 +1347,11 @@ impl Explore<'_, '_> {
                     outputs,
                     ..
                 } => {
-                    let g = if self.proof.kept.queries.contains(&outputs[0].0) {
-                        // Kept, the query answers over whichever lanes are at
-                        // it, which the programs apart do not agree on.
-                        self.fresh(side, outputs[0].0)
-                    } else {
-                        let bit = bits_of(self, &descs, inputs[0]);
-                        self.answer(side, outputs[0].0, bit, cond)
-                    };
+                    let local = self.logic().local(outputs[0].0);
+                    let bit = bits_of(self, &descs, inputs[0]);
+                    let answer = self.answer(side, outputs[0].0, bit, cond);
+                    let wave = self.fresh(side, outputs[0].0);
+                    let g = self.logic().m.ite(local, answer, wave);
                     descs.insert(
                         outputs[0].0,
                         Desc {
@@ -1380,8 +1410,7 @@ impl Explore<'_, '_> {
                 } => {
                     let pred = bits_of(self, &descs, inputs[2]);
                     if self.decide(pred, cond, side) != Some(false) {
-                        let assume = self.assume;
-                        return Err(self.proof.refuse(
+                        self.proof.require(
                             x,
                             index,
                             if side == WAVE {
@@ -1389,8 +1418,8 @@ impl Explore<'_, '_> {
                             } else {
                                 "the lane program may store while the programs are apart"
                             },
-                            assume,
-                        ));
+                            cond,
+                        )?;
                     }
                     for &(v, _) in outputs {
                         let d = formed(self, v, None);
@@ -1477,6 +1506,16 @@ impl Explore<'_, '_> {
             } else {
                 cond
             };
+            let differs = if ty == Ty::I32
+                && facts.lane_word[param.0]
+                && !(w.same.is_some() && w.same == l.same)
+            {
+                let mode = self.logic().materialized(facts, param);
+                let full = self.logic().m.and(cond, mode);
+                self.logic().m.or(differs, full)
+            } else {
+                differs
+            };
             contributions.push(differs);
         }
         let entry = arrivals
@@ -1488,8 +1527,8 @@ impl Explore<'_, '_> {
             }
             let joint = self.logic().m.and(c, relation);
             let logic = &mut *self.proof.logic;
-            // Query markers identify the transformation, not a block-local
-            // value. Quantifying them would lose the cause of the difference.
+            // Conversion choices are shared across all blocks and lanes.
+            // Quantify execution state here, never policy variables.
             let foreign: Vec<u32> = logic
                 .support(joint)
                 .into_iter()

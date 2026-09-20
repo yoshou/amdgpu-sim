@@ -29,6 +29,7 @@ pub(crate) struct Manager {
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
     ite: HashMap<(Bdd, Bdd, Bdd), Bdd>,
     restrict: HashMap<(Bdd, Bdd), Bdd>,
+    implications: HashMap<(Bdd, Bdd), bool>,
 }
 
 impl Manager {
@@ -43,6 +44,7 @@ impl Manager {
             unique: HashMap::new(),
             ite: HashMap::new(),
             restrict: HashMap::new(),
+            implications: HashMap::new(),
         }
     }
 
@@ -170,8 +172,23 @@ impl Manager {
     }
 
     pub fn implies(&mut self, f: Bdd, g: Bdd) -> bool {
-        let ng = self.not(g);
-        self.and(f, ng) == Bdd::FALSE
+        if f == Bdd::FALSE || g == Bdd::TRUE || f == g {
+            return true;
+        }
+        if f == Bdd::TRUE || g == Bdd::FALSE {
+            return false;
+        }
+        if let Some(&result) = self.implications.get(&(f, g)) {
+            return result;
+        }
+        // Decide inclusion directly. Constructing f AND NOT g can build a
+        // large product only to learn that a single counterexample exists.
+        let var = self.top(f).min(self.top(g));
+        let (f0, f1) = self.cofactors(f, var);
+        let (g0, g1) = self.cofactors(g, var);
+        let result = self.implies(f0, g0) && self.implies(f1, g1);
+        self.implications.insert((f, g), result);
+        result
     }
 
     fn quantify(&mut self, f: Bdd, chosen: &dyn Fn(u32) -> bool, any: bool) -> Bdd {
@@ -268,6 +285,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn implication_matches_every_two_variable_truth_table_without_building_nodes() {
+        let mut m = Manager::new();
+        let x = m.var(0);
+        let y = m.var(1);
+        let functions: Vec<_> = (0..16u32)
+            .map(|table| {
+                let bit = |n: u32| Manager::constant(table & (1u32 << n) != 0u32);
+                let low = m.ite(y, bit(1), bit(0));
+                let high = m.ite(y, bit(3), bit(2));
+                m.ite(x, high, low)
+            })
+            .collect();
+        let nodes = m.nodes.len();
+        for (a, &f) in functions.iter().enumerate() {
+            for (b, &g) in functions.iter().enumerate() {
+                assert_eq!(m.implies(f, g), a & !b == 0, "tables {a} => {b}");
+            }
+        }
+        assert_eq!(m.nodes.len(), nodes);
+    }
+
+    #[test]
     fn equal_functions_share_one_handle() {
         let mut m = Manager::new();
         let (a, b) = (m.var(0), m.var(1));
@@ -316,7 +355,11 @@ mod tests {
         let nc = m.not(c);
         let taken = m.and(mask, c);
         let other = m.and(mask, nc);
-        assert_eq!(m.restrict(taken, mask), c, "the two arms of a branch differ only in c");
+        assert_eq!(
+            m.restrict(taken, mask),
+            c,
+            "the two arms of a branch differ only in c"
+        );
         assert_eq!(m.restrict(other, mask), nc);
         let cd = m.and(c, d);
         let inner = m.and(mask, cd);
@@ -326,7 +369,10 @@ mod tests {
         let chosen = m.restrict(outer, care);
         let agreed = m.and(chosen, care);
         let expected = m.and(outer, care);
-        assert_eq!(agreed, expected, "restrict agrees with the function on the care set");
+        assert_eq!(
+            agreed, expected,
+            "restrict agrees with the function on the care set"
+        );
         assert!(!m.support(chosen).contains(&0));
         assert_eq!(m.restrict(taken, Bdd::FALSE), taken);
     }

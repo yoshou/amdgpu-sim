@@ -6,16 +6,12 @@
 //! own, so the lockstep lowering can rebuild the masks from its control flow
 //! and skip what no lane needs.
 //!
-//! Every query of the wave -- `any`, a ballot, a test of a ballot word, a
-//! read of the first lane -- is first answered from the lane's own bit. The
-//! [`proof`] checks that every store then happens, and writes, what the wave
-//! stores for that lane. Where a store depends on how another lane answered,
-//! the proof names the queries at fault and they are *kept*: the lane program
-//! asks them of the lanes that are at them, which is what the wave answers
-//! when the lanes that are not at them hold no bit of the question. An
-//! operation that exchanges values between lanes, a barrier and a fence are
-//! kept as they are; the lowering refuses a program where lanes may be
-//! elsewhere at one of them, and the program then runs as a wave program.
+//! Dataflow analysis identifies live conversion choices and whole-word uses.
+//! The [`proof`] interprets keeping and localizing each choice conditionally,
+//! checks observable effects once, and selects a safe policy that prefers
+//! local answers. No failed candidate restarts the proof. Exchanges, barriers
+//! and fences remain collective operations; their participation requirements
+//! also pass to the lowering, which may refuse and use the wave program.
 //!
 //! [`super::lockstep`] lowers the lane program into packets, with the kept
 //! operations answered over the wave -- inside the packet where it holds the
@@ -23,6 +19,7 @@
 
 mod fold;
 mod logic;
+mod policy;
 mod proof;
 mod rewrite;
 
@@ -30,7 +27,6 @@ use crate::rdna_spmd::analysis::facts;
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::LiftedFunction;
 use crate::rdna_spmd::refusal::Refusal;
-use logic::Kept;
 use std::collections::BTreeSet;
 
 /// A lane program and the provenances of collective operations the lowering
@@ -74,48 +70,17 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Result<Lane, Refusal> {
     let exec_index = function.parameter_inputs.iter().position(
         |p| matches!(p.source, crate::rdna_spmd::program::ParameterSource::MaskBit(r) if r == exec),
     );
-    // Every query is answered from the lane's own bit until the proof names
-    // one whose answer the wave must give; each round keeps more, so the
-    // rounds end.
-    let mut kept = Kept::default();
-    let (facts, everyone) = loop {
-        let facts = facts::Facts::new(f, &function.parameter_inputs, &kept.words);
-        let mut logic = logic::Logic::new(f, &facts, &kept.queries);
-        match proof::prove(
-            f,
-            &facts,
-            &mut logic,
-            &function.parameter_inputs,
-            exec_index,
-            &kept,
-        ) {
-            Ok(everyone) => break (facts, everyone),
-            Err(refusal) if !refusal.keep.is_empty() => {
-                let before = kept.clone();
-                for v in refusal.keep {
-                    match facts.inst(f, v) {
-                        Some(Inst::Effect {
-                            op: EffectOp::Wave(WaveOp::Any),
-                            ..
-                        }) => {
-                            kept.queries.insert(v);
-                        }
-                        Some(Inst::Core {
-                            op: Op::Cmp(_, a, b),
-                            ..
-                        }) => {
-                            let word = logic::lane_test(f, &facts, *a, *b)
-                                .expect("a marked test is a test of a lane word");
-                            kept.words.insert(word);
-                        }
-                        other => unreachable!("a marker names a query, not {:?}", other),
-                    }
-                }
-                assert!(kept != before, "the proof named queries it already keeps");
-            }
-            Err(refusal) => return Err(refusal),
-        }
-    };
+    let facts = facts::Facts::new(f, &function.parameter_inputs, &BTreeSet::new());
+    let mut logic = logic::Logic::policies(f, &facts);
+    let (kept, everyone) = proof::prove(
+        f,
+        &facts,
+        &mut logic,
+        &function.parameter_inputs,
+        exec_index,
+    )?;
+    drop(logic);
+    let facts = facts::Facts::new(f, &function.parameter_inputs, &kept.words);
     if std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() {
         eprintln!(
             "; the lane program keeps {} queries and {} words",
@@ -440,6 +405,67 @@ mod tests {
     }
 
     #[test]
+    fn independent_queries_can_choose_different_policies() {
+        let wave = parsed(
+            "func entry b0
+             b0(v0: i32, v1: i32, v2: i32, v3: i1):
+               v4: i32 = const i32 0x0
+               v5: i1 = cmp ne v0, v4
+               v6: i1 = effect !p0 wave any (v5)
+               v7: i1 = effect !p1 wave any (v5)
+               v8: i32 = const i32 0x1
+               v9: i32 = select v6, v8, v4
+               v10: i32 = select v7, v8, v4
+               v11: i64 = pack64 v1, v2
+               v12: i1 = int and v3, v5
+               effect !p2 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v11, v9, v3)
+               effect !p3 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v11, v10, v12)
+               ret",
+        );
+        let lane = decompile(&wave).expect("one query needs the wave, the guarded query does not");
+        assert_eq!(kept_wave_ops(&lane.function), vec![WaveOp::Any]);
+        assert!(lane
+            .function
+            .ir
+            .blocks
+            .values()
+            .flat_map(|b| &b.insts)
+            .any(|inst| {
+                matches!(
+                    inst,
+                    Inst::Effect {
+                        provenance: 0,
+                        op: EffectOp::Wave(WaveOp::Any),
+                        ..
+                    }
+                )
+            }));
+    }
+
+    #[test]
+    fn keeping_a_query_accounts_for_its_localized_input() {
+        let wave = parsed(
+            "func entry b0
+             b0(v0: i32, v1: i32, v2: i32, v3: i1):
+               v4: i32 = const i32 0x0
+               v5: i1 = cmp ne v0, v4
+               v6: i1 = effect !p0 wave any (v5)
+               v7: i1 = int xor v6, v5
+               v8: i1 = effect !p1 wave any (v7)
+               v9: i32 = const i32 0x1
+               v10: i32 = select v8, v9, v4
+               v11: i64 = pack64 v1, v2
+               effect !p2 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v11, v10, v3)
+               ret",
+        );
+        let lane = decompile(&wave).expect("dependent queries remain collective");
+        assert_eq!(
+            kept_wave_ops(&lane.function),
+            vec![WaveOp::Any, WaveOp::Any]
+        );
+    }
+
+    #[test]
     fn a_materialized_mask_in_an_unselected_arm_does_not_change_a_store() {
         for arms in ["v3, v7, v6", "v10, v6, v7"] {
             let wave = parsed(&format!(
@@ -456,14 +482,20 @@ mod tests {
                    effect !p1 memory store.b32 global cu relaxed temporal volatile=0 deferred=0 (v9, v8, v3)
                    ret"
             ));
-            decompile(&wave).unwrap_or_else(|e| panic!("the active store always writes 7: {:?}", e));
+            decompile(&wave)
+                .unwrap_or_else(|e| panic!("the active store always writes 7: {:?}", e));
             let mut used = wave.clone();
             for inst in &mut used.ir.blocks.get_mut(&used.ir.entry).unwrap().insts {
                 if let Inst::Effect {
-                    op: EffectOp::Memory { op: MemoryOp::Store(_), .. },
+                    op:
+                        EffectOp::Memory {
+                            op: MemoryOp::Store(_),
+                            ..
+                        },
                     inputs,
                     ..
-                } = inst {
+                } = inst
+                {
                     inputs[1] = ValueId(6);
                 }
             }
@@ -475,13 +507,34 @@ mod tests {
 
     #[test]
     #[ignore = "whole-kernel proof; run explicitly with --release --ignored"]
+    fn smallpt_is_entirely_lane_local() {
+        use crate::rdna_spmd::targets::rdna4::decode::{load_object, OBJECTS};
+        let &(path, symbol) = OBJECTS
+            .iter()
+            .find(|(path, _)| *path == "examples/smallpt/kernel_gfx1200.o")
+            .unwrap();
+        let (entry, memory) = load_object(path, symbol);
+        let program = crate::rdna_spmd::decode_program("gfx1200", entry, &memory).unwrap();
+        let lane = decompile(&program.to_ssa().function).expect("smallpt decompiles");
+        assert!(
+            kept_wave_ops(&lane.function).is_empty(),
+            "smallpt must keep no wave operation"
+        );
+        assert!(
+            lane.everyone.is_empty(),
+            "smallpt needs no collective rendezvous"
+        );
+    }
+
+    #[test]
+    #[ignore = "whole-kernel proof; run explicitly with --release --ignored"]
     fn shipped_kernels_decompile() {
         use crate::rdna_spmd::targets::rdna4::decode::{load_object, OBJECTS};
         for &(path, symbol) in OBJECTS {
             let (entry, memory) = load_object(path, symbol);
             let program = crate::rdna_spmd::decode_program("gfx1200", entry, &memory).unwrap();
-            let lane = decompile(&program.to_ssa().function)
-                .unwrap_or_else(|e| panic!("{}: {}", path, e));
+            let lane =
+                decompile(&program.to_ssa().function).unwrap_or_else(|e| panic!("{}: {}", path, e));
             if path == "examples/raytracing/kernel_gfx1200.o" {
                 compile_lockstep(&lane, 256, 8, Some(8))
                     .unwrap_or_else(|e| panic!("raytracing lane lowering: {}", e));
@@ -585,18 +638,30 @@ mod tests {
         // to retain the controlling any. This lane branch leaves lanes out.
         let mut lane = Lane::from(wave);
         lane.everyone.insert(1);
-        let entry = lane.function.ir.blocks
-            .get_mut(&lane.function.ir.entry).unwrap();
-        let bit = entry.insts.iter().find_map(|inst| match inst {
-            Inst::Effect {
-                op: EffectOp::Wave(WaveOp::Any), inputs, ..
-            } => Some(inputs[0]),
-            _ => None,
-        }).unwrap();
+        let entry = lane
+            .function
+            .ir
+            .blocks
+            .get_mut(&lane.function.ir.entry)
+            .unwrap();
+        let bit = entry
+            .insts
+            .iter()
+            .find_map(|inst| match inst {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any),
+                    inputs,
+                    ..
+                } => Some(inputs[0]),
+                _ => None,
+            })
+            .unwrap();
         if let Term::CondBr { cond, .. } = &mut entry.term {
             *cond = bit;
         }
-        lane.function.ir.one_region(lane.function.ir.presence_needed());
+        lane.function
+            .ir
+            .one_region(lane.function.ir.presence_needed());
         lane.function.ir.compact();
         assert!(
             compile_lockstep(&lane, 256, 8, None).is_err(),
