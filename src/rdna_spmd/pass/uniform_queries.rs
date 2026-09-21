@@ -1,6 +1,5 @@
 use super::super::analysis::Analyses;
 use super::super::ir::*;
-use super::super::program::{Parameter, ParameterSource};
 use super::Pass;
 
 struct Facts<'a> {

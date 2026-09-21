@@ -598,8 +598,8 @@ impl Shape {
 
     fn of(op: I, registry: &DialectRegistry) -> Shape {
         let cvt = conversion(op);
-        let target = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, op)
-            .or_else(|| crate::rdna_spmd::targets::rdna4::dialect::binary(registry, op));
+        let target = crate::rdna_spmd::rdna4::dialect::unary(registry, op)
+            .or_else(|| crate::rdna_spmd::rdna4::dialect::binary(registry, op));
         let float_ty =
             float_type(op).or_else(|| target.map(|id| registry.operation(id).unwrap().inputs[0]));
         let ty = cvt.map(|x| x.0).or(float_ty).unwrap_or(Ty::I32);

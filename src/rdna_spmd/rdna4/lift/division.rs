@@ -5,7 +5,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         if !matches!(i.op, I::V_DIV_SCALE_F32 | I::V_DIV_SCALE_F64) {
             return None;
         }
-        let target = crate::rdna_spmd::targets::rdna4::dialect::division(registry, i.op)?;
+        let target = crate::rdna_spmd::rdna4::dialect::division(registry, i.op)?;
         let ty = registry.operation(target).unwrap().inputs[0];
         let mut b = Builder::new(
             registry,
@@ -25,7 +25,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
     let InstFormat::VOP3(i) = inst else {
         return None;
     };
-    let target = crate::rdna_spmd::targets::rdna4::dialect::division(registry, i.op)?;
+    let target = crate::rdna_spmd::rdna4::dialect::division(registry, i.op)?;
     let spec = registry.operation(target).unwrap();
     let ty = spec.inputs[0];
     let mut inputs = vec![input(i.src0, ty), input(i.src1, ty), input(i.src2, ty)];

@@ -312,7 +312,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                     Ty::F64
                 };
                 let a = b.push(float, Op::Convert(Cvt::Bitcast, float, a));
-                let target = crate::rdna_spmd::targets::rdna4::dialect::comparison(registry, float);
+                let target = crate::rdna_spmd::rdna4::dialect::comparison(registry, float);
                 b.target_one(target, Arguments::Binary([a, c]))
             }
         }

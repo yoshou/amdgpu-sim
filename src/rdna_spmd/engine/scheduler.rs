@@ -6,9 +6,10 @@ use super::super::ir::EffectOp;
 use super::dispatch::{setup_sgprs, GridDims};
 use super::fiber::{Fiber, KernelArgs};
 use super::kernel::{
-    Kernel, Region, Scheduler, DONE, ENTER, LEAVE, SGPR_BUF,
+    Kernel, Region, Scheduler, SGPR_BUF,
 };
-use super::yields::YieldValues;
+use super::super::codegen::yields::YieldValues;
+use super::super::codegen::{DONE, ENTER, LEAVE};
 
 const WAVE: usize = 32;
 

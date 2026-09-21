@@ -1,9 +1,9 @@
 use super::regs::{footprint, words as register_words, Word, Words};
 use super::*;
-use crate::rdna_spmd::targets::rdna4::decode::{ScalarProgram, Terminator};
+use crate::rdna_spmd::rdna4::decode::{ScalarProgram, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::rdna_spmd::program::{Program, Parameter, ParameterSource};
+use crate::rdna_spmd::program::Program;
 pub(in crate::rdna_spmd) fn lift(
     registry: std::sync::Arc<DialectRegistry>,
     program: &ScalarProgram,

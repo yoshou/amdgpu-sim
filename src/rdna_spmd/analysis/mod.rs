@@ -9,9 +9,9 @@ pub(in crate::rdna_spmd) mod masks;
 pub(super) mod memory;
 pub(in crate::rdna_spmd) mod uniformity;
 
-use super::dialect::DialectRegistry;
+use super::ir::DialectRegistry;
 use super::ir::Func;
-use super::program::Parameter;
+use super::ir::Parameter;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -38,6 +38,11 @@ pub(crate) struct Context<'r> {
 }
 
 impl<'r> Context<'r> {
+    pub fn of(registry: &'r DialectRegistry, inputs: &'r [Parameter], lanes: u32) -> Self {
+        let exec = super::ir::exec_index(inputs, registry.registers().exec);
+        Self::new(registry, inputs, exec, lanes)
+    }
+
     pub fn new(
         registry: &'r DialectRegistry,
         inputs: &'r [Parameter],

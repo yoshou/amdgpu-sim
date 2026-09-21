@@ -1,14 +1,16 @@
 pub(super) mod memory;
 pub(super) mod ops;
+pub(super) mod prepare;
 pub(super) mod region;
 pub(super) mod wave;
+pub(super) mod wmma;
+pub(super) mod yields;
 
 use std::collections::BTreeMap;
 
 use super::analysis::Access;
 use super::ir::{Cvt, Env, IntOp, Op, Ty, ValueId, *};
 use super::native::{Atomic, BasicBlock, Builder, Type, Value};
-use super::program::{Parameter, ParameterSource};
 use ops::Emitter;
 use std::rc::Rc;
 
@@ -19,8 +21,62 @@ pub(super) struct Cluster {
     pub tile: u32,
 }
 
+pub(in crate::rdna_spmd) const DONE: u64 = u64::MAX;
+
+pub(in crate::rdna_spmd) const ENTER: u64 = 1 << 32;
+
+pub(in crate::rdna_spmd) const LEAVE: u64 = 1 << 33;
+
+pub(in crate::rdna_spmd) const YIELD: &str = "amdgpu_sim_fiber_yield_values";
+
+pub(super) fn lane_word(
+    definitions: &[Option<Op>],
+    uniform: &[bool],
+    shifted: ValueId,
+) -> Option<ValueId> {
+    match definitions[shifted.0] {
+        Some(Op::Int(IntOp::LShr, word, lane))
+            if matches!(definitions[lane.0], Some(Op::Env(Env::LaneId))) && uniform[word.0] =>
+        {
+            Some(word)
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn queried_word(
+    definitions: &[Option<Op>],
+    uniform: &[bool],
+    input: ValueId,
+) -> Option<(ValueId, bool)> {
+    let (bit, valid) = match definitions[input.0] {
+        Some(Op::Int(IntOp::And, a, b))
+            if matches!(definitions[b.0], Some(Op::Env(Env::ValidLane))) =>
+        {
+            (a, true)
+        }
+        Some(Op::Int(IntOp::And, a, b))
+            if matches!(definitions[a.0], Some(Op::Env(Env::ValidLane))) =>
+        {
+            (b, true)
+        }
+        _ => (input, false),
+    };
+    let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = definitions[bit.0] else {
+        return None;
+    };
+    Some((lane_word(definitions, uniform, shifted)?, valid))
+}
+
+pub(super) fn scalar_values(p: &Prepared) -> Vec<bool> {
+    let scalars = std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1");
+    (0..p.ir.func().types.len())
+        .map(|v| p.uniform[v] && scalars)
+        .collect()
+}
+
 pub(super) struct Prepared {
-    pub registry: std::sync::Arc<super::dialect::DialectRegistry>,
+    pub registry: std::sync::Arc<super::ir::DialectRegistry>,
     pub ir: VerifiedFunc,
     pub inputs: Vec<Parameter>,
     pub width: u32,
@@ -30,14 +86,14 @@ pub(super) struct Prepared {
     pub accesses: Rc<Vec<Access>>,
     pub shapes: Vec<memory::Shape>,
     pub clusters: BTreeMap<usize, Cluster>,
-    pub yields: BTreeMap<u64, super::engine::yields::YieldValues>,
+    pub yields: BTreeMap<u64, yields::YieldValues>,
     pub groups: Vec<Vec<u64>>,
     pub min_private_bytes: usize,
     pub num_vgprs: usize,
 }
 
 impl Prepared {
-    pub fn resume_layouts(&self) -> Vec<Vec<super::engine::yields::YieldValues>> {
+    pub fn resume_layouts(&self) -> Vec<Vec<yields::YieldValues>> {
         self.groups
             .iter()
             .map(|g| g.iter().map(|p| self.yields[p].clone()).collect())
@@ -166,8 +222,9 @@ impl Shared {
         self,
         native: super::native::jit::Module,
         symbol: &str,
+        runtime: &[(&str, u64)],
     ) -> super::native::jit::NativeCode {
-        let mut code = native.optimize().compile(symbol);
+        let mut code = native.optimize().compile(symbol, runtime);
         if let Some((path, _, index)) = self.counts {
             code.block_counts = Some((path, index.len()));
         }
@@ -175,7 +232,12 @@ impl Shared {
     }
 }
 
-pub(super) fn compile_regions(p: &Prepared, name: &str) -> Compiled {
+pub(super) fn compile_regions(
+    p: &Prepared,
+    lowerings: std::sync::Arc<ops::Lowerings>,
+    name: &str,
+    runtime: &[(&str, u64)],
+) -> Compiled {
     let regions = region::Regions::new(p);
     let native = super::native::jit::Module::new(name);
     let shared = Shared::new(native.builder(), p.ir.func());
@@ -183,9 +245,9 @@ pub(super) fn compile_regions(p: &Prepared, name: &str) -> Compiled {
         .map(|r| format!("kernel_{r}"))
         .collect();
     for (r, symbol) in symbols.iter().enumerate() {
-        emit_function(p, native.builder(), symbol, (&regions, r), &shared);
+        emit_function(p, &lowerings, native.builder(), symbol, (&regions, r), &shared);
     }
-    let code = shared.finish(native, &symbols[0]);
+    let code = shared.finish(native, &symbols[0], runtime);
     let compiled = symbols
         .iter()
         .enumerate()
@@ -204,6 +266,7 @@ pub(super) fn compile_regions(p: &Prepared, name: &str) -> Compiled {
 
 fn emit_function(
     p: &Prepared,
+    lowerings: &std::sync::Arc<ops::Lowerings>,
     ir: Builder,
     symbol: &str,
     scope: (&region::Regions, usize),
@@ -230,10 +293,10 @@ fn emit_function(
         ir.select(sized, aperture, scratch_base)
     };
     let sink = ir.array_alloca(i32t, ir.ci32(10), "");
-    let mut em = Emitter::new(ir, Some(p.width), p.registry.clone());
-    em.state = p.registry.lowering_state(&em, sink);
-    let mut sem = Emitter::new(ir, None, p.registry.clone());
-    sem.state = p.registry.lowering_state(&sem, sink);
+    let mut em = Emitter::new(ir, Some(p.width), p.registry.clone(), lowerings.clone());
+    em.state = lowerings.state(&em, sink);
+    let mut sem = Emitter::new(ir, None, p.registry.clone(), lowerings.clone());
+    sem.state = lowerings.state(&sem, sink);
     em.scratch = Some((scratch_base_scalar, scratch_stride));
     sem.scratch = em.scratch;
     let cells = p
@@ -287,7 +350,7 @@ fn emit_function(
         bbs: BTreeMap::new(),
         phis: BTreeMap::new(),
         incoming: BTreeMap::new(),
-        param_scalar: region::scalar_values(p),
+        param_scalar: scalar_values(p),
         types: f.types.clone(),
         definitions,
         access_at,
@@ -372,7 +435,7 @@ fn emit_function(
 }
 
 impl<'a> Cg<'a> {
-    fn regs(&self) -> super::dialect::Registers {
+    fn regs(&self) -> super::ir::Registers {
         self.p.registry.registers()
     }
 
@@ -641,10 +704,10 @@ impl<'a> Cg<'a> {
             Term::Ret(args) => {
                 assert!(args.is_empty(), "a packet program returns no register");
                 let left = match self.region {
-                    0 => super::engine::kernel::DONE,
+                    0 => DONE,
                     _ => {
                         let exit = self.regions.exit(self.region, id, None);
-                        super::engine::kernel::LEAVE | exit as u64
+                        LEAVE | exit as u64
                     }
                 };
                 self.ir.ret(self.ci64(left));
@@ -658,30 +721,7 @@ impl<'a> Cg<'a> {
 
     fn any_of_word(&mut self, input: ValueId) -> Option<Value> {
         let w = self.p.width;
-        let (bit, valid) = match self.definitions[input.0] {
-            Some(Op::Int(IntOp::And, a, b))
-                if matches!(self.definitions[b.0], Some(Op::Env(Env::ValidLane))) =>
-            {
-                (a, true)
-            }
-            Some(Op::Int(IntOp::And, a, b))
-                if matches!(self.definitions[a.0], Some(Op::Env(Env::ValidLane))) =>
-            {
-                (b, true)
-            }
-            _ => (input, false),
-        };
-        let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = self.definitions[bit.0] else {
-            return None;
-        };
-        let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shifted.0] else {
-            return None;
-        };
-        if !matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId)))
-            || !self.p.uniform[word.0]
-        {
-            return None;
-        }
+        let (word, valid) = queried_word(&self.definitions, &self.p.uniform, input)?;
         let word = self.scalar(word);
         let word = self.lane_base_word(word);
         let mut bits = self.ir.and(word, self.ci32(((1u64 << w) - 1) as u32));
@@ -776,16 +816,12 @@ impl<'a> Cg<'a> {
             }
         }
         if let Op::Convert(Cvt::Trunc, Ty::I1, shift) = op {
-            if let Some(Op::Int(IntOp::LShr, word, lane)) = self.definitions[shift.0] {
-                if matches!(self.definitions[lane.0], Some(Op::Env(Env::LaneId)))
-                    && self.p.uniform[word.0]
-                {
-                    let w = self.scalar(word);
-                    let w = self.lane_base_word(w);
-                    let out = self.mask_to_vec(w);
-                    self.define(value, out);
-                    return;
-                }
+            if let Some(word) = lane_word(&self.definitions, &self.p.uniform, shift) {
+                let w = self.scalar(word);
+                let w = self.lane_base_word(w);
+                let out = self.mask_to_vec(w);
+                self.define(value, out);
+                return;
             }
         }
         if let Op::Select(_, a, b) = op {

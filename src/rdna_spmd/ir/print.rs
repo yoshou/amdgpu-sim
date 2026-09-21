@@ -1,5 +1,5 @@
 use super::*;
-use crate::rdna_spmd::dialect::{DialectRegistry, TargetOp};
+use crate::rdna_spmd::ir::{DialectRegistry, TargetOp};
 use std::fmt::Write;
 
 pub(crate) fn ty(t: Ty) -> &'static str {

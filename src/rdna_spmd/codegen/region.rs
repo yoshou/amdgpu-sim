@@ -23,13 +23,6 @@ pub(super) struct Regions {
 
 pub(super) const FRAME_BASE: u32 = 16;
 
-pub(super) fn scalar_values(p: &Prepared) -> Vec<bool> {
-    let scalars = std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1");
-    (0..p.ir.func().types.len())
-        .map(|v| p.uniform[v] && scalars)
-        .collect()
-}
-
 fn outputs(inst: &Inst, mut f: impl FnMut(ValueId)) {
     match inst {
         Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
@@ -57,14 +50,6 @@ fn unseen_uses(
     definitions: &[Option<Op>],
 ) -> BTreeMap<(BlockId, usize), Vec<ValueId>> {
     let f = p.ir.func();
-    let lane_word = |shifted: ValueId| match definitions[shifted.0] {
-        Some(Op::Int(IntOp::LShr, word, lane))
-            if matches!(definitions[lane.0], Some(Op::Env(Env::LaneId))) =>
-        {
-            Some(word)
-        }
-        _ => None,
-    };
     let mut unseen: BTreeMap<(BlockId, usize), Vec<ValueId>> = BTreeMap::new();
     for (&id, block) in &f.blocks {
         for (index, inst) in block.insts.iter().enumerate() {
@@ -72,25 +57,9 @@ fn unseen_uses(
                 Inst::Core {
                     op: Op::Convert(Cvt::Trunc, Ty::I1, shifted),
                     ..
-                } => lane_word(*shifted),
+                } => lane_word(definitions, &p.uniform, *shifted),
                 Inst::Packet { input, .. } => {
-                    let bit = match definitions[input.0] {
-                        Some(Op::Int(IntOp::And, a, b))
-                            if matches!(definitions[b.0], Some(Op::Env(Env::ValidLane))) =>
-                        {
-                            a
-                        }
-                        Some(Op::Int(IntOp::And, a, b))
-                            if matches!(definitions[a.0], Some(Op::Env(Env::ValidLane))) =>
-                        {
-                            b
-                        }
-                        _ => *input,
-                    };
-                    match definitions[bit.0] {
-                        Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => lane_word(shifted),
-                        _ => None,
-                    }
+                    queried_word(definitions, &p.uniform, *input).map(|(word, _)| word)
                 }
                 _ => None,
             };
@@ -103,9 +72,7 @@ fn unseen_uses(
         let list = unseen
             .entry((access.block, access.effects[0]))
             .or_default();
-        list.extend([access.base, access.address, access.mask]);
-        list.extend(access.inside);
-        list.extend(access.data.iter().copied());
+        list.extend(access.reads());
     }
     unseen
 }
@@ -386,7 +353,7 @@ impl<'a> Cg<'a> {
         for ((&param, &slot), &value) in params.iter().zip(&slots).zip(&values) {
             self.store_value(param, value, slot);
         }
-        ir.ret(self.ci64(super::super::engine::kernel::LEAVE | exit as u64));
+        ir.ret(self.ci64(LEAVE | exit as u64));
         ir.position_at_end(here);
         leave
     }
@@ -438,8 +405,8 @@ impl<'a> Cg<'a> {
             self.store_value(v, value, slot);
         }
         let ty = ir.void().function(&[ir.ptr(), ir.i64(), ir.ptr()]);
-        let function = ir.function("amdgpu_sim_fiber_yield_values", ty);
-        let enter = super::super::engine::kernel::ENTER | ordinal as u64;
+        let function = ir.function(YIELD, ty);
+        let enter = ENTER | ordinal as u64;
         ir.call(
             ty,
             function,
@@ -484,11 +451,11 @@ impl<'a> Cg<'a> {
             }
             _ if self.region == 0 => {
                 assert!(exit.to.is_none(), "an edge leaves the outermost region");
-                ir.ret(self.ci64(super::super::engine::kernel::DONE));
+                ir.ret(self.ci64(DONE));
             }
             _ => {
                 let outer = regions.exit(self.region, exit.from, exit.edge);
-                ir.ret(self.ci64(super::super::engine::kernel::LEAVE | outer as u64));
+                ir.ret(self.ci64(LEAVE | outer as u64));
             }
         }
     }

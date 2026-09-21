@@ -45,6 +45,12 @@ pub(crate) struct Access {
 }
 
 impl Access {
+    pub fn reads(&self) -> impl Iterator<Item = ValueId> + '_ {
+        IntoIterator::into_iter([self.base, self.address, self.mask])
+            .chain(self.inside)
+            .chain(self.data.iter().copied())
+    }
+
     pub fn size(&self) -> MemSize {
         match self.op {
             MemoryOp::Load(s) | MemoryOp::Store(s) => s,

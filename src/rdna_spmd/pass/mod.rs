@@ -7,7 +7,7 @@ pub(crate) mod simplify;
 pub(crate) mod uniform_queries;
 
 use super::analysis::{Analyses, Preserved};
-use super::dialect::DialectRegistry;
+use super::ir::DialectRegistry;
 use super::ir::Func;
 
 pub(crate) trait Pass: Send + Sync {

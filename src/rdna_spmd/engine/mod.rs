@@ -1,6 +1,6 @@
 pub(super) mod barrier;
 pub(super) mod dispatch;
-pub mod fiber;
+pub(super) mod fiber;
 pub(super) mod kernel;
 pub(super) mod scheduler;
 pub(super) mod wmma;

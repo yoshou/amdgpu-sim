@@ -533,10 +533,10 @@ pub(super) fn branch(
     insts: &mut Vec<Inst>,
     words: &Words,
     scc: ValueId,
-    cond: crate::rdna_spmd::targets::rdna4::decode::Cond,
+    cond: crate::rdna_spmd::rdna4::decode::Cond,
 ) -> ValueId {
     use crate::rdna_spmd::ir::Inst;
-    use crate::rdna_spmd::targets::rdna4::decode::Cond;
+    use crate::rdna_spmd::rdna4::decode::Cond;
     let input_value = match cond {
         Cond::Scc0 | Cond::Scc1 => scc,
         Cond::ExecZ | Cond::ExecNz => words[&Word::Mask(126)],

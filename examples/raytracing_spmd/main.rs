@@ -359,11 +359,10 @@ fn main() -> Result<()> {
                     None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
                 };
 
-                // --vec_width=W selects the width-W SPMD path. Default is the
-                // host-aware default_width().
+                // --vec_width=W selects the width-W SPMD path. Default is 16.
                 let vec_w: u32 = match matches.opt_str("vec_width") {
                     Some(s) => s.parse::<u32>().unwrap(),
-                    None => default_width(),
+                    None => 16,
                 };
                 let kernel = compile(&scalar, CompileOptions { width: vec_w, num_vgprs, workgroup_x: Some(block_dim[0]) });
                 let start = Instant::now();

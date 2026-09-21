@@ -3,7 +3,8 @@ use super::super::native::{Builder, Type, Value};
 
 pub(crate) struct Emitter {
     pub(in crate::rdna_spmd) state: Option<Box<dyn std::any::Any>>,
-    registry: std::sync::Arc<super::super::dialect::DialectRegistry>,
+    registry: std::sync::Arc<super::super::ir::DialectRegistry>,
+    lowerings: std::sync::Arc<Lowerings>,
     pub(in crate::rdna_spmd) ir: Builder,
     width: Option<u32>,
     pub(in crate::rdna_spmd) valid_lane: Option<Value>,
@@ -26,10 +27,12 @@ impl Emitter {
     pub fn new(
         ir: Builder,
         width: Option<u32>,
-        registry: std::sync::Arc<super::super::dialect::DialectRegistry>,
+        registry: std::sync::Arc<super::super::ir::DialectRegistry>,
+        lowerings: std::sync::Arc<Lowerings>,
     ) -> Self {
         Self {
             registry,
+            lowerings,
             state: None,
             ir,
             width,
@@ -86,8 +89,8 @@ impl Emitter {
     }
     pub fn target(
         &self,
-        op: super::super::dialect::TargetOp,
-        args: super::super::dialect::Arguments,
+        op: super::super::ir::TargetOp,
+        args: super::super::ir::Arguments,
         values: &[Value],
     ) -> Vec<Value> {
         let spec = self.registry.operation(op).expect("unverified target");
@@ -96,7 +99,7 @@ impl Emitter {
             .iter()
             .map(|id| values[id.0])
             .collect::<Vec<_>>();
-        spec.emit(self, &args)
+        self.lowerings.emit(op, spec.outputs.len(), self, &args)
     }
     pub fn op(&self, ty: Ty, op: Op, values: &[Value]) -> Value {
         let ir = self.ir;
@@ -281,5 +284,42 @@ impl Emitter {
                 }
             }
         }
+    }
+}
+
+pub(crate) enum Implementation {
+    Single(fn(&Emitter, &[Value]) -> Value),
+    Multiple(fn(&Emitter, &[Value]) -> Vec<Value>),
+}
+
+#[derive(Default)]
+pub(crate) struct Lowerings {
+    lower: std::collections::BTreeMap<super::super::ir::TargetOp, Implementation>,
+    state: Option<fn(&Emitter, Value) -> Box<dyn std::any::Any>>,
+}
+
+impl Lowerings {
+    pub fn add(&mut self, op: super::super::ir::TargetOp, lower: Implementation) {
+        self.lower.insert(op, lower);
+    }
+    pub fn set_state(&mut self, prepare: fn(&Emitter, Value) -> Box<dyn std::any::Any>) {
+        self.state = Some(prepare);
+    }
+    pub fn state(&self, emitter: &Emitter, sink: Value) -> Option<Box<dyn std::any::Any>> {
+        self.state.map(|prepare| prepare(emitter, sink))
+    }
+    fn emit(
+        &self,
+        op: super::super::ir::TargetOp,
+        results: usize,
+        emitter: &Emitter,
+        args: &[Value],
+    ) -> Vec<Value> {
+        let values = match self.lower.get(&op).expect("a target operation without a lowering") {
+            Implementation::Single(lower) => vec![lower(emitter, args)],
+            Implementation::Multiple(lower) => lower(emitter, args),
+        };
+        assert_eq!(values.len(), results, "provider result count mismatch");
+        values
     }
 }

@@ -1,5 +1,7 @@
 use crate::instructions::I;
-use crate::rdna_spmd::dialect::{DialectRegistry, Effect, Implementation, Operation, TargetOp};
+use crate::rdna_spmd::dialect::{
+    Dialect, DialectRegistry, Effect, Implementation, Operation, TargetOp,
+};
 use crate::rdna_spmd::ir::{FloatPred, IntPred};
 use crate::rdna_spmd::native::{Type, Value};
 use crate::rdna_spmd::{codegen::ops::Emitter, ir::Ty};
@@ -21,7 +23,7 @@ pub(crate) const REGISTERS: crate::rdna_spmd::dialect::Registers =
         vgprs: 256,
     };
 
-pub(crate) fn register(registry: &mut DialectRegistry) -> Result<(), &'static str> {
+pub(crate) fn register(registry: &mut Dialect) -> Result<(), &'static str> {
     registry.register(
         ID,
         36,
