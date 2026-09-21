@@ -1354,7 +1354,6 @@ impl Emit<'_> {
                 inputs,
                 outputs,
             } => {
-                self.everyone(mask);
                 self.emit_effect(*provenance, *op, inputs, outputs);
             }
             Inst::Effect {
