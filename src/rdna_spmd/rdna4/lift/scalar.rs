@@ -202,7 +202,10 @@ fn float_compare(i: &crate::rdna_instructions::SOPC, registry: &DialectRegistry)
         I::S_CMP_GE_F32 => FloatPred::Oge,
         I::S_CMP_O_F32 => FloatPred::Ord,
         I::S_CMP_U_F32 => FloatPred::Uno,
+        I::S_CMP_NGE_F32 => FloatPred::Ult,
+        I::S_CMP_NLG_F32 => FloatPred::Ueq,
         I::S_CMP_NGT_F32 => FloatPred::Ule,
+        I::S_CMP_NLE_F32 => FloatPred::Ugt,
         I::S_CMP_NEQ_F32 => FloatPred::Une,
         I::S_CMP_NLT_F32 => FloatPred::Uge,
         _ => return None,
@@ -360,25 +363,24 @@ fn float(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         return None;
     };
     let op = match i.op {
-        I::S_ADD_F32 => FloatOp::Add,
-        I::S_SUB_F32 => FloatOp::Sub,
-        I::S_MUL_F32 => FloatOp::Mul,
-        I::S_MIN_NUM_F32 => FloatOp::MinNum,
-        I::S_MAX_NUM_F32 => FloatOp::MaxNum,
-        I::S_FMAC_F32 => FloatOp::Mul,
+        I::S_ADD_F32 => Some(FloatOp::Add),
+        I::S_SUB_F32 => Some(FloatOp::Sub),
+        I::S_MUL_F32 => Some(FloatOp::Mul),
+        I::S_MIN_NUM_F32 => Some(FloatOp::MinNum),
+        I::S_MAX_NUM_F32 => Some(FloatOp::MaxNum),
+        I::S_FMAC_F32 => None,
         _ => return None,
     };
     let ty = Ty::F32;
-    let accumulates = matches!(i.op, I::S_FMAC_F32);
     let mut inputs = vec![input(i.ssrc0, ty), input(i.ssrc1, ty)];
-    if accumulates {
+    if op.is_none() {
         inputs.push(input(SourceOperand::ScalarRegister(i.sdst), ty));
     }
     let mut b = Builder::new(registry, inputs);
-    let mut result = b.push(ty, Op::Float(op, ValueId(0), ValueId(1)));
-    if accumulates {
-        result = b.push(ty, Op::Float(FloatOp::Add, result, ValueId(2)));
-    }
+    let result = match op {
+        Some(op) => b.push(ty, Op::Float(op, ValueId(0), ValueId(1))),
+        None => b.push(ty, Op::Fma(ValueId(0), ValueId(1), ValueId(2))),
+    };
     Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, ty), result)]))
 }
 
