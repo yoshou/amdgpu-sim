@@ -20,6 +20,17 @@ impl NativeCode {
     pub fn address(&self) -> u64 {
         self.address
     }
+    pub fn lookup(&self, symbol: &str) -> u64 {
+        let symbol = CString::new(symbol).unwrap();
+        let mut address = 0u64;
+        unsafe {
+            check(
+                llvm::orc2::lljit::LLVMOrcLLJITLookup(self.jit, &mut address, symbol.as_ptr()),
+                "kernel lookup",
+            );
+        }
+        address
+    }
 }
 impl Drop for NativeCode {
     fn drop(&mut self) {
@@ -96,10 +107,6 @@ impl Module {
 
     pub fn builder(&self) -> super::Builder {
         super::Builder::new(self.ctx, self.module, self.builder)
-    }
-
-    pub fn finish(self) -> NativeCode {
-        self.optimize().compile("kernel")
     }
 
     pub fn optimize(mut self) -> OptimizedModule {
