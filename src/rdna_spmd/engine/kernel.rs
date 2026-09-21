@@ -7,7 +7,7 @@ pub enum Scheduler {
     Workgroup,
 }
 
-pub(crate) struct Region {
+pub struct Region {
     pub address: u64,
     pub scheduler: Scheduler,
     pub children: Vec<usize>,
@@ -15,22 +15,22 @@ pub(crate) struct Region {
 
 pub struct Kernel {
     _code: super::super::native::jit::NativeCode,
-    pub(crate) regions: Vec<Region>,
-    pub(crate) yields: Vec<Vec<super::super::codegen::yields::YieldValues>>,
-    pub(crate) registers: super::super::ir::Registers,
-    pub(crate) frame_words: usize,
-    pub(crate) num_vgprs: usize,
-    pub(crate) min_private_bytes: usize,
-    pub(crate) workgroup_x: Option<u32>,
-    scheduler: Scheduler,
-    width: u32,
+    pub(super) regions: Vec<Region>,
+    pub(super) yields: Vec<Vec<super::super::codegen::YieldValues>>,
+    pub(super) registers: super::super::ir::Registers,
+    pub(super) frame_words: usize,
+    pub(super) num_vgprs: usize,
+    pub(super) min_private_bytes: usize,
+    pub(super) workgroup_x: Option<u32>,
+    pub(super) scheduler: Scheduler,
+    pub(super) width: u32,
 }
 
 impl Kernel {
-    pub(in crate::rdna_spmd) fn new(
+    pub(crate) fn new(
         code: super::super::native::jit::NativeCode,
         regions: Vec<Region>,
-        yields: Vec<Vec<super::super::codegen::yields::YieldValues>>,
+        yields: Vec<Vec<super::super::codegen::YieldValues>>,
         registers: super::super::ir::Registers,
         frame_words: usize,
         num_vgprs: usize,
@@ -53,11 +53,5 @@ impl Kernel {
             scheduler,
             width,
         }
-    }
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-    pub fn scheduler(&self) -> Scheduler {
-        self.scheduler
     }
 }

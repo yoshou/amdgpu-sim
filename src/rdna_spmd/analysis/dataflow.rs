@@ -1,6 +1,6 @@
 use super::super::ir::{ValueId, *};
 
-pub(crate) trait Lattice: Clone + PartialEq {
+pub trait Lattice: Clone + PartialEq {
     fn meet(&self, other: &Self) -> Self;
 }
 
@@ -10,7 +10,7 @@ impl Lattice for bool {
     }
 }
 
-pub(crate) struct Cfg<'f> {
+pub struct Cfg<'f> {
     pub blocks: Vec<&'f Block>,
     pub index: Vec<usize>,
     pub order: Vec<usize>,
@@ -80,7 +80,7 @@ fn descend<L: Lattice>(facts: &mut [L], v: ValueId, next: L, changed: &mut bool)
     }
 }
 
-pub(crate) struct Sparse<'a, 'f, L: Lattice> {
+pub struct Sparse<'a, 'f, L: Lattice> {
     pub cfg: &'a Cfg<'f>,
     pub start: L,
     pub boundary: &'a dyn Fn(ValueId) -> L,
@@ -116,7 +116,7 @@ impl<'a, 'f, L: Lattice> Sparse<'a, 'f, L> {
                 }
                 for inst in &block.insts {
                     let mut outputs = Vec::new();
-                    for_each_output(inst, |v| outputs.push(v));
+                    inst.for_each_output(|v| outputs.push(v));
                     for v in outputs {
                         let fact = (self.transfer)(inst, v, &facts);
                         descend(&mut facts, v, fact, &mut changed);
@@ -128,15 +128,5 @@ impl<'a, 'f, L: Lattice> Sparse<'a, 'f, L> {
             }
         }
         facts
-    }
-}
-pub(super) fn for_each_output(inst: &Inst, mut f: impl FnMut(ValueId)) {
-    match inst {
-        Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
-        Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => {
-            for o in outputs {
-                f(o.0);
-            }
-        }
     }
 }

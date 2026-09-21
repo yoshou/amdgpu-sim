@@ -1,15 +1,15 @@
-use crate::rdna_spmd::analysis::facts::{operands, Facts, Site};
+use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Unit {
+pub enum Unit {
     Block(BlockId),
     Loop(usize),
 }
 
-pub(super) struct Region {
+pub struct Region {
     pub units: Vec<Unit>,
 
     pub children: Vec<Vec<usize>>,
@@ -17,7 +17,7 @@ pub(super) struct Region {
     pub span: Vec<Vec<BlockId>>,
 }
 
-pub(super) struct Structure {
+pub struct Structure {
     pub facts: Facts,
     pub loops: Loops,
     pub rank: BTreeMap<BlockId, usize>,
@@ -62,7 +62,7 @@ impl Structure {
         self.facts.order[self.loops.header(l)]
     }
 
-    pub fn unit(&self, l: Option<usize>, block: BlockId) -> Option<Unit> {
+    fn unit(&self, l: Option<usize>, block: BlockId) -> Option<Unit> {
         if !self.within(l, block) {
             return None;
         }
@@ -293,7 +293,7 @@ fn live(f: &Func, facts: &Facts) -> Vec<bool> {
     let mut used = vec![false; f.types.len()];
     for block in f.blocks.values() {
         for inst in &block.insts {
-            for v in operands(inst) {
+            for v in inst.operands() {
                 used[v.0] = true;
             }
         }

@@ -1,8 +1,7 @@
-use crate::rdna_spmd::analysis::facts::{operands, outputs};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn fold_forwarding(f: &mut Func) -> BTreeMap<ValueId, ValueId> {
+pub fn fold_forwarding(f: &mut Func) -> BTreeMap<ValueId, ValueId> {
     let mut renames: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     let find = |renames: &BTreeMap<ValueId, ValueId>, mut v: ValueId| {
         while let Some(&next) = renames.get(&v) {
@@ -116,7 +115,7 @@ fn rename_term(term: &mut Term, m: &dyn Fn(ValueId) -> ValueId) {
     }
 }
 
-pub(super) fn localize(f: &mut Func) {
+pub fn localize(f: &mut Func) {
     let mut home: Vec<Option<BlockId>> = vec![None; f.types.len()];
     let mut constant: Vec<Option<(Ty, u64)>> = vec![None; f.types.len()];
     let mut defs: BTreeMap<BlockId, BTreeSet<ValueId>> = BTreeMap::new();
@@ -125,12 +124,12 @@ pub(super) fn localize(f: &mut Func) {
         let mut local: BTreeSet<ValueId> = block.params.iter().map(|p| p.0).collect();
         let mut read = BTreeSet::new();
         for inst in &block.insts {
-            for v in operands(inst) {
+            for v in inst.operands() {
                 if !local.contains(&v) {
                     read.insert(v);
                 }
             }
-            for v in outputs(inst) {
+            for v in inst.outputs() {
                 local.insert(v);
             }
             if let Inst::Core {

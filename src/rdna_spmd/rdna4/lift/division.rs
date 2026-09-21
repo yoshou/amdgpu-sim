@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::VOP3SD(i) = inst {
         if !matches!(i.op, I::V_DIV_SCALE_F32 | I::V_DIV_SCALE_F64) {
             return None;

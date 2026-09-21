@@ -6,37 +6,26 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Exit {
+pub struct Exit {
     pub from: BlockId,
     pub edge: Option<usize>,
     pub to: Option<BlockId>,
 }
 
-pub(super) struct Regions {
-    pub entries: Vec<BlockId>,
-    pub children: Vec<Vec<usize>>,
-    pub home: BTreeMap<BlockId, usize>,
+pub struct Regions {
+    entries: Vec<BlockId>,
+    children: Vec<Vec<usize>>,
+    home: BTreeMap<BlockId, usize>,
     inside: Vec<BTreeSet<BlockId>>,
-    pub live: Vec<Vec<ValueId>>,
-    pub rebuilt: Vec<Vec<ValueId>>,
-    pub exits: Vec<Vec<Exit>>,
-    pub frame_words: usize,
+    live: Vec<Vec<ValueId>>,
+    rebuilt: Vec<Vec<ValueId>>,
+    exits: Vec<Vec<Exit>>,
+    frame_words: usize,
     scalar: Vec<bool>,
     width: u32,
 }
 
-pub(super) const FRAME_BASE: u32 = 16;
-
-fn outputs(inst: &Inst, mut f: impl FnMut(ValueId)) {
-    match inst {
-        Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
-        Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => {
-            for o in outputs {
-                f(o.0);
-            }
-        }
-    }
-}
+const FRAME_BASE: u32 = 16;
 
 fn term_uses(term: &Term, mut f: impl FnMut(ValueId)) {
     match term {
@@ -102,7 +91,7 @@ impl Regions {
         let inside: Vec<BTreeSet<BlockId>> = entries
             .iter()
             .map(|&e| {
-                doms.order
+                doms.order()
                     .iter()
                     .copied()
                     .filter(|&b| doms.dominates(e, b))
@@ -128,10 +117,10 @@ impl Regions {
                 let block = &f.blocks[&id];
                 defined.extend(block.params.iter().map(|p| p.0));
                 for (at, inst) in block.insts.iter().enumerate() {
-                    outputs(inst, |v| {
+                    inst.for_each_output(|v| {
                         defined.insert(v);
                     });
-                    super::super::pass::dce::operands(inst, |v| {
+                    inst.for_each_operand(|v| {
                         used.insert(v);
                     });
                     used.extend(unseen.get(&(id, at)).into_iter().flatten().copied());
@@ -206,7 +195,7 @@ impl Regions {
         regions
     }
 
-    pub fn inputs(&self, f: &Func, region: usize) -> Vec<ValueId> {
+    fn inputs(&self, f: &Func, region: usize) -> Vec<ValueId> {
         f.blocks[&self.entries[region]]
             .params
             .iter()
@@ -223,7 +212,7 @@ impl Regions {
         }
     }
 
-    pub fn slots(&self, f: &Func, values: &[ValueId]) -> Vec<u32> {
+    fn slots(&self, f: &Func, values: &[ValueId]) -> Vec<u32> {
         let mut next = FRAME_BASE;
         values
             .iter()
@@ -256,6 +245,18 @@ impl Regions {
             .expect("an edge leaves a region without being one of its exits")
     }
 
+    pub fn count(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn entry(&self, region: usize) -> BlockId {
+        self.entries[region]
+    }
+    pub fn children(&self, region: usize) -> &[usize] {
+        &self.children[region]
+    }
+    pub fn frame_words(&self) -> usize {
+        self.frame_words
+    }
     pub fn own(&self, region: usize) -> BTreeSet<BlockId> {
         self.home
             .iter()
@@ -306,7 +307,7 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn enter_region(&mut self) {
+    pub fn enter_region(&mut self) {
         let regions = self.regions;
         let f = self.p.ir.func();
         let entry = regions.entries[self.region];
@@ -330,7 +331,7 @@ impl<'a> Cg<'a> {
         self.incoming.entry(entry).or_default().push((from, args));
     }
 
-    pub(super) fn leave_region(&mut self, from: BlockId, ordinal: usize, edge: &Edge) -> BasicBlock {
+    pub fn leave_region(&mut self, from: BlockId, ordinal: usize, edge: &Edge) -> BasicBlock {
         let regions = self.regions;
         let f = self.p.ir.func();
         let ir = self.ir;
@@ -354,7 +355,7 @@ impl<'a> Cg<'a> {
         leave
     }
 
-    pub(super) fn emit_child(&mut self, ordinal: usize, child: usize) {
+    pub fn emit_child(&mut self, ordinal: usize, child: usize) {
         let regions = self.regions;
         let f = self.p.ir.func();
         let ir = self.ir;

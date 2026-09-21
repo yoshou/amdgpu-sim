@@ -42,7 +42,7 @@ impl Block<'_> {
     }
 }
 
-pub(super) fn rename(f: &mut Func, map: &std::collections::BTreeMap<ValueId, ValueId>) {
+pub fn rename(f: &mut Func, map: &std::collections::BTreeMap<ValueId, ValueId>) {
     if map.is_empty() {
         return;
     }
@@ -83,7 +83,7 @@ pub(super) fn rename(f: &mut Func, map: &std::collections::BTreeMap<ValueId, Val
     }
 }
 
-pub(super) fn converted(facts: &Facts, v: ValueId) -> bool {
+fn converted(facts: &Facts, v: ValueId) -> bool {
     facts.lane_word[v.0] && !facts.materialized[v.0]
 }
 
@@ -96,7 +96,7 @@ fn projection(p: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
     }
 }
 
-pub(super) fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
+pub fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
     let reachable: std::collections::BTreeSet<BlockId> = facts.order.iter().copied().collect();
     let mut q = Func::new(p.entry, Presence::Wave);
     q.blocks = p

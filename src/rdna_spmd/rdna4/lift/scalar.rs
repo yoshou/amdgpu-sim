@@ -283,7 +283,7 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
     Some(b.finish_many(true, outputs))
 }
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     masks(inst, registry)
         .or_else(|| arithmetic(inst, registry))
         .or_else(|| compare(inst, registry))

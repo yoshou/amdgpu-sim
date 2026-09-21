@@ -205,7 +205,7 @@ fn is_sop_u64(op: I) -> bool {
     )
 }
 
-pub(super) fn sgpr_u64_defs(inst: &InstFormat) -> Vec<u32> {
+pub fn sgpr_u64_defs(inst: &InstFormat) -> Vec<u32> {
     match inst {
         InstFormat::SOP1(i) if is_sop_u64(i.op) => vec![i.sdst as u32],
         InstFormat::SOP2(i) if is_sop_u64(i.op) => vec![i.sdst as u32],
@@ -213,7 +213,7 @@ pub(super) fn sgpr_u64_defs(inst: &InstFormat) -> Vec<u32> {
     }
 }
 
-pub(super) fn f64_pairs(inst: &InstFormat) -> Vec<u32> {
+pub fn f64_pairs(inst: &InstFormat) -> Vec<u32> {
     let reads = |op: I| {
         format!("{op:?}").contains("F64") && !matches!(op, I::V_CVT_F64_U32 | I::V_CVT_F64_I32)
     };
@@ -271,7 +271,7 @@ fn is_f64_op(op: I) -> bool {
     s.contains("F64") && !matches!(op, I::V_CVT_F64_U32 | I::V_CVT_F64_I32)
 }
 
-pub(super) fn math_reads(inst: &InstFormat) -> Vec<u32> {
+pub fn math_reads(inst: &InstFormat) -> Vec<u32> {
     if let Some((reads, _)) = super::half::registers(inst) {
         return reads;
     }

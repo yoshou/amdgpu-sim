@@ -42,7 +42,7 @@ fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut [Vec<ValueId>
     }
 }
 
-pub(crate) struct Pairs;
+pub struct Pairs;
 impl super::Pass for Pairs {
     fn name(&self) -> &str {
         "pairs"
@@ -53,7 +53,7 @@ impl super::Pass for Pairs {
     }
 }
 
-pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
+fn run(f: &mut Func, uniform: &[bool]) -> usize {
     let defs = f.definitions();
     let mut params: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut position = vec![usize::MAX; f.blocks.keys().map(|b| b.0 + 1).max().unwrap_or(0)];
@@ -70,7 +70,7 @@ pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
                     op: Op::UnpackLo(_) | Op::UnpackHi(_),
                     ..
                 } => {}
-                _ => super::dce::operands(inst, |v| wide[v.0] = true),
+                _ => inst.for_each_operand(|v| wide[v.0] = true),
             }
         }
         for edge in block.term.edges() {
@@ -274,7 +274,7 @@ pub(crate) fn run(f: &mut Func, uniform: &[bool]) -> usize {
     candidates.len()
 }
 
-pub(crate) struct WideMemory;
+pub struct WideMemory;
 impl super::Pass for WideMemory {
     fn name(&self) -> &str {
         "wide_memory"
@@ -337,7 +337,7 @@ fn word_effect(
     }
 }
 
-pub(crate) fn wide_stores(f: &mut Func, constants: &[Option<u64>]) -> usize {
+fn wide_stores(f: &mut Func, constants: &[Option<u64>]) -> usize {
     let defs = f.definitions();
     let half = |v: ValueId| match defs[v.0] {
         Some(Op::UnpackLo(x)) => Some((x, false)),
@@ -399,7 +399,7 @@ pub(crate) fn wide_stores(f: &mut Func, constants: &[Option<u64>]) -> usize {
     count
 }
 
-pub(crate) fn wide_loads(f: &mut Func, constants: &[Option<u64>]) -> usize {
+fn wide_loads(f: &mut Func, constants: &[Option<u64>]) -> usize {
     let defs = f.definitions();
     let mut uses: Vec<Vec<ValueId>> = vec![Vec::new(); f.types.len()];
     let mut packs: BTreeMap<ValueId, (ValueId, ValueId)> = BTreeMap::new();
@@ -415,7 +415,7 @@ pub(crate) fn wide_loads(f: &mut Func, constants: &[Option<u64>]) -> usize {
                     uses[a.0].push(*value);
                     uses[b.0].push(*value);
                 }
-                _ => super::dce::operands(inst, |v| uses[v.0].push(ValueId(usize::MAX))),
+                _ => inst.for_each_operand(|v| uses[v.0].push(ValueId(usize::MAX))),
             }
         }
         for edge in block.term.edges() {
@@ -501,7 +501,7 @@ pub(crate) fn wide_loads(f: &mut Func, constants: &[Option<u64>]) -> usize {
             |inst| !matches!(inst, Inst::Core { value, .. } if renames.contains_key(value)),
         );
     }
-    super::simplify::rename(f, &renames);
+    f.rename(&renames);
     f.compact();
     count
 }

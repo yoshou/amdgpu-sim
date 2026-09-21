@@ -6,7 +6,7 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
-pub(in crate::rdna_spmd) enum Address {
+pub enum Address {
     Global {
         scalar: Option<u32>,
         vector: u32,
@@ -33,7 +33,7 @@ pub(in crate::rdna_spmd) enum Address {
     },
 }
 #[derive(Clone, Debug)]
-pub(in crate::rdna_spmd) struct Memory {
+pub struct Memory {
     pub address: Address,
     pub op: MemoryOp,
     pub words: u32,
@@ -41,16 +41,16 @@ pub(in crate::rdna_spmd) struct Memory {
     pub data: u32,
     pub returns: bool,
     pub semantics: MemorySemantics,
-    pair: Option<LdsPair>,
+    pub pair: Option<LdsPair>,
 }
 #[derive(Clone, Debug)]
-struct LdsPair {
-    offsets: [u32; 2],
-    second_data: u32,
+pub struct LdsPair {
+    pub offsets: [u32; 2],
+    pub second_data: u32,
 }
 impl Memory {
 
-    pub fn word_offset(&self, word: u32) -> u32 {
+    fn word_offset(&self, word: u32) -> u32 {
         match &self.pair {
             Some(pair) => {
                 let n = self.words / 2;
@@ -59,7 +59,7 @@ impl Memory {
             None => word * 4,
         }
     }
-    pub fn data_register(&self, word: u32) -> u32 {
+    fn data_register(&self, word: u32) -> u32 {
         match &self.pair {
             Some(pair) if word >= self.words / 2 => pair.second_data + word - self.words / 2,
             _ => self.data + word,
@@ -83,7 +83,7 @@ impl Memory {
         }
         regs
     }
-    pub fn space(&self) -> Space {
+    fn space(&self) -> Space {
         match self.address {
             Address::Scratch { .. } => Space::Scratch,
             Address::Lds { .. } => Space::Lds,
@@ -93,7 +93,7 @@ impl Memory {
     pub fn scalar(&self) -> bool {
         matches!(self.address, Address::Scalar { .. })
     }
-    pub fn stores(&self) -> bool {
+    fn stores(&self) -> bool {
         matches!(self.op, MemoryOp::Store(_))
     }
 }
@@ -158,7 +158,7 @@ fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
     }
 }
 
-pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
+pub fn instruction(inst: &InstFormat) -> Option<Memory> {
     let (opcode, mut address, dest, data, scope, th) = match inst {
         InstFormat::SMEM(i) => (
             i.op,
@@ -360,7 +360,7 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
 }
 
 impl Memory {
-    pub(super) fn lift(
+    pub fn lift(
         &self,
         f: &mut Func,
         block: &mut Block,

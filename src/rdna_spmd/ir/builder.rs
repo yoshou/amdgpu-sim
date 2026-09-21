@@ -1,13 +1,13 @@
 use super::{Op, Ty, ValueId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Expr {
+pub struct Expr {
     pub params: Vec<Ty>,
     pub insts: Vec<ExprInst>,
     pub results: Vec<ValueId>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ExprInst {
+pub enum ExprInst {
     Core(Ty, Op),
     Target {
         op: crate::rdna_spmd::ir::TargetOp,

@@ -4,16 +4,19 @@ use crate::rdna_spmd::dialect::{
 };
 use crate::rdna_spmd::ir::{FloatPred, IntPred};
 use crate::rdna_spmd::native::{Type, Value};
-use crate::rdna_spmd::{codegen::ops::Emitter, ir::Ty};
-pub(in crate::rdna_spmd) mod bvh;
+use crate::rdna_spmd::{codegen::Emitter, ir::Ty};
+mod bvh;
 mod division;
 mod image;
 mod reduction;
 mod scale;
 
-pub(in crate::rdna_spmd) const ID: u32 = 0x52444e34;
-pub(crate) mod idioms;
-pub(crate) const REGISTERS: crate::rdna_spmd::dialect::Registers =
+pub const ID: u32 = 0x52444e34;
+mod idioms;
+
+pub use bvh::lowering_state;
+pub use idioms::{DivisionIdioms, SqrtIdioms};
+pub const REGISTERS: crate::rdna_spmd::dialect::Registers =
     crate::rdna_spmd::dialect::Registers {
         exec: 126,
         vcc: 106,
@@ -23,7 +26,7 @@ pub(crate) const REGISTERS: crate::rdna_spmd::dialect::Registers =
         vgprs: 256,
     };
 
-pub(crate) fn register(registry: &mut Dialect) -> Result<(), &'static str> {
+pub fn register(registry: &mut Dialect) -> Result<(), &'static str> {
     registry.register(
         ID,
         36,
@@ -336,13 +339,13 @@ pub(crate) fn register(registry: &mut Dialect) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub(in crate::rdna_spmd) fn image_sample(registry: &DialectRegistry) -> TargetOp {
+pub fn image_sample(registry: &DialectRegistry) -> TargetOp {
     registry
         .lookup(ID, "image_sample_lz")
         .expect("missing RDNA4 image provider")
 }
 
-pub(in crate::rdna_spmd) fn comparison(registry: &DialectRegistry, ty: Ty) -> TargetOp {
+pub fn comparison(registry: &DialectRegistry, ty: Ty) -> TargetOp {
     registry
         .lookup(
             ID,
@@ -356,7 +359,7 @@ pub(in crate::rdna_spmd) fn comparison(registry: &DialectRegistry, ty: Ty) -> Ta
 }
 
 fn classify(e: &Emitter, ty: Ty, value: Value, selector: Value) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let mut result = e.constant(Ty::I1, 0);
     for index in 0..10 {
         let class = e.call(
@@ -377,7 +380,7 @@ fn class_f64(e: &Emitter, a: &[Value]) -> Value {
     classify(e, Ty::F64, a[0], a[1])
 }
 
-pub(in crate::rdna_spmd) fn unary(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
+pub fn unary(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
     let name = match op {
         I::V_RCP_F32 | I::V_RCP_IFLAG_F32 | I::V_S_RCP_F32 => "rcp.f32",
         I::V_RCP_F64 => "rcp.f64",
@@ -408,7 +411,7 @@ pub(in crate::rdna_spmd) fn unary(registry: &DialectRegistry, op: I) -> Option<T
     Some(registry.lookup(ID, name).expect("missing RDNA4 provider"))
 }
 
-pub(in crate::rdna_spmd) fn binary(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
+pub fn binary(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
     let name = match op {
         I::V_LDEXP_F32 => "ldexp.f32",
         I::V_LDEXP_F64 => "ldexp.f64",
@@ -418,7 +421,7 @@ pub(in crate::rdna_spmd) fn binary(registry: &DialectRegistry, op: I) -> Option<
     Some(registry.lookup(ID, name).expect("missing RDNA4 provider"))
 }
 
-pub(in crate::rdna_spmd) fn division(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
+pub fn division(registry: &DialectRegistry, op: I) -> Option<TargetOp> {
     let name = match op {
         I::V_DIV_FIXUP_F32 => "div_fixup.f32",
         I::V_DIV_FIXUP_F64 => "div_fixup.f64",
@@ -432,7 +435,7 @@ pub(in crate::rdna_spmd) fn division(registry: &DialectRegistry, op: I) -> Optio
 }
 
 fn flush(e: &Emitter, value: Value) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
 
     let tiny = e.call(
         &format!("llvm.is.fpclass.{}", e.suffix(Ty::F32)),
@@ -460,7 +463,7 @@ fn math(e: &Emitter, ty: Ty, mut value: Value, sqrt: bool, reciprocal: bool) -> 
                 1f64.to_bits()
             },
         );
-        value = e.ir.fdiv(one, value);
+        value = e.ir().fdiv(one, value);
     }
     if ty == Ty::F32 {
         value = flush(e, value);
@@ -507,12 +510,12 @@ fn log2_f32(e: &Emitter, a: &[Value]) -> Value {
         ),
     );
 
-    let negative = e.ir.fcmp(FloatPred::Olt, input, e.constant(Ty::F32, 0));
-    e.ir.select(negative, e.constant(Ty::F32, 0xffc0_0000), result)
+    let negative = e.ir().fcmp(FloatPred::Olt, input, e.constant(Ty::F32, 0));
+    e.ir().select(negative, e.constant(Ty::F32, 0xffc0_0000), result)
 }
 
 fn trig(e: &Emitter, value: Value, cosine: bool) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let rounded = e.call(
         &format!("llvm.roundeven.{}", e.suffix(Ty::F32)),
         Ty::F32,
@@ -584,15 +587,15 @@ fn round_f64(e: &Emitter, a: &[Value]) -> Value {
 }
 fn fract_f64(e: &Emitter, a: &[Value]) -> Value {
     let floor = floor_f64(e, a);
-    let value = e.ir.fsub(a[0], floor);
+    let value = e.ir().fsub(a[0], floor);
 
     let cap = e.constant(Ty::F64, 0x3fef_ffff_ffff_ffff);
-    let over = e.ir.fcmp(FloatPred::Ogt, value, cap);
-    e.ir.select(over, cap, value)
+    let over = e.ir().fcmp(FloatPred::Ogt, value, cap);
+    e.ir().select(over, cap, value)
 }
 
 fn frexp(e: &Emitter, ty: Ty, input: Value) -> (Value, Value) {
-    let ir = e.ir;
+    let ir = e.ir();
     let (word, fraction_bits, exponent_bits, bias) = if ty == Ty::F32 {
         (Ty::I32, 23, 8, 127)
     } else {
@@ -648,7 +651,7 @@ fn exp_f64(e: &Emitter, a: &[Value]) -> Value {
 }
 
 fn from_half(e: &Emitter, a: &[Value]) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let i16 = e.shaped(ir.i16());
     let f16 = e.shaped(ir.f16());
     let bits = ir.trunc(a[0], i16);
@@ -656,7 +659,7 @@ fn from_half(e: &Emitter, a: &[Value]) -> Value {
     ir.fpext(value, e.ty(Ty::F32))
 }
 fn to_half(e: &Emitter, a: &[Value]) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let i16 = e.shaped(ir.i16());
     let f16 = e.shaped(ir.f16());
     let value = ir.fptrunc(a[0], f16);
@@ -664,12 +667,12 @@ fn to_half(e: &Emitter, a: &[Value]) -> Value {
     ir.zext(bits, e.ty(Ty::I32))
 }
 
-pub(in crate::rdna_spmd) fn bvh(registry: &DialectRegistry) -> TargetOp {
+pub fn bvh(registry: &DialectRegistry) -> TargetOp {
     registry
         .lookup(ID, "image_bvh64_intersect_ray")
         .expect("missing BVH provider")
 }
-pub(in crate::rdna_spmd) fn bvh8(registry: &DialectRegistry) -> TargetOp {
+pub fn bvh8(registry: &DialectRegistry) -> TargetOp {
     registry
         .lookup(ID, "image_bvh8_intersect_ray")
         .expect("missing BVH8 provider")

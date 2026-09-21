@@ -3,11 +3,11 @@ use super::predication::{predication, Predication};
 use super::super::ir::Func;
 use super::Pass;
 
-pub(crate) trait Idiom: Send + Sync {
+pub trait Idiom: Send + Sync {
     fn rewrite(&self, f: &mut Func, predication: &Predication, constants: &[Option<u64>]) -> usize;
 }
 
-pub(crate) struct Idioms<'a>(pub(crate) &'a [Box<dyn Idiom>]);
+pub struct Idioms<'a>(pub &'a [Box<dyn Idiom>]);
 impl Pass for Idioms<'_> {
     fn name(&self) -> &str {
         "idioms"

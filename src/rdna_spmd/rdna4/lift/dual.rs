@@ -1,7 +1,7 @@
 use super::*;
 use crate::rdna_instructions::{VOP1, VOP2, VOP3P};
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::VOPD(i) = inst else {
         return None;
     };

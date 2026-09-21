@@ -4,7 +4,7 @@ use crate::rdna_spmd::rdna4::decode::{ScalarProgram, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::rdna_spmd::program::Program;
-pub(in crate::rdna_spmd) fn lift(
+pub fn lift(
     registry: std::sync::Arc<DialectRegistry>,
     program: &ScalarProgram,
     lowerings: &BTreeMap<usize, Vec<&Lowering>>,
@@ -198,7 +198,7 @@ fn invalidate(views: &mut BTreeMap<(Word, Ty, bool), ValueId>, writes: &[Word]) 
     });
 }
 
-pub(super) fn alu(
+fn alu(
     registry: &DialectRegistry,
     f: &mut Func,
     block: &mut Block,

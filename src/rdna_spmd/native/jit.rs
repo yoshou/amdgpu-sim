@@ -1,22 +1,25 @@
 use llvm_sys::{self as llvm, core::*, prelude::*};
 use std::ffi::{CStr, CString};
 
-pub(in crate::rdna_spmd) struct Module {
+pub struct Module {
     ctx: LLVMContextRef,
     module: LLVMModuleRef,
     builder: LLVMBuilderRef,
     context: llvm::orc2::LLVMOrcThreadSafeContextRef,
 }
 
-pub(in crate::rdna_spmd) struct NativeCode {
+pub struct NativeCode {
     jit: llvm::orc2::lljit::LLVMOrcLLJITRef,
     address: u64,
-    pub(in crate::rdna_spmd) block_counts: Option<(String, usize)>,
+    block_counts: Option<(String, usize)>,
 }
 
 unsafe impl Send for NativeCode {}
 unsafe impl Sync for NativeCode {}
 impl NativeCode {
+    pub fn count_blocks(&mut self, path: String, blocks: usize) {
+        self.block_counts = Some((path, blocks));
+    }
     pub fn address(&self) -> u64 {
         self.address
     }
@@ -60,7 +63,7 @@ impl Drop for NativeCode {
     }
 }
 
-pub(in crate::rdna_spmd) struct OptimizedModule {
+pub struct OptimizedModule {
     module: Module,
     machine: llvm::target_machine::LLVMTargetMachineRef,
 }

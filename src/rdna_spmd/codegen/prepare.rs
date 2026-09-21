@@ -4,18 +4,13 @@ use super::super::analysis::{Analyses, Constants, Context, Packet, Uniformity};
 use super::super::ir::{Cvt, IntOp, Op, Ty, *};
 use super::access::{accesses, Access};
 use super::super::pass::{
-    adjacency::Adjacency,
-    dce::{Dce, DeadParams},
-    entry::PacketState,
-    pairs::{Pairs, WideMemory},
-    simplify::Simplify,
-    Driver,
+    Adjacency, Dce, DeadParams, Driver, PacketState, Pairs, Simplify, WideMemory,
 };
 use super::super::program::Program;
 use super::Prepared;
 use std::collections::BTreeMap;
 
-pub(in crate::rdna_spmd) fn prepare(
+pub fn prepare(
     f: Program,
     packing: super::super::lockstep::Packing,
     num_vgprs: usize,

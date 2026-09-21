@@ -1,11 +1,11 @@
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::analysis::bdd::HashMap;
+use crate::rdna_spmd::hash::HashMap;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Atom {
+pub enum Atom {
     Bit(ValueId),
     View(ValueId),
     Constant(u32),
@@ -16,14 +16,14 @@ pub(super) enum Atom {
 }
 
 #[derive(Default)]
-pub(super) struct Kept {
+pub struct Kept {
 
     pub queries: BTreeSet<ValueId>,
 
     pub words: BTreeSet<ValueId>,
 }
 
-pub(super) struct Logic {
+pub struct Logic {
     pub m: Manager,
     vars: HashMap<Atom, u32>,
     atoms: HashMap<u32, Atom>,
@@ -40,12 +40,16 @@ pub(super) struct Logic {
     abstract_queries: bool,
 
     open_words: bool,
-    pub all_local: Bdd,
+    all_local: Bdd,
     edges: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<EdgeIndex>>,
     relations: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<Vec<Binding>>>,
 }
 
 impl Logic {
+
+    pub fn all_local(&self) -> Bdd {
+        self.all_local
+    }
 
     pub fn new(f: &Func, facts: &Facts, kept: &BTreeSet<ValueId>) -> Self {
         let mut params = HashMap::default();
@@ -791,7 +795,7 @@ impl Logic {
         links
     }
 
-    pub fn reach(
+    fn reach(
         &mut self,
         f: &Func,
         facts: &Facts,
@@ -840,7 +844,7 @@ impl Logic {
         reach
     }
 
-    pub fn post(
+    fn post(
         &mut self,
         f: &Func,
         facts: &Facts,
@@ -862,7 +866,7 @@ struct EdgeIndex {
     words: HashMap<ValueId, Vec<usize>>,
 }
 
-pub(super) fn lane_test(f: &Func, facts: &Facts, a: ValueId, b: ValueId) -> Option<ValueId> {
+pub fn lane_test(f: &Func, facts: &Facts, a: ValueId, b: ValueId) -> Option<ValueId> {
     if facts.lane_word[a.0] && facts.constant(f, b) == Some(0) {
         Some(a)
     } else if facts.lane_word[b.0] && facts.constant(f, a) == Some(0) {

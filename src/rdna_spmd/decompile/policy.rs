@@ -1,7 +1,7 @@
-use crate::rdna_spmd::analysis::facts::{operands, Facts, Site};
+use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::ir::*;
 
-pub(super) fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
+pub fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
     let mut pending = Vec::new();
     for &id in &facts.order {
         let block = &f.blocks[&id];
@@ -30,7 +30,7 @@ pub(super) fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
                 pending.extend(facts.arguments(f, block, index));
             }
             Site::Inst { block, index } => {
-                pending.extend(operands(&f.blocks[&block].insts[index]));
+                pending.extend((f.blocks[&block].insts[index]).operands());
             }
             _ => {}
         }

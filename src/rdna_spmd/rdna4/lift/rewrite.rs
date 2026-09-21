@@ -1,11 +1,11 @@
 use super::regs::Word;
 use super::*;
 
-pub(super) const VGPR_BASE: u32 = 512;
+const VGPR_BASE: u32 = 512;
 
 const SGPR_NULL: u32 = 124;
 
-pub(super) struct InstEffects {
+pub struct InstEffects {
     pub reads: Vec<u32>,
 
     pub kills: Vec<u32>,
@@ -368,7 +368,7 @@ fn vopd_effects(inst: &crate::rdna_instructions::VOPD) -> InstEffects {
     }
 }
 
-pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
+pub fn effects_of(inst: &InstFormat) -> InstEffects {
     match inst {
         InstFormat::SOPP(inst) => sopp_effects(inst.op),
         InstFormat::SOP1(inst) => sop1_effects(inst),
@@ -391,7 +391,7 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
     }
 }
 
-pub(super) fn word(slot: u32) -> Option<Word> {
+pub fn word(slot: u32) -> Option<Word> {
     if slot >= VGPR_BASE {
         Some(Word::Vgpr(slot - VGPR_BASE))
     } else {

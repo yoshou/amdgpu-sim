@@ -6,7 +6,7 @@ use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::Program;
 use std::collections::BTreeMap;
 
-pub(super) fn context(lane: &Program, packing: Packing) -> Context<'_> {
+pub fn context(lane: &Program, packing: Packing) -> Context<'_> {
     Context {
         packet: Some(Packet {
             aligned: packing.aligned,
@@ -20,13 +20,13 @@ pub(super) fn context(lane: &Program, packing: Packing) -> Context<'_> {
     }
 }
 
-pub(super) fn assume(lane: &Program, packing: Packing) -> Vec<bool> {
+pub fn assume(lane: &Program, packing: Packing) -> Vec<bool> {
     Analyses::new(context(lane, packing))
         .get::<Uniformity>(&lane.ir)
         .uniform()
 }
 
-pub(super) fn refuted(
+pub fn refuted(
     lane: &Program,
     packing: Packing,
     packet: &Func,

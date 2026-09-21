@@ -1,13 +1,13 @@
 use super::effect::EffectOp;
 use super::scope::Presence;
 use super::{Op, Ty, ValueId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct BlockId(pub usize);
+pub struct BlockId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PacketOp {
+pub enum PacketOp {
     Any,
     Ballot,
 }
@@ -20,7 +20,7 @@ impl PacketOp {
     }
 }
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Inst {
+pub enum Inst {
     Packet {
         op: PacketOp,
         input: ValueId,
@@ -44,13 +44,46 @@ pub(crate) enum Inst {
         op: Op,
     },
 }
+impl Inst {
+    pub fn for_each_operand(&self, mut f: impl FnMut(ValueId)) {
+        match self {
+            Inst::Core { op, .. } => {
+                op.map(|v| {
+                    f(v);
+                    v
+                });
+            }
+            Inst::Packet { input, .. } => f(*input),
+            Inst::Target { args, .. } => args.values().iter().for_each(|&v| f(v)),
+            Inst::Effect { inputs, .. } => inputs.iter().for_each(|&v| f(v)),
+        }
+    }
+    pub fn for_each_output(&self, mut f: impl FnMut(ValueId)) {
+        match self {
+            Inst::Core { value, .. } | Inst::Packet { output: value, .. } => f(*value),
+            Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => {
+                outputs.iter().for_each(|o| f(o.0))
+            }
+        }
+    }
+    pub fn operands(&self) -> Vec<ValueId> {
+        let mut out = Vec::new();
+        self.for_each_operand(|v| out.push(v));
+        out
+    }
+    pub fn outputs(&self) -> Vec<ValueId> {
+        let mut out = Vec::new();
+        self.for_each_output(|v| out.push(v));
+        out
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Edge {
+pub struct Edge {
     pub dst: BlockId,
     pub args: Vec<ValueId>,
 }
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Term {
+pub enum Term {
     Br(Edge),
     CondBr { cond: ValueId, yes: Edge, no: Edge },
     Ret(Vec<ValueId>),
@@ -74,13 +107,13 @@ impl Term {
     }
 }
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Block {
+pub struct Block {
     pub params: Vec<(ValueId, Ty)>,
     pub insts: Vec<Inst>,
     pub term: Term,
 }
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Func {
+pub struct Func {
     pub entry: BlockId,
     pub blocks: BTreeMap<BlockId, Block>,
     pub types: Vec<Ty>,
@@ -102,6 +135,69 @@ impl Func {
         let v = ValueId(self.types.len());
         self.types.push(ty);
         v
+    }
+    pub fn reverse_postorder(&self) -> Vec<BlockId> {
+        let mut seen = BTreeSet::from([self.entry]);
+        let mut order = Vec::new();
+        let mut stack = vec![(self.entry, 0usize)];
+        while let Some(&mut (id, ref mut next)) = stack.last_mut() {
+            let edge = self.blocks[&id].term.edges().nth(*next).map(|e| e.dst);
+            match edge {
+                Some(dst) => {
+                    *next += 1;
+                    if seen.insert(dst) {
+                        stack.push((dst, 0));
+                    }
+                }
+                None => {
+                    order.push(id);
+                    stack.pop();
+                }
+            }
+        }
+        order.reverse();
+        order
+    }
+    pub fn rename(&mut self, map: &BTreeMap<ValueId, ValueId>) {
+        let m = |v: ValueId| {
+            let mut v = v;
+            while let Some(&next) = map.get(&v) {
+                v = next;
+            }
+            v
+        };
+        for block in self.blocks.values_mut() {
+            for inst in &mut block.insts {
+                match inst {
+                    Inst::Core { op, .. } => *op = op.map(m),
+                    Inst::Packet { input, .. } => *input = m(*input),
+                    Inst::Target { args, .. } => *args = args.map(m),
+                    Inst::Effect { inputs, .. } => {
+                        for v in inputs {
+                            *v = m(*v);
+                        }
+                    }
+                }
+            }
+            match &mut block.term {
+                Term::Br(e) => {
+                    for v in &mut e.args {
+                        *v = m(*v);
+                    }
+                }
+                Term::CondBr { cond, yes, no } => {
+                    *cond = m(*cond);
+                    for v in yes.args.iter_mut().chain(&mut no.args) {
+                        *v = m(*v);
+                    }
+                }
+                Term::Ret(args) => {
+                    for v in args {
+                        *v = m(*v);
+                    }
+                }
+            }
+        }
     }
     pub fn definitions(&self) -> Vec<Option<Op>> {
         let mut out = vec![None; self.types.len()];

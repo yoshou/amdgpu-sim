@@ -7,7 +7,7 @@ use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Val {
+pub enum Val {
     Value(ValueId),
     Bit(Bdd),
 }
@@ -63,12 +63,12 @@ struct Span {
     exits: BTreeMap<BlockId, Vec<Arrival>>,
 }
 
-pub(super) struct Lowering {
+pub struct Lowering {
     pub ir: Func,
     pub masks: Masks,
 }
 
-pub(super) fn lower(
+pub fn lower(
     q: &Func,
     s: &Structure,
     registry: &DialectRegistry,

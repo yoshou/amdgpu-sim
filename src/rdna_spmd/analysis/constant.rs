@@ -2,7 +2,7 @@ use super::super::ir::{Cvt, IntOp, IntPred, Op, Ty, ValueId, *};
 use super::{Analyses, Analysis};
 use std::collections::VecDeque;
 
-pub(crate) struct Constants;
+pub struct Constants;
 impl Analysis for Constants {
     type Result = Vec<Option<u64>>;
     const NAME: &'static str = "constants";

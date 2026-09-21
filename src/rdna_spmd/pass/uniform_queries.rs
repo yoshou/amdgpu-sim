@@ -83,7 +83,7 @@ impl Facts<'_> {
     }
 }
 
-pub(crate) fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
+fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
     let mut defs = vec![None; f.types.len()];
     let mut parameter = vec![None; f.types.len()];
     let mut effect = vec![false; f.types.len()];
@@ -152,13 +152,13 @@ pub(crate) fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
     for block in f.blocks.values_mut() {
         block.insts.retain(|inst| !matches!(inst, Inst::Effect { outputs, .. } if outputs.iter().any(|(v, _)| renames.contains_key(v))));
     }
-    super::simplify::rename(f, &renames);
+    f.rename(&renames);
     let count = renames.len();
     f.compact();
     count
 }
 
-pub(crate) struct UniformQueries;
+pub struct UniformQueries;
 impl Pass for UniformQueries {
     fn name(&self) -> &str {
         "uniform_queries"

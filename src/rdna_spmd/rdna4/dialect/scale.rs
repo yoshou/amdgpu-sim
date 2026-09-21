@@ -1,9 +1,9 @@
 use super::*;
 
-pub(super) fn f32(e: &Emitter, a: &[Value]) -> Value {
+pub fn f32(e: &Emitter, a: &[Value]) -> Value {
     scale(e, Ty::F32, a[0], a[1])
 }
-pub(super) fn f64(e: &Emitter, a: &[Value]) -> Value {
+pub fn f64(e: &Emitter, a: &[Value]) -> Value {
     scale(e, Ty::F64, a[0], a[1])
 }
 
@@ -20,7 +20,7 @@ fn scale(e: &Emitter, ty: Ty, value: Value, exponent: Value) -> Value {
 }
 
 fn power(e: &Emitter, ty: Ty, exponent: Value) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let (it, bias, fraction) = if ty == Ty::F32 {
         (Ty::I32, 127, 23)
     } else {
@@ -37,7 +37,7 @@ fn power(e: &Emitter, ty: Ty, exponent: Value) -> Value {
 }
 
 fn portable(e: &Emitter, ty: Ty, mut value: Value, mut exp: Value) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let (max, min, precision) = if ty == Ty::F32 {
         (127i32, -126i32, 24)
     } else {
@@ -60,7 +60,7 @@ fn portable(e: &Emitter, ty: Ty, mut value: Value, mut exp: Value) -> Value {
 }
 
 fn native_scale(e: &Emitter, ty: Ty, value: Value, exponent: Value, w: u32, native: u32) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let lanes = w.min(native);
     let scalar = if ty == Ty::F32 { ir.f32() } else { ir.f64() };
     let chunk_ty = scalar.vector(lanes);

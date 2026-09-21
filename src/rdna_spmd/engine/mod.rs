@@ -1,20 +1,24 @@
-pub(super) mod barrier;
-pub(super) mod dispatch;
-pub(super) mod fiber;
-pub(super) mod kernel;
-pub(super) mod scheduler;
-pub(super) mod wmma;
-pub(super) mod yields;
+mod barrier;
+mod dispatch;
+mod fiber;
+mod kernel;
+mod scheduler;
+mod wmma;
+mod yields;
+
+pub use dispatch::GridDims;
+pub use fiber::yield_address;
+pub use kernel::{Kernel, Region, Scheduler};
+pub use wmma::warm_wmma;
 
 use crate::processor::KernelDescriptor;
-use kernel::Kernel;
 
 pub fn dispatch(
     kernel: &Kernel,
     kd: &KernelDescriptor,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
-    dims: dispatch::GridDims,
+    dims: GridDims,
     private_segment_size: u32,
     group_segment_size: usize,
     num_threads: usize,

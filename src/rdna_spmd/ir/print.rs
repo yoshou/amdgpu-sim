@@ -2,7 +2,7 @@ use super::*;
 use crate::rdna_spmd::ir::{DialectRegistry, TargetOp};
 use std::fmt::Write;
 
-pub(crate) fn ty(t: Ty) -> &'static str {
+fn ty(t: Ty) -> &'static str {
     match t {
         Ty::I1 => "i1",
         Ty::I32 => "i32",
@@ -11,7 +11,7 @@ pub(crate) fn ty(t: Ty) -> &'static str {
         Ty::F64 => "f64",
     }
 }
-pub(crate) fn int_op(op: IntOp) -> &'static str {
+fn int_op(op: IntOp) -> &'static str {
     match op {
         IntOp::Add => "add",
         IntOp::Sub => "sub",
@@ -24,7 +24,7 @@ pub(crate) fn int_op(op: IntOp) -> &'static str {
         IntOp::AShr => "ashr",
     }
 }
-pub(crate) fn int_pred(p: IntPred) -> &'static str {
+fn int_pred(p: IntPred) -> &'static str {
     match p {
         IntPred::Eq => "eq",
         IntPred::Ne => "ne",
@@ -38,7 +38,7 @@ pub(crate) fn int_pred(p: IntPred) -> &'static str {
         IntPred::Sge => "sge",
     }
 }
-pub(crate) fn float_op(op: FloatOp) -> &'static str {
+fn float_op(op: FloatOp) -> &'static str {
     match op {
         FloatOp::Add => "add",
         FloatOp::Sub => "sub",
@@ -48,13 +48,13 @@ pub(crate) fn float_op(op: FloatOp) -> &'static str {
         FloatOp::MaxNum => "maxnum",
     }
 }
-pub(crate) fn float_unary(op: FloatUnary) -> &'static str {
+fn float_unary(op: FloatUnary) -> &'static str {
     match op {
         FloatUnary::Neg => "neg",
         FloatUnary::Abs => "abs",
     }
 }
-pub(crate) fn float_pred(p: FloatPred) -> &'static str {
+fn float_pred(p: FloatPred) -> &'static str {
     match p {
         FloatPred::Oeq => "oeq",
         FloatPred::Ogt => "ogt",
@@ -72,7 +72,7 @@ pub(crate) fn float_pred(p: FloatPred) -> &'static str {
         FloatPred::Une => "une",
     }
 }
-pub(crate) fn cvt(op: Cvt) -> &'static str {
+fn cvt(op: Cvt) -> &'static str {
     match op {
         Cvt::SignedToFloatRte => "sitofp.rte",
         Cvt::UnsignedToFloatRte => "uitofp.rte",
@@ -85,7 +85,7 @@ pub(crate) fn cvt(op: Cvt) -> &'static str {
         Cvt::Bitcast => "bitcast",
     }
 }
-pub(crate) fn env(e: Env) -> &'static str {
+fn env(e: Env) -> &'static str {
     match e {
         Env::LaneId => "lane_id",
         Env::ValidLane => "valid_lane",
@@ -93,14 +93,14 @@ pub(crate) fn env(e: Env) -> &'static str {
         Env::ScratchSize => "scratch_size",
     }
 }
-pub(crate) fn space(s: Space) -> &'static str {
+fn space(s: Space) -> &'static str {
     match s {
         Space::Global => "global",
         Space::Scratch => "scratch",
         Space::Lds => "lds",
     }
 }
-pub(crate) fn mem_size(s: MemSize) -> &'static str {
+fn mem_size(s: MemSize) -> &'static str {
     match s {
         MemSize::U8 => "u8",
         MemSize::I8 => "i8",
@@ -110,7 +110,7 @@ pub(crate) fn mem_size(s: MemSize) -> &'static str {
         MemSize::B64 => "b64",
     }
 }
-pub(crate) fn scope(s: Scope) -> &'static str {
+fn scope(s: Scope) -> &'static str {
     match s {
         Scope::WorkItem => "workitem",
         Scope::ComputeUnit => "cu",
@@ -120,7 +120,7 @@ pub(crate) fn scope(s: Scope) -> &'static str {
         Scope::Workgroup => "workgroup",
     }
 }
-pub(crate) fn ordering(o: Ordering) -> &'static str {
+fn ordering(o: Ordering) -> &'static str {
     match o {
         Ordering::Relaxed => "relaxed",
         Ordering::Acquire => "acquire",
@@ -128,7 +128,7 @@ pub(crate) fn ordering(o: Ordering) -> &'static str {
         Ordering::Sequential => "seqcst",
     }
 }
-pub(crate) fn cache_policy(c: CachePolicy) -> &'static str {
+fn cache_policy(c: CachePolicy) -> &'static str {
     match c {
         CachePolicy::Temporal => "temporal",
         CachePolicy::NonTemporal => "nontemporal",
@@ -141,7 +141,7 @@ pub(crate) fn cache_policy(c: CachePolicy) -> &'static str {
         CachePolicy::NearNonTemporalFarWriteBack => "near_nt_far_wb",
     }
 }
-pub(crate) fn wave_op(w: WaveOp) -> &'static str {
+fn wave_op(w: WaveOp) -> &'static str {
     match w {
         WaveOp::Any => "any",
         WaveOp::Ballot => "ballot",
@@ -164,7 +164,7 @@ fn edge(e: &Edge) -> String {
     format!("b{}({})", e.dst.0, values(&e.args))
 }
 
-pub(crate) fn effect_op(op: EffectOp) -> String {
+fn effect_op(op: EffectOp) -> String {
     match op {
         EffectOp::Memory {
             space: s,
@@ -194,7 +194,7 @@ pub(crate) fn effect_op(op: EffectOp) -> String {
     }
 }
 
-pub(crate) fn target_name(registry: &DialectRegistry, op: TargetOp) -> String {
+fn target_name(registry: &DialectRegistry, op: TargetOp) -> String {
     let dialect = registry.dialect_name(op.dialect()).unwrap_or("unknown");
     let name = registry
         .operation(op)
@@ -203,7 +203,7 @@ pub(crate) fn target_name(registry: &DialectRegistry, op: TargetOp) -> String {
     format!("{dialect}.{name}")
 }
 
-pub(crate) fn op(o: Op) -> String {
+fn op(o: Op) -> String {
     match o {
         Op::Env(e) => format!("env {}", env(e)),
         Op::Int(k, a, b) => format!("int {} {}, {}", int_op(k), v(a), v(b)),
@@ -226,7 +226,7 @@ pub(crate) fn op(o: Op) -> String {
     }
 }
 
-pub(crate) fn inst(registry: &DialectRegistry, types: &[Ty], i: &Inst) -> String {
+pub fn inst(registry: &DialectRegistry, types: &[Ty], i: &Inst) -> String {
     match i {
         Inst::Core {
             value,
@@ -289,7 +289,7 @@ pub(crate) fn inst(registry: &DialectRegistry, types: &[Ty], i: &Inst) -> String
     }
 }
 
-pub(crate) fn term(t: &Term) -> String {
+fn term(t: &Term) -> String {
     match t {
         Term::Ret(args) => {
             if args.is_empty() {
@@ -320,7 +320,7 @@ fn presence(p: Presence) -> &'static str {
     }
 }
 
-pub(crate) fn func(registry: &DialectRegistry, f: &Func) -> String {
+pub fn func(registry: &DialectRegistry, f: &Func) -> String {
     let mut out = String::new();
     writeln!(out, "func entry b{}", f.entry.0).unwrap();
     for (&entry, &present) in &f.regions {

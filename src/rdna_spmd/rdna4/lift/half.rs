@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn source(mut source: SourceOperand) -> SourceOperand {
+pub fn source(mut source: SourceOperand) -> SourceOperand {
 
     if let SourceOperand::FloatConstant(value) = source {
         source =
@@ -70,7 +70,7 @@ fn operands(inst: &InstFormat) -> Option<Operands> {
     })
 }
 
-pub(in crate::rdna_spmd) fn registers(inst: &InstFormat) -> Option<(Vec<u32>, u32)> {
+pub fn registers(inst: &InstFormat) -> Option<(Vec<u32>, u32)> {
     if let InstFormat::VOP3P(i) = inst {
         if matches!(i.op, I::V_FMA_MIXLO_F16 | I::V_FMA_MIXHI_F16) {
             let mut reads: Vec<_> = [i.src0, i.src1, i.src2]
@@ -98,7 +98,7 @@ pub(in crate::rdna_spmd) fn registers(inst: &InstFormat) -> Option<(Vec<u32>, u3
     Some((reads, o.dst as u32))
 }
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let Operands {
         op,
         src,

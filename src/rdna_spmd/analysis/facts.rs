@@ -2,68 +2,21 @@ use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Site {
+pub enum Site {
     Param { block: BlockId, index: usize },
     Inst { block: BlockId, index: usize },
     Unreached,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Use {
+pub enum Use {
     Inst { block: BlockId, index: usize },
     Arg { block: BlockId, edge: usize, index: usize },
     Cond(BlockId),
     Ret(BlockId),
 }
 
-pub(crate) fn operands(inst: &Inst) -> Vec<ValueId> {
-    match inst {
-        Inst::Core { op, .. } => {
-            let mut out = Vec::new();
-            op.map(|v| {
-                out.push(v);
-                v
-            });
-            out
-        }
-        Inst::Packet { input, .. } => vec![*input],
-        Inst::Target { args, .. } => args.values().to_vec(),
-        Inst::Effect { inputs, .. } => inputs.clone(),
-    }
-}
-
-pub(crate) fn outputs(inst: &Inst) -> Vec<ValueId> {
-    match inst {
-        Inst::Core { value, .. } => vec![*value],
-        Inst::Packet { output, .. } => vec![*output],
-        Inst::Target { outputs, .. } | Inst::Effect { outputs, .. } => {
-            outputs.iter().map(|o| o.0).collect()
-        }
-    }
-}
-
-pub(crate) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
-    let mut order = Vec::new();
-    let mut visited = std::collections::BTreeSet::from([f.entry]);
-    let mut stack: Vec<(BlockId, usize)> = vec![(f.entry, 0)];
-    while let Some((id, next)) = stack.last_mut() {
-        let dsts: Vec<BlockId> = f.blocks[id].term.edges().map(|e| e.dst).collect();
-        if *next < dsts.len() {
-            let dst = dsts[*next];
-            *next += 1;
-            if visited.insert(dst) {
-                stack.push((dst, 0));
-            }
-        } else {
-            order.push(*id);
-            stack.pop();
-        }
-    }
-    order.reverse();
-    order
-}
-
-pub(crate) struct Facts {
+pub struct Facts {
     pub site: Vec<Site>,
     pub uses: Vec<Vec<Use>>,
     pub incoming: BTreeMap<BlockId, Vec<(BlockId, usize)>>,
@@ -79,7 +32,7 @@ impl Facts {
 
     pub fn new(f: &Func, inputs: &[Parameter], kept: &BTreeSet<ValueId>) -> Self {
         let n = f.types.len();
-        let order = reverse_postorder(f);
+        let order = f.reverse_postorder();
         let mut site = vec![Site::Unreached; n];
         let mut uses: Vec<Vec<Use>> = vec![Vec::new(); n];
         let mut incoming: BTreeMap<BlockId, Vec<(BlockId, usize)>> =
@@ -90,10 +43,10 @@ impl Facts {
                 site[v.0] = Site::Param { block: id, index };
             }
             for (index, inst) in block.insts.iter().enumerate() {
-                for v in outputs(inst) {
+                for v in inst.outputs() {
                     site[v.0] = Site::Inst { block: id, index };
                 }
-                for v in operands(inst) {
+                for v in inst.operands() {
                     uses[v.0].push(Use::Inst { block: id, index });
                 }
             }
@@ -249,7 +202,7 @@ impl Facts {
                     }
                 }
                 for inst in &block.insts {
-                    let all = operands(inst).iter().all(|a| self.uniform[a.0]);
+                    let all = inst.operands().iter().all(|a| self.uniform[a.0]);
                     let u = match inst {
                         Inst::Core { op, .. } => match op {
                             Op::Const(..) => true,
@@ -271,7 +224,7 @@ impl Facts {
                             _ => false,
                         },
                     };
-                    for v in outputs(inst) {
+                    for v in inst.outputs() {
                         if !u && self.uniform[v.0] {
                             self.uniform[v.0] = false;
                             changed = true;
@@ -316,7 +269,7 @@ impl Facts {
                         _ => false,
                     };
                     if word {
-                        for v in outputs(inst) {
+                        for v in inst.outputs() {
                             if !self.lane_word[v.0] {
                                 self.lane_word[v.0] = true;
                                 changed = true;

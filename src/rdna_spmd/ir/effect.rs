@@ -2,13 +2,13 @@ use super::{Ty, ValueId};
 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Space {
+pub enum Space {
     Global,
     Scratch,
     Lds,
 }
 impl Space {
-    pub fn address_type(self) -> Ty {
+    fn address_type(self) -> Ty {
         if self == Self::Global {
             Ty::I64
         } else {
@@ -17,7 +17,7 @@ impl Space {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum MemSize {
+pub enum MemSize {
     U8,
     I8,
     U16,
@@ -39,7 +39,7 @@ impl MemSize {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Scope {
+pub enum Scope {
     WorkItem,
     ComputeUnit,
     ShaderEngine,
@@ -48,14 +48,14 @@ pub(crate) enum Scope {
     Workgroup,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Ordering {
+pub enum Ordering {
     Relaxed,
     Acquire,
     Release,
     Sequential,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum CachePolicy {
+pub enum CachePolicy {
     Temporal,
     NonTemporal,
     HighPriority,
@@ -67,7 +67,7 @@ pub(crate) enum CachePolicy {
     NearNonTemporalFarWriteBack,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct MemorySemantics {
+pub struct MemorySemantics {
     pub scope: Scope,
     pub ordering: Ordering,
     pub cache_policy: CachePolicy,
@@ -75,14 +75,14 @@ pub(crate) struct MemorySemantics {
     pub deferred_scope: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum MemoryOp {
+pub enum MemoryOp {
     Load(MemSize),
     Store(MemSize),
     AtomicAdd,
     Fence,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum WaveOp {
+pub enum WaveOp {
     Any,
     Ballot,
     ReadFirstLane,
@@ -93,7 +93,7 @@ pub(crate) enum WaveOp {
     Wmma,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum EffectOp {
+pub enum EffectOp {
     Memory {
         space: Space,
         op: MemoryOp,

@@ -1,7 +1,7 @@
 use crate::rdna_spmd::host::Vectors;
 use crate::rdna_spmd::ir::*;
 
-pub(super) struct Costs {
+pub struct Costs {
     lanes: u64,
     bits: u64,
 }

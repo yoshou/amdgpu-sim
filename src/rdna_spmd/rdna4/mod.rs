@@ -2,28 +2,28 @@ use crate::rdna_spmd::dialect::{Dialect, DialectRegistry};
 use crate::rdna_spmd::program::Program;
 use std::sync::Arc;
 
-pub(crate) mod decode;
-pub(crate) mod dialect;
-pub(crate) mod lift;
+mod decode;
+mod dialect;
+mod lift;
 
-pub(crate) fn dialect() -> Dialect {
+pub fn dialect() -> Dialect {
     let mut rdna4 = Dialect::new();
     rdna4.add_dialect(dialect::ID, "rdna4");
     rdna4.set_registers(dialect::REGISTERS);
-    rdna4.set_lowering_state(dialect::bvh::lowering_state);
+    rdna4.set_lowering_state(dialect::lowering_state);
     dialect::register(&mut rdna4).expect("RDNA4 target registration conflict");
-    let idioms = dialect::idioms::SqrtIdioms::new(&rdna4.registry);
+    let idioms = dialect::SqrtIdioms::new(&rdna4.registry);
     rdna4.add_idiom(Box::new(idioms));
-    let divisions = dialect::idioms::DivisionIdioms::new(&rdna4.registry);
+    let divisions = dialect::DivisionIdioms::new(&rdna4.registry);
     rdna4.add_idiom(Box::new(divisions));
     rdna4
 }
 
-pub(crate) fn supports(arch: &str) -> bool {
+pub fn supports(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
-pub(crate) fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
+pub fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
     let decoded = decode::program(entry_pc, memory)?;
     let normalized = decode::ScalarProgram {
         entry_pc: decoded.entry_pc,
@@ -36,7 +36,7 @@ pub(crate) fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> 
     Ok(lift_program(&normalized, Arc::new(dialect().registry)))
 }
 
-pub(crate) fn lift_program(
+fn lift_program(
     source: &decode::ScalarProgram,
     registry: Arc<DialectRegistry>,
 ) -> Program {
@@ -45,7 +45,7 @@ pub(crate) fn lift_program(
         instructions::I,
         rdna_instructions::{InstFormat, SourceOperand},
     };
-    use lift::{wave::YieldAction, Lowering};
+    use lift::{Lowering, YieldAction};
     let mut normalized = source.clone();
     let lowered: std::collections::BTreeMap<_, Vec<_>> = normalized
         .blocks
@@ -62,7 +62,7 @@ pub(crate) fn lift_program(
                         body.push(inst.clone());
                         lowerings.push(Lowering::Wave(YieldAction::new(
                             op,
-                            vec![lift::wave::Operand::Source(SourceOperand::LiteralConstant(
+                            vec![lift::Operand::Source(SourceOperand::LiteralConstant(
                                 u32::MAX,
                             ))],
                             vec![],
@@ -81,5 +81,5 @@ pub(crate) fn lift_program(
         .iter()
         .map(|(&pc, b)| (pc, b.iter().collect()))
         .collect();
-    lift::function::lift(registry, &normalized, &refs)
+    lift::lift(registry, &normalized, &refs)
 }

@@ -22,7 +22,7 @@ pub struct FiberCtx {
 const STACK_GUARD_BYTES: usize = 64;
 const STACK_POISON: u8 = 0xA5;
 
-pub(crate) type KernelFn = unsafe extern "C" fn(
+pub type KernelFn = unsafe extern "C" fn(
     *mut u32,
     *mut u32,
     u64,
@@ -112,7 +112,7 @@ impl Drop for Storage {
 
 impl Fiber {
 
-    pub(crate) fn batch(count: usize, stack_bytes: usize) -> Vec<Self> {
+    pub fn batch(count: usize, stack_bytes: usize) -> Vec<Self> {
         assert!(stack_bytes > STACK_GUARD_BYTES, "fiber stack too small");
         let stack_bytes = stack_bytes.checked_add(15).unwrap() & !15;
 
@@ -171,7 +171,7 @@ impl Fiber {
         unsafe { switch(&mut ctx.driver_rsp, ctx.fiber_rsp, 0) }
     }
 
-    pub(crate) fn yield_values(&self) -> *mut u32 {
+    pub fn yield_values(&self) -> *mut u32 {
         assert!(
             !self.ctx.values.is_null(),
             "fiber has no pending SSA values"
@@ -226,7 +226,7 @@ extern "C" fn main(ctx: *mut FiberCtx) -> ! {
     }
 }
 
-pub(in crate::rdna_spmd) fn yield_address() -> u64 {
+pub fn yield_address() -> u64 {
     amdgpu_sim_fiber_yield_values as *const () as u64
 }
 

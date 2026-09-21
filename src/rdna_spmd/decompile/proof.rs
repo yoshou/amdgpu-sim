@@ -1,12 +1,12 @@
 use super::logic::{lane_test, Atom, Kept, Logic};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
-use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
+use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::ir::TargetOp;
 use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::analysis::bdd::HashMap;
+use crate::rdna_spmd::hash::HashMap;
 use std::collections::BTreeMap;
 
-pub(super) fn prove(
+pub fn prove(
     f: &Func,
     facts: &Facts,
     inputs: &[crate::rdna_spmd::ir::Parameter],
@@ -19,7 +19,7 @@ pub(super) fn prove(
     };
     drop(all_local);
     let mut others = Logic::policies(f, facts);
-    let rest = others.m.not(others.all_local);
+    let rest = others.m.not(others.all_local());
     if rest != Bdd::FALSE {
         match analyse(f, facts, &mut others, rest, inputs, exec_index) {
             Ok(chosen) => return chosen,
@@ -213,7 +213,7 @@ impl Proof<'_> {
                 }
                 let mut lockstep: HashMap<ValueId, Option<Bdd>> = HashMap::default();
                 for inst in &block.insts {
-                    for v in outputs(inst) {
+                    for v in inst.outputs() {
                         let bit = f.types[v.0] == Ty::I1;
                         if !bit && f.types[v.0] != Ty::I32 {
                             continue;
@@ -429,7 +429,7 @@ impl Proof<'_> {
             }
             _ => {
                 let mut h = Bdd::FALSE;
-                for a in operands(inst) {
+                for a in inst.operands() {
                     h = self.or(h, self.whole(a));
                 }
                 h
@@ -485,7 +485,7 @@ impl Proof<'_> {
         }
         for (index, inst) in block.insts.iter().enumerate() {
             let h = self.inst(id, index, inst);
-            for v in outputs(inst) {
+            for v in inst.outputs() {
                 changed |= self.raise(v, h);
                 if facts.lane_word[v.0] {
                     let mode = self.logic.materialized(facts, v);
@@ -596,7 +596,7 @@ impl Proof<'_> {
                         self.logic.m.ite(mode, self.whole(w), local)
                     }
                 }
-                _ => any_of(self, &operands(inst)),
+                _ => any_of(self, &inst.operands()),
             },
             Inst::Target { args, .. } => any_of(self, args.values()),
             Inst::Packet { .. } => unreachable!("a packet query in a wave program"),
@@ -700,7 +700,7 @@ impl Proof<'_> {
                 if assume == Bdd::FALSE {
                     continue;
                 }
-                let all_local = self.logic.all_local;
+                let all_local = self.logic.all_local();
                 let other = self.not(all_local);
 
                 for (part, slice) in [all_local, other].iter().enumerate() {
@@ -1454,7 +1454,7 @@ impl Explore<'_, '_> {
                     }
                 }
                 _ => {
-                    for v in outputs(inst) {
+                    for v in inst.outputs() {
                         let d = formed(self, v, None);
                         descs.insert(v, d);
                     }

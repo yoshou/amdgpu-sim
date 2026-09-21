@@ -1,11 +1,10 @@
 use super::analysis::{Analyses, Context};
-use super::engine::kernel::{Kernel, Region, Scheduler};
+use super::engine::{Kernel, Region, Scheduler};
 use super::ir::{EffectOp, Func};
-use super::pass::uniform_queries::UniformQueries;
-use super::pass::{dce::Dce, idioms::Idioms, simplify::Simplify, Driver};
+use super::pass::{Dce, Driver, Idiom, Idioms, Simplify, UniformQueries};
 use super::program::Program;
 
-fn wave_passes(f: &mut Program, idioms: &[Box<dyn super::pass::idioms::Idiom>]) {
+fn wave_passes(f: &mut Program, idioms: &[Box<dyn Idiom>]) {
     let driver = Driver::new();
     let limit = 1 + f.ir.types.len();
     let mut an = Analyses::new(Context::of(&f.registry, &f.parameter_inputs, 32));
@@ -47,24 +46,24 @@ fn compile_lockstep(
         aligned: aligned(workgroup_x, width),
     };
     let packet = super::lockstep::lockstep(lane, packing);
-    let p = super::codegen::prepare::prepare(packet, packing, num_vgprs.max(256));
-    let scheduler = schedule(&sharing(p.ir.func(), None));
+    let p = super::codegen::prepare(packet, packing, num_vgprs.max(256));
+    let scheduler = schedule(&sharing(p.func(), None));
     let yields = p.resume_layouts();
     if yields
         .iter()
         .flatten()
         .any(|l| l.op == EffectOp::Wave(super::ir::WaveOp::Wmma))
     {
-        super::engine::wmma::warm(width as usize);
+        super::engine::warm_wmma(width as usize);
     }
-    let runtime = [(super::codegen::YIELD, super::engine::fiber::yield_address())];
+    let runtime = [(super::codegen::YIELD, super::engine::yield_address())];
     let lowerings = std::sync::Arc::new(super::rdna4::dialect().lowerings);
     let compiled = super::codegen::compile_regions(&p, lowerings, "vec_kernel", &runtime);
     let regions = compiled
         .regions
         .into_iter()
         .map(|region| {
-            let shares = sharing(p.ir.func(), Some(&region.blocks));
+            let shares = sharing(p.func(), Some(&region.blocks));
             Region {
                 address: region.address,
                 scheduler: schedule(&shares),
@@ -76,10 +75,10 @@ fn compile_lockstep(
         compiled.code,
         regions,
         yields,
-        p.registry.registers(),
+        p.registers(),
         compiled.frame_words,
-        p.num_vgprs,
-        p.min_private_bytes,
+        p.num_vgprs(),
+        p.min_private_bytes(),
         workgroup_x,
         scheduler,
         width,

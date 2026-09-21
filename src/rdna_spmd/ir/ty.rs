@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Ty {
+pub enum Ty {
     I1,
     I32,
     I64,
@@ -19,4 +19,4 @@ impl Ty {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ValueId(pub usize);
+pub struct ValueId(pub usize);
