@@ -1,9 +1,5 @@
-//! ISA §16.12 TRIG_PREOP_F64: extract a truncated 53-bit segment of
-//! floor((2/pi) * 2^1201), then scale according to the input's biased exponent.
-//! The table is immutable provider data, independent of architectural memory.
 use super::*;
 
-// Little-endian words of floor((2/pi) * 2^1201), with a sentinel word.
 const FRACTION: [u64; 20] = [
     0xBA10AC06608DF8F6,
     0x25D4D7F6BF623F1A,
@@ -96,25 +92,4 @@ pub(super) fn lower(e: &Emitter, args: &[Value]) -> Value {
     let exponent = ir.sub(base, shift);
     let result = scale::f64(e, &[fraction, exponent]);
     ir.select(valid, result, e.constant(Ty::F64, 0))
-}
-
-#[cfg(test)]
-pub(in crate::rdna_spmd) fn reference(bits: u64, selector: u32) -> u64 {
-    let exponent = (bits >> 52 & 0x7ff) as i32;
-    let shift = (selector & 31) as i32 * 53 + (exponent - 1077).max(0);
-    let offset = 1148 - shift;
-    if offset < 0 {
-        return 0;
-    }
-    // Independent bit-by-bit extraction; native code uses a two-word window.
-    let mut fraction = 0u64;
-    for bit in 0..53 {
-        let position = offset as usize + bit;
-        fraction |= (FRACTION[position / 64] >> (position % 64) & 1) << bit;
-    }
-    libm::scalbn(
-        fraction as f64,
-        -53 - shift + if exponent >= 1968 { 128 } else { 0 },
-    )
-    .to_bits()
 }

@@ -1,14 +1,3 @@
-//! The shape of a lane program as the lockstep lowering walks it.
-//!
-//! Every loop is a region and so is the whole function. A region's units are
-//! the blocks whose innermost loop it is, with each nested loop standing in as
-//! a single unit, so the edges between units form a DAG once the region's own
-//! latches are set aside. The units are listed in the preorder of that DAG's
-//! dominator tree, with the children of each unit in reverse postorder: this
-//! is a topological order in which every dominance subtree is contiguous, so a
-//! subtree -- the arm of a branch, or what follows a loop -- can be skipped as
-//! one span.
-
 use crate::rdna_spmd::analysis::facts::{operands, Facts, Site};
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::ir::*;
@@ -22,10 +11,9 @@ pub(super) enum Unit {
 
 pub(super) struct Region {
     pub units: Vec<Unit>,
-    /// Dominator-tree children of each unit, in topological order.
+
     pub children: Vec<Vec<usize>>,
-    /// The blocks of each unit's dominance subtree, loops included: what a
-    /// query over the unit's mask would skip.
+
     pub span: Vec<Vec<BlockId>>,
 }
 
@@ -33,12 +21,11 @@ pub(super) struct Structure {
     pub facts: Facts,
     pub loops: Loops,
     pub rank: BTreeMap<BlockId, usize>,
-    /// Region 0 is the function; loop `l` is region `l + 1`.
+
     pub regions: Vec<Region>,
-    /// Block parameters some instruction or live parameter reads.
+
     pub live: Vec<bool>,
-    /// A parameter every edge passes the same value, defined in every loop
-    /// the parameter's block is in, is that value.
+
     pub same: Vec<Option<ValueId>>,
 }
 
@@ -75,7 +62,6 @@ impl Structure {
         self.facts.order[self.loops.header(l)]
     }
 
-    /// The unit of region `l` a block belongs to, if the region contains it.
     pub fn unit(&self, l: Option<usize>, block: BlockId) -> Option<Unit> {
         if !self.within(l, block) {
             return None;
@@ -93,7 +79,6 @@ impl Structure {
         unreachable!("a block inside a region is in it or in one of its loops")
     }
 
-    /// Resolves a value through every parameter that only forwards another.
     pub fn resolve(&self, mut v: ValueId) -> ValueId {
         while let Some(next) = self.same[v.0] {
             v = next;

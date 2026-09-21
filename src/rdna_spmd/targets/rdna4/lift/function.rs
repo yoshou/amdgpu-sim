@@ -1,12 +1,8 @@
-//! Whole-function SSA construction from lifted instruction semantics.
-//! Register words become block parameters and explicit definitions; effects
-//! define their results before outgoing edges are constructed.
 use super::regs::{footprint, words as register_words, Word, Words};
 use super::*;
 use crate::rdna_spmd::targets::rdna4::decode::{ScalarProgram, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Typed SSA before native representation and predication decisions are applied.
 use crate::rdna_spmd::program::{LiftedFunction, Parameter, ParameterSource};
 pub(in crate::rdna_spmd) fn lift(
     registry: std::sync::Arc<DialectRegistry>,
@@ -28,8 +24,7 @@ pub(in crate::rdna_spmd) fn lift(
             regs.extend(register_words(&io.writes));
         }
     }
-    // Preserve the source use envelope while expressing each observation
-    // as the current SSA definition, including conservative adjacent words.
+
     for block in program.blocks.values() {
         for inst in &block.body {
             let rewrite = super::rewrite::effects_of(inst);
@@ -68,8 +63,7 @@ pub(in crate::rdna_spmd) fn lift(
     regs.extend([Word::Mask(106), Word::Mask(126)]);
     let regs: Vec<_> = regs.into_iter().collect();
     let mut f = Func::new(BlockId(program.entry_pc), crate::rdna_spmd::ir::Presence::Wave);
-    // Block parameters make all incoming definitions, including backedges,
-    // explicit before any block body is lifted.
+
     for &pc in program.blocks.keys() {
         let mut params: Vec<_> = regs.iter().map(|r| (f.value(r.ty()), r.ty())).collect();
         params.push((f.value(Ty::I1), Ty::I1));
@@ -206,8 +200,6 @@ fn invalidate(views: &mut BTreeMap<(Word, Ty, bool), ValueId>, writes: &[Word]) 
     });
 }
 
-/// Instantiate a replacement ALU expression in an existing SSA value namespace.
-/// Used by both initial lifting and typed instruction rewrites.
 pub(super) fn alu(
     registry: &DialectRegistry,
     f: &mut Func,
@@ -228,8 +220,7 @@ pub(super) fn alu(
         .iter()
         .map(|input| operands.read(input, *scalar, Some(*scc), f, block, words, views))
         .collect();
-    // A destination's old value is an update dependency,
-    // not a source view available to later instructions.
+
     let mut previous_views = views.clone();
     let previous: Vec<_> = outputs
         .iter()
@@ -253,8 +244,7 @@ pub(super) fn alu(
             _ => None,
         })
         .collect();
-    // Predicated destinations and mask writes read the previous
-    // architectural definitions before any result is assigned.
+
     for &word in writes.iter().chain(std::iter::once(&Word::Mask(126))) {
         let source = match word {
             Word::Vgpr(r) => InputSource::Operand(SourceOperand::VectorRegister(r as u8)),

@@ -1,5 +1,3 @@
-//! Shared scalar/packet LLVM lowering of the core SSA operations.
-//! No ISA opcodes, register files or per-lane runtime calls.
 use super::super::ir::*;
 use super::super::native::{Builder, Type, Value};
 

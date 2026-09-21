@@ -1,5 +1,3 @@
-//! Image descriptors are explicit SSA operands, including the sampler. DMASK
-//! chooses consecutive result words; it is not a hidden provider argument.
 use super::*;
 use std::convert::TryInto;
 
@@ -97,10 +95,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
     inputs.push(input(SourceOperand::VectorRegister(i.vaddr1), Ty::F32));
     inputs.push(input(SourceOperand::ScalarRegister(126), Ty::I1));
     let mut b = Builder::new(registry, inputs);
-    // Target signatures are architectural values, without an implicit EXEC
-    // argument. A zero descriptor selects constant zero and performs no read.
-    // Suppress every inactive operand, including undefined coordinates, before
-    // invoking this effect; selecting only its result would still read memory.
+
     let zero_word = b.k(Ty::I32, 0);
     let zero_float = b.k(Ty::F32, 0);
     let safe: [ValueId; 14] = std::array::from_fn(|k| {

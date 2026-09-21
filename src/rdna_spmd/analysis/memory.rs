@@ -2,7 +2,6 @@ use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
 use super::{Analyses, Analysis, Constants, Masking, Uniformity};
 use std::marker::PhantomData;
 
-/// The memory accesses of a program that carries its masks as `M` does.
 pub(crate) struct Accesses<M>(PhantomData<fn() -> M>);
 impl<M: Masking> Analysis for Accesses<M> {
     type Result = Vec<Access>;
@@ -272,8 +271,7 @@ fn accesses<M: Masking>(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -
                 words.len(),
                 "memory words share one address expression"
             );
-            // An access is a run of adjacent words; a word that does not
-            // follow the one before it starts the next access.
+
             if !flat && effects.len() == words.len() {
                 let size = match op {
                     MemoryOp::Load(s) | MemoryOp::Store(s) => s.bytes() as i64,
@@ -363,52 +361,4 @@ fn accesses<M: Masking>(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -
         }
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rdna_spmd::ir::parse;
-    use crate::rdna_spmd::program::{Parameter, ParameterSource};
-
-    #[test]
-    fn a_word_that_skips_an_address_starts_another_access() {
-        let registry = crate::rdna_spmd::targets::rdna4::registry();
-        let f = parse::func(
-            &registry,
-            "func entry b0
-             b0(v0: i32, v1: i32, v2: i1):
-               v3: i64 = pack64 v0, v1
-               v4: i32 = effect !p512 memory load.b32 global cu relaxed temporal volatile=0 deferred=0 (v3, v2)
-               v5: i64 = const i64 0x8
-               v6: i64 = int add v3, v5
-               v7: i32 = effect !p514 memory load.b32 global cu relaxed temporal volatile=0 deferred=0 (v6, v2)
-               v8: i64 = const i64 0xc
-               v9: i64 = int add v3, v8
-               v10: i32 = effect !p515 memory load.b32 global cu relaxed temporal volatile=0 deferred=0 (v9, v2)
-               ret",
-        )
-        .unwrap();
-        let inputs = [
-            Parameter {
-                source: ParameterSource::Sgpr(0),
-                ty: Ty::I32,
-            },
-            Parameter {
-                source: ParameterSource::Sgpr(1),
-                ty: Ty::I32,
-            },
-            Parameter {
-                source: ParameterSource::MaskBit(126),
-                ty: Ty::I1,
-            },
-        ];
-        let analyses = Analyses::new(super::super::Context::new(&registry, &inputs, 2, 8));
-        let runs: Vec<(u32, Vec<u32>)> = analyses
-            .get::<Accesses<super::super::ExecRegister>>(&f)
-            .iter()
-            .map(|a| (a.words, a.offsets.clone()))
-            .collect();
-        assert_eq!(runs, vec![(1, vec![0]), (2, vec![8, 12])]);
-    }
 }

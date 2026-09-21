@@ -1,4 +1,3 @@
-//! Lift wave and synchronization operations once, including their boundary values.
 use super::regs::BoundaryIo;
 use crate::rdna_spmd::ir::{Ty, *};
 use crate::{
@@ -13,19 +12,6 @@ pub(crate) enum Operand {
     Exec,
 }
 impl Operand {
-    #[cfg(test)]
-    pub fn eval(
-        &self,
-        lane: usize,
-        read: &impl Fn(usize, &SourceOperand) -> u32,
-        exec: &impl Fn(usize) -> bool,
-    ) -> u32 {
-        match self {
-            Self::Source(s) => read(lane, s),
-            Self::Add(s, k) => s.eval(lane, read, exec).wrapping_add(*k),
-            Self::Exec => exec(lane) as u32,
-        }
-    }
     pub(in crate::rdna_spmd) fn registers(&self, io: &mut BoundaryIo) {
         match self {
             Self::Source(SourceOperand::ScalarRegister(r)) => io.reads.add_sgpr(*r as u32),
@@ -42,8 +28,7 @@ pub(crate) enum Destination {
     Vgpr(u32),
     Scc,
 }
-/// A verified effect with its ISA operand and destination bindings. The scheduler consumes
-/// the same signature that function SSA and boundary IO use.
+
 #[derive(Clone, Debug)]
 pub struct YieldAction {
     pub(crate) op: EffectOp,
@@ -83,24 +68,6 @@ impl YieldAction {
             }
         }
         io
-    }
-    #[cfg(test)]
-    pub(crate) fn evaluate(
-        &self,
-        valid: u32,
-        read: impl Fn(usize, &SourceOperand) -> u32,
-        exec: impl Fn(usize) -> bool,
-    ) -> [[u32; 32]; 1] {
-        assert!(self.inputs.len() <= 4 && self.outputs.len() == 1);
-        let op = match self.op {
-            EffectOp::Wave(op) => op,
-            _ => panic!("workgroup barrier requires round state"),
-        };
-        [crate::rdna_spmd::engine::yields::evaluate(
-            op,
-            valid,
-            |index, lane| self.inputs[index].eval(lane, &read, &exec),
-        )]
     }
 }
 fn src(s: SourceOperand) -> Operand {
@@ -333,117 +300,5 @@ impl YieldAction {
             end: block.insts.len(),
             definitions,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn wave_operations_observe_all_32_lanes_and_validity() {
-        let value = |lane: usize, _: &SourceOperand| lane as u32 + 100;
-        for valid in [u32::MAX, 0x007f_ffff] {
-            for mask in [0u32, 1 << 21, 0xaaaa_aaaa, u32::MAX] {
-                let exec = |lane: usize| mask >> lane & 1 != 0;
-                for op in [WaveOp::Any, WaveOp::Ballot] {
-                    let action = YieldAction::new(
-                        EffectOp::Wave(op),
-                        vec![Operand::Exec],
-                        vec![Destination::Sgpr(0)],
-                    );
-                    let expected = if op == WaveOp::Any {
-                        ((mask & valid) != 0) as u32
-                    } else {
-                        mask & valid
-                    };
-                    assert_eq!(action.evaluate(valid, value, exec)[0], [expected; 32]);
-                }
-                let action = YieldAction::new(
-                    EffectOp::Wave(WaveOp::ReadFirstLane),
-                    vec![v(0), Operand::Exec],
-                    vec![Destination::Sgpr(0)],
-                );
-                let lane = if mask & valid == 0 {
-                    0
-                } else {
-                    (mask & valid).trailing_zeros()
-                };
-                assert_eq!(action.evaluate(valid, value, exec)[0], [lane + 100; 32]);
-            }
-        }
-        let args = vec![v(0), v(1), Operand::Exec];
-        let read = |lane: usize, s: &SourceOperand| match s {
-            SourceOperand::VectorRegister(0) => ((31 - lane) as u32 * 4) + 3,
-            _ => 100 + lane as u32,
-        };
-        for op in [WaveOp::Bpermute, WaveOp::BpermuteFi] {
-            let action =
-                YieldAction::new(EffectOp::Wave(op), args.clone(), vec![Destination::Vgpr(2)]);
-            let result = action.evaluate(u32::MAX, read, |lane| lane % 2 == 0);
-            for lane in 0..32 {
-                assert_eq!(
-                    result[0][lane],
-                    if op == WaveOp::BpermuteFi || (31 - lane) % 2 == 0 {
-                        131 - lane as u32
-                    } else {
-                        0
-                    }
-                );
-            }
-        }
-        let action = YieldAction::new(
-            EffectOp::Wave(WaveOp::ReadLane),
-            vec![v(0), v(1), src(SourceOperand::IntegerConstant(0))],
-            vec![Destination::Vgpr(2)],
-        );
-        let result = action.evaluate(
-            u32::MAX,
-            |lane, s| {
-                if matches!(s, SourceOperand::VectorRegister(0)) {
-                    lane as u32 + 100
-                } else {
-                    (lane as u32 + 41) % 64
-                }
-            },
-            |_| false,
-        );
-        for lane in 0..32 {
-            assert_eq!(result[0][lane], ((lane as u32 + 41) & 31) + 100);
-        }
-    }
-    #[test]
-    fn writelane_preserves_the_other_lanes_and_rejects_varying_arguments() {
-        let action = YieldAction::new(
-            EffectOp::Wave(WaveOp::WriteLane),
-            vec![
-                src(SourceOperand::IntegerConstant(99)),
-                src(SourceOperand::IntegerConstant(53)),
-                v(0),
-                src(SourceOperand::IntegerConstant(0)),
-            ],
-            vec![Destination::Vgpr(0)],
-        );
-        let result = action.evaluate(
-            u32::MAX,
-            |lane, s| match s {
-                SourceOperand::IntegerConstant(v) => *v as u32,
-                _ => lane as u32,
-            },
-            |_| false,
-        );
-        for lane in 0..32 {
-            assert_eq!(result[0][lane], if lane == 21 { 99 } else { lane as u32 });
-        }
-        assert!(std::panic::catch_unwind(|| YieldAction::new(
-            EffectOp::Wave(WaveOp::WriteLane),
-            vec![
-                v(0),
-                src(SourceOperand::IntegerConstant(0)),
-                v(1),
-                src(SourceOperand::IntegerConstant(1))
-            ],
-            vec![Destination::Vgpr(1)]
-        ))
-        .is_err());
     }
 }

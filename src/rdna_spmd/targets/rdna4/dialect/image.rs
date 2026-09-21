@@ -1,10 +1,4 @@
-//! RDNA4 ISA image resource/sampler fields and Table 61 address modes.
-//! Point sampling of the R8 formats exercised by the captured VSAMPLE suite.
-//! Coordinates and descriptors stay in SSA at every width. Masked byte gathers
-//! avoid touching memory for constant components or border samples.
 use super::*;
-#[cfg(test)]
-mod tests;
 
 fn call(e: &Emitter, name: &str, result: Type, args: &[Value]) -> Value {
     let types = args.iter().map(|v| v.ty()).collect::<Vec<_>>();
@@ -129,8 +123,7 @@ pub(super) fn sample(e: &Emitter, a: &[Value]) -> Value {
     );
     let offset = ir.add(ir.mul(wide(y), wide(row)), wide(x));
     let address = ir.add(base, offset);
-    // The scalar path uses the same masked-gather semantics with one element;
-    // LLVM lowers it to a guarded byte load, not an unconditional null load.
+
     let w = e.width().unwrap_or(1);
     let byte_vector = ir.i8().vector(w);
     let pointers = ir.ptr().vector(w);

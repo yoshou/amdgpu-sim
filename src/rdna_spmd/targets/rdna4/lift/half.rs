@@ -1,10 +1,7 @@
-//! Half conversion operand selection and partial-register destinations (§7.4).
-//! Numeric conversions are supplied by the RDNA4 provider.
 use super::*;
 
 pub(super) fn source(mut source: SourceOperand) -> SourceOperand {
-    // §4.1: inline floating constants use the operand's precision and occupy
-    // the low half, while integer and literal constants retain their bits.
+
     if let SourceOperand::FloatConstant(value) = source {
         source =
             SourceOperand::LiteralConstant(::half::f16::from_f32(value as f32).to_bits() as u32);
@@ -73,8 +70,6 @@ fn operands(inst: &InstFormat) -> Option<Operands> {
     })
 }
 
-/// The preserved half is an input, including when the numeric input is uniform.
-/// Share operand decoding with liveness, divergence and register-view analysis.
 pub(in crate::rdna_spmd) fn registers(inst: &InstFormat) -> Option<(Vec<u32>, u32)> {
     if let InstFormat::VOP3P(i) = inst {
         if matches!(i.op, I::V_FMA_MIXLO_F16 | I::V_FMA_MIXHI_F16) {

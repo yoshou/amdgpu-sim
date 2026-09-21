@@ -1,9 +1,6 @@
 use crate::rdna_spmd::analysis::facts::{operands, Facts, Site};
 use crate::rdna_spmd::ir::*;
 
-/// The decompiler discards register returns. Trace values used by control
-/// flow and effects through instructions and block arguments, so unused
-/// register flags do not force the ballots that computed them to stay whole.
 pub(super) fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
     let mut pending = Vec::new();
     for &id in &facts.order {

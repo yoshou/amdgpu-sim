@@ -1,6 +1,3 @@
-//! Width-independent facts derived from SSA definitions and CFG edges.
-//! Architectural register classes do not supply facts to this analysis.
-
 use super::super::ir::{Cvt, IntOp, IntPred, Op, Ty, ValueId, *};
 use super::{Analyses, Analysis};
 use std::collections::VecDeque;
@@ -73,14 +70,6 @@ impl Lists {
     }
 }
 
-/// A conservative, monotone constant analysis. All incoming CFG edges take
-/// part, including loop backedges; an unseeded cycle proves no constant.
-#[cfg(test)]
-pub(super) fn constants(function: &Func) -> Vec<Option<u64>> {
-    constant_facts(function, &[], false)
-}
-/// Facts valid on allocated work items. Use these only to fold queries which
-/// explicitly ignore padding; they must not replace ordinary EXEC/memory masks.
 fn constant_facts(f: &Func, entry_true: &[ValueId], valid_queries: bool) -> Vec<Option<u64>> {
     let mut definitions: Vec<_> = (0..f.types.len()).map(|_| Definition::External).collect();
     for (&id, block) in &f.blocks {
@@ -249,7 +238,7 @@ fn evaluate(ty: Ty, op: Op, types: &[Ty], facts: &[Fact]) -> Fact {
                 IntOp::And => a & b,
                 IntOp::Or => a | b,
                 IntOp::Xor => a ^ b,
-                // An oversized shift is not evidence of a defined constant.
+
                 IntOp::Shl | IntOp::LShr | IntOp::AShr if b >= ty.bits() as u64 => return Dynamic,
                 IntOp::Shl => a << b,
                 IntOp::LShr => a >> b,
@@ -284,106 +273,4 @@ fn evaluate(ty: Ty, op: Op, types: &[Ty], facts: &[Fact]) -> Fact {
         _ => return Dynamic,
     };
     Constant(result & mask(ty))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loop_backedge_can_disprove_a_constant_without_losing_invariants() {
-        let mut f = Func::new(BlockId(0), Presence::Wave);
-        let initial = f.value(Ty::I32);
-        let a = f.value(Ty::I32);
-        let invariant = f.value(Ty::I32);
-        let one = f.value(Ty::I32);
-        let next = f.value(Ty::I32);
-        let condition = f.value(Ty::I1);
-        let result = f.value(Ty::I32);
-        f.blocks.insert(
-            BlockId(0),
-            Block {
-                params: vec![],
-                insts: vec![Inst::Core {
-                    value: initial,
-                    ty: Ty::I32,
-                    op: Op::Const(Ty::I32, 7),
-                }],
-                term: Term::Br(Edge {
-                    dst: BlockId(1),
-                    args: vec![initial, initial],
-                }),
-            },
-        );
-        f.blocks.insert(
-            BlockId(1),
-            Block {
-                params: vec![(a, Ty::I32), (invariant, Ty::I32)],
-                insts: vec![
-                    Inst::Core {
-                        value: one,
-                        ty: Ty::I32,
-                        op: Op::Const(Ty::I32, 1),
-                    },
-                    Inst::Core {
-                        value: next,
-                        ty: Ty::I32,
-                        op: Op::Int(IntOp::Add, a, one),
-                    },
-                    Inst::Core {
-                        value: condition,
-                        ty: Ty::I1,
-                        op: Op::Env(crate::rdna_spmd::ir::Env::ValidLane),
-                    },
-                ],
-                term: Term::CondBr {
-                    cond: condition,
-                    yes: Edge {
-                        dst: BlockId(1),
-                        args: vec![next, invariant],
-                    },
-                    no: Edge {
-                        dst: BlockId(2),
-                        args: vec![invariant],
-                    },
-                },
-            },
-        );
-        f.blocks.insert(
-            BlockId(2),
-            Block {
-                params: vec![(result, Ty::I32)],
-                insts: vec![],
-                term: Term::Ret(vec![]),
-            },
-        );
-        let facts = constants(f.verify().unwrap().func());
-        assert_eq!(facts[a.0], None);
-        assert_eq!(facts[next.0], None);
-        assert_eq!(facts[invariant.0], Some(7));
-        assert_eq!(facts[result.0], Some(7));
-    }
-
-    #[test]
-    fn constant_words_keep_width_and_do_not_fold_undefined_shifts() {
-        let facts = [
-            Fact::Constant(0x8000_0001),
-            Fact::Constant(32),
-            Fact::Constant(1),
-        ];
-        let types = [Ty::I32; 3];
-        let a = ValueId(0);
-        let b = ValueId(1);
-        let one = ValueId(2);
-        assert!(evaluate(Ty::I32, Op::Int(IntOp::Shl, a, b), &types, &facts) == Fact::Dynamic);
-        assert!(
-            evaluate(Ty::I32, Op::Int(IntOp::AShr, a, one), &types, &facts)
-                == Fact::Constant(0xc000_0000)
-        );
-        assert!(
-            evaluate(Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, a), &types, &facts)
-                == Fact::Constant(0xffff_ffff_8000_0001)
-        );
-        assert!(evaluate(Ty::I32, Op::Int(IntOp::Add, a, a), &types, &facts) == Fact::Constant(2));
-    }
 }

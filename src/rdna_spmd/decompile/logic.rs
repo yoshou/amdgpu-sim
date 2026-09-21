@@ -11,20 +11,15 @@ pub(super) enum Atom {
     Constant(u32),
     Fresh(usize, ValueId, u32),
     Term(usize, usize, bool),
-    /// A conversion choice: true answers an `any` locally, or allows a
-    /// lane word to be represented by its own bit. False keeps the query or
-    /// requires the word to remain whole.
+
     Marker(ValueId),
 }
 
-/// The wave operations the lane program keeps as operations over the lanes
-/// that are at them, instead of answering from the lane's own values.
 #[derive(Default)]
 pub(super) struct Kept {
-    /// `any` queries kept as operations over the lanes at them.
+
     pub queries: BTreeSet<ValueId>,
-    /// Lane words kept as the words the wave computes, because a query kept
-    /// over them or an operation reads them whole.
+
     pub words: BTreeSet<ValueId>,
 }
 
@@ -43,10 +38,7 @@ pub(super) struct Logic {
     policy: Option<Vec<Bdd>>,
     choices: Vec<(ValueId, bool)>,
     abstract_queries: bool,
-    /// Leaves the words kept whole out of the relation reach follows along an
-    /// edge, so reach takes their bits to be anything. Relating them is most
-    /// of what reach costs where queries are answered by the wave, since the
-    /// lanes a query brings along hold them in every combination.
+
     open_words: bool,
     pub all_local: Bdd,
     edges: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<EdgeIndex>>,
@@ -54,8 +46,7 @@ pub(super) struct Logic {
 }
 
 impl Logic {
-    /// `kept` holds the `any` queries the lane program keeps, by the value
-    /// each defines; a test of a lane word is kept with the word.
+
     pub fn new(f: &Func, facts: &Facts, kept: &BTreeSet<ValueId>) -> Self {
         let mut params = HashMap::default();
         for (rank, id) in facts.order.iter().enumerate() {
@@ -85,9 +76,6 @@ impl Logic {
         }
     }
 
-    /// Interpret every conversion policy in the same formulas. A marker is
-    /// true when a query is answered locally; word materialization propagates
-    /// backwards from the tests that choose to read the whole word.
     pub fn policies(f: &Func, facts: &Facts) -> Self {
         let mut logic = Self::new(f, facts, &BTreeSet::new());
         let mut whole: Vec<Bdd> = facts
@@ -176,7 +164,6 @@ impl Logic {
         }
     }
 
-    /// Eliminate execution-state variables, retaining only policy choices.
     pub fn possible_policies(&mut self, condition: Bdd) -> Bdd {
         let varying: BTreeSet<_> = self
             .support(condition)
@@ -186,9 +173,6 @@ impl Logic {
         self.m.exists(condition, &|var| varying.contains(&var))
     }
 
-    /// Prefer a local answer whenever the remaining safety conditions allow
-    /// it. This chooses a model of an already proved formula, not another
-    /// invocation of the program proof.
     pub fn choose(&mut self, mut safe: Bdd) -> Kept {
         assert_ne!(safe, Bdd::FALSE);
         let mut kept = Kept::default();
@@ -221,12 +205,6 @@ impl Logic {
         self.relations.clear();
     }
 
-    /// Reachability under the policies this logic interprets. It is exact
-    /// for the policy that answers everything locally. For the others,
-    /// unconstrained query results and words kept whole safely overapproximate
-    /// reach. This avoids
-    /// enumerating combinations of unrelated branch choices in the
-    /// reachability relation; value differences still carry their choices.
     pub fn policy_reach(
         &mut self,
         f: &Func,
@@ -249,7 +227,6 @@ impl Logic {
         general
     }
 
-    /// Reach that takes the bits of the words kept whole to be anything.
     pub fn open_reach(
         &mut self,
         f: &Func,
@@ -306,8 +283,7 @@ impl Logic {
                         (3 << 30) | *self.fresh.entry(key).or_insert(next)
                     }
                 };
-                // Put policy choices before the execution-state variables:
-                // mux selectors after their inputs duplicate large subgraphs.
+
                 let var = if matches!(atom, Atom::Marker(_)) {
                     var
                 } else {
@@ -325,7 +301,6 @@ impl Logic {
         self.atoms[&var]
     }
 
-    /// The variables a function tests, in their order.
     pub fn support(&mut self, f: Bdd) -> Vec<u32> {
         if let Some(s) = self.supports.get(&f) {
             return s.clone();
@@ -344,8 +319,6 @@ impl Logic {
         }
     }
 
-    /// A formula with every marker settled: the queries in `kept` answered by
-    /// the wave, every other query by the lane.
     pub fn settled(&mut self, f: Bdd, kept: &[ValueId]) -> Bdd {
         let markers: HashMap<u32, Bdd> = self
             .support(f)
@@ -433,9 +406,6 @@ impl Logic {
         }
     }
 
-    /// Interpret equality through selects rather than inventing an unrelated
-    /// bit for a boolean encoded as an integer. On arms we cannot interpret,
-    /// the original comparison's bit remains an unknown answer.
     fn compare(
         &mut self,
         f: &Func,
@@ -835,10 +805,7 @@ impl Logic {
             .map(|(r, &b)| (b, r))
             .collect();
         let mut reach = std::collections::BTreeMap::from([(start, formula)]);
-        // What each block has already passed on. An image distributes over a
-        // union, so only what a block gained since is passed on again; any
-        // function between the gain and the whole serves, and the smallest
-        // such is cheapest to pass on.
+
         let mut sent: std::collections::BTreeMap<BlockId, Bdd> = Default::default();
         let mut worklist: BTreeSet<(usize, BlockId)> = BTreeSet::from([(rank[&start], start)]);
         while let Some((_, x)) = worklist.pop_first() {

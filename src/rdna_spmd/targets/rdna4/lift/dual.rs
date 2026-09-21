@@ -1,4 +1,3 @@
-//! Dual issue reads both operand sets before either architectural write.
 use super::*;
 use crate::rdna_instructions::{VOP1, VOP2, VOP3P};
 
@@ -33,7 +32,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                 b.finish(Output::Vgpr(dst as u32, Ty::F32), value)
             } else {
                 let bf16 = matches!(op, I::V_DUAL_DOT2ACC_F32_BF16);
-                // §7.7.2 DOT2ACC inlines replicate the short-format constant.
+
                 let source = match *source {
                     SourceOperand::FloatConstant(x) => {
                         let bits = if bf16 {
@@ -97,8 +96,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
             I::V_DUAL_FMAAK_F32 => I::V_FMAAK_F32,
             _ => return None,
         };
-        // Normalize the format at the ISA boundary; the arithmetic semantics
-        // are the same shared lift used for individually encoded operations.
+
         let single = if matches!(op, I::V_MOV_B32) {
             InstFormat::VOP1(VOP1 {
                 op,

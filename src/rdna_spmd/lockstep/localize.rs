@@ -1,19 +1,7 @@
-//! From the dominance form the lowering builds in to the block-local form the
-//! IR requires.
-//!
-//! The lowering lets a block read any value a dominating block defined. Two
-//! steps take it from there: a parameter every edge passes the same value
-//! (or itself) is that value, and every value a block reads from elsewhere
-//! becomes a parameter of that block, passed along every edge into it.
-//! Constants are defined again where they are read instead, so an operand a
-//! target operation requires to be constant stays one.
-
 use crate::rdna_spmd::analysis::facts::{operands, outputs};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Folds every parameter that only forwards one value, returning what each
-/// folded parameter became.
 pub(super) fn fold_forwarding(f: &mut Func) -> BTreeMap<ValueId, ValueId> {
     let mut renames: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     let find = |renames: &BTreeMap<ValueId, ValueId>, mut v: ValueId| {
@@ -128,7 +116,6 @@ fn rename_term(term: &mut Term, m: &dyn Fn(ValueId) -> ValueId) {
     }
 }
 
-/// Passes every value a block reads from another block in as a parameter.
 pub(super) fn localize(f: &mut Func) {
     let mut home: Vec<Option<BlockId>> = vec![None; f.types.len()];
     let mut constant: Vec<Option<(Ty, u64)>> = vec![None; f.types.len()];

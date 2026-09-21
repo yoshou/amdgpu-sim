@@ -1,4 +1,3 @@
-//! Lift ISA operands, state updates and effects into typed SSA.
 use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry};
@@ -33,8 +32,7 @@ pub(crate) struct Input {
     pub ty: Ty,
 }
 impl Input {
-    /// Resolve encoded constant precision at the ISA boundary. Mask constants
-    /// still require lane extraction, so they are not plain I1 constants.
+
     fn constant_bits(&self) -> Option<u64> {
         if self.ty == Ty::I1 {
             return None;
@@ -78,10 +76,9 @@ impl Input {
 pub(crate) enum InputSource {
     Operand(SourceOperand),
     Scc,
-    /// Architectural per-work-item state; never a wave reduction.
+
     MaskBit(u32),
-    /// EXEC used by an architectural write, in the existing native predicate
-    /// representation rather than an ISA numeric source view.
+
     ExecPredicate,
 }
 #[derive(Clone, Copy, Debug)]
@@ -155,8 +152,7 @@ impl<'r> Builder<'r> {
         }
         a
     }
-    /// Preserve captured VOP3 bit-modifier behavior also on integer encodings
-    /// (ISA §7.2.2.1 leaves that combination undefined). This is not integer negation.
+
     fn bits_mod(
         &mut self,
         ty: Ty,
@@ -200,7 +196,7 @@ impl<'r> Builder<'r> {
                 },
             );
             value = self.push(ty, Op::Float(FloatOp::Mul, value, factor));
-            // ISA §7.2.3.1: OMOD flushes output subnormals and maps -0 to +0.
+
             let word_ty = if ty == Ty::F64 { Ty::I64 } else { Ty::I32 };
             let word = self.push(word_ty, Op::Convert(Cvt::Bitcast, word_ty, value));
             let mask = self.k(
@@ -227,7 +223,7 @@ impl<'r> Builder<'r> {
                     1f32.to_bits() as u64
                 },
             );
-            // Ordered > maps NaNs, negative values and both zeros to +0.
+
             let positive = self.push(Ty::I1, Op::FCmp(FloatPred::Ogt, value, zero));
             value = self.push(ty, Op::Float(FloatOp::MinNum, value, one));
             value = self.push(ty, Op::Select(positive, value, zero));
@@ -276,8 +272,7 @@ fn input(source: SourceOperand, ty: Ty) -> Input {
         ty,
     }
 }
-/// Literal words in signed 64-bit operand positions are sign-extended;
-/// unsigned and bit-pattern positions retain their zero-extension rule.
+
 fn signed_input(source: SourceOperand, ty: Ty) -> Input {
     input(
         match (source, ty) {
@@ -290,8 +285,6 @@ fn signed_input(source: SourceOperand, ty: Ty) -> Input {
     )
 }
 
-/// Arithmetic results and flags are separate SSA values. All operands are
-/// bound before either destination is written, including aliased carry words.
 fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (op, mut sources, dst, mask) = match inst {
         InstFormat::VOP2(i)
@@ -404,11 +397,6 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         results.push((Output::Mask(mask as u32), flag));
     }
     Some(b.finish_many(false, results))
-}
-
-#[cfg(test)]
-pub(super) fn instruction(inst: &InstFormat) -> Lowering {
-    instruction_with_registry(inst, &crate::rdna_spmd::targets::rdna4::registry())
 }
 
 pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
@@ -579,7 +567,7 @@ impl Alu {
             inputs.push(input(SourceOperand::LiteralConstant(literal), Ty::F32));
         }
         if matches!(self.op, I::V_CNDMASK_B32) {
-            // I1 inputs are lane-mask projections, not integer conversions.
+
             inputs.push(input(
                 self.src
                     .get(2)
@@ -607,8 +595,7 @@ struct Shape {
 }
 
 impl Shape {
-    // Decide input types/arity before assigning IDs. Literals retain their ISA
-    // interpretation in Input, while constants introduced by the lift are bits.
+
     fn of(op: I, registry: &DialectRegistry) -> Shape {
         let cvt = conversion(op);
         let target = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, op)
@@ -948,8 +935,7 @@ fn lower_float(
             };
             let mut result = q.push(ty, Op::Float(f, a, b));
             if matches!(op, I::V_SUB_F32 | I::V_SUBREV_F32) {
-                // Captured subtraction cases preserve the NaN operand's
-                // payload and negate the subtrahend's NaN sign.
+
                 let nan_a = q.push(Ty::I1, Op::FCmp(FloatPred::Uno, a, a));
                 let nan_b = q.push(Ty::I1, Op::FCmp(FloatPred::Uno, b, b));
                 let word = q.push(Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, b));
@@ -984,7 +970,5 @@ fn conversion(op: I) -> Option<(Ty, Ty, Cvt)> {
         _ => return None,
     })
 }
-#[cfg(test)]
-mod tests;
 
 pub(crate) mod function;

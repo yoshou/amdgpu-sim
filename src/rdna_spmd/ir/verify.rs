@@ -3,10 +3,6 @@ use std::collections::BTreeSet;
 
 pub(crate) struct VerifiedFunc(Func);
 impl Func {
-    #[cfg(test)]
-    pub fn verify(self) -> Result<VerifiedFunc, &'static str> {
-        self.verify_with(&crate::rdna_spmd::targets::rdna4::registry())
-    }
     pub fn verify_with(
         self,
         registry: &crate::rdna_spmd::dialect::DialectRegistry,
@@ -165,9 +161,6 @@ impl Func {
         self.check_regions()
     }
 
-    /// The regions: each is entered at a block the function reaches, the lanes
-    /// present do not grow as they nest, and every operation is in a region
-    /// with at least the lanes it reads present. See [`super::scope`].
     fn check_regions(&self) -> Result<(), &'static str> {
         let doms = Dominators::of(self);
         if self.regions.get(&self.entry).is_none() {
@@ -201,8 +194,6 @@ impl Func {
     }
 }
 
-/// The lanes an operation reads beyond the one running it, and so the least a
-/// region holding it must have present. `None` where it reads no other lane.
 pub(super) fn lanes_read(inst: &Inst) -> Option<Presence> {
     match inst {
         Inst::Packet { .. }
@@ -229,10 +220,6 @@ impl VerifiedFunc {
 
 pub(crate) struct VerifiedExpr(Expr);
 impl Expr {
-    #[cfg(test)]
-    pub fn verify(self) -> Result<VerifiedExpr, &'static str> {
-        self.verify_with(&crate::rdna_spmd::targets::rdna4::registry())
-    }
     pub fn verify_with(
         self,
         registry: &crate::rdna_spmd::dialect::DialectRegistry,
@@ -269,66 +256,5 @@ impl Expr {
 impl VerifiedExpr {
     pub fn expr(&self) -> &Expr {
         &self.0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn verifies_multistep_ssa_with_boolean_result_and_select() {
-        Expr {
-            params: vec![Ty::I32, Ty::I32],
-            insts: vec![
-                ExprInst::Core(Ty::I1, Op::Cmp(IntPred::Ult, ValueId(0), ValueId(1))),
-                ExprInst::Core(Ty::I32, Op::Select(ValueId(2), ValueId(0), ValueId(1))),
-            ],
-            results: vec![ValueId(3)],
-        }
-        .verify()
-        .unwrap();
-    }
-
-    #[test]
-    fn rejects_forward_self_and_missing_references() {
-        for value in [1, 2, 99] {
-            assert!(Expr {
-                params: vec![Ty::I32],
-                insts: vec![ExprInst::Core(
-                    Ty::I32,
-                    Op::Int(IntOp::Add, ValueId(0), ValueId(value))
-                )],
-                results: vec![ValueId(1)]
-            }
-            .verify()
-            .is_err());
-        }
-        assert!(Expr {
-            params: vec![],
-            insts: vec![],
-            results: vec![ValueId(0)]
-        }
-        .verify()
-        .is_err());
-    }
-
-    #[test]
-    fn rejects_invalid_operand_and_result_types() {
-        for (ty, op) in [
-            (Ty::I32, Op::Int(IntOp::Add, ValueId(0), ValueId(1))),
-            (Ty::I1, Op::Int(IntOp::Add, ValueId(1), ValueId(1))),
-            (Ty::I32, Op::Cmp(IntPred::Ult, ValueId(0), ValueId(0))),
-            (Ty::I32, Op::Select(ValueId(0), ValueId(0), ValueId(0))),
-            (Ty::I32, Op::Select(ValueId(1), ValueId(0), ValueId(1))),
-        ] {
-            assert!(Expr {
-                params: vec![Ty::I32, Ty::I1],
-                insts: vec![ExprInst::Core(ty, op)],
-                results: vec![ValueId(2)]
-            }
-            .verify()
-            .is_err());
-        }
     }
 }

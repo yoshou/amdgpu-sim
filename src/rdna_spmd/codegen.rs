@@ -32,7 +32,7 @@ pub(super) struct Prepared {
     pub abi: Abi,
     pub observable_return: bool,
     pub uniform: Vec<bool>,
-    /// For each access, whether the mask it runs under always holds a lane.
+
     pub holds_a_lane: Vec<bool>,
     pub constants: Rc<Vec<Option<u64>>>,
     pub accesses: Rc<Vec<Access>>,

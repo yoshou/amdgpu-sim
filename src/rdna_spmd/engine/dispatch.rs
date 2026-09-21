@@ -1,14 +1,5 @@
-//! OpenMP-style parallel dispatch of independent scalar work-items.
-//!
-//! The target kernel has no cross-lane ops and no barriers (see the M1 scan),
-//! so every work-item is independent: we map the grid onto all CPU cores and
-//! run one [`ScalarKernel`] invocation per work-item. Per-work-item register
-//! files and scratch are thread-local; output is written by the kernel itself
-//! through global stores into the (disjoint, per-pixel) result buffer.
-
 use crate::processor::KernelDescriptor;
 
-/// Grid geometry (workgroup counts and per-workgroup sizes).
 #[derive(Clone, Copy)]
 pub struct GridDims {
     pub num_wg_x: u32,
@@ -28,8 +19,6 @@ impl GridDims {
     }
 }
 
-/// Build the 128-entry SGPR file for one work-item, mirroring the masked
-/// backend's `dispatch()` system-SGPR layout.
 #[inline]
 pub(in crate::rdna_spmd) fn setup_sgprs(
     s: &mut [u32],
@@ -68,7 +57,7 @@ pub(in crate::rdna_spmd) fn setup_sgprs(
         p += 2;
     }
     if kd.enable_sgpr_flat_scratch_init {
-        // Each work-item owns its scratch buffer, so the offset is 0.
+
         s[p] = 0;
         s[p + 1] = private_segment_size;
         p += 2;
@@ -82,8 +71,7 @@ pub(in crate::rdna_spmd) fn setup_sgprs(
     if kd.enable_sgpr_grid_workgroup_count_z && p < 16 {
         p += 1;
     }
-    // Workgroup IDs are delivered in architected high SGPRs (TTMP), matching the
-    // masked dispatch: sgpr117 = wgid_x, sgpr115 = (wgid_z << 16) | wgid_y.
+
     if kd.enable_sgpr_workgroup_id_x {
         s[117] = wg_id.0;
     }

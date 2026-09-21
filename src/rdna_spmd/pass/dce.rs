@@ -212,8 +212,6 @@ impl super::Pass for Dce {
     }
 }
 
-/// Removes the parameters nothing reads from a program that carries its masks
-/// as `M` does.
 pub(crate) struct DeadParams<M>(pub(crate) PhantomData<fn() -> M>);
 impl<M: Masking> super::Pass for DeadParams<M> {
     fn name(&self) -> &str {

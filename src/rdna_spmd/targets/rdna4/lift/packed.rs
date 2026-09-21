@@ -1,5 +1,3 @@
-//! Packed integer semantics (RDNA4 ISA §16.10), expressed as word SSA.
-//! Both selected source halves are captured before the packed destination write.
 use super::*;
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
@@ -57,8 +55,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
                 raw
             };
             let selected = b.int(IntOp::And, selected, mask);
-            // Preserve hardware-captured NEG/NEG_HI behavior on packed integer
-            // encodings: toggle bit 15 before interpreting the signed half.
+
             let selected = b.bits_mod(Ty::I32, 16, selected, 0, neg, source);
             let selected = if signed {
                 let shifted = b.int(IntOp::Shl, selected, shift);
@@ -97,8 +94,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         if saturates && i.cm != 0 {
             let low = b.k(Ty::I32, if signed { 0xffff_8000 } else { 0 });
             let high = b.k(Ty::I32, if signed { 0x7fff } else { 0xffff });
-            // Unsigned multiplication plus an unsigned half still fits u32.
-            // Unsigned subtraction alone needs a borrow check before clipping.
+
             if !signed && arithmetic == IntOp::Sub {
                 let borrow = b.push(Ty::I1, Op::Cmp(IntPred::Ult, args[0], args[1]));
                 result = b.push(Ty::I32, Op::Select(borrow, low, result));
@@ -124,8 +120,6 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
     Some(b.finish(Output::Vgpr(i.vdst as u32, Ty::I32), packed))
 }
 
-// §16.10: IU8/IU4 use NEG[0:1] as signedness selectors. OPSEL selects
-// halves before unpacking; the accumulator is a complete, unmodified word.
 fn dot_integer(
     i: &crate::rdna_instructions::VOP3P,
     registry: &DialectRegistry,
@@ -203,10 +197,6 @@ fn dot_integer(
     Some(b.finish(Output::Vgpr(i.vdst as u32, Ty::I32), value))
 }
 
-// F16 products have at most 22 significant bits. F64 retains every bit
-// relevant to a finite F16 fused result. Jam an inexact intermediate F32
-// conversion to odd before the provider's RNE half conversion, avoiding
-// double rounding at half-precision midpoints.
 fn narrow_wide_half(b: &mut Builder<'_>, value: ValueId) -> ValueId {
     let single = b.push(Ty::F32, Op::Convert(Cvt::FloatResizeRte, Ty::F32, value));
     let widened = b.push(Ty::F64, Op::Convert(Cvt::FloatResizeRte, Ty::F64, single));
@@ -292,8 +282,7 @@ fn packed_float(
             }
             value
         };
-        // Clipping commutes with half RNE because 0 and 1 are exactly
-        // representable, including the ISA's NaN-to-zero clamp rule.
+
         value = b.output_mod(if wide { Ty::F64 } else { Ty::F32 }, value, i.cm, 0);
         results.push(if wide {
             narrow_wide_half(&mut b, value)
@@ -307,8 +296,6 @@ fn packed_float(
     Some(b.finish(Output::Vgpr(i.vdst as u32, Ty::I32), value))
 }
 
-// §16.10 MIX: OPSEL_HI chooses precision; OPSEL chooses the half only
-// for F16 inputs. NEG_HI is ABS, and a half destination preserves its sibling.
 fn mixed_float(
     i: &crate::rdna_instructions::VOP3P,
     registry: &DialectRegistry,
@@ -375,9 +362,6 @@ fn mixed_float(
     ))
 }
 
-// §16.10 dot products accumulate two exact short-format products and F32 C.
-// Retaining the F64 summation residual avoids losing C when two large
-// products cancel. Captured F32 results allow two ULP; CLAMP is ignored.
 fn dot_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) -> Option<Lowering> {
     let bf16 = match i.op {
         I::V_DOT2_F32_F16 => false,
@@ -399,7 +383,7 @@ fn dot_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) ->
         let mut values = Vec::new();
         for index in 0..2 {
             let mut value = ValueId(index);
-            // BF16 floating inlines always select the FP32 upper half (§7.7.2).
+
             let source = if index == 0 { i.src0 } else { i.src1 };
             let high = if bf16 && matches!(source, SourceOperand::FloatConstant(_)) {
                 true
@@ -428,8 +412,7 @@ fn dot_float(i: &crate::rdna_instructions::VOP3P, registry: &DialectRegistry) ->
     let (total, error) = two_sum(&mut b, sum, c);
     let error = b.push(Ty::F64, Op::Float(FloatOp::Add, error, residual));
     let corrected = b.push(Ty::F64, Op::Float(FloatOp::Add, total, error));
-    // Residual arithmetic is undefined for infinities; preserve the ordinary
-    // IEEE sum in that case, including NaN payload propagation.
+
     let magnitude = b.push(Ty::F64, Op::Unary(FloatUnary::Abs, total));
     let bound = b.k(Ty::F64, f64::MAX.to_bits());
     let finite = b.push(Ty::I1, Op::FCmp(FloatPred::Ole, magnitude, bound));

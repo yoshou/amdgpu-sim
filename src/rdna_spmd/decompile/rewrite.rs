@@ -96,9 +96,6 @@ fn projection(p: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
     }
 }
 
-/// The lane program: the wave program with every query answered from the
-/// lane's own bit, except the queries and words in `kept`, which stay wave
-/// operations over the lanes that are at them.
 pub(super) fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
     let reachable: std::collections::BTreeSet<BlockId> = facts.order.iter().copied().collect();
     let mut q = Func::new(p.entry, Presence::Wave);
@@ -181,7 +178,7 @@ fn rewrite_inst(p: &Func, facts: &Facts, kept: &Kept, b: &mut Block, inst: Inst)
                     op: Op::Convert(Cvt::Bitcast, Ty::I1, inputs[0]),
                 });
             } else {
-                // A word read whole stays the word the wave computes.
+
                 b.insts.push(inst);
             }
         }

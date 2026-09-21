@@ -117,9 +117,6 @@ fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
     local
 }
 
-/// A wave query answers over all 32 lanes. Only a packet that holds the whole
-/// wave answers every query from its own lanes; a narrower packet answers
-/// locally only the queries whose answers nothing observes.
 pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     let all = whole_wave;
     let mut count = 0;
@@ -165,9 +162,6 @@ pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     count
 }
 
-/// WriteLane requires wave-uniform value and selector. Lane i's result is
-/// exactly `i == (selector & 31) ? value : old[i]`, so no value crosses a
-/// packet boundary and the rendezvous can be removed.
 pub(crate) fn local_write_lanes(f: &mut Func) -> usize {
     let scheduled_reads = f.blocks.values().flat_map(|b| &b.insts).any(|inst| matches!(inst,
         Inst::Effect { op: EffectOp::Wave(WaveOp::ReadLane), provenance, .. } if provenance & SCHEDULED != 0));

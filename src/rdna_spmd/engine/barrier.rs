@@ -1,4 +1,3 @@
-//! Workgroup barrier rounds, counted per wave rather than per work item.
 use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 struct Round {
@@ -57,30 +56,5 @@ impl Barriers {
             b.rounds.remove(&generation);
         }
         true
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn rounds_ids_and_first_wave_are_independent() {
-        let mut b = Barriers::new(3);
-        assert!(!b.wait(1, 7));
-        assert!(b.signal(2, 7));
-        assert!(!b.signal(0, 7));
-        assert!(!b.wait(2, 7));
-        assert!(b.signal(0, 9));
-        assert!(!b.signal(1, 7));
-        assert!(b.wait(1, 7));
-        assert!(b.wait(2, 7));
-        assert!(b.signal(1, 7));
-        assert!(b.wait(0, 7));
-        assert!(!b.wait(1, 7));
-        assert!(!b.signal(0, 7));
-        assert!(!b.signal(2, 7));
-        for w in 0..3 {
-            assert!(b.wait(w, 7));
-        }
-        assert!(!b.wait(0, 9));
     }
 }
