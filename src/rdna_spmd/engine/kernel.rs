@@ -6,8 +6,6 @@ pub const COOP_LEAVE: u64 = 1 << 33;
 
 pub const COOP_SGPR_BUF: usize = 129;
 
-pub const COOP_SPILL_SLOTS: usize = 256;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheduler {
     Independent,

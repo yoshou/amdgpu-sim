@@ -7,7 +7,6 @@ use super::target::Target;
 use super::engine::kernel::{
     Kernel, Region, Scheduler,
 };
-use super::program::{CompilationInput, Program};
 
 use super::analysis::uniformity::Fact;
 use super::analysis::{
@@ -21,13 +20,13 @@ use super::pass::{
     active::Active,
     adjacency::Adjacency,
     dce::{Dce, DeadParams},
-    entry::{DiscardReturn, LocalWriteLanes, PacketState},
+    entry::{DiscardReturn, PacketState},
     idioms::Idioms,
     pairs::{Pairs, WideMemory},
     simplify::Simplify,
 };
 use super::pass::{Driver, Pass};
-use super::program::{LiftedFunction, Parameter, ParameterSource};
+use super::program::{CompilationInput, Parameter, ParameterSource, Program};
 
 pub struct Compiler {
     target: Arc<dyn Target>,
@@ -52,7 +51,7 @@ fn context<'r>(registry: &'r DialectRegistry, inputs: &'r [Parameter], lanes: u3
     Context::new(registry, inputs, exec_index(inputs, registry), lanes)
 }
 
-pub(super) fn wave_passes(f: &mut LiftedFunction) {
+pub(super) fn wave_passes(f: &mut Program) {
     let driver = Driver::new();
     let limit = 1 + f.ir.types.len();
     let mut an = Analyses::new(context(&f.registry, &f.parameter_inputs, 32));
@@ -93,8 +92,10 @@ fn yield_layouts_ir(
                 open = None;
                 continue;
             };
-            let scheduled = *provenance & crate::rdna_spmd::ir::SCHEDULED != 0
-                || matches!(op, EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait);
+            let scheduled = matches!(
+                op,
+                EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait
+            );
             if !scheduled {
                 open = None;
                 continue;
@@ -146,7 +147,7 @@ struct Bare {
     registry: Arc<DialectRegistry>,
 }
 
-fn bare(f: LiftedFunction) -> Bare {
+fn bare(f: Program) -> Bare {
     Bare {
         ir: f.ir,
         inputs: f.parameter_inputs,
@@ -162,7 +163,7 @@ fn prepared<M: Masking>(
     num_vgprs: usize,
 ) -> Prepared {
     let driver = Driver::new();
-    let mut passes: Vec<&dyn Pass> = vec![&PacketState, &LocalWriteLanes];
+    let mut passes: Vec<&dyn Pass> = vec![&PacketState];
     if width.is_none() {
         passes.push(&Active);
     }
@@ -231,7 +232,6 @@ fn prepared<M: Masking>(
         width,
         uniform,
         holds_a_lane,
-        constants,
         accesses,
         shapes,
         clusters,
@@ -243,17 +243,10 @@ fn prepared<M: Masking>(
 }
 
 pub(super) fn prepare_lockstep(
-    f: LiftedFunction,
+    f: Program,
     packing: super::lockstep::Packing,
     num_vgprs: usize,
-    meets: bool,
 ) -> Prepared {
-    let f = if meets {
-        let program = Program { function: f };
-        super::program::split_at_effects(program, packing.lanes >= WAVE).function
-    } else {
-        f
-    };
     let Bare {
         mut ir,
         inputs,
@@ -286,9 +279,9 @@ pub(super) fn prepare_lockstep(
 
 impl Compiler {
     pub fn decode_program(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-        let mut function = self.target.decode(entry_pc, memory)?;
-        wave_passes(&mut function);
-        Ok(Program { function })
+        let mut program = self.target.decode(entry_pc, memory)?;
+        wave_passes(&mut program);
+        Ok(program)
     }
 }
 
@@ -328,16 +321,8 @@ pub(crate) fn compile_lockstep(
         aligned: aligned(workgroup_x, width),
     };
     let packet = super::lockstep::lockstep(lane, packing);
-    let program = Program { function: packet };
-    let shares = sharing(
-        &program.function.ir,
-        &constants_of(&program),
-        None,
-        width >= WAVE,
-    );
-    let scheduler = schedule(&shares);
-    let meets = shares.barrier || shares.exchange;
-    let p = prepare_lockstep(program.function, packing, num_vgprs.max(256), meets);
+    let p = prepare_lockstep(packet, packing, num_vgprs.max(256));
+    let scheduler = schedule(&sharing(p.ir.func(), None));
     let yields = p.resume_layouts();
     if yields
         .iter()
@@ -351,12 +336,7 @@ pub(crate) fn compile_lockstep(
         .regions
         .into_iter()
         .map(|region| {
-            let shares = sharing(
-                p.ir.func(),
-                &p.constants,
-                Some(&region.blocks),
-                width >= WAVE,
-            );
+            let shares = sharing(p.ir.func(), Some(&region.blocks));
             Region {
                 address: region.address,
                 scheduler: schedule(&shares),
@@ -382,7 +362,6 @@ pub fn decode_program(arch: &str, entry_pc: usize, memory: &[u8]) -> Result<Prog
     Compiler::for_arch(arch)?.decode_program(entry_pc, memory)
 }
 
-const WAVE: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompileOptions {
@@ -397,22 +376,11 @@ struct Sharing {
     exchange: bool,
 }
 
-fn constants_of(program: &Program) -> std::rc::Rc<Vec<Option<u64>>> {
-    Analyses::new(context(
-        &program.function.registry,
-        &program.function.parameter_inputs,
-        32,
-    ))
-    .get::<Constants>(&program.function.ir)
-}
-
 fn sharing(
     f: &Func,
-    constants: &[Option<u64>],
     blocks: Option<&std::collections::BTreeSet<super::ir::BlockId>>,
-    whole_wave: bool,
 ) -> Sharing {
-    use super::ir::{EffectOp, Inst, Space, WaveOp};
+    use super::ir::{EffectOp, Inst, Space};
     let mut out = Sharing {
         barrier: false,
         group: false,
@@ -423,7 +391,7 @@ fn sharing(
             continue;
         }
         for inst in &block.insts {
-            let Inst::Effect { op, inputs, .. } = inst else {
+            let Inst::Effect { op, .. } = inst else {
                 continue;
             };
             match op {
@@ -431,9 +399,8 @@ fn sharing(
                     space: Space::Lds, ..
                 } => out.group = true,
                 EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => out.barrier = true,
-                EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane)
-                    if whole_wave => {}
-                _ => out.exchange |= super::program::exchange(op, inputs, constants),
+                EffectOp::Wave(_) => out.exchange = true,
+                _ => {}
             }
         }
     }
@@ -453,6 +420,6 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
         options.width
     );
     let program = program.to_ssa();
-    let lane = super::decompile::decompile(&program.function);
+    let lane = super::decompile::decompile(&program);
     compile_lane(&lane, options.num_vgprs, options.width, options.workgroup_x)
 }

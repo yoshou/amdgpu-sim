@@ -155,23 +155,7 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     })
 }
 
-pub(in crate::rdna_spmd) fn mark_scheduled(insts: &mut [crate::rdna_spmd::ir::Inst]) {
-    for inst in insts {
-        if let crate::rdna_spmd::ir::Inst::Effect { provenance, op, .. } = inst {
-            if matches!(
-                op,
-                EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait
-            ) && *provenance & (1 << 63) == 0
-            {
-                *provenance |= crate::rdna_spmd::ir::SCHEDULED;
-            }
-        }
-    }
-}
-
 pub(in crate::rdna_spmd) struct Plan {
-    pub core: std::ops::Range<usize>,
-    pub end: usize,
     pub definitions: Vec<(Destination, super::ValueId)>,
 }
 
@@ -225,7 +209,6 @@ impl YieldAction {
             block.insts.extend(operands.core);
             value
         }
-        let start = block.insts.len();
         let (args, results) = self.op.signature();
         let inputs: Vec<_> = self
             .inputs
@@ -239,7 +222,6 @@ impl YieldAction {
             EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi)
         )
         .then(|| inputs[2]);
-        let end = block.insts.len();
         block.insts.push(Inst::Effect {
             provenance: *provenance << 8,
             op: self.op,
@@ -296,8 +278,6 @@ impl YieldAction {
             definitions.push((*dest, stored));
         }
         Plan {
-            core: start..end,
-            end: block.insts.len(),
             definitions,
         }
     }

@@ -2,88 +2,6 @@ use super::super::engine::yields::Argument;
 use super::*;
 
 impl<'a> Cg<'a> {
-    fn spill_slot_ptr(&self, vgpr: u32, lane: u32) -> Value {
-        let idx = {
-            let mut m = self.spill.borrow_mut();
-            let next = m.len();
-            *m.entry((vgpr, lane)).or_insert(next)
-        };
-        assert!(
-            idx < super::super::engine::kernel::COOP_SPILL_SLOTS,
-            "too many writelane/readlane spill slots"
-        );
-        self.register_slot(self.spill_base, idx as u32)
-    }
-    fn lane_constant(&self, lane: ValueId) -> u32 {
-        self.p.constants[lane.0].expect("cross-lane access requires a constant lane") as u32
-    }
-
-    pub(super) fn emit_local_wave(
-        &mut self,
-        op: EffectOp,
-        inputs: &[ValueId],
-        outputs: &[(ValueId, Ty)],
-    ) {
-        let ir = self.ir;
-        match op {
-            EffectOp::Wave(WaveOp::Any) | EffectOp::Wave(WaveOp::Ballot) => {
-                let bits = match self.p.width {
-                    Some(_) => {
-                        let v = self.vector(inputs[0]);
-                        self.vec_to_mask(v)
-                    }
-                    None => {
-                        let v = self.scalar(inputs[0]);
-                        ir.zext(v, ir.i32())
-                    }
-                };
-                let result = if op == EffectOp::Wave(WaveOp::Any) {
-                    ir.icmp(IntPred::Ne, bits, self.ci32(0))
-                } else {
-                    bits
-                };
-                self.define(outputs[0].0, result);
-            }
-            EffectOp::Wave(WaveOp::ReadFirstLane) => {
-                let result = if let Some(w) = self.p.width {
-                    let src = self.vector(inputs[0]);
-                    let exec = self.vector(inputs[1]);
-                    let word = self.vec_to_mask(exec);
-                    let tz = ir.call_named(
-                        "llvm.cttz.i32",
-                        ir.i32(),
-                        &[ir.i32(), ir.i1()],
-                        &[word, ir.ci1(false)],
-                    );
-                    let over = ir.icmp(IntPred::Uge, tz, self.ci32(w));
-                    let idx = ir.select(over, self.ci32(0), tz);
-                    ir.extract(src, idx)
-                } else {
-                    self.scalar(inputs[0])
-                };
-                self.define(outputs[0].0, result);
-            }
-            EffectOp::Wave(WaveOp::WriteLane) => {
-                let lane = self.lane_constant(inputs[1]);
-                let reg = self.lane_constant(inputs[3]);
-                let value = self.scalar(inputs[0]);
-                let slot = self.spill_slot_ptr(reg, lane);
-                ir.store(value, slot);
-                let old = self.values[inputs[2].0];
-                self.define(outputs[0].0, old);
-            }
-            EffectOp::Wave(WaveOp::ReadLane) => {
-                let lane = self.lane_constant(inputs[1]);
-                let reg = self.lane_constant(inputs[2]);
-                assert!(reg != u32::MAX, "readlane source must be a VGPR");
-                let slot = self.spill_slot_ptr(reg, lane);
-                let value = ir.load(ir.i32(), slot);
-                self.define(outputs[0].0, value);
-            }
-            _ => panic!("wave operation {:?} requires cooperative dispatch", op),
-        }
-    }
-
     pub(super) fn emit_yield(&mut self, members: &[(u64, Vec<ValueId>, Vec<(ValueId, Ty)>)]) {
         let ir = self.ir;
         let resume = self.p.resume_index(members[0].0);
@@ -120,7 +38,7 @@ impl<'a> Cg<'a> {
         }
         let ty = ir.void().function(&[ir.ptr(), ir.i64(), ir.ptr()]);
         let function = ir.function("amdgpu_sim_fiber_yield_values", ty);
-        let context = self.func.param(7);
+        let context = self.func.param(6);
         ir.call(ty, function, &[context, ir.ci64(resume as u64), frame]);
         for (provenance, _, outputs) in members {
             let layout = self

@@ -7,7 +7,6 @@ use super::dispatch::{setup_sgprs, GridDims};
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 use super::kernel::{
     Kernel, Region, Scheduler, COOP_ENTER, COOP_LEAVE, COOP_SGPR_BUF,
-    COOP_SPILL_SLOTS,
 };
 use super::yields::YieldValues;
 
@@ -79,7 +78,6 @@ enum Unit {
 struct State {
     sgprs: Vec<[u32; COOP_SGPR_BUF]>,
     vgprs: Vec<Vec<u32>>,
-    spill: Vec<Vec<u32>>,
     fibers: Vec<Vec<Fiber>>,
     frames: Vec<Vec<u32>>,
     args: Vec<Option<KernelArgs>>,
@@ -120,9 +118,6 @@ fn acquire(shape: Shape) -> State {
         sgprs: vec![[0u32; COOP_SGPR_BUF]; shape.packets],
         vgprs: (0..shape.packets)
             .map(|_| vec![0u32; shape.words])
-            .collect(),
-        spill: (0..shape.packets)
-            .map(|_| vec![0u32; COOP_SPILL_SLOTS])
             .collect(),
         fibers: (0..shape.fibers)
             .map(|_| Fiber::batch(shape.packets, shape.stack))
@@ -370,12 +365,10 @@ impl Engine<'_> {
             }
             state.done[packet] = valid_lanes == 0;
             {
-                state.spill[packet].fill(0);
                 let args = KernelArgs {
                     entry: self.view.regions[0].address,
                     sgprs: sgprs.as_mut_ptr(),
                     vgprs: vgprs.as_mut_ptr(),
-                    spill: state.spill[packet].as_mut_ptr(),
                     scratch_base,
                     scratch_stride: self.stride as u64,
                     lane_base: ((packet % self.packets_per_wave) * width) as u64,

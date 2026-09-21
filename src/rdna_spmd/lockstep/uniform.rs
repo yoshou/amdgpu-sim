@@ -4,10 +4,10 @@ use crate::rdna_spmd::analysis::uniformity::Fact;
 use crate::rdna_spmd::analysis::{Analyses, Context, MaskValues, Packet, Uniformity};
 use crate::rdna_spmd::compiler::exec_index;
 use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::program::LiftedFunction;
+use crate::rdna_spmd::program::Program;
 use std::collections::BTreeMap;
 
-pub(super) fn context(lane: &LiftedFunction, packing: Packing) -> Context<'_> {
+pub(super) fn context(lane: &Program, packing: Packing) -> Context<'_> {
     Context {
         packet: Some(Packet {
             aligned: packing.aligned,
@@ -21,14 +21,14 @@ pub(super) fn context(lane: &LiftedFunction, packing: Packing) -> Context<'_> {
     }
 }
 
-pub(super) fn assume(lane: &LiftedFunction, packing: Packing) -> Vec<bool> {
+pub(super) fn assume(lane: &Program, packing: Packing) -> Vec<bool> {
     Analyses::new(context(lane, packing))
         .get::<Uniformity<MaskValues>>(&lane.ir)
         .uniform()
 }
 
 pub(super) fn refuted(
-    lane: &LiftedFunction,
+    lane: &Program,
     packing: Packing,
     packet: &Func,
     masks: &Masks,

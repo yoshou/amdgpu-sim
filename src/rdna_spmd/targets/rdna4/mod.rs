@@ -1,5 +1,5 @@
 use crate::rdna_spmd::dialect::DialectRegistry;
-use crate::rdna_spmd::program::{CompilationInput, LiftedFunction, Program};
+use crate::rdna_spmd::program::{CompilationInput, Program};
 use crate::rdna_spmd::target::Target;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ impl Target for Rdna4 {
     fn supports(&self, arch: &str) -> bool {
         arch.starts_with("gfx12")
     }
-    fn decode(&self, entry_pc: usize, memory: &[u8]) -> Result<LiftedFunction, String> {
+    fn decode(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
         let decoded = decode::program(entry_pc, memory)?;
         let normalized = decode::ScalarProgram {
             entry_pc: decoded.entry_pc,
@@ -53,7 +53,7 @@ impl Target for Rdna4 {
 pub(crate) fn lift_program(
     source: &decode::ScalarProgram,
     registry: Arc<DialectRegistry>,
-) -> LiftedFunction {
+) -> Program {
     use crate::rdna_spmd::ir::EffectOp;
     use crate::{
         instructions::I,
@@ -100,8 +100,6 @@ pub(crate) fn lift_program(
 
 impl CompilationInput for decode::ScalarProgram {
     fn to_ssa(&self) -> Program {
-        Program {
-            function: lift_program(self, Arc::new(registry())),
-        }
+        lift_program(self, Arc::new(registry()))
     }
 }

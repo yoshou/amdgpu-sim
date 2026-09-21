@@ -5,16 +5,16 @@ mod proof;
 mod rewrite;
 
 use crate::rdna_spmd::analysis::facts;
-use crate::rdna_spmd::program::LiftedFunction;
+use crate::rdna_spmd::program::Program;
 use std::collections::BTreeSet;
 
 pub(crate) struct Lane {
-    pub function: LiftedFunction,
+    pub function: Program,
     pub everyone: BTreeSet<u64>,
 }
 
-impl From<LiftedFunction> for Lane {
-    fn from(function: LiftedFunction) -> Self {
+impl From<Program> for Lane {
+    fn from(function: Program) -> Self {
         Self {
             function,
             everyone: BTreeSet::new(),
@@ -22,7 +22,7 @@ impl From<LiftedFunction> for Lane {
     }
 }
 
-pub(crate) fn decompile(function: &LiftedFunction) -> Lane {
+pub(crate) fn decompile(function: &Program) -> Lane {
     let f = &function.ir;
     assert!(
         !f.reads_the_packet(),
@@ -52,7 +52,7 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Lane {
         );
     }
     Lane {
-        function: LiftedFunction {
+        function: Program {
             registry: function.registry.clone(),
             ir: lane,
             parameter_inputs: function.parameter_inputs.clone(),
