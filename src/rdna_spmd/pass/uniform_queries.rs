@@ -69,7 +69,7 @@ impl Facts<'_> {
             return false;
         };
         match op {
-            Op::Env(Env::LaneId | Env::PacketLaneId | Env::ValidLane) => false,
+            Op::Env(Env::LaneId | Env::ValidLane) => false,
             Op::Env(_) => true,
             Op::Const(..) => true,
             _ => {

@@ -88,7 +88,6 @@ pub(crate) fn cvt(op: Cvt) -> &'static str {
 pub(crate) fn env(e: Env) -> &'static str {
     match e {
         Env::LaneId => "lane_id",
-        Env::PacketLaneId => "packet_lane_id",
         Env::ValidLane => "valid_lane",
         Env::ScratchBase => "scratch_base",
         Env::ScratchSize => "scratch_size",

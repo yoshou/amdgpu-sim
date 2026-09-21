@@ -105,10 +105,6 @@ impl Emitter {
             Op::Env(Env::LaneId) => self
                 .lane_id
                 .expect("LaneId requires the invocation environment"),
-            Op::Env(Env::PacketLaneId) => match self.width {
-                Some(width) => ir.const_i32_vector(&(0..width).collect::<Vec<u32>>()),
-                None => self.constant(Ty::I32, 0),
-            },
             Op::Env(env @ (Env::ScratchBase | Env::ScratchSize)) => {
                 let (base, size) = self
                     .scratch
