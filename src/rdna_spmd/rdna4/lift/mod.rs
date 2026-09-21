@@ -455,10 +455,28 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
     let [a, b, c] = values;
     let dst = alu.dst as u32;
     let (result, output) = if let Some((_, to, kind)) = shape.cvt {
+        let a = match alu.op {
+            I::V_CVT_F32_UBYTE0
+            | I::V_CVT_F32_UBYTE1
+            | I::V_CVT_F32_UBYTE2
+            | I::V_CVT_F32_UBYTE3 => {
+                let index = match alu.op {
+                    I::V_CVT_F32_UBYTE0 => 0,
+                    I::V_CVT_F32_UBYTE1 => 1,
+                    I::V_CVT_F32_UBYTE2 => 2,
+                    _ => 3,
+                };
+                let shift = q.k(Ty::I32, index * 8);
+                let moved = q.int(IntOp::LShr, a, shift);
+                let mask = q.k(Ty::I32, 0xff);
+                q.int(IntOp::And, moved, mask)
+            }
+            _ => a,
+        };
         (q.push(to, Op::Convert(kind, to, a)), Output::Vgpr(dst, to))
     } else if let Some(target) = shape.target {
         let to = registry.operation(target).unwrap().outputs[0];
-        let output = if matches!(alu.op, I::V_S_RCP_F32) {
+        let output = if writes_a_scalar(alu.op) {
             Output::Scalar(dst, to)
         } else {
             Output::Vgpr(dst, to)
@@ -487,11 +505,18 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
     } else {
         result
     };
-    if matches!(alu.op, I::V_S_RCP_F32) {
+    if writes_a_scalar(alu.op) {
         q.finish_many(true, vec![(output, result)])
     } else {
         q.finish(output, result)
     }
+}
+
+fn writes_a_scalar(op: I) -> bool {
+    matches!(
+        op,
+        I::V_S_RCP_F32 | I::V_S_RSQ_F32 | I::V_S_SQRT_F32 | I::V_S_EXP_F32 | I::V_S_LOG_F32
+    )
 }
 
 struct Alu {
@@ -681,6 +706,12 @@ fn arity(op: I) -> usize {
         | I::V_XOR3_B32
         | I::V_XAD_U32
         | I::V_AND_OR_B32
+        | I::V_MIN3_I32
+        | I::V_MIN3_U32
+        | I::V_MAX3_I32
+        | I::V_MAX3_U32
+        | I::V_MED3_I32
+        | I::V_MED3_U32
         | I::V_OR3_B32
         | I::V_LSHL_OR_B32
         | I::V_LSHL_ADD_U32
@@ -725,6 +756,47 @@ fn lower_integer(
         I::V_BCNT_U32_B32 => {
             let count = q.push(Ty::I32, Op::PopulationCount(a));
             q.int(IntOp::Add, count, b)
+        }
+        I::V_MBCNT_LO_U32_B32 => {
+            let lane = q.push(Ty::I32, Op::Env(Env::LaneId));
+            let one = q.k(Ty::I32, 1);
+            let bit = q.int(IntOp::Shl, one, lane);
+            let below = q.int(IntOp::Sub, bit, one);
+            let taken = q.int(IntOp::And, a, below);
+            let count = q.push(Ty::I32, Op::PopulationCount(taken));
+            q.int(IntOp::Add, count, b)
+        }
+        I::V_MBCNT_HI_U32_B32 => b,
+        I::V_MIN3_I32
+        | I::V_MIN3_U32
+        | I::V_MAX3_I32
+        | I::V_MAX3_U32
+        | I::V_MED3_I32
+        | I::V_MED3_U32 => {
+            let signed = matches!(op, I::V_MIN3_I32 | I::V_MAX3_I32 | I::V_MED3_I32);
+            let lt = if signed { IntPred::Slt } else { IntPred::Ult };
+            let gt = if signed { IntPred::Sgt } else { IntPred::Ugt };
+            fn pick(q: &mut Builder, pred: IntPred, x: ValueId, y: ValueId) -> ValueId {
+                let cond = q.push(Ty::I1, Op::Cmp(pred, x, y));
+                q.push(Ty::I32, Op::Select(cond, x, y))
+            }
+            match op {
+                I::V_MIN3_I32 | I::V_MIN3_U32 => {
+                    let ab = pick(q, lt, a, b);
+                    pick(q, lt, ab, c)
+                }
+                I::V_MAX3_I32 | I::V_MAX3_U32 => {
+                    let ab = pick(q, gt, a, b);
+                    pick(q, gt, ab, c)
+                }
+                _ => {
+                    let ab = pick(q, lt, a, b);
+                    let ac = pick(q, lt, a, c);
+                    let bc = pick(q, lt, b, c);
+                    let m = pick(q, gt, ab, ac);
+                    pick(q, gt, m, bc)
+                }
+            }
         }
         I::V_MAD_U32_U24 | I::V_MAD_I32_I24 => {
             let (a, b) = if matches!(op, I::V_MAD_I32_I24) {
@@ -961,6 +1033,10 @@ fn lower_float(
 }
 fn conversion(op: I) -> Option<(Ty, Ty, Cvt)> {
     Some(match op {
+        I::V_CVT_F32_UBYTE0
+        | I::V_CVT_F32_UBYTE1
+        | I::V_CVT_F32_UBYTE2
+        | I::V_CVT_F32_UBYTE3 => (Ty::I32, Ty::F32, Cvt::UnsignedToFloatRte),
         I::V_CVT_F32_I32 => (Ty::I32, Ty::F32, Cvt::SignedToFloatRte),
         I::V_CVT_F32_U32 => (Ty::I32, Ty::F32, Cvt::UnsignedToFloatRte),
         I::V_CVT_F64_I32 => (Ty::I32, Ty::F64, Cvt::SignedToFloatRte),
