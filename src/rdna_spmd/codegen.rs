@@ -899,7 +899,7 @@ impl<'a> Cg<'a> {
         let scalar = self.p.width.is_none()
             || (!matches!(
                 op,
-                Op::Env(Env::PacketLaneId | Env::LaneId | Env::ValidLane)
+                Op::Env(Env::LaneId | Env::ValidLane)
             ) && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1")
                 && args.iter().all(|a| !self.values[a.0].is_vector()));
         let mut table = self.values.clone();

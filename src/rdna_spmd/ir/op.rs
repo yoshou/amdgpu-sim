@@ -74,7 +74,6 @@ pub(crate) enum Cvt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Env {
     LaneId,
-    PacketLaneId,
     ValidLane,
     ScratchBase,
     ScratchSize,
@@ -142,7 +141,7 @@ impl Op {
             }
         };
         match self {
-            Self::Env(Env::LaneId | Env::PacketLaneId) => Ok(Ty::I32),
+            Self::Env(Env::LaneId) => Ok(Ty::I32),
             Self::Env(Env::ValidLane) => Ok(Ty::I1),
             Self::Env(Env::ScratchBase | Env::ScratchSize) => Ok(Ty::I64),
             Self::Pack64(a, b) => {

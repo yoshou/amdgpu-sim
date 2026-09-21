@@ -419,7 +419,7 @@ fn packet<M>(
             Inst::Core { ty, op, .. } => {
                 let fact = match *op {
                     Op::Const(..) => Fact::Uniform,
-                    Op::Env(Env::LaneId | Env::PacketLaneId) => Fact::Affine {
+                    Op::Env(Env::LaneId) => Fact::Affine {
                         stride: 1,
                         span: None,
                     },
