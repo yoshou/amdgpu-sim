@@ -1,4 +1,8 @@
-use super::*;
+use super::emit::{lane_word, queried_word, Cg};
+use super::{Prepared, DONE, ENTER, LEAVE, YIELD};
+use crate::rdna_spmd::ir::*;
+use crate::rdna_spmd::native::{BasicBlock, Type, Value};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

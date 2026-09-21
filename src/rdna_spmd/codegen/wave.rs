@@ -1,5 +1,7 @@
 use super::yields::Argument;
-use super::*;
+use super::emit::Cg;
+use super::YIELD;
+use crate::rdna_spmd::ir::*;
 
 impl<'a> Cg<'a> {
     pub(super) fn emit_yield(&mut self, members: &[(u64, Vec<ValueId>, Vec<(ValueId, Ty)>)]) {
