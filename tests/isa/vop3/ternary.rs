@@ -548,6 +548,504 @@ fn v_ldexp_f64_vop3() {
 }
 
 #[test]
+fn v_min3_u32_vop3() {
+    // V_MIN3_U32. The smallest of the three, compared as unsigned.
+    check_vop3_u32(
+        539,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0001 }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0005 }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0001 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0001 }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x0000_0010 }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x0000_0003 }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x0000_0003 }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0003 }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_min3_i32_vop3() {
+    // V_MIN3_I32. The smallest of the three, compared as signed.
+    check_vop3_u32(
+        538,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0001 }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFF }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xDEAD_BEEF }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFE }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0001 }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0005 }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0001 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFF }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xDEAD_BEEF }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFE }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0001 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0001 }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFF }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xDEAD_BEEF }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFE }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0001 }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x8000_0003 }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x8000_FFFF }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x8000_0010 }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0003 }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_med3_u32_vop3() {
+    // V_MED3_U32. The middle of the three, compared as unsigned.
+    check_vop3_u32(
+        545,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FF }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0005 }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FF }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0005 }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x0000_FFFF }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x0000_0010 }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x0000_FFFF }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0010 }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_med3_i32_vop3() {
+    // V_MED3_I32. The middle of the three, compared as signed.
+    check_vop3_u32(
+        544,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FF }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0005 }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FF }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0003 }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0005 }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x0000_0010 }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x0000_0003 }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x0000_0003 }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_0010 }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_max3_u32_vop3() {
+    // V_MAX3_U32. The largest of the three, compared as unsigned.
+    check_vop3_u32(
+        542,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFF }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x7FFF_FFFF }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xDEAD_BEEF }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFE }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0001 }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x4000_0000 }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFF }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x7FFF_FFFF }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xDEAD_BEEF }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FF }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFE }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0001 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x4000_0000 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFF }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0000 }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x7FFF_FFFF }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xDEAD_BEEF }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0xFFFF_FFFE }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x8000_0001 }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x4000_0000 }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x8000_0003 }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x8000_FFFF }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x8000_0010 }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_FFFF }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_max3_i32_vop3() {
+    // V_MAX3_I32. The largest of the three, compared as signed.
+    check_vop3_u32(
+        541,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x7FFF_FFFF }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x4000_0000 }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x7FFF_FFFF }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FF }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x4000_0000 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x7FFF_FFFF }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x4000_0000 }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x0000_FFFF }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x0000_0010 }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x0000_FFFF }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_FFFF }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_mad_u16_vop3() {
+    // V_MAD_U16. The sources and the result are the low 16 bits; the rest
+    // of the destination is left alone.
+    check_vop3_u32(
+        577,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000F }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0011 }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0011 }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000E }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0011 }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_4121 }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FF11 }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0012 }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000F }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000B }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0013 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0016 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_3CDD }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0040 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_030D }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0019 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000A }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0013 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_001F }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFD }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFE }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFC }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFD }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFC }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFC }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_BEEC }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FC }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFB }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFE }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFD }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x0000_800D }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x0000_800D }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_800D }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x0000_800D }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_FFFF }, // clamp
+        ],
+    );
+}
+
+#[test]
+fn v_mad_i16_vop3() {
+    // V_MAD_I16. The sources and the result are the low 16 bits; the rest
+    // of the destination is left alone.
+    check_vop3_u32(
+        595,
+        &[
+            Vop3F32 { src0: Src::Vgpr(0x0000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000F }, // 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0011 }, // -1 / UINT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src0
+            Vop3F32 { src0: Src::Vgpr(0x7FFF_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0011 }, // INT_MAX in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0002), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000E }, // 2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_FFFF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0011 }, // 0xFFFF in src0
+            Vop3F32 { src0: Src::Vgpr(0xDEAD_BEEF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_4121 }, // 0xDEADBEEF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0010), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 16 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_00FF), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FF11 }, // 0xFF in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // 3 in src0
+            Vop3F32 { src0: Src::Vgpr(0xFFFF_FFFE), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0012 }, // -2 in src0
+            Vop3F32 { src0: Src::Vgpr(0x8000_0001), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000F }, // INT_MIN + 1 in src0
+            Vop3F32 { src0: Src::Vgpr(0x4000_0000), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0005), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000B }, // 5 in src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0013 }, // 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // -1 / UINT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // INT_MIN in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x7FFF_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // INT_MAX in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0002), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0016 }, // 2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // 0xFFFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xDEAD_BEEF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_3CDD }, // 0xDEADBEEF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0010), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0040 }, // 16 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_00FF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_030D }, // 0xFF in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0003), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0019 }, // 3 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0xFFFF_FFFE), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000A }, // -2 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x8000_0001), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0013 }, // INT_MIN + 1 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x4000_0000), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0010 }, // 0x40000000 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_0005), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_001F }, // 5 in src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFD }, // 0 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFE }, // 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFC }, // -1 / UINT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFD }, // INT_MIN in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x7FFF_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFC }, // INT_MAX in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0002), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFF }, // 2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_FFFF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFC }, // 0xFFFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xDEAD_BEEF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_BEEC }, // 0xDEADBEEF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // 16 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_00FF), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_00FC }, // 0xFF in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0003), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0000 }, // 3 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0xFFFF_FFFE), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFB }, // -2 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x8000_0001), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFE }, // INT_MIN + 1 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x4000_0000), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_FFFD }, // 0x40000000 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0005), abs: 0, neg: 0, clamp: false, omod: 0, expected: 0x0000_0002 }, // 5 in src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 1, clamp: false, omod: 0, expected: 0x0000_800D }, // neg src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 1, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // abs src0
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 2, clamp: false, omod: 0, expected: 0x0000_800D }, // neg src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 2, neg: 0, clamp: false, omod: 0, expected: 0x0000_800D }, // abs src1
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 4, clamp: false, omod: 0, expected: 0x0000_800D }, // neg src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 4, neg: 0, clamp: false, omod: 0, expected: 0x0000_000D }, // abs src2
+            Vop3F32 { src0: Src::Vgpr(0x0000_0003), src1: Src::Vgpr(0x0000_FFFF), src2: Src::Vgpr(0x0000_0010), abs: 0, neg: 0, clamp: true, omod: 0, expected: 0x0000_000D }, // clamp
+        ],
+    );
+}
+
+#[test]
 fn v_trig_preop_f64_vop3() {
     // V_TRIG_PREOP_F64.
     // src1 selects which 53-bit window of 2/pi is returned.
