@@ -59,15 +59,7 @@ pub(crate) fn decompile(function: &LiftedFunction) -> Lane {
         |p| matches!(p.source, crate::rdna_spmd::program::ParameterSource::MaskBit(r) if r == exec),
     );
     let facts = facts::Facts::new(f, &function.parameter_inputs, &BTreeSet::new());
-    let mut logic = logic::Logic::policies(f, &facts);
-    let (kept, everyone) = proof::prove(
-        f,
-        &facts,
-        &mut logic,
-        &function.parameter_inputs,
-        exec_index,
-    );
-    drop(logic);
+    let (kept, everyone) = proof::prove(f, &facts, &function.parameter_inputs, exec_index);
     let facts = facts::Facts::new(f, &function.parameter_inputs, &kept.words);
     if std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() {
         eprintln!(

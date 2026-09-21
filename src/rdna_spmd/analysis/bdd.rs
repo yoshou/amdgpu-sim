@@ -1,4 +1,44 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// A multiply-and-rotate hash of the small integer keys the tables here and
+/// in the decompiler's logic hold. The tables are looked up once for nearly
+/// every node an operation visits, so the hash is most of their cost.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Mix(u64);
+
+impl Mix {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+}
+
+impl Hasher for Mix {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+    fn write_u8(&mut self, x: u8) {
+        self.add(x as u64);
+    }
+    fn write_u32(&mut self, x: u32) {
+        self.add(x as u64);
+    }
+    fn write_u64(&mut self, x: u64) {
+        self.add(x);
+    }
+    fn write_usize(&mut self, x: usize) {
+        self.add(x as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+}
+
+pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<Mix>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Bdd(u32);
@@ -41,10 +81,10 @@ impl Manager {
         };
         Self {
             nodes: vec![terminal(0), terminal(1)],
-            unique: HashMap::new(),
-            ite: HashMap::new(),
-            restrict: HashMap::new(),
-            implications: HashMap::new(),
+            unique: HashMap::default(),
+            ite: HashMap::default(),
+            restrict: HashMap::default(),
+            implications: HashMap::default(),
         }
     }
 
@@ -192,7 +232,7 @@ impl Manager {
     }
 
     fn quantify(&mut self, f: Bdd, chosen: &dyn Fn(u32) -> bool, any: bool) -> Bdd {
-        let mut memo = HashMap::new();
+        let mut memo = HashMap::default();
         self.quantify_memo(f, chosen, any, &mut memo)
     }
 
@@ -235,7 +275,7 @@ impl Manager {
     }
 
     pub fn compose(&mut self, f: Bdd, map: &dyn Fn(u32) -> Option<Bdd>) -> Bdd {
-        let mut memo = HashMap::new();
+        let mut memo = HashMap::default();
         self.compose_memo(f, map, &mut memo)
     }
 
@@ -266,9 +306,9 @@ impl Manager {
     pub fn support(&self, f: Bdd) -> BTreeSet<u32> {
         let mut out = BTreeSet::new();
         let mut stack = vec![f];
-        let mut seen = BTreeSet::new();
+        let mut seen: HashMap<Bdd, ()> = HashMap::default();
         while let Some(g) = stack.pop() {
-            if g.constant().is_some() || !seen.insert(g) {
+            if g.constant().is_some() || seen.insert(g, ()).is_some() {
                 continue;
             }
             let node = self.nodes[g.0 as usize];

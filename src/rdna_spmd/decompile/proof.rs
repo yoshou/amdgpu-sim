@@ -3,25 +3,66 @@ use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
 use crate::rdna_spmd::dialect::TargetOp;
 use crate::rdna_spmd::ir::*;
-use std::collections::{BTreeMap, HashMap};
+use crate::rdna_spmd::analysis::bdd::HashMap;
+use std::collections::BTreeMap;
 
 /// Prove all candidate conversion policies in one conditional analysis.
 /// Observable differences exclude unsafe policies; a model of the final
 /// condition selects the queries and words to keep. Collective participation
 /// requirements are evaluated under that same model.
+///
+/// The analysis treats each policy on its own: no formula relates what holds
+/// under one policy to what holds under another, and the detours already take
+/// the policy that answers everything locally apart from the rest. The choice
+/// prefers that policy to every other, so it is analysed first and alone, as
+/// the slice of the conditional analysis it is; the other policies, whose
+/// formulas carry every choice, are analysed only where that one is unsafe.
 pub(super) fn prove(
     f: &Func,
     facts: &Facts,
-    logic: &mut Logic,
     inputs: &[crate::rdna_spmd::program::Parameter],
     exec_index: Option<usize>,
 ) -> (Kept, std::collections::BTreeSet<u64>) {
+    let mut all_local = Logic::new(f, facts, &Default::default());
+    let mut exhausted = match analyse(f, facts, &mut all_local, Bdd::TRUE, inputs, exec_index) {
+        Ok(chosen) => return chosen,
+        Err(exhausted) => exhausted,
+    };
+    drop(all_local);
+    let mut others = Logic::policies(f, facts);
+    let rest = others.m.not(others.all_local);
+    if rest != Bdd::FALSE {
+        match analyse(f, facts, &mut others, rest, inputs, exec_index) {
+            Ok(chosen) => return chosen,
+            Err(last) => exhausted = last,
+        }
+    }
+    let (block, index, reason) = exhausted;
+    panic!(
+        "b{}:{}: {} under every conversion policy",
+        block.0, index, reason
+    )
+}
+
+/// Where and why the last of the policies analysed was excluded.
+type Exhausted = (BlockId, usize, &'static str);
+
+/// Analyses the policies in `safe`, which `logic` interprets.
+fn analyse(
+    f: &Func,
+    facts: &Facts,
+    logic: &mut Logic,
+    safe: Bdd,
+    inputs: &[crate::rdna_spmd::program::Parameter],
+    exec_index: Option<usize>,
+) -> Result<(Kept, std::collections::BTreeSet<u64>), Exhausted> {
     let exec = exec_index.map(|index| f.blocks[&f.entry].params[index].0);
     let mut proof = Proof {
         f,
         facts,
         logic,
-        safe: Bdd::TRUE,
+        safe,
+        exhausted: None,
         demands: BTreeMap::new(),
         masked: vec![false; f.types.len()],
         faithful: vec![false; f.types.len()],
@@ -47,10 +88,19 @@ pub(super) fn prove(
         None => Bdd::TRUE,
     };
     proof.reach = proof.logic.policy_reach(f, facts, f.entry, start);
+    for r in proof.reach.values_mut() {
+        *r = proof.logic.m.and(*r, safe);
+    }
     proof.solve_masked(inputs, exec_index);
     loop {
         proof.settle();
+        if let Some(exhausted) = proof.exhausted {
+            return Err(exhausted);
+        }
         let arrivals = proof.detours();
+        if let Some(exhausted) = proof.exhausted {
+            return Err(exhausted);
+        }
         let mut changed = false;
         for (block, contributions) in arrivals {
             let old = proof
@@ -77,7 +127,7 @@ pub(super) fn prove(
                     (proof.logic.settled(condition, &disabled) == Bdd::TRUE).then_some(p)
                 })
                 .collect();
-            return (kept, everyone);
+            return Ok((kept, everyone));
         }
     }
 }
@@ -87,6 +137,9 @@ struct Proof<'a> {
     facts: &'a Facts,
     logic: &'a mut Logic,
     safe: Bdd,
+    /// Set once no policy is left: every difference is then empty, so the
+    /// analysis runs out at once.
+    exhausted: Option<Exhausted>,
     /// Collective operations whose results require every lane to be present.
     demands: BTreeMap<u64, Bdd>,
     /// Bits and lane words that hold nothing for a lane that is not active at
@@ -190,7 +243,7 @@ impl Proof<'_> {
                         active = self.or(active, known);
                     }
                 }
-                let mut lockstep: HashMap<ValueId, Option<Bdd>> = HashMap::new();
+                let mut lockstep: HashMap<ValueId, Option<Bdd>> = HashMap::default();
                 for inst in &block.insts {
                     for v in outputs(inst) {
                         let bit = f.types[v.0] == Ty::I1;
@@ -322,13 +375,9 @@ impl Proof<'_> {
                 *h = self.logic.m.and(*h, self.safe);
             }
         }
-        assert!(
-            self.safe != Bdd::FALSE,
-            "b{}:{}: {} under every conversion policy",
-            block.0,
-            index,
-            reason
-        );
+        if self.safe == Bdd::FALSE {
+            self.exhausted.get_or_insert((block, index, reason));
+        }
     }
 
     fn demand(&mut self, provenance: u64, condition: Bdd) {
@@ -337,12 +386,33 @@ impl Proof<'_> {
         self.demands.insert(provenance, condition);
     }
 
+    /// Raises the differences to their fixed point. A block's transfer reads
+    /// what its predecessors pass it, the arrivals the detours bring it and
+    /// the policies left, and values are used only in the block that defines
+    /// them, so after a first sweep a block is transferred again only when a
+    /// predecessor's differences rose or a policy was excluded.
     fn settle(&mut self) {
+        let order = &self.facts.order;
+        let mut stale = vec![true; order.len()];
         loop {
             let mut changed = false;
-            for index in 0..self.facts.order.len() {
-                let id = self.facts.order[index];
-                changed |= self.transfer(id);
+            for index in 0..order.len() {
+                if !std::mem::take(&mut stale[index]) {
+                    continue;
+                }
+                let id = order[index];
+                let safe = self.safe;
+                let rose = self.transfer(id);
+                if self.safe != safe {
+                    stale.fill(true);
+                    changed = true;
+                }
+                if rose {
+                    changed = true;
+                    for edge in self.f.blocks[&id].term.edges() {
+                        stale[self.rank[&edge.dst]] = true;
+                    }
+                }
             }
             if !changed {
                 return;
@@ -695,11 +765,11 @@ impl Proof<'_> {
                         id: (position * 2 + wave) * 2 + part,
                         branch: b,
                         assume,
-                        unreliable: HashMap::new(),
+                        unreliable: HashMap::default(),
                         terms: Vec::new(),
                         types: Vec::new(),
                         leaves: Vec::new(),
-                        index: HashMap::new(),
+                        index: HashMap::default(),
                     }
                     .run(wave, lane, &mut arrivals);
                 }
@@ -1156,7 +1226,7 @@ impl Explore<'_, '_> {
     ) -> HashMap<ValueId, Desc> {
         let (f, facts) = (self.proof.f, self.proof.facts);
         let block = &f.blocks[&x];
-        let mut descs: HashMap<ValueId, Desc> = HashMap::new();
+        let mut descs: HashMap<ValueId, Desc> = HashMap::default();
         for (&(v, _), &d) in block.params.iter().zip(params) {
             descs.insert(v, d);
         }
