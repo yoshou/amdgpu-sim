@@ -675,11 +675,13 @@ impl Emit<'_> {
         }
         for (route, target, mut list) in inside {
             for arrival in list.iter_mut() {
-                if self.inner(arrival.mask, atoms) {
+                let outside = if self.inner(arrival.mask, atoms) {
                     let replace = |var: u32| atoms_of.get(&var).copied();
-                    let outside = self.masks.m.compose(arrival.mask, &replace);
-                    arrival.mask = self.masks.and(mask, outside);
-                }
+                    self.masks.m.compose(arrival.mask, &replace)
+                } else {
+                    arrival.mask
+                };
+                arrival.mask = self.masks.and(mask, outside);
                 for arg in arrival.args.iter_mut() {
                     if let Some(Val::Value(value)) = *arg {
                         if let Some(&val) = renamed.get(&value) {
