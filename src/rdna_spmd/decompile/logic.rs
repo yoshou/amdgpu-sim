@@ -1,7 +1,8 @@
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::ir::*;
-use std::collections::{BTreeSet, HashMap};
+use crate::rdna_spmd::analysis::bdd::HashMap;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Atom {
@@ -38,7 +39,7 @@ pub(super) struct Logic {
     kept: BTreeSet<ValueId>,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
-    supports: HashMap<Bdd, BTreeSet<u32>>,
+    supports: HashMap<Bdd, Vec<u32>>,
     policy: Option<Vec<Bdd>>,
     choices: Vec<(ValueId, bool)>,
     abstract_queries: bool,
@@ -51,7 +52,7 @@ impl Logic {
     /// `kept` holds the `any` queries the lane program keeps, by the value
     /// each defines; a test of a lane word is kept with the word.
     pub fn new(f: &Func, facts: &Facts, kept: &BTreeSet<ValueId>) -> Self {
-        let mut params = HashMap::new();
+        let mut params = HashMap::default();
         for (rank, id) in facts.order.iter().enumerate() {
             for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
                 params.insert(v, (rank, index));
@@ -59,16 +60,16 @@ impl Logic {
         }
         Self {
             m: Manager::new(),
-            vars: HashMap::new(),
-            atoms: HashMap::new(),
+            vars: HashMap::default(),
+            atoms: HashMap::default(),
             params,
-            constants: HashMap::new(),
-            markers: HashMap::new(),
-            fresh: HashMap::new(),
+            constants: HashMap::default(),
+            markers: HashMap::default(),
+            fresh: HashMap::default(),
             kept: kept.clone(),
-            bits: HashMap::new(),
-            views: HashMap::new(),
-            supports: HashMap::new(),
+            bits: HashMap::default(),
+            views: HashMap::default(),
+            supports: HashMap::default(),
             policy: None,
             choices: Vec::new(),
             abstract_queries: false,
@@ -214,10 +215,11 @@ impl Logic {
         self.relations.clear();
     }
 
-    /// Keep exact reachability for the all-local policy. For the other
-    /// policies, unconstrained query results safely overapproximate reach.
-    /// This avoids enumerating combinations of unrelated branch choices in
-    /// the reachability relation; value differences still carry their choices.
+    /// Reachability under the policies this logic interprets. It is exact
+    /// for the policy that answers everything locally. For the others,
+    /// unconstrained query results safely overapproximate reach. This avoids
+    /// enumerating combinations of unrelated branch choices in the
+    /// reachability relation; value differences still carry their choices.
     pub fn policy_reach(
         &mut self,
         f: &Func,
@@ -225,24 +227,17 @@ impl Logic {
         start: BlockId,
         initial: Bdd,
     ) -> std::collections::BTreeMap<BlockId, Bdd> {
+        if self.policy.is_none() {
+            return self.reach(f, facts, start, initial);
+        }
         let policy = self.policy.take();
-        self.clear_values();
-        let local = self.reach(f, facts, start, initial);
         self.clear_values();
         self.abstract_queries = true;
         let general = self.reach(f, facts, start, initial);
         self.abstract_queries = false;
         self.policy = policy;
         self.clear_values();
-        facts
-            .order
-            .iter()
-            .map(|&id| {
-                let a = local.get(&id).copied().unwrap_or(Bdd::FALSE);
-                let b = general.get(&id).copied().unwrap_or(Bdd::FALSE);
-                (id, self.m.ite(self.all_local, a, b))
-            })
-            .collect()
+        general
     }
 
     pub fn atom(&mut self, atom: Atom) -> Bdd {
@@ -306,11 +301,12 @@ impl Logic {
         self.atoms[&var]
     }
 
-    pub fn support(&mut self, f: Bdd) -> BTreeSet<u32> {
+    /// The variables a function tests, in their order.
+    pub fn support(&mut self, f: Bdd) -> Vec<u32> {
         if let Some(s) = self.supports.get(&f) {
             return s.clone();
         }
-        let s = self.m.support(f);
+        let s: Vec<u32> = self.m.support(f).into_iter().collect();
         self.supports.insert(f, s.clone());
         s
     }
@@ -405,7 +401,7 @@ impl Logic {
                     _ => self.atom(opaque),
                 },
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
-                    self.compare(f, facts, p, a, b, opaque, &mut HashMap::new())
+                    self.compare(f, facts, p, a, b, opaque, &mut HashMap::default())
                 }
                 _ => self.atom(opaque),
             },
@@ -638,7 +634,7 @@ impl Logic {
     }
 
     fn project(&mut self, facts: &Facts, src: BlockId, formula: Bdd, links: &[Binding]) -> Bdd {
-        let mut renamed: HashMap<u32, Bdd> = HashMap::new();
+        let mut renamed: HashMap<u32, Bdd> = HashMap::default();
         let mut equalities = Bdd::TRUE;
         let mut rest: Vec<usize> = Vec::new();
         for (i, link) in links.iter().enumerate() {
@@ -700,7 +696,7 @@ impl Logic {
             .into_iter()
             .filter(|&v| self.scope(facts, v) == Some(src))
             .collect();
-        let mut occurrences: HashMap<u32, usize> = HashMap::new();
+        let mut occurrences: HashMap<u32, usize> = HashMap::default();
         for link in links {
             for &v in &link.support {
                 *occurrences.entry(v).or_default() += 1;
