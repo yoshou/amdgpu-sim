@@ -443,7 +443,7 @@ impl<'a> Cg<'a> {
         ir.call(
             ty,
             function,
-            &[self.func.param(7), ir.ci64(enter), self.yield_frame],
+            &[self.func.param(6), ir.ci64(enter), self.yield_frame],
         );
         let left = ir.load(ir.i32(), self.frame_slot(0)).set_alignment(4);
         let exits = &regions.exits[child];

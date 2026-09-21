@@ -3,12 +3,12 @@ use super::*;
 use crate::rdna_spmd::targets::rdna4::decode::{ScalarProgram, Terminator};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::rdna_spmd::program::{LiftedFunction, Parameter, ParameterSource};
+use crate::rdna_spmd::program::{Program, Parameter, ParameterSource};
 pub(in crate::rdna_spmd) fn lift(
     registry: std::sync::Arc<DialectRegistry>,
     program: &ScalarProgram,
     lowerings: &BTreeMap<usize, Vec<&Lowering>>,
-) -> LiftedFunction {
+) -> Program {
     let mut regs = BTreeSet::new();
     for block in lowerings.values() {
         for lowering in block {
@@ -128,7 +128,6 @@ pub(in crate::rdna_spmd) fn lift(
         }
         if let Terminator::Yield { ref action, .. } = source.term {
             let plan = action.lift(&mut f, &mut block, &mut words, &mut provenance);
-            super::wave::mark_scheduled(&mut block.insts[plan.core.start..plan.end]);
             for &(dest, value) in &plan.definitions {
                 if matches!(dest, super::wave::Destination::Scc) {
                     scc = value;
@@ -185,7 +184,7 @@ pub(in crate::rdna_spmd) fn lift(
         }))
         .collect();
     f.one_region(f.presence_needed());
-    LiftedFunction {
+    Program {
         registry,
         ir: f,
         parameter_inputs,

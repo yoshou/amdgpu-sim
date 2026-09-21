@@ -8,7 +8,7 @@ mod uniform;
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::compiler::exec_index;
 use crate::rdna_spmd::decompile::Lane;
-use crate::rdna_spmd::program::LiftedFunction;
+use crate::rdna_spmd::program::Program;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Packing {
@@ -18,7 +18,7 @@ pub(crate) struct Packing {
     pub aligned: bool,
 }
 
-fn represent(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
+fn represent(lane: &Program, packing: Packing) -> Program {
     use crate::rdna_spmd::analysis::{Analyses, MaskValues};
     use crate::rdna_spmd::pass::dce::{Dce, DeadParams};
     use crate::rdna_spmd::pass::pairs::{Pairs, WideMemory};
@@ -50,7 +50,7 @@ fn represent(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
             ],
         )
         .unwrap();
-    LiftedFunction {
+    Program {
         registry: lane.registry.clone(),
         ir,
         parameter_inputs: lane.parameter_inputs.clone(),
@@ -58,7 +58,7 @@ fn represent(lane: &LiftedFunction, packing: Packing) -> LiftedFunction {
     }
 }
 
-pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> LiftedFunction {
+pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Program {
     let everyone = &lane.everyone;
     let lane = &represent(&lane.function, packing);
     let facts = Facts::new(&lane.ir, &lane.parameter_inputs, &Default::default());
@@ -94,7 +94,7 @@ pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> LiftedFunction {
                     e
                 );
             }
-            return LiftedFunction {
+            return Program {
                 registry: lane.registry.clone(),
                 ir,
                 parameter_inputs: lane.parameter_inputs.clone(),

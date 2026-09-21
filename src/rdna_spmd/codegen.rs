@@ -27,7 +27,6 @@ pub(super) struct Prepared {
     pub uniform: Vec<bool>,
 
     pub holds_a_lane: Vec<bool>,
-    pub constants: Rc<Vec<Option<u64>>>,
     pub accesses: Rc<Vec<Access>>,
     pub shapes: Vec<memory::Shape>,
     pub clusters: BTreeMap<usize, Cluster>,
@@ -35,10 +34,6 @@ pub(super) struct Prepared {
     pub groups: Vec<Vec<u64>>,
     pub min_private_bytes: usize,
     pub num_vgprs: usize,
-}
-
-pub(super) fn resume_key(provenance: u64) -> usize {
-    (provenance & !crate::rdna_spmd::ir::SCHEDULED) as usize
 }
 
 impl Prepared {
@@ -114,8 +109,6 @@ pub(super) struct Cg<'a> {
     scratch_base_scalar: Value,
     scratch_vec: Value,
     lds_base: Value,
-    spill_base: Value,
-    spill: &'a std::cell::RefCell<BTreeMap<(u32, u32), usize>>,
     regions: &'a region::Regions,
     region: usize,
     frame: Value,
@@ -141,7 +134,6 @@ pub(super) struct Compiled {
 }
 
 struct Shared {
-    spill: std::cell::RefCell<BTreeMap<(u32, u32), usize>>,
     counts: Option<(String, Value, BTreeMap<BlockId, usize>)>,
 }
 
@@ -166,7 +158,6 @@ impl Shared {
             (path, global, index)
         });
         Self {
-            spill: std::cell::RefCell::new(BTreeMap::new()),
             counts,
         }
     }
@@ -221,7 +212,7 @@ fn emit_function(
     let (i32t, i64t, ptr) = (ir.i32(), ir.i64(), ir.ptr());
     let func = ir.add_function(
         symbol,
-        i64t.function(&[ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t, ptr]),
+        i64t.function(&[ptr, ptr, i64t, i64t, i64t, i64t, ptr, i32t, ptr]),
     );
     let entry = ir.append_block(func, "entry");
     ir.position_at_end(entry);
@@ -229,10 +220,9 @@ fn emit_function(
     let vgprs_p = func.param(1);
     let scratch_base = func.param(2);
     let scratch_stride = func.param(3);
-    let spill_base = func.param(4);
-    let lds_base = func.param(5);
-    let lane_base = func.param(6);
-    let valid_mask = func.param(8);
+    let lds_base = func.param(4);
+    let lane_base = func.param(5);
+    let valid_mask = func.param(7);
     let width_lanes = p.width.unwrap_or(1);
     let scratch_base_scalar = {
         let aperture = ir.and(scratch_base, ir.ci64(0xffff_ffff_0000_0000));
@@ -309,11 +299,9 @@ fn emit_function(
         scratch_base_scalar,
         scratch_vec: scratch_base,
         lds_base,
-        spill_base,
-        spill: &shared.spill,
         regions: scope.0,
         region: scope.1,
-        frame: func.param(9),
+        frame: func.param(8),
         loaded_pairs: BTreeMap::new(),
         valid_mask,
         lane_base: ir.trunc(lane_base, i32t),
@@ -810,12 +798,7 @@ impl<'a> Cg<'a> {
                 };
                 self.define(*output, result);
             }
-            Inst::Effect {
-                provenance,
-                op,
-                inputs,
-                outputs,
-            } => match op {
+            Inst::Effect { provenance, op, .. } => match op {
                 EffectOp::Memory { .. } => {
                     let access = self.access_at[&(id, index)];
                     if let Some(cluster) = self.p.clusters.get(&access) {
@@ -826,37 +809,31 @@ impl<'a> Cg<'a> {
                     }
                 }
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
-                    if *provenance & crate::rdna_spmd::ir::SCHEDULED != 0
-                        || !matches!(op, EffectOp::Wave(_))
-                    {
-                        let Some(group) = self.p.group_at(*provenance) else {
-                            return;
+                    let Some(group) = self.p.group_at(*provenance) else {
+                        return;
+                    };
+                    let mut members = Vec::with_capacity(group.len());
+                    let mut wanted = group.iter();
+                    let mut next = wanted.next();
+                    for inst in &self.p.ir.func().blocks[&id].insts[index..] {
+                        let Some(&want) = next else { break };
+                        let Inst::Effect {
+                            provenance: at,
+                            inputs,
+                            outputs,
+                            ..
+                        } = inst
+                        else {
+                            continue;
                         };
-                        let mut members = Vec::with_capacity(group.len());
-                        let mut wanted = group.iter();
-                        let mut next = wanted.next();
-                        for inst in &self.p.ir.func().blocks[&id].insts[index..] {
-                            let Some(&want) = next else { break };
-                            let Inst::Effect {
-                                provenance: at,
-                                inputs,
-                                outputs,
-                                ..
-                            } = inst
-                            else {
-                                continue;
-                            };
-                            if *at != want {
-                                continue;
-                            }
-                            members.push((want, inputs.clone(), outputs.clone()));
-                            next = wanted.next();
+                        if *at != want {
+                            continue;
                         }
-                        assert_eq!(members.len(), group.len(), "a yield group lost a member");
-                        self.emit_yield(&members);
-                    } else {
-                        self.emit_local_wave(*op, inputs, outputs);
+                        members.push((want, inputs.clone(), outputs.clone()));
+                        next = wanted.next();
                     }
+                    assert_eq!(members.len(), group.len(), "a yield group lost a member");
+                    self.emit_yield(&members);
                 }
             },
         }

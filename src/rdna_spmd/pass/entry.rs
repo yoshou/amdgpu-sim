@@ -1,5 +1,5 @@
 use super::super::analysis::{Constants, DispatchConstants, Preserved};
-use super::super::ir::{Env, IntOp, IntPred, Op, Ty, *};
+use super::super::ir::*;
 use super::{Analyses, Pass};
 
 fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
@@ -129,66 +129,6 @@ pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     count
 }
 
-pub(crate) fn local_write_lanes(f: &mut Func) -> usize {
-    let scheduled_reads = f.blocks.values().flat_map(|b| &b.insts).any(|inst| matches!(inst,
-        Inst::Effect { op: EffectOp::Wave(WaveOp::ReadLane), provenance, .. } if provenance & SCHEDULED != 0));
-    if !scheduled_reads {
-        return 0;
-    }
-    let mut count = 0;
-    let ids: Vec<BlockId> = f.blocks.keys().copied().collect();
-    for id in ids {
-        let old = std::mem::take(&mut f.blocks.get_mut(&id).unwrap().insts);
-        let mut insts = Vec::with_capacity(old.len());
-        for inst in old {
-            match inst {
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::WriteLane),
-                    inputs,
-                    outputs,
-                    provenance,
-                } if provenance & (SCHEDULED | (1 << 63)) == 0 => {
-                    let (result, ty) = outputs[0];
-                    assert_eq!(ty, Ty::I32);
-                    let lane = f.value(Ty::I32);
-                    let mask = f.value(Ty::I32);
-                    let selector = f.value(Ty::I32);
-                    let selected = f.value(Ty::I1);
-                    insts.push(Inst::Core {
-                        value: lane,
-                        ty: Ty::I32,
-                        op: Op::Env(Env::LaneId),
-                    });
-                    insts.push(Inst::Core {
-                        value: mask,
-                        ty: Ty::I32,
-                        op: Op::Const(Ty::I32, 31),
-                    });
-                    insts.push(Inst::Core {
-                        value: selector,
-                        ty: Ty::I32,
-                        op: Op::Int(IntOp::And, inputs[1], mask),
-                    });
-                    insts.push(Inst::Core {
-                        value: selected,
-                        ty: Ty::I1,
-                        op: Op::Cmp(IntPred::Eq, lane, selector),
-                    });
-                    insts.push(Inst::Core {
-                        value: result,
-                        ty: Ty::I32,
-                        op: Op::Select(selected, inputs[0], inputs[2]),
-                    });
-                    count += 1;
-                }
-                other => insts.push(other),
-            }
-        }
-        f.blocks.get_mut(&id).unwrap().insts = insts;
-    }
-    count
-}
-
 pub(crate) struct PacketState;
 impl Pass for PacketState {
     fn name(&self) -> &str {
@@ -221,12 +161,3 @@ impl Pass for DiscardReturn {
     }
 }
 
-pub(crate) struct LocalWriteLanes;
-impl Pass for LocalWriteLanes {
-    fn name(&self) -> &str {
-        "local_write_lanes"
-    }
-    fn run(&self, f: &mut Func, _: &Analyses) -> bool {
-        local_write_lanes(f) > 0
-    }
-}

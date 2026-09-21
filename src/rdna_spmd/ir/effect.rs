@@ -1,6 +1,5 @@
 use super::{Ty, ValueId};
 
-pub(crate) const SCHEDULED: u64 = 1 << 62;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Space {

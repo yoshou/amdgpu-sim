@@ -17,8 +17,7 @@ impl Pass for Adjacency {
 }
 
 fn member(inst: &Inst) -> bool {
-    matches!(inst, Inst::Effect { provenance, op: EffectOp::Wave(w), .. }
-        if *provenance & SCHEDULED != 0 && *w != WaveOp::Wmma)
+    matches!(inst, Inst::Effect { op: EffectOp::Wave(w), .. } if *w != WaveOp::Wmma)
 }
 
 fn barrier(inst: &Inst) -> bool {

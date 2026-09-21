@@ -102,7 +102,7 @@ pub(super) fn lower(
             .values()
             .flat_map(|b| &b.insts)
             .filter_map(|inst| match inst {
-                Inst::Effect { provenance, .. } => Some(provenance & !SCHEDULED),
+                Inst::Effect { provenance, .. } => Some(*provenance),
                 Inst::Target { provenance, .. } => *provenance,
                 _ => None,
             })
