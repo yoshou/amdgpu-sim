@@ -31,7 +31,7 @@ pub enum Terminator {
 
     Yield {
         resume: usize,
-        action: Box<super::lift::wave::YieldAction>,
+        action: Box<super::lift::YieldAction>,
     },
 }
 
@@ -50,7 +50,7 @@ pub struct ScalarProgram {
     pub blocks: BTreeMap<usize, ScalarBlock>,
 }
 
-pub fn is_noop(inst: &InstFormat) -> bool {
+fn is_noop(inst: &InstFormat) -> bool {
     match inst {
         InstFormat::SOPP(i) => matches!(
             i.op,
@@ -130,7 +130,7 @@ fn lower_terminator(last: &InstFormat, next_pcs: &[usize]) -> Terminator {
     Terminator::Jump(next_pcs[0])
 }
 
-pub(crate) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
+pub fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
     let (last, head) = insts.split_last().expect("empty block");
 
     let term = lower_terminator(last, next_pcs);
@@ -155,12 +155,12 @@ pub(crate) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -
     ScalarBlock { pc, body, term }
 }
 
-pub(crate) struct DecodedBlock {
+pub struct DecodedBlock {
     pub insts: Vec<InstFormat>,
     pub next_pcs: Vec<usize>,
 }
 
-pub(crate) struct Decoded {
+pub struct Decoded {
     pub entry_pc: usize,
     pub blocks: BTreeMap<usize, DecodedBlock>,
 }
@@ -221,7 +221,7 @@ impl Search<'_> {
             pc += size;
             let stop = is_terminator(&inst)
                 || self.containing(pc).is_some()
-                || super::lift::control::writes_exec(&inst);
+                || super::lift::writes_exec(&inst);
             last = inst;
             if stop {
                 break;
@@ -244,7 +244,7 @@ impl Search<'_> {
     }
 }
 
-pub(crate) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
+pub fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
     let mut search = Search {
         memory,
         ranges: BTreeSet::new(),

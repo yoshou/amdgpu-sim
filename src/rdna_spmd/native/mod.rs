@@ -4,10 +4,10 @@ use std::ffi::CString;
 
 use super::ir::{FloatPred, IntPred};
 
-pub(crate) mod jit;
+pub mod jit;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Atomic {
+pub enum Atomic {
     Monotonic,
     Acquire,
     Release,
@@ -62,15 +62,15 @@ fn ordering(order: Atomic) -> llvm_sys::LLVMAtomicOrdering {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
-pub(crate) struct Value(LLVMValueRef);
+pub struct Value(LLVMValueRef);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
-pub(crate) struct Type(LLVMTypeRef);
+pub struct Type(LLVMTypeRef);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(transparent)]
-pub(crate) struct BasicBlock(LLVMBasicBlockRef);
+pub struct BasicBlock(LLVMBasicBlockRef);
 
 impl Value {
     pub const fn from_raw(raw: LLVMValueRef) -> Self {
@@ -137,7 +137,7 @@ impl Value {
 }
 
 impl Type {
-    pub fn is_vector(self) -> bool {
+    fn is_vector(self) -> bool {
         unsafe { LLVMGetTypeKind(self.0) == llvm_sys::LLVMTypeKind::LLVMVectorTypeKind }
     }
     pub fn is_float(self) -> bool {
@@ -200,7 +200,7 @@ fn cstr(s: &str) -> CString {
 const ANON: *const std::ffi::c_char = b"\0".as_ptr() as *const std::ffi::c_char;
 
 #[derive(Clone, Copy)]
-pub(crate) struct Builder {
+pub struct Builder {
     ctx: LLVMContextRef,
     module: LLVMModuleRef,
     b: LLVMBuilderRef,
@@ -334,7 +334,7 @@ impl Builder {
         let name = cstr(name);
         unsafe { Value(LLVMAddGlobal(self.module, ty.0, name.as_ptr())) }
     }
-    pub fn intrinsic(&self, prefix: &str, overloads: &[Type]) -> (Value, Type) {
+    fn intrinsic(&self, prefix: &str, overloads: &[Type]) -> (Value, Type) {
         let mut overloads: Vec<LLVMTypeRef> = overloads.iter().map(|t| t.0).collect();
         unsafe {
             let id = LLVMLookupIntrinsicID(prefix.as_ptr() as *const _, prefix.len());
@@ -489,7 +489,7 @@ impl Builder {
     pub fn extract_at(&self, v: Value, index: u32) -> Value {
         self.extract(v, self.ci32(index))
     }
-    pub fn insert(&self, v: Value, element: Value, index: Value) -> Value {
+    fn insert(&self, v: Value, element: Value, index: Value) -> Value {
         unsafe {
             Value(LLVMBuildInsertElement(
                 self.b, v.0, element.0, index.0, ANON,

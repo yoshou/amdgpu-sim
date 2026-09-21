@@ -1,9 +1,9 @@
-pub(in crate::rdna_spmd) mod bdd;
-pub(super) mod constant;
-pub(in crate::rdna_spmd) mod dataflow;
-pub(in crate::rdna_spmd) mod facts;
-pub(in crate::rdna_spmd) mod loops;
-pub(in crate::rdna_spmd) mod uniformity;
+pub mod bdd;
+mod constant;
+pub mod dataflow;
+pub mod facts;
+pub mod loops;
+pub mod uniformity;
 
 use super::ir::DialectRegistry;
 use super::ir::Func;
@@ -12,16 +12,16 @@ use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pub(crate) use constant::Constants;
-pub(crate) use uniformity::Uniformity;
+pub use constant::Constants;
+pub use uniformity::Uniformity;
 
 #[derive(Clone, Copy)]
-pub(crate) struct Packet {
+pub struct Packet {
     pub aligned: bool,
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct Context<'r> {
+pub struct Context<'r> {
     pub registry: &'r DialectRegistry,
     pub inputs: &'r [Parameter],
     pub exec_index: usize,
@@ -53,13 +53,13 @@ impl<'r> Context<'r> {
     }
 }
 
-pub(crate) trait Analysis: 'static {
+pub trait Analysis: 'static {
     type Result: PartialEq + 'static;
     const NAME: &'static str;
     fn compute(f: &Func, analyses: &Analyses) -> Self::Result;
 }
 
-pub(crate) struct Preserved(Vec<TypeId>);
+pub struct Preserved(Vec<TypeId>);
 impl Preserved {
     pub fn none() -> Self {
         Self(Vec::new())
@@ -67,7 +67,7 @@ impl Preserved {
     pub fn of<A: Analysis>() -> Self {
         Self::none().and::<A>()
     }
-    pub fn and<A: Analysis>(mut self) -> Self {
+    fn and<A: Analysis>(mut self) -> Self {
         self.0.push(TypeId::of::<A>());
         self
     }
@@ -92,7 +92,7 @@ fn equals<A: Analysis>(a: &dyn Any, b: &dyn Any) -> bool {
     a.downcast_ref::<A::Result>() == b.downcast_ref::<A::Result>()
 }
 
-pub(crate) struct Analyses<'r> {
+pub struct Analyses<'r> {
     ctx: Context<'r>,
     slots: RefCell<Vec<Slot>>,
     computing: RefCell<Vec<(TypeId, &'static str, Vec<TypeId>)>>,

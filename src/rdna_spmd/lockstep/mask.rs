@@ -1,7 +1,7 @@
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::ir::ValueId;
 
-pub(super) struct Atom {
+pub struct Atom {
 
     pub value: ValueId,
 
@@ -10,7 +10,7 @@ pub(super) struct Atom {
     pub origin: Option<ValueId>,
 }
 
-pub(super) struct Masks {
+pub struct Masks {
     pub m: Manager,
     atoms: Vec<Atom>,
     invariants: Bdd,
@@ -18,7 +18,7 @@ pub(super) struct Masks {
 }
 
 #[derive(Clone)]
-pub(super) struct Knowledge {
+pub struct Knowledge {
     invariants: Bdd,
     nonempty: usize,
 }

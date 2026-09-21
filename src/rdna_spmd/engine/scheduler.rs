@@ -8,7 +8,7 @@ use super::fiber::{Fiber, KernelArgs};
 use super::kernel::{
     Kernel, Region, Scheduler, SGPR_BUF,
 };
-use super::super::codegen::yields::YieldValues;
+use super::super::codegen::YieldValues;
 use super::super::codegen::{DONE, ENTER, LEAVE};
 
 const WAVE: usize = 32;
@@ -27,7 +27,7 @@ const LDS_MIN_BYTES: usize = 128 * 1024;
 const POOL_LIMIT: usize = 64;
 
 #[derive(Clone)]
-pub(crate) struct View<'a> {
+pub struct View<'a> {
     regions: &'a [Region],
     scheduler: Scheduler,
     width: usize,
@@ -41,7 +41,7 @@ pub(crate) struct View<'a> {
 }
 
 impl<'a> View<'a> {
-    pub(crate) fn of(kernel: &'a Kernel) -> Self {
+    pub fn of(kernel: &'a Kernel) -> Self {
         let regions = &kernel.regions;
         let mut depth = vec![0; regions.len()];
         let mut pending = vec![0];
@@ -53,8 +53,8 @@ impl<'a> View<'a> {
         }
         Self {
             regions,
-            scheduler: kernel.scheduler(),
-            width: kernel.width() as usize,
+            scheduler: kernel.scheduler,
+            width: kernel.width as usize,
             num_vgprs: kernel.num_vgprs,
             min_private_bytes: kernel.min_private_bytes,
             workgroup_x: kernel.workgroup_x,
@@ -154,7 +154,7 @@ struct Engine<'a> {
     shape: Shape,
 }
 
-pub(crate) fn run(
+pub fn run(
     view: View,
     kd: &KernelDescriptor,
     kernarg_ptr: u64,

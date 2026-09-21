@@ -3,7 +3,6 @@ use super::super::ir::{
 };
 use super::dataflow::{Cfg, Lattice, Sparse};
 use super::{Analyses, Analysis, Constants, Packet};
-use std::collections::BTreeMap;
 
 impl Analysis for Uniformity {
     type Result = Uniformity;
@@ -13,7 +12,6 @@ impl Analysis for Uniformity {
         let Some(Packet { aligned }) = ctx.packet else {
             return Uniformity {
                 facts: vec![Fact::Uniform; f.types.len()],
-                pairs: BTreeMap::new(),
             };
         };
         let constants = analyses.get::<Constants>(f);
@@ -53,7 +51,7 @@ fn entry(f: &Func, inputs: &[Parameter], aligned: bool) -> Entry {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Fact {
+pub enum Fact {
     Uniform,
     Affine {
         stride: i64,
@@ -237,16 +235,9 @@ struct Entry {
     varying: Vec<ValueId>,
 }
 
-pub(crate) struct Uniformity {
+#[derive(PartialEq)]
+pub struct Uniformity {
     pub facts: Vec<Fact>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub pairs: BTreeMap<(ValueId, ValueId), Fact>,
-}
-
-impl PartialEq for Uniformity {
-    fn eq(&self, other: &Self) -> bool {
-        self.facts == other.facts && self.pairs == other.pairs
-    }
 }
 
 impl Uniformity {
@@ -581,16 +572,7 @@ fn packet(
         transfer: &transfer,
     }
     .solve(f.types.len());
-    let pairs = lanes
-        .iter()
-        .enumerate()
-        .filter_map(|(lo, lane)| match lane.pair {
-            Pair::Of(hi, fact) => Some(((ValueId(lo), hi), fact)),
-            _ => None,
-        })
-        .collect();
     Uniformity {
         facts: lanes.iter().map(|lane| lane.fact.get()).collect(),
-        pairs,
     }
 }

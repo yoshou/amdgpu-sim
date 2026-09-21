@@ -1,4 +1,4 @@
-pub(crate) struct Vectors {
+pub struct Vectors {
     pub bits: u32,
 }
 

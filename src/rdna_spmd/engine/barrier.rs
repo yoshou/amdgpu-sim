@@ -9,7 +9,7 @@ struct Barrier {
     waits: Vec<u64>,
     rounds: BTreeMap<u64, Round>,
 }
-pub(in crate::rdna_spmd) struct Barriers {
+pub struct Barriers {
     waves: usize,
     barriers: BTreeMap<u32, Barrier>,
 }

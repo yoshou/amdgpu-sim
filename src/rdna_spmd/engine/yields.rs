@@ -7,7 +7,7 @@ fn lanes(width: usize) -> u32 {
         (1u32 << width) - 1
     }
 }
-use super::super::codegen::yields::{Argument, YieldValues};
+use super::super::codegen::{Argument, YieldValues};
 use super::super::ir::{EffectOp, WaveOp};
 
 impl YieldValues {
@@ -289,7 +289,7 @@ impl YieldValues {
     }
 }
 
-pub(crate) fn evaluate(op: WaveOp, valid: u32, read: impl Fn(usize, usize) -> u32) -> [u32; 32] {
+fn evaluate(op: WaveOp, valid: u32, read: impl Fn(usize, usize) -> u32) -> [u32; 32] {
     assert_ne!(valid, 0, "empty wave");
     let arg = |index, lane| {
         if valid >> lane & 1 != 0 {

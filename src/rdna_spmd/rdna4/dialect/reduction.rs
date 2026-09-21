@@ -24,7 +24,7 @@ const FRACTION: [u64; 20] = [
 ];
 
 fn table(e: &Emitter) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let name = "rdna4.two_over_pi";
     match ir.global(name) {
         Some(global) => global,
@@ -44,8 +44,8 @@ fn table(e: &Emitter) -> Value {
     }
 }
 
-pub(super) fn lower(e: &Emitter, args: &[Value]) -> Value {
-    let ir = e.ir;
+pub fn lower(e: &Emitter, args: &[Value]) -> Value {
+    let ir = e.ir();
     let k = |v: i32| e.constant(Ty::I32, v as u32 as u64);
     let bits = ir.bitcast(args[0], e.ty(Ty::I64));
     let exp = ir.lshr(bits, e.constant(Ty::I64, 52));

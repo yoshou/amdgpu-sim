@@ -2,7 +2,7 @@ use super::*;
 
 const EXEC: u32 = 126;
 
-pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
+fn scalar_dests(inst: &InstFormat) -> u128 {
     let bit = |r: u32| 1u128 << (r & 127);
     let pair = |r: u32| bit(r) | bit(r + 1);
     match inst {
@@ -45,7 +45,7 @@ pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
     }
 }
 
-pub(in crate::rdna_spmd) fn writes_exec(inst: &InstFormat) -> bool {
+pub fn writes_exec(inst: &InstFormat) -> bool {
     scalar_dests(inst) & (1u128 << EXEC) != 0
         || matches!(inst,
         InstFormat::SOP1(i) if matches!(i.op,
@@ -134,6 +134,6 @@ fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
     }
 }
 
-pub(super) fn mask_scalar_reads(inst: &InstFormat) -> Vec<u32> {
+pub fn mask_scalar_reads(inst: &InstFormat) -> Vec<u32> {
     (0..128).filter(|&r| scalar_mask_read(inst, r)).collect()
 }

@@ -1,44 +1,9 @@
 use std::collections::BTreeSet;
-use std::hash::{BuildHasherDefault, Hasher};
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct Mix(u64);
-
-impl Mix {
-    fn add(&mut self, word: u64) {
-        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-}
-
-impl Hasher for Mix {
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.add(u64::from_le_bytes(word));
-        }
-    }
-    fn write_u8(&mut self, x: u8) {
-        self.add(x as u64);
-    }
-    fn write_u32(&mut self, x: u32) {
-        self.add(x as u64);
-    }
-    fn write_u64(&mut self, x: u64) {
-        self.add(x);
-    }
-    fn write_usize(&mut self, x: usize) {
-        self.add(x as u64);
-    }
-    fn finish(&self) -> u64 {
-        self.0.rotate_left(26)
-    }
-}
-
-pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<Mix>>;
+use crate::rdna_spmd::hash::{HashMap, Mix};
+use std::hash::Hasher;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct Bdd(u32);
+pub struct Bdd(u32);
 
 impl Bdd {
     pub const FALSE: Bdd = Bdd(0);
@@ -61,7 +26,7 @@ struct Node {
 
 const TERMINAL: u32 = u32::MAX;
 
-pub(crate) struct Manager {
+pub struct Manager {
     nodes: Vec<Node>,
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
 
@@ -163,8 +128,8 @@ impl Manager {
 
     fn slot(&self, f: Bdd, g: Bdd, h: Bdd) -> usize {
         let mut hash = Mix::default();
-        hash.add(f.0 as u64 | (g.0 as u64) << 32);
-        hash.add(h.0 as u64);
+        hash.write_u64(f.0 as u64 | (g.0 as u64) << 32);
+        hash.write_u64(h.0 as u64);
         hash.finish() as usize & (self.ite.len() - 1)
     }
 

@@ -1,17 +1,26 @@
-pub(crate) mod adjacency;
-pub(crate) mod dce;
-pub(crate) mod entry;
-pub(crate) mod idioms;
-pub(crate) mod pairs;
-pub(crate) mod predication;
-pub(crate) mod simplify;
-pub(crate) mod uniform_queries;
+mod adjacency;
+mod dce;
+mod entry;
+mod idioms;
+mod pairs;
+mod predication;
+mod simplify;
+mod uniform_queries;
+
+pub use adjacency::Adjacency;
+pub use dce::{Dce, DeadParams};
+pub use entry::PacketState;
+pub use idioms::{Idiom, Idioms};
+pub use pairs::{Pairs, WideMemory};
+pub use predication::Predication;
+pub use simplify::Simplify;
+pub use uniform_queries::UniformQueries;
 
 use super::analysis::{Analyses, Preserved};
 use super::ir::DialectRegistry;
 use super::ir::Func;
 
-pub(crate) trait Pass: Send + Sync {
+pub trait Pass: Send + Sync {
     fn name(&self) -> &str;
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool;
     fn preserves(&self) -> Preserved {
@@ -19,8 +28,8 @@ pub(crate) trait Pass: Send + Sync {
     }
 }
 
-pub(super) struct Driver {
-    pub(super) trace: bool,
+pub struct Driver {
+    trace: bool,
     verify_each: bool,
 }
 

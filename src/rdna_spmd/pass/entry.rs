@@ -14,7 +14,7 @@ fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
                         seed(&mut critical, v)
                     }
                 }
-                Inst::Target { .. } => super::dce::operands(inst, |v| critical[v.0] = true),
+                Inst::Target { .. } => inst.for_each_operand(|v| critical[v.0] = true),
                 _ => {}
             }
         }
@@ -42,7 +42,7 @@ fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
                     }
                 };
                 if live {
-                    super::dce::operands(inst, |v| {
+                    inst.for_each_operand(|v| {
                         if !critical[v.0] {
                             critical[v.0] = true;
                             changed = true
@@ -84,7 +84,7 @@ fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
     local
 }
 
-pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
+fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     let all = whole_wave;
     let mut count = 0;
     loop {
@@ -129,7 +129,7 @@ pub(crate) fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
     count
 }
 
-pub(crate) struct PacketState;
+pub struct PacketState;
 impl Pass for PacketState {
     fn name(&self) -> &str {
         "packet_state"

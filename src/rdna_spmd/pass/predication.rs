@@ -29,14 +29,14 @@ fn same_bit(value: ValueId, exec: ValueId, defs: &[Option<Op>]) -> bool {
     }
 }
 
-pub(crate) struct Predication {
+pub struct Predication {
     pub predicated: Vec<Option<(ValueId, ValueId)>>,
     pub masked: Vec<bool>,
     pub masked_result: Vec<Option<ValueId>>,
     pub chain: BTreeMap<BlockId, Vec<(usize, ValueId)>>,
 }
 
-pub(crate) fn predication(f: &Func, exec_index: usize) -> Predication {
+pub fn predication(f: &Func, exec_index: usize) -> Predication {
     let defs = &f.definitions();
     let mut predicated: Vec<Option<(ValueId, ValueId)>> = vec![None; f.types.len()];
     let mut masked = vec![false; f.types.len()];

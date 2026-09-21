@@ -1,8 +1,8 @@
-use super::{BlockId, Func};
-use std::collections::{BTreeMap, BTreeSet};
+use super::{BlockId, EffectOp, Func, Inst};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Presence {
+pub enum Presence {
 
     Own,
 
@@ -13,14 +13,14 @@ pub(crate) enum Presence {
     Workgroup,
 }
 
-pub(crate) struct Dominators {
-    pub order: Vec<BlockId>,
+pub struct Dominators {
+    order: Vec<BlockId>,
     idom: BTreeMap<BlockId, BlockId>,
 }
 
 impl Dominators {
     pub fn of(f: &Func) -> Self {
-        let order = reverse_postorder(f);
+        let order = f.reverse_postorder();
         let rank: BTreeMap<BlockId, usize> =
             order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
         let mut preds: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
@@ -78,6 +78,10 @@ impl Dominators {
         }
     }
 
+    pub fn order(&self) -> &[BlockId] {
+        &self.order
+    }
+
     pub fn parent(&self, b: BlockId) -> Option<BlockId> {
         self.idom.get(&b).copied()
     }
@@ -96,27 +100,21 @@ impl Dominators {
     }
 }
 
-pub(crate) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
-    let mut seen = BTreeSet::from([f.entry]);
-    let mut order = Vec::new();
-    let mut stack = vec![(f.entry, 0usize)];
-    while let Some(&mut (id, ref mut next)) = stack.last_mut() {
-        let edge = f.blocks[&id].term.edges().nth(*next).map(|e| e.dst);
-        match edge {
-            Some(dst) => {
-                *next += 1;
-                if seen.insert(dst) {
-                    stack.push((dst, 0));
-                }
-            }
-            None => {
-                order.push(id);
-                stack.pop();
-            }
+impl Inst {
+    pub fn lanes_read(&self) -> Option<Presence> {
+        match self {
+            Inst::Packet { .. } => Some(Presence::Packet),
+            Inst::Effect {
+                op: EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait,
+                ..
+            } => Some(Presence::Workgroup),
+            Inst::Effect {
+                op: EffectOp::Wave(_),
+                ..
+            } => Some(Presence::Wave),
+            _ => None,
         }
     }
-    order.reverse();
-    order
 }
 
 impl Func {
@@ -139,7 +137,7 @@ impl Func {
                 let own = self.blocks[&id]
                     .insts
                     .iter()
-                    .filter_map(super::verify::lanes_read)
+                    .filter_map(Inst::lanes_read)
                     .max()
                     .unwrap_or(Presence::Own);
                 (id, own)
@@ -181,7 +179,7 @@ impl Func {
         self.blocks
             .values()
             .flat_map(|b| b.insts.iter())
-            .filter_map(super::verify::lanes_read)
+            .filter_map(Inst::lanes_read)
             .max()
             .unwrap_or(Presence::Own)
     }
@@ -190,7 +188,7 @@ impl Func {
         self.blocks
             .values()
             .flat_map(|b| b.insts.iter())
-            .any(|inst| super::verify::lanes_read(inst) == Some(Presence::Packet))
+            .any(|inst| inst.lanes_read() == Some(Presence::Packet))
     }
 
     pub fn regions_of(&self, doms: &Dominators) -> BTreeMap<BlockId, BlockId> {
@@ -198,7 +196,7 @@ impl Func {
         let depths: BTreeMap<BlockId, usize> =
             self.regions.keys().map(|&e| (e, depth(e))).collect();
         let mut out = BTreeMap::new();
-        for &b in &doms.order {
+        for &b in doms.order() {
             let held = self
                 .regions
                 .keys()

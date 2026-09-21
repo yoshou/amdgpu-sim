@@ -1,10 +1,10 @@
 use crate::rdna_spmd::analysis::bdd::Bdd;
-use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
+use crate::rdna_spmd::analysis::facts::Facts;
 use super::logic::{Atom, Logic};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {
+pub fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {
     let decided = {
         let facts = Facts::new(q, inputs, &BTreeSet::new());
 
@@ -57,7 +57,7 @@ fn decisions(
             .params
             .iter()
             .map(|p| p.0)
-            .chain(block.insts.iter().flat_map(outputs));
+            .chain(block.insts.iter().flat_map(Inst::outputs));
         for v in values {
             if q.types[v.0] != Ty::I1 {
                 continue;
@@ -199,7 +199,7 @@ fn simplify(q: &mut Func) {
 }
 
 fn remove_unreachable(q: &mut Func) {
-    let reachable: BTreeSet<BlockId> = crate::rdna_spmd::analysis::facts::reverse_postorder(q).into_iter().collect();
+    let reachable: BTreeSet<BlockId> = q.reverse_postorder().into_iter().collect();
     q.blocks.retain(|id, _| reachable.contains(id));
 }
 
@@ -208,7 +208,7 @@ fn remove_dead(q: &mut Func) {
         let mut used = vec![false; q.types.len()];
         for block in q.blocks.values() {
             for inst in &block.insts {
-                for v in operands(inst) {
+                for v in inst.operands() {
                     used[v.0] = true;
                 }
             }
@@ -241,7 +241,7 @@ fn remove_dead(q: &mut Func) {
                     ),
                     _ => false,
                 };
-                observable || outputs(inst).iter().any(|v| used[v.0])
+                observable || inst.outputs().iter().any(|v| used[v.0])
             });
             removed |= block.insts.len() != before;
         }

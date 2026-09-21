@@ -6,7 +6,7 @@ use crate::rdna_spmd::native::{Atomic, Type, Value};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::rdna_spmd) enum Lanes {
+pub enum Lanes {
     Gather,
     Broadcast,
     Lds,
@@ -14,7 +14,7 @@ pub(in crate::rdna_spmd) enum Lanes {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::rdna_spmd) enum StoreShape {
+pub enum StoreShape {
     Narrow,
     Lds,
     Affine,
@@ -22,12 +22,12 @@ pub(in crate::rdna_spmd) enum StoreShape {
     Scatter,
 }
 
-pub(super) fn transpose_tile(width: u32) -> u32 {
+fn transpose_tile(width: u32) -> u32 {
     width.min(super::super::host::Vectors::detect().lanes(64))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::rdna_spmd) enum GlobalLoad {
+pub enum GlobalLoad {
     Gather,
     Broadcast,
     Frame {
@@ -37,7 +37,7 @@ pub(in crate::rdna_spmd) enum GlobalLoad {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::rdna_spmd) enum Shape {
+pub enum Shape {
     Fence,
     ScalarWords,
     AtomicAdd {
@@ -59,7 +59,7 @@ pub(in crate::rdna_spmd) enum Shape {
     },
 }
 
-pub(in crate::rdna_spmd) fn global_load(
+pub fn global_load(
     access: &Access,
     uniform: &[bool],
     affine: &BTreeMap<ValueId, u32>,
@@ -96,7 +96,7 @@ pub(in crate::rdna_spmd) fn global_load(
     GlobalLoad::Gather
 }
 
-pub(in crate::rdna_spmd) fn shape(
+pub fn shape(
     access: &Access,
     width: u32,
     load: GlobalLoad,
@@ -194,7 +194,7 @@ pub(in crate::rdna_spmd) fn shape(
     }
 }
 
-pub(in crate::rdna_spmd) fn clusters(
+pub fn clusters(
     f: &Func,
     accesses: &[Access],
     width: u32,
@@ -299,16 +299,16 @@ impl<'a> Cg<'a> {
         self.ir.set_call_align(call, ptr_pos + 1, align);
         call
     }
-    pub(super) fn vptr(&self) -> Type {
+    fn vptr(&self) -> Type {
         self.ir.ptr().vector(self.width())
     }
-    pub(super) fn vi32(&self) -> Type {
+    pub fn vi32(&self) -> Type {
         self.ir.i32().vector(self.width())
     }
-    pub(super) fn vi64(&self) -> Type {
+    fn vi64(&self) -> Type {
         self.ir.i64().vector(self.width())
     }
-    pub(super) fn vi1(&self) -> Type {
+    pub fn vi1(&self) -> Type {
         self.ir.i1().vector(self.width())
     }
     fn ptr_at_vec(&self, addr: Value, off: u64) -> Value {
@@ -489,7 +489,7 @@ impl<'a> Cg<'a> {
             .collect()
     }
 
-    pub(super) fn emit_cluster(&mut self, members: &[usize], cluster: &Cluster) {
+    pub fn emit_cluster(&mut self, members: &[usize], cluster: &Cluster) {
         let ir = self.ir;
         let first = &self.p.accesses[members[0]];
         let exec = self.vector(first.mask);
@@ -539,7 +539,7 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn emit_memory(&mut self, index: usize) {
+    pub fn emit_memory(&mut self, index: usize) {
         let access = &self.p.accesses[index];
         let shape = self.p.shapes[index];
         if shape == Shape::Fence {

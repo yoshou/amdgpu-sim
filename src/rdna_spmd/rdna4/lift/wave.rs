@@ -6,13 +6,13 @@ use crate::{
 };
 
 #[derive(Clone, Debug)]
-pub(crate) enum Operand {
+pub enum Operand {
     Source(SourceOperand),
     Add(Box<Operand>, u32),
     Exec,
 }
 impl Operand {
-    pub(in crate::rdna_spmd) fn registers(&self, io: &mut BoundaryIo) {
+    fn registers(&self, io: &mut BoundaryIo) {
         match self {
             Self::Source(SourceOperand::ScalarRegister(r)) => io.reads.add_sgpr(*r as u32),
             Self::Source(SourceOperand::VectorRegister(r)) => io.reads.add_vgpr(*r as u32),
@@ -23,7 +23,7 @@ impl Operand {
     }
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Destination {
+pub enum Destination {
     Sgpr(u32),
     Vgpr(u32),
     Scc,
@@ -31,12 +31,12 @@ pub(crate) enum Destination {
 
 #[derive(Clone, Debug)]
 pub struct YieldAction {
-    pub(crate) op: EffectOp,
-    pub(crate) inputs: Vec<Operand>,
-    pub(crate) outputs: Vec<Destination>,
+    pub op: EffectOp,
+    pub inputs: Vec<Operand>,
+    pub outputs: Vec<Destination>,
 }
 impl YieldAction {
-    pub(crate) fn new(op: EffectOp, inputs: Vec<Operand>, outputs: Vec<Destination>) -> Self {
+    pub fn new(op: EffectOp, inputs: Vec<Operand>, outputs: Vec<Destination>) -> Self {
         let (a, r) = op.signature();
         assert_eq!(a.len(), inputs.len());
         assert_eq!(r.len(), outputs.len());
@@ -55,7 +55,7 @@ impl YieldAction {
             outputs,
         }
     }
-    pub(in crate::rdna_spmd) fn io(&self) -> BoundaryIo {
+    pub fn io(&self) -> BoundaryIo {
         let mut io = BoundaryIo::default();
         for operand in &self.inputs {
             operand.registers(&mut io);
@@ -64,7 +64,7 @@ impl YieldAction {
             match dest {
                 Destination::Sgpr(r) => io.writes.add_sgpr(*r),
                 Destination::Vgpr(r) => io.writes.add_vgpr(*r),
-                Destination::Scc => io.writes.scc = true,
+                Destination::Scc => io.writes.add_scc(),
             }
         }
         io
@@ -76,7 +76,7 @@ fn src(s: SourceOperand) -> Operand {
 fn v(r: u32) -> Operand {
     src(SourceOperand::VectorRegister(r as u8))
 }
-pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
+pub fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     use Destination::*;
     Some(match inst {
         InstFormat::VOP1(i) if matches!(i.op, I::V_READFIRSTLANE_B32) => YieldAction::new(
@@ -155,12 +155,12 @@ pub(crate) fn instruction(inst: &InstFormat) -> Option<YieldAction> {
     })
 }
 
-pub(in crate::rdna_spmd) struct Plan {
+pub struct Plan {
     pub definitions: Vec<(Destination, super::ValueId)>,
 }
 
 impl YieldAction {
-    pub(super) fn lift(
+    pub fn lift(
         &self,
         f: &mut crate::rdna_spmd::ir::Func,
         block: &mut crate::rdna_spmd::ir::Block,

@@ -1,6 +1,6 @@
 use super::super::native::Value;
 
-pub(in crate::rdna_spmd) fn compile(w: u32) -> super::super::native::jit::NativeCode {
+pub fn compile_wmma(w: u32) -> super::super::native::jit::NativeCode {
 
     let name = format!("wmma_apply_w{w}");
     let native = super::super::native::jit::Module::new(&name);

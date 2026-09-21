@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-pub(crate) struct VerifiedFunc(Func);
+pub struct VerifiedFunc(Func);
 impl Func {
     pub fn verify_with(
         self,
@@ -166,7 +166,7 @@ impl Func {
         if self.regions.get(&self.entry).is_none() {
             return Err("no region is entered at the function's entry");
         }
-        let reached: BTreeSet<BlockId> = doms.order.iter().copied().collect();
+        let reached: BTreeSet<BlockId> = doms.order().iter().copied().collect();
         for (&entry, &present) in &self.regions {
             if !reached.contains(&entry) {
                 return Err("a region is entered at a block the function does not reach");
@@ -182,10 +182,10 @@ impl Func {
             }
         }
         let held = self.regions_of(&doms);
-        for &id in &doms.order {
+        for &id in doms.order() {
             let present = self.regions[&held[&id]];
             for inst in &self.blocks[&id].insts {
-                if lanes_read(inst) > Some(present) {
+                if inst.lanes_read() > Some(present) {
                     return Err("an operation reads lanes its region does not have present");
                 }
             }
@@ -194,27 +194,13 @@ impl Func {
     }
 }
 
-pub(super) fn lanes_read(inst: &Inst) -> Option<Presence> {
-    match inst {
-        Inst::Packet { .. } => Some(Presence::Packet),
-        Inst::Effect {
-            op: EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait,
-            ..
-        } => Some(Presence::Workgroup),
-        Inst::Effect {
-            op: EffectOp::Wave(_),
-            ..
-        } => Some(Presence::Wave),
-        _ => None,
-    }
-}
 impl VerifiedFunc {
     pub fn func(&self) -> &Func {
         &self.0
     }
 }
 
-pub(crate) struct VerifiedExpr(Expr);
+pub struct VerifiedExpr(Expr);
 impl Expr {
     pub fn verify_with(
         self,

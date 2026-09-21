@@ -1,7 +1,7 @@
 use super::*;
 
 fn scale_operand(e: &Emitter, ty: Ty, a: &[Value]) -> Vec<Value> {
-    let ir = e.ir;
+    let ir = e.ir();
     let (word, fraction, mask, threshold, reciprocal, tiny, amount, nan) = if ty == Ty::F32 {
         (Ty::I32, 23, 0xff, 96, 253, 23, 64i32, 0xffc0_0000)
     } else {
@@ -63,10 +63,10 @@ fn scale_operand(e: &Emitter, ty: Ty, a: &[Value]) -> Vec<Value> {
     let flag = ir.or(invalid, ir.or(over, under));
     vec![result, flag]
 }
-pub(super) fn scale_f32(e: &Emitter, a: &[Value]) -> Vec<Value> {
+pub fn scale_f32(e: &Emitter, a: &[Value]) -> Vec<Value> {
     scale_operand(e, Ty::F32, a)
 }
-pub(super) fn scale_f64(e: &Emitter, a: &[Value]) -> Vec<Value> {
+pub fn scale_f64(e: &Emitter, a: &[Value]) -> Vec<Value> {
     scale_operand(e, Ty::F64, a)
 }
 
@@ -77,21 +77,21 @@ fn fmas(e: &Emitter, ty: Ty, a: &[Value]) -> Value {
     } else {
         (2f64.powi(64)).to_bits()
     };
-    let scaled = e.ir.fmul(fused, e.constant(ty, factor));
-    e.ir.select(a[3], scaled, fused)
+    let scaled = e.ir().fmul(fused, e.constant(ty, factor));
+    e.ir().select(a[3], scaled, fused)
 }
-pub(super) fn fmas_f32(e: &Emitter, a: &[Value]) -> Value {
+pub fn fmas_f32(e: &Emitter, a: &[Value]) -> Value {
     fmas(e, Ty::F32, a)
 }
-pub(super) fn fmas_f64(e: &Emitter, a: &[Value]) -> Value {
+pub fn fmas_f64(e: &Emitter, a: &[Value]) -> Value {
     fmas(e, Ty::F64, a)
 }
 
-pub(super) fn fixup_f32(e: &Emitter, a: &[Value]) -> Value {
+pub fn fixup_f32(e: &Emitter, a: &[Value]) -> Value {
     fixup(e, Ty::F32, a)
 }
 fn fixup(e: &Emitter, ty: Ty, a: &[Value]) -> Value {
-    let ir = e.ir;
+    let ir = e.ir();
     let (word, fraction, exponent_mask, sign, infinity, underflow) = if ty == Ty::F32 {
         (Ty::I32, 23, 0xff, 0x8000_0000u64, 0x7f80_0000u64, -150i32)
     } else {
@@ -155,6 +155,6 @@ fn fixup(e: &Emitter, ty: Ty, a: &[Value]) -> Value {
     ir.bitcast(result, e.ty(ty))
 }
 
-pub(super) fn fixup_f64(e: &Emitter, a: &[Value]) -> Value {
+pub fn fixup_f64(e: &Emitter, a: &[Value]) -> Value {
     fixup(e, Ty::F64, a)
 }

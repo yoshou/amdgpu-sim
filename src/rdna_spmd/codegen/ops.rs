@@ -1,18 +1,18 @@
 use super::super::ir::*;
 use super::super::native::{Builder, Type, Value};
 
-pub(crate) struct Emitter {
-    pub(in crate::rdna_spmd) state: Option<Box<dyn std::any::Any>>,
+pub struct Emitter {
+    pub(super) state: Option<Box<dyn std::any::Any>>,
     registry: std::sync::Arc<super::super::ir::DialectRegistry>,
     lowerings: std::sync::Arc<Lowerings>,
-    pub(in crate::rdna_spmd) ir: Builder,
+    ir: Builder,
     width: Option<u32>,
-    pub(in crate::rdna_spmd) valid_lane: Option<Value>,
-    pub(in crate::rdna_spmd) scratch: Option<(Value, Value)>,
-    pub(in crate::rdna_spmd) lane_id: Option<Value>,
+    pub(super) valid_lane: Option<Value>,
+    pub(super) scratch: Option<(Value, Value)>,
+    pub(super) lane_id: Option<Value>,
 }
 impl Emitter {
-    pub(in crate::rdna_spmd) fn set_lane_id(&mut self, lane_base: Value) {
+    pub(super) fn set_lane_id(&mut self, lane_base: Value) {
         let ir = self.ir;
         let base = ir.trunc(lane_base, ir.i32());
         self.lane_id = Some(match self.width {
@@ -24,7 +24,7 @@ impl Emitter {
             None => base,
         });
     }
-    pub fn new(
+    pub(super) fn new(
         ir: Builder,
         width: Option<u32>,
         registry: std::sync::Arc<super::super::ir::DialectRegistry>,
@@ -41,7 +41,10 @@ impl Emitter {
             lane_id: None,
         }
     }
-    pub(in crate::rdna_spmd) fn ty(&self, t: Ty) -> Type {
+    pub fn ir(&self) -> Builder {
+        self.ir
+    }
+    pub fn ty(&self, t: Ty) -> Type {
         let t = match t {
             Ty::I1 => self.ir.i1(),
             Ty::I32 => self.ir.i32(),
@@ -51,10 +54,10 @@ impl Emitter {
         };
         self.shaped(t)
     }
-    pub(in crate::rdna_spmd) fn shaped(&self, scalar: Type) -> Type {
+    pub fn shaped(&self, scalar: Type) -> Type {
         self.width.map_or(scalar, |w| scalar.vector(w))
     }
-    pub(in crate::rdna_spmd) fn constant(&self, ty: Ty, bits: u64) -> Value {
+    pub fn constant(&self, ty: Ty, bits: u64) -> Value {
         let t = self.ir.int(ty.bits());
         let v = t.const_int(bits);
         let v = match self.width {
@@ -67,7 +70,7 @@ impl Emitter {
             self.ir.const_bitcast(v, self.ty(ty))
         }
     }
-    pub(in crate::rdna_spmd) fn suffix(&self, t: Ty) -> String {
+    pub fn suffix(&self, t: Ty) -> String {
         let t = match t {
             Ty::I1 => "i1",
             Ty::I32 => "i32",
@@ -77,17 +80,17 @@ impl Emitter {
         };
         self.width.map_or_else(|| t.into(), |w| format!("v{w}{t}"))
     }
-    pub(in crate::rdna_spmd) fn width(&self) -> Option<u32> {
+    pub fn width(&self) -> Option<u32> {
         self.width
     }
-    pub(in crate::rdna_spmd) fn state<T: 'static>(&self) -> Option<&T> {
+    pub fn state<T: 'static>(&self) -> Option<&T> {
         self.state.as_ref().and_then(|s| s.downcast_ref::<T>())
     }
-    pub(in crate::rdna_spmd) fn call(&self, name: &str, ret: Ty, args: &[Value]) -> Value {
+    pub fn call(&self, name: &str, ret: Ty, args: &[Value]) -> Value {
         let types: Vec<Type> = args.iter().map(|v| v.ty()).collect();
         self.ir.call_named(name, self.ty(ret), &types, args)
     }
-    pub fn target(
+    pub(super) fn target(
         &self,
         op: super::super::ir::TargetOp,
         args: super::super::ir::Arguments,
@@ -101,7 +104,7 @@ impl Emitter {
             .collect::<Vec<_>>();
         self.lowerings.emit(op, spec.outputs.len(), self, &args)
     }
-    pub fn op(&self, ty: Ty, op: Op, values: &[Value]) -> Value {
+    pub(super) fn op(&self, ty: Ty, op: Op, values: &[Value]) -> Value {
         let ir = self.ir;
         let v = |id: ValueId| values[id.0];
         match op {
@@ -287,13 +290,13 @@ impl Emitter {
     }
 }
 
-pub(crate) enum Implementation {
+pub enum Implementation {
     Single(fn(&Emitter, &[Value]) -> Value),
     Multiple(fn(&Emitter, &[Value]) -> Vec<Value>),
 }
 
 #[derive(Default)]
-pub(crate) struct Lowerings {
+pub struct Lowerings {
     lower: std::collections::BTreeMap<super::super::ir::TargetOp, Implementation>,
     state: Option<fn(&Emitter, Value) -> Box<dyn std::any::Any>>,
 }
@@ -305,7 +308,7 @@ impl Lowerings {
     pub fn set_state(&mut self, prepare: fn(&Emitter, Value) -> Box<dyn std::any::Any>) {
         self.state = Some(prepare);
     }
-    pub fn state(&self, emitter: &Emitter, sink: Value) -> Option<Box<dyn std::any::Any>> {
+    pub(super) fn state(&self, emitter: &Emitter, sink: Value) -> Option<Box<dyn std::any::Any>> {
         self.state.map(|prepare| prepare(emitter, sink))
     }
     fn emit(

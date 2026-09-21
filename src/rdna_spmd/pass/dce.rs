@@ -46,7 +46,7 @@ fn count_uses(f: &Func, uses: &mut [usize]) {
     }
 }
 
-pub(crate) struct Dce;
+pub struct Dce;
 impl super::Pass for Dce {
     fn name(&self) -> &str {
         "dce"
@@ -56,7 +56,7 @@ impl super::Pass for Dce {
     }
 }
 
-pub(crate) struct DeadParams;
+pub struct DeadParams;
 impl super::Pass for DeadParams {
     fn name(&self) -> &str {
         "dead_params"
@@ -66,7 +66,7 @@ impl super::Pass for DeadParams {
     }
 }
 
-pub(crate) fn run(f: &mut Func) -> usize {
+fn run(f: &mut Func) -> usize {
     let mut removed = 0;
     loop {
         let mut uses = vec![0usize; f.types.len()];
@@ -133,7 +133,7 @@ fn live_values(f: &Func) -> Vec<bool> {
                 }
             }
             if observed {
-                operands(inst, |v| pending.push(v));
+                inst.for_each_operand(|v| pending.push(v));
             }
         }
         match &block.term {
@@ -152,7 +152,7 @@ fn live_values(f: &Func) -> Vec<bool> {
         }
         live[value.0] = true;
         if let Some((block, index)) = producer[value.0] {
-            operands(&f.blocks[&block].insts[index], |v| pending.push(v));
+            f.blocks[&block].insts[index].for_each_operand(|v| pending.push(v));
         }
         if let Some((block, index)) = parameter[value.0] {
             for edge in incoming.get(&block).into_iter().flatten() {
@@ -163,29 +163,7 @@ fn live_values(f: &Func) -> Vec<bool> {
     live
 }
 
-pub(crate) fn operands(inst: &Inst, mut f: impl FnMut(ValueId)) {
-    match inst {
-        Inst::Core { op, .. } => {
-            op.map(|v| {
-                f(v);
-                v
-            });
-        }
-        Inst::Packet { input, .. } => f(*input),
-        Inst::Effect { inputs, .. } => {
-            for &v in inputs {
-                f(v)
-            }
-        }
-        Inst::Target { args, .. } => {
-            for &v in args.values() {
-                f(v)
-            }
-        }
-    }
-}
-
-pub(crate) fn dead_params(f: &mut Func) -> usize {
+fn dead_params(f: &mut Func) -> usize {
     let mut removed = 0;
     loop {
         let live = live_values(f);

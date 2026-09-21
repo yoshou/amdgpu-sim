@@ -176,7 +176,7 @@ fn decode(op: I) -> Option<Comparison> {
     })
 }
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (op, sources, dst, abs, neg, opsel) = match inst {
         InstFormat::VOPC(i) => (
             i.op,

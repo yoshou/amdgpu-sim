@@ -2,21 +2,25 @@ use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry};
 use crate::rdna_spmd::ir::*;
-pub(crate) mod access;
+mod access;
 mod compare;
-pub(crate) mod control;
+mod control;
 mod division;
 mod dual;
-pub(crate) mod half;
+mod half;
 mod image;
-pub(crate) mod memory;
+mod memory;
 mod packed;
-pub(crate) mod regs;
-pub(crate) mod rewrite;
+mod regs;
+mod rewrite;
 mod scalar;
-pub(crate) mod wave;
+mod wave;
 
-pub(crate) enum Lowering {
+pub use control::writes_exec;
+pub use function::lift;
+pub use wave::{Operand, YieldAction};
+
+pub enum Lowering {
     Memory(memory::Memory),
     Wave(wave::YieldAction),
     TypedAlu {
@@ -27,7 +31,7 @@ pub(crate) enum Lowering {
     },
 }
 #[derive(Clone, Debug)]
-pub(crate) struct Input {
+pub struct Input {
     pub source: InputSource,
     pub ty: Ty,
 }
@@ -73,7 +77,7 @@ impl Input {
     }
 }
 #[derive(Clone, Debug)]
-pub(crate) enum InputSource {
+pub enum InputSource {
     Operand(SourceOperand),
     Scc,
 
@@ -82,7 +86,7 @@ pub(crate) enum InputSource {
     ExecPredicate,
 }
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Output {
+pub enum Output {
     Vgpr(u32, Ty),
     Compare(u32),
     Mask(u32),
@@ -399,7 +403,7 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     Some(b.finish_many(false, results))
 }
 
-pub(super) fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
+pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
     if let Some(action) = wave::instruction(inst) {
         return Lowering::Wave(action);
     }
@@ -971,4 +975,4 @@ fn conversion(op: I) -> Option<(Ty, Ty, Cvt)> {
     })
 }
 
-pub(crate) mod function;
+mod function;

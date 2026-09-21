@@ -2,13 +2,13 @@ use super::{Ty, ValueId};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct TargetOp {
+pub struct TargetOp {
     dialect: u32,
     operation: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Arguments {
+pub enum Arguments {
     Unary(ValueId),
     Binary([ValueId; 2]),
     Ternary([ValueId; 3]),
@@ -45,7 +45,7 @@ impl Arguments {
     }
 }
 
-pub(crate) struct Operation {
+pub struct Operation {
     pub name: &'static str,
     pub inputs: &'static [Ty],
     pub outputs: Vec<Ty>,
@@ -54,7 +54,7 @@ pub(crate) struct Operation {
     pub immediates: &'static [(usize, u64)],
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Effect {
+pub enum Effect {
     Pure,
     ReadGlobal { every_lane: bool },
 }
@@ -79,7 +79,7 @@ impl Operation {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Registers {
+pub struct Registers {
     pub exec: u32,
     pub vcc: u32,
     pub null: u32,
@@ -89,7 +89,7 @@ pub(crate) struct Registers {
 }
 
 #[derive(Default)]
-pub(crate) struct DialectRegistry {
+pub struct DialectRegistry {
     operations: BTreeMap<TargetOp, Operation>,
     dialects: BTreeMap<u32, &'static str>,
     registers: Registers,

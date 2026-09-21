@@ -2,14 +2,14 @@ use super::super::ir::{EffectOp, Func, Inst, Ty, WaveOp};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy)]
-pub(crate) enum Argument {
+pub enum Argument {
     Lane,
     Uniform,
     Constant(u32),
 }
 
 #[derive(Clone)]
-pub(crate) struct YieldValues {
+pub struct YieldValues {
     pub op: EffectOp,
     pub inputs: Vec<Ty>,
     pub outputs: Vec<Ty>,
@@ -19,7 +19,7 @@ pub(crate) struct YieldValues {
     pub arguments: Vec<Argument>,
 }
 impl YieldValues {
-    pub fn new(op: EffectOp) -> Self {
+    fn new(op: EffectOp) -> Self {
         let (inputs, outputs) = op.signature();
         assert!(inputs.len() <= 24 && outputs.len() <= 8);
         assert!(inputs.iter().chain(&outputs).all(|ty| ty.bits() <= 32));
@@ -57,7 +57,7 @@ impl YieldValues {
     }
 }
 
-pub(super) fn layouts(
+pub fn layouts(
     ir: &Func,
     uniform: &[bool],
     constants: &[Option<u64>],

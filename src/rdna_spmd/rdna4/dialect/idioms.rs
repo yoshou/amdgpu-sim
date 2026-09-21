@@ -1,17 +1,17 @@
-use crate::rdna_spmd::pass::predication::Predication;
+use crate::rdna_spmd::pass::Predication;
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry, TargetOp};
 use crate::rdna_spmd::ir::{FloatOp, FloatUnary, Op, Ty, ValueId, *};
-use crate::rdna_spmd::pass::idioms::Idiom;
+use crate::rdna_spmd::pass::Idiom;
 use std::collections::BTreeMap;
 
-pub(in crate::rdna_spmd) struct SqrtIdioms {
+pub struct SqrtIdioms {
     sqrt: TargetOp,
     rsq: TargetOp,
     ldexp: TargetOp,
     class: TargetOp,
 }
 impl SqrtIdioms {
-    pub(in crate::rdna_spmd) fn new(registry: &DialectRegistry) -> Self {
+    pub fn new(registry: &DialectRegistry) -> Self {
         let op = |name: &str| {
             registry
                 .lookup(super::ID, name)
@@ -308,14 +308,14 @@ fn guarded_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> 
     Some(view.raw(x))
 }
 
-pub(in crate::rdna_spmd) struct DivisionIdioms {
+pub struct DivisionIdioms {
     fixup: TargetOp,
     fmas: TargetOp,
     scale: TargetOp,
     rcp: TargetOp,
 }
 impl DivisionIdioms {
-    pub(in crate::rdna_spmd) fn new(registry: &DialectRegistry) -> Self {
+    pub fn new(registry: &DialectRegistry) -> Self {
         let op = |name: &str| {
             registry
                 .lookup(super::ID, name)
@@ -336,7 +336,7 @@ impl Idiom for DivisionIdioms {
     }
 }
 
-pub(super) fn quotient_fixups(f: &mut Func, fixup: TargetOp) -> usize {
+fn quotient_fixups(f: &mut Func, fixup: TargetOp) -> usize {
     let defs = f.definitions();
     let alias = |mut value: ValueId| {
         while let Some(Op::Convert(Cvt::Bitcast, to, source)) = defs[value.0] {
@@ -686,6 +686,6 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
             b.insts.insert(index + 1, inst);
         }
     }
-    crate::rdna_spmd::pass::simplify::rename(f, &renames);
+    f.rename(&renames);
     rewrites.len()
 }

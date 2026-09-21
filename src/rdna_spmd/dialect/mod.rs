@@ -1,11 +1,11 @@
-use super::codegen::ops::Lowerings;
+use super::codegen::Lowerings;
 use super::native::Value;
-use super::pass::idioms::Idiom;
+use super::pass::Idiom;
 
-pub(crate) use super::codegen::ops::Implementation;
-pub(crate) use super::ir::{Arguments, DialectRegistry, Effect, Registers, TargetOp};
+pub use super::codegen::Implementation;
+pub use super::ir::{Arguments, DialectRegistry, Effect, Registers, TargetOp};
 
-pub(crate) struct Operation {
+pub struct Operation {
     pub name: &'static str,
     pub inputs: &'static [super::ir::Ty],
     pub outputs: Vec<super::ir::Ty>,
@@ -16,7 +16,7 @@ pub(crate) struct Operation {
 }
 
 #[derive(Default)]
-pub(crate) struct Dialect {
+pub struct Dialect {
     pub registry: DialectRegistry,
     pub lowerings: Lowerings,
     pub idioms: Vec<Box<dyn Idiom>>,
@@ -34,7 +34,7 @@ impl Dialect {
     }
     pub fn set_lowering_state(
         &mut self,
-        prepare: fn(&super::codegen::ops::Emitter, Value) -> Box<dyn std::any::Any>,
+        prepare: fn(&super::codegen::Emitter, Value) -> Box<dyn std::any::Any>,
     ) {
         self.lowerings.set_state(prepare);
     }

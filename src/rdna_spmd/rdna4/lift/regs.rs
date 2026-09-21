@@ -2,19 +2,19 @@ use super::*;
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::rdna_spmd) enum Word {
+pub enum Word {
     Vgpr(u32),
     Sgpr(u32),
     Mask(u32),
 }
-pub(in crate::rdna_spmd) type Words = BTreeMap<Word, ValueId>;
+pub type Words = BTreeMap<Word, ValueId>;
 
-pub(super) fn core(f: &mut Func, insts: &mut Vec<Inst>, ty: Ty, op: Op) -> ValueId {
+pub fn core(f: &mut Func, insts: &mut Vec<Inst>, ty: Ty, op: Op) -> ValueId {
     let value = f.value(ty);
     insts.push(Inst::Core { value, ty, op });
     value
 }
-pub(super) fn query(f: &mut Func, insts: &mut Vec<Inst>, op: WaveOp, bit: ValueId) -> ValueId {
+fn query(f: &mut Func, insts: &mut Vec<Inst>, op: WaveOp, bit: ValueId) -> ValueId {
     let ty = if op == WaveOp::Any { Ty::I1 } else { Ty::I32 };
     let value = f.value(ty);
     insts.push(Inst::Effect {
@@ -25,18 +25,18 @@ pub(super) fn query(f: &mut Func, insts: &mut Vec<Inst>, op: WaveOp, bit: ValueI
     });
     value
 }
-pub(super) fn project(f: &mut Func, insts: &mut Vec<Inst>, word: ValueId) -> ValueId {
+pub fn project(f: &mut Func, insts: &mut Vec<Inst>, word: ValueId) -> ValueId {
     let lane = core(f, insts, Ty::I32, Op::Env(Env::LaneId));
     let shifted = core(f, insts, Ty::I32, Op::Int(IntOp::LShr, word, lane));
     core(f, insts, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
 }
-pub(super) fn valid_exec(f: &mut Func, insts: &mut Vec<Inst>, bit: ValueId) -> ValueId {
+pub fn valid_exec(f: &mut Func, insts: &mut Vec<Inst>, bit: ValueId) -> ValueId {
     let valid = core(f, insts, Ty::I1, Op::Env(Env::ValidLane));
     core(f, insts, Ty::I1, Op::Int(IntOp::And, bit, valid))
 }
 
 impl Word {
-    pub(in crate::rdna_spmd) fn scalar(r: u32) -> Option<Self> {
+    pub fn scalar(r: u32) -> Option<Self> {
         if matches!(r, 106 | 126) {
             Some(Self::Mask(r))
         } else {
@@ -50,7 +50,7 @@ impl Word {
             Ty::I32
         }
     }
-    pub fn source(source: &SourceOperand) -> Option<Self> {
+    fn source(source: &SourceOperand) -> Option<Self> {
         match *source {
             SourceOperand::VectorRegister(r) => Some(Self::Vgpr(r as u32)),
             SourceOperand::ScalarRegister(r) => Self::scalar(r as u32),
@@ -67,15 +67,15 @@ impl Word {
         (0..ty.bits().div_ceil(32)).all(|k| self.offset(k).is_some_and(|r| r.ty() == Ty::I32))
     }
 }
-pub(super) fn words(set: &RegSet) -> impl Iterator<Item = Word> + '_ {
+pub fn words(set: &RegSet) -> impl Iterator<Item = Word> + '_ {
     set.vgprs()
         .map(Word::Vgpr)
         .chain(set.sgprs().filter_map(Word::scalar))
 }
 
-pub(super) type Views = BTreeMap<(Word, Ty, bool), ValueId>;
+pub type Views = BTreeMap<(Word, Ty, bool), ValueId>;
 #[derive(Default)]
-pub(super) struct Operands {
+pub struct Operands {
     pub bindings: Vec<(Input, ValueId)>,
     pub pairs: Vec<(ValueId, ValueId)>,
     pub core: Vec<Inst>,
@@ -302,7 +302,7 @@ fn source(set: &mut RegSet, src: &SourceOperand, count: u32) {
         }
     }
 }
-pub(super) fn footprint(lowering: &Lowering) -> BoundaryIo {
+pub fn footprint(lowering: &Lowering) -> BoundaryIo {
     let mut io = BoundaryIo::default();
     match lowering {
         Lowering::TypedAlu {
@@ -313,7 +313,7 @@ pub(super) fn footprint(lowering: &Lowering) -> BoundaryIo {
                     InputSource::Operand(s) => {
                         source(&mut io.reads, s, input.ty.bits().div_ceil(32))
                     }
-                    InputSource::Scc => io.reads.scc = true,
+                    InputSource::Scc => io.reads.add_scc(),
                     InputSource::MaskBit(r) => io.reads.add_sgpr(*r),
                     InputSource::ExecPredicate => io.reads.add_sgpr(126),
                 }
@@ -331,7 +331,7 @@ pub(super) fn footprint(lowering: &Lowering) -> BoundaryIo {
                         }
                     }
                     Output::Compare(r) | Output::Mask(r) => io.writes.add_sgpr(r),
-                    Output::Scc => io.writes.scc = true,
+                    Output::Scc => io.writes.add_scc(),
                 }
             }
         }
@@ -381,11 +381,11 @@ pub(super) fn footprint(lowering: &Lowering) -> BoundaryIo {
     io
 }
 
-pub(super) struct Definitions {
+pub struct Definitions {
     pub stored: Vec<(ValueId, Ty)>,
 }
 
-pub(super) fn define(
+pub fn define(
     f: &mut Func,
     insts: &mut Vec<Inst>,
     words: &mut Words,
@@ -528,7 +528,7 @@ pub(super) fn define(
     Definitions { stored }
 }
 
-pub(super) fn branch(
+pub fn branch(
     f: &mut Func,
     insts: &mut Vec<Inst>,
     words: &Words,
@@ -568,40 +568,43 @@ pub(super) fn branch(
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
-pub(crate) struct RegSet {
-    pub(crate) scc: bool,
+pub struct RegSet {
+    scc: bool,
     sgpr: u128,
     vgpr: [u128; 2],
 }
 
 impl RegSet {
 
-    pub(crate) fn add_sgpr(&mut self, reg: u32) {
+    pub fn add_scc(&mut self) {
+        self.scc = true;
+    }
+    pub fn add_sgpr(&mut self, reg: u32) {
         if reg < 128 {
             self.sgpr |= 1 << reg;
         }
     }
-    pub(crate) fn add_vgpr(&mut self, reg: u32) {
+    pub fn add_vgpr(&mut self, reg: u32) {
         if reg < 256 {
             self.vgpr[(reg >> 7) as usize] |= 1 << (reg & 127);
         }
     }
-    pub(crate) fn has_sgpr(&self, reg: u32) -> bool {
+    fn has_sgpr(&self, reg: u32) -> bool {
         reg < 128 && self.sgpr & (1 << reg) != 0
     }
-    pub(crate) fn has_vgpr(&self, reg: u32) -> bool {
+    fn has_vgpr(&self, reg: u32) -> bool {
         reg < 256 && self.vgpr[(reg >> 7) as usize] & (1 << (reg & 127)) != 0
     }
-    pub(crate) fn vgprs(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn vgprs(&self) -> impl Iterator<Item = u32> + '_ {
         (0..256u32).filter(move |&reg| self.has_vgpr(reg))
     }
-    pub(crate) fn sgprs(&self) -> impl Iterator<Item = u32> + '_ {
+    fn sgprs(&self) -> impl Iterator<Item = u32> + '_ {
         (0..128u32).filter(move |&reg| self.has_sgpr(reg))
     }
 }
 
 #[derive(Clone, Copy, Default)]
-pub(crate) struct BoundaryIo {
-    pub(crate) reads: RegSet,
-    pub(crate) writes: RegSet,
+pub struct BoundaryIo {
+    pub reads: RegSet,
+    pub writes: RegSet,
 }

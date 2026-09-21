@@ -4,6 +4,7 @@ mod compiler;
 mod decompile;
 mod dialect;
 mod engine;
+mod hash;
 mod host;
 mod ir;
 mod lockstep;
@@ -13,9 +14,5 @@ mod program;
 mod rdna4;
 
 pub use compiler::{compile, decode_program, CompileOptions};
-pub use engine::{
-    dispatch,
-    dispatch::GridDims,
-    kernel::{Kernel, Scheduler},
-};
+pub use engine::{dispatch, GridDims, Kernel};
 pub use program::Program;

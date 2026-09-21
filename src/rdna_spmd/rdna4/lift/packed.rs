@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::VOP3P(i) = inst else {
         return None;
     };

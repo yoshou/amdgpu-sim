@@ -10,7 +10,7 @@ use crate::rdna_spmd::decompile::Lane;
 use crate::rdna_spmd::program::Program;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Packing {
+pub struct Packing {
 
     pub lanes: u32,
 
@@ -19,10 +19,7 @@ pub(crate) struct Packing {
 
 fn represent(lane: &Program, packing: Packing) -> Program {
     use crate::rdna_spmd::analysis::Analyses;
-    use crate::rdna_spmd::pass::dce::{Dce, DeadParams};
-    use crate::rdna_spmd::pass::pairs::{Pairs, WideMemory};
-    use crate::rdna_spmd::pass::simplify::Simplify;
-    use crate::rdna_spmd::pass::Driver;
+    use crate::rdna_spmd::pass::{Dce, DeadParams, Driver, Pairs, Simplify, WideMemory};
     let mut ir = lane.ir.clone();
     let driver = Driver::new();
     let mut analyses = Analyses::new(uniform::context(lane, packing));
@@ -55,7 +52,7 @@ fn represent(lane: &Program, packing: Packing) -> Program {
     }
 }
 
-pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Program {
+pub fn lockstep(lane: &Lane, packing: Packing) -> Program {
     let everyone = &lane.everyone;
     let lane = &represent(&lane.function, packing);
     let facts = Facts::new(&lane.ir, &lane.parameter_inputs, &Default::default());

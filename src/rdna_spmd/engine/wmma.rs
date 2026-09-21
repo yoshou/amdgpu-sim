@@ -18,15 +18,15 @@ fn apply_fn(width: usize) -> ApplyFn {
         width
     );
     let addr = APPLY[width.trailing_zeros() as usize]
-        .get_or_init(|| super::super::codegen::wmma::compile(width as u32))
+        .get_or_init(|| super::super::codegen::compile_wmma(width as u32))
         .address();
     unsafe { std::mem::transmute::<u64, ApplyFn>(addr) }
 }
 
-pub(in crate::rdna_spmd) fn warm(width: usize) {
+pub fn warm_wmma(width: usize) {
     let _ = apply_fn(width);
 }
 
-pub(in crate::rdna_spmd) unsafe fn apply_values(width: usize, packets: *const *mut u32) {
+pub unsafe fn apply_values(width: usize, packets: *const *mut u32) {
     apply_fn(width)(packets);
 }

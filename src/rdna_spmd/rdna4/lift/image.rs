@@ -1,7 +1,7 @@
 use super::*;
 use std::convert::TryInto;
 
-pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::VIMAGE(i) = inst {
         if matches!(i.op, I::IMAGE_BVH8_INTERSECT_RAY) {
             let mut inputs = vec![

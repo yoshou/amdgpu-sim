@@ -5,7 +5,7 @@ use crate::rdna_spmd::ir::{Cvt, Env, IntOp, Op, Ty, ValueId, *};
 use crate::rdna_spmd::native::{Atomic, BasicBlock, Builder, Type, Value};
 use std::collections::BTreeMap;
 
-pub(super) fn lane_word(
+pub fn lane_word(
     definitions: &[Option<Op>],
     uniform: &[bool],
     shifted: ValueId,
@@ -20,7 +20,7 @@ pub(super) fn lane_word(
     }
 }
 
-pub(super) fn queried_word(
+pub fn queried_word(
     definitions: &[Option<Op>],
     uniform: &[bool],
     input: ValueId,
@@ -44,71 +44,44 @@ pub(super) fn queried_word(
     Some((lane_word(definitions, uniform, shifted)?, valid))
 }
 
-fn reverse_postorder(f: &Func) -> Vec<BlockId> {
-    let mut order = Vec::new();
-    let mut visited = std::collections::BTreeSet::new();
-    let mut stack: Vec<(BlockId, usize)> = vec![(f.entry, 0)];
-    visited.insert(f.entry);
-    while let Some((id, next)) = stack.last_mut() {
-        let edges: Vec<&Edge> = f.blocks[id].term.edges().collect();
-        if *next < edges.len() {
-            let dst = edges[*next].dst;
-            *next += 1;
-            if visited.insert(dst) {
-                stack.push((dst, 0));
-            }
-        } else {
-            order.push(*id);
-            stack.pop();
-        }
-    }
-    order.reverse();
-    for &id in f.blocks.keys() {
-        if visited.insert(id) {
-            order.push(id);
-        }
-    }
-    order
+pub const UNDEFINED: Value = Value::from_raw(std::ptr::null_mut());
+
+pub struct Cg<'a> {
+    pub p: &'a Prepared,
+    pub ir: Builder,
+    pub func: Value,
+    pub em: Emitter,
+    pub sem: Emitter,
+    pub values: Vec<Value>,
+    pub vectors: Vec<Value>,
+    pub scalars: Vec<Value>,
+    pub bbs: BTreeMap<BlockId, BasicBlock>,
+    pub phis: BTreeMap<BlockId, Vec<Value>>,
+    pub incoming: BTreeMap<BlockId, Vec<(BasicBlock, Vec<Value>)>>,
+    pub param_scalar: Vec<bool>,
+    pub types: Vec<Ty>,
+    pub definitions: Vec<Option<Op>>,
+    pub access_at: BTreeMap<(BlockId, usize), usize>,
+    pub skip: std::collections::BTreeSet<(BlockId, usize)>,
+    pub current: BlockId,
+    pub sgprs_p: Value,
+    pub vgprs_p: Value,
+    pub scratch_base_scalar: Value,
+    pub scratch_vec: Value,
+    pub lds_base: Value,
+    pub regions: &'a Regions,
+    pub region: usize,
+    pub frame: Value,
+    pub loaded_pairs: BTreeMap<(ValueId, ValueId), Value>,
+    pub valid_mask: Value,
+    pub lane_base: Value,
+    pub yield_frame: Value,
+    pub sink: Value,
+    pub store_sink: Value,
+    pub tile_sink: Value,
 }
 
-pub(super) const UNDEFINED: Value = Value::from_raw(std::ptr::null_mut());
-
-pub(super) struct Cg<'a> {
-    pub(super) p: &'a Prepared,
-    pub(super) ir: Builder,
-    pub(super) func: Value,
-    pub(super) em: Emitter,
-    pub(super) sem: Emitter,
-    pub(super) values: Vec<Value>,
-    pub(super) vectors: Vec<Value>,
-    pub(super) scalars: Vec<Value>,
-    pub(super) bbs: BTreeMap<BlockId, BasicBlock>,
-    pub(super) phis: BTreeMap<BlockId, Vec<Value>>,
-    pub(super) incoming: BTreeMap<BlockId, Vec<(BasicBlock, Vec<Value>)>>,
-    pub(super) param_scalar: Vec<bool>,
-    pub(super) types: Vec<Ty>,
-    pub(super) definitions: Vec<Option<Op>>,
-    pub(super) access_at: BTreeMap<(BlockId, usize), usize>,
-    pub(super) skip: std::collections::BTreeSet<(BlockId, usize)>,
-    pub(super) current: BlockId,
-    pub(super) sgprs_p: Value,
-    pub(super) vgprs_p: Value,
-    pub(super) scratch_base_scalar: Value,
-    pub(super) scratch_vec: Value,
-    pub(super) lds_base: Value,
-    pub(super) regions: &'a Regions,
-    pub(super) region: usize,
-    pub(super) frame: Value,
-    pub(super) loaded_pairs: BTreeMap<(ValueId, ValueId), Value>,
-    pub(super) valid_mask: Value,
-    pub(super) lane_base: Value,
-    pub(super) yield_frame: Value,
-    pub(super) sink: Value,
-    pub(super) store_sink: Value,
-    pub(super) tile_sink: Value,
-}
-
-pub(super) fn emit_function(
+pub fn emit_function(
     p: &Prepared,
     lowerings: &std::sync::Arc<Lowerings>,
     ir: Builder,
@@ -239,8 +212,8 @@ pub(super) fn emit_function(
         cg.bbs
             .insert(id, ir.append_block(func, &format!("b{:x}", id.0)));
     }
-    for &child in &regions.children[r] {
-        let entry = regions.entries[child];
+    for &child in regions.children(r) {
+        let entry = regions.entry(child);
         cg.bbs
             .insert(entry, ir.append_block(func, &format!("enter{:x}", entry.0)));
     }
@@ -249,8 +222,8 @@ pub(super) fn emit_function(
     } else {
         cg.load_entry();
     }
-    ir.br(cg.bbs[&regions.entries[r]]);
-    for id in reverse_postorder(f).into_iter().filter(|id| mine(id)) {
+    ir.br(cg.bbs[&regions.entry(r)]);
+    for id in f.reverse_postorder().into_iter().filter(|id| mine(id)) {
         let block = &f.blocks[&id];
         ir.position_at_end(cg.bbs[&id]);
         cg.current = id;
@@ -267,41 +240,41 @@ pub(super) fn emit_function(
         }
         cg.emit_term(id, block);
     }
-    for (ordinal, &child) in regions.children[r].iter().enumerate() {
+    for (ordinal, &child) in regions.children(r).iter().enumerate() {
         cg.emit_child(ordinal, child);
     }
     cg.finish_phis();
 }
 
 impl<'a> Cg<'a> {
-    pub(super) fn regs(&self) -> crate::rdna_spmd::ir::Registers {
+    fn regs(&self) -> crate::rdna_spmd::ir::Registers {
         self.p.registry.registers()
     }
 
-    pub(super) fn width(&self) -> u32 {
+    pub fn width(&self) -> u32 {
         self.p.width
     }
-    pub(super) fn ci32(&self, v: u32) -> Value {
+    pub fn ci32(&self, v: u32) -> Value {
         self.ir.ci32(v)
     }
-    pub(super) fn ci64(&self, v: u64) -> Value {
+    pub fn ci64(&self, v: u64) -> Value {
         self.ir.ci64(v)
     }
-    pub(super) fn vec_ty(&self, scalar: Type) -> Type {
+    pub fn vec_ty(&self, scalar: Type) -> Type {
         scalar.vector(self.p.width)
     }
-    pub(super) fn splat(&self, v: Value) -> Value {
+    pub fn splat(&self, v: Value) -> Value {
         self.ir.splat(v, self.p.width)
     }
-    pub(super) fn mask_to_vec(&self, word: Value) -> Value {
+    pub fn mask_to_vec(&self, word: Value) -> Value {
         let bits = self.ir.trunc(word, self.ir.int(self.p.width));
         self.ir.bitcast(bits, self.ir.i1().vector(self.p.width))
     }
-    pub(super) fn vec_to_mask(&self, v: Value) -> Value {
+    pub fn vec_to_mask(&self, v: Value) -> Value {
         let bits = self.ir.bitcast(v, self.ir.int(self.p.width));
         self.ir.zext(bits, self.ir.i32())
     }
-    pub(super) fn describe(&self, v: ValueId) -> String {
+    pub fn describe(&self, v: ValueId) -> String {
         let f = self.p.ir.func();
         for (&id, block) in &f.blocks {
             if let Some(index) = block.params.iter().position(|p| p.0 == v) {
@@ -347,7 +320,7 @@ impl<'a> Cg<'a> {
         }
         "undefined".into()
     }
-    pub(super) fn vector(&mut self, v: ValueId) -> Value {
+    pub fn vector(&mut self, v: ValueId) -> Value {
         let value = self.values[v.0];
         assert!(
             !value.is_null(),
@@ -370,7 +343,7 @@ impl<'a> Cg<'a> {
         self.vectors[v.0] = out;
         out
     }
-    pub(super) fn scalar(&mut self, v: ValueId) -> Value {
+    pub fn scalar(&mut self, v: ValueId) -> Value {
         let value = self.values[v.0];
         assert!(
             !value.is_null(),
@@ -388,24 +361,24 @@ impl<'a> Cg<'a> {
         self.scalars[v.0] = out;
         out
     }
-    pub(super) fn shaped(&mut self, v: ValueId, scalar: bool) -> Value {
+    pub fn shaped(&mut self, v: ValueId, scalar: bool) -> Value {
         if scalar {
             self.scalar(v)
         } else {
             self.vector(v)
         }
     }
-    pub(super) fn define(&mut self, v: ValueId, value: Value) {
+    pub fn define(&mut self, v: ValueId, value: Value) {
         self.values[v.0] = value;
         self.vectors[v.0] = UNDEFINED;
         self.scalars[v.0] = UNDEFINED;
     }
 
-    pub(super) fn register_slot(&self, file: Value, index: u32) -> Value {
+    pub fn register_slot(&self, file: Value, index: u32) -> Value {
         self.ir.gep(self.ir.i32(), file, &[self.ci32(index)])
     }
 
-    pub(super) fn load_entry(&mut self) {
+    fn load_entry(&mut self) {
         let f = self.p.ir.func();
         let entry = &f.blocks[&f.entry];
         let ir = self.ir;
@@ -446,7 +419,7 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn begin_block(&mut self, id: BlockId, block: &Block) {
+    fn begin_block(&mut self, id: BlockId, block: &Block) {
         let f = self.p.ir.func();
         if id == f.entry {
             return;
@@ -465,7 +438,7 @@ impl<'a> Cg<'a> {
         self.phis.insert(id, phis);
     }
 
-    pub(super) fn finish_phis(&mut self) {
+    fn finish_phis(&mut self) {
         for (&id, phis) in &self.phis {
             let incoming = self.incoming.get(&id).cloned().unwrap_or_default();
             for (index, &phi) in phis.iter().enumerate() {
@@ -483,7 +456,7 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn edge_args(&mut self, edge: &Edge) -> Vec<Value> {
+    fn edge_args(&mut self, edge: &Edge) -> Vec<Value> {
         let f = self.p.ir.func();
         let params: Vec<_> = f.blocks[&edge.dst].params.iter().map(|p| p.0).collect();
         edge.args
@@ -493,7 +466,7 @@ impl<'a> Cg<'a> {
             .collect()
     }
 
-    pub(super) fn branch_to(&mut self, from: BlockId, ordinal: usize, edge: &Edge) -> BasicBlock {
+    fn branch_to(&mut self, from: BlockId, ordinal: usize, edge: &Edge) -> BasicBlock {
         if !self.regions.holds(self.region, edge.dst) {
             return self.leave_region(from, ordinal, edge);
         }
@@ -506,7 +479,7 @@ impl<'a> Cg<'a> {
         self.bbs[&edge.dst]
     }
 
-    pub(super) fn emit_term(&mut self, id: BlockId, block: &Block) {
+    fn emit_term(&mut self, id: BlockId, block: &Block) {
         match &block.term {
             Term::Br(edge) => {
                 let bb = self.branch_to(id, 0, edge);
@@ -532,11 +505,11 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn lane_base_word(&self, word: Value) -> Value {
+    fn lane_base_word(&self, word: Value) -> Value {
         self.ir.lshr(word, self.lane_base)
     }
 
-    pub(super) fn any_of_word(&mut self, input: ValueId) -> Option<Value> {
+    fn any_of_word(&mut self, input: ValueId) -> Option<Value> {
         let w = self.p.width;
         let (word, valid) = queried_word(&self.definitions, &self.p.uniform, input)?;
         let word = self.scalar(word);
@@ -549,7 +522,7 @@ impl<'a> Cg<'a> {
         Some(self.ir.icmp(IntPred::Ne, bits, self.ci32(0)))
     }
 
-    pub(super) fn emit_inst(&mut self, id: BlockId, index: usize, inst: &Inst) {
+    fn emit_inst(&mut self, id: BlockId, index: usize, inst: &Inst) {
         match inst {
             Inst::Core { value, ty, op } => self.emit_core(*value, *ty, *op),
             Inst::Target {
@@ -624,7 +597,7 @@ impl<'a> Cg<'a> {
         }
     }
 
-    pub(super) fn emit_core(&mut self, value: ValueId, ty: Ty, op: Op) {
+    pub fn emit_core(&mut self, value: ValueId, ty: Ty, op: Op) {
         if let Op::Pack64(a, b) = op {
             if let Some(&loaded) = self.loaded_pairs.get(&(a, b)) {
                 let result = self.ir.bitcast(loaded, self.vec_ty(self.ir.i64()));

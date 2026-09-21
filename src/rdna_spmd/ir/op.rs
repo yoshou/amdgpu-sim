@@ -1,7 +1,7 @@
 use super::{Ty, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum IntOp {
+pub enum IntOp {
     Add,
     Sub,
     Mul,
@@ -13,7 +13,7 @@ pub(crate) enum IntOp {
     AShr,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum IntPred {
+pub enum IntPred {
     Eq,
     Ne,
     Ult,
@@ -26,7 +26,7 @@ pub(crate) enum IntPred {
     Sge,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum FloatOp {
+pub enum FloatOp {
     Add,
     Sub,
     Mul,
@@ -35,13 +35,13 @@ pub(crate) enum FloatOp {
     MaxNum,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum FloatUnary {
+pub enum FloatUnary {
     Neg,
     Abs,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
-pub(crate) enum FloatPred {
+pub enum FloatPred {
     Oeq,
     Ogt,
     Oge,
@@ -60,7 +60,7 @@ pub(crate) enum FloatPred {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
-pub(crate) enum Cvt {
+pub enum Cvt {
     SignedToFloatRte,
     UnsignedToFloatRte,
     FloatToSignedSatRtz,
@@ -72,7 +72,7 @@ pub(crate) enum Cvt {
     Bitcast,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Env {
+pub enum Env {
     LaneId,
     ValidLane,
     ScratchBase,
@@ -80,7 +80,7 @@ pub(crate) enum Env {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Op {
+pub enum Op {
     Env(Env),
     Int(IntOp, ValueId, ValueId),
 

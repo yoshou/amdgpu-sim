@@ -2,49 +2,7 @@ use super::super::analysis::Analyses;
 use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) fn rename(f: &mut Func, map: &BTreeMap<ValueId, ValueId>) {
-    let m = |v: ValueId| {
-        let mut v = v;
-        while let Some(&next) = map.get(&v) {
-            v = next;
-        }
-        v
-    };
-    for block in f.blocks.values_mut() {
-        for inst in &mut block.insts {
-            match inst {
-                Inst::Core { op, .. } => *op = op.map(m),
-                Inst::Packet { input, .. } => *input = m(*input),
-                Inst::Target { args, .. } => *args = args.map(m),
-                Inst::Effect { inputs, .. } => {
-                    for v in inputs {
-                        *v = m(*v);
-                    }
-                }
-            }
-        }
-        match &mut block.term {
-            Term::Br(e) => {
-                for v in &mut e.args {
-                    *v = m(*v);
-                }
-            }
-            Term::CondBr { cond, yes, no } => {
-                *cond = m(*cond);
-                for v in yes.args.iter_mut().chain(&mut no.args) {
-                    *v = m(*v);
-                }
-            }
-            Term::Ret(args) => {
-                for v in args {
-                    *v = m(*v);
-                }
-            }
-        }
-    }
-}
-
-pub(crate) struct Simplify;
+pub struct Simplify;
 impl super::Pass for Simplify {
     fn name(&self) -> &str {
         "simplify"
@@ -285,7 +243,7 @@ fn common(f: &mut Func) -> usize {
     if map.is_empty() {
         return 0;
     }
-    rename(f, &map);
+    f.rename(&map);
     for block in f.blocks.values_mut() {
         block
             .insts
@@ -294,7 +252,7 @@ fn common(f: &mut Func) -> usize {
     map.len()
 }
 
-pub(crate) fn run(f: &mut Func) -> usize {
+fn run(f: &mut Func) -> usize {
     let mut folded = expand(f);
     let known = f.definitions();
     for block in f.blocks.values_mut() {
@@ -370,7 +328,7 @@ pub(crate) fn run(f: &mut Func) -> usize {
     }
     let mut count = map.len() + folded;
     if !map.is_empty() {
-        rename(f, &map);
+        f.rename(&map);
         for block in f.blocks.values_mut() {
             block.insts.retain(
                 |inst| !matches!(inst, Inst::Core { value, .. } if map.contains_key(value)),

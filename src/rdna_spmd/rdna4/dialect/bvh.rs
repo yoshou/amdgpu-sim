@@ -2,7 +2,7 @@ use super::*;
 use crate::rdna_spmd::native::{BasicBlock, Builder, Type};
 
 #[derive(Clone, Copy)]
-pub(in crate::rdna_spmd) struct Storage {
+pub struct Storage {
     pub scratch: Value,
     pub packet: Option<(Value, Type)>,
 }
@@ -23,8 +23,8 @@ struct Native {
     bvh_packet: Option<(Value, Type)>,
 }
 
-pub(in crate::rdna_spmd) fn lowering_state(e: &Emitter, sink: Value) -> Box<dyn std::any::Any> {
-    let ir = e.ir;
+pub fn lowering_state(e: &Emitter, sink: Value) -> Box<dyn std::any::Any> {
+    let ir = e.ir();
     let packet = e.width().map(|_| {
         let lanes = crate::rdna_translator::bvh::BVH_RAY_PACKET_LANES as u64;
         let (packet_i64, packet_f32, packet_i32) = (
@@ -47,7 +47,7 @@ pub(in crate::rdna_spmd) fn lowering_state(e: &Emitter, sink: Value) -> Box<dyn 
 
 fn native(e: &Emitter, bvh_packet: Option<(Value, Type)>) -> Native {
     Native {
-        ir: e.ir,
+        ir: e.ir(),
         w: e.width().unwrap_or(1),
         vi32: e.ty(Ty::I32),
         vi64: e.ty(Ty::I64),
@@ -56,11 +56,11 @@ fn native(e: &Emitter, bvh_packet: Option<(Value, Type)>) -> Native {
     }
 }
 
-pub(super) fn lower(e: &Emitter, a: &[Value]) -> Vec<Value> {
+pub fn lower(e: &Emitter, a: &[Value]) -> Vec<Value> {
     let storage = *e
         .state::<Storage>()
         .expect("BVH lowering requires native scratch storage");
-    let ir = e.ir;
+    let ir = e.ir();
     let cg = native(e, storage.packet);
     if e.width().is_some() {
         let resource = [ir.extract_at(a[0], 0), ir.extract_at(a[1], 0)];
@@ -103,8 +103,8 @@ pub(super) fn lower(e: &Emitter, a: &[Value]) -> Vec<Value> {
     (0..4).map(|k| ir.load(i32t, scratch_ptr(k))).collect()
 }
 
-pub(super) fn lower8(e: &Emitter, a: &[Value]) -> Vec<Value> {
-    let ir = e.ir;
+pub fn lower8(e: &Emitter, a: &[Value]) -> Vec<Value> {
+    let ir = e.ir();
     let cg = native(e, None);
     let packed = e.width().is_some();
     let lanes = e.width().unwrap_or(1);

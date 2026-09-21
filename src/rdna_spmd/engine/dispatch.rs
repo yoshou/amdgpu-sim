@@ -20,7 +20,7 @@ impl GridDims {
 }
 
 #[inline]
-pub(in crate::rdna_spmd) fn setup_sgprs(
+pub fn setup_sgprs(
     s: &mut [u32],
     kd: &KernelDescriptor,
     kernarg_ptr: u64,

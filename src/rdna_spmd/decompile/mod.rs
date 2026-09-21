@@ -8,7 +8,7 @@ use crate::rdna_spmd::analysis::facts;
 use crate::rdna_spmd::program::Program;
 use std::collections::BTreeSet;
 
-pub(crate) struct Lane {
+pub struct Lane {
     pub function: Program,
     pub everyone: BTreeSet<u64>,
 }
@@ -22,7 +22,7 @@ impl From<Program> for Lane {
     }
 }
 
-pub(crate) fn decompile(function: &Program) -> Lane {
+pub fn decompile(function: &Program) -> Lane {
     let f = &function.ir;
     assert!(
         !f.reads_the_packet(),

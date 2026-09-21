@@ -1,7 +1,7 @@
 use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Form {
+pub enum Form {
     Scalar,
     Global { scalar_base: bool },
     Flat,
@@ -10,7 +10,7 @@ pub(crate) enum Form {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Access {
+pub struct Access {
     pub block: BlockId,
     pub start: usize,
     pub end: usize,
@@ -139,7 +139,7 @@ fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
     }
 }
 
-pub(crate) fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
+pub fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
     let mut uses = vec![false; f.types.len()];
     for b in f.blocks.values() {
         for inst in &b.insts {

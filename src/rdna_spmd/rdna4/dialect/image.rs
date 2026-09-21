@@ -2,11 +2,11 @@ use super::*;
 
 fn call(e: &Emitter, name: &str, result: Type, args: &[Value]) -> Value {
     let types = args.iter().map(|v| v.ty()).collect::<Vec<_>>();
-    e.ir.call_named(name, result, &types, args)
+    e.ir().call_named(name, result, &types, args)
 }
 
 fn require(e: &Emitter, mut valid: Value) {
-    let ir = e.ir;
+    let ir = e.ir();
     if let Some(w) = e.width() {
         valid = call(
             e,
@@ -25,8 +25,8 @@ fn require(e: &Emitter, mut valid: Value) {
     ir.position_at_end(next);
 }
 
-pub(super) fn sample(e: &Emitter, a: &[Value]) -> Value {
-    let ir = e.ir;
+pub fn sample(e: &Emitter, a: &[Value]) -> Value {
+    let ir = e.ir();
     let k = |v| e.constant(Ty::I32, v);
     let eq = |a, c| ir.icmp(IntPred::Eq, a, c);
     let and = |a, c| ir.and(a, c);
