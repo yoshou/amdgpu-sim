@@ -39,22 +39,20 @@ pub(in crate::rdna_spmd) fn prepare(
         .fixpoint(&mut ir, &mut an, "simplify", limit, &[&Simplify, &Dce])
         .unwrap();
     driver.pipeline(&mut ir, &mut an, &[&PacketState]).unwrap();
-    if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
-        driver
-            .pipeline(&mut ir, &mut an, &[&Simplify, &Dce])
-            .unwrap();
-        driver.pipeline(&mut ir, &mut an, &[&Pairs]).unwrap();
-        let limit = 1 + ir.types.len();
-        driver
-            .fixpoint(
-                &mut ir,
-                &mut an,
-                "simplify",
-                limit,
-                &[&Simplify, &Dce, &DeadParams, &WideMemory],
-            )
-            .unwrap();
-    }
+    driver
+        .pipeline(&mut ir, &mut an, &[&Simplify, &Dce])
+        .unwrap();
+    driver.pipeline(&mut ir, &mut an, &[&Pairs]).unwrap();
+    let limit = 1 + ir.types.len();
+    driver
+        .fixpoint(
+            &mut ir,
+            &mut an,
+            "simplify",
+            limit,
+            &[&Simplify, &Dce, &DeadParams, &WideMemory],
+        )
+        .unwrap();
     driver.pipeline(&mut ir, &mut an, &[&Adjacency]).unwrap();
     let constants = an.get::<Constants>(&ir);
     let uniformity = an.get::<Uniformity>(&ir);

@@ -186,7 +186,7 @@ impl Regions {
             rebuilt,
             exits,
             frame_words: 0,
-            scalar: scalar_values(p),
+            scalar: p.uniform.clone(),
             width: p.width,
         };
         let mut words = FRAME_BASE;
@@ -302,14 +302,6 @@ impl<'a> Cg<'a> {
         }
     }
 
-    fn as_incoming(&self, param: ValueId, value: Value) -> Value {
-        if !self.param_scalar[param.0] && self.types[param.0] == Ty::I1 && self.mask_words() {
-            self.ir.bitcast(value, self.ir.int(self.width()))
-        } else {
-            value
-        }
-    }
-
     pub(super) fn enter_region(&mut self) {
         let regions = self.regions;
         let f = self.p.ir.func();
@@ -321,7 +313,7 @@ impl<'a> Cg<'a> {
         for (i, (&v, &slot)) in inputs.iter().zip(&slots).enumerate() {
             let value = self.load_value(v, slot);
             if i < params {
-                args.push(self.as_incoming(v, value));
+                args.push(value);
             } else {
                 self.define(v, value);
             }
@@ -365,26 +357,16 @@ impl<'a> Cg<'a> {
         let entry = regions.entries[child];
         let block = &f.blocks[&entry];
         ir.position_at_end(self.bbs[&entry]);
-        let words = self.mask_words();
         let mut phis = Vec::new();
-        let mut held = Vec::new();
         for &(v, ty) in &block.params {
-            let scalar = self.param_scalar[v.0];
-            let t = if scalar {
+            let t = if self.param_scalar[v.0] {
                 self.sem.ty(ty)
-            } else if ty == Ty::I1 && words {
-                ir.int(self.width())
             } else {
                 self.em.ty(ty)
             };
-            let phi = ir.phi(t);
-            phis.push(phi);
-            held.push(if !scalar && ty == Ty::I1 && words {
-                ir.bitcast(phi, self.em.ty(Ty::I1))
-            } else {
-                phi
-            });
+            phis.push(ir.phi(t));
         }
+        let held = phis.clone();
         self.phis.insert(entry, phis);
         let inputs = regions.inputs(f, child);
         let slots = regions.slots(f, &inputs);
@@ -443,7 +425,7 @@ impl<'a> Cg<'a> {
                 let values: Vec<Value> = params
                     .iter()
                     .zip(&slots)
-                    .map(|(&param, &slot)| self.as_incoming(param, self.load_value(param, slot)))
+                    .map(|(&param, &slot)| self.load_value(param, slot))
                     .collect();
                 let from = ir.insert_block();
                 self.incoming.entry(to).or_default().push((from, values));

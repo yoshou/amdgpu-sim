@@ -68,13 +68,6 @@ pub(super) fn queried_word(
     Some((lane_word(definitions, uniform, shifted)?, valid))
 }
 
-pub(super) fn scalar_values(p: &Prepared) -> Vec<bool> {
-    let scalars = std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1");
-    (0..p.ir.func().types.len())
-        .map(|v| p.uniform[v] && scalars)
-        .collect()
-}
-
 pub(super) struct Prepared {
     pub registry: std::sync::Arc<super::ir::DialectRegistry>,
     pub ir: VerifiedFunc,
@@ -350,7 +343,7 @@ fn emit_function(
         bbs: BTreeMap::new(),
         phis: BTreeMap::new(),
         incoming: BTreeMap::new(),
-        param_scalar: scalar_values(p),
+        param_scalar: p.uniform.clone(),
         types: f.types.clone(),
         definitions,
         access_at,
@@ -406,12 +399,7 @@ fn emit_function(
         cg.load_entry();
     }
     ir.br(cg.bbs[&regions.entries[r]]);
-    let order: Vec<BlockId> = if std::env::var("AMDGPU_SIM_RPO").map_or(true, |v| v != "0") {
-        reverse_postorder(f)
-    } else {
-        f.blocks.keys().copied().collect()
-    };
-    for id in order.into_iter().filter(|id| mine(id)) {
+    for id in reverse_postorder(f).into_iter().filter(|id| mine(id)) {
         let block = &f.blocks[&id];
         ir.position_at_end(cg.bbs[&id]);
         cg.current = id;
@@ -439,9 +427,6 @@ impl<'a> Cg<'a> {
         self.p.registry.registers()
     }
 
-    fn mask_words(&self) -> bool {
-        std::env::var("AMDGPU_SIM_MASK_WORDS").map_or(false, |v| v == "1")
-    }
     fn width(&self) -> u32 {
         self.p.width
     }
@@ -616,25 +601,15 @@ impl<'a> Cg<'a> {
             return;
         }
         let mut phis = Vec::new();
-        let words = self.mask_words();
         for &(v, ty) in &block.params {
-            let scalar = self.param_scalar[v.0];
-            let t = if scalar {
+            let t = if self.param_scalar[v.0] {
                 self.sem.ty(ty)
-            } else if ty == Ty::I1 && words {
-                self.ir.int(self.width())
             } else {
                 self.em.ty(ty)
             };
             let phi = self.ir.phi(t);
             phis.push(phi);
             self.define(v, phi);
-        }
-        for (&(v, ty), &phi) in block.params.iter().zip(&phis) {
-            if !self.param_scalar[v.0] && ty == Ty::I1 && words {
-                let vec = self.ir.bitcast(phi, self.em.ty(Ty::I1));
-                self.define(v, vec);
-            }
         }
         self.phis.insert(id, phis);
     }
@@ -660,19 +635,10 @@ impl<'a> Cg<'a> {
     fn edge_args(&mut self, edge: &Edge) -> Vec<Value> {
         let f = self.p.ir.func();
         let params: Vec<_> = f.blocks[&edge.dst].params.iter().map(|p| p.0).collect();
-        let words = self.mask_words();
         edge.args
             .iter()
             .zip(params)
-            .map(|(&arg, param)| {
-                let scalar = self.param_scalar[param.0];
-                let value = self.shaped(arg, scalar);
-                if !scalar && words && self.types[param.0] == Ty::I1 {
-                    self.ir.bitcast(value, self.ir.int(self.width()))
-                } else {
-                    value
-                }
-            })
+            .map(|(&arg, param)| self.shaped(arg, self.param_scalar[param.0]))
             .collect()
     }
 
@@ -839,7 +805,6 @@ impl<'a> Cg<'a> {
             id
         });
         let scalar = !matches!(op, Op::Env(Env::LaneId | Env::ValidLane))
-            && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1")
             && args.iter().all(|a| !self.values[a.0].is_vector());
         let mut table = self.values.clone();
         for a in &args {
