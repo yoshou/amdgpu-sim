@@ -340,11 +340,11 @@ fn main() -> Result<()> {
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
-                .unwrap_or(0);
-            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16 | 32));
+                .unwrap_or(1);
+            assert!(matches!(vec_width, 1 | 2 | 4 | 8 | 16 | 32));
             let verify_widths = matches.opt_present("verify_widths");
             let widths: Vec<u32> = if verify_widths {
-                vec![0, 1, 2, 4, 8, 16, 32]
+                vec![1, 2, 4, 8, 16, 32]
             } else {
                 vec![vec_width]
             };
@@ -432,7 +432,7 @@ fn main() -> Result<()> {
 
                 if verify_widths {
                     let actual_bits: Vec<u16> = matrix_d.iter().map(|value| value.to_bits()).collect();
-                    if width == 0 {
+                    if width == 1 {
                         baseline_bits = Some(actual_bits);
                     } else {
                         let baseline = baseline_bits.as_ref().unwrap();
@@ -446,12 +446,12 @@ fn main() -> Result<()> {
                             return Err(Error::new(
                                 ErrorKind::InvalidData,
                                 format!(
-                                    "vec_width={} differs from vec_width=0 at {} elements; first index {}: {:#06x} != {:#06x}",
+                                    "vec_width={} differs from vec_width=1 at {} elements; first index {}: {:#06x} != {:#06x}",
                                     width, mismatch_count, index, actual, expected
                                 ),
                             ));
                         }
-                        println!("Bitwise match with vec_width=0: passed.");
+                        println!("Bitwise match with vec_width=1: passed.");
                     }
                 }
             }

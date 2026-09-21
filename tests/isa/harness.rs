@@ -24,9 +24,9 @@ pub(crate) enum Engine {
     Spmd(u32),
 }
 
-pub(crate) const ENGINES: [Engine; 9] = [
+pub(crate) const ENGINES: [Engine; 8] = [
     Engine::Interpreter, Engine::LlvmJit,
-    Engine::Spmd(0), Engine::Spmd(1), Engine::Spmd(2),
+    Engine::Spmd(1), Engine::Spmd(2),
     Engine::Spmd(4), Engine::Spmd(8), Engine::Spmd(16), Engine::Spmd(32),
 ];
 
@@ -363,7 +363,6 @@ pub(crate) fn engine_name(engine: Engine) -> &'static str {
     match engine {
         Engine::Interpreter => "interpreter",
         Engine::LlvmJit => "LLVM JIT",
-        Engine::Spmd(0) => "SPMD W=0",
         Engine::Spmd(1) => "SPMD W=1",
         Engine::Spmd(2) => "SPMD W=2",
         Engine::Spmd(4) => "SPMD W=4",

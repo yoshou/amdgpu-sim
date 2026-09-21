@@ -6,7 +6,7 @@ use super::super::ir::EffectOp;
 use super::dispatch::{setup_sgprs, GridDims};
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 use super::kernel::{
-    Code, CoopVecKernel, Kernel, ScalarKernel, Scheduler, VecKernel, COOP_SGPR_BUF,
+    Code, CoopVecKernel, Kernel, Scheduler, VecKernel, COOP_SGPR_BUF,
     COOP_SPILL_SLOTS,
 };
 use super::yields::YieldValues;
@@ -28,7 +28,6 @@ const POOL_LIMIT: usize = 64;
 
 #[derive(Clone, Copy)]
 enum Invoke<'a> {
-    Scalar(&'a ScalarKernel),
     Packet(&'a VecKernel),
     Fiber(&'a CoopVecKernel),
 }
@@ -48,16 +47,6 @@ pub(crate) struct View<'a> {
 impl<'a> View<'a> {
     pub(crate) fn of(kernel: &'a Kernel) -> Self {
         match &kernel.code {
-            Code::Scalar(k) => Self {
-                invoke: Invoke::Scalar(k),
-                scheduler: kernel.scheduler(),
-                width: 1,
-                num_vgprs: k.num_vgprs,
-                min_private_bytes: 0,
-                workgroup_x: None,
-                yields: &[],
-                exec: 0,
-            },
             Code::Packet(k) => Self {
                 invoke: Invoke::Packet(k),
                 scheduler: kernel.scheduler(),
@@ -297,19 +286,9 @@ pub(crate) fn run(
             scope.spawn(move || {
                 let mut state = acquire(engine.shape);
                 let mut index = tid as u64;
-                match (engine.unit, engine.view.invoke) {
-                    (Unit::Packet, Invoke::Scalar(kernel)) if !kernel.group => {
-                        while index < engine.units {
-                            engine.run_scalar_packet(index, &mut state, kernel);
-                            index += threads as u64;
-                        }
-                    }
-                    _ => {
-                        while index < engine.units {
-                            engine.run_unit(index, &mut state);
-                            index += threads as u64;
-                        }
-                    }
+                while index < engine.units {
+                    engine.run_unit(index, &mut state);
+                    index += threads as u64;
                 }
                 release(engine.shape, state);
             });
@@ -444,27 +423,6 @@ impl Engine<'_> {
     fn run_unit(&self, index: u64, state: &mut State) {
         self.start_unit(index, state);
         match self.view.invoke {
-            Invoke::Scalar(kernel) => {
-                let lds_base = if state.lds.is_empty() {
-                    0
-                } else {
-                    state.lds.as_mut_ptr() as u64
-                };
-                for packet in 0..self.shape.packets {
-                    if state.done[packet] {
-                        continue;
-                    }
-                    let scratch_base = self.packet_scratch(packet, state);
-                    unsafe {
-                        kernel.run(
-                            state.sgprs[packet].as_mut_ptr(),
-                            state.vgprs[packet].as_mut_ptr(),
-                            scratch_base,
-                            lds_base,
-                        );
-                    }
-                }
-            }
             Invoke::Packet(kernel) => {
                 let lds_base = if state.lds.is_empty() {
                     0
@@ -489,40 +447,6 @@ impl Engine<'_> {
                 }
             }
             Invoke::Fiber(_) => self.run_fibers(state),
-        }
-    }
-
-    #[inline(never)]
-    fn run_scalar_packet(&self, index: u64, state: &mut State, kernel: &ScalarKernel) {
-        let (wg, local) = self.locate(index);
-        let wg_id = (
-            (wg % self.dims.num_wg_x as u64) as u32,
-            ((wg / self.dims.num_wg_x as u64) % self.dims.num_wg_y as u64) as u32,
-            (wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64)) as u32,
-        );
-        let scratch = if state.scratch.is_empty() {
-            0
-        } else {
-            state.scratch.as_ptr() as u64
-        };
-        let sgprs = &mut state.sgprs[0];
-        setup_sgprs(
-            &mut sgprs[..],
-            self.kd,
-            self.kernarg_ptr,
-            self.aql_packet_addr,
-            scratch,
-            self.private_segment_size,
-            wg_id,
-        );
-        let vgprs = &mut state.vgprs[0];
-        vgprs.fill(0);
-        let item = local as u32;
-        vgprs[0] = item % self.dims.wg_x
-            | ((item / self.dims.wg_x) % self.dims.wg_y) << 10
-            | (item / (self.dims.wg_x * self.dims.wg_y)) << 20;
-        unsafe {
-            kernel.run(sgprs.as_mut_ptr(), vgprs.as_mut_ptr(), scratch, 0);
         }
     }
 

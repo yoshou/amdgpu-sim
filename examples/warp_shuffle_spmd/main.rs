@@ -134,7 +134,7 @@ fn main() -> Result<()> {
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.optopt("", "arch", "Architecture", "ARCH");
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (0: scalar lanes)", "W");
+    opts.optopt("", "vec_width", "SPMD work-item packing width W", "W");
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
@@ -284,8 +284,8 @@ fn main() -> Result<()> {
             let vec_width = matches
                 .opt_str("vec_width")
                 .map(|s| s.parse::<u32>().unwrap())
-                .unwrap_or(0);
-            assert!(matches!(vec_width, 0 | 1 | 2 | 4 | 8 | 16 | 32));
+                .unwrap_or(1);
+            assert!(matches!(vec_width, 1 | 2 | 4 | 8 | 16 | 32));
 
             set_u64(&mut arg_buffer, 0, output_ptr);
             set_u64(&mut arg_buffer, 8, input_ptr);

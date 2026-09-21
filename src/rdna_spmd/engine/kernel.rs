@@ -1,37 +1,3 @@
-pub struct ScalarKernel {
-    code: super::super::native::jit::NativeCode,
-    pub num_vgprs: usize,
-    pub(crate) group: bool,
-}
-
-impl ScalarKernel {
-    pub(in crate::rdna_spmd) fn from_code(
-        code: super::super::native::jit::NativeCode,
-        num_vgprs: usize,
-        group: bool,
-    ) -> Self {
-        Self {
-            code,
-            num_vgprs,
-            group,
-        }
-    }
-
-    pub unsafe fn run(&self, sgprs: *mut u32, vgprs: *mut u32, scratch_base: u64, lds_base: u64) {
-        if self.group {
-            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64, u64)>(
-                self.code.address(),
-            );
-            f(sgprs, vgprs, scratch_base, lds_base);
-        } else {
-            let f = std::mem::transmute::<u64, extern "C" fn(*mut u32, *mut u32, u64)>(
-                self.code.address(),
-            );
-            f(sgprs, vgprs, scratch_base);
-        }
-    }
-}
-
 pub const COOP_DONE: u64 = u64::MAX;
 
 pub const COOP_SGPR_BUF: usize = 129;
@@ -142,7 +108,6 @@ pub enum Scheduler {
 }
 
 pub(crate) enum Code {
-    Scalar(ScalarKernel),
     Packet(VecKernel),
     Cooperative(CoopVecKernel),
 }

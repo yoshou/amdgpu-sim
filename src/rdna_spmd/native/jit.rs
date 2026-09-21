@@ -1,11 +1,6 @@
 use llvm_sys::{self as llvm, core::*, prelude::*};
 use std::ffi::{CStr, CString};
 
-pub(in crate::rdna_spmd) enum Mode {
-    Scalar,
-    Packet,
-}
-
 pub(in crate::rdna_spmd) struct Module {
     ctx: LLVMContextRef,
     module: LLVMModuleRef,
@@ -103,11 +98,11 @@ impl Module {
         super::Builder::new(self.ctx, self.module, self.builder)
     }
 
-    pub fn finish(self, mode: Mode) -> NativeCode {
-        self.optimize(mode).compile("kernel")
+    pub fn finish(self) -> NativeCode {
+        self.optimize().compile("kernel")
     }
 
-    pub fn optimize(mut self, mode: Mode) -> OptimizedModule {
+    pub fn optimize(mut self) -> OptimizedModule {
         unsafe {
             LLVMDisposeBuilder(self.builder);
             self.builder = std::ptr::null_mut();
@@ -139,15 +134,7 @@ impl Module {
             let host_features = llvm::target_machine::LLVMGetHostCPUFeatures();
             let features = CStr::from_ptr(host_features).to_string_lossy();
 
-            let features = CString::new(if matches!(mode, Mode::Scalar) {
-                format!(
-                    "{},-avx512f,-avx512vl,-avx512dq,-avx512bw,-avx512cd",
-                    features
-                )
-            } else {
-                features.into_owned()
-            })
-            .unwrap();
+            let features = CString::new(features.into_owned()).unwrap();
 
             let machine = llvm::target_machine::LLVMCreateTargetMachine(
                 target,

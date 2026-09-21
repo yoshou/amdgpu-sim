@@ -144,7 +144,7 @@ fn main() -> Result<()> {
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.optopt("", "arch", "Architecture", "ARCH");
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (0 = scalar path)", "W");
+    opts.optopt("", "vec_width", "SPMD work-item packing width W", "W");
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
     opts.optflag("h", "help", "Print help");
     let matches = opts.parse(&args[1..]).unwrap_or_else(|f| panic!("{}", f));

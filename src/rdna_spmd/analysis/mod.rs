@@ -17,8 +17,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) use constant::{Constants, DispatchConstants};
-pub(crate) use masking::{ExecRegister, MaskValues, Masking};
-pub(crate) use masks::{Exec, Masks, Predication};
+pub(crate) use masking::{MaskValues, Masking};
+pub(crate) use masks::{Exec, Predication};
 pub(crate) use memory::{Access, Accesses};
 pub(crate) use uniformity::Uniformity;
 
@@ -33,7 +33,6 @@ pub(crate) struct Context<'r> {
     pub inputs: &'r [Parameter],
     pub exec_index: usize,
     pub lanes: u32,
-    pub entry_full: bool,
     pub exec_initial: bool,
     pub packet: Option<Packet>,
 }
@@ -50,7 +49,6 @@ impl<'r> Context<'r> {
             inputs,
             exec_index,
             lanes,
-            entry_full: false,
             exec_initial: false,
             packet: None,
         }

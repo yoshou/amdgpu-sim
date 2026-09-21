@@ -137,11 +137,7 @@ pub(super) struct Cg<'a> {
     tile_sink: Value,
 }
 
-pub(super) fn compile(
-    p: &Prepared,
-    name: &str,
-    mode: super::native::jit::Mode,
-) -> super::native::jit::NativeCode {
+pub(super) fn compile(p: &Prepared, name: &str) -> super::native::jit::NativeCode {
     let native = super::native::jit::Module::new(name);
     let ir = native.builder();
     let (i32t, i64t, ptr, void) = (ir.i32(), ir.i64(), ir.ptr(), ir.void());
@@ -368,7 +364,7 @@ pub(super) fn compile(
         cg.emit_term(id, block);
     }
     cg.finish_phis();
-    let mut code = native.finish(mode);
+    let mut code = native.finish();
     if let Some((path, _, index)) = counts {
         code.block_counts = Some((path, index.len()));
     }
