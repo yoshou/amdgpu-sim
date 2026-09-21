@@ -201,6 +201,165 @@ pub(crate) fn check_smem_load(op: u32, cases: &[SmemLoad]) {
 }
 
 #[test]
+fn global_atomic_add_f32_atomic() {
+    // GLOBAL_ATOMIC_ADD_F32.
+    // Lane n adds to word n of the buffer. Table 15: TH[0] asks for the
+    // value the memory held before the operation, and the case states
+    // both that value and what the word became. The addends are float bit
+    // patterns, so a sum that an integer add would have produced fails here.
+    check_vmem_atomic(
+        VGLOBAL,
+        86,
+        &[
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0x0000_0000 }, // TH 0
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0xA000_0000 }, // TH 1
+            MemAtomic { th: 2, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0x0000_0000 }, // TH 2
+            MemAtomic { th: 3, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0xA000_0000 }, // TH 3
+            MemAtomic { th: 4, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0x0000_0000 }, // TH 4
+            MemAtomic { th: 5, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0xA000_0000 }, // TH 5
+            MemAtomic { th: 6, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0x0000_0000 }, // TH 6
+            MemAtomic { th: 7, ioffset: 0, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0x3F80_0000, expected_vdst: 0xA000_0000 }, // TH 7
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0000, expected_data: 0xA000_0000, expected_vdst: 0xA000_0000 }, // adding +0
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0x0000_0000, expected_data: 0xA000_0000, expected_vdst: 0x0000_0000 }, // adding +0
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0xBF80_0000, expected_data: 0xBF80_0000, expected_vdst: 0xA000_0000 }, // adding -1.0
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0xBF80_0000, expected_data: 0xBF80_0000, expected_vdst: 0x0000_0000 }, // adding -1.0
+            MemAtomic { th: 1, ioffset: 0, saddr: SADDR_NULL, addend: 0x4000_0000, expected_data: 0x4000_0000, expected_vdst: 0xA000_0000 }, // adding 2.0
+            MemAtomic { th: 0, ioffset: 0, saddr: SADDR_NULL, addend: 0x4000_0000, expected_data: 0x4000_0000, expected_vdst: 0x0000_0000 }, // adding 2.0
+            MemAtomic { th: 1, ioffset: 4, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0xA000_0000, expected_vdst: 0xA101_0101 }, // offset 4
+            MemAtomic { th: 0, ioffset: 4, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0xA000_0000, expected_vdst: 0x0000_0000 }, // offset 4
+            MemAtomic { th: 1, ioffset: 64, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0xA000_0000, expected_vdst: 0xB010_1010 }, // offset 64
+            MemAtomic { th: 0, ioffset: 64, saddr: SADDR_NULL, addend: 0x3F80_0000, expected_data: 0xA000_0000, expected_vdst: 0x0000_0000 }, // offset 64
+        ],
+    );
+}
+
+#[test]
+fn flat_load_d16_u8_load() {
+    // FLAT_LOAD_D16_U8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the low half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VFLAT,
+        30,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0000_0002, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0000_0010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn flat_load_d16_i8_load() {
+    // FLAT_LOAD_D16_I8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the low half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VFLAT,
+        31,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0000_0002, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0000_0010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn flat_load_d16_hi_u8_load() {
+    // FLAT_LOAD_D16_HI_U8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the high half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VFLAT,
+        33,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0001_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0002_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0010_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn flat_load_d16_hi_i8_load() {
+    // FLAT_LOAD_D16_HI_I8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the high half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VFLAT,
+        34,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0001_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0002_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0010_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn flat_load_d16_hi_b16_load() {
+    // FLAT_LOAD_D16_HI_B16.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the high half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VFLAT,
+        35,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0101_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0202_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x1010_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn flat_load_d16_b16_load() {
+    // FLAT_LOAD_D16_B16.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the low half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VFLAT,
+        32,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0000_0202, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0000_1010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
 fn global_atomic_add_u32_atomic() {
     // GLOBAL_ATOMIC_ADD_U32.
     // Lane n adds to word n of the buffer. Table 15: TH[0] asks for the
@@ -304,6 +463,132 @@ fn global_load_b96_load() {
             MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0xA202_0202, 0xA303_0303, 0xA404_0404, 0x0000_0000] },
             MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0xB010_1010, 0xB111_1111, 0xB212_1212, 0x0000_0000] },
             MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0xA000_0000, 0xA101_0101, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn global_load_d16_u8_load() {
+    // GLOBAL_LOAD_D16_U8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the low half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VGLOBAL,
+        30,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0000_0002, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0000_0010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn global_load_d16_i8_load() {
+    // GLOBAL_LOAD_D16_I8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the low half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VGLOBAL,
+        31,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0001, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0000_0002, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0000_0010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn global_load_d16_hi_u8_load() {
+    // GLOBAL_LOAD_D16_HI_U8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the high half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VGLOBAL,
+        33,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0001_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0002_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0010_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn global_load_d16_hi_i8_load() {
+    // GLOBAL_LOAD_D16_HI_I8.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the high half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VGLOBAL,
+        34,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0001_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0002_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0010_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn global_load_d16_hi_b16_load() {
+    // GLOBAL_LOAD_D16_HI_B16.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the high half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VGLOBAL,
+        35,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0101_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0202_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x1010_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+        ],
+    );
+}
+
+#[test]
+fn global_load_d16_b16_load() {
+    // GLOBAL_LOAD_D16_B16.
+    // Lane n addresses word n of the buffer, so the value that comes back
+    // identifies the address the instruction used. IOFFSET is varied,
+    // including a negative one.
+    // This form writes the low half of its destination and leaves the
+    // other half alone, which the harness leaves zeroed.
+    check_vmem_load(
+        VGLOBAL,
+        32,
+        &[
+            MemLoad { ioffset: 0, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 4, saddr: SADDR_NULL, expected: [0x0000_0101, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 8, saddr: SADDR_NULL, expected: [0x0000_0202, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: 64, saddr: SADDR_NULL, expected: [0x0000_1010, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
+            MemLoad { ioffset: -4, saddr: SADDR_NULL, expected: [0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000] },
         ],
     );
 }
