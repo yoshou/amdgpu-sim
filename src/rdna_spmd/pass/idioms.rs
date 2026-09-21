@@ -1,4 +1,5 @@
-use super::super::analysis::{Analyses, Constants, Predication};
+use super::super::analysis::{Analyses, Constants};
+use super::predication::{predication, Predication};
 use super::super::ir::Func;
 use super::Pass;
 
@@ -12,8 +13,8 @@ impl Pass for Idioms<'_> {
         "idioms"
     }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        let (predication, constants) =
-            (analyses.get::<Predication>(f), analyses.get::<Constants>(f));
+        let constants = analyses.get::<Constants>(f);
+        let predication = predication(f, analyses.context().exec_index);
         for idiom in self.0 {
             if idiom.rewrite(f, &predication, &constants) > 0 {
                 return true;

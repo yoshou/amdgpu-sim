@@ -1,3 +1,4 @@
+pub(super) mod access;
 pub(super) mod memory;
 pub(super) mod ops;
 pub(super) mod prepare;
@@ -8,11 +9,10 @@ pub(super) mod yields;
 
 use std::collections::BTreeMap;
 
-use super::analysis::Access;
+use access::Access;
 use super::ir::{Cvt, Env, IntOp, Op, Ty, ValueId, *};
 use super::native::{Atomic, BasicBlock, Builder, Type, Value};
 use ops::Emitter;
-use std::rc::Rc;
 
 pub(super) struct Cluster {
     pub members: usize,
@@ -76,7 +76,7 @@ pub(super) struct Prepared {
     pub uniform: Vec<bool>,
 
     pub holds_a_lane: Vec<bool>,
-    pub accesses: Rc<Vec<Access>>,
+    pub accesses: Vec<Access>,
     pub shapes: Vec<memory::Shape>,
     pub clusters: BTreeMap<usize, Cluster>,
     pub yields: BTreeMap<u64, yields::YieldValues>,

@@ -3,6 +3,7 @@ pub(crate) mod dce;
 pub(crate) mod entry;
 pub(crate) mod idioms;
 pub(crate) mod pairs;
+pub(crate) mod predication;
 pub(crate) mod simplify;
 pub(crate) mod uniform_queries;
 

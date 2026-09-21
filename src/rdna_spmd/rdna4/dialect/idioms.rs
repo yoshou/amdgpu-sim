@@ -1,4 +1,4 @@
-use crate::rdna_spmd::analysis::Predication;
+use crate::rdna_spmd::pass::predication::Predication;
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry, TargetOp};
 use crate::rdna_spmd::ir::{FloatOp, FloatUnary, Op, Ty, ValueId, *};
 use crate::rdna_spmd::pass::idioms::Idiom;

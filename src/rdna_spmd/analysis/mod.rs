@@ -1,12 +1,8 @@
 pub(in crate::rdna_spmd) mod bdd;
 pub(super) mod constant;
-pub(super) mod dataflow;
+pub(in crate::rdna_spmd) mod dataflow;
 pub(in crate::rdna_spmd) mod facts;
-pub(super) mod lanes;
 pub(in crate::rdna_spmd) mod loops;
-pub(in crate::rdna_spmd) mod masking;
-pub(in crate::rdna_spmd) mod masks;
-pub(super) mod memory;
 pub(in crate::rdna_spmd) mod uniformity;
 
 use super::ir::DialectRegistry;
@@ -17,9 +13,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub(crate) use constant::Constants;
-pub(crate) use masking::holds_a_lane;
-pub(crate) use masks::Predication;
-pub(crate) use memory::{Access, Accesses};
 pub(crate) use uniformity::Uniformity;
 
 #[derive(Clone, Copy)]
