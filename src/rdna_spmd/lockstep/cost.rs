@@ -52,7 +52,7 @@ impl Costs {
                 let shared = |index: usize| uniform[inputs[index].0];
                 let alike = match op {
                     MemoryOp::Load(_) => shared(0),
-                    MemoryOp::Store(_) | MemoryOp::AtomicAdd => shared(0) && shared(1),
+                    MemoryOp::Store(_) | MemoryOp::AtomicAdd(_) => shared(0) && shared(1),
                     MemoryOp::Fence => true,
                 };
                 if alike {

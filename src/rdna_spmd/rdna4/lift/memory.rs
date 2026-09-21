@@ -42,6 +42,12 @@ pub struct Memory {
     pub returns: bool,
     pub semantics: MemorySemantics,
     pub pair: Option<LdsPair>,
+    pub half: Option<Half>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    Lo,
+    Hi,
 }
 #[derive(Clone, Debug)]
 pub struct LdsPair {
@@ -78,7 +84,7 @@ impl Memory {
             Address::Lds { vector, .. } => regs.push(vector),
             _ => {}
         }
-        if self.stores() || self.op == MemoryOp::AtomicAdd {
+        if self.stores() || matches!(self.op, MemoryOp::AtomicAdd(_)) {
             regs.extend((0..self.words).map(|k| self.data_register(k)));
         }
         regs
@@ -114,7 +120,7 @@ fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
         "reserved memory temporal hint {}",
         th
     );
-    let (cache_policy, deferred_scope) = if op == MemoryOp::AtomicAdd {
+    let (cache_policy, deferred_scope) = if matches!(op, MemoryOp::AtomicAdd(_)) {
         (
             if th & 2 == 0 {
                 CachePolicy::Temporal
@@ -150,7 +156,7 @@ fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
         cache_policy,
         deferred_scope,
         volatile: false,
-        ordering: if op == MemoryOp::AtomicAdd {
+        ordering: if matches!(op, MemoryOp::AtomicAdd(_)) {
             Ordering::Sequential
         } else {
             Ordering::Relaxed
@@ -288,7 +294,14 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         I::GLOBAL_STORE_B128 | I::FLAT_STORE_B128 | I::SCRATCH_STORE_B128 | I::DS_STORE_B128 => {
             (Store(B32), 4)
         }
-        I::GLOBAL_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => (AtomicAdd, 1),
+        I::GLOBAL_LOAD_D16_U8 | I::FLAT_LOAD_D16_U8 | I::GLOBAL_LOAD_D16_HI_U8
+        | I::FLAT_LOAD_D16_HI_U8 => (Load(U8), 1),
+        I::GLOBAL_LOAD_D16_I8 | I::FLAT_LOAD_D16_I8 | I::GLOBAL_LOAD_D16_HI_I8
+        | I::FLAT_LOAD_D16_HI_I8 => (Load(I8), 1),
+        I::GLOBAL_LOAD_D16_B16 | I::FLAT_LOAD_D16_B16 | I::GLOBAL_LOAD_D16_HI_B16
+        | I::FLAT_LOAD_D16_HI_B16 => (Load(U16), 1),
+        I::GLOBAL_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => (AtomicAdd(Numeric::Unsigned), 1),
+        I::GLOBAL_ATOMIC_ADD_F32 | I::DS_ADD_F32 | I::DS_ADD_RTN_F32 => (AtomicAdd(Numeric::Float), 1),
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
         _ => panic!("unsupported memory lift {:?}", opcode),
     };
@@ -332,7 +345,7 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         None
     };
     let returns = matches!(op, Load(_))
-        || op == AtomicAdd && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
+        || matches!(op, AtomicAdd(_)) && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
     let mut semantics = semantics(scope, th, op, matches!(address, Address::Scalar { .. }));
     if matches!(address, Address::Lds { .. }) {
         semantics.scope = Scope::Workgroup;
@@ -356,6 +369,21 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         returns,
         semantics,
         pair,
+        half: match opcode {
+            I::GLOBAL_LOAD_D16_U8
+            | I::FLAT_LOAD_D16_U8
+            | I::GLOBAL_LOAD_D16_I8
+            | I::FLAT_LOAD_D16_I8
+            | I::GLOBAL_LOAD_D16_B16
+            | I::FLAT_LOAD_D16_B16 => Some(Half::Lo),
+            I::GLOBAL_LOAD_D16_HI_U8
+            | I::FLAT_LOAD_D16_HI_U8
+            | I::GLOBAL_LOAD_D16_HI_I8
+            | I::FLAT_LOAD_D16_HI_I8
+            | I::GLOBAL_LOAD_D16_HI_B16
+            | I::FLAT_LOAD_D16_HI_B16 => Some(Half::Hi),
+            _ => None,
+        },
     })
 }
 
@@ -504,7 +532,7 @@ impl Memory {
                 Ty::I32,
             ),
         };
-        let data: Vec<_> = if self.stores() || self.op == MemoryOp::AtomicAdd {
+        let data: Vec<_> = if self.stores() || matches!(self.op, MemoryOp::AtomicAdd(_)) {
             (0..self.words)
                 .map(|k| {
                     reg(
@@ -593,6 +621,36 @@ impl Memory {
         outputs.first().map(|o| o.0)
     }
 
+    fn merge_half(
+        &self,
+        f: &mut Func,
+        block: &mut Block,
+        half: Half,
+        result: ValueId,
+        old: ValueId,
+    ) -> ValueId {
+        let mut core = |ty, op| {
+            let value = f.value(ty);
+            block.insts.push(Inst::Core { value, ty, op });
+            value
+        };
+        let low = core(Ty::I32, Op::Const(Ty::I32, 0xffff));
+        let loaded = core(Ty::I32, Op::Int(IntOp::And, result, low));
+        match half {
+            Half::Lo => {
+                let high = core(Ty::I32, Op::Const(Ty::I32, 0xffff_0000));
+                let kept = core(Ty::I32, Op::Int(IntOp::And, old, high));
+                core(Ty::I32, Op::Int(IntOp::Or, kept, loaded))
+            }
+            Half::Hi => {
+                let kept = core(Ty::I32, Op::Int(IntOp::And, old, low));
+                let sixteen = core(Ty::I32, Op::Const(Ty::I32, 16));
+                let moved = core(Ty::I32, Op::Int(IntOp::Shl, loaded, sixteen));
+                core(Ty::I32, Op::Int(IntOp::Or, kept, moved))
+            }
+        }
+    }
+
     fn write_result(
         &self,
         f: &mut Func,
@@ -618,11 +676,16 @@ impl Memory {
         } else if self.scalar() {
             result
         } else {
+            let old = words[&word];
+            let result = match self.half {
+                None => result,
+                Some(half) => self.merge_half(f, block, half, result, old),
+            };
             let stored = f.value(Ty::I32);
             block.insts.push(Inst::Core {
                 value: stored,
                 ty: Ty::I32,
-                op: Op::Select(mask, result, words[&word]),
+                op: Op::Select(mask, result, old),
             });
             stored
         };

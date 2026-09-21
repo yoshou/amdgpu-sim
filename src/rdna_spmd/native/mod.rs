@@ -554,6 +554,18 @@ impl Builder {
             ))
         }
     }
+    pub fn atomic_fadd(&self, ptr: Value, v: Value, order: Atomic) -> Value {
+        unsafe {
+            Value(LLVMBuildAtomicRMW(
+                self.b,
+                llvm_sys::LLVMAtomicRMWBinOp::LLVMAtomicRMWBinOpFAdd,
+                ptr.0,
+                v.0,
+                ordering(order),
+                0,
+            ))
+        }
+    }
     pub fn fence(&self, order: Atomic) -> Value {
         unsafe { Value(LLVMBuildFence(self.b, ordering(order), 0, ANON)) }
     }
