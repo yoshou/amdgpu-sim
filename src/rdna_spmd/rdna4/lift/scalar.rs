@@ -182,13 +182,37 @@ fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         I::S_CMP_LE_I32 => (Ty::I32, IntPred::Sle),
         I::S_CMP_EQ_U64 => (Ty::I64, IntPred::Eq),
         I::S_CMP_LG_U64 => (Ty::I64, IntPred::Ne),
-        _ => return None,
+        _ => return float_compare(i, registry),
     };
     let mut b = Builder::new(
         registry,
         vec![input(i.ssrc0.clone(), ty), input(i.ssrc1.clone(), ty)],
     );
     let flag = b.push(Ty::I1, Op::Cmp(predicate, ValueId(0), ValueId(1)));
+    Some(b.finish_many(true, vec![(Output::Scc, flag)]))
+}
+
+fn float_compare(i: &crate::rdna_instructions::SOPC, registry: &DialectRegistry) -> Option<Lowering> {
+    let predicate = match i.op {
+        I::S_CMP_LT_F32 => FloatPred::Olt,
+        I::S_CMP_EQ_F32 => FloatPred::Oeq,
+        I::S_CMP_LE_F32 => FloatPred::Ole,
+        I::S_CMP_GT_F32 => FloatPred::Ogt,
+        I::S_CMP_LG_F32 => FloatPred::One,
+        I::S_CMP_GE_F32 => FloatPred::Oge,
+        I::S_CMP_O_F32 => FloatPred::Ord,
+        I::S_CMP_U_F32 => FloatPred::Uno,
+        I::S_CMP_NGT_F32 => FloatPred::Ule,
+        I::S_CMP_NEQ_F32 => FloatPred::Une,
+        I::S_CMP_NLT_F32 => FloatPred::Uge,
+        _ => return None,
+    };
+    let ty = Ty::F32;
+    let mut b = Builder::new(
+        registry,
+        vec![input(i.ssrc0.clone(), ty), input(i.ssrc1.clone(), ty)],
+    );
+    let flag = b.push(Ty::I1, Op::FCmp(predicate, ValueId(0), ValueId(1)));
     Some(b.finish_many(true, vec![(Output::Scc, flag)]))
 }
 
@@ -199,7 +223,8 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let (from, to, cvt) = match i.op {
         I::S_MOV_B32 => (Ty::I32, Ty::I32, None),
         I::S_MOV_B64 => (Ty::I64, Ty::I64, None),
-        I::S_CTZ_I32_B32 | I::S_SEXT_I32_I16 => (Ty::I32, Ty::I32, None),
+        I::S_CTZ_I32_B32 | I::S_SEXT_I32_I16 | I::S_BREV_B32 => (Ty::I32, Ty::I32, None),
+        I::S_BREV_B64 => (Ty::I64, Ty::I64, None),
         I::S_CVT_F32_I32 => (Ty::I32, Ty::F32, Some(Cvt::SignedToFloatRte)),
         I::S_CVT_F32_U32 => (Ty::I32, Ty::F32, Some(Cvt::UnsignedToFloatRte)),
         I::S_CVT_I32_F32 => (Ty::F32, Ty::I32, Some(Cvt::FloatToSignedSatRtz)),
@@ -213,6 +238,8 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         let shift = b.k(Ty::I32, 16);
         let high = b.int(IntOp::Shl, ValueId(0), shift);
         b.int(IntOp::AShr, high, shift)
+    } else if matches!(i.op, I::S_BREV_B32 | I::S_BREV_B64) {
+        b.push(to, Op::ReverseBits(ValueId(0)))
     } else if matches!(i.op, I::S_CTZ_I32_B32) {
         let count = b.push(Ty::I32, Op::TrailingZeros(ValueId(0)));
         let zero = b.k(Ty::I32, 0);
@@ -286,9 +313,73 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
 pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     masks(inst, registry)
         .or_else(|| arithmetic(inst, registry))
+        .or_else(|| float(inst, registry))
+        .or_else(|| bit_count(inst, registry))
         .or_else(|| compare(inst, registry))
         .or_else(|| unary(inst, registry))
         .or_else(|| immediate(inst, registry))
+}
+
+fn bit_count(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+    let InstFormat::SOP1(i) = inst else {
+        return None;
+    };
+    let (ty, ones) = match i.op {
+        I::S_BCNT1_I32_B32 => (Ty::I32, true),
+        I::S_BCNT0_I32_B32 => (Ty::I32, false),
+        I::S_BCNT1_I32_B64 => (Ty::I64, true),
+        I::S_BCNT0_I32_B64 => (Ty::I64, false),
+        _ => return None,
+    };
+    let mut b = Builder::new(registry, vec![input(i.ssrc0.clone(), ty)]);
+    let word = if ones {
+        ValueId(0)
+    } else {
+        let all = b.k(ty, u64::MAX);
+        b.push(ty, Op::Int(IntOp::Xor, ValueId(0), all))
+    };
+    let count = b.push(ty, Op::PopulationCount(word));
+    let count = if ty == Ty::I64 {
+        b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, count))
+    } else {
+        count
+    };
+    let zero = b.k(Ty::I32, 0);
+    let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, count, zero));
+    Some(b.finish_many(
+        true,
+        vec![
+            (Output::Scalar(i.sdst as u32, Ty::I32), count),
+            (Output::Scc, flag),
+        ],
+    ))
+}
+
+fn float(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+    let InstFormat::SOP2(i) = inst else {
+        return None;
+    };
+    let op = match i.op {
+        I::S_ADD_F32 => FloatOp::Add,
+        I::S_SUB_F32 => FloatOp::Sub,
+        I::S_MUL_F32 => FloatOp::Mul,
+        I::S_MIN_NUM_F32 => FloatOp::MinNum,
+        I::S_MAX_NUM_F32 => FloatOp::MaxNum,
+        I::S_FMAC_F32 => FloatOp::Mul,
+        _ => return None,
+    };
+    let ty = Ty::F32;
+    let accumulates = matches!(i.op, I::S_FMAC_F32);
+    let mut inputs = vec![input(i.ssrc0, ty), input(i.ssrc1, ty)];
+    if accumulates {
+        inputs.push(input(SourceOperand::ScalarRegister(i.sdst), ty));
+    }
+    let mut b = Builder::new(registry, inputs);
+    let mut result = b.push(ty, Op::Float(op, ValueId(0), ValueId(1)));
+    if accumulates {
+        result = b.push(ty, Op::Float(FloatOp::Add, result, ValueId(2)));
+    }
+    Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, ty), result)]))
 }
 
 fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
