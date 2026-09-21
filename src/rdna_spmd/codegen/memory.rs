@@ -1,4 +1,4 @@
-use super::super::analysis::memory::Form;
+use super::access::Form;
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

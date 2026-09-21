@@ -1,6 +1,6 @@
 use super::super::ir::{ValueId, *};
 
-pub(super) trait Lattice: Clone + PartialEq {
+pub(crate) trait Lattice: Clone + PartialEq {
     fn meet(&self, other: &Self) -> Self;
 }
 
@@ -10,7 +10,7 @@ impl Lattice for bool {
     }
 }
 
-pub(super) struct Cfg<'f> {
+pub(crate) struct Cfg<'f> {
     pub blocks: Vec<&'f Block>,
     pub index: Vec<usize>,
     pub order: Vec<usize>,
@@ -80,7 +80,7 @@ fn descend<L: Lattice>(facts: &mut [L], v: ValueId, next: L, changed: &mut bool)
     }
 }
 
-pub(super) struct Sparse<'a, 'f, L: Lattice> {
+pub(crate) struct Sparse<'a, 'f, L: Lattice> {
     pub cfg: &'a Cfg<'f>,
     pub start: L,
     pub boundary: &'a dyn Fn(ValueId) -> L,

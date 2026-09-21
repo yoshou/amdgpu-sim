@@ -1,16 +1,4 @@
 use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
-use super::{Analyses, Analysis, Constants, Uniformity};
-
-pub(crate) struct Accesses;
-impl Analysis for Accesses {
-    type Result = Vec<Access>;
-    const NAME: &'static str = "accesses";
-    fn compute(f: &Func, analyses: &Analyses) -> Self::Result {
-        let constants = analyses.get::<Constants>(f);
-        let uniform = analyses.get::<Uniformity>(f).uniform();
-        accesses(f, &constants, &uniform)
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Form {
@@ -151,7 +139,7 @@ fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
     }
 }
 
-fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
+pub(crate) fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
     let mut uses = vec![false; f.types.len()];
     for b in f.blocks.values() {
         for inst in &b.insts {

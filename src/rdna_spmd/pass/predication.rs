@@ -1,40 +1,5 @@
 use super::super::ir::{Cvt, EffectOp, IntOp, Op, Ty, ValueId, WaveOp, *};
-use super::lanes::Lanes;
-use super::{Analyses, Analysis, Constants};
 use std::collections::BTreeMap;
-use std::rc::Rc;
-
-impl Analysis for Predication {
-    type Result = Predication;
-    const NAME: &'static str = "predication";
-    fn compute(f: &Func, analyses: &Analyses) -> Self {
-        let constants = analyses.get::<Constants>(f);
-        predication(f, analyses.context().exec_index, &constants)
-    }
-}
-
-pub(super) fn any_of(f: &Func) -> Vec<Option<ValueId>> {
-    let mut out = vec![None; f.types.len()];
-    for block in f.blocks.values() {
-        for inst in &block.insts {
-            match inst {
-                Inst::Packet {
-                    op: PacketOp::Any,
-                    input,
-                    output,
-                } => out[output.0] = Some(*input),
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Any),
-                    inputs,
-                    outputs,
-                    ..
-                } => out[outputs[0].0 .0] = Some(inputs[0]),
-                _ => {}
-            }
-        }
-    }
-    out
-}
 
 fn exec_param(block: &Block, exec_index: usize, f: &Func) -> ValueId {
     let entry = &f.blocks[&f.entry];
@@ -64,22 +29,15 @@ fn same_bit(value: ValueId, exec: ValueId, defs: &[Option<Op>]) -> bool {
     }
 }
 
-#[derive(PartialEq)]
 pub(crate) struct Predication {
-    pub reactivation: Rc<Vec<(BlockId, usize)>>,
-    pub predicated: Rc<Vec<Option<(ValueId, ValueId)>>>,
-    pub masked: Rc<Vec<bool>>,
+    pub predicated: Vec<Option<(ValueId, ValueId)>>,
+    pub masked: Vec<bool>,
     pub masked_result: Vec<Option<ValueId>>,
-    pub chain: Rc<BTreeMap<BlockId, Vec<(usize, ValueId)>>>,
-    updates: Vec<(ValueId, ValueId, ValueId)>,
-    lanes: Lanes,
+    pub chain: BTreeMap<BlockId, Vec<(usize, ValueId)>>,
 }
 
-fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predication {
-    let lanes = Lanes::new(f, constants);
-    let defs = &lanes.defs;
-    let mut reactivation = Vec::new();
-    let mut updates: Vec<(ValueId, ValueId, ValueId)> = Vec::new();
+pub(crate) fn predication(f: &Func, exec_index: usize) -> Predication {
+    let defs = &f.definitions();
     let mut predicated: Vec<Option<(ValueId, ValueId)>> = vec![None; f.types.len()];
     let mut masked = vec![false; f.types.len()];
     let mut masked_result = vec![None; f.types.len()];
@@ -112,11 +70,7 @@ fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predic
             let Inst::Core { value, ty, op } = inst else {
                 continue;
             };
-            if let Some(bit) = lanes.valid_masked(*value).filter(|_| query != Some(*value)) {
-                if !lanes.within(bit, &lanes.class(current)) {
-                    reactivation.push((id, index));
-                }
-                updates.push((*value, current, bit));
+            if valid_masked(defs, *value).is_some() && query != Some(*value) {
                 current = *value;
                 entries.push((index + 1, current));
                 continue;
@@ -138,12 +92,18 @@ fn predication(f: &Func, exec_index: usize, constants: &[Option<u64>]) -> Predic
         chain.insert(id, entries);
     }
     Predication {
-        reactivation: Rc::new(reactivation),
-        predicated: Rc::new(predicated),
-        masked: Rc::new(masked),
+        predicated,
+        masked,
         masked_result,
-        chain: Rc::new(chain),
-        updates,
-        lanes,
+        chain,
+    }
+}
+
+fn valid_masked(defs: &[Option<Op>], value: ValueId) -> Option<ValueId> {
+    let valid = |v: ValueId| matches!(defs[v.0], Some(Op::Env(Env::ValidLane)));
+    match defs[value.0] {
+        Some(Op::Int(IntOp::And, a, b)) if valid(b) => Some(a),
+        Some(Op::Int(IntOp::And, a, b)) if valid(a) => Some(b),
+        _ => None,
     }
 }
