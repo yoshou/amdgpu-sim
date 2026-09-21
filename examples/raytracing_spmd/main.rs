@@ -147,7 +147,7 @@ fn main() -> Result<()> {
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.optopt("", "arch", "Architecture", "ARCH");
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (0 = scalar path)", "W");
+    opts.optopt("", "vec_width", "SPMD work-item packing width W", "W");
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
@@ -359,8 +359,8 @@ fn main() -> Result<()> {
                     None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
                 };
 
-                // --vec_width=W selects the width-W SPMD path; 0 uses the scalar
-                // de-SIMT path. Default is the host-aware default_width().
+                // --vec_width=W selects the width-W SPMD path. Default is the
+                // host-aware default_width().
                 let vec_w: u32 = match matches.opt_str("vec_width") {
                     Some(s) => s.parse::<u32>().unwrap(),
                     None => default_width(),

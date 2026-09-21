@@ -1,7 +1,7 @@
 use super::super::ir::{Cvt, IntOp, Op, Ty, *};
 use super::dataflow::{Cfg, Sparse};
 use super::masks::any_of;
-use super::{Access, Analyses, Exec, Masks};
+use super::{Access, Analyses};
 
 pub(crate) trait Masking: 'static {
 
@@ -12,31 +12,6 @@ pub(crate) trait Masking: 'static {
     fn scalar_word(mask: Option<u64>) -> bool;
 
     fn positional(ty: Ty) -> bool;
-}
-
-pub(crate) struct ExecRegister;
-
-impl Masking for ExecRegister {
-
-    fn guarded(f: &Func, analyses: &Analyses) -> Vec<bool> {
-        analyses.get::<Masks>(f).guarded.clone()
-    }
-
-    fn holds_a_lane(f: &Func, analyses: &Analyses, accesses: &[Access]) -> Vec<bool> {
-        let exec = analyses.get::<Exec>(f);
-        accesses
-            .iter()
-            .map(|a| exec.nonempty_at(a.block, a.effects[0]))
-            .collect()
-    }
-
-    fn scalar_word(mask: Option<u64>) -> bool {
-        mask == Some(1)
-    }
-
-    fn positional(ty: Ty) -> bool {
-        ty == Ty::I1
-    }
 }
 
 pub(crate) struct MaskValues;

@@ -124,7 +124,7 @@ fn main() -> Result<()> {
     let program = args[0].clone();
     let mut opts = Options::new();
     opts.optopt("", "arch", "Architecture", "ARCH");
-    opts.optopt("", "vec_width", "SPMD work-item packing width W (0: scalar lanes)", "W");
+    opts.optopt("", "vec_width", "SPMD work-item packing width W", "W");
     opts.optopt("", "num_threads", "CPU dispatch thread count", "N");
     opts.optflag("h", "help", "Print help");
     let matches = match opts.parse(&args[1..]) {
@@ -270,7 +270,7 @@ fn main() -> Result<()> {
 
             // Build scalar IR, split at workgroup barriers, JIT the cooperative kernel.
             let program = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-            let vec_width = matches.opt_str("vec_width").map(|s| s.parse::<u32>().unwrap()).unwrap_or(0);
+            let vec_width = matches.opt_str("vec_width").map(|s| s.parse::<u32>().unwrap()).unwrap_or(1);
             let kernel = compile(&program, CompileOptions { width: vec_width, num_vgprs, workgroup_x: Some(threads_per_block as u32) });
 
             set_u64(&mut arg_buffer, 0, input_ptr);

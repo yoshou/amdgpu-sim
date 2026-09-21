@@ -130,6 +130,6 @@ fn compile(w: u32) -> super::super::native::jit::NativeCode {
     }
     ir.ret_void();
     native
-        .optimize(super::super::native::jit::Mode::Packet)
+        .optimize()
         .compile(&name)
 }

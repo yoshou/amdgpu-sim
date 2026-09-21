@@ -5,22 +5,22 @@ use std::sync::Arc;
 use super::target::Target;
 
 use super::engine::kernel::{
-    Code, CoopVecKernel, Kernel, ScalarKernel, Scheduler, VecKernel,
+    Code, CoopVecKernel, Kernel, Scheduler, VecKernel,
 };
 use super::program::{CompilationInput, Program};
 
 use super::analysis::uniformity::Fact;
 use super::analysis::{
-    Accesses, Analyses, Constants, Context, ExecRegister, MaskValues, Masking, Packet, Uniformity,
+    Accesses, Analyses, Constants, Context, MaskValues, Masking, Packet, Uniformity,
 };
 use super::codegen::{Abi, Prepared};
 use super::dialect::DialectRegistry;
-use super::ir::{EffectOp, Func, Inst, ValueId};
+use super::ir::{EffectOp, Func, ValueId};
 use super::pass::uniform_queries::UniformQueries;
 use super::pass::{
     active::Active,
     adjacency::Adjacency,
-    dce::{Dce, DeadParams, DeadWrites},
+    dce::{Dce, DeadParams},
     entry::{AssumeDispatchExec, DiscardReturn, LocalWriteLanes, PacketState},
     idioms::Idioms,
     pairs::{Pairs, WideMemory},
@@ -66,13 +66,6 @@ pub(super) fn wave_passes(f: &mut LiftedFunction) {
         )
         .unwrap();
     f.revision += 1;
-}
-
-fn dead_writes(f: &mut Func, an: &mut Analyses, driver: &Driver) {
-    let limit = 1 + f.types.len();
-    driver
-        .fixpoint(f, an, "dead_writes", limit, &[&DeadWrites, &Simplify, &Dce])
-        .unwrap();
 }
 
 fn yield_layouts_ir(
@@ -259,18 +252,6 @@ fn prepared<M: Masking>(
     }
 }
 
-fn keeps_wave_ops(f: &Func) -> bool {
-    f.blocks.values().flat_map(|b| &b.insts).any(|inst| {
-        matches!(
-            inst,
-            Inst::Effect {
-                op: EffectOp::Wave(_),
-                ..
-            }
-        )
-    })
-}
-
 pub(super) fn prepare_lockstep(
     f: LiftedFunction,
     packing: super::lockstep::Packing,
@@ -320,50 +301,12 @@ pub(super) fn prepare_lockstep(
     )
 }
 
-pub(super) fn prepare_scalar(f: LiftedFunction, num_vgprs: usize) -> Prepared {
-    let Bare {
-        mut ir,
-        inputs,
-        registry,
-    } = bare(f);
-    let driver = Driver::new();
-    let base = context(&registry, &inputs, 1);
-    {
-        let mut an = Analyses::new(base);
-        driver
-            .pipeline(&mut ir, &mut an, &[&DiscardReturn])
-            .unwrap();
-        dead_writes(&mut ir, &mut an, &driver);
-    }
-    let mut an = Analyses::new(Context {
-        entry_full: true,
-        exec_initial: true,
-        ..base
-    });
-    prepared::<ExecRegister>(
-        ir,
-        &mut an,
-        &registry,
-        None,
-        Abi::Whole,
-        false,
-        num_vgprs,
-    )
-}
-
 impl Compiler {
     pub fn decode_program(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
         let mut function = self.target.decode(entry_pc, memory)?;
         wave_passes(&mut function);
         Ok(Program { function })
     }
-}
-
-pub(crate) fn compile_scalar(program: Program, num_vgprs: usize) -> ScalarKernel {
-    let p = prepare_scalar(program.function, num_vgprs.max(256));
-    let group = p.group();
-    let code = super::codegen::compile(&p, "scalar_kernel", super::native::jit::Mode::Scalar);
-    ScalarKernel::from_code(code, p.num_vgprs, group)
 }
 
 pub(crate) fn aligned(workgroup_x: Option<u32>, width: u32) -> bool {
@@ -376,26 +319,7 @@ pub(crate) fn compile_lane(
     width: u32,
     workgroup_x: Option<u32>,
 ) -> (Code, Scheduler) {
-    if width != 0 {
-        return compile_lockstep(lane, num_vgprs, width, workgroup_x);
-    }
-    if keeps_wave_ops(&lane.function.ir) {
-        return compile_lockstep(lane, num_vgprs, 1, workgroup_x);
-    }
-    let program = Program {
-        function: lane.function.clone(),
-    };
-    let scheduler = if program_shares_a_group(&program) {
-        Scheduler::Workgroup
-    } else {
-        Scheduler::Independent
-    };
-    let kernel = compile_scalar(program, num_vgprs);
-    (Code::Scalar(kernel), scheduler)
-}
-
-fn program_shares_a_group(program: &Program) -> bool {
-    sharing(program, true).group
+    compile_lockstep(lane, num_vgprs, width, workgroup_x)
 }
 
 pub(crate) fn compile_lockstep(
@@ -423,7 +347,7 @@ pub(crate) fn compile_lockstep(
     let cooperative = shares.barrier || shares.exchange;
     let p = prepare_lockstep(program.function, packing, num_vgprs.max(256), cooperative);
     if cooperative {
-        let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
+        let code = super::codegen::compile(&p, "vec_kernel");
         let yields = p.resume_layouts();
         if yields
             .iter()
@@ -452,7 +376,7 @@ pub(crate) fn compile_lockstep(
 
 fn packet_kernel(p: Prepared, width: u32, workgroup_x: Option<u32>) -> VecKernel {
     let group = p.group();
-    let code = super::codegen::compile(&p, "vec_kernel", super::native::jit::Mode::Packet);
+    let code = super::codegen::compile(&p, "vec_kernel");
     VecKernel::from_code(
         code,
         p.num_vgprs,
@@ -523,7 +447,7 @@ impl Compiler {
 
 pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kernel {
     assert!(
-        matches!(options.width, 0 | 1 | 2 | 4 | 8 | 16 | 32),
+        matches!(options.width, 1 | 2 | 4 | 8 | 16 | 32),
         "unsupported packet width {}",
         options.width
     );
