@@ -43,6 +43,11 @@ pub(super) struct Logic {
     policy: Option<Vec<Bdd>>,
     choices: Vec<(ValueId, bool)>,
     abstract_queries: bool,
+    /// Leaves the words kept whole out of the relation reach follows along an
+    /// edge, so reach takes their bits to be anything. Relating them is most
+    /// of what reach costs where queries are answered by the wave, since the
+    /// lanes a query brings along hold them in every combination.
+    open_words: bool,
     pub all_local: Bdd,
     edges: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<EdgeIndex>>,
     relations: std::collections::BTreeMap<(BlockId, usize), std::rc::Rc<Vec<Binding>>>,
@@ -73,6 +78,7 @@ impl Logic {
             policy: None,
             choices: Vec::new(),
             abstract_queries: false,
+            open_words: false,
             all_local: Bdd::TRUE,
             edges: std::collections::BTreeMap::new(),
             relations: std::collections::BTreeMap::new(),
@@ -217,7 +223,8 @@ impl Logic {
 
     /// Reachability under the policies this logic interprets. It is exact
     /// for the policy that answers everything locally. For the others,
-    /// unconstrained query results safely overapproximate reach. This avoids
+    /// unconstrained query results and words kept whole safely overapproximate
+    /// reach. This avoids
     /// enumerating combinations of unrelated branch choices in the
     /// reachability relation; value differences still carry their choices.
     pub fn policy_reach(
@@ -233,11 +240,28 @@ impl Logic {
         let policy = self.policy.take();
         self.clear_values();
         self.abstract_queries = true;
+        self.open_words = true;
         let general = self.reach(f, facts, start, initial);
         self.abstract_queries = false;
+        self.open_words = false;
         self.policy = policy;
         self.clear_values();
         general
+    }
+
+    /// Reach that takes the bits of the words kept whole to be anything.
+    pub fn open_reach(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        start: BlockId,
+        initial: Bdd,
+    ) -> std::collections::BTreeMap<BlockId, Bdd> {
+        self.open_words = true;
+        let reach = self.reach(f, facts, start, initial);
+        self.open_words = false;
+        self.relations.clear();
+        reach
     }
 
     pub fn atom(&mut self, atom: Atom) -> Bdd {
@@ -738,7 +762,6 @@ impl Logic {
                 .unwrap();
             let i = pending.swap_remove(position);
             let link = self.m.iff(links[i].atom, links[i].bound);
-            acc = self.m.and(acc, link);
             let mut finished = Vec::new();
             for &v in &links[i].support {
                 let count = occurrences.get_mut(&v).unwrap();
@@ -747,9 +770,11 @@ impl Logic {
                     finished.push(v);
                 }
             }
-            if !finished.is_empty() {
-                acc = self.m.exists(acc, &|v| finished.contains(&v));
-            }
+            acc = if finished.is_empty() {
+                self.m.and(acc, link)
+            } else {
+                self.m.and_exists(acc, link, &|v| finished.contains(&v))
+            };
             if acc == Bdd::FALSE {
                 return acc;
             }
@@ -781,7 +806,12 @@ impl Logic {
         for (&(param, ty), &arg) in dst.params.iter().zip(&edge.args) {
             let (atom, bound) = match ty {
                 Ty::I1 => (Atom::Bit(param), self.bit(f, facts, arg)),
-                Ty::I32 if facts.viewed[param.0] => (Atom::View(param), self.view(f, facts, arg)),
+                Ty::I32
+                    if facts.viewed[param.0]
+                        && !(self.open_words && facts.materialized[param.0]) =>
+                {
+                    (Atom::View(param), self.view(f, facts, arg))
+                }
                 _ => continue,
             };
             links.push(self.binding(facts, src, atom, bound));
@@ -805,9 +835,17 @@ impl Logic {
             .map(|(r, &b)| (b, r))
             .collect();
         let mut reach = std::collections::BTreeMap::from([(start, formula)]);
+        // What each block has already passed on. An image distributes over a
+        // union, so only what a block gained since is passed on again; any
+        // function between the gain and the whole serves, and the smallest
+        // such is cheapest to pass on.
+        let mut sent: std::collections::BTreeMap<BlockId, Bdd> = Default::default();
         let mut worklist: BTreeSet<(usize, BlockId)> = BTreeSet::from([(rank[&start], start)]);
         while let Some((_, x)) = worklist.pop_first() {
-            let r = reach[&x];
+            let whole = reach[&x];
+            let before = sent.insert(x, whole).unwrap_or(Bdd::FALSE);
+            let unsent = self.m.not(before);
+            let r = self.m.restrict(whole, unsent);
             let block = &f.blocks[&x];
             let conditions: Vec<(usize, Bdd)> = match &block.term {
                 Term::Ret(_) => vec![],

@@ -67,7 +67,10 @@ const TERMINAL: u32 = u32::MAX;
 pub(crate) struct Manager {
     nodes: Vec<Node>,
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
-    ite: HashMap<(Bdd, Bdd, Bdd), Bdd>,
+    /// The results of `ite`, each in the one slot its operands hash to. A
+    /// result another displaced is computed again, which costs less than a
+    /// table that keeps every one: the table is looked up at every step.
+    ite: Vec<(Bdd, Bdd, Bdd, Bdd)>,
     restrict: HashMap<(Bdd, Bdd), Bdd>,
     implications: HashMap<(Bdd, Bdd), bool>,
 }
@@ -82,7 +85,7 @@ impl Manager {
         Self {
             nodes: vec![terminal(0), terminal(1)],
             unique: HashMap::default(),
-            ite: HashMap::default(),
+            ite: Vec::new(),
             restrict: HashMap::default(),
             implications: HashMap::default(),
         }
@@ -167,6 +170,13 @@ impl Manager {
         }
     }
 
+    fn slot(&self, f: Bdd, g: Bdd, h: Bdd) -> usize {
+        let mut hash = Mix::default();
+        hash.add(f.0 as u64 | (g.0 as u64) << 32);
+        hash.add(h.0 as u64);
+        hash.finish() as usize & (self.ite.len() - 1)
+    }
+
     pub fn ite(&mut self, f: Bdd, g: Bdd, h: Bdd) -> Bdd {
         match f.constant() {
             Some(true) => return g,
@@ -179,8 +189,23 @@ impl Manager {
         if g == Bdd::TRUE && h == Bdd::FALSE {
             return f;
         }
-        if let Some(&r) = self.ite.get(&(f, g, h)) {
-            return r;
+        // `and` and `or` do not depend on the order of their operands.
+        let (f, g, h) = if h == Bdd::FALSE && g.0 < f.0 {
+            (g, f, h)
+        } else if g == Bdd::TRUE && h.0 < f.0 {
+            (h, g, f)
+        } else {
+            (f, g, h)
+        };
+        if self.ite.len() < self.nodes.len() && self.ite.len() < 1 << 22 {
+            let slots = (self.nodes.len() * 2).next_power_of_two().max(1 << 10);
+            self.ite = vec![(Bdd::FALSE, Bdd::FALSE, Bdd::FALSE, Bdd::FALSE); slots];
+        }
+        let slot = self.slot(f, g, h);
+        let (cf, cg, ch, cached) = self.ite[slot];
+        // No entry has a constant first operand, which the empty slots have.
+        if (cf, cg, ch) == (f, g, h) {
+            return cached;
         }
         let var = self.top(f).min(self.top(g)).min(self.top(h));
         let (f0, f1) = self.cofactors(f, var);
@@ -189,7 +214,9 @@ impl Manager {
         let low = self.ite(f0, g0, h0);
         let high = self.ite(f1, g1, h1);
         let r = self.node(var, low, high);
-        self.ite.insert((f, g, h), r);
+        // The table may have grown below; the slot is found again.
+        let slot = self.slot(f, g, h);
+        self.ite[slot] = (f, g, h, r);
         r
     }
 
@@ -263,6 +290,49 @@ impl Manager {
             self.ite(v, high, low)
         };
         memo.insert(f, r);
+        r
+    }
+
+    /// `exists(and(f, g), chosen)` without building the conjunction, whose
+    /// size the quantified variables often make the largest of the three.
+    pub fn and_exists(&mut self, f: Bdd, g: Bdd, chosen: &dyn Fn(u32) -> bool) -> Bdd {
+        let mut memo = HashMap::default();
+        self.and_exists_memo(f, g, chosen, &mut memo)
+    }
+
+    fn and_exists_memo(
+        &mut self,
+        f: Bdd,
+        g: Bdd,
+        chosen: &dyn Fn(u32) -> bool,
+        memo: &mut HashMap<(Bdd, Bdd), Bdd>,
+    ) -> Bdd {
+        if f == Bdd::FALSE || g == Bdd::FALSE {
+            return Bdd::FALSE;
+        }
+        if f == Bdd::TRUE && g == Bdd::TRUE {
+            return Bdd::TRUE;
+        }
+        let (f, g) = if g.0 < f.0 { (g, f) } else { (f, g) };
+        if let Some(&r) = memo.get(&(f, g)) {
+            return r;
+        }
+        let var = self.top(f).min(self.top(g));
+        let (f0, f1) = self.cofactors(f, var);
+        let (g0, g1) = self.cofactors(g, var);
+        let low = self.and_exists_memo(f0, g0, chosen, memo);
+        let r = if chosen(var) {
+            if low == Bdd::TRUE {
+                low
+            } else {
+                let high = self.and_exists_memo(f1, g1, chosen, memo);
+                self.or(low, high)
+            }
+        } else {
+            let high = self.and_exists_memo(f1, g1, chosen, memo);
+            self.node(var, low, high)
+        };
+        memo.insert((f, g), r);
         r
     }
 
@@ -344,6 +414,78 @@ mod tests {
             }
         }
         assert_eq!(m.nodes.len(), nodes);
+    }
+
+    /// Every function of three variables, by its truth table.
+    fn three_variable_functions(m: &mut Manager) -> Vec<Bdd> {
+        let vars = [m.var(0), m.var(1), m.var(2)];
+        (0..256u32)
+            .map(|table| {
+                let mut f = Bdd::FALSE;
+                for row in 0..8u32 {
+                    if table & (1 << row) == 0 {
+                        continue;
+                    }
+                    let mut term = Bdd::TRUE;
+                    for (i, &v) in vars.iter().enumerate() {
+                        let literal = if row & (1 << i) != 0 { v } else { m.not(v) };
+                        term = m.and(term, literal);
+                    }
+                    f = m.or(f, term);
+                }
+                f
+            })
+            .collect()
+    }
+
+    #[test]
+    fn and_exists_is_the_quantified_conjunction_of_every_pair_of_functions() {
+        let mut m = Manager::new();
+        let functions = three_variable_functions(&mut m);
+        for chosen in 0..8u32 {
+            let pick = |v: u32| chosen & (1 << v) != 0;
+            for &f in functions.iter().step_by(3) {
+                for &g in functions.iter().step_by(5) {
+                    let both = m.and(f, g);
+                    assert_eq!(m.and_exists(f, g, &pick), m.exists(both, &pick));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_restricted_function_lies_between_its_part_in_the_care_set_and_itself() {
+        // What the reach fixpoint relies on: where the care set leaves out
+        // only states the function holds, restricting loses none of the
+        // states in the care set and adds none the function does not hold.
+        let mut m = Manager::new();
+        let functions = three_variable_functions(&mut m);
+        for &f in functions.iter().step_by(3) {
+            for &sent in functions.iter().step_by(5) {
+                if !m.implies(sent, f) {
+                    continue;
+                }
+                let unsent = m.not(sent);
+                let r = m.restrict(f, unsent);
+                let gain = m.and(f, unsent);
+                assert!(m.implies(gain, r));
+                assert!(m.implies(r, f));
+            }
+        }
+    }
+
+    #[test]
+    fn displaced_results_are_computed_again_the_same() {
+        // More operations than the table has slots, each checked against
+        // the truth tables.
+        let mut m = Manager::new();
+        let functions = three_variable_functions(&mut m);
+        for (a, &f) in functions.iter().enumerate() {
+            for (b, &g) in functions.iter().enumerate() {
+                assert_eq!(m.and(f, g), functions[a & b]);
+                assert_eq!(m.or(g, f), functions[a | b]);
+            }
+        }
     }
 
     #[test]
