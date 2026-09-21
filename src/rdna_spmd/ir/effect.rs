@@ -78,8 +78,13 @@ pub struct MemorySemantics {
 pub enum MemoryOp {
     Load(MemSize),
     Store(MemSize),
-    AtomicAdd,
+    AtomicAdd(Numeric),
     Fence,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Numeric {
+    Unsigned,
+    Float,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WaveOp {
@@ -114,7 +119,7 @@ impl EffectOp {
                 MemoryOp::Load(_) => (vec![space.address_type(), I1], vec![I32]),
                 MemoryOp::Store(MemSize::B64) => (vec![space.address_type(), I64, I1], vec![]),
                 MemoryOp::Store(_) => (vec![space.address_type(), I32, I1], vec![]),
-                MemoryOp::AtomicAdd => (vec![space.address_type(), I32, I1], vec![I32]),
+                MemoryOp::AtomicAdd(_) => (vec![space.address_type(), I32, I1], vec![I32]),
                 MemoryOp::Fence => (vec![], vec![]),
             },
             Self::Wave(op) => match op {
@@ -156,7 +161,7 @@ impl EffectOp {
             semantics,
         } = self
         {
-            if space == Space::Scratch && matches!(op, MemoryOp::AtomicAdd | MemoryOp::Fence) {
+            if space == Space::Scratch && matches!(op, MemoryOp::AtomicAdd(_) | MemoryOp::Fence) {
                 return Err("invalid private-memory effect");
             }
             if matches!(op, MemoryOp::Store(MemSize::I8 | MemSize::I16)) {

@@ -441,7 +441,15 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
         values[index] = if input_ty.integer() {
             let bits = if matches!(
                 alu.op,
-                I::V_ADD_NC_U16 | I::V_LSHLREV_B16 | I::V_LSHRREV_B16
+                I::V_ADD_NC_U16
+                    | I::V_SUB_NC_U16
+                    | I::V_ADD_NC_I16
+                    | I::V_SUB_NC_I16
+                    | I::V_MUL_LO_U16
+                    | I::V_MAD_U16
+                    | I::V_MAD_I16
+                    | I::V_LSHLREV_B16
+                    | I::V_LSHRREV_B16
             ) {
                 16
             } else {
@@ -712,6 +720,8 @@ fn arity(op: I) -> usize {
         | I::V_MAX3_U32
         | I::V_MED3_I32
         | I::V_MED3_U32
+        | I::V_MAD_U16
+        | I::V_MAD_I16
         | I::V_OR3_B32
         | I::V_LSHL_OR_B32
         | I::V_LSHL_ADD_U32
@@ -847,6 +857,34 @@ fn lower_integer(
             } else {
                 q.int(IntOp::And, sum, mask)
             }
+        }
+        I::V_SUB_NC_U16 | I::V_ADD_NC_I16 | I::V_SUB_NC_I16 => {
+            let mask = q.k(Ty::I32, 0xffff);
+            let a = q.int(IntOp::And, a, mask);
+            let b = q.int(IntOp::And, b, mask);
+            let op = if matches!(op, I::V_ADD_NC_I16) {
+                IntOp::Add
+            } else {
+                IntOp::Sub
+            };
+            let value = q.push(Ty::I32, Op::Int(op, a, b));
+            q.int(IntOp::And, value, mask)
+        }
+        I::V_MUL_LO_U16 => {
+            let mask = q.k(Ty::I32, 0xffff);
+            let a = q.int(IntOp::And, a, mask);
+            let b = q.int(IntOp::And, b, mask);
+            let product = q.int(IntOp::Mul, a, b);
+            q.int(IntOp::And, product, mask)
+        }
+        I::V_MAD_U16 | I::V_MAD_I16 => {
+            let mask = q.k(Ty::I32, 0xffff);
+            let a = q.int(IntOp::And, a, mask);
+            let b = q.int(IntOp::And, b, mask);
+            let c = q.int(IntOp::And, c, mask);
+            let product = q.int(IntOp::Mul, a, b);
+            let sum = q.int(IntOp::Add, product, c);
+            q.int(IntOp::And, sum, mask)
         }
         I::V_LSHLREV_B16 | I::V_LSHRREV_B16 => {
             let mask = q.k(Ty::I32, 0xffff);

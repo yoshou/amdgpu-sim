@@ -1378,7 +1378,7 @@ impl Emit<'_> {
                 };
                 let predicate = match memory {
                     MemoryOp::Load(_) => 1,
-                    MemoryOp::Store(_) | MemoryOp::AtomicAdd => 2,
+                    MemoryOp::Store(_) | MemoryOp::AtomicAdd(_) => 2,
                     MemoryOp::Fence => unreachable!("a fence is lowered above"),
                 };
                 let active = self.access_predicate(rest, *provenance, *op, inputs[predicate], mask);

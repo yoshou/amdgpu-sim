@@ -42,6 +42,7 @@ pub enum Shape {
     ScalarWords,
     AtomicAdd {
         grouped: bool,
+        kind: Numeric,
     },
     Store(StoreShape),
     NarrowLoad,
@@ -108,12 +109,13 @@ pub fn shape(
     if access.scalar() {
         return Shape::ScalarWords;
     }
-    if access.op == MemoryOp::AtomicAdd {
-        let grouped = width >= 4
+    if let MemoryOp::AtomicAdd(kind) = access.op {
+        let grouped = kind == Numeric::Unsigned
+            && width >= 4
             && access.space == Space::Global
             && !access.returns()
             && !access.semantics.volatile;
-        return Shape::AtomicAdd { grouped };
+        return Shape::AtomicAdd { grouped, kind };
     }
     let affine = access.form == (Form::Scratch { uniform: true });
     if access.stores() {
@@ -631,13 +633,13 @@ impl<'a> Cg<'a> {
         let base = self.p.accesses[index].base;
         let nonempty = self.p.holds_a_lane[index];
         match shape {
-            Shape::AtomicAdd { grouped } => {
+            Shape::AtomicAdd { grouped, kind } => {
                 let d = self.vector(words.data[0]);
                 if grouped {
                     self.emit_grouped_atomic_add(addr, d, exec);
                     return;
                 }
-                self.emit_lane_atomic_add(addr, d, exec, words.results.first().copied());
+                self.emit_lane_atomic_add(addr, d, exec, kind, words.results.first().copied());
             }
             Shape::Store(StoreShape::Tile) => self.emit_tile_store(addr, exec, words),
             Shape::Store(kind) => self.emit_word_stores(addr, exec, kind, words),
@@ -668,6 +670,7 @@ impl<'a> Cg<'a> {
         addr: Value,
         d: Value,
         exec: Value,
+        kind: Numeric,
         result_id: Option<ValueId>,
     ) {
         let ir = self.ir;
@@ -681,7 +684,14 @@ impl<'a> Cg<'a> {
             let ptr = ir.select(active, ptr, self.sink);
             let value = ir.extract_at(d, k);
             let value = ir.select(active, value, self.ci32(0));
-            let old = ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent);
+            let old = match kind {
+                Numeric::Unsigned => ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent),
+                Numeric::Float => {
+                    let addend = ir.bitcast(value, ir.f32());
+                    let old = ir.atomic_fadd(ptr, addend, Atomic::SequentiallyConsistent);
+                    ir.bitcast(old, ir.i32())
+                }
+            };
             result = ir.insert_at(result, old, k);
         }
         if let Some(r) = result_id {

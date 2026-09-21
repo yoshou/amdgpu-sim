@@ -46,7 +46,8 @@ impl Access {
         }
     }
     pub fn returns(&self) -> bool {
-        matches!(self.op, MemoryOp::Load(_)) || self.op == MemoryOp::AtomicAdd && self.used
+        matches!(self.op, MemoryOp::Load(_))
+            || matches!(self.op, MemoryOp::AtomicAdd(_)) && self.used
     }
     pub fn stores(&self) -> bool {
         matches!(self.op, MemoryOp::Store(_))

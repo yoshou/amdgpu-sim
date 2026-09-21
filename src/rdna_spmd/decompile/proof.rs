@@ -638,7 +638,7 @@ impl Proof<'_> {
                     self.or(h, absent)
                 }
                 EffectOp::Memory {
-                    op: MemoryOp::Store(_) | MemoryOp::AtomicAdd,
+                    op: MemoryOp::Store(_) | MemoryOp::AtomicAdd(_),
                     ..
                 } => {
                     let pred = inputs[2];
@@ -1414,7 +1414,7 @@ impl Explore<'_, '_> {
                 Inst::Effect {
                     op:
                         EffectOp::Memory {
-                            op: MemoryOp::Store(_) | MemoryOp::AtomicAdd,
+                            op: MemoryOp::Store(_) | MemoryOp::AtomicAdd(_),
                             ..
                         },
                     inputs,

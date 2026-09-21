@@ -174,7 +174,8 @@ fn effect_op(op: EffectOp) -> String {
             let op = match op {
                 MemoryOp::Load(size) => format!("load.{}", mem_size(size)),
                 MemoryOp::Store(size) => format!("store.{}", mem_size(size)),
-                MemoryOp::AtomicAdd => "atomic_add".into(),
+                MemoryOp::AtomicAdd(Numeric::Unsigned) => "atomic_add".into(),
+                MemoryOp::AtomicAdd(Numeric::Float) => "atomic_fadd".into(),
                 MemoryOp::Fence => "fence".into(),
             };
             format!(
