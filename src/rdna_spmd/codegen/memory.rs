@@ -69,9 +69,7 @@ pub(in crate::rdna_spmd) fn global_load(
     if uniform[access.base.0] {
         return GlobalLoad::Broadcast;
     }
-    if std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("gather"))
-        || !(1..=4).contains(&access.words)
-    {
+    if !(1..=4).contains(&access.words) {
         return GlobalLoad::Gather;
     }
     if access.form == (Form::Global { scalar_base: false }) {
@@ -151,10 +149,7 @@ pub(in crate::rdna_spmd) fn shape(
         return Shape::NarrowLoad;
     }
     let allocated = access.static_scratch_end(constants).is_some();
-    if allocated
-        && access.words >= 2
-        && !std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("notile"))
-    {
+    if allocated && access.words >= 2 {
         return Shape::PrivateTile {
             tile: if width % 4 == 0 {
                 4
@@ -203,9 +198,7 @@ pub(in crate::rdna_spmd) fn clusters(
     affine: &BTreeMap<ValueId, u32>,
 ) -> BTreeMap<usize, Cluster> {
     let mut out = BTreeMap::new();
-    if !width.is_power_of_two()
-        || std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("nocluster"))
-    {
+    if !width.is_power_of_two() {
         return out;
     }
     let mut start = 0;
