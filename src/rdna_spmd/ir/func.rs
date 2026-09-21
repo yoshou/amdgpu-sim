@@ -28,8 +28,8 @@ pub(crate) enum Inst {
     },
     Target {
         provenance: Option<u64>,
-        op: crate::rdna_spmd::dialect::TargetOp,
-        args: crate::rdna_spmd::dialect::Arguments,
+        op: crate::rdna_spmd::ir::TargetOp,
+        args: crate::rdna_spmd::ir::Arguments,
         outputs: Vec<(ValueId, Ty)>,
     },
     Effect {

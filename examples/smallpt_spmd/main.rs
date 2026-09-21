@@ -595,10 +595,10 @@ fn main() -> Result<()> {
                 };
 
                 // --vec_width=W packs W work-items in each SIMD vector; omission
-                // selects a host-aware default.
+                // packs 16.
                 let vec_w = match matches.opt_str("vec_width") {
                     Some(s) => s.parse::<u32>().unwrap(),
-                    None => default_width(),
+                    None => 16,
                 };
                 let compile_start = Instant::now();
                 let kernel = compile(&scalar, CompileOptions { width: vec_w, num_vgprs, workgroup_x: Some(dims.wg_x) });

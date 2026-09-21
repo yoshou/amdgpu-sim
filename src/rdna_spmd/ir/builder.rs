@@ -10,8 +10,8 @@ pub(crate) struct Expr {
 pub(crate) enum ExprInst {
     Core(Ty, Op),
     Target {
-        op: crate::rdna_spmd::dialect::TargetOp,
-        args: crate::rdna_spmd::dialect::Arguments,
+        op: crate::rdna_spmd::ir::TargetOp,
+        args: crate::rdna_spmd::ir::Arguments,
         outputs: Vec<Ty>,
     },
 }

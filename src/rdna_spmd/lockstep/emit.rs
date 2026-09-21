@@ -2,7 +2,7 @@ use crate::rdna_spmd::analysis::bdd::Bdd;
 use super::cost::Costs;
 use super::mask::Masks;
 use super::structure::{Structure, Unit};
-use crate::rdna_spmd::dialect::{DialectRegistry, Effect};
+use crate::rdna_spmd::ir::{DialectRegistry, Effect};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 

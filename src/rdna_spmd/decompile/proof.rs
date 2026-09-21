@@ -1,7 +1,7 @@
 use super::logic::{lane_test, Atom, Kept, Logic};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
-use crate::rdna_spmd::dialect::TargetOp;
+use crate::rdna_spmd::ir::TargetOp;
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::analysis::bdd::HashMap;
 use std::collections::BTreeMap;
@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 pub(super) fn prove(
     f: &Func,
     facts: &Facts,
-    inputs: &[crate::rdna_spmd::program::Parameter],
+    inputs: &[crate::rdna_spmd::ir::Parameter],
     exec_index: Option<usize>,
 ) -> (Kept, std::collections::BTreeSet<u64>) {
     let mut all_local = Logic::new(f, facts, &Default::default());
@@ -40,7 +40,7 @@ fn analyse(
     facts: &Facts,
     logic: &mut Logic,
     safe: Bdd,
-    inputs: &[crate::rdna_spmd::program::Parameter],
+    inputs: &[crate::rdna_spmd::ir::Parameter],
     exec_index: Option<usize>,
 ) -> Result<(Kept, std::collections::BTreeSet<u64>), Exhausted> {
     let exec = exec_index.map(|index| f.blocks[&f.entry].params[index].0);
@@ -170,11 +170,10 @@ impl Proof<'_> {
 
     fn solve_masked(
         &mut self,
-        inputs: &[crate::rdna_spmd::program::Parameter],
+        inputs: &[crate::rdna_spmd::ir::Parameter],
         exec_index: Option<usize>,
     ) {
-        use crate::rdna_spmd::program::ParameterSource;
-        let (f, facts) = (self.f, self.facts);
+                let (f, facts) = (self.f, self.facts);
         let word = |v: ValueId| f.types[v.0] == Ty::I32 && facts.lane_word[v.0];
         let Some(exec_index) = exec_index else {
             self.masked = vec![true; f.types.len()];

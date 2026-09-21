@@ -30,7 +30,7 @@ pub(crate) fn decompile(function: &Program) -> Lane {
     );
     let exec = function.registry.registers().exec;
     let exec_index = function.parameter_inputs.iter().position(
-        |p| matches!(p.source, crate::rdna_spmd::program::ParameterSource::MaskBit(r) if r == exec),
+        |p| matches!(p.source, crate::rdna_spmd::ir::ParameterSource::MaskBit(r) if r == exec),
     );
     let facts = facts::Facts::new(f, &function.parameter_inputs, &BTreeSet::new());
     let (kept, everyone) = proof::prove(f, &facts, &function.parameter_inputs, exec_index);

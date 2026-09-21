@@ -23,7 +23,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
             });
             let mut b = Builder::new(registry, inputs);
             let values = b.target(
-                crate::rdna_spmd::targets::rdna4::dialect::bvh8(registry),
+                crate::rdna_spmd::rdna4::dialect::bvh8(registry),
                 Arguments::Thirteen(std::array::from_fn(ValueId)),
             );
             return Some(
@@ -57,7 +57,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         });
         let mut b = Builder::new(registry, inputs);
         let values = b.target(
-            crate::rdna_spmd::targets::rdna4::dialect::bvh(registry),
+            crate::rdna_spmd::rdna4::dialect::bvh(registry),
             Arguments::Fourteen(std::array::from_fn(ValueId)),
         );
         return Some(
@@ -106,7 +106,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         };
         b.push(ty, Op::Select(ValueId(14), ValueId(k), zero))
     });
-    let target = crate::rdna_spmd::targets::rdna4::dialect::image_sample(registry);
+    let target = crate::rdna_spmd::rdna4::dialect::image_sample(registry);
     let unrm = b.k(Ty::I1, (i.unrm != 0) as u64);
     let mut results = vec![];
     for component in 0..4 {

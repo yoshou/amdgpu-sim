@@ -163,7 +163,7 @@ fn main() -> Result<()> {
 
     let vec_w = match matches.opt_str("vec_width") {
         Some(s) => s.parse::<u32>().unwrap(),
-        None => default_width(),
+        None => 16,
     };
 
     let size_x = 1024;

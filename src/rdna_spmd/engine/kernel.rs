@@ -1,9 +1,3 @@
-pub const DONE: u64 = u64::MAX;
-
-pub const ENTER: u64 = 1 << 32;
-
-pub const LEAVE: u64 = 1 << 33;
-
 pub const SGPR_BUF: usize = 129;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,8 +16,8 @@ pub(crate) struct Region {
 pub struct Kernel {
     _code: super::super::native::jit::NativeCode,
     pub(crate) regions: Vec<Region>,
-    pub(crate) yields: Vec<Vec<super::yields::YieldValues>>,
-    pub(crate) registers: super::super::dialect::Registers,
+    pub(crate) yields: Vec<Vec<super::super::codegen::yields::YieldValues>>,
+    pub(crate) registers: super::super::ir::Registers,
     pub(crate) frame_words: usize,
     pub(crate) num_vgprs: usize,
     pub(crate) min_private_bytes: usize,
@@ -36,8 +30,8 @@ impl Kernel {
     pub(in crate::rdna_spmd) fn new(
         code: super::super::native::jit::NativeCode,
         regions: Vec<Region>,
-        yields: Vec<Vec<super::yields::YieldValues>>,
-        registers: super::super::dialect::Registers,
+        yields: Vec<Vec<super::super::codegen::yields::YieldValues>>,
+        registers: super::super::ir::Registers,
         frame_words: usize,
         num_vgprs: usize,
         min_private_bytes: usize,

@@ -2,7 +2,6 @@ use super::mask::Masks;
 use super::Packing;
 use crate::rdna_spmd::analysis::uniformity::Fact;
 use crate::rdna_spmd::analysis::{Analyses, Context, Packet, Uniformity};
-use crate::rdna_spmd::compiler::exec_index;
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::Program;
 use std::collections::BTreeMap;
@@ -15,7 +14,7 @@ pub(super) fn context(lane: &Program, packing: Packing) -> Context<'_> {
         ..Context::new(
             &lane.registry,
             &lane.parameter_inputs,
-            exec_index(&lane.parameter_inputs, &lane.registry),
+            exec_index(&lane.parameter_inputs, lane.registry.registers().exec),
             packing.lanes,
         )
     }

@@ -1,247 +1,26 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
-
-
-use super::engine::kernel::{
-    Kernel, Region, Scheduler,
-};
-
-use super::analysis::uniformity::Fact;
-use super::analysis::{
-    holds_a_lane, Accesses, Analyses, Constants, Context, Packet, Uniformity,
-};
-use super::codegen::Prepared;
-use super::dialect::DialectRegistry;
-use super::ir::{EffectOp, Func, ValueId};
+use super::analysis::{Analyses, Context};
+use super::engine::kernel::{Kernel, Region, Scheduler};
+use super::ir::{EffectOp, Func};
 use super::pass::uniform_queries::UniformQueries;
-use super::pass::{
-    adjacency::Adjacency,
-    dce::{Dce, DeadParams},
-    entry::PacketState,
-    idioms::Idioms,
-    pairs::{Pairs, WideMemory},
-    simplify::Simplify,
-};
-use super::pass::Driver;
-use super::program::{Parameter, ParameterSource, Program};
+use super::pass::{dce::Dce, idioms::Idioms, simplify::Simplify, Driver};
+use super::program::Program;
 
-pub(super) fn exec_index(inputs: &[Parameter], registry: &DialectRegistry) -> usize {
-    let exec = registry.registers().exec;
-    inputs
-        .iter()
-        .position(|p| matches!(p.source, ParameterSource::MaskBit(r) if r == exec))
-        .unwrap()
-}
-
-fn context<'r>(registry: &'r DialectRegistry, inputs: &'r [Parameter], lanes: u32) -> Context<'r> {
-    Context::new(registry, inputs, exec_index(inputs, registry), lanes)
-}
-
-pub(super) fn wave_passes(f: &mut Program) {
+fn wave_passes(f: &mut Program, idioms: &[Box<dyn super::pass::idioms::Idiom>]) {
     let driver = Driver::new();
     let limit = 1 + f.ir.types.len();
-    let mut an = Analyses::new(context(&f.registry, &f.parameter_inputs, 32));
+    let mut an = Analyses::new(Context::of(&f.registry, &f.parameter_inputs, 32));
     driver
         .fixpoint(
             &mut f.ir,
             &mut an,
             "wave",
             limit,
-            &[&Idioms, &UniformQueries, &Simplify, &Dce],
+            &[&Idioms(idioms), &UniformQueries, &Simplify, &Dce],
         )
         .unwrap();
 }
 
-fn yield_layouts_ir(
-    ir: &Func,
-    uniform: &[bool],
-    constants: &[Option<u64>],
-) -> (
-    BTreeMap<u64, super::engine::yields::YieldValues>,
-    Vec<Vec<u64>>,
-) {
-    use super::engine::yields::{Argument, YieldValues};
-    use super::ir::{EffectOp, Inst, WaveOp};
-    let mut out: BTreeMap<u64, YieldValues> = BTreeMap::new();
-    let mut groups: Vec<Vec<u64>> = Vec::new();
-    for block in ir.blocks.values() {
-        let mut open: Option<(usize, std::collections::BTreeSet<usize>)> = None;
-        for inst in &block.insts {
-            let Inst::Effect {
-                provenance,
-                op,
-                inputs,
-                outputs,
-            } = inst
-            else {
-                open = None;
-                continue;
-            };
-            let scheduled = matches!(
-                op,
-                EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait
-            );
-            if !scheduled {
-                open = None;
-                continue;
-            }
-            let mut layout = YieldValues::new(*op);
-            layout.uniform_selector =
-                *op == EffectOp::Wave(WaveOp::ReadLane) && uniform[inputs[1].0];
-            for (index, &input) in inputs.iter().enumerate() {
-                if *op == EffectOp::Wave(WaveOp::Wmma)
-                    || *op == EffectOp::Wave(WaveOp::WriteLane) && index == 2
-                {
-                    continue;
-                }
-                layout.arguments[index] = if let Some(k) = constants[input.0] {
-                    Argument::Constant(k as u32)
-                } else if uniform[input.0] {
-                    Argument::Uniform
-                } else {
-                    Argument::Lane
-                };
-            }
-            let joinable = matches!(op, EffectOp::Wave(w) if *w != WaveOp::Wmma);
-            let joins = match (&open, joinable) {
-                (Some((_, produced)), true) => !inputs.iter().any(|v| produced.contains(&v.0)),
-                _ => false,
-            };
-            if joins {
-                let (group, produced) = open.as_mut().unwrap();
-                let last = *groups[*group].last().unwrap();
-                layout.base = out[&last].base + out[&last].cells();
-                for (v, _) in outputs {
-                    produced.insert(v.0);
-                }
-                groups[*group].push(*provenance);
-            } else {
-                groups.push(vec![*provenance]);
-                open = joinable
-                    .then(|| (groups.len() - 1, outputs.iter().map(|(v, _)| v.0).collect()));
-            }
-            out.insert(*provenance, layout);
-        }
-    }
-    (out, groups)
-}
-
-fn prepared(
-    mut ir: Func,
-    an: &mut Analyses,
-    registry: &Arc<DialectRegistry>,
-    width: u32,
-    num_vgprs: usize,
-) -> Prepared {
-    let driver = Driver::new();
-    driver.pipeline(&mut ir, an, &[&PacketState]).unwrap();
-    if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
-        driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
-        driver
-            .pipeline(&mut ir, an, &[&Pairs])
-            .unwrap();
-        let limit = 1 + ir.types.len();
-        driver
-            .fixpoint(
-                &mut ir,
-                an,
-                "simplify",
-                limit,
-                &[&Simplify, &Dce, &DeadParams, &WideMemory],
-            )
-            .unwrap();
-    }
-    driver.pipeline(&mut ir, an, &[&Adjacency]).unwrap();
-    let constants = an.get::<Constants>(&ir);
-    let uniformity = an.get::<Uniformity>(&ir);
-    let accesses = an.get::<Accesses>(&ir);
-    let holds_a_lane = holds_a_lane(&ir, an, &accesses);
-    let uniform = uniformity.uniform();
-    let affine: BTreeMap<ValueId, u32> = uniformity
-        .facts
-        .iter()
-        .enumerate()
-        .filter_map(|(v, fact)| match *fact {
-            Fact::Affine { stride, .. }
-                if stride > 0 && stride <= 256 && ir.types[v] == super::ir::Ty::I64 =>
-            {
-                Some((ValueId(v), stride as u32))
-            }
-            _ => None,
-        })
-        .collect();
-    let (yields, groups) = yield_layouts_ir(&ir, &uniform, &constants);
-    let shapes = accesses
-        .iter()
-        .map(|a| {
-            super::codegen::memory::shape(
-                a,
-                width,
-                super::codegen::memory::global_load(a, &uniform, &affine),
-                &constants,
-            )
-        })
-        .collect();
-    let clusters = super::codegen::memory::clusters(&ir, &accesses, width, &uniform, &affine);
-    let min_private_bytes = accesses
-        .iter()
-        .filter_map(|a| a.static_scratch_end(&constants))
-        .max()
-        .unwrap_or(0) as usize;
-    let inputs = an.context().inputs.to_vec();
-    let ir = ir
-        .verify_with(registry)
-        .expect("invalid prepared function SSA");
-    Prepared {
-        registry: Arc::clone(registry),
-        ir,
-        inputs,
-        width,
-        uniform,
-        holds_a_lane,
-        accesses,
-        shapes,
-        clusters,
-        yields,
-        groups,
-        min_private_bytes,
-        num_vgprs,
-    }
-}
-
-pub(super) fn prepare_lockstep(
-    f: Program,
-    packing: super::lockstep::Packing,
-    num_vgprs: usize,
-) -> Prepared {
-    let Program {
-        mut ir,
-        parameter_inputs: inputs,
-        registry,
-    } = f;
-    ir.lowered_to_packets();
-    let driver = Driver::new();
-    let mut an = Analyses::new(Context {
-        exec_initial: true,
-        packet: Some(Packet {
-            aligned: packing.aligned,
-        }),
-        ..context(&registry, &inputs, packing.lanes)
-    });
-    let limit = 1 + ir.types.len();
-    driver
-        .fixpoint(&mut ir, &mut an, "simplify", limit, &[&Simplify, &Dce])
-        .unwrap();
-    prepared(
-        ir,
-        &mut an,
-        &registry,
-        packing.lanes,
-        num_vgprs,
-    )
-}
-
-pub(crate) fn aligned(workgroup_x: Option<u32>, width: u32) -> bool {
+fn aligned(workgroup_x: Option<u32>, width: u32) -> bool {
     workgroup_x.map_or(true, |x| x % width == 0)
 }
 
@@ -257,7 +36,7 @@ fn schedule(shares: &Sharing) -> Scheduler {
     }
 }
 
-pub(crate) fn compile_lockstep(
+fn compile_lockstep(
     lane: &super::decompile::Lane,
     num_vgprs: usize,
     width: u32,
@@ -268,7 +47,7 @@ pub(crate) fn compile_lockstep(
         aligned: aligned(workgroup_x, width),
     };
     let packet = super::lockstep::lockstep(lane, packing);
-    let p = prepare_lockstep(packet, packing, num_vgprs.max(256));
+    let p = super::codegen::prepare::prepare(packet, packing, num_vgprs.max(256));
     let scheduler = schedule(&sharing(p.ir.func(), None));
     let yields = p.resume_layouts();
     if yields
@@ -278,7 +57,9 @@ pub(crate) fn compile_lockstep(
     {
         super::engine::wmma::warm(width as usize);
     }
-    let compiled = super::codegen::compile_regions(&p, "vec_kernel");
+    let runtime = [(super::codegen::YIELD, super::engine::fiber::yield_address())];
+    let lowerings = std::sync::Arc::new(super::rdna4::dialect().lowerings);
+    let compiled = super::codegen::compile_regions(&p, lowerings, "vec_kernel", &runtime);
     let regions = compiled
         .regions
         .into_iter()
@@ -306,11 +87,11 @@ pub(crate) fn compile_lockstep(
 }
 
 pub fn decode_program(arch: &str, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-    if !super::targets::rdna4::supports(arch) {
+    if !super::rdna4::supports(arch) {
         return Err(format!("no SPMD target supports {arch}"));
     }
-    let mut program = super::targets::rdna4::decode(entry_pc, memory)?;
-    wave_passes(&mut program);
+    let mut program = super::rdna4::decode(entry_pc, memory)?;
+    wave_passes(&mut program, &super::rdna4::dialect().idioms);
     Ok(program)
 }
 

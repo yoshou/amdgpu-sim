@@ -7,63 +7,10 @@ fn lanes(width: usize) -> u32 {
         (1u32 << width) - 1
     }
 }
-use super::super::ir::{EffectOp, Ty, WaveOp};
+use super::super::codegen::yields::{Argument, YieldValues};
+use super::super::ir::{EffectOp, WaveOp};
 
-#[derive(Clone, Copy)]
-pub(crate) enum Argument {
-    Lane,
-    Uniform,
-    Constant(u32),
-}
-
-#[derive(Clone)]
-pub(crate) struct YieldValues {
-    pub op: EffectOp,
-    pub inputs: Vec<Ty>,
-    pub outputs: Vec<Ty>,
-    pub output_base: usize,
-    pub base: usize,
-    pub uniform_selector: bool,
-    pub arguments: Vec<Argument>,
-}
 impl YieldValues {
-    pub fn new(op: EffectOp) -> Self {
-        let (inputs, outputs) = op.signature();
-        assert!(inputs.len() <= 24 && outputs.len() <= 8);
-        assert!(inputs.iter().chain(&outputs).all(|ty| ty.bits() <= 32));
-
-        let output_base = match op {
-            EffectOp::Wave(WaveOp::WriteLane) => 2,
-            EffectOp::Wave(WaveOp::Bpermute | WaveOp::BpermuteFi) => 1,
-            EffectOp::Wave(WaveOp::Wmma) => 8,
-            _ => 0,
-        };
-        let arguments = vec![Argument::Lane; inputs.len()];
-        Self {
-            op,
-            inputs,
-            outputs,
-            output_base,
-            base: 0,
-            uniform_selector: false,
-            arguments,
-        }
-    }
-    pub fn cells(&self) -> usize {
-        self.inputs.len().max(self.output_base + self.outputs.len())
-    }
-    pub fn uniform_result(&self) -> bool {
-        match self.op {
-            EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane) => true,
-            EffectOp::Wave(WaveOp::ReadLane) => self.uniform_selector,
-            EffectOp::BarrierSignal { is_first: true } => true,
-            _ => false,
-        }
-    }
-    pub fn is_wave(&self) -> bool {
-        matches!(self.op, EffectOp::Wave(_))
-    }
-
     #[inline]
     fn argument(&self, index: usize, lane: usize, width: usize, fibers: &[Fiber]) -> u32 {
         let offset = match self.arguments[index] {

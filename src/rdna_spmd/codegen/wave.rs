@@ -1,4 +1,4 @@
-use super::super::engine::yields::Argument;
+use super::yields::Argument;
 use super::*;
 
 impl<'a> Cg<'a> {
@@ -37,7 +37,7 @@ impl<'a> Cg<'a> {
             }
         }
         let ty = ir.void().function(&[ir.ptr(), ir.i64(), ir.ptr()]);
-        let function = ir.function("amdgpu_sim_fiber_yield_values", ty);
+        let function = ir.function(YIELD, ty);
         let context = self.func.param(6);
         ir.call(ty, function, &[context, ir.ci64(resume as u64), frame]);
         for (provenance, _, outputs) in members {

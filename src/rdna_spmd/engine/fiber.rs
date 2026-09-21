@@ -226,6 +226,10 @@ extern "C" fn main(ctx: *mut FiberCtx) -> ! {
     }
 }
 
+pub(in crate::rdna_spmd) fn yield_address() -> u64 {
+    amdgpu_sim_fiber_yield_values as *const () as u64
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn amdgpu_sim_fiber_yield_values(ctx: *mut FiberCtx, id: u64, values: *mut u32) {
     unsafe {

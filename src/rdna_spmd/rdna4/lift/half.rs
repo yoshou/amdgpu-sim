@@ -111,7 +111,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
         dst_high,
         widening,
     } = operands(inst)?;
-    let target = crate::rdna_spmd::targets::rdna4::dialect::unary(registry, op).unwrap();
+    let target = crate::rdna_spmd::rdna4::dialect::unary(registry, op).unwrap();
     if widening {
         let mut b = Builder::new(registry, vec![input(source(src), Ty::I32)]);
         let mut value = ValueId(0);

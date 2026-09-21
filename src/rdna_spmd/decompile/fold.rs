@@ -2,7 +2,6 @@ use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::{operands, outputs, Facts};
 use super::logic::{Atom, Logic};
 use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::program::Parameter;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {

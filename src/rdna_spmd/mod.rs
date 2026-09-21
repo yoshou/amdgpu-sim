@@ -10,7 +10,7 @@ mod lockstep;
 mod native;
 mod pass;
 mod program;
-mod targets;
+mod rdna4;
 
 pub use compiler::{compile, decode_program, CompileOptions};
 pub use engine::{
@@ -19,13 +19,3 @@ pub use engine::{
     kernel::{Kernel, Scheduler},
 };
 pub use program::Program;
-
-pub fn default_width() -> u32 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            return 16;
-        }
-    }
-    0
-}

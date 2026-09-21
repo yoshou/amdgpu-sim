@@ -74,6 +74,27 @@ impl Drop for OptimizedModule {
     }
 }
 
+fn runtime_library() -> std::path::PathBuf {
+    let executable = std::env::current_exe().expect("the running executable has no path");
+    let beside = executable
+        .parent()
+        .expect("the running executable has no directory");
+    let candidates = [
+        beside.join("libamdgpu_sim.so"),
+        beside.join("../libamdgpu_sim.so"),
+    ];
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the SPMD runtime library is at none of {:?}",
+                candidates
+            )
+        })
+}
+
 unsafe fn check(error: llvm::error::LLVMErrorRef, operation: &str) {
     if !error.is_null() {
         let message = llvm::error::LLVMGetErrorMessage(error);
@@ -198,7 +219,7 @@ impl Module {
 
 impl OptimizedModule {
 
-    pub fn compile(mut self, symbol: &str) -> NativeCode {
+    pub fn compile(mut self, symbol: &str, runtime: &[(&str, u64)]) -> NativeCode {
         unsafe {
             let builder = llvm::orc2::lljit::LLVMOrcCreateLLJITBuilder();
             let machine =
@@ -217,10 +238,12 @@ impl OptimizedModule {
             };
             let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
 
-            let mut symbols = [
-                (&b"amdgpu_sim_fiber_yield_values\0"[..], super::super::engine::fiber::amdgpu_sim_fiber_yield_values as *const () as u64),
-            ].map(|(name, address)| llvm::orc2::LLVMOrcCSymbolMapPair {
-                Name: llvm::orc2::lljit::LLVMOrcLLJITMangleAndIntern(jit, name.as_ptr().cast()),
+            let names: Vec<CString> = runtime
+                .iter()
+                .map(|(name, _)| CString::new(*name).unwrap())
+                .collect();
+            let mut symbols: Vec<_> = names.iter().zip(runtime).map(|(name, &(_, address))| llvm::orc2::LLVMOrcCSymbolMapPair {
+                Name: llvm::orc2::lljit::LLVMOrcLLJITMangleAndIntern(jit, name.as_ptr()),
                 Sym: llvm::orc2::LLVMJITEvaluatedSymbol {
                     Address: address,
                     Flags: llvm::orc2::LLVMJITSymbolFlags {
@@ -229,13 +252,15 @@ impl OptimizedModule {
                         TargetFlags: 0,
                     },
                 },
-            });
-            let unit = llvm::orc2::LLVMOrcAbsoluteSymbols(symbols.as_mut_ptr(), symbols.len());
-            let error = llvm::orc2::LLVMOrcJITDylibDefine(dylib, unit);
-            if !error.is_null() {
-                llvm::orc2::LLVMOrcDisposeMaterializationUnit(unit);
+            }).collect();
+            if !symbols.is_empty() {
+                let unit = llvm::orc2::LLVMOrcAbsoluteSymbols(symbols.as_mut_ptr(), symbols.len());
+                let error = llvm::orc2::LLVMOrcJITDylibDefine(dylib, unit);
+                if !error.is_null() {
+                    llvm::orc2::LLVMOrcDisposeMaterializationUnit(unit);
+                }
+                check(error, "runtime symbols");
             }
-            check(error, "fiber symbols");
             let prefix = llvm::orc2::lljit::LLVMOrcLLJITGetGlobalPrefix(jit);
             let mut generator = std::ptr::null_mut();
             check(
@@ -248,16 +273,13 @@ impl OptimizedModule {
                 "process symbols",
             );
             llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, generator);
-            let library: &[u8] = if cfg!(debug_assertions) {
-                b"target/debug/libamdgpu_sim.so\0"
-            } else {
-                b"target/release/libamdgpu_sim.so\0"
-            };
+            let library = CString::new(runtime_library().into_os_string().into_encoded_bytes())
+                .expect("the runtime library path holds a NUL byte");
             let mut generator = std::ptr::null_mut();
             check(
                 llvm::orc2::LLVMOrcCreateDynamicLibrarySearchGeneratorForPath(
                     &mut generator,
-                    library.as_ptr().cast(),
+                    library.as_ptr(),
                     prefix,
                     None,
                     std::ptr::null_mut(),

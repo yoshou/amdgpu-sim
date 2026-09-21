@@ -1,5 +1,4 @@
 use crate::rdna_spmd::ir::*;
-use crate::rdna_spmd::program::{Parameter, ParameterSource};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

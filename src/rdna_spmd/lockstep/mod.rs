@@ -6,7 +6,6 @@ mod structure;
 mod uniform;
 
 use crate::rdna_spmd::analysis::facts::Facts;
-use crate::rdna_spmd::compiler::exec_index;
 use crate::rdna_spmd::decompile::Lane;
 use crate::rdna_spmd::program::Program;
 
@@ -62,7 +61,7 @@ pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Program {
     let facts = Facts::new(&lane.ir, &lane.parameter_inputs, &Default::default());
     let shape = structure::Structure::new(&lane.ir, facts);
     let costs = cost::Costs::new(packing.lanes, &crate::rdna_spmd::host::Vectors::detect());
-    let exec = exec_index(&lane.parameter_inputs, &lane.registry);
+    let exec = crate::rdna_spmd::ir::exec_index(&lane.parameter_inputs, lane.registry.registers().exec);
     let mut uniform = uniform::assume(lane, packing);
     loop {
         let lowered = emit::lower(

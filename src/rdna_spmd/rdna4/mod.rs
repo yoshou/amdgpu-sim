@@ -1,4 +1,4 @@
-use crate::rdna_spmd::dialect::DialectRegistry;
+use crate::rdna_spmd::dialect::{Dialect, DialectRegistry};
 use crate::rdna_spmd::program::Program;
 use std::sync::Arc;
 
@@ -6,17 +6,17 @@ pub(crate) mod decode;
 pub(crate) mod dialect;
 pub(crate) mod lift;
 
-pub(crate) fn registry() -> DialectRegistry {
-    let mut registry = DialectRegistry::new();
-    registry.add_dialect(dialect::ID, "rdna4");
-    registry.set_registers(dialect::REGISTERS);
-    registry.set_lowering_state(dialect::bvh::lowering_state);
-    dialect::register(&mut registry).expect("RDNA4 target registration conflict");
-    let idioms = dialect::idioms::SqrtIdioms::new(&registry);
-    registry.add_idiom(Box::new(idioms));
-    let divisions = dialect::idioms::DivisionIdioms::new(&registry);
-    registry.add_idiom(Box::new(divisions));
-    registry
+pub(crate) fn dialect() -> Dialect {
+    let mut rdna4 = Dialect::new();
+    rdna4.add_dialect(dialect::ID, "rdna4");
+    rdna4.set_registers(dialect::REGISTERS);
+    rdna4.set_lowering_state(dialect::bvh::lowering_state);
+    dialect::register(&mut rdna4).expect("RDNA4 target registration conflict");
+    let idioms = dialect::idioms::SqrtIdioms::new(&rdna4.registry);
+    rdna4.add_idiom(Box::new(idioms));
+    let divisions = dialect::idioms::DivisionIdioms::new(&rdna4.registry);
+    rdna4.add_idiom(Box::new(divisions));
+    rdna4
 }
 
 pub(crate) fn supports(arch: &str) -> bool {
@@ -33,7 +33,7 @@ pub(crate) fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> 
             .map(|(&pc, b)| (pc, decode::lower_block(pc, &b.insts, &b.next_pcs)))
             .collect(),
     };
-    Ok(lift_program(&normalized, Arc::new(registry())))
+    Ok(lift_program(&normalized, Arc::new(dialect().registry)))
 }
 
 pub(crate) fn lift_program(

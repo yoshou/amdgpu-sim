@@ -5,14 +5,14 @@ pub(crate) struct VerifiedFunc(Func);
 impl Func {
     pub fn verify_with(
         self,
-        registry: &crate::rdna_spmd::dialect::DialectRegistry,
+        registry: &crate::rdna_spmd::ir::DialectRegistry,
     ) -> Result<VerifiedFunc, &'static str> {
         self.check(registry)?;
         Ok(VerifiedFunc(self))
     }
     pub fn check(
         &self,
-        registry: &crate::rdna_spmd::dialect::DialectRegistry,
+        registry: &crate::rdna_spmd::ir::DialectRegistry,
     ) -> Result<(), &'static str> {
         if !self.blocks.contains_key(&self.entry) {
             return Err("missing entry");
@@ -74,7 +74,7 @@ impl Func {
                         }
                         let spec = registry.operation(*op)?;
                         spec.verify_immediates(*args, |v| constants.get(v.0).copied().flatten())?;
-                        if (spec.effect == crate::rdna_spmd::dialect::Effect::Pure)
+                        if (spec.effect == crate::rdna_spmd::ir::Effect::Pure)
                             != provenance.is_none()
                         {
                             return Err("target effect provenance mismatch");
@@ -218,7 +218,7 @@ pub(crate) struct VerifiedExpr(Expr);
 impl Expr {
     pub fn verify_with(
         self,
-        registry: &crate::rdna_spmd::dialect::DialectRegistry,
+        registry: &crate::rdna_spmd::ir::DialectRegistry,
     ) -> Result<VerifiedExpr, &'static str> {
         let mut types = self.params.clone();
         let mut constants = std::collections::BTreeMap::new();

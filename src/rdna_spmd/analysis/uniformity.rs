@@ -1,7 +1,6 @@
 use super::super::ir::{
     Cvt, EffectOp, Env, IntOp, MemSize, MemoryOp, Op, Space, Ty, ValueId, WaveOp, *,
 };
-use super::super::program::{Parameter, ParameterSource};
 use super::dataflow::{Cfg, Lattice, Sparse};
 use super::{Analyses, Analysis, Constants, Packet};
 use std::collections::BTreeMap;

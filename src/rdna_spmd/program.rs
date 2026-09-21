@@ -1,20 +1,6 @@
-use super::dialect::DialectRegistry;
-use super::ir::{Func, Ty};
+use super::ir::DialectRegistry;
+use super::ir::{Func, Parameter};
 use std::sync::Arc;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ParameterSource {
-    Vgpr(u32),
-    Sgpr(u32),
-    MaskBit(u32),
-    Scc,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Parameter {
-    pub source: ParameterSource,
-    pub ty: Ty,
-}
 
 #[derive(Clone)]
 pub struct Program {
