@@ -56,7 +56,6 @@ pub(crate) fn decompile(function: &Program) -> Lane {
             registry: function.registry.clone(),
             ir: lane,
             parameter_inputs: function.parameter_inputs.clone(),
-            revision: function.revision + 1,
         },
         everyone,
     }

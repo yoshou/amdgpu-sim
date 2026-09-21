@@ -1,6 +1,5 @@
 use crate::rdna_spmd::dialect::DialectRegistry;
-use crate::rdna_spmd::program::{CompilationInput, Program};
-use crate::rdna_spmd::target::Target;
+use crate::rdna_spmd::program::Program;
 use std::sync::Arc;
 
 pub(crate) mod decode;
@@ -20,34 +19,21 @@ pub(crate) fn registry() -> DialectRegistry {
     registry
 }
 
-pub(crate) struct Rdna4 {
-    registry: Arc<DialectRegistry>,
+pub(crate) fn supports(arch: &str) -> bool {
+    arch.starts_with("gfx12")
 }
 
-impl Rdna4 {
-    pub fn new() -> Self {
-        Self {
-            registry: Arc::new(registry()),
-        }
-    }
-}
-
-impl Target for Rdna4 {
-    fn supports(&self, arch: &str) -> bool {
-        arch.starts_with("gfx12")
-    }
-    fn decode(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-        let decoded = decode::program(entry_pc, memory)?;
-        let normalized = decode::ScalarProgram {
-            entry_pc: decoded.entry_pc,
-            blocks: decoded
-                .blocks
-                .iter()
-                .map(|(&pc, b)| (pc, decode::lower_block(pc, &b.insts, &b.next_pcs)))
-                .collect(),
-        };
-        Ok(lift_program(&normalized, self.registry.clone()))
-    }
+pub(crate) fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
+    let decoded = decode::program(entry_pc, memory)?;
+    let normalized = decode::ScalarProgram {
+        entry_pc: decoded.entry_pc,
+        blocks: decoded
+            .blocks
+            .iter()
+            .map(|(&pc, b)| (pc, decode::lower_block(pc, &b.insts, &b.next_pcs)))
+            .collect(),
+    };
+    Ok(lift_program(&normalized, Arc::new(registry())))
 }
 
 pub(crate) fn lift_program(
@@ -96,10 +82,4 @@ pub(crate) fn lift_program(
         .map(|(&pc, b)| (pc, b.iter().collect()))
         .collect();
     lift::function::lift(registry, &normalized, &refs)
-}
-
-impl CompilationInput for decode::ScalarProgram {
-    fn to_ssa(&self) -> Program {
-        lift_program(self, Arc::new(registry()))
-    }
 }

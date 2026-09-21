@@ -7,17 +7,7 @@ impl Analysis for Constants {
     type Result = Vec<Option<u64>>;
     const NAME: &'static str = "constants";
     fn compute(f: &Func, _: &Analyses) -> Self::Result {
-        constant_facts(f, &[], false)
-    }
-}
-
-pub(crate) struct DispatchConstants;
-impl Analysis for DispatchConstants {
-    type Result = Vec<Option<u64>>;
-    const NAME: &'static str = "dispatch_constants";
-    fn compute(f: &Func, analyses: &Analyses) -> Self::Result {
-        let exec = f.blocks[&f.entry].params[analyses.context().exec_index].0;
-        constant_facts(f, &[exec], true)
+        constant_facts(f)
     }
 }
 
@@ -70,7 +60,7 @@ impl Lists {
     }
 }
 
-fn constant_facts(f: &Func, entry_true: &[ValueId], valid_queries: bool) -> Vec<Option<u64>> {
+fn constant_facts(f: &Func) -> Vec<Option<u64>> {
     let mut definitions: Vec<_> = (0..f.types.len()).map(|_| Definition::External).collect();
     for (&id, block) in &f.blocks {
         if id != f.entry {
@@ -80,33 +70,7 @@ fn constant_facts(f: &Func, entry_true: &[ValueId], valid_queries: bool) -> Vec<
         }
         for inst in &block.insts {
             if let Inst::Core { value, ty, op } = *inst {
-                let op = if valid_queries
-                    && matches!(op, Op::Env(crate::rdna_spmd::ir::Env::ValidLane))
-                {
-                    Op::Const(Ty::I1, 1)
-                } else {
-                    op
-                };
                 definitions[value.0] = Definition::Core(ty, op);
-            } else if valid_queries {
-                let query = match inst {
-                    Inst::Packet {
-                        op: PacketOp::Any,
-                        input,
-                        output,
-                    } => Some((*input, *output)),
-                    Inst::Effect {
-                        op: super::super::ir::EffectOp::Wave(super::super::ir::WaveOp::Any),
-                        inputs,
-                        outputs,
-                        ..
-                    } => Some((inputs[0], outputs[0].0)),
-                    _ => None,
-                };
-                if let Some((input, output)) = query {
-                    definitions[output.0] =
-                        Definition::Core(Ty::I1, Op::Int(IntOp::Or, input, input));
-                }
             }
         }
     }
@@ -129,9 +93,6 @@ fn constant_facts(f: &Func, entry_true: &[ValueId], valid_queries: bool) -> Vec<
             |fill| each(fill),
         )
     };
-    for &id in entry_true {
-        definitions[id.0] = Definition::Core(Ty::I1, Op::Const(Ty::I1, 1));
-    }
     let users = {
         let each = |visit: &mut dyn FnMut(usize, u32)| {
             for (id, definition) in definitions.iter().enumerate() {

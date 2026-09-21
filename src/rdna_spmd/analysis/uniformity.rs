@@ -3,12 +3,11 @@ use super::super::ir::{
 };
 use super::super::program::{Parameter, ParameterSource};
 use super::dataflow::{Cfg, Lattice, Sparse};
-use super::{Analyses, Analysis, Constants, Masking, Packet};
+use super::{Analyses, Analysis, Constants, Packet};
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 
-impl<M: Masking> Analysis for Uniformity<M> {
-    type Result = Uniformity<M>;
+impl Analysis for Uniformity {
+    type Result = Uniformity;
     const NAME: &'static str = "uniformity";
     fn compute(f: &Func, analyses: &Analyses) -> Self {
         let ctx = analyses.context();
@@ -16,7 +15,6 @@ impl<M: Masking> Analysis for Uniformity<M> {
             return Uniformity {
                 facts: vec![Fact::Uniform; f.types.len()],
                 pairs: BTreeMap::new(),
-                masking: PhantomData,
             };
         };
         let constants = analyses.get::<Constants>(f);
@@ -24,7 +22,6 @@ impl<M: Masking> Analysis for Uniformity<M> {
             f,
             &entry(f, ctx.inputs, aligned),
             &constants,
-            &M::guarded(f, analyses),
         )
     }
 }
@@ -241,20 +238,19 @@ struct Entry {
     varying: Vec<ValueId>,
 }
 
-pub(crate) struct Uniformity<M> {
+pub(crate) struct Uniformity {
     pub facts: Vec<Fact>,
     #[cfg_attr(not(test), allow(dead_code))]
     pub pairs: BTreeMap<(ValueId, ValueId), Fact>,
-    masking: PhantomData<fn() -> M>,
 }
 
-impl<M> PartialEq for Uniformity<M> {
+impl PartialEq for Uniformity {
     fn eq(&self, other: &Self) -> bool {
         self.facts == other.facts && self.pairs == other.pairs
     }
 }
 
-impl<M> Uniformity<M> {
+impl Uniformity {
     pub fn uniform(&self) -> Vec<bool> {
         self.facts
             .iter()
@@ -337,12 +333,11 @@ impl Lattice for Lane {
     }
 }
 
-fn packet<M>(
+fn packet(
     f: &Func,
     entry: &Entry,
     constants: &[Option<u64>],
-    guarded: &[bool],
-) -> Uniformity<M> {
+) -> Uniformity {
     let definitions = f.definitions();
     let mut high_of: Vec<Option<ValueId>> = vec![None; f.types.len()];
     for block in f.blocks.values() {
@@ -514,7 +509,7 @@ fn packet<M>(
                         _ => Fact::Varying,
                     },
                     Op::Select(c, a, b) => {
-                        if a == b || guarded[value.0] {
+                        if a == b {
                             v(a)
                         } else if v(c) == Fact::Uniform {
                             v(a).meet(v(b))
@@ -598,6 +593,5 @@ fn packet<M>(
     Uniformity {
         facts: lanes.iter().map(|lane| lane.fact.get()).collect(),
         pairs,
-        masking: PhantomData,
     }
 }

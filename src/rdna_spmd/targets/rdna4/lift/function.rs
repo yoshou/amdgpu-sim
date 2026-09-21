@@ -188,7 +188,6 @@ pub(in crate::rdna_spmd) fn lift(
         registry,
         ir: f,
         parameter_inputs,
-        revision: 0,
     }
 }
 fn invalidate(views: &mut BTreeMap<(Word, Ty, bool), ValueId>, writes: &[Word]) {

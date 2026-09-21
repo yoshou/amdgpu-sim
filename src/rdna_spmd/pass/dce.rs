@@ -1,7 +1,6 @@
-use super::super::analysis::{Analyses, Masking};
+use super::super::analysis::Analyses;
 use super::super::ir::{ValueId, *};
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 
 fn count_uses(f: &Func, uses: &mut [usize]) {
     for block in f.blocks.values() {
@@ -57,13 +56,13 @@ impl super::Pass for Dce {
     }
 }
 
-pub(crate) struct DeadParams<M>(pub(crate) PhantomData<fn() -> M>);
-impl<M: Masking> super::Pass for DeadParams<M> {
+pub(crate) struct DeadParams;
+impl super::Pass for DeadParams {
     fn name(&self) -> &str {
         "dead_params"
     }
     fn run(&self, f: &mut Func, _: &Analyses) -> bool {
-        dead_params::<M>(f) > 0
+        dead_params(f) > 0
     }
 }
 
@@ -103,15 +102,15 @@ pub(crate) fn run(f: &mut Func) -> usize {
     removed
 }
 
-fn live_values<M: Masking>(f: &Func) -> Vec<bool> {
+fn live_values(f: &Func) -> Vec<bool> {
     let mut producer: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut parameter: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     let mut incoming: BTreeMap<BlockId, Vec<&Edge>> = BTreeMap::new();
     let mut pending: Vec<ValueId> = Vec::new();
     for (&id, block) in &f.blocks {
-        for (index, &(p, ty)) in block.params.iter().enumerate() {
+        for (index, &(p, _)) in block.params.iter().enumerate() {
             parameter[p.0] = Some((id, index));
-            if M::positional(ty) || id == f.entry {
+            if id == f.entry {
                 pending.push(p);
             }
         }
@@ -186,10 +185,10 @@ pub(crate) fn operands(inst: &Inst, mut f: impl FnMut(ValueId)) {
     }
 }
 
-pub(crate) fn dead_params<M: Masking>(f: &mut Func) -> usize {
+pub(crate) fn dead_params(f: &mut Func) -> usize {
     let mut removed = 0;
     loop {
-        let live = live_values::<M>(f);
+        let live = live_values(f);
         for block in f.blocks.values_mut() {
             let before = block.insts.len();
             block.insts.retain(|inst| match inst {

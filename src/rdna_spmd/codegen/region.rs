@@ -26,7 +26,7 @@ pub(super) const FRAME_BASE: u32 = 16;
 pub(super) fn scalar_values(p: &Prepared) -> Vec<bool> {
     let scalars = std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1");
     (0..p.ir.func().types.len())
-        .map(|v| p.width.is_none() || (p.uniform[v] && scalars))
+        .map(|v| p.uniform[v] && scalars)
         .collect()
 }
 
@@ -220,7 +220,7 @@ impl Regions {
             exits,
             frame_words: 0,
             scalar: scalar_values(p),
-            width: p.width.expect("regions belong to a packet program"),
+            width: p.width,
         };
         let mut words = FRAME_BASE;
         for r in 1..regions.entries.len() {
@@ -386,7 +386,7 @@ impl<'a> Cg<'a> {
         for ((&param, &slot), &value) in params.iter().zip(&slots).zip(&values) {
             self.store_value(param, value, slot);
         }
-        ir.ret(self.ci64(super::super::engine::kernel::COOP_LEAVE | exit as u64));
+        ir.ret(self.ci64(super::super::engine::kernel::LEAVE | exit as u64));
         ir.position_at_end(here);
         leave
     }
@@ -439,7 +439,7 @@ impl<'a> Cg<'a> {
         }
         let ty = ir.void().function(&[ir.ptr(), ir.i64(), ir.ptr()]);
         let function = ir.function("amdgpu_sim_fiber_yield_values", ty);
-        let enter = super::super::engine::kernel::COOP_ENTER | ordinal as u64;
+        let enter = super::super::engine::kernel::ENTER | ordinal as u64;
         ir.call(
             ty,
             function,
@@ -484,11 +484,11 @@ impl<'a> Cg<'a> {
             }
             _ if self.region == 0 => {
                 assert!(exit.to.is_none(), "an edge leaves the outermost region");
-                ir.ret(self.ci64(super::super::engine::kernel::COOP_DONE));
+                ir.ret(self.ci64(super::super::engine::kernel::DONE));
             }
             _ => {
                 let outer = regions.exit(self.region, exit.from, exit.edge);
-                ir.ret(self.ci64(super::super::engine::kernel::COOP_LEAVE | outer as u64));
+                ir.ret(self.ci64(super::super::engine::kernel::LEAVE | outer as u64));
             }
         }
     }

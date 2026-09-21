@@ -16,9 +16,9 @@ use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pub(crate) use constant::{Constants, DispatchConstants};
-pub(crate) use masking::{MaskValues, Masking};
-pub(crate) use masks::{Exec, Predication};
+pub(crate) use constant::Constants;
+pub(crate) use masking::holds_a_lane;
+pub(crate) use masks::Predication;
 pub(crate) use memory::{Access, Accesses};
 pub(crate) use uniformity::Uniformity;
 

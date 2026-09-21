@@ -21,8 +21,8 @@ impl<'a> Cg<'a> {
                     continue;
                 }
                 let uniform = matches!(layout.arguments[i], Argument::Uniform);
-                let value = self.shaped(id, uniform || self.p.width.is_none());
-                let int_ty = if uniform || self.p.width.is_none() {
+                let value = self.shaped(id, uniform);
+                let int_ty = if uniform {
                     ir.i32()
                 } else {
                     self.vi32()
@@ -49,7 +49,7 @@ impl<'a> Cg<'a> {
                 .clone();
             let uniform = layout.uniform_result();
             for (i, &(id, ty)) in outputs.iter().enumerate() {
-                let int_ty = if uniform || self.p.width.is_none() {
+                let int_ty = if uniform {
                     ir.i32()
                 } else {
                     self.vi32()
@@ -57,12 +57,12 @@ impl<'a> Cg<'a> {
                 let bits = ir
                     .load(int_ty, pointer(layout.base + layout.output_base + i))
                     .set_alignment(4);
-                let bool_ty = if uniform || self.p.width.is_none() {
+                let bool_ty = if uniform {
                     ir.i1()
                 } else {
                     self.vi1()
                 };
-                let f32_ty = if uniform || self.p.width.is_none() {
+                let f32_ty = if uniform {
                     ir.f32()
                 } else {
                     self.vec_ty(ir.f32())

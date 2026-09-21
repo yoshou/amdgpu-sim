@@ -23,7 +23,7 @@ pub(super) struct Prepared {
     pub registry: std::sync::Arc<super::dialect::DialectRegistry>,
     pub ir: VerifiedFunc,
     pub inputs: Vec<Parameter>,
-    pub width: Option<u32>,
+    pub width: u32,
     pub uniform: Vec<bool>,
 
     pub holds_a_lane: Vec<bool>,
@@ -223,18 +223,17 @@ fn emit_function(
     let lds_base = func.param(4);
     let lane_base = func.param(5);
     let valid_mask = func.param(7);
-    let width_lanes = p.width.unwrap_or(1);
+    let width_lanes = p.width;
     let scratch_base_scalar = {
         let aperture = ir.and(scratch_base, ir.ci64(0xffff_ffff_0000_0000));
         let sized = ir.icmp(IntPred::Ne, scratch_stride, ir.ci64(0));
         ir.select(sized, aperture, scratch_base)
     };
     let sink = ir.array_alloca(i32t, ir.ci32(10), "");
-    let mut em = Emitter::new(ir, p.width, p.registry.clone());
+    let mut em = Emitter::new(ir, Some(p.width), p.registry.clone());
     em.state = p.registry.lowering_state(&em, sink);
     let mut sem = Emitter::new(ir, None, p.registry.clone());
     sem.state = p.registry.lowering_state(&sem, sink);
-    let lane_offset = p.width.is_none().then(|| ir.mul(scratch_stride, lane_base));
     em.scratch = Some((scratch_base_scalar, scratch_stride));
     sem.scratch = em.scratch;
     let cells = p
@@ -310,8 +309,8 @@ fn emit_function(
         store_sink: ir.alloca(i64t, "store_sink"),
         tile_sink: ir.array_alloca(i32t, ir.ci32(64), "tile_sink"),
     };
-    if let Some(w) = p.width {
-        let lanes: Vec<Value> = (0..w).map(|k| ir.ci64(k as u64)).collect();
+    {
+        let lanes: Vec<Value> = (0..p.width).map(|k| ir.ci64(k as u64)).collect();
         let lane_idx = ir.const_vector(&lanes);
         let base_v = cg.splat(scratch_base);
         let stride_v = cg.splat(scratch_stride);
@@ -319,11 +318,6 @@ fn emit_function(
         let scratch_lane = ir.add(lane_base_v, lane_idx);
         let off = ir.mul(scratch_lane, stride_v);
         cg.scratch_vec = ir.add(base_v, off);
-    } else {
-        cg.scratch_vec = match lane_offset {
-            Some(offset) => ir.add(scratch_base, offset),
-            None => scratch_base,
-        };
     }
     let packet_valid = cg.lane_base_word(valid_mask);
     let valid_vec = cg.mask_to_vec(packet_valid);
@@ -383,10 +377,10 @@ impl<'a> Cg<'a> {
     }
 
     fn mask_words(&self) -> bool {
-        self.p.width.is_some() && std::env::var("AMDGPU_SIM_MASK_WORDS").map_or(false, |v| v == "1")
+        std::env::var("AMDGPU_SIM_MASK_WORDS").map_or(false, |v| v == "1")
     }
     fn width(&self) -> u32 {
-        self.p.width.unwrap_or(1)
+        self.p.width
     }
     fn ci32(&self, v: u32) -> Value {
         self.ir.ci32(v)
@@ -395,33 +389,18 @@ impl<'a> Cg<'a> {
         self.ir.ci64(v)
     }
     fn vec_ty(&self, scalar: Type) -> Type {
-        self.p.width.map_or(scalar, |w| scalar.vector(w))
+        scalar.vector(self.p.width)
     }
     fn splat(&self, v: Value) -> Value {
-        match self.p.width {
-            Some(w) => self.ir.splat(v, w),
-            None => v,
-        }
+        self.ir.splat(v, self.p.width)
     }
     fn mask_to_vec(&self, word: Value) -> Value {
-        match self.p.width {
-            Some(w) => {
-                let bits = self.ir.trunc(word, self.ir.int(w));
-                self.ir.bitcast(bits, self.ir.i1().vector(w))
-            }
-            None => self
-                .ir
-                .icmp(IntPred::Ne, self.ir.and(word, self.ci32(1)), self.ci32(0)),
-        }
+        let bits = self.ir.trunc(word, self.ir.int(self.p.width));
+        self.ir.bitcast(bits, self.ir.i1().vector(self.p.width))
     }
     fn vec_to_mask(&self, v: Value) -> Value {
-        match self.p.width {
-            Some(w) => {
-                let bits = self.ir.bitcast(v, self.ir.int(w));
-                self.ir.zext(bits, self.ir.i32())
-            }
-            None => self.ir.zext(v, self.ir.i32()),
-        }
+        let bits = self.ir.bitcast(v, self.ir.int(self.p.width));
+        self.ir.zext(bits, self.ir.i32())
     }
     fn describe(&self, v: ValueId) -> String {
         let f = self.p.ir.func();
@@ -477,7 +456,7 @@ impl<'a> Cg<'a> {
             v.0,
             self.describe(v)
         );
-        if self.p.width.is_none() || value.is_vector() {
+        if value.is_vector() {
             return value;
         }
         if !self.vectors[v.0].is_null() {
@@ -535,12 +514,9 @@ impl<'a> Cg<'a> {
             let input = &self.p.inputs[index];
             let value = match input.source {
                 ParameterSource::Vgpr(r) => {
-                    if let Some(w) = self.p.width {
-                        ir.load(ir.i32().vector(w), self.register_slot(self.vgprs_p, r * w))
-                            .set_alignment(4)
-                    } else {
-                        ir.load(ir.i32(), self.register_slot(self.vgprs_p, r))
-                    }
+                    let w = self.p.width;
+                    ir.load(ir.i32().vector(w), self.register_slot(self.vgprs_p, r * w))
+                        .set_alignment(4)
                 }
                 ParameterSource::Sgpr(r) => {
                     if r == self.regs().null {
@@ -663,12 +639,12 @@ impl<'a> Cg<'a> {
                 self.ir.cond_br(c, yes_bb, no_bb);
             }
             Term::Ret(args) => {
-                self.store_return(args);
+                assert!(args.is_empty(), "a packet program returns no register");
                 let left = match self.region {
-                    0 => super::engine::kernel::COOP_DONE,
+                    0 => super::engine::kernel::DONE,
                     _ => {
                         let exit = self.regions.exit(self.region, id, None);
-                        super::engine::kernel::COOP_LEAVE | exit as u64
+                        super::engine::kernel::LEAVE | exit as u64
                     }
                 };
                 self.ir.ret(self.ci64(left));
@@ -681,9 +657,7 @@ impl<'a> Cg<'a> {
     }
 
     fn any_of_word(&mut self, input: ValueId) -> Option<Value> {
-        let Some(w) = self.p.width else {
-            return None;
-        };
+        let w = self.p.width;
         let (bit, valid) = match self.definitions[input.0] {
             Some(Op::Int(IntOp::And, a, b))
                 if matches!(self.definitions[b.0], Some(Op::Env(Env::ValidLane))) =>
@@ -718,44 +692,6 @@ impl<'a> Cg<'a> {
         Some(self.ir.icmp(IntPred::Ne, bits, self.ci32(0)))
     }
 
-    fn store_return(&mut self, args: &[ValueId]) {
-        let entry = &self.p.ir.func().blocks[&self.p.ir.func().entry];
-        let ir = self.ir;
-        for (index, &arg) in args.iter().enumerate() {
-            let input = &self.p.inputs[index];
-            if arg == entry.params[index].0 {
-                continue;
-            }
-            match input.source {
-                ParameterSource::Vgpr(r) => {
-                    if r as usize >= self.p.num_vgprs {
-                        continue;
-                    }
-                    let value = self.vector(arg);
-                    ir.store(value, self.register_slot(self.vgprs_p, r * self.width()))
-                        .set_alignment(4);
-                }
-                ParameterSource::Sgpr(r) => {
-                    if r == self.regs().null {
-                        continue;
-                    }
-                    let value = self.scalar(arg);
-                    ir.store(value, self.register_slot(self.sgprs_p, r));
-                }
-                ParameterSource::MaskBit(r) => {
-                    let value = self.vector(arg);
-                    let word = self.vec_to_mask(value);
-                    ir.store(word, self.register_slot(self.sgprs_p, r));
-                }
-                ParameterSource::Scc => {
-                    let value = self.scalar(arg);
-                    let word = ir.zext(value, ir.i32());
-                    ir.store(word, self.register_slot(self.sgprs_p, self.regs().scc_slot));
-                }
-            }
-        }
-    }
-
     fn emit_inst(&mut self, id: BlockId, index: usize, inst: &Inst) {
         match inst {
             Inst::Core { value, ty, op } => self.emit_core(*value, *ty, *op),
@@ -763,13 +699,11 @@ impl<'a> Cg<'a> {
                 op, args, outputs, ..
             } => {
                 let values: Vec<ValueId> = args.values().to_vec();
-                let scalar = self.p.width.is_none();
                 let mut table = self.values.clone();
                 for a in &values {
-                    table[a.0] = self.shaped(*a, scalar);
+                    table[a.0] = self.vector(*a);
                 }
-                let emitter = if scalar { &self.sem } else { &self.em };
-                let results = emitter.target(*op, *args, &table);
+                let results = self.em.target(*op, *args, &table);
                 for (&(out, _), result) in outputs.iter().zip(results) {
                     self.define(out, result);
                 }
@@ -781,15 +715,9 @@ impl<'a> Cg<'a> {
                         return;
                     }
                 }
-                let bits = match self.p.width {
-                    Some(_) => {
-                        let v = self.vector(*input);
-                        self.vec_to_mask(v)
-                    }
-                    None => {
-                        let v = self.scalar(*input);
-                        self.ir.zext(v, self.ir.i32())
-                    }
+                let bits = {
+                    let v = self.vector(*input);
+                    self.vec_to_mask(v)
                 };
                 let result = if *op == PacketOp::Any {
                     self.ir.icmp(IntPred::Ne, bits, self.ci32(0))
@@ -874,12 +802,9 @@ impl<'a> Cg<'a> {
             }
             id
         });
-        let scalar = self.p.width.is_none()
-            || (!matches!(
-                op,
-                Op::Env(Env::LaneId | Env::ValidLane)
-            ) && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1")
-                && args.iter().all(|a| !self.values[a.0].is_vector()));
+        let scalar = !matches!(op, Op::Env(Env::LaneId | Env::ValidLane))
+            && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1")
+            && args.iter().all(|a| !self.values[a.0].is_vector());
         let mut table = self.values.clone();
         for a in &args {
             table[a.0] = self.shaped(*a, scalar);

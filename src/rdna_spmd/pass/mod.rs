@@ -1,4 +1,3 @@
-pub(crate) mod active;
 pub(crate) mod adjacency;
 pub(crate) mod dce;
 pub(crate) mod entry;

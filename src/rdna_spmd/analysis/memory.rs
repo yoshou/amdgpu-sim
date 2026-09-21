@@ -1,15 +1,14 @@
 use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
-use super::{Analyses, Analysis, Constants, Masking, Uniformity};
-use std::marker::PhantomData;
+use super::{Analyses, Analysis, Constants, Uniformity};
 
-pub(crate) struct Accesses<M>(PhantomData<fn() -> M>);
-impl<M: Masking> Analysis for Accesses<M> {
+pub(crate) struct Accesses;
+impl Analysis for Accesses {
     type Result = Vec<Access>;
     const NAME: &'static str = "accesses";
     fn compute(f: &Func, analyses: &Analyses) -> Self::Result {
         let constants = analyses.get::<Constants>(f);
-        let uniform = analyses.get::<Uniformity<M>>(f).uniform();
-        accesses::<M>(f, &constants, &uniform)
+        let uniform = analyses.get::<Uniformity>(f).uniform();
+        accesses(f, &constants, &uniform)
     }
 }
 
@@ -146,7 +145,7 @@ fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
     }
 }
 
-fn accesses<M: Masking>(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
+fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Access> {
     let mut uses = vec![false; f.types.len()];
     for b in f.blocks.values() {
         for inst in &b.insts {
@@ -304,11 +303,6 @@ fn accesses<M: Masking>(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -
                 Form::Scratch {
                     uniform: uniform[address.0],
                 }
-            } else if words
-                .first()
-                .is_some_and(|w| M::scalar_word(constants[w.mask.0]))
-            {
-                Form::Scalar
             } else {
                 let scalar_base = matches!(defs[base.0], Some(Op::Int(IntOp::Add, a, c))
                         if matches!(defs[c.0], Some(Op::Convert(Cvt::ZExt, Ty::I64, _))) && uniform[a.0]);

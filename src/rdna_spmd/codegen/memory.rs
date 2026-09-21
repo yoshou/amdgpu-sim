@@ -53,11 +53,6 @@ pub(in crate::rdna_spmd) enum Shape {
         lanes: Lanes,
         pairs: bool,
     },
-    ScalarLoad {
-        pairs: bool,
-    },
-    ScalarStore,
-    ScalarAtomic,
 }
 
 pub(in crate::rdna_spmd) fn global_load(
@@ -101,26 +96,13 @@ pub(in crate::rdna_spmd) fn global_load(
 
 pub(in crate::rdna_spmd) fn shape(
     access: &Access,
-    width: Option<u32>,
+    width: u32,
     load: GlobalLoad,
     constants: &[Option<u64>],
 ) -> Shape {
     if access.op == MemoryOp::Fence {
         return Shape::Fence;
     }
-    let Some(width) = width else {
-        if access.op == MemoryOp::AtomicAdd {
-            return Shape::ScalarAtomic;
-        }
-        if access.stores() {
-            return Shape::ScalarStore;
-        }
-        return Shape::ScalarLoad {
-            pairs: matches!(access.form, Form::Global { .. })
-                && access.size() == MemSize::B32
-                && !access.semantics.volatile,
-        };
-    };
     if access.scalar() {
         return Shape::ScalarWords;
     }
@@ -216,14 +198,11 @@ pub(in crate::rdna_spmd) fn shape(
 pub(in crate::rdna_spmd) fn clusters(
     f: &Func,
     accesses: &[Access],
-    width: Option<u32>,
+    width: u32,
     uniform: &[bool],
     affine: &BTreeMap<ValueId, u32>,
 ) -> BTreeMap<usize, Cluster> {
     let mut out = BTreeMap::new();
-    let Some(width) = width else {
-        return out;
-    };
     if !width.is_power_of_two()
         || std::env::var("AMDGPU_SIM_DEBUG_SHAPE").map_or(false, |v| v.contains("nocluster"))
     {
@@ -308,8 +287,6 @@ struct Words {
     offsets: Vec<u32>,
     results: Vec<ValueId>,
     data: Vec<ValueId>,
-    space: Space,
-    volatile: bool,
 }
 
 impl<'a> Cg<'a> {
@@ -589,15 +566,10 @@ impl<'a> Cg<'a> {
             offsets: access.offsets.clone(),
             results: access.results.clone(),
             data: access.data.clone(),
-            space: access.space,
-            volatile: access.semantics.volatile,
         };
         let private: Vec<ValueId> = access.private.clone();
         match shape {
-            Shape::ScalarWords
-            | Shape::ScalarLoad { .. }
-            | Shape::ScalarStore
-            | Shape::ScalarAtomic => self.emit_scalar_access(index, shape, &words),
+            Shape::ScalarWords => self.emit_scalar_access(index, &words),
             _ => self.emit_vector_access(index, shape, &words),
         }
         for (&r, &private) in words.results.iter().zip(&private) {
@@ -606,118 +578,15 @@ impl<'a> Cg<'a> {
         }
     }
 
-    fn scalar_address(&mut self, index: usize, shape: Shape) -> (Value, Option<Value>) {
+    fn emit_scalar_access(&mut self, index: usize, words: &Words) {
         let ir = self.ir;
-        let access = &self.p.accesses[index];
-        let (space, inside, address, mask) =
-            (access.space, access.inside, access.address, access.mask);
-        let predicated = shape != Shape::ScalarWords && !access.scalar();
-        let mut addr = self.scalar(address);
-        if self.p.width.is_none() {
-            if let Some(inside) = inside {
-                let offset = ir.sub(self.scratch_vec, self.scratch_base_scalar);
-                let physical = ir.add(addr, offset);
-                let inside = self.scalar(inside);
-                addr = ir.select(inside, physical, addr);
-            }
-            if space != Space::Global {
-                let extended = if space == Space::Scratch {
-                    ir.sext(addr, ir.i64())
-                } else {
-                    ir.zext(addr, ir.i64())
-                };
-                addr = ir.add(
-                    if space == Space::Scratch {
-                        self.scratch_vec
-                    } else {
-                        self.lds_base
-                    },
-                    extended,
-                );
-            }
-        }
-        let active = predicated.then(|| self.scalar(mask));
-        (addr, active)
-    }
-
-    fn guarded(&self, address: Value, active: Option<Value>) -> Value {
-        match active {
-            Some(active) => {
-                let dummy = self.ir.ptrtoint(self.sink, self.ir.i64());
-                self.ir.select(active, address, dummy)
-            }
-            None => address,
-        }
-    }
-
-    fn emit_scalar_access(&mut self, index: usize, shape: Shape, words: &Words) {
-        let ir = self.ir;
-        let (addr, active) = self.scalar_address(index, shape);
-        match shape {
-            Shape::ScalarAtomic => {
-                let p = ir.inttoptr(self.guarded(addr, active), ir.ptr());
-                let d = self.scalar(words.data[0]);
-                let old = ir.atomic_add(p, d, Atomic::SequentiallyConsistent);
-                if let Some(&r) = words.results.first() {
-                    self.define(r, old);
-                }
-            }
-            Shape::ScalarStore => {
-                for k in 0..words.count as usize {
-                    let value = self.scalar(words.data[k]);
-                    let value = if words.size.bytes() >= 4 {
-                        value
-                    } else {
-                        ir.trunc(value, words.elem)
-                    };
-                    let a = self.guarded(ir.add(addr, self.ci64(words.offsets[k] as u64)), active);
-                    let p = ir.inttoptr(a, ir.ptr());
-                    ir.store(value, p)
-                        .set_alignment(if words.space == Space::Lds {
-                            1
-                        } else {
-                            words.size.bytes()
-                        })
-                        .set_volatile(words.volatile);
-                }
-            }
-            _ => {
-                let load_addr = self.guarded(addr, active);
-                let at = |cg: &Self, k: usize| {
-                    ir.inttoptr(
-                        ir.add(load_addr, cg.ci64(words.offsets[k] as u64)),
-                        ir.ptr(),
-                    )
-                };
-                let pairs = matches!(shape, Shape::ScalarLoad { pairs: true });
-                let mut k = 0usize;
-                while k < words.count as usize {
-                    if pairs && k + 1 < words.count as usize {
-                        let value = ir.load(ir.f64(), at(self, k)).set_alignment(4);
-                        self.define_pair(&words.results[k..k + 2], value);
-                        k += 2;
-                    } else {
-                        let load = ir.load(words.elem, at(self, k));
-                        load.set_alignment(if shape == Shape::ScalarWords {
-                            if words.size.bytes() >= 4 {
-                                4
-                            } else {
-                                1
-                            }
-                        } else if words.space == Space::Lds || words.size.bytes() < 4 {
-                            1
-                        } else {
-                            4
-                        });
-                        if shape != Shape::ScalarWords {
-                            load.set_volatile(words.volatile);
-                        }
-                        let value = self.widen_word(load, words.size);
-                        self.define(words.results[k], value);
-                        k += 1;
-                    }
-                }
-            }
+        let addr = self.scalar(self.p.accesses[index].address);
+        for k in 0..words.count as usize {
+            let at = ir.inttoptr(ir.add(addr, self.ci64(words.offsets[k] as u64)), ir.ptr());
+            let load = ir.load(words.elem, at);
+            load.set_alignment(if words.size.bytes() >= 4 { 4 } else { 1 });
+            let value = self.widen_word(load, words.size);
+            self.define(words.results[k], value);
         }
     }
 

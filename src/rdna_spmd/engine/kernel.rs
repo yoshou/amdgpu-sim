@@ -1,10 +1,10 @@
-pub const COOP_DONE: u64 = u64::MAX;
+pub const DONE: u64 = u64::MAX;
 
-pub const COOP_ENTER: u64 = 1 << 32;
+pub const ENTER: u64 = 1 << 32;
 
-pub const COOP_LEAVE: u64 = 1 << 33;
+pub const LEAVE: u64 = 1 << 33;
 
-pub const COOP_SGPR_BUF: usize = 129;
+pub const SGPR_BUF: usize = 129;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scheduler {
@@ -46,7 +46,7 @@ impl Kernel {
         width: u32,
     ) -> Self {
         assert!(!regions.is_empty(), "a kernel without its outermost region");
-        assert_eq!(registers.scc_slot as usize + 1, COOP_SGPR_BUF);
+        assert_eq!(registers.scc_slot as usize + 1, SGPR_BUF);
         Self {
             _code: code,
             regions,

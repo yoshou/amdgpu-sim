@@ -22,8 +22,6 @@ pub struct FiberCtx {
 const STACK_GUARD_BYTES: usize = 64;
 const STACK_POISON: u8 = 0xA5;
 
-pub const FIBER_DONE: u64 = super::kernel::COOP_DONE;
-
 pub(crate) type KernelFn = unsafe extern "C" fn(
     *mut u32,
     *mut u32,

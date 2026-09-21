@@ -4,9 +4,9 @@ use crate::processor::KernelDescriptor;
 
 use super::super::ir::EffectOp;
 use super::dispatch::{setup_sgprs, GridDims};
-use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
+use super::fiber::{Fiber, KernelArgs};
 use super::kernel::{
-    Kernel, Region, Scheduler, COOP_ENTER, COOP_LEAVE, COOP_SGPR_BUF,
+    Kernel, Region, Scheduler, DONE, ENTER, LEAVE, SGPR_BUF,
 };
 use super::yields::YieldValues;
 
@@ -68,15 +68,8 @@ impl<'a> View<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unit {
-    Packet,
-    Wave,
-    Workgroup,
-}
-
 struct State {
-    sgprs: Vec<[u32; COOP_SGPR_BUF]>,
+    sgprs: Vec<[u32; SGPR_BUF]>,
     vgprs: Vec<Vec<u32>>,
     fibers: Vec<Vec<Fiber>>,
     frames: Vec<Vec<u32>>,
@@ -115,7 +108,7 @@ fn acquire(shape: Shape) -> State {
     let mut scratch = aligned_vec::AVec::new(0x1_0000_0000);
     scratch.resize(shape.scratch, 0u8);
     State {
-        sgprs: vec![[0u32; COOP_SGPR_BUF]; shape.packets],
+        sgprs: vec![[0u32; SGPR_BUF]; shape.packets],
         vgprs: (0..shape.packets)
             .map(|_| vec![0u32; shape.words])
             .collect(),
@@ -150,7 +143,7 @@ struct Engine<'a> {
     aql_packet_addr: u64,
     dims: GridDims,
     private_segment_size: u32,
-    unit: Unit,
+    unit: Scheduler,
     wg_size: usize,
     packets_per_wave: usize,
     waves_per_wg: usize,
@@ -173,14 +166,10 @@ pub(crate) fn run(
     let width = view.width;
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32));
     let wg_size = dims.workgroup_size() as usize;
-    let unit = match view.scheduler {
-        Scheduler::Independent => Unit::Packet,
-        Scheduler::Wave => Unit::Wave,
-        Scheduler::Workgroup => Unit::Workgroup,
-    };
+    let unit = view.scheduler;
     match view.workgroup_x {
         Some(x) => assert_eq!(x, dims.wg_x, "kernel compiled for another workgroup width"),
-        None if unit != Unit::Workgroup => assert!(
+        None if unit != Scheduler::Workgroup => assert!(
             dims.wg_x as usize % width == 0,
             "workgroup width {} not divisible by W={}; compile with the workgroup layout",
             dims.wg_x,
@@ -188,7 +177,7 @@ pub(crate) fn run(
         ),
         None => {}
     }
-    if unit == Unit::Packet {
+    if unit == Scheduler::Independent {
         assert!(
             wg_size % width == 0,
             "workgroup size {} not divisible by W={}",
@@ -200,44 +189,44 @@ pub(crate) fn run(
     let packets_per_wave = WAVE / width;
     let waves_per_wg = wg_size.div_ceil(WAVE);
     let packets_per_wg = match unit {
-        Unit::Packet => wg_size / width,
+        Scheduler::Independent => wg_size / width,
         _ => waves_per_wg * packets_per_wave,
     };
     let (unit_packets, unit_waves) = match unit {
-        Unit::Packet => (1, 1),
-        Unit::Wave => (packets_per_wave, 1),
-        Unit::Workgroup => (packets_per_wg, waves_per_wg),
+        Scheduler::Independent => (1, 1),
+        Scheduler::Wave => (packets_per_wave, 1),
+        Scheduler::Workgroup => (packets_per_wg, waves_per_wg),
     };
     let units = match unit {
-        Unit::Packet => num_wg * packets_per_wg as u64,
-        Unit::Wave => num_wg * waves_per_wg as u64,
-        Unit::Workgroup => num_wg,
+        Scheduler::Independent => num_wg * packets_per_wg as u64,
+        Scheduler::Wave => num_wg * waves_per_wg as u64,
+        Scheduler::Workgroup => num_wg,
     };
     if units == 0 {
         return;
     }
     let stride = match unit {
-        Unit::Workgroup => {
+        Scheduler::Workgroup => {
             (private_segment_size as usize)
                 .max(view.min_private_bytes)
                 .div_ceil(16)
                 * 16
         }
-        Unit::Wave => {
+        Scheduler::Wave => {
             (private_segment_size as usize)
                 .max(view.min_private_bytes)
                 .div_ceil(8)
                 * 8
         }
-        Unit::Packet => {
+        Scheduler::Independent => {
             ((private_segment_size as usize / 8 + 2).max(view.min_private_bytes.div_ceil(8))) * 8
         }
     };
     let scratch = match unit {
-        Unit::Packet => width * stride,
+        Scheduler::Independent => width * stride,
         _ => unit_waves * WAVE * stride,
     };
-    let lds = if unit == Unit::Workgroup {
+    let lds = if unit == Scheduler::Workgroup {
         group_segment_size.max(LDS_MIN_BYTES)
     } else {
         0
@@ -288,15 +277,15 @@ pub(crate) fn run(
 impl Engine<'_> {
     fn locate(&self, index: u64) -> (u64, usize) {
         match self.unit {
-            Unit::Packet => (
+            Scheduler::Independent => (
                 index / self.packets_per_wg as u64,
                 (index % self.packets_per_wg as u64) as usize * self.view.width,
             ),
-            Unit::Wave => (
+            Scheduler::Wave => (
                 index / self.waves_per_wg as u64,
                 (index % self.waves_per_wg as u64) as usize * WAVE,
             ),
-            Unit::Workgroup => (index, 0),
+            Scheduler::Workgroup => (index, 0),
         }
     }
 
@@ -309,13 +298,13 @@ impl Engine<'_> {
             ((wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64))
                 % self.dims.num_wg_z as u64) as u32,
         );
-        if self.unit != Unit::Packet {
+        if self.unit != Scheduler::Independent {
             state.lds.fill(0);
         }
         let width = self.view.width;
         for packet in 0..self.shape.packets {
             let wave = packet / self.packets_per_wave;
-            let wave_base = if self.unit == Unit::Packet {
+            let wave_base = if self.unit == Scheduler::Independent {
                 0
             } else {
                 wave * WAVE * self.stride
@@ -417,11 +406,11 @@ impl Engine<'_> {
                 .expect("a packet left its outermost region");
             let level = self.view.depth[at];
             let left = state.fibers[level][packet].resume();
-            if left == FIBER_DONE {
+            if left == DONE {
                 assert_eq!(at, 0, "a nested region finished the kernel");
                 return left;
             }
-            if left & COOP_ENTER != 0 {
+            if left & ENTER != 0 {
                 let child = regions[at].children[(left & 0xffff_ffff) as usize];
                 state.active[packet].push(child);
                 let args = KernelArgs {
@@ -429,7 +418,7 @@ impl Engine<'_> {
                     ..state.args[packet].unwrap()
                 };
                 state.fibers[self.view.depth[child]][packet].start(args);
-            } else if left & COOP_LEAVE != 0 {
+            } else if left & LEAVE != 0 {
                 state.active[packet].pop();
                 assert!(
                     !state.active[packet].is_empty(),
@@ -458,15 +447,15 @@ impl Engine<'_> {
             }
         }
         while live != 0 {
-            let mut boundary = FIBER_DONE;
+            let mut boundary = DONE;
             let mut remaining = live;
             while remaining != 0 {
                 let packet = remaining.trailing_zeros() as usize;
                 remaining &= remaining - 1;
                 let pc = self.advance(regions, packet, state);
-                if pc == FIBER_DONE {
+                if pc == DONE {
                     live &= !(1 << packet);
-                } else if boundary == FIBER_DONE {
+                } else if boundary == DONE {
                     boundary = pc;
                 } else if boundary != pc {
                     panic!(
@@ -475,7 +464,7 @@ impl Engine<'_> {
                     );
                 }
             }
-            if boundary == FIBER_DONE {
+            if boundary == DONE {
                 break;
             }
             let group = self
@@ -503,17 +492,17 @@ impl Engine<'_> {
     }
 
     fn run_regions(&self, regions: &[Region], state: &mut State) {
-        if self.unit == Unit::Packet {
+        if self.unit == Scheduler::Independent {
             for packet in 0..self.shape.packets {
                 if !state.done[packet] {
                     let left = self.advance(regions, packet, state);
-                    assert_eq!(left, FIBER_DONE, "an independent packet reached a meeting point");
+                    assert_eq!(left, DONE, "an independent packet reached a meeting point");
                     state.done[packet] = true;
                 }
             }
             return;
         }
-        if self.unit == Unit::Wave {
+        if self.unit == Scheduler::Wave {
             return self.run_wave(regions, state);
         }
         let ppw = self.packets_per_wave;
@@ -548,10 +537,10 @@ impl Engine<'_> {
                         None => boundary = Some(r),
                     }
                     level = state.yielded[p];
-                    state.done[p] = r == FIBER_DONE;
+                    state.done[p] = r == DONE;
                 }
                 let pc = boundary.unwrap();
-                if pc == FIBER_DONE {
+                if pc == DONE {
                     continue;
                 }
                 let group = self
@@ -576,7 +565,7 @@ impl Engine<'_> {
                 } else {
                     assert_eq!(
                         self.unit,
-                        Unit::Workgroup,
+                        Scheduler::Workgroup,
                         "barrier outside a workgroup scheduler"
                     );
                     let id = action.uniform_id(width, valid, &state.fibers[level][range.clone()]) & 31;
