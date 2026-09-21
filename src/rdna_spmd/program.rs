@@ -1,4 +1,3 @@
-//! Owned typed SSA between decode/lift, preparation and codegen.
 use super::dialect::DialectRegistry;
 use super::ir::{Func, Ty};
 use std::collections::BTreeMap;
@@ -26,15 +25,11 @@ pub(crate) struct LiftedFunction {
     pub revision: u64,
 }
 
-/// Typed SSA prepared for reuse across execution widths and schedules.
-/// It owns no decoded instruction stream.
 #[derive(Clone)]
 pub struct Program {
     pub(crate) function: LiftedFunction,
 }
 
-/// Inputs accepted by the compiler. Decoded fixtures are lifted at this
-/// boundary; an already prepared program retains its SSA graph.
 pub trait CompilationInput {
     fn to_ssa(&self) -> Program;
 }
@@ -49,20 +44,6 @@ impl CompilationInput for Program {
     }
 }
 impl Program {
-    #[cfg(test)]
-    pub(super) fn vgpr_count(&self, declared: usize) -> usize {
-        let needed = self
-            .function
-            .parameter_inputs
-            .iter()
-            .filter_map(|i| match i.source {
-                ParameterSource::Vgpr(r) => Some(r as usize + 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(1);
-        declared.max(needed)
-    }
     pub(super) fn schedule(
         self,
         accept: impl Fn(&super::ir::EffectOp, &[super::ir::ValueId]) -> bool,

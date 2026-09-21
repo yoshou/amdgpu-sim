@@ -1,7 +1,3 @@
-//! BVH64 target lowering. Inputs and outputs are values; no ISA decoding or
-//! architectural register access occurs here. Preserve the existing native paths.
-//! Ray operands are explicit bit-pattern values. Form their floating-point
-//! views where each native path consumes them, preserving the original order.
 use super::*;
 use crate::rdna_spmd::native::{BasicBlock, Builder, Type};
 
@@ -251,9 +247,6 @@ impl Native {
         let slow = ir.append_block(func, "bvh.general");
         let join = ir.append_block(func, "bvh.join");
 
-        // The resource names the base of the BVH in 256-byte units,
-        // and says whether the children that point at triangle nodes
-        // sort before the ones that point at boxes.
         let base_hi = ir.shl(
             self.zext64s(ir.and(resource[1], self.ci32(0xFF))),
             self.ci64(32),
@@ -276,9 +269,6 @@ impl Native {
             ],
         };
 
-        // Representative node address over the active lanes, the same
-        // umax idiom `emit_vglobal_cluster` uses (the block only runs
-        // with EXEC != 0, so at least one lane contributes).
         let exec = a[13];
         let masked = ir.select(exec, ray.addr, self.vi64.null());
         let rep = self.reduce(&format!("umax.v{}i64", self.w), ir.i64(), masked);
@@ -289,16 +279,9 @@ impl Native {
         let is_box = ir.icmp(IntPred::Eq, ntype, self.ci64(5));
         let is_tri = ir.icmp(IntPred::Ult, ntype, self.ci64(2));
         let known = ir.or(is_box, is_tri);
-        // With EXEC == 0 the reduction above has no active lane to pick,
-        // so `rep` would be 0 and the type test would accept it as a
-        // triangle node at address 0. Blocks are not supposed to run
-        // with EXEC == 0, but the fast path must not dereference a null
-        // node if one ever does.
+
         let any_active = ir.icmp(IntPred::Ne, mask, self.ci32(0));
-        // The inline path sorts the children by the time the ray
-        // reaches them and nothing else, which is what a resource that
-        // sorts its boxes and leaves triangle nodes where they are
-        // asks for; the helper knows the rest of Table 65.
+
         let plainly_sorted = ir.and(sorts_boxes, ir.not(sorts_triangles_first));
         let take = ir.and(ir.and(ir.and(uniform, known), any_active), plainly_sorted);
         ir.cond_br(take, uni_bb, slow);
@@ -313,8 +296,7 @@ impl Native {
         let (slow_res, slow_end) = self.general_path(a, resource, mask, &ray, join);
 
         ir.position_at_end(join);
-        // All phis must sit at the top of the block, so build them
-        // before any of the register writes.
+
         (0..4)
             .map(|k| {
                 let phi = ir.phi(self.vi32);
@@ -338,7 +320,7 @@ impl Native {
     ) -> ([Value; 4], BasicBlock) {
         let ir = self.ir;
         let node_ptr = self.node_address(bvh_base, rep);
-        // Box4Node: child_index[4], then aabb[4] of { min[3], max[3] }.
+
         let field = |off: u64, ty: Type| self.node_field(node_ptr, off, ty);
         let vzero = self.vf32.null();
         let mut child = [self.vi32.null(); 4];
@@ -403,8 +385,6 @@ impl Native {
         swap_pair(2, 3, &mut child, &mut dist);
         swap_pair(1, 2, &mut child, &mut dist);
 
-        // A NaN slab value makes the ordered min/max above differ from
-        // minNum; that lane set is rare enough to redo in the helper.
         let any_nan = self.reduce(&format!("or.v{}i1", self.w), ir.i1(), nan_acc.unwrap());
         ir.cond_br(any_nan, slow, join);
         (child, ir.insert_block())
@@ -421,10 +401,10 @@ impl Native {
         let ir = self.ir;
         let tnode = self.node_address(bvh_base, rep);
         let tfield = |off: u64, ty: Type| self.node_field(tnode, off, ty);
-        // TrianglePairNode: v0,v1,v2,v3 (3 f32 each), pad, prim_index[2], flags.
+
         let odd = ir.icmp(IntPred::Ne, ir.and(rep, self.ci64(1)), self.ci64(0));
         let vtx = |slot: u64, axis: u64| tfield(slot * 12 + axis * 4, ir.f32());
-        // tri = odd ? [v1, v3, v2] : [v0, v1, v2]
+
         let pick = |a: u64, b: u64, axis: u64| ir.select(odd, vtx(a, axis), vtx(b, axis));
         let t0v: Vec<Value> = (0..3)
             .map(|k| self.splat(pick(1, 0, k), self.vf32))
@@ -442,8 +422,7 @@ impl Native {
         let sub3 = |a: &[Value], b: &[Value]| -> Vec<Value> {
             (0..3).map(|k| self.vfsub(a[k], b[k])).collect()
         };
-        // Same association as `intersect_triangle_frac`: cross uses
-        // a1*b2 - a2*b1, dot is (x + y) + z. No contraction.
+
         let cross = |a: &[Value], b: &[Value]| -> Vec<Value> {
             vec![
                 self.vfsub(self.vfmul(a[1], b[2]), self.vfmul(a[2], b[1])),
@@ -506,24 +485,20 @@ impl Native {
                 fc(FloatPred::Ogt, t_hit, zero),
             ),
         );
-        // A ray in the plane of the triangle meets nothing either.
+
         let miss = or(or(reject_pos, reject_neg), fc(FloatPred::Oeq, denom, zero));
         let sel = |c, a, b| ir.select(c, a, b);
-        // The numerator a miss returns is infinite, signed with the
-        // denominator so that the quotient is positive infinity
-        // whichever way round the triangle faces.
+
         let missed = self.vf32_of(ir.or(
             ir.and(self.vf32_bits(denom), self.vci32(0x8000_0000)),
             self.vci32(0x7F80_0000),
         ));
-        // `flags` picks a barycentric per output; it is uniform, so the
-        // index is a scalar and the selects are scalar-controlled.
+
         let bary = |shift: u32| -> Value {
             let idx = ir.and(ir.lshr(flags, self.ci32(shift)), self.ci32(3));
             let is1 = ir.icmp(IntPred::Eq, idx, self.ci32(1));
             let is2 = ir.icmp(IntPred::Eq, idx, self.ci32(2));
-            // The fourth encoding is reserved, and the part answers it
-            // with the first barycentric.
+
             sel(is1, b_y, sel(is2, b_z, b_x))
         };
         let tri_res = [sel(miss, missed, t_hit), denom, bary(0), bary(2)];

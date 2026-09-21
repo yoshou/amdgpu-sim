@@ -1,6 +1,3 @@
-//! Typed, width-independent SSA operations. ISA registers and lane-mask word
-//! conventions are resolved by the ISA lifter, outside the core ops.
-
 use super::{Ty, ValueId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -43,7 +40,7 @@ pub(crate) enum FloatUnary {
     Abs,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Complete predicate set, including forms not used by current ISA input.
+#[allow(dead_code)]
 pub(crate) enum FloatPred {
     Oeq,
     Ogt,
@@ -60,10 +57,9 @@ pub(crate) enum FloatPred {
     Ule,
     Une,
 }
-/// The current ISA lift uses rte for integer -> float and saturating rtz for
-/// float -> integer (including NaN -> 0), retaining those semantics explicitly.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)] // Core conversion forms are independent of the initial ISA coverage.
+#[allow(dead_code)]
 pub(crate) enum Cvt {
     SignedToFloatRte,
     UnsignedToFloatRte,
@@ -88,9 +84,9 @@ pub(crate) enum Env {
 pub(crate) enum Op {
     Env(Env),
     Int(IntOp, ValueId, ValueId),
-    /// Integer width for zero, otherwise the number of trailing zero bits.
+
     TrailingZeros(ValueId),
-    /// Integer width for zero, otherwise the number of leading zero bits.
+
     LeadingZeros(ValueId),
     PopulationCount(ValueId),
     ReverseBits(ValueId),
@@ -102,8 +98,7 @@ pub(crate) enum Op {
     Unary(FloatUnary, ValueId),
     FCmp(FloatPred, ValueId, ValueId),
     Fma(ValueId, ValueId, ValueId),
-    /// Optional contraction, kept distinct from fused fma to preserve the
-    /// existing f64 lowering's llvm.fmuladd contract.
+
     MulAdd(ValueId, ValueId, ValueId),
     Convert(Cvt, Ty, ValueId),
     Const(Ty, u64),

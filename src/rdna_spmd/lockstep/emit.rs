@@ -1,22 +1,3 @@
-//! Lowering a lane program into a packet program that runs its lanes in
-//! lockstep.
-//!
-//! The packet program walks the lane program's regions in the order
-//! [`super::structure`] fixes. Every lane block runs under a *mask*: the lanes
-//! whose own control flow has brought them there. Where lanes disagree the
-//! blocks of both sides run one after the other under their own masks and the
-//! values they computed meet in a choice at the merge; where every lane agrees
-//! -- a uniform condition, a uniform trip count -- the query over the mask is a
-//! scalar test and the packet program simply branches, as a single program
-//! would. A span whose work would be wasted on an empty mask is skipped by a
-//! query over that mask.
-//!
-//! A loop becomes a packet loop carrying the mask of the lanes still in it.
-//! Lanes leave it at their own iteration: what they carry out is accumulated at
-//! the loop's end, unless no lane can leave while another continues, in which
-//! case every lane leaves on the last iteration and the values it computed
-//! there are what leaves.
-
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use super::cost::Costs;
 use super::mask::Masks;
@@ -25,8 +6,6 @@ use crate::rdna_spmd::dialect::{DialectRegistry, Effect};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// A lane value in the packet program: a value, or a bit held as a function of
-/// mask atoms so the algebra can still reason about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Val {
     Value(ValueId),
@@ -35,13 +14,10 @@ pub(super) enum Val {
 
 struct Arrival {
     mask: Bdd,
-    /// One entry per parameter of the block arrived at; `None` where nothing
-    /// reads the parameter.
+
     args: Vec<Option<Val>>,
 }
 
-/// A loop being emitted: where the lanes that go around again and the lanes
-/// that leave are collected.
 struct Frame {
     l: usize,
     header: BlockId,
@@ -49,26 +25,24 @@ struct Frame {
     exits: BTreeMap<BlockId, Vec<Arrival>>,
 }
 
-/// Lanes that left a loop for one block outside it.
 struct Leave {
     target: BlockId,
-    /// The parameters of the target the loop carries out.
+
     carried: Vec<(usize, ValueId, Ty)>,
     list: Vec<Arrival>,
-    /// The lanes that left on an earlier iteration, where a lane can.
+
     held: Bdd,
-    /// Where what those lanes carried out is kept, parameter by parameter.
+
     kept: Vec<Kept>,
 }
 
 enum Kept {
-    /// In the loop's own parameter, which the lane stops writing.
+
     Variable(usize),
-    /// In a parameter of its own the loop fills as lanes leave.
+
     Slot(Val),
 }
 
-/// The value every arrival brings for a parameter, if they all bring one.
 fn agreed(arrivals: &[Arrival], index: usize) -> Option<Val> {
     let first = arrivals.first()?.args[index]?;
     arrivals
@@ -77,7 +51,6 @@ fn agreed(arrivals: &[Arrival], index: usize) -> Option<Val> {
         .then_some(first)
 }
 
-/// A stretch of blocks a query over its mask branches around.
 struct Span {
     merge: BlockId,
     guard: BlockId,
@@ -95,10 +68,6 @@ pub(super) struct Lowering {
     pub masks: Masks,
 }
 
-/// Lowers a lane program for packets every lane of which runs it, as the
-/// independent dispatch runs them. An operation that needs every lane of the
-/// wave sits where the lanes are together: the decompiler keeps such an
-/// operation only there, so anywhere else is a lane program it did not make.
 pub(super) fn lower(
     q: &Func,
     s: &Structure,
@@ -146,8 +115,7 @@ pub(super) fn lower(
     e.out.entry = block;
     e.cur = block;
     let mut args = Vec::with_capacity(params.len());
-    // The dispatch starts the packet with the lanes that hold work items in
-    // EXEC, and at least one does; the rest ride along, at no block.
+
     let valid = e.masks.atom(params[exec], false, None);
     e.masks.assume_a_lane(valid);
     e.root = valid;
@@ -156,8 +124,7 @@ pub(super) fn lower(
     for (index, (&(p, ty), &value)) in entry.params.iter().zip(&params).enumerate() {
         let val = if ty == Ty::I1 {
             if index == exec {
-                // Every lane with a work item runs the lane program, so every
-                // lane that reads its own EXEC bit reads a one.
+
                 Val::Bit(Bdd::TRUE)
             } else {
                 Val::Bit(e.masks.atom(value, uniform[p.0], Some(p)))
@@ -203,32 +170,23 @@ struct Emit<'a> {
     frames: Vec<Frame>,
     scopes: Vec<Scope>,
     blocks: usize,
-    /// The predicates the private halves of flat accesses run under, by
-    /// provenance, decided with their global halves; `None` where no lane runs
-    /// the access.
+
     flat: HashMap<u64, Option<ValueId>>,
-    /// The next provenance for a wave query the lowering asks, above every
-    /// provenance the lane program's effects carry.
+
     provenance: u64,
-    /// The lane block being lowered.
+
     at: BlockId,
-    /// The mask of the lanes that hold work items: what every lane of the
-    /// wave being at a block means.
+
     root: Bdd,
-    /// For the function and each loop being lowered, innermost last, the mask
-    /// that holds every lane of the wave inside it: the root, a loop's mask
-    /// where every lane entered the loop, and nothing where lanes stayed out.
+
     full: Vec<Bdd>,
-    /// The depths in `full` of the operations that needed every lane and
-    /// found the mask of their loop, which holds every lane only if the loop
-    /// keeps the lanes together to its end.
+
     wanted: Vec<usize>,
-    /// Provenances of the kept queries that need every lane at them.
+
     demanded: &'a BTreeSet<u64>,
 }
 
 impl Emit<'_> {
-    // ---- the packet function under construction ----
 
     fn block(&mut self, types: &[Ty]) -> (BlockId, Vec<ValueId>) {
         let id = BlockId(self.blocks);
@@ -274,8 +232,6 @@ impl Emit<'_> {
         value
     }
 
-    /// A constant defined in an already terminated block, for an edge that
-    /// block branches along.
     fn constant_in(&mut self, block: BlockId, ty: Ty, bits: u64) -> ValueId {
         let value = self.out.value(ty);
         self.out
@@ -291,9 +247,6 @@ impl Emit<'_> {
         value
     }
 
-    // ---- masks ----
-
-    /// Emits the code that computes a mask, exactly, for every lane.
     fn materialize(&mut self, f: Bdd) -> ValueId {
         let f = self.masks.exact(f);
         self.build(f)
@@ -347,7 +300,6 @@ impl Emit<'_> {
         value
     }
 
-    /// How many instructions building a mask would emit.
     fn building(&self, f: Bdd) -> usize {
         if f.constant().is_some() || self.scopes.iter().any(|s| s.bits.contains_key(&f)) {
             return 0;
@@ -367,9 +319,6 @@ impl Emit<'_> {
         self.core(Ty::I1, Op::Int(IntOp::Xor, value, one))
     }
 
-    /// Whether any lane is in the mask, as a function of uniform atoms: a
-    /// uniform condition is tested as it stands, and only what is left over
-    /// costs a query over the lanes.
     fn query(&mut self, f: Bdd) -> Bdd {
         let f = self.masks.exact(f);
         if f.constant().is_some() {
@@ -403,7 +352,6 @@ impl Emit<'_> {
         answer
     }
 
-    /// Whether the query over a mask would only test uniform bits.
     fn query_is_scalar(&mut self, f: Bdd) -> bool {
         let f = self.masks.exact(f);
         if f.constant().is_some() || self.masks.holds_a_lane(f) {
@@ -426,8 +374,6 @@ impl Emit<'_> {
             .into_iter()
             .find(|&var| self.masks.at(var).uniform)
     }
-
-    // ---- lane values ----
 
     fn val(&mut self, v: ValueId) -> Val {
         let v = self.s.resolve(v);
@@ -469,8 +415,6 @@ impl Emit<'_> {
         }
     }
 
-    // ---- regions ----
-
     fn region(&mut self, l: Option<usize>) {
         let region = l.map_or(0, |l| l + 1);
         self.subtree(region, 0, false);
@@ -510,28 +454,11 @@ impl Emit<'_> {
         self.masks.exact(mask)
     }
 
-    /// Whether to skip a span when no lane is in its mask, by the operations
-    /// either choice is expected to perform.
-    ///
-    /// Without a query the span's work W is always done. With one, the query's
-    /// own work Q is always done, and when the mask holds no lane the span is
-    /// skipped and its merge moves a zero into each of the M registers of what
-    /// leaves it instead. Skipping pays when Q + (1 - e) W + e M < W, that is
-    /// when W > Q / e + M, where e is the chance that no lane takes the span.
-    ///
-    /// Nothing is known of how often a lane takes the span. The prior that
-    /// says so without depending on how that chance is written down is
-    /// Jeffreys', Beta(1/2, 1/2); with the `n` lanes that decide independently
-    /// -- the packet's lanes, or one when the query only tests bits every lane
-    /// shares -- all staying out,
-    /// e = E[(1 - p)^n] = B(1/2, n + 1/2) / B(1/2, 1/2) = prod_{k=1..n} (2k - 1) / 2k.
     fn decide(&mut self, region: usize, u: usize, mask: Bdd) -> Option<Span> {
         if self.masks.holds_a_lane(mask) {
             return None;
         }
-        // A wave operation runs for every packet of the wave at once, so a
-        // span holding one is run by every packet whatever its lanes -- or
-        // by none, where the lanes take the span all together or not at all.
+
         if self.keeps_wave(self.s.regions[region].span[u].iter().copied()) {
             let full = *self.full.last().unwrap();
             let own = self.masks.m.support(full);
@@ -550,9 +477,6 @@ impl Emit<'_> {
         (work as f64 > query as f64 / empty + merge as f64).then(|| self.open(mask))
     }
 
-    /// The operations a query over a mask performs before its branch: the
-    /// masks it builds, a reduction for each part that is not a uniform test,
-    /// and a choice for each uniform bit it tests.
     fn query_work(&mut self, f: Bdd) -> u64 {
         let f = self.masks.exact(f);
         if f.constant().is_some() || self.masks.holds_a_lane(f) {
@@ -571,10 +495,6 @@ impl Emit<'_> {
         }
     }
 
-    /// The operations a span performs, a loop in it counted for one trip, and
-    /// the operations its merge performs on the skipped path: a zero for every
-    /// value a block in the span defines that leaves it, and for the mask each
-    /// edge leaving it brings.
     fn span_work(&self, region: usize, u: usize) -> (u64, u64) {
         let blocks = &self.s.regions[region].span[u];
         let inside: BTreeSet<BlockId> = blocks.iter().copied().collect();
@@ -645,15 +565,12 @@ impl Emit<'_> {
         self.cur = run;
         self.scopes.push(Scope::default());
         self.masks.assume_a_lane(mask);
-        // A lane in the mask means whatever the mask tests that every lane
-        // shares holds.
+
         let shared = self.shared_part(mask);
         self.masks.assume(shared);
         span
     }
 
-    /// What a mask tests that every lane shares: the mask with its varying
-    /// bits quantified away.
     fn shared_part(&mut self, f: Bdd) -> Bdd {
         let f = self.masks.exact(f);
         let varying: Vec<u32> = self
@@ -689,8 +606,7 @@ impl Emit<'_> {
             inside.push((Route::Latch, header, latched));
             inside.extend(left.into_iter().map(|(t, list)| (Route::Exit, t, list)));
         }
-        // What the span computed and something after it reads crosses into
-        // the merge, where the skipped path brings nothing.
+
         let mut crossing = Crossing::default();
         for (_, _, list) in inside.iter_mut() {
             for arrival in list.iter_mut() {
@@ -795,8 +711,6 @@ impl Emit<'_> {
             .any(|var| var as usize >= atoms)
     }
 
-    /// Whether a packet value is a bit every lane agrees on, as far as the
-    /// atoms say; wider values carry no such claim across a merge.
     fn uniform_value(&self, value: ValueId) -> bool {
         self.masks
             .atoms()
@@ -812,8 +726,6 @@ impl Emit<'_> {
         }
         params
     }
-
-    // ---- blocks ----
 
     fn emit_block(&mut self, id: BlockId, arrivals: Vec<Arrival>, mask: Bdd) {
         self.at = id;
@@ -850,10 +762,6 @@ impl Emit<'_> {
         }
     }
 
-    // ---- loops ----
-
-    /// The parameters of a block the lowering carries: the ones something
-    /// reads and that do not merely forward a value from outside.
     fn carried(&self, block: BlockId) -> Vec<(usize, ValueId, Ty)> {
         self.q.blocks[&block]
             .params
@@ -871,7 +779,6 @@ impl Emit<'_> {
         }
     }
 
-    /// The values a block's carried parameters take from a set of arrivals.
     fn incoming(&mut self, block: BlockId, arrivals: &[Arrival], care: Bdd) -> Vec<Val> {
         let masks: Vec<Bdd> = arrivals.iter().map(|a| a.mask).collect();
         self.carried(block)
@@ -883,7 +790,6 @@ impl Emit<'_> {
             .collect()
     }
 
-    /// Reads a block parameter of the packet program as a lane value.
     fn param_val(&mut self, value: ValueId, lane: ValueId, ty: Ty) -> Val {
         if ty == Ty::I1 {
             Val::Bit(self.masks.atom(value, self.uniform[lane.0], Some(lane)))
@@ -918,8 +824,7 @@ impl Emit<'_> {
         }
         let guard = self.cur;
         let held = self.masks.holds_a_lane(entered);
-        // A loop holding a wave operation goes around while any lane of the
-        // wave does, so that every packet meets the operation together.
+
         let wave = self.keeps_wave(self.loop_blocks(l));
         if held {
             self.terminate(Term::Br(Edge {
@@ -946,15 +851,14 @@ impl Emit<'_> {
                 },
             });
         }
-        // The body runs under the mask of the lanes still going around.
+
         self.cur = head;
         self.scopes.push(Scope::default());
         let knowledge = self.masks.knowledge();
         let mask = self.masks.atom(params[0], false, None);
         self.masks.assume_a_lane(mask);
         self.masks.assume_within(mask, entered);
-        // The loop's mask holds every lane of the wave while every lane
-        // entered and the lanes go around together.
+
         let together = self.masks.exact(entered) == *self.full.last().unwrap();
         self.full.push(if together { mask } else { Bdd::FALSE });
         let mut args: Vec<Option<Val>> = vec![None; self.q.blocks[&header].params.len()];
@@ -997,8 +901,7 @@ impl Emit<'_> {
             self.query(continuing)
         };
         let cond = self.materialize(answer);
-        // What each carried parameter goes around with, where every lane that
-        // goes around brings the same value.
+
         let around: Vec<Option<Val>> = carried
             .iter()
             .map(|&(index, _, _)| agreed(&frame.latches, index))
@@ -1007,9 +910,7 @@ impl Emit<'_> {
         let mut leaves: Vec<Leave> = Vec::new();
         for (target, list) in frame.exits {
             let left = self.union(&list);
-            // A lane that leaves while others go around has to carry what it
-            // computed to the end of the loop. Where no lane can, every lane
-            // leaves together and carries out what the last iteration made.
+
             let early = self.masks.coexist(left, continuing);
             let mut leave = Leave {
                 target,
@@ -1032,10 +933,7 @@ impl Emit<'_> {
                     let out = agreed(&leave.list, index);
                     let same = out.and_then(|v| around.iter().position(|&a| a == Some(v)));
                     let kept = match same {
-                        // The lane leaves with the value it would have gone
-                        // around with, so the header parameter keeps it: a
-                        // masked store the loop's mask stops writing once the
-                        // lane is gone, as a variable is in ISPC.
+
                         Some(k) => {
                             kept_around[k] = true;
                             Kept::Variable(k)
@@ -1101,7 +999,7 @@ impl Emit<'_> {
         }
         self.masks.restore(knowledge);
         self.scopes.pop();
-        // What left the loop arrives after it.
+
         let types: Vec<Ty> = leaves
             .iter()
             .flat_map(|leave| {
@@ -1117,9 +1015,7 @@ impl Emit<'_> {
             self.extend_edge(guard, after, &zeros);
         }
         self.cur = after;
-        // Every lane that entered leaves by one of the exits -- a block that
-        // returns cannot reach the latch, so it is an exit too -- and by one
-        // only, so the last exit's lanes are the ones the others did not take.
+
         let mut taken = Bdd::FALSE;
         let mut at = 0usize;
         let count = leaves.len();
@@ -1150,8 +1046,6 @@ impl Emit<'_> {
         }
     }
 
-    /// The values one of the two edges out of a loop body carries, under what
-    /// that edge has already decided about the lanes.
     #[allow(clippy::too_many_arguments)]
     fn loop_edge(
         &mut self,
@@ -1256,7 +1150,6 @@ impl Emit<'_> {
         }
     }
 
-    /// The value a parameter takes: whichever arrival brought the lane there.
     fn blend(&mut self, ty: Ty, masks: &[Bdd], vals: &[Option<Val>], care: Bdd) -> Val {
         let mut groups: Vec<(Val, Bdd)> = Vec::new();
         for (&m, val) in masks.iter().zip(vals) {
@@ -1307,8 +1200,7 @@ impl Emit<'_> {
         let (Val::Value(a), Val::Value(b)) = (taken, other) else {
             unreachable!("a value wider than a bit is held as a value");
         };
-        // Choosing the other way round on the opposite condition is the same
-        // choice; test whichever condition costs less to compute.
+
         let flipped = self.masks.not(discriminator);
         if self.building(flipped) < self.building(discriminator) {
             let c = self.build(flipped);
@@ -1318,13 +1210,6 @@ impl Emit<'_> {
         Val::Value(self.core(ty, Op::Select(c, a, b)))
     }
 
-    // ---- instructions ----
-
-    /// The predicate a memory access runs under. The two halves of a flat
-    /// access -- the global words outside the scratch aperture and the private
-    /// words inside it -- keep the form that makes them one access: the global
-    /// half runs under `active & !inside` and the private half under
-    /// `active & inside`, where `active` is every lane doing either.
     fn access_predicate(
         &mut self,
         rest: &[Inst],
@@ -1431,9 +1316,7 @@ impl Emit<'_> {
                                 && !immediates.contains(&index)
                                 && mask != Bdd::TRUE =>
                         {
-                            // The operation reads for every lane whatever its
-                            // operands say, so an inactive lane's operands are
-                            // suppressed instead of its result.
+
                             let operand = self.value(v);
                             let zero = self.constant(ty, 0);
                             let active = self.materialize(mask);
@@ -1532,8 +1415,6 @@ impl Emit<'_> {
         }
     }
 
-    /// Whether a block among `blocks` holds an operation the packets of a
-    /// wave meet together: one over the wave, or a barrier.
     fn keeps_wave(&self, blocks: impl Iterator<Item = BlockId>) -> bool {
         blocks.into_iter().any(|b| {
             self.q.blocks[&b].insts.iter().any(|inst| {
@@ -1550,10 +1431,6 @@ impl Emit<'_> {
         })
     }
 
-    /// Every lane of the wave is at the block: an operation that reads or
-    /// writes the lanes' registers across lanes, or holds them at a barrier,
-    /// reads a lane that is elsewhere as something it is not, so a lane
-    /// program holds one only where its lanes are together.
     fn everyone(&mut self, mask: Bdd) {
         let full = *self.full.last().unwrap();
         assert!(
@@ -1564,16 +1441,11 @@ impl Emit<'_> {
         self.wanted.push(self.full.len() - 1);
     }
 
-    /// Whether the lanes that go around a loop are all of the lanes in it or
-    /// none: the mask going around tests nothing varying but the loop's own
-    /// mask.
     fn go_around_together(&mut self, mask: Bdd, continuing: Bdd) -> bool {
         let own: BTreeSet<u32> = self.masks.m.support(mask);
         self.all_or_none(continuing, &own)
     }
 
-    /// Whether a mask holds every lane of `own` or none of them: it tests
-    /// nothing varying beyond `own`.
     fn all_or_none(&mut self, f: Bdd, own: &BTreeSet<u32>) -> bool {
         let f = self.masks.exact(f);
         self.masks
@@ -1583,7 +1455,6 @@ impl Emit<'_> {
             .all(|var| own.contains(&var) || self.masks.at(var).uniform)
     }
 
-    /// An effect kept as it is, its inputs the lane values.
     fn emit_effect(
         &mut self,
         provenance: u64,
@@ -1621,8 +1492,6 @@ impl Emit<'_> {
         p
     }
 
-    /// A wave operation the lane program kept: it runs over the lanes at it,
-    /// which the mask holds, and answers the same for every lane.
     fn emit_wave(
         &mut self,
         provenance: u64,
@@ -1686,10 +1555,6 @@ impl Emit<'_> {
         }
     }
 
-    /// Whether any lane of the wave holds a mask: answered without the wave
-    /// where the packet's own lanes settle it, and otherwise asked of the
-    /// wave. Unlike a packet query, a wave query is not split on uniform
-    /// bits, which the packets of a wave need not share.
     fn wave_query(&mut self, provenance: u64, f: Bdd) -> Bdd {
         let f = self.masks.exact(f);
         if f.constant().is_some() {

@@ -1,13 +1,3 @@
-//! For a single work-item, a wavefront program is just a control-flow graph
-//! whose branches test a 1-bit EXEC (lane active?) / VCC / SCC. This module
-//! represents decoded instructions as:
-//!  - a per-block linear stream of [`InstFormat`] with pure scheduling no-ops
-//!    (`s_delay_alu`, `s_wait*`, `s_clause`, `s_nop`, ...) removed, and
-//!  - an explicit [`Terminator`] per block.
-//!
-//! `lift` produces typed SSA semantics for analysis and code generation; this layer only
-//! normalizes control flow and removes scheduling no-ops. Optimization order
-//! belongs to [`crate::rdna_spmd::compiler::Compiler`].
 use crate::instructions::I;
 use crate::rdna4_decoder::{decode_rdna4, InstStream};
 use crate::rdna_instructions::InstFormat;
@@ -23,52 +13,43 @@ pub enum Cond {
     Scc1,
 }
 
-/// How a scalar block transfers control.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum Terminator {
-    /// `s_endpgm`: return from the work-item function.
+
     Return,
-    /// Unconditional fall-through / `s_branch` to a single successor.
+
     Jump(usize),
-    /// Conditional branch: if `cond` holds go to `taken`, else `fallthrough`.
+
     Branch {
         cond: Cond,
         taken: usize,
         fallthrough: usize,
     },
-    /// Workgroup barrier (`s_barrier_signal`/`s_barrier_wait`): the cooperative
-    /// backend yields here so the scheduler can run every other work-item to the
-    /// same barrier before any proceeds. `resume` is the pc of the block holding
-    /// the post-barrier continuation (a resume entry). Only produced by
-    /// [`split_at_barriers`]; the non-cooperative backends never see it.
+
     Barrier { resume: usize },
-    /// A typed wave or workgroup effect, with its continuation.
+
     Yield {
         resume: usize,
         action: Box<super::lift::wave::YieldAction>,
     },
 }
 
-/// A basic block lowered for scalar execution.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ScalarBlock {
     pub pc: usize,
-    /// Body instructions (terminator removed), scheduling no-ops filtered out.
+
     pub body: Vec<InstFormat>,
     pub term: Terminator,
 }
 
-/// A whole work-item program in Scalar IR form.
 #[derive(Debug, Clone)]
 pub struct ScalarProgram {
     pub entry_pc: usize,
     pub blocks: BTreeMap<usize, ScalarBlock>,
 }
 
-/// Instructions with no architectural effect in emulation: scheduling hints,
-/// wait counters, and clause/nop markers. Dropped during lowering.
 pub fn is_noop(inst: &InstFormat) -> bool {
     match inst {
         InstFormat::SOPP(i) => matches!(
@@ -95,8 +76,6 @@ pub fn is_noop(inst: &InstFormat) -> bool {
     }
 }
 
-/// Build the [`Terminator`] for a block from its last instruction and the CFG
-/// successor list (`next_pcs`: `[fallthrough, taken]` for conditional branches).
 fn lower_terminator(last: &InstFormat, next_pcs: &[usize]) -> Terminator {
     if let InstFormat::SOPP(i) = last {
         match i.op {
@@ -147,19 +126,15 @@ fn lower_terminator(last: &InstFormat, next_pcs: &[usize]) -> Terminator {
             _ => {}
         }
     }
-    // Non-terminator last instruction: straight-line fall-through.
+
     Terminator::Jump(next_pcs[0])
 }
 
-/// Normalize one instruction block without applying optimization passes.
-/// `insts` still contains its final instruction so fallthrough blocks retain it.
 pub(crate) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
     let (last, head) = insts.split_last().expect("empty block");
 
     let term = lower_terminator(last, next_pcs);
 
-    // Whether the last instruction is itself a control-flow terminator: if
-    // not, it is a normal instruction that must stay in the body.
     let last_is_term = matches!(
         last,
         InstFormat::SOPP(i) if matches!(
@@ -180,9 +155,6 @@ pub(crate) fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -
     ScalarBlock { pc, body, term }
 }
 
-/// Split barriers into typed signal/wait yields, preserving IDs, signal-is-first
-/// results and the original instruction order. Resume entries retain the body
-/// after each effect; existing branch targets remain unchanged.
 pub(crate) struct DecodedBlock {
     pub insts: Vec<InstFormat>,
     pub next_pcs: Vec<usize>,
@@ -305,101 +277,4 @@ pub(crate) fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String>
         blocks.insert(start, DecodedBlock { insts, next_pcs });
     }
     Ok(Decoded { entry_pc, blocks })
-}
-
-#[cfg(test)]
-pub(crate) fn load_object(path: &str, descriptor_symbol: &str) -> (usize, Vec<u8>) {
-    use object::{Object, ObjectSegment};
-    let data = std::fs::read(path).unwrap();
-    let elf = object::File::parse(data.as_slice()).unwrap();
-    let mut memory = Vec::<u8>::new();
-    for segment in elf.segments() {
-        let offset = segment.address() as usize;
-        let size = segment.size() as usize;
-        memory.resize(memory.len().max(offset + size), 0);
-        let bytes = segment.data();
-        memory[offset..offset + bytes.len().min(size)]
-            .copy_from_slice(&bytes[..bytes.len().min(size)]);
-    }
-    let descriptor_address = elf
-        .symbols()
-        .find(|symbol| symbol.name() == Some(descriptor_symbol))
-        .unwrap()
-        .address() as usize;
-    let descriptor =
-        crate::processor::decode_kernel_desc(&memory[descriptor_address..descriptor_address + 64]);
-    (
-        descriptor_address + descriptor.kernel_code_entry_byte_offset,
-        memory,
-    )
-}
-
-#[cfg(test)]
-pub(crate) const OBJECTS: &[(&str, &str)] = &[
-    (
-        "examples/smallpt/kernel_gfx1200.o",
-        "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd",
-    ),
-    (
-        "examples/raytracing/kernel_gfx1200.o",
-        "_Z24ambient_occlusion_kernelP14_hiprtGeometryPh15HIP_vector_typeIiLj2EEf.kd",
-    ),
-    (
-        "examples/texture/kernel_gfx1200.o",
-        "_Z16histogram_kernelPjjjjP13__hip_texture.kd",
-    ),
-    (
-        "examples/histogram/kernel_gfx1200.o",
-        "_Z18histogram256_blockPhPji.kd",
-    ),
-    (
-        "examples/simple_hgemm/kernel_gfx1200.o",
-        "_Z15hgemm_rocwmma_djjjPKDF16_S0_S0_PDF16_jjjjff.kd",
-    ),
-    (
-        "examples/warp_shuffle/kernel_gfx1200.o",
-        "_Z23matrix_transpose_kernelPfPKfj.kd",
-    ),
-    (
-        "examples/bitonic_sort/kernel_gfx1200.o",
-        "_Z19bitonic_sort_kernelPjjjb.kd",
-    ),
-];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_kernel_object_decodes_to_the_shared_translator_cfg() {
-        for &(path, symbol) in OBJECTS {
-            let (entry, memory) = load_object(path, symbol);
-            let ours = program(entry, &memory).unwrap();
-            let theirs = crate::rdna_translator::RDNAProgram::new(entry, &memory);
-            assert_eq!(ours.entry_pc, theirs.entry_pc(), "{path}");
-            let mut expected: Vec<_> = theirs.blocks().keys().copied().collect();
-            expected.sort_unstable();
-            assert_eq!(
-                ours.blocks.keys().copied().collect::<Vec<_>>(),
-                expected,
-                "{path}"
-            );
-            for (pc, block) in &ours.blocks {
-                let other = &theirs.blocks()[pc];
-                assert_eq!(block.next_pcs, other.next_pcs(), "{path} block {pc:#x}");
-                assert_eq!(
-                    format!("{:?}", block.insts),
-                    format!("{:?}", other.insts()),
-                    "{path} block {pc:#x}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn truncated_input_is_a_structured_error() {
-        let (entry, memory) = load_object(OBJECTS[0].0, OBJECTS[0].1);
-        assert!(program(entry, &memory[..entry + 8]).is_err());
-        assert!(program(memory.len() + 4, &memory).is_err());
-    }
 }

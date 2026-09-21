@@ -1,4 +1,3 @@
-//! Memory decoding and address semantics; no LLVM or execution-width knowledge.
 use super::input;
 use crate::rdna_spmd::ir::*;
 use crate::{
@@ -50,7 +49,7 @@ struct LdsPair {
     second_data: u32,
 }
 impl Memory {
-    /// Byte displacement of one word, including noncontiguous LDS addresses.
+
     pub fn word_offset(&self, word: u32) -> u32 {
         match &self.pair {
             Some(pair) => {
@@ -102,8 +101,6 @@ fn sext(v: u32) -> i64 {
     ((v << 8) as i32 >> 8) as i64
 }
 
-/// RDNA4 ISA §4.1.4, Tables 12–16. Reserved fields are rejected at lift.
-/// https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content
 fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
     let scope = match scope {
         0 => Scope::ComputeUnit,
@@ -295,10 +292,7 @@ pub(in crate::rdna_spmd) fn instruction(inst: &InstFormat) -> Option<Memory> {
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
         _ => panic!("unsupported memory lift {:?}", opcode),
     };
-    // RDNA4 ISA §16.15 DS_LOAD/STORE_2ADDR: each offset counts elements
-    // (4 or 8 bytes); STRIDE64 multiplies that element stride by 64. DATA1
-    // supplies the second store's source independently of DATA0.
-    // https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content
+
     let pair = if matches!(
         opcode,
         I::DS_LOAD_2ADDR_B32
@@ -463,7 +457,7 @@ impl Memory {
                 views,
             )
         };
-        // Collect register operands first, preserving their ISA widths.
+
         let (s, v, offset, ty) = match self.address {
             Address::Global {
                 scalar,
@@ -673,8 +667,7 @@ fn flat_aperture(
         value
     };
     let hi = push(Ty::I64, Op::Int(IntOp::Add, sb, size));
-    // RDNA4 ISA section 11.2: classify the base before IOFFSET.
-    // Keeping this separate also shares the aperture test across fields.
+
     let ge = push(Ty::I1, Op::Cmp(IntPred::Uge, base, sb));
     let lt = push(Ty::I1, Op::Cmp(IntPred::Ult, base, hi));
     let inside = push(Ty::I1, Op::Int(IntOp::And, ge, lt));

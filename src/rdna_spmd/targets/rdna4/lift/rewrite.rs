@@ -1,16 +1,13 @@
-//! Decode conservative rewrite eligibility and attach SSA observations.
 use super::regs::Word;
 use super::*;
-// SGPRs live at 0.., VGPRs at VGPR_BASE.. in the pass's register numbering.
+
 pub(super) const VGPR_BASE: u32 = 512;
 
 const SGPR_NULL: u32 = 124;
 
 pub(super) struct InstEffects {
     pub reads: Vec<u32>,
-    // Registers fully written by the instruction. Must be exact or
-    // under-approximated: a partial write (e.g. 16-bit halves) must not be
-    // listed here.
+
     pub kills: Vec<u32>,
 }
 
@@ -63,9 +60,6 @@ fn kill_vgpr(reg: u32, words: u32, kills: &mut Vec<u32>) {
     }
 }
 
-// Width of each operand in 32-bit words for instructions the pass
-// understands; (src_words, dst_words). Reads may be over-approximated,
-// kills must not be.
 fn vop3_arith_widths(op: &I) -> Option<(u32, u32)> {
     match op {
         I::V_FMA_F64
@@ -267,7 +261,7 @@ fn vop3_effects(inst: &crate::rdna_instructions::VOP3) -> InstEffects {
             .known();
     }
     if name.starts_with("V_CMP_") {
-        // VOP3-encoded compare: vdst is the destination SGPR.
+
         return Effects::default()
             .read(&inst.src0, 2)
             .read(&inst.src1, 2)
@@ -326,8 +320,7 @@ fn vglobal_effects(inst: &crate::rdna_instructions::VGLOBAL) -> InstEffects {
     }
     let effects = effects.read_exec();
     if name.starts_with("GLOBAL_LOAD") {
-        // Loads only write lanes with EXEC set, so the destination is
-        // a partial write: model it as a read, never a kill.
+
         effects.read_vgpr(inst.vdst as u32, data_words).known()
     } else if name.starts_with("GLOBAL_STORE") {
         effects.read_vgpr(inst.vsrc as u32, data_words).known()
@@ -358,9 +351,7 @@ fn vopd_half(op: &I, src0: &SourceOperand, vsrc1: u8, vdst: u32) -> Option<Effec
 }
 
 fn vopd_effects(inst: &crate::rdna_instructions::VOPD) -> InstEffects {
-    // VOPD Y-op's real VGPR is (vdsty << 1) | ((vdstx & 1) ^ 1) — opposite
-    // parity of X — not vdsty directly. Using vdsty here made the DCE treat
-    // the wrong register as killed and drop live producers of the real one.
+
     let dy = ((inst.vdsty as u32) << 1) | (((inst.vdstx as u32) & 1) ^ 1);
     match (
         vopd_half(&inst.opx, &inst.src0x, inst.vsrc1x, inst.vdstx as u32),
@@ -382,12 +373,12 @@ pub(super) fn effects_of(inst: &InstFormat) -> InstEffects {
         InstFormat::SOPP(inst) => sopp_effects(inst.op),
         InstFormat::SOP1(inst) => sop1_effects(inst),
         InstFormat::SOP2(inst) => sop2_effects(inst),
-        // SOPC compares only write SCC, which this pass does not model.
+
         InstFormat::SOPC(inst) => Effects::default()
             .read(&inst.ssrc0, 2)
             .read(&inst.ssrc1, 2)
             .known(),
-        // Conservatively treat the destination as read.
+
         InstFormat::SOPK(inst) => Effects::default().read_sgpr(inst.sdst as u32, 2).known(),
         InstFormat::VOPC(inst) => vopc_effects(inst),
         InstFormat::VOP1(inst) => vop1_effects(inst),

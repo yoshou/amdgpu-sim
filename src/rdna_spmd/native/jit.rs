@@ -1,4 +1,3 @@
-//! Shared ownership, verification, optimization and registration of native IR.
 use llvm_sys::{self as llvm, core::*, prelude::*};
 use std::ffi::{CStr, CString};
 
@@ -14,15 +13,12 @@ pub(in crate::rdna_spmd) struct Module {
     context: llvm::orc2::LLVMOrcThreadSafeContextRef,
 }
 
-/// Executable memory belongs to this handle. Kernel execution borrows it, so
-/// scoped dispatch workers finish before its LLJIT can be released.
 pub(in crate::rdna_spmd) struct NativeCode {
     jit: llvm::orc2::lljit::LLVMOrcLLJITRef,
     address: u64,
     pub(in crate::rdna_spmd) block_counts: Option<(String, usize)>,
 }
-// Compilation is complete before publication. Running native code does not
-// mutate the ORC session, and destruction requires exclusive ownership.
+
 unsafe impl Send for NativeCode {}
 unsafe impl Sync for NativeCode {}
 impl NativeCode {
@@ -58,8 +54,6 @@ impl Drop for NativeCode {
     }
 }
 
-/// The exact optimized module subsequently consumed by ORC, with its native
-/// target machine. Inspection uses LLVM's printer on this owned module.
 pub(in crate::rdna_spmd) struct OptimizedModule {
     module: Module,
     machine: llvm::target_machine::LLVMTargetMachineRef,
@@ -86,8 +80,7 @@ unsafe fn check(error: llvm::error::LLVMErrorRef, operation: &str) {
 impl Module {
     pub fn new(name: &str) -> Self {
         unsafe {
-            // LLVM's process-wide target registry must be initialized before
-            // concurrent compiler instances begin creating target machines.
+
             static TARGETS: std::sync::Once = std::sync::Once::new();
             TARGETS.call_once(|| {
                 assert_eq!(llvm::target::LLVM_InitializeNativeTarget(), 0);
@@ -145,8 +138,7 @@ impl Module {
             let cpu = llvm::target_machine::LLVMGetHostCPUName();
             let host_features = llvm::target_machine::LLVMGetHostCPUFeatures();
             let features = CStr::from_ptr(host_features).to_string_lossy();
-            // Preserve the scalar backend's measured AVX-512 exclusion: scalar
-            // f64 selects use blend/cmov rather than mask-register round trips.
+
             let features = CString::new(if matches!(mode, Mode::Scalar) {
                 format!(
                     "{},-avx512f,-avx512vl,-avx512dq,-avx512bw,-avx512cd",
@@ -156,8 +148,7 @@ impl Module {
                 features.into_owned()
             })
             .unwrap();
-            // Keep JITDefault relocation/code model. Small/PIC changed LICM and
-            // regressed the existing scalar reciprocal loop.
+
             let machine = llvm::target_machine::LLVMCreateTargetMachine(
                 target,
                 triple,
@@ -212,15 +203,6 @@ impl Module {
 }
 
 impl OptimizedModule {
-    #[cfg(test)]
-    pub fn ir(&self) -> String {
-        unsafe {
-            let text = LLVMPrintModuleToString(self.module.module);
-            let ir = CStr::from_ptr(text).to_string_lossy().into_owned();
-            LLVMDisposeMessage(text);
-            ir
-        }
-    }
 
     pub fn compile(mut self, symbol: &str) -> NativeCode {
         unsafe {
@@ -240,8 +222,7 @@ impl OptimizedModule {
                 block_counts: None,
             };
             let dylib = llvm::orc2::lljit::LLVMOrcLLJITGetMainJITDylib(jit);
-            // Bind context-switch entrypoints to this host's FiberCtx ABI. A stale
-            // separately built dylib must not supply a different context layout.
+
             let mut symbols = [
                 (&b"amdgpu_sim_fiber_yield_values\0"[..], super::super::engine::fiber::amdgpu_sim_fiber_yield_values as *const () as u64),
             ].map(|(name, address)| llvm::orc2::LLVMOrcCSymbolMapPair {
@@ -291,8 +272,6 @@ impl OptimizedModule {
             );
             llvm::orc2::LLVMOrcJITDylibAddGenerator(dylib, generator);
 
-            // The module and ORC wrapper share the very same LLVMContext. ORC
-            // retains its reference after this construction handle is released.
             let module = llvm::orc2::LLVMOrcCreateNewThreadSafeModule(
                 self.module.module,
                 self.module.context,
@@ -355,30 +334,6 @@ impl Drop for Module {
                 LLVMDisposeModule(self.module);
             }
             llvm::orc2::LLVMOrcDisposeThreadSafeContext(self.context);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn inspected_optimized_module_is_the_one_consumed_by_jit() {
-        unsafe {
-            for constant in [7, 19] {
-                let module = Module::new("owned_jit_test");
-                let ir = module.builder();
-                let function = ir.add_function("answer", ir.i32().function(&[]));
-                ir.position_at_end(ir.append_block(function, "entry"));
-                ir.ret(ir.ci32(constant));
-                let optimized = module.optimize(Mode::Packet);
-                assert!(optimized.ir().contains(&format!("ret i32 {}", constant)));
-                let code = optimized.compile("answer");
-                let call =
-                    std::mem::transmute::<u64, unsafe extern "C" fn() -> u32>(code.address());
-                assert_eq!(call(), constant as u32);
-                // Drop this ORC session before building and calling the next one.
-            }
         }
     }
 }

@@ -1,4 +1,3 @@
-//! Comparison semantics shared by VOPC and VOP3, before mask writeback.
 use super::*;
 use crate::instructions::{OP16, OP8};
 
@@ -277,7 +276,7 @@ pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Opti
             a = b.bits_mod(ty, comparison.bits, a, abs, neg, 0);
             c = b.bits_mod(ty, comparison.bits, c, abs, neg, 1);
             if comparison.bits == 16 {
-                // Restore sign extension after changing bit 15.
+
                 a = half_word(&mut b, a, false, signed);
                 c = half_word(&mut b, c, false, signed);
             }
@@ -340,9 +339,6 @@ fn half_word(b: &mut Builder, value: ValueId, high: bool, signed: bool) -> Value
     }
 }
 
-/// ISA class bits are sNaN, qNaN, -inf, -normal, -subnormal, -zero,
-/// +zero, +subnormal, +normal, +inf. The class selector is a runtime word,
-/// including per-lane selectors; LLVM's immarg fpclass cannot express it.
 fn classify(b: &mut Builder, ty: Ty, bits: u32, value: ValueId, selector: ValueId) -> ValueId {
     let fraction_bits = match bits {
         16 => 10,

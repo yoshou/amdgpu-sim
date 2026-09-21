@@ -1,50 +1,18 @@
-//! Which lanes are present in a region of the function.
-//!
-//! A region's [`Presence`] is the set of lanes guaranteed to be at the region's
-//! entry at the same time. `Own` promises nothing about the other lanes, so
-//! nothing in an `Own` region may read them; `Packet` promises the lanes the
-//! lowering runs in lockstep, which is what a query over the packet needs;
-//! `Wave` promises every lane of the wave, the mask saying which of them are
-//! active, which is what a wave operation needs since it reads the registers of
-//! lanes EXEC leaves out; `Workgroup` promises the same of every wave of the
-//! work group, which is what a barrier needs.
-//!
-//! An operation may always run where more lanes are present than it reads, so
-//! one rule covers them all: an operation belongs in a region whose presence is
-//! at least what it reads.
-//!
-//! The set does not grow as the regions nest. A `Wave` region inside an `Own`
-//! region could not be entered: the lanes of an `Own` region are wherever their
-//! own control flow took them, and nothing reconverges them part way through a
-//! region. So a region that keeps lanes together forces every region enclosing
-//! it to keep them together as well, while its siblings stay free.
-//!
-//! A region is named by the block it is entered at, and holds every block that
-//! entry dominates and no inner region's entry does. Nesting is therefore
-//! dominance between entries, and a region cannot be entered anywhere but at
-//! its entry. Adding or removing ordinary blocks leaves the regions alone; only
-//! removing an entry removes a region. The whole function at `Wave` -- one
-//! region, entered at the function's entry -- is the wave program the lifter
-//! makes.
-
 use super::{BlockId, Func};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Presence {
-    /// Only the lane running the code; the others are wherever they are.
+
     Own,
-    /// Every lane of the packet, which runs them in lockstep. This is what a
-    /// lowered `Own` region becomes: the lowering brings the packet's lanes
-    /// together, so a query over the packet can be answered there.
+
     Packet,
-    /// Every lane of the wave, the mask saying which are active.
+
     Wave,
-    /// Every lane of every wave of the work group.
+
     Workgroup,
 }
 
-/// Each block's immediate dominator. A block the entry does not reach has none.
 pub(crate) struct Dominators {
     pub order: Vec<BlockId>,
     idom: BTreeMap<BlockId, BlockId>,
@@ -110,7 +78,6 @@ impl Dominators {
         }
     }
 
-    /// Whether `a` dominates `b`, which it does to itself.
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         let mut at = b;
         loop {
@@ -125,7 +92,6 @@ impl Dominators {
     }
 }
 
-/// The blocks a function's entry reaches, in reverse postorder.
 pub(crate) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
     let mut seen = BTreeSet::from([f.entry]);
     let mut order = Vec::new();
@@ -150,14 +116,11 @@ pub(crate) fn reverse_postorder(f: &Func) -> Vec<BlockId> {
 }
 
 impl Func {
-    /// Puts the whole function in one region with `presence` there.
+
     pub fn one_region(&mut self, presence: Presence) {
         self.regions = BTreeMap::from([(self.entry, presence)]);
     }
 
-    /// Lowering to packets of lanes running in lockstep brings the lanes of a
-    /// packet together, so a region that had only its own lane now has the
-    /// packet. What already had the wave or the work group is unchanged.
     pub fn lowered_to_packets(&mut self) {
         for present in self.regions.values_mut() {
             if *present == Presence::Own {
@@ -166,9 +129,6 @@ impl Func {
         }
     }
 
-    /// The least a region holding the whole function must have present: the
-    /// lanes its operations read beyond the one running them. A function that
-    /// reads no other lane needs none of them present.
     pub fn presence_needed(&self) -> Presence {
         self.blocks
             .values()
@@ -178,8 +138,6 @@ impl Func {
             .unwrap_or(Presence::Own)
     }
 
-    /// Whether an operation reads the packet running it, which only a program
-    /// lowered to packets does.
     pub fn reads_the_packet(&self) -> bool {
         self.blocks
             .values()
@@ -187,9 +145,6 @@ impl Func {
             .any(|inst| super::verify::lanes_read(inst) == Some(Presence::Packet))
     }
 
-    /// Which region each block belongs to, named by the region's entry: the
-    /// innermost region whose entry dominates the block. Blocks the function's
-    /// entry does not reach are left out.
     pub fn regions_of(&self, doms: &Dominators) -> BTreeMap<BlockId, BlockId> {
         let depth = |e: BlockId| self.regions.keys().filter(|&&o| doms.dominates(o, e)).count();
         let depths: BTreeMap<BlockId, usize> =
@@ -208,8 +163,6 @@ impl Func {
         out
     }
 
-    /// Whether the region entered at `outer` encloses the one entered at
-    /// `inner`, which it does not do to itself.
     pub fn encloses(&self, doms: &Dominators, outer: BlockId, inner: BlockId) -> bool {
         outer != inner && doms.dominates(outer, inner)
     }

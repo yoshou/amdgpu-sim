@@ -1,7 +1,3 @@
-//! ISA §16.12 LDEXP: x * 2^n with one final rounding. AVX-512 SCALEF
-//! retains the existing native vector implementation. Portable prescaling
-//! prevents premature underflow: negative chunks are applied only below Emin
-//! and retain a full significand's headroom before the final multiplication.
 use super::*;
 
 pub(super) fn f32(e: &Emitter, a: &[Value]) -> Value {
@@ -93,7 +89,7 @@ fn native_scale(e: &Emitter, ty: Ty, value: Value, exponent: Value, w: u32, nati
         let types = args.iter().map(|a| a.ty()).collect::<Vec<_>>();
         parts.push(ir.call_named(&name, chunk_ty, &types, &args));
     }
-    // W / lanes is a power of two: join neighbouring chunks until one remains.
+
     while parts.len() > 1 {
         let mask: Vec<u32> = (0..2 * parts[0].ty().vector_size()).collect();
         parts = parts

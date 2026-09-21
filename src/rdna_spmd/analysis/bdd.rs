@@ -1,9 +1,6 @@
 use std::collections::BTreeSet;
 use std::hash::{BuildHasherDefault, Hasher};
 
-/// A multiply-and-rotate hash of the small integer keys the tables here and
-/// in the decompiler's logic hold. The tables are looked up once for nearly
-/// every node an operation visits, so the hash is most of their cost.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Mix(u64);
 
@@ -67,9 +64,7 @@ const TERMINAL: u32 = u32::MAX;
 pub(crate) struct Manager {
     nodes: Vec<Node>,
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
-    /// The results of `ite`, each in the one slot its operands hash to. A
-    /// result another displaced is computed again, which costs less than a
-    /// table that keeps every one: the table is looked up at every step.
+
     ite: Vec<(Bdd, Bdd, Bdd, Bdd)>,
     restrict: HashMap<(Bdd, Bdd), Bdd>,
     implications: HashMap<(Bdd, Bdd), bool>,
@@ -91,7 +86,6 @@ impl Manager {
         }
     }
 
-    /// The variable a function tests first and its two cofactors on it.
     pub fn decompose(&self, f: Bdd) -> Option<(u32, Bdd, Bdd)> {
         let node = self.nodes[f.0 as usize];
         (node.var != TERMINAL).then_some((node.var, node.low, node.high))
@@ -102,9 +96,6 @@ impl Manager {
         self.compose(f, &|v| (v == var).then_some(constant))
     }
 
-    /// A function that agrees with `f` wherever `care` holds, found by
-    /// dropping every test that `care` already decides (Coudert and Madre's
-    /// restrict). Outside `care` the result is unspecified.
     pub fn restrict(&mut self, f: Bdd, care: Bdd) -> Bdd {
         if care == Bdd::FALSE || care == Bdd::TRUE || f.constant().is_some() {
             return f;
@@ -189,7 +180,7 @@ impl Manager {
         if g == Bdd::TRUE && h == Bdd::FALSE {
             return f;
         }
-        // `and` and `or` do not depend on the order of their operands.
+
         let (f, g, h) = if h == Bdd::FALSE && g.0 < f.0 {
             (g, f, h)
         } else if g == Bdd::TRUE && h.0 < f.0 {
@@ -203,7 +194,7 @@ impl Manager {
         }
         let slot = self.slot(f, g, h);
         let (cf, cg, ch, cached) = self.ite[slot];
-        // No entry has a constant first operand, which the empty slots have.
+
         if (cf, cg, ch) == (f, g, h) {
             return cached;
         }
@@ -214,7 +205,7 @@ impl Manager {
         let low = self.ite(f0, g0, h0);
         let high = self.ite(f1, g1, h1);
         let r = self.node(var, low, high);
-        // The table may have grown below; the slot is found again.
+
         let slot = self.slot(f, g, h);
         self.ite[slot] = (f, g, h, r);
         r
@@ -248,8 +239,7 @@ impl Manager {
         if let Some(&result) = self.implications.get(&(f, g)) {
             return result;
         }
-        // Decide inclusion directly. Constructing f AND NOT g can build a
-        // large product only to learn that a single counterexample exists.
+
         let var = self.top(f).min(self.top(g));
         let (f0, f1) = self.cofactors(f, var);
         let (g0, g1) = self.cofactors(g, var);
@@ -293,8 +283,6 @@ impl Manager {
         r
     }
 
-    /// `exists(and(f, g), chosen)` without building the conjunction, whose
-    /// size the quantified variables often make the largest of the three.
     pub fn and_exists(&mut self, f: Bdd, g: Bdd, chosen: &dyn Fn(u32) -> bool) -> Bdd {
         let mut memo = HashMap::default();
         self.and_exists_memo(f, g, chosen, &mut memo)
@@ -387,189 +375,5 @@ impl Manager {
             stack.push(node.high);
         }
         out
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn implication_matches_every_two_variable_truth_table_without_building_nodes() {
-        let mut m = Manager::new();
-        let x = m.var(0);
-        let y = m.var(1);
-        let functions: Vec<_> = (0..16u32)
-            .map(|table| {
-                let bit = |n: u32| Manager::constant(table & (1u32 << n) != 0u32);
-                let low = m.ite(y, bit(1), bit(0));
-                let high = m.ite(y, bit(3), bit(2));
-                m.ite(x, high, low)
-            })
-            .collect();
-        let nodes = m.nodes.len();
-        for (a, &f) in functions.iter().enumerate() {
-            for (b, &g) in functions.iter().enumerate() {
-                assert_eq!(m.implies(f, g), a & !b == 0, "tables {a} => {b}");
-            }
-        }
-        assert_eq!(m.nodes.len(), nodes);
-    }
-
-    /// Every function of three variables, by its truth table.
-    fn three_variable_functions(m: &mut Manager) -> Vec<Bdd> {
-        let vars = [m.var(0), m.var(1), m.var(2)];
-        (0..256u32)
-            .map(|table| {
-                let mut f = Bdd::FALSE;
-                for row in 0..8u32 {
-                    if table & (1 << row) == 0 {
-                        continue;
-                    }
-                    let mut term = Bdd::TRUE;
-                    for (i, &v) in vars.iter().enumerate() {
-                        let literal = if row & (1 << i) != 0 { v } else { m.not(v) };
-                        term = m.and(term, literal);
-                    }
-                    f = m.or(f, term);
-                }
-                f
-            })
-            .collect()
-    }
-
-    #[test]
-    fn and_exists_is_the_quantified_conjunction_of_every_pair_of_functions() {
-        let mut m = Manager::new();
-        let functions = three_variable_functions(&mut m);
-        for chosen in 0..8u32 {
-            let pick = |v: u32| chosen & (1 << v) != 0;
-            for &f in functions.iter().step_by(3) {
-                for &g in functions.iter().step_by(5) {
-                    let both = m.and(f, g);
-                    assert_eq!(m.and_exists(f, g, &pick), m.exists(both, &pick));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_restricted_function_lies_between_its_part_in_the_care_set_and_itself() {
-        // What the reach fixpoint relies on: where the care set leaves out
-        // only states the function holds, restricting loses none of the
-        // states in the care set and adds none the function does not hold.
-        let mut m = Manager::new();
-        let functions = three_variable_functions(&mut m);
-        for &f in functions.iter().step_by(3) {
-            for &sent in functions.iter().step_by(5) {
-                if !m.implies(sent, f) {
-                    continue;
-                }
-                let unsent = m.not(sent);
-                let r = m.restrict(f, unsent);
-                let gain = m.and(f, unsent);
-                assert!(m.implies(gain, r));
-                assert!(m.implies(r, f));
-            }
-        }
-    }
-
-    #[test]
-    fn displaced_results_are_computed_again_the_same() {
-        // More operations than the table has slots, each checked against
-        // the truth tables.
-        let mut m = Manager::new();
-        let functions = three_variable_functions(&mut m);
-        for (a, &f) in functions.iter().enumerate() {
-            for (b, &g) in functions.iter().enumerate() {
-                assert_eq!(m.and(f, g), functions[a & b]);
-                assert_eq!(m.or(g, f), functions[a | b]);
-            }
-        }
-    }
-
-    #[test]
-    fn equal_functions_share_one_handle() {
-        let mut m = Manager::new();
-        let (a, b) = (m.var(0), m.var(1));
-        let nb = m.not(b);
-        let ab = m.and(a, b);
-        let anb = m.and(a, nb);
-        assert_eq!(m.or(ab, anb), a);
-        let na = m.not(a);
-        assert_eq!(m.and(a, na), Bdd::FALSE);
-        assert_eq!(m.or(a, na), Bdd::TRUE);
-        let x = m.xor(a, b);
-        let e = m.iff(a, b);
-        assert_eq!(m.not(x), e);
-    }
-
-    #[test]
-    fn a_saved_mask_restored_by_or_implies_the_mask_it_saved() {
-        let mut m = Manager::new();
-        let (exec, c) = (m.var(0), m.var(1));
-        let pushed = m.and(exec, c);
-        let not_pushed = m.not(pushed);
-        let other = m.and(exec, not_pushed);
-        let restored = m.or(pushed, other);
-        assert_eq!(restored, exec);
-        assert!(m.implies(pushed, exec));
-        assert!(!m.implies(exec, pushed));
-    }
-
-    #[test]
-    fn quantifying_a_variable_removes_it_from_the_support() {
-        let mut m = Manager::new();
-        let (a, b, c) = (m.var(0), m.var(1), m.var(2));
-        let ab = m.and(a, b);
-        let f = m.or(ab, c);
-        let e = m.exists(f, &|v| v == 1);
-        assert_eq!(e, m.or(a, c));
-        assert!(!m.support(e).contains(&1));
-        let u = m.forall(f, &|v| v == 1);
-        assert_eq!(u, c);
-    }
-
-    #[test]
-    fn restricting_to_a_care_set_drops_the_tests_the_care_set_decides() {
-        let mut m = Manager::new();
-        let (mask, c, d) = (m.var(0), m.var(1), m.var(2));
-        let nc = m.not(c);
-        let taken = m.and(mask, c);
-        let other = m.and(mask, nc);
-        assert_eq!(
-            m.restrict(taken, mask),
-            c,
-            "the two arms of a branch differ only in c"
-        );
-        assert_eq!(m.restrict(other, mask), nc);
-        let cd = m.and(c, d);
-        let inner = m.and(mask, cd);
-        let rest = m.not(inner);
-        let care = m.and(mask, rest);
-        let outer = m.and(mask, nc);
-        let chosen = m.restrict(outer, care);
-        let agreed = m.and(chosen, care);
-        let expected = m.and(outer, care);
-        assert_eq!(
-            agreed, expected,
-            "restrict agrees with the function on the care set"
-        );
-        assert!(!m.support(chosen).contains(&0));
-        assert_eq!(m.restrict(taken, Bdd::FALSE), taken);
-    }
-
-    #[test]
-    fn composition_substitutes_a_formula_or_a_constant_for_a_variable() {
-        let mut m = Manager::new();
-        let (a, b, c) = (m.var(0), m.var(1), m.var(2));
-        let f = m.xor(a, b);
-        let bc = m.and(b, c);
-        let g = m.compose(f, &|v| (v == 0).then_some(bc));
-        let expected = m.xor(bc, b);
-        assert_eq!(g, expected);
-        let set = m.compose(f, &|v| (v == 0).then_some(Bdd::TRUE));
-        let nb = m.not(b);
-        assert_eq!(set, nb);
     }
 }

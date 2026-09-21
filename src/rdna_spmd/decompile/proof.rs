@@ -6,17 +6,6 @@ use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::analysis::bdd::HashMap;
 use std::collections::BTreeMap;
 
-/// Prove all candidate conversion policies in one conditional analysis.
-/// Observable differences exclude unsafe policies; a model of the final
-/// condition selects the queries and words to keep. Collective participation
-/// requirements are evaluated under that same model.
-///
-/// The analysis treats each policy on its own: no formula relates what holds
-/// under one policy to what holds under another, and the detours already take
-/// the policy that answers everything locally apart from the rest. The choice
-/// prefers that policy to every other, so it is analysed first and alone, as
-/// the slice of the conditional analysis it is; the other policies, whose
-/// formulas carry every choice, are analysed only where that one is unsafe.
 pub(super) fn prove(
     f: &Func,
     facts: &Facts,
@@ -44,10 +33,8 @@ pub(super) fn prove(
     )
 }
 
-/// Where and why the last of the policies analysed was excluded.
 type Exhausted = (BlockId, usize, &'static str);
 
-/// Analyses the policies in `safe`, which `logic` interprets.
 fn analyse(
     f: &Func,
     facts: &Facts,
@@ -108,8 +95,7 @@ fn analyse(
                 .entry(block)
                 .or_insert_with(|| vec![Bdd::FALSE; contributions.len()]);
             for (slot, c) in contributions.into_iter().enumerate() {
-                // A later detour may have excluded a policy after an earlier
-                // detour recorded this contribution. Do not reintroduce it.
+
                 let c = proof.logic.m.and(c, proof.safe);
                 let joined = proof.logic.m.or(old[slot], c);
                 if joined != old[slot] {
@@ -137,22 +123,16 @@ struct Proof<'a> {
     facts: &'a Facts,
     logic: &'a mut Logic,
     safe: Bdd,
-    /// Set once no policy is left: every difference is then empty, so the
-    /// analysis runs out at once.
+
     exhausted: Option<Exhausted>,
-    /// Collective operations whose results require every lane to be present.
+
     demands: BTreeMap<u64, Bdd>,
-    /// Bits and lane words that hold nothing for a lane that is not active at
-    /// their block, so a wave operation over the lanes at the block reads
-    /// them as the wave does.
+
     masked: Vec<bool>,
-    /// Lane words a ballot over the lanes at the block computes as the wave
-    /// does: ballots of masked bits, and what such words make.
+
     faithful: Vec<bool>,
     h: Vec<Bdd>,
-    /// Difference of a materialized word, distinct from its own lane's bit.
-    /// In particular, selecting a word does not make its difference hold on
-    /// the path that selects the other arm.
+
     words: Vec<Bdd>,
     arrivals: BTreeMap<BlockId, Vec<Bdd>>,
     reach: BTreeMap<BlockId, Bdd>,
@@ -180,8 +160,6 @@ impl Proof<'_> {
         self.logic.m.not(a)
     }
 
-    /// Difference of the value actually consumed, rather than a classification
-    /// of whether any definition reaching it may contain a ballot.
     fn whole(&self, v: ValueId) -> Bdd {
         if self.facts.lane_word[v.0] {
             self.words[v.0]
@@ -190,14 +168,6 @@ impl Proof<'_> {
         }
     }
 
-    /// Settles which bits and lane words hold nothing for a lane that is not
-    /// active at their block: those that imply the block's EXEC bit or a
-    /// parameter known to, and parameters every arrival brings such a value
-    /// to. A ballot of such a bit over the lanes at the block is the word the
-    /// wave computes, and a word made of such words and parameters every
-    /// arrival brings one to is too; those words are faithful. Both facts
-    /// are inductive, so a parameter is taken to hold them until an arrival
-    /// refutes it. Without an EXEC register every lane is active everywhere.
     fn solve_masked(
         &mut self,
         inputs: &[crate::rdna_spmd::program::Parameter],
@@ -214,8 +184,7 @@ impl Proof<'_> {
         for (&id, block) in &f.blocks {
             let exec = block.params[exec_index].0;
             for (index, &(param, ty)) in block.params.iter().enumerate() {
-                // The dispatch clears every mask register but EXEC, so a
-                // mask bit the program starts with holds nothing for any lane.
+
                 let cleared = matches!(
                     inputs.get(index).map(|p| p.source),
                     Some(ParameterSource::MaskBit(_))
@@ -283,7 +252,7 @@ impl Proof<'_> {
                         self.masked[param.0] = false;
                         changed = true;
                     }
-                    // A value that is no lane word is what the wave computes.
+
                     let mut arguments = facts.arguments(f, id, index);
                     if self.faithful[param.0] && !arguments.all(|a| !word(a) || self.faithful[a.0])
                     {
@@ -295,9 +264,6 @@ impl Proof<'_> {
         }
     }
 
-    /// The bit a lane holds of a word the lane program computes, where a
-    /// ballot holds nothing for a lane that is not at it; `None` where the
-    /// word takes a parameter the arrivals do not agree on.
     fn lockstep_view(
         &mut self,
         w: ValueId,
@@ -347,9 +313,6 @@ impl Proof<'_> {
         l
     }
 
-    /// Remove policies under which an observable difference is possible.
-    /// The formulas for every other policy remain valid; no program state or
-    /// proof is rebuilt after imposing this constraint.
     fn require(
         &mut self,
         block: BlockId,
@@ -386,11 +349,6 @@ impl Proof<'_> {
         self.demands.insert(provenance, condition);
     }
 
-    /// Raises the differences to their fixed point. A block's transfer reads
-    /// what its predecessors pass it, the arrivals the detours bring it and
-    /// the policies left, and values are used only in the block that defines
-    /// them, so after a first sweep a block is transferred again only when a
-    /// predecessor's differences rose or a policy was excluded.
     fn settle(&mut self) {
         let order = &self.facts.order;
         let mut stale = vec![true; order.len()];
@@ -452,7 +410,7 @@ impl Proof<'_> {
                     let whole = self.logic.materialized(self.facts, value);
                     self.demand(*provenance, whole);
                 }
-                // A changed bit in any lane can change the gathered word.
+
                 let h = self.h[inputs[0].0];
                 let varying: Vec<_> = self
                     .logic
@@ -480,8 +438,6 @@ impl Proof<'_> {
         }
     }
 
-    /// Restrict a difference before eliminating the predecessor's local
-    /// variables. A value undefined off this edge need not differ on it.
     fn edge_difference(&mut self, pred: BlockId, slot: usize, difference: Bdd) -> Bdd {
         if difference == Bdd::FALSE {
             return difference;
@@ -547,9 +503,6 @@ impl Proof<'_> {
         changed
     }
 
-    /// How the lane's answer to a query it answers itself differs from the
-    /// wave's: the lane holds no bit and another lane may. The difference is
-    /// conditioned on the query's marker.
     fn query(&mut self, x: Bdd, hx: Bdd) -> Bdd {
         let (logic, facts) = (&mut *self.logic, self.facts);
         let set = logic.m.or(x, hx);
@@ -719,9 +672,7 @@ impl Proof<'_> {
                     op: MemoryOp::Fence,
                     ..
                 } => Bdd::FALSE,
-                // An exchange between lanes or a barrier runs with every lane
-                // at it, which the lowering sees to, so it answers what the
-                // wave answers wherever its inputs are what the wave holds.
+
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
                     any_of(self, inputs)
                 }
@@ -752,9 +703,7 @@ impl Proof<'_> {
                 }
                 let all_local = self.logic.all_local;
                 let other = self.not(all_local);
-                // Desc merges intentionally forget some value correlations.
-                // Keep the all-local policy separate so alternatives cannot
-                // weaken an otherwise valid per-lane loop proof.
+
                 for (part, slice) in [all_local, other].iter().enumerate() {
                     let assume = self.and(assume, *slice);
                     if assume == Bdd::FALSE {
@@ -1245,10 +1194,7 @@ impl Explore<'_, '_> {
             Desc { same: t, bits }
         };
         for (index, inst) in block.insts.iter().enumerate() {
-            // A retained collective observes the lanes at this point. While
-            // the two executions are apart, their participating sets need not
-            // agree. Keep the controlling query rather than treating the two
-            // collective answers as unrelated values all the way to a store.
+
             let collective = match inst {
                 Inst::Effect {
                     op: EffectOp::Wave(WaveOp::Any),
@@ -1595,8 +1541,7 @@ impl Explore<'_, '_> {
             }
             let joint = self.logic().m.and(c, relation);
             let logic = &mut *self.proof.logic;
-            // Conversion choices are shared across all blocks and lanes.
-            // Quantify execution state here, never policy variables.
+
             let foreign: Vec<u32> = logic
                 .support(joint)
                 .into_iter()

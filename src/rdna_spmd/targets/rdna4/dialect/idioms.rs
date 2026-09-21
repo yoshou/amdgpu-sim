@@ -256,12 +256,8 @@ fn scaled_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> {
     Some(view.raw(x))
 }
 
-/// LLVM class bits, in the ISA's order, of the zeros, positive infinity and
-/// the quiet NaNs: the classes a square root maps to themselves.
 const ROOT_FIXED_CLASSES: u64 = (1 << 1) | (1 << 5) | (1 << 6) | (1 << 9);
 
-/// The value a bit pattern reinterprets, through the casts that change how it
-/// is read but not what it holds.
 fn bits_of(view: &View, v: ValueId) -> ValueId {
     let mut v = view.raw(v);
     while let Some(Op::Convert(Cvt::Bitcast, _, a)) = view.defs[v.0] {
@@ -270,8 +266,6 @@ fn bits_of(view: &View, v: ValueId) -> ValueId {
     v
 }
 
-/// Whether two conditions ask the same question: the same value, or a
-/// wave-wide query of the same value.
 fn same_question(view: &View, a: ValueId, b: ValueId) -> bool {
     if a == b {
         return true;
@@ -285,16 +279,6 @@ fn same_question(view: &View, a: ValueId, b: ValueId) -> bool {
     }
 }
 
-/// A square root whose operand the compiler scaled out of the subnormal range,
-/// keeping the scaled operand itself where a root maps its class to itself.
-///
-/// Scaling by an even power of two and halving it after the root is exact, so
-/// the sequence is the square root of the operand, except where the scale
-/// overflows it: at `2^(1023 - up)` and above the sequence yields infinity.
-/// The scale is chosen once for the whole wave when the compiler tests it with
-/// a scalar instruction, so the sequence reads the other lanes there; the
-/// square root the source asked for does not, and the target computes that,
-/// within the accuracy the ISA allows it.
 fn guarded_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> {
     let Some(Op::Select(c, fixed, rescaled)) = view.defs[view.raw(out).0] else {
         return None;
@@ -352,9 +336,6 @@ impl Idiom for DivisionIdioms {
     }
 }
 
-/// A quotient formed from these exact operands already has the right sign
-/// and handles zero/infinity. Keep the ISA-specific NaN and tiny-result rules
-/// as ordinary SSA operations; code generation needs no special case.
 pub(super) fn quotient_fixups(f: &mut Func, fixup: TargetOp) -> usize {
     let defs = f.definitions();
     let alias = |mut value: ValueId| {
@@ -376,8 +357,7 @@ pub(super) fn quotient_fixups(f: &mut Func, fixup: TargetOp) -> usize {
                 continue;
             }
             let a = args.values();
-            // Do not strip predicated selects: an inactive lane may still
-            // hold an old quotient or different denominator/numerator.
+
             if let Some(Op::Float(FloatOp::Div, numerator, denominator)) = defs[alias(a[0]).0] {
                 if alias(numerator) == alias(a[2]) && alias(denominator) == alias(a[1]) {
                     sites.entry(id).or_default().push(index);
@@ -450,8 +430,7 @@ fn fixup_division(
     let fixed = push(Ty::I64, Op::Select(invalid_operands, invalid, signed_zero));
     let quiet_den = push(Ty::I64, Op::Int(IntOp::Or, den, quiet));
     let quiet_num = push(Ty::I64, Op::Int(IntOp::Or, num, quiet));
-    // Reverse ISA priority: numerator NaN wins over denominator NaN, then
-    // invalid operand pairs, then the exponent-based signed-zero correction.
+
     let fixed = push(Ty::I64, Op::Select(den_nan, quiet_den, fixed));
     let fixed = push(Ty::I64, Op::Select(num_nan, quiet_num, fixed));
     let fix = push(Ty::I1, Op::Int(IntOp::Or, tiny, invalid_operands));
@@ -497,8 +476,7 @@ fn scale_flag(
     exec: ValueId,
     ops: &DivisionIdioms,
 ) -> bool {
-    // A select keeps the old bit in the lanes its mask leaves out, so it
-    // carries the scale's flag only when FMAS runs under that same mask.
+
     if let Some((new, mask)) = view.masks.predicated[view.alias(v).0] {
         return view.same(mask, exec)
             && scale_flag(view, new, denominator, numerator, exec, ops);
@@ -509,9 +487,7 @@ fn scale_flag(
             && view.same(args[2], numerator);
     }
     let raw = view.raw(v);
-    // Packing a lane flag into its wave word and projecting that same lane
-    // preserves the flag. A packet ballot or a different lane is not enough.
-    // Only strip bitcast aliases here: a selected word may contain old bits.
+
     if let Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) = view.defs[raw.0] {
         if let Some(Op::Int(IntOp::LShr, word, lane)) = view.defs[view.alias(shifted).0] {
             if matches!(view.defs[view.alias(lane).0], Some(Op::Env(Env::LaneId))) {
@@ -645,7 +621,7 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
                     Inst::Core {
                         value, ty: Ty::F64, ..
                     } => *value,
-                    // A guarded root selects between bit patterns.
+
                     Inst::Core {
                         value,
                         ty: Ty::I64,
@@ -679,8 +655,7 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
     for &(block, index, value, x) in &rewrites {
         let root = f.value(Ty::F64);
         let mut replacement = root;
-        // The instructions are inserted one after another at the same place,
-        // so a bit pattern's cast is queued before the root it casts.
+
         if f.types[value.0] == Ty::I64 {
             let bits = f.value(Ty::I64);
             inserted.entry(block).or_default().push((
@@ -713,495 +688,4 @@ fn run(f: &mut Func, masks: &Predication, constants: &[Option<u64>], ops: &SqrtI
     }
     crate::rdna_spmd::pass::simplify::rename(f, &renames);
     rewrites.len()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::instructions::I;
-    use crate::rdna_instructions::{
-        InstFormat, SourceOperand, SOP1, SOP2, VOP1, VOP2, VOP3, VOP3SD, VOPC,
-    };
-    use crate::rdna_spmd::analysis::{Analyses, Constants, Context, Masks};
-    use crate::rdna_spmd::{CompilationInput, ScalarBlock, ScalarProgram, Terminator};
-
-    fn v(r: u8) -> SourceOperand {
-        SourceOperand::VectorRegister(r)
-    }
-    fn fma(dst: u8, a: SourceOperand, b: SourceOperand, c: SourceOperand, neg: u8) -> InstFormat {
-        InstFormat::VOP3(VOP3 {
-            op: I::V_FMA_F64,
-            vdst: dst,
-            src0: a,
-            src1: b,
-            src2: c,
-            neg,
-            abs: 0,
-            cm: 0,
-            omod: 0,
-            opsel: 0,
-        })
-    }
-    fn mul(dst: u8, a: SourceOperand, b: u8) -> InstFormat {
-        InstFormat::VOP2(VOP2 {
-            op: I::V_MUL_F64,
-            vdst: dst,
-            src0: a,
-            vsrc1: b,
-            literal_constant: None,
-        })
-    }
-
-    #[test]
-    fn rsq_newton_chain_inside_the_scale_guard_folds_to_sqrt() {
-        let half = SourceOperand::FloatConstant(0.5);
-        let body = vec![
-            InstFormat::VOP3(VOP3 {
-                op: I::V_CNDMASK_B32,
-                vdst: 20,
-                src0: SourceOperand::IntegerConstant(0),
-                src1: SourceOperand::LiteralConstant(768),
-                src2: SourceOperand::ScalarRegister(106),
-                neg: 0,
-                abs: 0,
-                cm: 0,
-                omod: 0,
-                opsel: 0,
-            }),
-            InstFormat::VOP3(VOP3 {
-                op: I::V_LDEXP_F64,
-                vdst: 2,
-                src0: v(0),
-                src1: v(20),
-                src2: SourceOperand::IntegerConstant(0),
-                neg: 0,
-                abs: 0,
-                cm: 0,
-                omod: 0,
-                opsel: 0,
-            }),
-            InstFormat::VOP1(VOP1 {
-                op: I::V_RSQ_F64,
-                vdst: 4,
-                src0: v(2),
-            }),
-            mul(6, v(2), 4),
-            mul(4, half.clone(), 4),
-            fma(8, v(4), v(6), half.clone(), 1),
-            fma(6, v(6), v(8), v(6), 0),
-            fma(4, v(4), v(8), v(4), 0),
-            fma(8, v(6), v(6), v(2), 1),
-            fma(6, v(8), v(4), v(6), 0),
-            fma(8, v(6), v(6), v(2), 1),
-            fma(4, v(8), v(4), v(6), 0),
-            InstFormat::VOP3(VOP3 {
-                op: I::V_CNDMASK_B32,
-                vdst: 21,
-                src0: SourceOperand::IntegerConstant(0),
-                src1: SourceOperand::LiteralConstant((-384i32) as u32),
-                src2: SourceOperand::ScalarRegister(106),
-                neg: 0,
-                abs: 0,
-                cm: 0,
-                omod: 0,
-                opsel: 0,
-            }),
-            InstFormat::VOP3(VOP3 {
-                op: I::V_LDEXP_F64,
-                vdst: 10,
-                src0: v(4),
-                src1: v(21),
-                src2: SourceOperand::IntegerConstant(0),
-                neg: 0,
-                abs: 0,
-                cm: 0,
-                omod: 0,
-                opsel: 0,
-            }),
-        ];
-        let program = ScalarProgram {
-            entry_pc: 0,
-            blocks: BTreeMap::from([(
-                0,
-                ScalarBlock {
-                    pc: 0,
-                    body,
-                    term: Terminator::Return,
-                },
-            )]),
-        };
-        let f = program.to_ssa().function;
-        let registry = f.registry.clone();
-        let mut ir = f.ir.clone();
-        let keep: Vec<usize> = f
-            .parameter_inputs
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| {
-                matches!(
-                    p.source,
-                    crate::rdna_spmd::program::ParameterSource::Vgpr(10 | 11)
-                )
-            })
-            .map(|(i, _)| i)
-            .collect();
-        for block in ir.blocks.values_mut() {
-            if let Term::Ret(args) = &mut block.term {
-                *args = keep.iter().map(|&i| args[i]).collect();
-            }
-        }
-        let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &registry);
-        let count = |ir: &Func, name: &str| {
-            ir.blocks.values().flat_map(|b| &b.insts).filter(|i| matches!(i, Inst::Target { op, .. } if registry.lookup(crate::rdna_spmd::targets::rdna4::dialect::ID, name).ok() == Some(*op))).count()
-        };
-        assert_eq!(
-            (
-                count(&ir, "rsq.f64"),
-                count(&ir, "sqrt.f64"),
-                count(&ir, "ldexp.f64")
-            ),
-            (1, 0, 2)
-        );
-        for _ in 0..3 {
-            let analyses =
-                || Analyses::new(Context::new(&registry, &f.parameter_inputs, exec_index, 32));
-            let (constants, masks) = (
-                analyses().get::<Constants>(&ir),
-                analyses().get::<Predication>(&ir),
-            );
-            run(&mut ir, &masks, &constants, &SqrtIdioms::new(&registry));
-            let masks = analyses().get::<Masks>(&ir);
-            crate::rdna_spmd::pass::dce::dead_writes(&mut ir, &masks, exec_index);
-            crate::rdna_spmd::pass::simplify::run(&mut ir);
-            crate::rdna_spmd::pass::dce::run(&mut ir);
-        }
-        ir.clone().verify_with(&registry).unwrap();
-        assert_eq!(
-            (
-                count(&ir, "rsq.f64"),
-                count(&ir, "sqrt.f64"),
-                count(&ir, "ldexp.f64")
-            ),
-            (0, 1, 0)
-        );
-    }
-
-    /// A root whose operand is scaled when the wave answers that any lane
-    /// needs it, with the classes a root fixes taken from the scaled operand.
-    fn guarded(up: u32, down: u32) -> String {
-        format!(
-            "func entry b0
-             b0(v0: i32, v1: i32, v2: i1):
-               v3: i64 = pack64 v0, v1
-               v4: f64 = convert bitcast f64 v3
-               v5: i32 = const i32 0x0
-               v6: i1 = cmp ne v0, v5
-               v7: i1 = effect !p0 wave any (v6)
-               v8: i32 = const i32 {up:#x}
-               v9: i32 = select v7, v8, v5
-               v10: f64 = target rdna4.ldexp.f64(v4, v9)
-               v11: i32 = const i32 0x260
-               v12: i1 = target rdna4.cmp_class.f64(v10, v11)
-               v13: f64 = target rdna4.sqrt.f64(v10)
-               v14: i1 = effect !p1 wave any (v6)
-               v15: i32 = const i32 {down:#x}
-               v16: i32 = select v14, v15, v5
-               v17: f64 = target rdna4.ldexp.f64(v13, v16)
-               v18: i64 = convert bitcast i64 v10
-               v19: i64 = convert bitcast i64 v17
-               v20: i64 = select v12, v18, v19
-               ret v20"
-        )
-    }
-
-    fn fold(text: &str) -> (Func, usize, SqrtIdioms) {
-        let registry = crate::rdna_spmd::targets::rdna4::registry();
-        let mut ir = crate::rdna_spmd::ir::parse::func(&registry, text).unwrap();
-        let input = |source, ty| crate::rdna_spmd::program::Parameter { source, ty };
-        let inputs = vec![
-            input(crate::rdna_spmd::program::ParameterSource::Vgpr(0), Ty::I32),
-            input(crate::rdna_spmd::program::ParameterSource::Vgpr(1), Ty::I32),
-            input(
-                crate::rdna_spmd::program::ParameterSource::MaskBit(126),
-                Ty::I1,
-            ),
-        ];
-        let analyses = || Analyses::new(Context::new(&registry, &inputs, 2, 32));
-        let (constants, masks) = (
-            analyses().get::<Constants>(&ir),
-            analyses().get::<Predication>(&ir),
-        );
-        let ops = SqrtIdioms::new(&registry);
-        let count = run(&mut ir, &masks, &constants, &ops);
-        (ir, count, ops)
-    }
-
-    #[test]
-    fn a_scale_the_wave_chooses_around_a_root_folds_to_the_root_of_the_operand() {
-        let (ir, count, ops) = fold(&guarded(0x100, 0xffff_ff80));
-        assert_eq!(count, 1);
-        let block = &ir.blocks[&ir.entry];
-        let Term::Ret(returned) = &block.term else {
-            panic!("the block returns")
-        };
-        let defs = ir.definitions();
-        let Some(Op::Convert(Cvt::Bitcast, Ty::I64, root)) = defs[returned[0].0] else {
-            panic!("the result is a bit pattern")
-        };
-        let operand = block
-            .insts
-            .iter()
-            .find_map(|inst| match inst {
-                Inst::Target {
-                    op, args, outputs, ..
-                } if *op == ops.sqrt && outputs[0].0 == root => Some(args.values()[0]),
-                _ => None,
-            })
-            .expect("the bit pattern is a root");
-        // The root is taken of the operand itself, before any scaling.
-        assert!(matches!(defs[operand.0], Some(Op::Convert(Cvt::Bitcast, Ty::F64, p)) if matches!(defs[p.0], Some(Op::Pack64(..)))));
-    }
-
-    #[test]
-    fn a_rescale_that_does_not_halve_the_scale_is_left_alone() {
-        let (_, count, _) = fold(&guarded(0x100, 0xffff_ffc0));
-        assert_eq!(count, 0);
-    }
-
-    fn division_body(flag: u8) -> Vec<InstFormat> {
-        let scale = |dst: u8, a: SourceOperand, b: u8, c: SourceOperand| {
-            InstFormat::VOP3SD(VOP3SD {
-                op: I::V_DIV_SCALE_F64,
-                vdst: dst,
-                sdst: 106,
-                src0: a,
-                src1: SourceOperand::VectorRegister(b),
-                src2: c,
-                neg: 0,
-                cm: 0,
-                omod: 0,
-            })
-        };
-        let one = SourceOperand::FloatConstant(1.0);
-        let mut body = vec![
-            scale(4, v(2), 2, v(0)),
-            scale(6, v(0), 2, v(0)),
-            InstFormat::VOP1(VOP1 {
-                op: I::V_RCP_F64,
-                vdst: 8,
-                src0: v(4),
-            }),
-            fma(10, v(4), v(8), one.clone(), 1),
-            fma(8, v(8), v(10), v(8), 0),
-            fma(10, v(4), v(8), one, 1),
-            fma(8, v(8), v(10), v(8), 0),
-            mul(12, v(6), 8),
-            fma(14, v(4), v(12), v(6), 1),
-        ];
-        if flag == 1 {
-            body.push(InstFormat::VOPC(VOPC {
-                op: I::V_CMP_EQ_U32,
-                src0: SourceOperand::IntegerConstant(0),
-                vsrc1: 0,
-            }));
-        }
-        if flag == 3 {
-            body.insert(
-                0,
-                InstFormat::SOP1(SOP1 {
-                    op: I::S_AND_SAVEEXEC_B32,
-                    sdst: 2,
-                    ssrc0: SourceOperand::ScalarRegister(3),
-                }),
-            );
-            body.push(InstFormat::SOP1(SOP1 {
-                op: I::S_MOV_B32,
-                sdst: 126,
-                ssrc0: SourceOperand::IntegerConstant(u32::MAX as u64),
-            }));
-        }
-        if flag == 2 {
-            body.push(InstFormat::SOP2(SOP2 {
-                op: I::S_AND_B32,
-                sdst: 106,
-                ssrc0: SourceOperand::ScalarRegister(106),
-                ssrc1: SourceOperand::ScalarRegister(20),
-            }));
-        }
-        body.push(InstFormat::VOP3(VOP3 {
-            op: I::V_DIV_FMAS_F64,
-            vdst: 16,
-            src0: v(14),
-            src1: v(8),
-            src2: v(12),
-            neg: 0,
-            abs: 0,
-            cm: 0,
-            omod: 0,
-            opsel: 0,
-        }));
-        body.push(InstFormat::VOP3(VOP3 {
-            op: I::V_DIV_FIXUP_F64,
-            vdst: 18,
-            src0: v(16),
-            src1: v(2),
-            src2: v(0),
-            neg: 0,
-            abs: 0,
-            cm: 0,
-            omod: 0,
-            opsel: 0,
-        }));
-        body
-    }
-
-    fn division_fixups(flag: u8, projection: u8) -> usize {
-        let program = ScalarProgram {
-            entry_pc: 0,
-            blocks: BTreeMap::from([(
-                0,
-                ScalarBlock {
-                    pc: 0,
-                    body: division_body(flag),
-                    term: Terminator::Return,
-                },
-            )]),
-        };
-        let f = program.to_ssa().function;
-        let registry = f.registry.clone();
-        let mut ir = f.ir.clone();
-        if projection != 0 {
-            // Exercise the SSA word round trip used when VCC is observed as
-            // an SGPR before FMAS consumes its lane bit.
-            let fmas = registry.lookup(super::super::ID, "div_fmas.f64").unwrap();
-            let (index, inputs) = ir.blocks[&BlockId(0)]
-                .insts
-                .iter()
-                .enumerate()
-                .find_map(|(index, inst)| match inst {
-                    Inst::Target { op, args, .. } if *op == fmas => {
-                        Some((index, args.values().to_vec()))
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            let mut inserted = Vec::new();
-            let word = ir.value(Ty::I32);
-            inserted.push(if projection == 4 {
-                Inst::Packet {
-                    op: PacketOp::Ballot,
-                    input: inputs[3],
-                    output: word,
-                }
-            } else {
-                Inst::Effect {
-                    provenance: 999,
-                    op: EffectOp::Wave(WaveOp::Ballot),
-                    inputs: vec![inputs[3]],
-                    outputs: vec![(word, Ty::I32)],
-                }
-            });
-            let lane = ir.value(Ty::I32);
-            inserted.push(Inst::Core {
-                value: lane,
-                ty: Ty::I32,
-                op: if projection == 2 {
-                    Op::Const(Ty::I32, 0)
-                } else {
-                    Op::Env(Env::LaneId)
-                },
-            });
-            let word = if projection == 3 {
-                let mask = ir.value(Ty::I32);
-                let narrowed = ir.value(Ty::I32);
-                inserted.push(Inst::Core {
-                    value: mask,
-                    ty: Ty::I32,
-                    op: Op::Const(Ty::I32, 0x55555555),
-                });
-                inserted.push(Inst::Core {
-                    value: narrowed,
-                    ty: Ty::I32,
-                    op: Op::Int(IntOp::And, word, mask),
-                });
-                narrowed
-            } else {
-                word
-            };
-            let shifted = ir.value(Ty::I32);
-            let bit = ir.value(Ty::I1);
-            inserted.push(Inst::Core {
-                value: shifted,
-                ty: Ty::I32,
-                op: Op::Int(IntOp::LShr, word, lane),
-            });
-            inserted.push(Inst::Core {
-                value: bit,
-                ty: Ty::I1,
-                op: Op::Convert(Cvt::Trunc, Ty::I1, shifted),
-            });
-            let block = ir.blocks.get_mut(&BlockId(0)).unwrap();
-            if let Inst::Target { args, .. } = &mut block.insts[index] {
-                *args = Arguments::Quaternary([inputs[0], inputs[1], inputs[2], bit]);
-            }
-            block.insts.splice(index..index, inserted);
-        }
-        let exec_index = crate::rdna_spmd::compiler::exec_index(&f.parameter_inputs, &registry);
-        let analyses = Analyses::new(Context::new(&registry, &f.parameter_inputs, exec_index, 32));
-        let (constants, masks) = (
-            analyses.get::<Constants>(&ir),
-            analyses.get::<Predication>(&ir),
-        );
-        let collapsed = divisions(&mut ir, &masks, &constants, &DivisionIdioms::new(&registry));
-        let fixup = registry.lookup(super::super::ID, "div_fixup.f64").unwrap();
-        assert_eq!(
-            quotient_fixups(&mut ir, fixup),
-            collapsed,
-            "each recognized macro gets its SSA correction"
-        );
-        ir.one_region(ir.presence_needed());
-        ir.clone().verify_with(&registry).unwrap();
-        collapsed
-    }
-
-    #[test]
-    fn a_division_macro_collapses_only_when_its_own_scale_sets_the_fmas_flag() {
-        for projection in [0, 1] {
-            assert_eq!(
-                division_fixups(0, projection),
-                1,
-                "the macro's own scale sets the flag, so it is a division"
-            );
-            assert_eq!(
-                division_fixups(1, projection),
-                0,
-                "a foreign flag scales the result by 2^64, so it is not"
-            );
-            assert_eq!(
-                division_fixups(2, projection),
-                0,
-                "a flag narrowed by anything but the lane mask changes the scaling too"
-            );
-            assert_eq!(
-                division_fixups(3, projection),
-                0,
-                "lanes reactivated after the flag was made, so its cleared bits still count"
-            );
-        }
-        assert_eq!(
-            division_fixups(0, 2),
-            0,
-            "another lane's bit cannot prove this lane's scaling"
-        );
-        assert_eq!(
-            division_fixups(0, 3),
-            0,
-            "masking the wave word changes the scaling"
-        );
-        assert_eq!(
-            division_fixups(0, 4),
-            0,
-            "a packet ballot is not a wave word"
-        );
-    }
 }

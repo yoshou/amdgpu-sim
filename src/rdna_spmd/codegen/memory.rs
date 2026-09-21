@@ -70,11 +70,7 @@ pub(in crate::rdna_spmd) fn global_load(
     {
         return GlobalLoad::Gather;
     }
-    // The uniformity analysis holds every lane of a global word load from an
-    // address the lanes share to one value, and the packet program keeps such
-    // a value as one scalar. Only a broadcast reads it as one value: a gather
-    // would give a lane outside the mask a zero, and that lane can be the one
-    // the scalar is read from.
+
     if uniform[access.base.0] {
         return GlobalLoad::Broadcast;
     }

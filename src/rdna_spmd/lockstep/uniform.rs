@@ -1,16 +1,3 @@
-//! Which lane bits every lane agrees on.
-//!
-//! The lowering branches on a query that only tests uniform bits and lets no
-//! lane stay behind in a loop whose exits are uniform, so it has to know which
-//! bits are uniform before it emits the packet program -- and whether a bit is
-//! uniform depends on what the lowering emitted around it. It starts from what
-//! the packet analysis says of the lane program, where every merge is taken to
-//! agree, lowers, and asks the same analysis of the packet program it made. A
-//! bit it relied on that turns out to vary is no longer relied on, and the
-//! lowering runs again; every round only gives up assumptions, so the rounds
-//! end, and the program that comes out rests only on what the analysis the
-//! code generator trusts confirms.
-
 use super::mask::Masks;
 use super::Packing;
 use crate::rdna_spmd::analysis::uniformity::Fact;
@@ -34,16 +21,12 @@ pub(super) fn context(lane: &LiftedFunction, packing: Packing) -> Context<'_> {
     }
 }
 
-/// What the packet analysis says of the lane program's own values.
 pub(super) fn assume(lane: &LiftedFunction, packing: Packing) -> Vec<bool> {
     Analyses::new(context(lane, packing))
         .get::<Uniformity<MaskValues>>(&lane.ir)
         .uniform()
 }
 
-/// What the packet analysis refutes of the lowering's assumptions: the lane
-/// values whose bits were taken to be uniform and are not, and whether a bit
-/// the lowering made from other bits was refuted as well.
 pub(super) fn refuted(
     lane: &LiftedFunction,
     packing: Packing,

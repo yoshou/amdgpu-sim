@@ -1,10 +1,7 @@
-//! Decode the existing EXEC proof restrictions into SSA definition policies.
-//! The policies describe permitted proofs, not alternate execution semantics.
 use super::*;
 
 const EXEC: u32 = 126;
-/// SGPRs written by an instruction (over-approximated — used to *clear* tracked
-/// saved-active bits, so over-clearing is always sound).
+
 pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
     let bit = |r: u32| 1u128 << (r & 127);
     let pair = |r: u32| bit(r) | bit(r + 1);
@@ -35,7 +32,7 @@ pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
         InstFormat::VOP3SD(i) => bit(i.sdst as u32),
         InstFormat::VOP1(i) if matches!(i.op, I::V_READFIRSTLANE_B32) => bit(i.vdst as u32),
         InstFormat::VOP3(i) if matches!(i.op, I::V_READLANE_B32) => bit(i.vdst as u32),
-        // VOPC / VOP3 compares write a lane mask (VCC or, for V_CMPX, EXEC).
+
         InstFormat::VOPC(i) => {
             if format!("{:?}", i.op).starts_with("V_CMPX") {
                 bit(EXEC)
@@ -48,7 +45,6 @@ pub(super) fn scalar_dests(inst: &InstFormat) -> u128 {
     }
 }
 
-/// Includes implicit EXEC writes (saveexec and cmpx), not just scalar destinations.
 pub(in crate::rdna_spmd) fn writes_exec(inst: &InstFormat) -> bool {
     scalar_dests(inst) & (1u128 << EXEC) != 0
         || matches!(inst,
@@ -89,10 +85,6 @@ fn range_contains(first: u32, words: u32, reg: u32) -> bool {
     (first..first.saturating_add(words)).contains(&reg)
 }
 
-/// Whether `inst` reads `reg` as an ordinary scalar value rather than as a
-/// packed lane mask. Destinations are deliberately absent: a scalar
-/// redefinition after the mask value is dead is harmless, and the reaching
-/// definition transfer below kills it before a later read.
 fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
     match inst {
         InstFormat::SOP1(i) => {
@@ -108,8 +100,7 @@ fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
         InstFormat::VOP1(i) => operand_is_reg(&i.src0, reg),
         InstFormat::VOP2(i) => operand_is_reg(&i.src0, reg),
         InstFormat::VOP3(i) => {
-            // V_CMP writes EXEC/VCC implicitly; its vector operands do not
-            // alias an SGPR unless one is explicitly encoded as a source.
+
             operand_is_reg(&i.src0, reg)
                 || operand_is_reg(&i.src1, reg)
                 || operand_is_reg(&i.src2, reg)

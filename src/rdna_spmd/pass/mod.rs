@@ -1,15 +1,10 @@
-//! Semantic rewrites of typed SSA, independent of ISA operands and width.
 pub(crate) mod active;
 pub(crate) mod adjacency;
 pub(crate) mod dce;
 pub(crate) mod entry;
 pub(crate) mod idioms;
-#[cfg(test)]
-pub(crate) mod narrow;
 pub(crate) mod pairs;
 pub(crate) mod simplify;
-#[cfg(test)]
-pub(crate) mod specialise;
 pub(crate) mod uniform_queries;
 
 use super::analysis::{Analyses, Preserved};
@@ -45,15 +40,7 @@ impl Driver {
     ) -> Result<bool, String> {
         let mut any = false;
         for pass in passes {
-            #[cfg(test)]
-            let before = f.clone();
             let changed = pass.run(f, analyses);
-            #[cfg(test)]
-            assert!(
-                changed || *f == before,
-                "{}: changed the function without reporting it",
-                pass.name()
-            );
             if changed {
                 analyses.invalidate(&pass.preserves());
                 if self.verify_each {

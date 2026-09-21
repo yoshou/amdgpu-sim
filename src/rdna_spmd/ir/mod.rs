@@ -2,8 +2,6 @@ pub(crate) mod builder;
 pub(crate) mod effect;
 pub(crate) mod func;
 pub(crate) mod op;
-#[cfg(test)]
-pub(crate) mod parse;
 pub(crate) mod print;
 pub(crate) mod scope;
 pub(crate) mod ty;

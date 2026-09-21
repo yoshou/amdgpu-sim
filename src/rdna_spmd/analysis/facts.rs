@@ -77,8 +77,7 @@ pub(crate) struct Facts {
 }
 
 impl Facts {
-    /// `kept` names lane words the lane program keeps whole, as the wave
-    /// computes them, whatever their uses.
+
     pub fn new(f: &Func, inputs: &[Parameter], kept: &BTreeSet<ValueId>) -> Self {
         let n = f.types.len();
         let order = reverse_postorder(f);

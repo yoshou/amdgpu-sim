@@ -1,6 +1,3 @@
-//! Scalar arithmetic is lifted into the same core SSA as vector arithmetic.
-//! Carry, shift and extension rules: RDNA4 ISA §§16.1–16.3.
-//! https://docs.amd.com/api/khub/documents/uQpkEvk3pv~kfAb2x~j4uw/content
 use super::*;
 
 fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {

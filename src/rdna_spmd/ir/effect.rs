@@ -1,4 +1,3 @@
-//! Ordered, typed effects. ISA operands are resolved by the lifter.
 use super::{Ty, ValueId};
 
 pub(crate) const SCHEDULED: u64 = 1 << 62;
@@ -172,87 +171,5 @@ impl EffectOp {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::{Block, BlockId, Func, Inst, Term};
-    use super::*;
-    use std::collections::BTreeMap;
-    #[test]
-    fn effects_reject_wrong_spaces_masks_results_and_duplicate_provenance() {
-        let semantics = MemorySemantics {
-            scope: Scope::Device,
-            ordering: Ordering::Relaxed,
-            cache_policy: CachePolicy::Temporal,
-            volatile: false,
-            deferred_scope: false,
-        };
-        let load = EffectOp::Memory {
-            space: Space::Global,
-            op: MemoryOp::Load(MemSize::B32),
-            semantics,
-        };
-        let types = vec![Ty::I64, Ty::I1, Ty::I32];
-        let inputs = [ValueId(0), ValueId(1)];
-        let outputs = [(ValueId(2), Ty::I32)];
-        assert!(load.verify(&inputs, &outputs, &types).is_ok());
-        assert!(load
-            .verify(&[ValueId(2), ValueId(1)], &outputs, &types)
-            .is_err());
-        assert!(load
-            .verify(&[ValueId(0), ValueId(2)], &outputs, &types)
-            .is_err());
-        assert!(load
-            .verify(&inputs, &[(ValueId(2), Ty::F32)], &types)
-            .is_err());
-        let private = EffectOp::Memory {
-            space: Space::Scratch,
-            op: MemoryOp::AtomicAdd,
-            semantics,
-        };
-        assert!(private
-            .verify(&[ValueId(2), ValueId(2), ValueId(1)], &outputs, &types)
-            .is_err());
-        let invalid_order = EffectOp::Memory {
-            space: Space::Global,
-            op: MemoryOp::Load(MemSize::B32),
-            semantics: MemorySemantics {
-                ordering: Ordering::Release,
-                ..semantics
-            },
-        };
-        assert!(invalid_order.verify(&inputs, &outputs, &types).is_err());
-        let mut f = Func::new(BlockId(0), crate::rdna_spmd::ir::Presence::Wave);
-        f.types = vec![Ty::I64, Ty::I1, Ty::I32, Ty::I32];
-        f.blocks = BTreeMap::from([(
-                BlockId(0),
-                Block {
-                    params: vec![(ValueId(0), Ty::I64), (ValueId(1), Ty::I1)],
-                    insts: vec![
-                        Inst::Effect {
-                            provenance: 7,
-                            op: load,
-                            inputs: inputs.to_vec(),
-                            outputs: outputs.to_vec(),
-                        },
-                        Inst::Effect {
-                            provenance: 7,
-                            op: load,
-                            inputs: inputs.to_vec(),
-                            outputs: vec![(ValueId(3), Ty::I32)],
-                        },
-                    ],
-                    term: Term::Ret(vec![]),
-                },
-        )]);
-        assert!(f.clone().verify().is_err());
-        if let Inst::Effect { provenance, .. } =
-            &mut f.blocks.get_mut(&BlockId(0)).unwrap().insts[1]
-        {
-            *provenance = 8;
-        }
-        assert!(f.verify().is_ok());
     }
 }

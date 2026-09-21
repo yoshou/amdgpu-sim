@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {
     let decided = {
         let facts = Facts::new(q, inputs, &BTreeSet::new());
-        // Every query the lane program still holds is one it keeps.
+
         let kept: BTreeSet<ValueId> = q
             .blocks
             .values()
@@ -27,10 +27,7 @@ pub(super) fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {
             Some(index) => logic.atom(Atom::Bit(q.blocks[&q.entry].params[index].0)),
             None => Bdd::TRUE,
         };
-        // Folding under more states than the lanes reach only folds less.
-        // The exact reach of a program that keeps queries costs seconds; in
-        // the raytracing kernel it decides 35 more bits out of 183, all of
-        // them one mask word's own bit being set, and in no other kernel any.
+
         let reach = logic.open_reach(q, &facts, q.entry, start);
         decisions(q, &facts, &mut logic, &reach)
     };

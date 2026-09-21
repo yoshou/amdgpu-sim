@@ -1,4 +1,3 @@
-//! Division macro operands and explicit VCC input for FMAS.
 use super::*;
 
 pub(super) fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {

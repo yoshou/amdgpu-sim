@@ -43,8 +43,6 @@ fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut [Vec<ValueId>
     }
 }
 
-/// Carries a 64-bit value that crosses blocks as two words as one value, in a
-/// program that carries its masks as `M` does.
 pub(crate) struct Pairs<M>(pub(crate) PhantomData<fn() -> M>);
 impl<M: Masking> super::Pass for Pairs<M> {
     fn name(&self) -> &str {

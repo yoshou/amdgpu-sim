@@ -1,15 +1,12 @@
-//! Decode conservative operand-use envelopes and native address forms.
-//! SSA analyses consume the corresponding ValueIds recorded by the lifter.
 use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
 fn src_vgpr(op: &SourceOperand, out: &mut Vec<u32>) {
     if let SourceOperand::VectorRegister(r) = op {
         out.push(*r as u32);
-        out.push(*r as u32 + 1); // over-approx: covers f64/64-bit pair reads
+        out.push(*r as u32 + 1);
     }
 }
 
-/// All VGPRs an instruction may read (over-approximated upward — never under).
 pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
     if let Some((reads, _)) = super::half::registers(inst) {
         return reads;
@@ -77,17 +74,11 @@ pub fn vgpr_reads(inst: &InstFormat) -> Vec<u32> {
                 r.push(i.vdst as u32);
             }
         }
-        _ => {} // SALU/SMEM/SOPC read SGPRs only
+        _ => {}
     }
     r
 }
 
-/// PRECISE VGPR reads for divergence analysis: a 32-bit operand reads only `r`
-/// (not the over-approximated `{r,r+1}` used for liveness soundness), so the
-/// 32-bit address arithmetic doesn't pick up a spurious divergent neighbour and
-/// a uniform load address stays provably uniform. f64/64-bit operands read the
-/// pair. (Over-counting here would only *add* divergence — conservative/sound —
-/// but it loses the uniform-gather→broadcast optimization, so we read precisely.)
 fn op_is_pair(op: I) -> bool {
     let s = format!("{:?}", op);
     (s.contains("F64") && !matches!(op, I::V_CVT_F64_U32 | I::V_CVT_F64_I32 | I::V_CVT_I32_F64))
@@ -146,7 +137,7 @@ pub fn div_reads(inst: &InstFormat) -> Vec<u32> {
             push_v(&mut r, i.vsrc1y, false);
         }
         InstFormat::VGLOBAL(i) => {
-            // address: 64-bit VGPR pair when saddr is null (124), else a 32-bit offset.
+
             r.push(i.vaddr as u32);
             if i.saddr == 124 {
                 r.push(i.vaddr as u32 + 1);
@@ -198,7 +189,6 @@ pub fn div_reads(inst: &InstFormat) -> Vec<u32> {
     r
 }
 
-/// Opcodes that write their `vdst:vdst+1` as an f64 result (set the pair fresh).
 fn is_sop_u64(op: I) -> bool {
     matches!(
         op,
@@ -215,7 +205,6 @@ fn is_sop_u64(op: I) -> bool {
     )
 }
 
-/// SGPR pairs an instruction defines as a 64-bit value (set the i64 shadow).
 pub(super) fn sgpr_u64_defs(inst: &InstFormat) -> Vec<u32> {
     match inst {
         InstFormat::SOP1(i) if is_sop_u64(i.op) => vec![i.sdst as u32],
@@ -224,8 +213,6 @@ pub(super) fn sgpr_u64_defs(inst: &InstFormat) -> Vec<u32> {
     }
 }
 
-/// Native f64 views requested by the original operand encoding. This includes
-/// encoded unused operands, preserving the existing disjoint-cell policy.
 pub(super) fn f64_pairs(inst: &InstFormat) -> Vec<u32> {
     let reads = |op: I| {
         format!("{op:?}").contains("F64") && !matches!(op, I::V_CVT_F64_U32 | I::V_CVT_F64_I32)
@@ -279,10 +266,7 @@ pub(super) fn f64_pairs(inst: &InstFormat) -> Vec<u32> {
 }
 
 fn is_f64_op(op: I) -> bool {
-    // Ops whose vector source operands are read as f64 *pairs* (r, r+1). i32 ops
-    // (V_CNDMASK/V_MOV/V_AND/...) read a single register. Over-including a pair
-    // for an f64 op's occasional i32 sub-operand (e.g. V_LDEXP src1) is safe;
-    // under-counting an i32 op's single read as a pair was the bug.
+
     let s = format!("{:?}", op);
     s.contains("F64") && !matches!(op, I::V_CVT_F64_U32 | I::V_CVT_F64_I32)
 }
@@ -337,9 +321,7 @@ pub(super) fn math_reads(inst: &InstFormat) -> Vec<u32> {
             }
         }
         InstFormat::VOP3P(i) => {
-            // Mirror the VOP3P write side in `freshness::vgpr_writes`. Reads are the
-            // base VGPR of each source (V_FMA_MIXLO_F16; the wave-wide WMMA is lifted
-            // out before this runs, so its multi-register spans never reach here).
+
             for o in [&i.src0, &i.src1, &i.src2] {
                 if let SourceOperand::VectorRegister(x) = o {
                     r.push(*x as u32);
@@ -360,7 +342,7 @@ pub(super) fn math_reads(inst: &InstFormat) -> Vec<u32> {
             }
         }
         InstFormat::VOPD(i) => {
-            // VOPD packs two 32-bit ops; sources are single registers.
+
             if let SourceOperand::VectorRegister(x) = i.src0x {
                 r.push(x as u32);
             }
@@ -372,10 +354,10 @@ pub(super) fn math_reads(inst: &InstFormat) -> Vec<u32> {
         }
         InstFormat::VGLOBAL(i) => {
             r.push(i.vaddr as u32);
-            r.push(i.vaddr as u32 + 1); // 64-bit address
+            r.push(i.vaddr as u32 + 1);
             for k in 0..4 {
                 r.push(i.vsrc as u32 + k);
-            } // store data (up to B128)
+            }
         }
         _ => {}
     }

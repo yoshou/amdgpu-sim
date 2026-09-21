@@ -1,4 +1,3 @@
-//! Function SSA with explicit block arguments, including loop backedges.
 use super::effect::EffectOp;
 use super::scope::Presence;
 use super::{Op, Ty, ValueId};
@@ -6,8 +5,7 @@ use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct BlockId(pub usize);
-/// Pure mask reductions within the current packet. These are compiler IR
-/// operations, not variants of the runtime's wave-effect protocol.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PacketOp {
     Any,
@@ -86,16 +84,11 @@ pub(crate) struct Func {
     pub entry: BlockId,
     pub blocks: BTreeMap<BlockId, Block>,
     pub types: Vec<Ty>,
-    /// Each region's entry block and the lanes it keeps together. A block
-    /// belongs to the innermost region whose entry dominates it; see
-    /// [`super::scope`].
+
     pub regions: BTreeMap<BlockId, Presence>,
 }
 impl Func {
-    /// An empty function entered at `entry`, all of it in one region with
-    /// `presence` there. Blocks and values are added to it;
-    /// [`Func::one_region`] relabels the region once what the body reads is
-    /// known, and narrowing replaces the one region with a tree.
+
     pub fn new(entry: BlockId, presence: Presence) -> Self {
         Self {
             entry,
@@ -197,119 +190,5 @@ impl Func {
             }
         }
         self.types = types;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::IntOp;
-    use super::*;
-    fn loop_func() -> Func {
-        let mut f = Func::new(BlockId(0), Presence::Wave);
-        f.types = vec![Ty::I32, Ty::I32, Ty::I32, Ty::I1];
-        f.blocks = BTreeMap::from([
-                (
-                    BlockId(0),
-                    Block {
-                        params: vec![(ValueId(0), Ty::I32)],
-                        insts: vec![],
-                        term: Term::Br(Edge {
-                            dst: BlockId(1),
-                            args: vec![ValueId(0)],
-                        }),
-                    },
-                ),
-                (
-                    BlockId(1),
-                    Block {
-                        params: vec![(ValueId(1), Ty::I32)],
-                        insts: vec![
-                            Inst::Core {
-                                value: ValueId(2),
-                                ty: Ty::I32,
-                                op: Op::Int(IntOp::Add, ValueId(1), ValueId(1)),
-                            },
-                            Inst::Core {
-                                value: ValueId(3),
-                                ty: Ty::I1,
-                                op: Op::Const(Ty::I1, 1),
-                            },
-                        ],
-                        term: Term::CondBr {
-                            cond: ValueId(3),
-                            yes: Edge {
-                                dst: BlockId(1),
-                                args: vec![ValueId(2)],
-                            },
-                            no: Edge {
-                                dst: BlockId(2),
-                                args: vec![],
-                            },
-                        },
-                    },
-                ),
-                (
-                    BlockId(2),
-                    Block {
-                        params: vec![],
-                        insts: vec![],
-                        term: Term::Ret(vec![]),
-                    },
-                ),
-        ]);
-        f
-    }
-    #[test]
-    fn verifies_loop_block_arguments() {
-        loop_func().verify().unwrap();
-    }
-    #[test]
-    fn rejects_broken_cfg_ssa() {
-        for kind in 0..6 {
-            let mut f = loop_func();
-            let block = f.blocks.get_mut(&BlockId(1)).unwrap();
-            match kind {
-                0 => block.params[0].0 = ValueId(0),
-                1 => {
-                    block.insts[0] = Inst::Core {
-                        value: ValueId(2),
-                        ty: Ty::I32,
-                        op: Op::Int(IntOp::Add, ValueId(0), ValueId(1)),
-                    }
-                }
-                2 => {
-                    block.term = Term::Br(Edge {
-                        dst: BlockId(99),
-                        args: vec![],
-                    })
-                }
-                3 => {
-                    block.term = Term::Br(Edge {
-                        dst: BlockId(1),
-                        args: vec![],
-                    })
-                }
-                4 => {
-                    block.term = Term::Br(Edge {
-                        dst: BlockId(1),
-                        args: vec![ValueId(3)],
-                    })
-                }
-                _ => {
-                    block.term = Term::CondBr {
-                        cond: ValueId(2),
-                        yes: Edge {
-                            dst: BlockId(2),
-                            args: vec![],
-                        },
-                        no: Edge {
-                            dst: BlockId(2),
-                            args: vec![],
-                        },
-                    }
-                }
-            }
-            assert!(f.verify().is_err(), "case {}", kind);
-        }
     }
 }

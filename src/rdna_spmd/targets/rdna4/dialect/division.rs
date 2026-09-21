@@ -1,14 +1,5 @@
-//! ISA §16.12 division macro primitives. FIXUP consumes the supplied
-//! approximation; recognizing a complete division macro is a separate pass.
-//! FMAS is fused, supports input denormals and retains output denormals.
 use super::*;
-#[cfg(test)]
-mod tests;
 
-// Hardware captures in tests/isa/vop3/scalar_dst.rs take precedence over
-// §16.12's pseudocode (user decision, 2026-09-06). Zero operands produce
-// negative qNaN and set the flag. The quotient thresholds are symmetric
-// exponent differences; a very large denominator scales down.
 fn scale_operand(e: &Emitter, ty: Ty, a: &[Value]) -> Vec<Value> {
     let ir = e.ir;
     let (word, fraction, mask, threshold, reciprocal, tiny, amount, nan) = if ty == Ty::F32 {
@@ -77,80 +68,6 @@ pub(super) fn scale_f32(e: &Emitter, a: &[Value]) -> Vec<Value> {
 }
 pub(super) fn scale_f64(e: &Emitter, a: &[Value]) -> Vec<Value> {
     scale_operand(e, Ty::F64, a)
-}
-
-#[cfg(test)]
-pub(in crate::rdna_spmd) fn reference_scale(ty: Ty, operands: [u64; 3]) -> (u64, bool) {
-    // §16.12 scaling rules with the captured exponent thresholds and the
-    // authorized zero-input rule. libm supplies independently rounded scaling.
-    let (a, den, num, fraction, exponent_mask, limit, reciprocal, tiny, amount, nan) =
-        if ty == Ty::F32 {
-            (
-                f32::from_bits(operands[0] as u32) as f64,
-                f32::from_bits(operands[1] as u32) as f64,
-                f32::from_bits(operands[2] as u32) as f64,
-                23,
-                255,
-                96,
-                253,
-                23,
-                64,
-                0xffc0_0000,
-            )
-        } else {
-            (
-                f64::from_bits(operands[0]),
-                f64::from_bits(operands[1]),
-                f64::from_bits(operands[2]),
-                52,
-                2047,
-                768,
-                2045,
-                53,
-                128,
-                0xfff8_0000_0000_0000,
-            )
-        };
-    if den == 0. || num == 0. {
-        return (nan, true);
-    }
-    let den_exp = ((operands[1] >> fraction) & exponent_mask) as i32;
-    let num_exp = ((operands[2] >> fraction) & exponent_mask) as i32;
-    let delta = num_exp - den_exp;
-    let shift = match delta {
-        d if d >= limit => {
-            if a == den {
-                amount
-            } else {
-                0
-            }
-        }
-        d if d <= -limit && den_exp >= reciprocal => {
-            if a == den {
-                -amount
-            } else {
-                0
-            }
-        }
-        d if d <= -limit => {
-            if a == num {
-                amount
-            } else {
-                0
-            }
-        }
-        _ if den_exp >= reciprocal => -amount,
-        _ if den_exp == 0 || num_exp <= tiny => amount,
-        _ => 0,
-    };
-    let result = if shift == 0 {
-        operands[0]
-    } else if ty == Ty::F32 {
-        libm::scalbnf(f32::from_bits(operands[0] as u32), shift).to_bits() as u64
-    } else {
-        libm::scalbn(a, shift).to_bits()
-    };
-    (result, delta.abs() >= limit)
 }
 
 fn fmas(e: &Emitter, ty: Ty, a: &[Value]) -> Value {

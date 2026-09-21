@@ -1,5 +1,3 @@
-//! Architectural register-word dependencies and typed SSA operand views.
-//! EXEC/VCC keep their explicit mask bindings; NULL is never an SSA variable.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -74,8 +72,7 @@ pub(super) fn words(set: &RegSet) -> impl Iterator<Item = Word> + '_ {
         .map(Word::Vgpr)
         .chain(set.sgprs().filter_map(Word::scalar))
 }
-/// Register views shared by ALU and memory consumers. The shape is a native
-/// representation choice; ordinary word definitions remain width independent.
+
 pub(super) type Views = BTreeMap<(Word, Ty, bool), ValueId>;
 #[derive(Default)]
 pub(super) struct Operands {
@@ -431,8 +428,7 @@ pub(super) fn define(
                 value
             }
             Output::Scalar(..) | Output::Scc => result,
-            // The ISA writes a mask bit only in the lanes EXEC selects; the
-            // other lanes keep the bit they held.
+
             Output::Compare(reg) | Output::Mask(reg) => match Word::scalar(reg) {
                 Some(word) => {
                     let old = if matches!(word, Word::Mask(_)) {
@@ -451,8 +447,7 @@ pub(super) fn define(
                 let raw = if matches!(word, Word::Mask(_)) {
                     value
                 } else {
-                    // A ballot clears invalid lanes, so the word keeps its old
-                    // bits wherever EXEC is clear rather than balloting `value`.
+
                     let active = query(f, insts, WaveOp::Ballot, exec);
                     let taken = core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec));
                     let written = query(f, insts, WaveOp::Ballot, taken);
@@ -580,9 +575,7 @@ pub(crate) struct RegSet {
 }
 
 impl RegSet {
-    /// Registers outside the architectural files (128 SGPRs, 256 VGPRs) are
-    /// dropped: operand encodings can name reserved indices, and aliasing one
-    /// onto a real register would be worse than ignoring it.
+
     pub(crate) fn add_sgpr(&mut self, reg: u32) {
         if reg < 128 {
             self.sgpr |= 1 << reg;
@@ -607,11 +600,6 @@ impl RegSet {
     }
 }
 
-/// What the host-applied wave-level op at a boundary touches: the registers it
-/// reads out of the packet (which the kernel stores before yielding) and the
-/// ones it writes back (which the kernel reloads afterwards). A partial write
-/// — writelane touches one lane of the packed vector — belongs in `reads` too,
-/// so the lanes it leaves alone survive the round trip.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct BoundaryIo {
     pub(crate) reads: RegSet,
