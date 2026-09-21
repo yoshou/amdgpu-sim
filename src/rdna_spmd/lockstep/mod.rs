@@ -19,12 +19,11 @@ pub(crate) struct Packing {
 }
 
 fn represent(lane: &Program, packing: Packing) -> Program {
-    use crate::rdna_spmd::analysis::{Analyses, MaskValues};
+    use crate::rdna_spmd::analysis::Analyses;
     use crate::rdna_spmd::pass::dce::{Dce, DeadParams};
     use crate::rdna_spmd::pass::pairs::{Pairs, WideMemory};
     use crate::rdna_spmd::pass::simplify::Simplify;
     use crate::rdna_spmd::pass::Driver;
-    use std::marker::PhantomData;
     let mut ir = lane.ir.clone();
     let driver = Driver::new();
     let mut analyses = Analyses::new(uniform::context(lane, packing));
@@ -32,7 +31,7 @@ fn represent(lane: &Program, packing: Packing) -> Program {
         .pipeline(
             &mut ir,
             &mut analyses,
-            &[&Simplify, &Dce, &Pairs::<MaskValues>(PhantomData)],
+            &[&Simplify, &Dce, &Pairs],
         )
         .unwrap();
     let limit = 1 + ir.types.len();
@@ -45,7 +44,7 @@ fn represent(lane: &Program, packing: Packing) -> Program {
             &[
                 &Simplify,
                 &Dce,
-                &DeadParams::<MaskValues>(PhantomData),
+                &DeadParams,
                 &WideMemory,
             ],
         )
@@ -54,7 +53,6 @@ fn represent(lane: &Program, packing: Packing) -> Program {
         registry: lane.registry.clone(),
         ir,
         parameter_inputs: lane.parameter_inputs.clone(),
-        revision: lane.revision + 1,
     }
 }
 
@@ -98,7 +96,6 @@ pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> Program {
                 registry: lane.registry.clone(),
                 ir,
                 parameter_inputs: lane.parameter_inputs.clone(),
-                revision: lane.revision + 1,
             };
         }
         for v in refuted {

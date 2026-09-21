@@ -1,4 +1,4 @@
-use super::super::analysis::{Constants, DispatchConstants, Preserved};
+use super::super::analysis::{Constants, Preserved};
 use super::super::ir::*;
 use super::{Analyses, Pass};
 
@@ -138,26 +138,7 @@ impl Pass for PacketState {
         packet_state(f, analyses.context().lanes >= 32) > 0
     }
     fn preserves(&self) -> Preserved {
-        Preserved::of::<Constants>().and::<DispatchConstants>()
-    }
-}
-
-pub(crate) struct DiscardReturn;
-impl Pass for DiscardReturn {
-    fn name(&self) -> &str {
-        "discard_return"
-    }
-    fn run(&self, f: &mut Func, _: &Analyses) -> bool {
-        let mut count = 0;
-        for block in f.blocks.values_mut() {
-            if let Term::Ret(args) = &mut block.term {
-                if !args.is_empty() {
-                    args.clear();
-                    count += 1;
-                }
-            }
-        }
-        count > 0
+        Preserved::of::<Constants>()
     }
 }
 

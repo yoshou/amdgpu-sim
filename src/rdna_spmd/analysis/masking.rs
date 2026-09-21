@@ -3,38 +3,10 @@ use super::dataflow::{Cfg, Sparse};
 use super::masks::any_of;
 use super::{Access, Analyses};
 
-pub(crate) trait Masking: 'static {
-
-    fn guarded(f: &Func, analyses: &Analyses) -> Vec<bool>;
-
-    fn holds_a_lane(f: &Func, analyses: &Analyses, accesses: &[Access]) -> Vec<bool>;
-
-    fn scalar_word(mask: Option<u64>) -> bool;
-
-    fn positional(ty: Ty) -> bool;
-}
-
-pub(crate) struct MaskValues;
-
-impl Masking for MaskValues {
-
-    fn guarded(f: &Func, _: &Analyses) -> Vec<bool> {
-        vec![false; f.types.len()]
-    }
-
-    fn holds_a_lane(f: &Func, analyses: &Analyses, accesses: &[Access]) -> Vec<bool> {
-        let ctx = analyses.context();
-        let nonempty = nonempty(f, ctx.exec_index, ctx.exec_initial);
-        accesses.iter().map(|a| nonempty[a.mask.0]).collect()
-    }
-
-    fn scalar_word(_: Option<u64>) -> bool {
-        false
-    }
-
-    fn positional(_: Ty) -> bool {
-        false
-    }
+pub(crate) fn holds_a_lane(f: &Func, analyses: &Analyses, accesses: &[Access]) -> Vec<bool> {
+    let ctx = analyses.context();
+    let nonempty = nonempty(f, ctx.exec_index, ctx.exec_initial);
+    accesses.iter().map(|a| nonempty[a.mask.0]).collect()
 }
 
 fn nonempty(f: &Func, exec_index: usize, initial: bool) -> Vec<bool> {

@@ -1,4 +1,4 @@
-use super::super::analysis::{Analyses, Constants, DispatchConstants, Preserved};
+use super::super::analysis::{Analyses, Constants, Preserved};
 use super::super::ir::*;
 use super::Pass;
 use std::collections::BTreeSet;
@@ -12,7 +12,7 @@ impl Pass for Adjacency {
         run(f) > 0
     }
     fn preserves(&self) -> Preserved {
-        Preserved::of::<Constants>().and::<DispatchConstants>()
+        Preserved::of::<Constants>()
     }
 }
 

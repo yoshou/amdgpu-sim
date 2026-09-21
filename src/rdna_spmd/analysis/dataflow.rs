@@ -12,7 +12,6 @@ impl Lattice for bool {
 
 pub(super) struct Cfg<'f> {
     pub blocks: Vec<&'f Block>,
-    pub ids: Vec<BlockId>,
     pub index: Vec<usize>,
     pub order: Vec<usize>,
     pub incoming: Vec<Vec<(usize, &'f Edge)>>,
@@ -63,7 +62,6 @@ impl<'f> Cfg<'f> {
         }
         Cfg {
             blocks,
-            ids,
             index,
             order,
             incoming,

@@ -94,12 +94,6 @@ impl Value {
         }
         self
     }
-    pub fn set_volatile(self, volatile: bool) -> Value {
-        unsafe {
-            LLVMSetVolatile(self.0, volatile as i32);
-        }
-        self
-    }
     pub fn set_initializer(self, value: Value) {
         unsafe {
             LLVMSetInitializer(self.0, value.0);

@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::target::Target;
 
 use super::engine::kernel::{
     Kernel, Region, Scheduler,
@@ -10,34 +8,22 @@ use super::engine::kernel::{
 
 use super::analysis::uniformity::Fact;
 use super::analysis::{
-    Accesses, Analyses, Constants, Context, MaskValues, Masking, Packet, Uniformity,
+    holds_a_lane, Accesses, Analyses, Constants, Context, Packet, Uniformity,
 };
 use super::codegen::Prepared;
 use super::dialect::DialectRegistry;
 use super::ir::{EffectOp, Func, ValueId};
 use super::pass::uniform_queries::UniformQueries;
 use super::pass::{
-    active::Active,
     adjacency::Adjacency,
     dce::{Dce, DeadParams},
-    entry::{DiscardReturn, PacketState},
+    entry::PacketState,
     idioms::Idioms,
     pairs::{Pairs, WideMemory},
     simplify::Simplify,
 };
-use super::pass::{Driver, Pass};
-use super::program::{CompilationInput, Parameter, ParameterSource, Program};
-
-pub struct Compiler {
-    target: Arc<dyn Target>,
-}
-impl Compiler {
-    pub fn for_arch(arch: &str) -> Result<Self, String> {
-        super::targets::select(arch)
-            .map(|target| Self { target })
-            .ok_or_else(|| format!("no SPMD target supports {arch}"))
-    }
-}
+use super::pass::Driver;
+use super::program::{Parameter, ParameterSource, Program};
 
 pub(super) fn exec_index(inputs: &[Parameter], registry: &DialectRegistry) -> usize {
     let exec = registry.registers().exec;
@@ -64,7 +50,6 @@ pub(super) fn wave_passes(f: &mut Program) {
             &[&Idioms, &UniformQueries, &Simplify, &Dce],
         )
         .unwrap();
-    f.revision += 1;
 }
 
 fn yield_layouts_ir(
@@ -141,37 +126,19 @@ fn yield_layouts_ir(
     (out, groups)
 }
 
-struct Bare {
-    ir: Func,
-    inputs: Vec<Parameter>,
-    registry: Arc<DialectRegistry>,
-}
-
-fn bare(f: Program) -> Bare {
-    Bare {
-        ir: f.ir,
-        inputs: f.parameter_inputs,
-        registry: f.registry,
-    }
-}
-
-fn prepared<M: Masking>(
+fn prepared(
     mut ir: Func,
     an: &mut Analyses,
     registry: &Arc<DialectRegistry>,
-    width: Option<u32>,
+    width: u32,
     num_vgprs: usize,
 ) -> Prepared {
     let driver = Driver::new();
-    let mut passes: Vec<&dyn Pass> = vec![&PacketState];
-    if width.is_none() {
-        passes.push(&Active);
-    }
-    driver.pipeline(&mut ir, an, &passes).unwrap();
+    driver.pipeline(&mut ir, an, &[&PacketState]).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
         driver.pipeline(&mut ir, an, &[&Simplify, &Dce]).unwrap();
         driver
-            .pipeline(&mut ir, an, &[&Pairs::<M>(PhantomData)])
+            .pipeline(&mut ir, an, &[&Pairs])
             .unwrap();
         let limit = 1 + ir.types.len();
         driver
@@ -180,15 +147,15 @@ fn prepared<M: Masking>(
                 an,
                 "simplify",
                 limit,
-                &[&Simplify, &Dce, &DeadParams::<M>(PhantomData), &WideMemory],
+                &[&Simplify, &Dce, &DeadParams, &WideMemory],
             )
             .unwrap();
     }
     driver.pipeline(&mut ir, an, &[&Adjacency]).unwrap();
     let constants = an.get::<Constants>(&ir);
-    let uniformity = an.get::<Uniformity<M>>(&ir);
-    let accesses = an.get::<Accesses<M>>(&ir);
-    let holds_a_lane = M::holds_a_lane(&ir, an, &accesses);
+    let uniformity = an.get::<Uniformity>(&ir);
+    let accesses = an.get::<Accesses>(&ir);
+    let holds_a_lane = holds_a_lane(&ir, an, &accesses);
     let uniform = uniformity.uniform();
     let affine: BTreeMap<ValueId, u32> = uniformity
         .facts
@@ -247,11 +214,11 @@ pub(super) fn prepare_lockstep(
     packing: super::lockstep::Packing,
     num_vgprs: usize,
 ) -> Prepared {
-    let Bare {
+    let Program {
         mut ir,
-        inputs,
+        parameter_inputs: inputs,
         registry,
-    } = bare(f);
+    } = f;
     ir.lowered_to_packets();
     let driver = Driver::new();
     let mut an = Analyses::new(Context {
@@ -261,41 +228,21 @@ pub(super) fn prepare_lockstep(
         }),
         ..context(&registry, &inputs, packing.lanes)
     });
-    driver
-        .pipeline(&mut ir, &mut an, &[&DiscardReturn])
-        .unwrap();
     let limit = 1 + ir.types.len();
     driver
         .fixpoint(&mut ir, &mut an, "simplify", limit, &[&Simplify, &Dce])
         .unwrap();
-    prepared::<MaskValues>(
+    prepared(
         ir,
         &mut an,
         &registry,
-        Some(packing.lanes),
+        packing.lanes,
         num_vgprs,
     )
 }
 
-impl Compiler {
-    pub fn decode_program(&self, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-        let mut program = self.target.decode(entry_pc, memory)?;
-        wave_passes(&mut program);
-        Ok(program)
-    }
-}
-
 pub(crate) fn aligned(workgroup_x: Option<u32>, width: u32) -> bool {
     workgroup_x.map_or(true, |x| x % width == 0)
-}
-
-pub(crate) fn compile_lane(
-    lane: &super::decompile::Lane,
-    num_vgprs: usize,
-    width: u32,
-    workgroup_x: Option<u32>,
-) -> Kernel {
-    compile_lockstep(lane, num_vgprs, width, workgroup_x)
 }
 
 fn schedule(shares: &Sharing) -> Scheduler {
@@ -359,7 +306,12 @@ pub(crate) fn compile_lockstep(
 }
 
 pub fn decode_program(arch: &str, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
-    Compiler::for_arch(arch)?.decode_program(entry_pc, memory)
+    if !super::targets::rdna4::supports(arch) {
+        return Err(format!("no SPMD target supports {arch}"));
+    }
+    let mut program = super::targets::rdna4::decode(entry_pc, memory)?;
+    wave_passes(&mut program);
+    Ok(program)
 }
 
 
@@ -407,19 +359,12 @@ fn sharing(
     out
 }
 
-impl Compiler {
-    pub fn compile(&self, program: &impl CompilationInput, options: CompileOptions) -> Kernel {
-        compile(program, options)
-    }
-}
-
-pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kernel {
+pub fn compile(program: &Program, options: CompileOptions) -> Kernel {
     assert!(
         matches!(options.width, 1 | 2 | 4 | 8 | 16 | 32),
         "unsupported packet width {}",
         options.width
     );
-    let program = program.to_ssa();
-    let lane = super::decompile::decompile(&program);
-    compile_lane(&lane, options.num_vgprs, options.width, options.workgroup_x)
+    let lane = super::decompile::decompile(program);
+    compile_lockstep(&lane, options.num_vgprs, options.width, options.workgroup_x)
 }

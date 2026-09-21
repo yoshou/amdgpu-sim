@@ -10,16 +10,15 @@ mod lockstep;
 mod native;
 mod pass;
 mod program;
-mod target;
 mod targets;
 
-pub use compiler::{compile, decode_program, CompileOptions, Compiler};
+pub use compiler::{compile, decode_program, CompileOptions};
 pub use engine::{
     dispatch,
     dispatch::GridDims,
     kernel::{Kernel, Scheduler},
 };
-pub use program::{CompilationInput, Program};
+pub use program::Program;
 
 pub fn default_width() -> u32 {
     #[cfg(target_arch = "x86_64")]

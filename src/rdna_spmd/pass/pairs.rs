@@ -1,7 +1,6 @@
-use super::super::analysis::{Analyses, Constants, Masking, Uniformity};
+use super::super::analysis::{Analyses, Constants, Uniformity};
 use super::super::ir::{Op, Ty, ValueId, *};
 use std::collections::{BTreeMap, BTreeSet};
-use std::marker::PhantomData;
 
 enum Source {
     Packed(ValueId),
@@ -43,13 +42,13 @@ fn observed(a: ValueId, b: ValueId, defs: &[Option<Op>], out: &mut [Vec<ValueId>
     }
 }
 
-pub(crate) struct Pairs<M>(pub(crate) PhantomData<fn() -> M>);
-impl<M: Masking> super::Pass for Pairs<M> {
+pub(crate) struct Pairs;
+impl super::Pass for Pairs {
     fn name(&self) -> &str {
         "pairs"
     }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        let uniform = analyses.get::<Uniformity<M>>(f).uniform();
+        let uniform = analyses.get::<Uniformity>(f).uniform();
         run(f, &uniform) > 0
     }
 }
