@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::target::Target;
 
 use super::engine::kernel::{
-    Code, CoopVecKernel, Kernel, Scheduler, VecKernel,
+    Kernel, Region, Scheduler,
 };
 use super::program::{CompilationInput, Program};
 
@@ -13,7 +13,7 @@ use super::analysis::uniformity::Fact;
 use super::analysis::{
     Accesses, Analyses, Constants, Context, MaskValues, Masking, Packet, Uniformity,
 };
-use super::codegen::{Abi, Prepared};
+use super::codegen::Prepared;
 use super::dialect::DialectRegistry;
 use super::ir::{EffectOp, Func, ValueId};
 use super::pass::uniform_queries::UniformQueries;
@@ -21,7 +21,7 @@ use super::pass::{
     active::Active,
     adjacency::Adjacency,
     dce::{Dce, DeadParams},
-    entry::{AssumeDispatchExec, DiscardReturn, LocalWriteLanes, PacketState},
+    entry::{DiscardReturn, LocalWriteLanes, PacketState},
     idioms::Idioms,
     pairs::{Pairs, WideMemory},
     simplify::Simplify,
@@ -159,20 +159,12 @@ fn prepared<M: Masking>(
     an: &mut Analyses,
     registry: &Arc<DialectRegistry>,
     width: Option<u32>,
-    abi: Abi,
-    observable_return: bool,
     num_vgprs: usize,
 ) -> Prepared {
     let driver = Driver::new();
-    let mut passes: Vec<&dyn Pass> = vec![&PacketState];
-    if abi == Abi::Cooperative {
-        passes.push(&LocalWriteLanes);
-    }
+    let mut passes: Vec<&dyn Pass> = vec![&PacketState, &LocalWriteLanes];
     if width.is_none() {
         passes.push(&Active);
-    }
-    if !observable_return || (width.is_none() && abi == Abi::Whole) {
-        passes.push(&AssumeDispatchExec);
     }
     driver.pipeline(&mut ir, an, &passes).unwrap();
     if std::env::var("AMDGPU_SIM_PAIRS").map_or(true, |v| v != "0") {
@@ -237,8 +229,6 @@ fn prepared<M: Masking>(
         ir,
         inputs,
         width,
-        abi,
-        observable_return,
         uniform,
         holds_a_lane,
         constants,
@@ -256,9 +246,9 @@ pub(super) fn prepare_lockstep(
     f: LiftedFunction,
     packing: super::lockstep::Packing,
     num_vgprs: usize,
-    cooperative: bool,
+    meets: bool,
 ) -> Prepared {
-    let f = if cooperative {
+    let f = if meets {
         let program = Program { function: f };
         super::program::split_at_effects(program, packing.lanes >= WAVE).function
     } else {
@@ -285,18 +275,11 @@ pub(super) fn prepare_lockstep(
     driver
         .fixpoint(&mut ir, &mut an, "simplify", limit, &[&Simplify, &Dce])
         .unwrap();
-    let abi = if cooperative {
-        Abi::Cooperative
-    } else {
-        Abi::Whole
-    };
     prepared::<MaskValues>(
         ir,
         &mut an,
         &registry,
         Some(packing.lanes),
-        abi,
-        cooperative,
         num_vgprs,
     )
 }
@@ -318,24 +301,12 @@ pub(crate) fn compile_lane(
     num_vgprs: usize,
     width: u32,
     workgroup_x: Option<u32>,
-) -> (Code, Scheduler) {
+) -> Kernel {
     compile_lockstep(lane, num_vgprs, width, workgroup_x)
 }
 
-pub(crate) fn compile_lockstep(
-    lane: &super::decompile::Lane,
-    num_vgprs: usize,
-    width: u32,
-    workgroup_x: Option<u32>,
-) -> (Code, Scheduler) {
-    let packing = super::lockstep::Packing {
-        lanes: width,
-        aligned: aligned(workgroup_x, width),
-    };
-    let packet = super::lockstep::lockstep(lane, packing);
-    let program = Program { function: packet };
-    let shares = sharing(&program, width >= WAVE);
-    let scheduler = if shares.barrier {
+fn schedule(shares: &Sharing) -> Scheduler {
+    if shares.barrier {
         Scheduler::Workgroup
     } else if shares.exchange {
         Scheduler::Wave
@@ -343,47 +314,67 @@ pub(crate) fn compile_lockstep(
         Scheduler::Workgroup
     } else {
         Scheduler::Independent
-    };
-    let cooperative = shares.barrier || shares.exchange;
-    let p = prepare_lockstep(program.function, packing, num_vgprs.max(256), cooperative);
-    if cooperative {
-        let code = super::codegen::compile(&p, "vec_kernel");
-        let yields = p.resume_layouts();
-        if yields
-            .iter()
-            .flatten()
-            .any(|l| l.op == EffectOp::Wave(super::ir::WaveOp::Wmma))
-        {
-            super::engine::wmma::warm(width as usize);
-        }
-        let kernel = CoopVecKernel::from_code(
-            code,
-            yields,
-            p.num_vgprs,
-            width,
-            p.min_private_bytes,
-            workgroup_x,
-            p.registry.registers(),
-        );
-        (Code::Cooperative(kernel), scheduler)
-    } else {
-        (
-            Code::Packet(packet_kernel(p, width, workgroup_x)),
-            scheduler,
-        )
     }
 }
 
-fn packet_kernel(p: Prepared, width: u32, workgroup_x: Option<u32>) -> VecKernel {
-    let group = p.group();
-    let code = super::codegen::compile(&p, "vec_kernel");
-    VecKernel::from_code(
-        code,
+pub(crate) fn compile_lockstep(
+    lane: &super::decompile::Lane,
+    num_vgprs: usize,
+    width: u32,
+    workgroup_x: Option<u32>,
+) -> Kernel {
+    let packing = super::lockstep::Packing {
+        lanes: width,
+        aligned: aligned(workgroup_x, width),
+    };
+    let packet = super::lockstep::lockstep(lane, packing);
+    let program = Program { function: packet };
+    let shares = sharing(
+        &program.function.ir,
+        &constants_of(&program),
+        None,
+        width >= WAVE,
+    );
+    let scheduler = schedule(&shares);
+    let meets = shares.barrier || shares.exchange;
+    let p = prepare_lockstep(program.function, packing, num_vgprs.max(256), meets);
+    let yields = p.resume_layouts();
+    if yields
+        .iter()
+        .flatten()
+        .any(|l| l.op == EffectOp::Wave(super::ir::WaveOp::Wmma))
+    {
+        super::engine::wmma::warm(width as usize);
+    }
+    let compiled = super::codegen::compile_regions(&p, "vec_kernel");
+    let regions = compiled
+        .regions
+        .into_iter()
+        .map(|region| {
+            let shares = sharing(
+                p.ir.func(),
+                &p.constants,
+                Some(&region.blocks),
+                width >= WAVE,
+            );
+            Region {
+                address: region.address,
+                scheduler: schedule(&shares),
+                children: region.children,
+            }
+        })
+        .collect();
+    Kernel::new(
+        compiled.code,
+        regions,
+        yields,
+        p.registry.registers(),
+        compiled.frame_words,
         p.num_vgprs,
-        width,
         p.min_private_bytes,
         workgroup_x,
-        group,
+        scheduler,
+        width,
     )
 }
 
@@ -406,21 +397,31 @@ struct Sharing {
     exchange: bool,
 }
 
-fn sharing(program: &Program, whole_wave: bool) -> Sharing {
-    use super::ir::{EffectOp, Inst, Space, WaveOp};
-    let f = &program.function.ir;
-    let constants = Analyses::new(context(
+fn constants_of(program: &Program) -> std::rc::Rc<Vec<Option<u64>>> {
+    Analyses::new(context(
         &program.function.registry,
         &program.function.parameter_inputs,
         32,
     ))
-    .get::<Constants>(f);
+    .get::<Constants>(&program.function.ir)
+}
+
+fn sharing(
+    f: &Func,
+    constants: &[Option<u64>],
+    blocks: Option<&std::collections::BTreeSet<super::ir::BlockId>>,
+    whole_wave: bool,
+) -> Sharing {
+    use super::ir::{EffectOp, Inst, Space, WaveOp};
     let mut out = Sharing {
         barrier: false,
         group: false,
         exchange: false,
     };
-    for block in f.blocks.values() {
+    for (id, block) in &f.blocks {
+        if blocks.is_some_and(|blocks| !blocks.contains(id)) {
+            continue;
+        }
         for inst in &block.insts {
             let Inst::Effect { op, inputs, .. } = inst else {
                 continue;
@@ -432,7 +433,7 @@ fn sharing(program: &Program, whole_wave: bool) -> Sharing {
                 EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => out.barrier = true,
                 EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane)
                     if whole_wave => {}
-                _ => out.exchange |= super::program::exchange(op, inputs, &constants),
+                _ => out.exchange |= super::program::exchange(op, inputs, constants),
             }
         }
     }
@@ -453,7 +454,5 @@ pub fn compile(program: &impl CompilationInput, options: CompileOptions) -> Kern
     );
     let program = program.to_ssa();
     let lane = super::decompile::decompile(&program.function);
-    let (code, scheduler) =
-        compile_lane(&lane, options.num_vgprs, options.width, options.workgroup_x);
-    Kernel::new(code, scheduler, options.width)
+    compile_lane(&lane, options.num_vgprs, options.width, options.workgroup_x)
 }

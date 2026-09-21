@@ -87,6 +87,7 @@ pub(crate) fn lockstep(lane: &Lane, packing: Packing) -> LiftedFunction {
             );
 
             ir.compact();
+            ir.enter_regions();
             if let Err(e) = ir.check(&lane.registry) {
                 panic!(
                     "the lockstep lowering built an invalid packet program: {}",

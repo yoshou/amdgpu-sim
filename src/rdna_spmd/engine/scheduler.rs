@@ -6,7 +6,7 @@ use super::super::ir::EffectOp;
 use super::dispatch::{setup_sgprs, GridDims};
 use super::fiber::{Fiber, KernelArgs, FIBER_DONE};
 use super::kernel::{
-    Code, CoopVecKernel, Kernel, Scheduler, VecKernel, COOP_SGPR_BUF,
+    Kernel, Region, Scheduler, COOP_ENTER, COOP_LEAVE, COOP_SGPR_BUF,
     COOP_SPILL_SLOTS,
 };
 use super::yields::YieldValues;
@@ -26,15 +26,9 @@ fn fiber_stack_bytes(width: usize) -> usize {
 const LDS_MIN_BYTES: usize = 128 * 1024;
 const POOL_LIMIT: usize = 64;
 
-#[derive(Clone, Copy)]
-enum Invoke<'a> {
-    Packet(&'a VecKernel),
-    Fiber(&'a CoopVecKernel),
-}
-
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct View<'a> {
-    invoke: Invoke<'a>,
+    regions: &'a [Region],
     scheduler: Scheduler,
     width: usize,
     num_vgprs: usize,
@@ -42,38 +36,36 @@ pub(crate) struct View<'a> {
     workgroup_x: Option<u32>,
     yields: &'a [Vec<YieldValues>],
     exec: usize,
+    frame: usize,
+    depth: Vec<usize>,
 }
 
 impl<'a> View<'a> {
     pub(crate) fn of(kernel: &'a Kernel) -> Self {
-        match &kernel.code {
-            Code::Packet(k) => Self {
-                invoke: Invoke::Packet(k),
-                scheduler: kernel.scheduler(),
-                width: k.width as usize,
-                num_vgprs: k.num_vgprs,
-                min_private_bytes: k.min_private_bytes,
-                workgroup_x: k.workgroup_x,
-                yields: &[],
-                exec: 0,
-            },
-            Code::Cooperative(k) => Self::cooperative(k, kernel.scheduler()),
+        let regions = &kernel.regions;
+        let mut depth = vec![0; regions.len()];
+        let mut pending = vec![0];
+        while let Some(r) = pending.pop() {
+            for &child in &regions[r].children {
+                depth[child] = depth[r] + 1;
+                pending.push(child);
+            }
         }
-    }
-    pub(crate) fn cooperative(k: &'a CoopVecKernel, scheduler: Scheduler) -> Self {
         Self {
-            invoke: Invoke::Fiber(k),
-            scheduler,
-            width: k.width as usize,
-            num_vgprs: k.num_vgprs,
-            min_private_bytes: k.min_private_bytes,
-            workgroup_x: k.workgroup_x,
-            yields: &k.yields,
-            exec: k.registers.exec as usize,
+            regions,
+            scheduler: kernel.scheduler(),
+            width: kernel.width() as usize,
+            num_vgprs: kernel.num_vgprs,
+            min_private_bytes: kernel.min_private_bytes,
+            workgroup_x: kernel.workgroup_x,
+            yields: &kernel.yields,
+            exec: kernel.registers.exec as usize,
+            frame: kernel.frame_words.max(1),
+            depth,
         }
     }
-    fn fibers(&self) -> bool {
-        matches!(self.invoke, Invoke::Fiber(_))
+    fn fibers(&self) -> usize {
+        self.depth.iter().max().map_or(1, |deepest| deepest + 1)
     }
 }
 
@@ -88,12 +80,14 @@ struct State {
     sgprs: Vec<[u32; COOP_SGPR_BUF]>,
     vgprs: Vec<Vec<u32>>,
     spill: Vec<Vec<u32>>,
-    fibers: Vec<Fiber>,
-    resume: Vec<u64>,
+    fibers: Vec<Vec<Fiber>>,
+    frames: Vec<Vec<u32>>,
+    args: Vec<Option<KernelArgs>>,
+    active: Vec<Vec<usize>>,
+    yielded: Vec<usize>,
     done: Vec<bool>,
     waiting: Vec<Option<u32>>,
     valid: Vec<u32>,
-    lanes: Vec<u32>,
     scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>>,
     lds: Vec<u8>,
 }
@@ -105,7 +99,8 @@ struct Shape {
     packets: usize,
     waves: usize,
     words: usize,
-    fibers: bool,
+    fibers: usize,
+    frame: usize,
     scratch: usize,
     lds: usize,
     stack: usize,
@@ -126,23 +121,21 @@ fn acquire(shape: Shape) -> State {
         vgprs: (0..shape.packets)
             .map(|_| vec![0u32; shape.words])
             .collect(),
-        spill: if shape.fibers {
-            (0..shape.packets)
-                .map(|_| vec![0u32; COOP_SPILL_SLOTS])
-                .collect()
-        } else {
-            Vec::new()
-        },
-        fibers: if shape.fibers {
-            Fiber::batch(shape.packets, shape.stack)
-        } else {
-            Vec::new()
-        },
-        resume: vec![0; shape.packets],
+        spill: (0..shape.packets)
+            .map(|_| vec![0u32; COOP_SPILL_SLOTS])
+            .collect(),
+        fibers: (0..shape.fibers)
+            .map(|_| Fiber::batch(shape.packets, shape.stack))
+            .collect(),
+        frames: (0..shape.packets)
+            .map(|_| vec![0u32; shape.frame])
+            .collect(),
+        args: vec![None; shape.packets],
+        active: vec![Vec::new(); shape.packets],
+        yielded: vec![0; shape.packets],
         done: vec![true; shape.packets],
         waiting: vec![None; shape.waves],
         valid: vec![0; shape.waves],
-        lanes: vec![0; shape.packets],
         scratch,
         lds: vec![0u8; shape.lds],
     }
@@ -259,6 +252,7 @@ pub(crate) fn run(
         waves: unit_waves,
         words: view.num_vgprs.max(1) * width,
         fibers: view.fibers(),
+        frame: view.frame,
         scratch,
         lds,
         stack: fiber_stack_bytes(width),
@@ -320,7 +314,6 @@ impl Engine<'_> {
             ((wg / (self.dims.num_wg_x as u64 * self.dims.num_wg_y as u64))
                 % self.dims.num_wg_z as u64) as u32,
         );
-        let fibers = self.view.fibers();
         if self.unit != Unit::Packet {
             state.lds.fill(0);
         }
@@ -365,10 +358,7 @@ impl Engine<'_> {
                     ((1u64 << count) - 1) as u32
                 }
             };
-            state.lanes[packet] = valid_mask;
-            if fibers {
-                sgprs[self.view.exec] = valid_mask;
-            }
+            sgprs[self.view.exec] = valid_mask;
             let vgprs = &mut state.vgprs[packet];
             vgprs.fill(0);
             for lane in 0..valid_lanes {
@@ -379,31 +369,33 @@ impl Engine<'_> {
                 vgprs[lane] = x | (y << 10) | (z << 20);
             }
             state.done[packet] = valid_lanes == 0;
-            if fibers {
+            {
                 state.spill[packet].fill(0);
+                let args = KernelArgs {
+                    entry: self.view.regions[0].address,
+                    sgprs: sgprs.as_mut_ptr(),
+                    vgprs: vgprs.as_mut_ptr(),
+                    spill: state.spill[packet].as_mut_ptr(),
+                    scratch_base,
+                    scratch_stride: self.stride as u64,
+                    lane_base: ((packet % self.packets_per_wave) * width) as u64,
+                    valid_mask: wave_valid,
+                    lds_base: if state.lds.is_empty() {
+                        0
+                    } else {
+                        state.lds.as_mut_ptr() as u64
+                    },
+                    frame: state.frames[packet].as_mut_ptr(),
+                };
+                state.args[packet] = Some(args);
+                state.active[packet].clear();
+                state.active[packet].push(0);
                 if !state.done[packet] {
-                    let Invoke::Fiber(kernel) = self.view.invoke else {
-                        unreachable!()
-                    };
-                    state.fibers[packet].start(KernelArgs {
-                        entry: kernel.addr(),
-                        sgprs: sgprs.as_mut_ptr(),
-                        vgprs: vgprs.as_mut_ptr(),
-                        spill: state.spill[packet].as_mut_ptr(),
-                        scratch_base,
-                        scratch_stride: self.stride as u64,
-                        lane_base: ((packet % self.packets_per_wave) * width) as u64,
-                        valid_mask: wave_valid,
-                        lds_base: if state.lds.is_empty() {
-                            0
-                        } else {
-                            state.lds.as_mut_ptr() as u64
-                        },
-                    });
+                    state.fibers[0][packet].start(args);
                 }
             }
         }
-        if fibers {
+        {
             for wave in 0..self.shape.waves {
                 state.waiting[wave] = None;
                 let count = self
@@ -422,47 +414,48 @@ impl Engine<'_> {
     #[inline(never)]
     fn run_unit(&self, index: u64, state: &mut State) {
         self.start_unit(index, state);
-        match self.view.invoke {
-            Invoke::Packet(kernel) => {
-                let lds_base = if state.lds.is_empty() {
-                    0
-                } else {
-                    state.lds.as_mut_ptr() as u64
-                };
-                for packet in 0..self.shape.packets {
-                    if state.done[packet] {
-                        continue;
-                    }
-                    let scratch_base = self.packet_scratch(packet, state);
-                    unsafe {
-                        kernel.run(
-                            state.sgprs[packet].as_mut_ptr(),
-                            state.vgprs[packet].as_mut_ptr(),
-                            scratch_base,
-                            self.stride as u64,
-                            state.lanes[packet],
-                            lds_base,
-                        );
-                    }
-                }
+        self.run_regions(self.view.regions, state);
+    }
+
+    fn advance(&self, regions: &[Region], packet: usize, state: &mut State) -> u64 {
+        loop {
+            let at = *state.active[packet]
+                .last()
+                .expect("a packet left its outermost region");
+            let level = self.view.depth[at];
+            let left = state.fibers[level][packet].resume();
+            if left == FIBER_DONE {
+                assert_eq!(at, 0, "a nested region finished the kernel");
+                return left;
             }
-            Invoke::Fiber(_) => self.run_fibers(state),
+            if left & COOP_ENTER != 0 {
+                let child = regions[at].children[(left & 0xffff_ffff) as usize];
+                state.active[packet].push(child);
+                let args = KernelArgs {
+                    entry: regions[child].address,
+                    ..state.args[packet].unwrap()
+                };
+                state.fibers[self.view.depth[child]][packet].start(args);
+            } else if left & COOP_LEAVE != 0 {
+                state.active[packet].pop();
+                assert!(
+                    !state.active[packet].is_empty(),
+                    "the outermost region was left, not finished"
+                );
+                state.frames[packet][0] = (left & 0xffff_ffff) as u32;
+            } else {
+                assert_ne!(
+                    regions[at].scheduler,
+                    Scheduler::Independent,
+                    "an independent region reached a meeting point"
+                );
+                state.yielded[packet] = level;
+                return left;
+            }
         }
     }
 
-    fn packet_scratch(&self, packet: usize, state: &State) -> u64 {
-        if state.scratch.is_empty() {
-            return 0;
-        }
-        let base = state.scratch.as_ptr() as u64;
-        if self.unit == Unit::Packet {
-            base
-        } else {
-            base + (packet / self.packets_per_wave * WAVE * self.stride) as u64
-        }
-    }
-
-    fn run_wave(&self, state: &mut State) {
+    fn run_wave(&self, regions: &[Region], state: &mut State) {
         let width = self.view.width;
         let valid = state.valid[0];
         let mut live: u32 = 0;
@@ -477,7 +470,7 @@ impl Engine<'_> {
             while remaining != 0 {
                 let packet = remaining.trailing_zeros() as usize;
                 remaining &= remaining - 1;
-                let pc = state.fibers[packet].resume();
+                let pc = self.advance(regions, packet, state);
                 if pc == FIBER_DONE {
                     live &= !(1 << packet);
                 } else if boundary == FIBER_DONE {
@@ -506,8 +499,9 @@ impl Engine<'_> {
                 holders,
                 "wave met without all of its packets"
             );
+            let level = state.yielded[live.trailing_zeros() as usize];
             for action in group {
-                action.apply_wave(width, valid, &state.fibers);
+                action.apply_wave(width, valid, &state.fibers[level]);
             }
         }
         for packet in 0..self.packets_per_wave {
@@ -515,9 +509,19 @@ impl Engine<'_> {
         }
     }
 
-    fn run_fibers(&self, state: &mut State) {
+    fn run_regions(&self, regions: &[Region], state: &mut State) {
+        if self.unit == Unit::Packet {
+            for packet in 0..self.shape.packets {
+                if !state.done[packet] {
+                    let left = self.advance(regions, packet, state);
+                    assert_eq!(left, FIBER_DONE, "an independent packet reached a meeting point");
+                    state.done[packet] = true;
+                }
+            }
+            return;
+        }
         if self.unit == Unit::Wave {
-            return self.run_wave(state);
+            return self.run_wave(regions, state);
         }
         let ppw = self.packets_per_wave;
         let width = self.view.width;
@@ -540,16 +544,17 @@ impl Engine<'_> {
                 }
                 progress = true;
                 let mut boundary = None;
+                let mut level = 0;
                 for p in range.clone() {
                     if state.done[p] {
                         continue;
                     }
-                    let r = state.fibers[p].resume();
+                    let r = self.advance(regions, p, state);
                     match boundary {
                         Some(other) => assert_eq!(other, r, "wave reached a non-uniform boundary"),
                         None => boundary = Some(r),
                     }
-                    state.resume[p] = r;
+                    level = state.yielded[p];
                     state.done[p] = r == FIBER_DONE;
                 }
                 let pc = boundary.unwrap();
@@ -573,7 +578,7 @@ impl Engine<'_> {
                         "wave met without all of its packets"
                     );
                     for action in group {
-                        action.apply_wave(width, valid, &state.fibers[range.clone()]);
+                        action.apply_wave(width, valid, &state.fibers[level][range.clone()]);
                     }
                 } else {
                     assert_eq!(
@@ -581,7 +586,7 @@ impl Engine<'_> {
                         Unit::Workgroup,
                         "barrier outside a workgroup scheduler"
                     );
-                    let id = action.uniform_id(width, valid, &state.fibers[range.clone()]) & 31;
+                    let id = action.uniform_id(width, valid, &state.fibers[level][range.clone()]) & 31;
                     match action.op {
                         EffectOp::BarrierSignal { is_first } => {
                             let first = barriers.signal(wave, id);
@@ -589,7 +594,7 @@ impl Engine<'_> {
                                 action.broadcast_result(
                                     width,
                                     valid,
-                                    &state.fibers[range],
+                                    &state.fibers[level][range],
                                     first as u32,
                                 );
                             }

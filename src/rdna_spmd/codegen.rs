@@ -1,5 +1,6 @@
 pub(super) mod memory;
 pub(super) mod ops;
+pub(super) mod region;
 pub(super) mod wave;
 
 use std::collections::BTreeMap;
@@ -10,12 +11,6 @@ use super::native::{Atomic, BasicBlock, Builder, Type, Value};
 use super::program::{Parameter, ParameterSource};
 use ops::Emitter;
 use std::rc::Rc;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Abi {
-    Whole,
-    Cooperative,
-}
 
 pub(super) struct Cluster {
     pub members: usize,
@@ -29,8 +24,6 @@ pub(super) struct Prepared {
     pub ir: VerifiedFunc,
     pub inputs: Vec<Parameter>,
     pub width: Option<u32>,
-    pub abi: Abi,
-    pub observable_return: bool,
     pub uniform: Vec<bool>,
 
     pub holds_a_lane: Vec<bool>,
@@ -49,11 +42,6 @@ pub(super) fn resume_key(provenance: u64) -> usize {
 }
 
 impl Prepared {
-    pub fn group(&self) -> bool {
-        self.accesses
-            .iter()
-            .any(|a| a.space == super::ir::Space::Lds)
-    }
     pub fn resume_layouts(&self) -> Vec<Vec<super::engine::yields::YieldValues>> {
         self.groups
             .iter()
@@ -127,96 +115,137 @@ pub(super) struct Cg<'a> {
     scratch_vec: Value,
     lds_base: Value,
     spill_base: Value,
-    spill: std::cell::RefCell<BTreeMap<(u32, u32), usize>>,
+    spill: &'a std::cell::RefCell<BTreeMap<(u32, u32), usize>>,
+    regions: &'a region::Regions,
+    region: usize,
+    frame: Value,
     loaded_pairs: BTreeMap<(ValueId, ValueId), Value>,
     valid_mask: Value,
-    lane_base: Option<Value>,
+    lane_base: Value,
     yield_frame: Value,
     sink: Value,
     store_sink: Value,
     tile_sink: Value,
 }
 
-pub(super) fn compile(p: &Prepared, name: &str) -> super::native::jit::NativeCode {
+pub(super) struct RegionCode {
+    pub address: u64,
+    pub children: Vec<usize>,
+    pub blocks: std::collections::BTreeSet<BlockId>,
+}
+
+pub(super) struct Compiled {
+    pub code: super::native::jit::NativeCode,
+    pub regions: Vec<RegionCode>,
+    pub frame_words: usize,
+}
+
+struct Shared {
+    spill: std::cell::RefCell<BTreeMap<(u32, u32), usize>>,
+    counts: Option<(String, Value, BTreeMap<BlockId, usize>)>,
+}
+
+impl Shared {
+    fn new(ir: Builder, f: &Func) -> Self {
+        let counts = std::env::var("AMDGPU_SIM_BLOCK_COUNTS").ok().map(|path| {
+            let ty = ir.i64().array(f.blocks.len() as u64);
+            let global = ir.add_global("block_counts", ty);
+            global.set_initializer(ty.null());
+            let index: BTreeMap<BlockId, usize> = f
+                .blocks
+                .keys()
+                .enumerate()
+                .map(|(i, &id)| (id, i))
+                .collect();
+            let text: String = f
+                .blocks
+                .keys()
+                .map(|id| format!("{} b{:x}\n", index[id], id.0))
+                .collect();
+            std::fs::write(format!("{path}.blocks"), text).unwrap();
+            (path, global, index)
+        });
+        Self {
+            spill: std::cell::RefCell::new(BTreeMap::new()),
+            counts,
+        }
+    }
+
+    fn finish(
+        self,
+        native: super::native::jit::Module,
+        symbol: &str,
+    ) -> super::native::jit::NativeCode {
+        let mut code = native.optimize().compile(symbol);
+        if let Some((path, _, index)) = self.counts {
+            code.block_counts = Some((path, index.len()));
+        }
+        code
+    }
+}
+
+pub(super) fn compile_regions(p: &Prepared, name: &str) -> Compiled {
+    let regions = region::Regions::new(p);
     let native = super::native::jit::Module::new(name);
-    let ir = native.builder();
-    let (i32t, i64t, ptr, void) = (ir.i32(), ir.i64(), ir.ptr(), ir.void());
-    let coop = p.abi == Abi::Cooperative;
-    let group = p.group();
-    let func = if coop {
-        ir.add_function(
-            "kernel",
-            i64t.function(&[ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t]),
-        )
-    } else if p.width.is_some() {
-        let params = [ptr, ptr, i64t, i64t, i32t, i64t];
-        ir.add_function("kernel", void.function(&params[..4 + 2 * group as usize]))
-    } else {
-        let params = [ptr, ptr, i64t, i64t];
-        ir.add_function("kernel", void.function(&params[..3 + group as usize]))
-    };
+    let shared = Shared::new(native.builder(), p.ir.func());
+    let symbols: Vec<String> = (0..regions.entries.len())
+        .map(|r| format!("kernel_{r}"))
+        .collect();
+    for (r, symbol) in symbols.iter().enumerate() {
+        emit_function(p, native.builder(), symbol, (&regions, r), &shared);
+    }
+    let code = shared.finish(native, &symbols[0]);
+    let compiled = symbols
+        .iter()
+        .enumerate()
+        .map(|(r, symbol)| RegionCode {
+            address: code.lookup(symbol),
+            children: regions.children[r].clone(),
+            blocks: regions.own(r),
+        })
+        .collect();
+    Compiled {
+        code,
+        regions: compiled,
+        frame_words: regions.frame_words,
+    }
+}
+
+fn emit_function(
+    p: &Prepared,
+    ir: Builder,
+    symbol: &str,
+    scope: (&region::Regions, usize),
+    shared: &Shared,
+) {
+    let (i32t, i64t, ptr) = (ir.i32(), ir.i64(), ir.ptr());
+    let func = ir.add_function(
+        symbol,
+        i64t.function(&[ptr, ptr, i64t, i64t, ptr, i64t, i64t, ptr, i32t, ptr]),
+    );
     let entry = ir.append_block(func, "entry");
     ir.position_at_end(entry);
     let sgprs_p = func.param(0);
     let vgprs_p = func.param(1);
     let scratch_base = func.param(2);
-    let scratch_stride = if coop || p.width.is_some() {
-        func.param(3)
-    } else {
-        ir.ci64(0)
-    };
-    let lane_base = if coop { func.param(6) } else { ir.ci64(0) };
-    let lds_base = if coop {
-        func.param(5)
-    } else if group {
-        func.param(3 + 2 * p.width.is_some() as u32)
-    } else if p.width.is_some() {
-        ir.ci64(0)
-    } else {
-        i64t.undef()
-    };
+    let scratch_stride = func.param(3);
+    let spill_base = func.param(4);
+    let lds_base = func.param(5);
+    let lane_base = func.param(6);
+    let valid_mask = func.param(8);
     let width_lanes = p.width.unwrap_or(1);
-    let valid_mask = if coop {
-        func.param(8)
-    } else if group && p.width.is_some() {
-        func.param(4)
-    } else {
-        ir.ci32(if p.width.is_some() {
-            ((1u64 << width_lanes) - 1) as u32
-        } else {
-            u32::MAX
-        })
-    };
-    let spill_base = if coop {
-        func.param(4)
-    } else {
-        ir.array_alloca(
-            i32t,
-            ir.ci32(super::engine::kernel::COOP_SPILL_SLOTS as u32),
-            "",
-        )
-    };
-    let scratch_base_scalar = if coop || p.width.is_none() {
+    let scratch_base_scalar = {
         let aperture = ir.and(scratch_base, ir.ci64(0xffff_ffff_0000_0000));
         let sized = ir.icmp(IntPred::Ne, scratch_stride, ir.ci64(0));
         ir.select(sized, aperture, scratch_base)
-    } else {
-        scratch_base
     };
     let sink = ir.array_alloca(i32t, ir.ci32(10), "");
     let mut em = Emitter::new(ir, p.width, p.registry.clone());
     em.state = p.registry.lowering_state(&em, sink);
     let mut sem = Emitter::new(ir, None, p.registry.clone());
     sem.state = p.registry.lowering_state(&sem, sink);
-    let lane_offset = (p.width.is_none() && coop).then(|| ir.mul(scratch_stride, lane_base));
-    em.scratch = Some((
-        scratch_base_scalar,
-        if coop || p.width.is_some() {
-            scratch_stride
-        } else {
-            ir.ci64(0)
-        },
-    ));
+    let lane_offset = p.width.is_none().then(|| ir.mul(scratch_stride, lane_base));
+    em.scratch = Some((scratch_base_scalar, scratch_stride));
     sem.scratch = em.scratch;
     let cells = p
         .yields
@@ -269,13 +298,7 @@ pub(super) fn compile(p: &Prepared, name: &str) -> super::native::jit::NativeCod
         bbs: BTreeMap::new(),
         phis: BTreeMap::new(),
         incoming: BTreeMap::new(),
-        param_scalar: (0..f.types.len())
-            .map(|v| {
-                p.width.is_none()
-                    || (p.uniform[v]
-                        && std::env::var("AMDGPU_SIM_NOSCALAR").map_or(true, |x| x != "1"))
-            })
-            .collect(),
+        param_scalar: region::scalar_values(p),
         types: f.types.clone(),
         definitions,
         access_at,
@@ -287,10 +310,13 @@ pub(super) fn compile(p: &Prepared, name: &str) -> super::native::jit::NativeCod
         scratch_vec: scratch_base,
         lds_base,
         spill_base,
-        spill: std::cell::RefCell::new(BTreeMap::new()),
+        spill: &shared.spill,
+        regions: scope.0,
+        region: scope.1,
+        frame: func.param(9),
         loaded_pairs: BTreeMap::new(),
         valid_mask,
-        lane_base: coop.then(|| ir.trunc(lane_base, i32t)),
+        lane_base: ir.trunc(lane_base, i32t),
         yield_frame,
         sink,
         store_sink: ir.alloca(i64t, "store_sink"),
@@ -317,41 +343,35 @@ pub(super) fn compile(p: &Prepared, name: &str) -> super::native::jit::NativeCod
     cg.em.set_lane_id(lane_base);
     cg.sem.set_lane_id(lane_base);
     cg.sem.valid_lane = Some(ir.icmp(IntPred::Ne, ir.and(packet_valid, ir.ci32(1)), ir.ci32(0)));
-    for &id in f.blocks.keys() {
+    let (regions, r) = scope;
+    let own = regions.own(r);
+    let mine = |id: &BlockId| own.contains(id);
+    for &id in f.blocks.keys().filter(|id| mine(id)) {
         cg.bbs
             .insert(id, ir.append_block(func, &format!("b{:x}", id.0)));
     }
-    cg.load_entry();
-    ir.br(cg.bbs[&f.entry]);
+    for &child in &regions.children[r] {
+        let entry = regions.entries[child];
+        cg.bbs
+            .insert(entry, ir.append_block(func, &format!("enter{:x}", entry.0)));
+    }
+    if r > 0 {
+        cg.enter_region();
+    } else {
+        cg.load_entry();
+    }
+    ir.br(cg.bbs[&regions.entries[r]]);
     let order: Vec<BlockId> = if std::env::var("AMDGPU_SIM_RPO").map_or(true, |v| v != "0") {
         reverse_postorder(f)
     } else {
         f.blocks.keys().copied().collect()
     };
-    let counts = std::env::var("AMDGPU_SIM_BLOCK_COUNTS").ok().map(|path| {
-        let ty = i64t.array(f.blocks.len() as u64);
-        let global = ir.add_global("block_counts", ty);
-        global.set_initializer(ty.null());
-        let index: BTreeMap<BlockId, usize> = f
-            .blocks
-            .keys()
-            .enumerate()
-            .map(|(i, &id)| (id, i))
-            .collect();
-        let text: String = f
-            .blocks
-            .keys()
-            .map(|id| format!("{} b{:x}\n", index[id], id.0))
-            .collect();
-        std::fs::write(format!("{path}.blocks"), text).unwrap();
-        (path, global, index)
-    });
-    for id in order {
+    for id in order.into_iter().filter(|id| mine(id)) {
         let block = &f.blocks[&id];
         ir.position_at_end(cg.bbs[&id]);
         cg.current = id;
         cg.begin_block(id, block);
-        if let Some((_, global, index)) = &counts {
+        if let Some((_, global, index)) = &shared.counts {
             let slot = ir.gep(i64t, *global, &[ir.ci64(index[&id] as u64)]);
             ir.atomic_add(slot, ir.ci64(1), Atomic::Monotonic);
         }
@@ -363,12 +383,10 @@ pub(super) fn compile(p: &Prepared, name: &str) -> super::native::jit::NativeCod
         }
         cg.emit_term(id, block);
     }
-    cg.finish_phis();
-    let mut code = native.finish();
-    if let Some((path, _, index)) = counts {
-        code.block_counts = Some((path, index.len()));
+    for (ordinal, &child) in regions.children[r].iter().enumerate() {
+        cg.emit_child(ordinal, child);
     }
-    code
+    cg.finish_phis();
 }
 
 impl<'a> Cg<'a> {
@@ -524,7 +542,6 @@ impl<'a> Cg<'a> {
     fn load_entry(&mut self) {
         let f = self.p.ir.func();
         let entry = &f.blocks[&f.entry];
-        let coop = self.p.abi == Abi::Cooperative;
         let ir = self.ir;
         for (index, &(id, ty)) in entry.params.iter().enumerate() {
             let input = &self.p.inputs[index];
@@ -545,32 +562,20 @@ impl<'a> Cg<'a> {
                     }
                 }
                 ParameterSource::MaskBit(r) => {
-                    let word = if r == self.regs().exec && self.p.abi == Abi::Whole {
-                        if self.p.width.is_some() {
-                            self.lane_base_word(self.valid_mask)
-                        } else {
-                            self.ci32(1)
-                        }
+                    let word = ir.load(ir.i32(), self.register_slot(self.sgprs_p, r));
+                    let word = if r == self.regs().exec {
+                        ir.and(word, self.lane_base_word(self.valid_mask))
                     } else {
-                        let word = ir.load(ir.i32(), self.register_slot(self.sgprs_p, r));
-                        if r == self.regs().exec && coop {
-                            ir.and(word, self.lane_base_word(self.valid_mask))
-                        } else {
-                            word
-                        }
+                        word
                     };
                     self.mask_to_vec(word)
                 }
                 ParameterSource::Scc => {
-                    if coop {
-                        let word = ir.load(
-                            ir.i32(),
-                            self.register_slot(self.sgprs_p, self.regs().scc_slot),
-                        );
-                        ir.icmp(IntPred::Ne, word, self.ci32(0))
-                    } else {
-                        ir.ci1(false)
-                    }
+                    let word = ir.load(
+                        ir.i32(),
+                        self.register_slot(self.sgprs_p, self.regs().scc_slot),
+                    );
+                    ir.icmp(IntPred::Ne, word, self.ci32(0))
                 }
             };
             assert_eq!(ty, input.ty);
@@ -644,7 +649,10 @@ impl<'a> Cg<'a> {
             .collect()
     }
 
-    fn branch_to(&mut self, edge: &Edge) -> BasicBlock {
+    fn branch_to(&mut self, from: BlockId, ordinal: usize, edge: &Edge) -> BasicBlock {
+        if !self.regions.holds(self.region, edge.dst) {
+            return self.leave_region(from, ordinal, edge);
+        }
         let args = self.edge_args(edge);
         let from = self.ir.insert_block();
         self.incoming
@@ -654,37 +662,34 @@ impl<'a> Cg<'a> {
         self.bbs[&edge.dst]
     }
 
-    fn emit_term(&mut self, _id: BlockId, block: &Block) {
+    fn emit_term(&mut self, id: BlockId, block: &Block) {
         match &block.term {
             Term::Br(edge) => {
-                let bb = self.branch_to(edge);
+                let bb = self.branch_to(id, 0, edge);
                 self.ir.br(bb);
             }
             Term::CondBr { cond, yes, no } => {
                 let c = self.scalar(*cond);
-                let yes_bb = self.branch_to(yes);
-                let no_bb = self.branch_to(no);
+                let yes_bb = self.branch_to(id, 0, yes);
+                let no_bb = self.branch_to(id, 1, no);
                 self.ir.cond_br(c, yes_bb, no_bb);
             }
             Term::Ret(args) => {
-                let coop = self.p.abi == Abi::Cooperative;
-                if coop && self.p.observable_return {
-                    self.store_return(args);
-                }
-                if coop {
-                    self.ir.ret(self.ci64(super::engine::kernel::COOP_DONE));
-                } else {
-                    self.ir.ret_void();
-                }
+                self.store_return(args);
+                let left = match self.region {
+                    0 => super::engine::kernel::COOP_DONE,
+                    _ => {
+                        let exit = self.regions.exit(self.region, id, None);
+                        super::engine::kernel::COOP_LEAVE | exit as u64
+                    }
+                };
+                self.ir.ret(self.ci64(left));
             }
         }
     }
 
     fn lane_base_word(&self, word: Value) -> Value {
-        match self.lane_base {
-            Some(base) => self.ir.lshr(word, base),
-            None => word,
-        }
+        self.ir.lshr(word, self.lane_base)
     }
 
     fn any_of_word(&mut self, input: ValueId) -> Option<Value> {

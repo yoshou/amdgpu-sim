@@ -1,3 +1,4 @@
+#[derive(Clone, Copy)]
 pub struct KernelArgs {
     pub entry: u64,
     pub sgprs: *mut u32,
@@ -8,6 +9,7 @@ pub struct KernelArgs {
     pub lane_base: u64,
     pub lds_base: u64,
     pub valid_mask: u32,
+    pub frame: *mut u32,
 }
 
 #[repr(C)]
@@ -23,7 +25,7 @@ const STACK_POISON: u8 = 0xA5;
 
 pub const FIBER_DONE: u64 = super::kernel::COOP_DONE;
 
-type KernelFn = unsafe extern "C" fn(
+pub(crate) type KernelFn = unsafe extern "C" fn(
     *mut u32,
     *mut u32,
     u64,
@@ -33,6 +35,7 @@ type KernelFn = unsafe extern "C" fn(
     u64,
     *mut FiberCtx,
     u32,
+    *mut u32,
 ) -> u64;
 
 pub struct Fiber {
@@ -137,6 +140,7 @@ impl Fiber {
                         scratch_base: 0,
                         scratch_stride: 0,
                         lane_base: 0,
+                        frame: std::ptr::null_mut(),
                     },
                 }),
                 stack: stack.clone(),
@@ -211,7 +215,7 @@ extern "C" fn main(ctx: *mut FiberCtx) -> ! {
     unsafe {
         let args = &(*ctx).args;
         let kernel: KernelFn = std::mem::transmute::<u64, KernelFn>(args.entry);
-        let done = kernel(
+        let left = kernel(
             args.sgprs,
             args.vgprs,
             args.scratch_base,
@@ -221,9 +225,9 @@ extern "C" fn main(ctx: *mut FiberCtx) -> ! {
             args.lane_base,
             ctx,
             args.valid_mask,
+            args.frame,
         );
-        debug_assert_eq!(done, FIBER_DONE, "packet kernel returned without finishing");
-        switch(&mut (*ctx).fiber_rsp, (*ctx).driver_rsp, FIBER_DONE);
+        switch(&mut (*ctx).fiber_rsp, (*ctx).driver_rsp, left);
         unreachable!("resumed a finished fiber");
     }
 }

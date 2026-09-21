@@ -78,6 +78,10 @@ impl Dominators {
         }
     }
 
+    pub fn parent(&self, b: BlockId) -> Option<BlockId> {
+        self.idom.get(&b).copied()
+    }
+
     pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
         let mut at = b;
         loop {
@@ -119,6 +123,50 @@ impl Func {
 
     pub fn one_region(&mut self, presence: Presence) {
         self.regions = BTreeMap::from([(self.entry, presence)]);
+    }
+
+    pub fn enter_regions(&mut self) {
+        let scope = |present: Presence| match present {
+            Presence::Own | Presence::Packet => 0,
+            Presence::Wave => 1,
+            Presence::Workgroup => 2,
+        };
+        let doms = Dominators::of(self);
+        let mut needed: BTreeMap<BlockId, Presence> = doms
+            .order
+            .iter()
+            .map(|&id| {
+                let own = self.blocks[&id]
+                    .insts
+                    .iter()
+                    .filter_map(super::verify::lanes_read)
+                    .max()
+                    .unwrap_or(Presence::Own);
+                (id, own)
+            })
+            .collect();
+        for &id in doms.order.iter().rev() {
+            if let Some(parent) = doms.parent(id) {
+                let below = needed[&id];
+                let above = needed.get_mut(&parent).unwrap();
+                *above = (*above).max(below);
+            }
+        }
+        let mut held: BTreeMap<BlockId, Presence> = BTreeMap::new();
+        let mut regions = BTreeMap::new();
+        for &id in &doms.order {
+            let present = match doms.parent(id) {
+                None => needed[&id],
+                Some(parent) if scope(needed[&id]) < scope(held[&parent]) => needed[&id],
+                Some(parent) => {
+                    held.insert(id, held[&parent]);
+                    continue;
+                }
+            };
+            regions.insert(id, present);
+            held.insert(id, present);
+        }
+        self.regions = regions;
     }
 
     pub fn lowered_to_packets(&mut self) {

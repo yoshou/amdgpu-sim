@@ -2,39 +2,6 @@ use super::super::analysis::{Constants, DispatchConstants, Preserved};
 use super::super::ir::{Env, IntOp, IntPred, Op, Ty, *};
 use super::{Analyses, Pass};
 
-pub(crate) fn constant_queries(f: &mut Func, facts: &[Option<u64>]) -> usize {
-    let mut count = 0;
-    for block in f.blocks.values_mut() {
-        for inst in &mut block.insts {
-            let query = match inst {
-                Inst::Packet {
-                    op: PacketOp::Any,
-                    input,
-                    output,
-                } => Some((*input, *output)),
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Any),
-                    inputs,
-                    outputs,
-                    ..
-                } => Some((inputs[0], outputs[0].0)),
-                _ => None,
-            };
-            if let Some((input, output)) = query {
-                if let Some(bits) = facts[input.0] {
-                    *inst = Inst::Core {
-                        value: output,
-                        ty: Ty::I1,
-                        op: Op::Const(Ty::I1, bits),
-                    };
-                    count += 1;
-                }
-            }
-        }
-    }
-    count
-}
-
 fn branch_local_queries(f: &Func) -> std::collections::BTreeSet<ValueId> {
     use std::collections::BTreeSet;
     let mut critical = vec![false; f.types.len()];
@@ -232,17 +199,6 @@ impl Pass for PacketState {
     }
     fn preserves(&self) -> Preserved {
         Preserved::of::<Constants>().and::<DispatchConstants>()
-    }
-}
-
-pub(crate) struct AssumeDispatchExec;
-impl Pass for AssumeDispatchExec {
-    fn name(&self) -> &str {
-        "assume_dispatch_exec"
-    }
-    fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        let facts = analyses.get::<DispatchConstants>(f);
-        constant_queries(f, &facts) > 0
     }
 }
 
