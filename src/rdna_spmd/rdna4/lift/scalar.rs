@@ -338,7 +338,14 @@ fn bit_count(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
     let word = if ones {
         ValueId(0)
     } else {
-        let all = b.k(ty, u64::MAX);
+        let all = b.k(
+            ty,
+            if ty == Ty::I64 {
+                u64::MAX
+            } else {
+                u32::MAX as u64
+            },
+        );
         b.push(ty, Op::Int(IntOp::Xor, ValueId(0), all))
     };
     let count = b.push(ty, Op::PopulationCount(word));
@@ -377,10 +384,22 @@ fn float(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         inputs.push(input(SourceOperand::ScalarRegister(i.sdst), ty));
     }
     let mut b = Builder::new(registry, inputs);
-    let result = match op {
+    let mut result = match op {
         Some(op) => b.push(ty, Op::Float(op, ValueId(0), ValueId(1))),
         None => b.push(ty, Op::Fma(ValueId(0), ValueId(1), ValueId(2))),
     };
+    if matches!(i.op, I::S_SUB_F32) {
+        let nan_a = b.push(Ty::I1, Op::FCmp(FloatPred::Uno, ValueId(0), ValueId(0)));
+        let nan_b = b.push(Ty::I1, Op::FCmp(FloatPred::Uno, ValueId(1), ValueId(1)));
+        let word = b.push(Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, ValueId(1)));
+        let quiet = b.k(Ty::I32, 0x0040_0000);
+        let word = b.int(IntOp::Or, word, quiet);
+        let sign = b.k(Ty::I32, 0x8000_0000);
+        let word = b.int(IntOp::Xor, word, sign);
+        let nan = b.push(Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, word));
+        let right_nan = b.push(Ty::F32, Op::Select(nan_b, nan, result));
+        result = b.push(Ty::F32, Op::Select(nan_a, result, right_nan));
+    }
     Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, ty), result)]))
 }
 
