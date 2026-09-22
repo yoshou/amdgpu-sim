@@ -133,6 +133,40 @@ pub(crate) struct Sop2Case {
     pub(crate) expected_scc: u32,
 }
 
+/// SOP2: two sources and an SGPR destination the form reads as well as writes.
+pub(crate) struct Sop2AccCase {
+    pub(crate) src0: SaluSrc,
+    pub(crate) src1: SaluSrc,
+    pub(crate) dst_in: u32,
+    pub(crate) scc_in: u32,
+    pub(crate) expected: u64,
+    pub(crate) expected_scc: u32,
+}
+
+pub(crate) fn check_sop2_acc(op: u32, cases: &[Sop2AccCase]) {
+    let harness = Harness::salu();
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        let mut uni = vec![0u32; 8];
+        let mut literal = Vec::new();
+        let f0 = place(case.src0, 0, &mut uni, &mut literal);
+        let f1 = place(case.src1, 1, &mut uni, &mut literal);
+        uni[4] = case.scc_in;
+        uni[5] = 0xFFFF_FFFF;
+        // Seed the destination through a preceding s_mov, since these forms
+        // read it.
+        let mut words = vec![sop1(0, SDST, 255), case.dst_in, sop2(op, SDST, f1, f0)];
+        words.extend(literal);
+        for engine in ENGINES {
+            let got = run(&harness, engine, &words, &uni);
+            let ctx = format!("dst_in=0x{:08X} scc_in={}", case.dst_in, case.scc_in);
+            compare(engine, i, &got, case.expected, case.expected_scc, 0xFFFF_FFFF,
+                    &ctx, &mut failures);
+        }
+    }
+    report(failures, cases.len() * ENGINES.len());
+}
+
 pub(crate) fn check_sop2(op: u32, cases: &[Sop2Case]) {
     let harness = Harness::salu();
     let mut failures = Vec::new();
@@ -1437,47 +1471,47 @@ fn s_fmac_f32_sop2() {
     // Both operand positions are swept over the values the manual pins down
     // for a float, and SCC is driven beforehand because the carry and select
     // forms read it.
-    check_sop2(
+    check_sop2_acc(
         71,
         &[
-            Sop2Case { src0: SaluSrc::Sgpr(0x0000_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x8000_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x3F80_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_40A0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0xBF80_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_BF80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x7F80_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0xFF80_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_FF80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x7FC0_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_7FC0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x7FA0_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_7FE0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x0000_0001), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x807F_FFFF), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x0080_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x7F7F_FFFF), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x3F00_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4060_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x3FC0_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_40D0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4000_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4100_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0xC020_0000), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_C0B0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4049_0FDB), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x0000_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x8000_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x3F80_0000), scc_in: 0, expected: 0x0000_0000_40A0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0xBF80_0000), scc_in: 0, expected: 0x0000_0000_BF80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7F80_0000), scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0xFF80_0000), scc_in: 0, expected: 0x0000_0000_FF80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7FC0_0000), scc_in: 0, expected: 0x0000_0000_7FC0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7FA0_0000), scc_in: 0, expected: 0x0000_0000_7FE0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x0000_0001), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x807F_FFFF), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x0080_0000), scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7F7F_FFFF), scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x3F00_0000), scc_in: 0, expected: 0x0000_0000_4060_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x3FC0_0000), scc_in: 0, expected: 0x0000_0000_40D0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x4000_0000), scc_in: 0, expected: 0x0000_0000_4100_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0xC020_0000), scc_in: 0, expected: 0x0000_0000_C0B0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x4049_0FDB), scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Inline(242), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_40A0_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Inline(240), scc_in: 0, expected: 0x0000_0000_4060_0000, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Literal(0x4049_0FDB), src1: SaluSrc::Sgpr(0x4040_0000), scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
-            Sop2Case { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Literal(0x4049_0FDB), scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x0000_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x8000_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x3F80_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_40A0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0xBF80_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_BF80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x7F80_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0xFF80_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_FF80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x7FC0_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7FC0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x7FA0_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7FE0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x0000_0001), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x807F_FFFF), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x0080_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x7F7F_FFFF), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x3F00_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4060_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x3FC0_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_40D0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4000_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4100_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0xC020_0000), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_C0B0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4049_0FDB), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x0000_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x8000_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x3F80_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_40A0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0xBF80_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_BF80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7F80_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0xFF80_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_FF80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7FC0_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7FC0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7FA0_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7FE0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x0000_0001), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x807F_FFFF), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x0080_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4000_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x7F7F_FFFF), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_7F80_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x3F00_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4060_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x3FC0_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_40D0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x4000_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4100_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0xC020_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_C0B0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Sgpr(0x4049_0FDB), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Inline(242), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_40A0_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Inline(240), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4060_0000, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Literal(0x4049_0FDB), src1: SaluSrc::Sgpr(0x4040_0000), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
+            Sop2AccCase { src0: SaluSrc::Sgpr(0x4040_0000), src1: SaluSrc::Literal(0x4049_0FDB), dst_in: 0x4000_0000, scc_in: 0, expected: 0x0000_0000_4136_CBE4, expected_scc: 0 },
         ],
     );
 }
