@@ -283,6 +283,7 @@ fn guarded_sqrt(view: &View, out: ValueId, ops: &SqrtIdioms) -> Option<ValueId> 
     let Some(Op::Select(c, fixed, rescaled)) = view.defs[view.raw(out).0] else {
         return None;
     };
+    let c = view.masks.masked_result[view.raw(c).0].unwrap_or(c);
     let class = view.target(c, ops.class)?;
     let selector = view.constants[view.raw(class[1]).0]?;
     if selector & !ROOT_FIXED_CLASSES != 0 {
