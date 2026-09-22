@@ -55,3 +55,20 @@ extern "C" __global__ void spmv_csr(float* y, const int* rp, const int* ci,
   for (int j = rp[r]; j < rp[r + 1]; ++j) acc += v[j] * x[ci[j]];
   y[r] = acc;
 }
+
+#include <hip/hip_fp16.h>
+extern "C" __global__ void dot_half(float* out, const __half* a, const __half* b, int n) {
+  __shared__ float s[256];
+  int t = threadIdx.x;
+  float acc = 0.0f;
+  for (int i = blockIdx.x * blockDim.x + t; i < n; i += gridDim.x * blockDim.x) {
+    acc += __half2float(a[i]) * __half2float(b[i]);
+  }
+  s[t] = acc;
+  __syncthreads();
+  for (int d = blockDim.x / 2; d; d >>= 1) {
+    if (t < d) s[t] += s[t + d];
+    __syncthreads();
+  }
+  if (t == 0) atomicAdd(out, s[0]);
+}

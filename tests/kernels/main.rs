@@ -1,6 +1,6 @@
 mod harness;
 
-use harness::{close, same, Arg, Kernels, Run, WIDTHS};
+use harness::{close, close64, halves, f16_bits, round_f16, same, Arg, Kernels, Run, WIDTHS};
 
 fn ramp(n: usize, scale: f32, bias: f32) -> Vec<f32> {
     (0..n).map(|k| ((k * 37 % 211) as f32) * scale + bias).collect()
@@ -150,7 +150,7 @@ fn spmv_walks_each_row() {
 #[test]
 fn reduce_sums_each_workgroup() {
     let k = Kernels::load();
-    let n = 512usize;
+    let n = 500usize;
     let input = ramp(n, 0.1, -5.0);
     for width in WIDTHS {
         let mut out = vec![0f32; 2];
@@ -168,7 +168,7 @@ fn reduce_sums_each_workgroup() {
             width,
         );
         let want: Vec<f32> = (0..2)
-            .map(|b| input[b * 256..(b + 1) * 256].iter().sum())
+            .map(|b| input[b * 256..((b + 1) * 256).min(n)].iter().sum())
             .collect();
         close("reduce_sum", width, &out, &want, 1e-4);
     }
@@ -218,7 +218,7 @@ fn argmax_finds_the_largest_and_its_index() {
 #[test]
 fn scan_is_an_inclusive_prefix_sum() {
     let k = Kernels::load();
-    let n = 256usize;
+    let n = 200usize;
     let input: Vec<i32> = (0..n as i32).map(|v| v % 7 - 3).collect();
     let mut want = input.clone();
     for i in 1..n {
@@ -325,7 +325,7 @@ fn softmax_sums_to_one() {
             },
             width,
         );
-        close("softmax", width, &out, &want, 1e-4);
+        close("softmax", width, &out, &want, 1e-5);
     }
 }
 
@@ -360,7 +360,7 @@ fn layernorm_centres_and_scales() {
             },
             width,
         );
-        close("layernorm", width, &out, &want, 1e-3);
+        close("layernorm", width, &out, &want, 1e-4);
     }
 }
 
@@ -388,7 +388,7 @@ fn gelu_matches_its_formula() {
             },
             width,
         );
-        close("gelu", width, &out, &want, 1e-3);
+        close("gelu", width, &out, &want, 1e-5);
     }
 }
 
@@ -426,7 +426,7 @@ fn relu_backward_gates_the_gradient() {
 #[test]
 fn transpose_exchanges_the_axes() {
     let k = Kernels::load();
-    let (w, h) = (32usize, 32usize);
+    let (w, h) = (64usize, 32usize);
     let input = ramp(w * h, 0.5, 0.0);
     let want: Vec<f32> = (0..w * h).map(|k| input[(k % h) * w + k / h]).collect();
     for width in WIDTHS {
@@ -435,7 +435,7 @@ fn transpose_exchanges_the_axes() {
             &Run {
                 kernel: "transpose_lds",
                 wg: [32, 32, 1],
-                grid: [1, 1, 1],
+                grid: [(w / 32) as u32, (h / 32) as u32, 1],
                 args: &[
                     Arg::Ptr(out.as_mut_ptr() as u64),
                     Arg::Ptr(input.as_ptr() as u64),
@@ -764,8 +764,8 @@ fn nbody_advances_the_positions() {
         want_y[i] = py0[i] + ay * dt;
     }
     for width in WIDTHS {
-        let mut px = px0.clone();
-        let mut py = py0.clone();
+        let mut px = vec![0f32; n];
+        let mut py = vec![0f32; n];
         k.run(
             &Run {
                 kernel: "nbody_step",
@@ -774,6 +774,8 @@ fn nbody_advances_the_positions() {
                 args: &[
                     Arg::Ptr(px.as_mut_ptr() as u64),
                     Arg::Ptr(py.as_mut_ptr() as u64),
+                    Arg::Ptr(px0.as_ptr() as u64),
+                    Arg::Ptr(py0.as_ptr() as u64),
                     Arg::Ptr(mass.as_ptr() as u64),
                     Arg::I32(n as i32),
                     Arg::F32(dt),
@@ -781,8 +783,8 @@ fn nbody_advances_the_positions() {
             },
             width,
         );
-        close("nbody_step", width, &px, &want_x, 2e-2);
-        close("nbody_step", width, &py, &want_y, 2e-2);
+        close("nbody_step", width, &px, &want_x, 1e-5);
+        close("nbody_step", width, &py, &want_y, 1e-5);
     }
 }
 
@@ -877,16 +879,7 @@ fn mixed_math_divides_and_transcends() {
             },
             width,
         );
-        for (at, (&g, &w)) in out.iter().zip(&want).enumerate() {
-            assert!(
-                (g - w).abs() <= 1e-9 * w.abs().max(1.0),
-                "mixed_math at W={} index {}: got {}, expected {}",
-                width,
-                at,
-                g,
-                w
-            );
-        }
+        close64("mixed_math", width, &out, &want, 1e-9);
     }
 }
 
@@ -918,3 +911,351 @@ fn several_host_threads_agree() {
         same("histogram", width, "the reference", &bins, &want);
     }
 }
+
+#[test]
+fn axpy_half2_fuses_in_half_precision() {
+    let k = Kernels::load();
+    let n2 = 100usize;
+    let (x_bits, x) = halves(&ramp(2 * n2, 0.03, -2.0));
+    let (y_bits, y) = halves(&ramp(2 * n2, 0.07, 1.0));
+    let a = 1.5f32;
+    let want: Vec<f32> = x
+        .iter()
+        .zip(&y)
+        .map(|(&x, &y)| round_f16(a as f64 * x as f64 + y as f64))
+        .collect();
+    for width in WIDTHS {
+        let mut out = y_bits.clone();
+        k.run(
+            &Run {
+                kernel: "axpy_half2",
+                wg: [32, 1, 1],
+                grid: [4, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(x_bits.as_ptr() as u64),
+                    Arg::F32(a),
+                    Arg::I32(n2 as i32),
+                ],
+            },
+            width,
+        );
+        let got: Vec<f32> = out.iter().map(|&b| harness::f16_value(b)).collect();
+        same("axpy_half2", width, "the reference", &got, &want);
+    }
+}
+
+#[test]
+fn half_to_float_widens() {
+    let k = Kernels::load();
+    let n = 150usize;
+    let (bits, want) = halves(&ramp(n, 0.011, -0.8));
+    for width in WIDTHS {
+        let mut out = vec![0f32; n];
+        k.run(
+            &Run {
+                kernel: "half_to_float",
+                wg: [64, 1, 1],
+                grid: [3, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(bits.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                ],
+            },
+            width,
+        );
+        same("half_to_float", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn float_to_half_rounds_to_nearest_even() {
+    let k = Kernels::load();
+    let n = 150usize;
+    let input = ramp(n, 0.0137, -0.9);
+    let want: Vec<u16> = input.iter().map(|&v| f16_bits(v)).collect();
+    for width in WIDTHS {
+        let mut out = vec![0u16; n];
+        k.run(
+            &Run {
+                kernel: "float_to_half",
+                wg: [64, 1, 1],
+                grid: [3, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(input.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                ],
+            },
+            width,
+        );
+        same("float_to_half", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn dot_half_accumulates_in_single_precision() {
+    let k = Kernels::load();
+    let n = 500usize;
+    let (a_bits, a) = halves(&ramp(n, 0.05, -1.0));
+    let (b_bits, b) = halves(&ramp(n, 0.03, 0.5));
+    let want: f32 = a.iter().zip(&b).map(|(x, y)| x * y).sum();
+    for width in WIDTHS {
+        let mut out = vec![0f32; 1];
+        k.run(
+            &Run {
+                kernel: "dot_half",
+                wg: [256, 1, 1],
+                grid: [2, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(a_bits.as_ptr() as u64),
+                    Arg::Ptr(b_bits.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                ],
+            },
+            width,
+        );
+        close("dot_half", width, &out, &[want], 1e-4);
+    }
+}
+
+#[test]
+fn conv2d_slides_the_filter_over_the_image() {
+    let k = Kernels::load();
+    let (w, h, ks) = (24usize, 16usize, 3usize);
+    let input = ramp(w * h, 0.2, -2.0);
+    let filter = ramp(ks * ks, 0.3, -0.5);
+    let r = ks / 2;
+    let mut want = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut acc = 0f32;
+            for dy in 0..ks {
+                for dx in 0..ks {
+                    let sx = x as isize + dx as isize - r as isize;
+                    let sy = y as isize + dy as isize - r as isize;
+                    if sx >= 0 && sy >= 0 && (sx as usize) < w && (sy as usize) < h {
+                        acc += input[sy as usize * w + sx as usize] * filter[dy * ks + dx];
+                    }
+                }
+            }
+            want[y * w + x] = acc;
+        }
+    }
+    for width in WIDTHS {
+        let mut out = vec![0f32; w * h];
+        k.run(
+            &Run {
+                kernel: "conv2d",
+                wg: [8, 8, 1],
+                grid: [3, 2, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(input.as_ptr() as u64),
+                    Arg::Ptr(filter.as_ptr() as u64),
+                    Arg::I32(w as i32),
+                    Arg::I32(h as i32),
+                    Arg::I32(ks as i32),
+                ],
+            },
+            width,
+        );
+        close("conv2d", width, &out, &want, 1e-5);
+    }
+}
+
+#[test]
+fn stencil7_relaxes_the_interior_of_a_volume() {
+    let k = Kernels::load();
+    let (nx, ny, nz) = (8usize, 8usize, 8usize);
+    let input = ramp(nx * ny * nz, 0.25, -3.0);
+    let mut want = vec![0f32; nx * ny * nz];
+    for z in 1..nz - 1 {
+        for y in 1..ny - 1 {
+            for x in 1..nx - 1 {
+                let c = (z * ny + y) * nx + x;
+                want[c] = input[c]
+                    + 0.1 * (input[c - 1] + input[c + 1] + input[c - nx] + input[c + nx]
+                        + input[c - nx * ny] + input[c + nx * ny] - 6.0 * input[c]);
+            }
+        }
+    }
+    for width in WIDTHS {
+        let mut out = vec![0f32; nx * ny * nz];
+        k.run(
+            &Run {
+                kernel: "stencil7_3d",
+                wg: [8, 4, 2],
+                grid: [1, 2, 4],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(input.as_ptr() as u64),
+                    Arg::I32(nx as i32),
+                    Arg::I32(ny as i32),
+                    Arg::I32(nz as i32),
+                ],
+            },
+            width,
+        );
+        close("stencil7_3d", width, &out, &want, 1e-5);
+    }
+}
+
+#[test]
+fn median3x3_picks_the_middle_neighbour() {
+    let k = Kernels::load();
+    let (w, h) = (20usize, 12usize);
+    let input: Vec<u8> = (0..w * h).map(|k| (k * 53 % 251) as u8).collect();
+    let mut want = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let mut v: Vec<u8> = (-1i32..=1)
+                .flat_map(|dy| {
+                    (-1i32..=1).map(move |dx| {
+                        let sx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                        let sy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                        (sx, sy)
+                    })
+                })
+                .map(|(sx, sy)| input[sy * w + sx])
+                .collect();
+            v.sort_unstable();
+            want[y * w + x] = v[4];
+        }
+    }
+    for width in WIDTHS {
+        let mut out = vec![0u8; w * h];
+        k.run(
+            &Run {
+                kernel: "median3x3",
+                wg: [8, 4, 1],
+                grid: [3, 3, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(input.as_ptr() as u64),
+                    Arg::I32(w as i32),
+                    Arg::I32(h as i32),
+                ],
+            },
+            width,
+        );
+        same("median3x3", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn radix_count_tallies_each_digit_per_thread() {
+    let k = Kernels::load();
+    let n = 1000usize;
+    let shift = 8i32;
+    let keys: Vec<u32> = (0..n as u32).map(|v| v.wrapping_mul(2654435761)).collect();
+    let stride = 128usize;
+    let mut want = vec![0u32; 256 * stride];
+    for (i, &key) in keys.iter().enumerate() {
+        let d = ((key >> shift) & 0xff) as usize;
+        want[d * stride + i % stride] += 1;
+    }
+    for width in WIDTHS {
+        let mut counts = vec![0u32; 256 * stride];
+        k.run(
+            &Run {
+                kernel: "radix_count",
+                wg: [64, 1, 1],
+                grid: [(stride / 64) as u32, 1, 1],
+                args: &[
+                    Arg::Ptr(counts.as_mut_ptr() as u64),
+                    Arg::Ptr(keys.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                    Arg::I32(shift),
+                ],
+            },
+            width,
+        );
+        same("radix_count", width, "the reference", &counts, &want);
+    }
+}
+
+#[test]
+fn lower_bound_finds_the_insertion_point() {
+    let k = Kernels::load();
+    let m = 100usize;
+    let sorted: Vec<i32> = (0..m as i32).map(|v| v * 3 / 2 - 20).collect();
+    let n = 128usize;
+    let queries: Vec<i32> = (0..n as i32).map(|v| (v * 37) % 190 - 30).collect();
+    let want: Vec<i32> = queries
+        .iter()
+        .map(|&q| sorted.partition_point(|&v| v < q) as i32)
+        .collect();
+    for width in WIDTHS {
+        let mut out = vec![-1i32; n];
+        k.run(
+            &Run {
+                kernel: "lower_bound",
+                wg: [64, 1, 1],
+                grid: [2, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(sorted.as_ptr() as u64),
+                    Arg::I32(m as i32),
+                    Arg::Ptr(queries.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                ],
+            },
+            width,
+        );
+        same("lower_bound", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn max_int_reduces_then_publishes_atomically() {
+    let k = Kernels::load();
+    let n = 300usize;
+    let input = ints(n, 1000);
+    let want = *input.iter().max().unwrap();
+    for width in WIDTHS {
+        let mut out = vec![i32::MIN; 1];
+        k.run(
+            &Run {
+                kernel: "max_int",
+                wg: [128, 1, 1],
+                grid: [2, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(input.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                ],
+            },
+            width,
+        );
+        assert_eq!(out[0], want, "max_int at W={}", width);
+    }
+}
+
+#[test]
+fn max_float_cas_retries_until_it_wins() {
+    let k = Kernels::load();
+    let n = 200usize;
+    let input = ramp(n, 0.5, -30.0);
+    let want = input.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    for width in WIDTHS {
+        let mut out = vec![f32::NEG_INFINITY; 1];
+        k.run(
+            &Run {
+                kernel: "max_float_cas",
+                wg: [64, 1, 1],
+                grid: [4, 1, 1],
+                args: &[
+                    Arg::Ptr(out.as_mut_ptr() as u64),
+                    Arg::Ptr(input.as_ptr() as u64),
+                    Arg::I32(n as i32),
+                ],
+            },
+            width,
+        );
+        assert_eq!(out[0], want, "max_float_cas at W={}", width);
+    }
+}
+

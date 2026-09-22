@@ -38,3 +38,49 @@ extern "C" __global__ void count_matches(int* count, const int* a, const int* b,
   int g = blockIdx.x * blockDim.x + threadIdx.x;
   if (g < n && a[g] == b[g]) atomicAdd(count, 1);
 }
+
+extern "C" __global__ void radix_count(unsigned* counts, const unsigned* keys, int n, int shift) {
+  unsigned local[256];
+  for (int d = 0; d < 256; ++d) local[d] = 0;
+  int t = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
+  for (int i = t; i < n; i += stride) local[(keys[i] >> shift) & 0xff]++;
+  for (int d = 0; d < 256; ++d) counts[d * stride + t] = local[d];
+}
+
+extern "C" __global__ void lower_bound(int* out, const int* sorted, int m, const int* q, int n) {
+  int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= n) return;
+  int key = q[g], lo = 0, hi = m;
+  while (lo < hi) {
+    int mid = (lo + hi) >> 1;
+    if (sorted[mid] < key) lo = mid + 1; else hi = mid;
+  }
+  out[g] = lo;
+}
+
+extern "C" __global__ void max_int(int* out, const int* in, int n) {
+  __shared__ int s[256];
+  int t = threadIdx.x;
+  int m = INT_MIN;
+  for (int i = blockIdx.x * blockDim.x + t; i < n; i += gridDim.x * blockDim.x) m = max(m, in[i]);
+  s[t] = m;
+  __syncthreads();
+  for (int d = blockDim.x / 2; d; d >>= 1) {
+    if (t < d) s[t] = max(s[t], s[t + d]);
+    __syncthreads();
+  }
+  if (t == 0) atomicMax(out, s[0]);
+}
+
+extern "C" __global__ void max_float_cas(float* out, const float* in, int n) {
+  int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= n) return;
+  float v = in[g];
+  int* p = (int*)out;
+  int old = *p, assumed;
+  do {
+    assumed = old;
+    if (__int_as_float(assumed) >= v) break;
+    old = atomicCAS(p, assumed, __float_as_int(v));
+  } while (assumed != old);
+}

@@ -638,10 +638,14 @@ impl Proof<'_> {
                     self.or(h, absent)
                 }
                 EffectOp::Memory {
-                    op: MemoryOp::Store(_) | MemoryOp::AtomicAdd(_),
+                    op:
+                        memory @ (MemoryOp::Store(_)
+                        | MemoryOp::AtomicAdd(_)
+                        | MemoryOp::AtomicRmw(_)
+                        | MemoryOp::AtomicCmpSwap),
                     ..
                 } => {
-                    let pred = inputs[2];
+                    let pred = inputs[memory.mask_input()];
                     let reachable = self.reachable(id);
                     let happens = self.and(self.h[pred.0], reachable);
                     if happens != Bdd::FALSE {
@@ -653,7 +657,7 @@ impl Proof<'_> {
                         );
                     }
                     let fp = self.bit(pred);
-                    let operands = any_of(self, &inputs[..2]);
+                    let operands = any_of(self, &inputs[..memory.mask_input()]);
                     let performed = self.and(fp, reachable);
                     let writes = self.and(performed, operands);
                     if writes != Bdd::FALSE {
@@ -1414,14 +1418,18 @@ impl Explore<'_, '_> {
                 Inst::Effect {
                     op:
                         EffectOp::Memory {
-                            op: MemoryOp::Store(_) | MemoryOp::AtomicAdd(_),
+                            op:
+                                memory @ (MemoryOp::Store(_)
+                                | MemoryOp::AtomicAdd(_)
+                                | MemoryOp::AtomicRmw(_)
+                                | MemoryOp::AtomicCmpSwap),
                             ..
                         },
                     inputs,
                     outputs,
                     ..
                 } => {
-                    let pred = bits_of(self, &descs, inputs[2]);
+                    let pred = bits_of(self, &descs, inputs[memory.mask_input()]);
                     if self.decide(pred, cond, side) != Some(false) {
                         self.proof.require(
                             x,

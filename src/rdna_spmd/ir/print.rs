@@ -176,6 +176,11 @@ fn effect_op(op: EffectOp) -> String {
                 MemoryOp::Store(size) => format!("store.{}", mem_size(size)),
                 MemoryOp::AtomicAdd(Numeric::Unsigned) => "atomic_add".into(),
                 MemoryOp::AtomicAdd(Numeric::Float) => "atomic_fadd".into(),
+                MemoryOp::AtomicRmw(Rmw::SignedMin) => "atomic_smin".into(),
+                MemoryOp::AtomicRmw(Rmw::SignedMax) => "atomic_smax".into(),
+                MemoryOp::AtomicRmw(Rmw::UnsignedMin) => "atomic_umin".into(),
+                MemoryOp::AtomicRmw(Rmw::UnsignedMax) => "atomic_umax".into(),
+                MemoryOp::AtomicCmpSwap => "atomic_cmpswap".into(),
                 MemoryOp::Fence => "fence".into(),
             };
             format!(
