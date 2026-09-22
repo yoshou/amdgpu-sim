@@ -879,12 +879,37 @@ fn lower_integer(
         }
         I::V_MAD_U16 | I::V_MAD_I16 => {
             let mask = q.k(Ty::I32, 0xffff);
-            let a = q.int(IntOp::And, a, mask);
-            let b = q.int(IntOp::And, b, mask);
-            let c = q.int(IntOp::And, c, mask);
+            let signed = matches!(op, I::V_MAD_I16);
+            let widen = |q: &mut Builder, value: ValueId| {
+                if signed {
+                    let shift = q.k(Ty::I32, 16);
+                    let high = q.int(IntOp::Shl, value, shift);
+                    q.int(IntOp::AShr, high, shift)
+                } else {
+                    q.int(IntOp::And, value, mask)
+                }
+            };
+            let a = widen(q, a);
+            let b = widen(q, b);
+            let c = widen(q, c);
             let product = q.int(IntOp::Mul, a, b);
             let sum = q.int(IntOp::Add, product, c);
-            q.int(IntOp::And, sum, mask)
+            if cm != 0 {
+                if signed {
+                    let low = q.k(Ty::I32, i16::MIN as u32 as u64);
+                    let high = q.k(Ty::I32, i16::MAX as u64);
+                    let under = q.push(Ty::I1, Op::Cmp(IntPred::Slt, sum, low));
+                    let sum = q.push(Ty::I32, Op::Select(under, low, sum));
+                    let over = q.push(Ty::I1, Op::Cmp(IntPred::Sgt, sum, high));
+                    let sum = q.push(Ty::I32, Op::Select(over, high, sum));
+                    q.int(IntOp::And, sum, mask)
+                } else {
+                    let over = q.push(Ty::I1, Op::Cmp(IntPred::Ugt, sum, mask));
+                    q.push(Ty::I32, Op::Select(over, mask, sum))
+                }
+            } else {
+                q.int(IntOp::And, sum, mask)
+            }
         }
         I::V_LSHLREV_B16 | I::V_LSHRREV_B16 => {
             let mask = q.k(Ty::I32, 0xffff);
