@@ -2786,9 +2786,6 @@ impl SIMD32 {
             vcc |= (carry as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -2807,9 +2804,6 @@ impl SIMD32 {
             vcc |= (carry as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -2828,9 +2822,6 @@ impl SIMD32 {
             vcc |= (carry as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13094,9 +13085,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13113,9 +13101,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13132,9 +13117,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13151,9 +13133,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13265,9 +13244,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13284,9 +13260,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13303,9 +13276,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13322,9 +13292,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13341,9 +13308,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13360,9 +13324,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13379,9 +13340,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13398,9 +13356,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13417,9 +13372,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13436,9 +13388,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13455,9 +13404,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13474,9 +13420,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_vcc_bit(elem, ((vcc >> elem) & 1) != 0);
         }
     }
