@@ -1,5 +1,3 @@
-use crate::rdna_translator::*;
-
 use llvm_sys as llvm;
 
 use super::*;
