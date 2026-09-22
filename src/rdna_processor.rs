@@ -1324,6 +1324,16 @@ impl SIMD32 {
             I::S_MOV_B64 => {
                 self.s_mov_b64(d, s0);
             }
+            I::S_CMOV_B32 => {
+                if self.ctx.scc {
+                    self.s_mov_b32(d, s0);
+                }
+            }
+            I::S_CMOV_B64 => {
+                if self.ctx.scc {
+                    self.s_mov_b64(d, s0);
+                }
+            }
             I::S_CTZ_I32_B32 => {
                 self.s_ctz_i32_b32(d, s0);
             }
@@ -3343,6 +3353,12 @@ impl SIMD32 {
             I::V_MIN3_I32 => {
                 self.v_min3_i32(d, s0, s1, s2, abs, neg);
             }
+            I::V_MAXMIN_I32 => {
+                self.v_maxmin_i32(d, s0, s1, s2, abs, neg);
+            }
+            I::V_MINMAX_I32 => {
+                self.v_minmax_i32(d, s0, s1, s2, abs, neg);
+            }
             I::V_MIN3_U32 => {
                 self.v_min3_u32(d, s0, s1, s2, abs, neg);
             }
@@ -3721,6 +3737,84 @@ impl SIMD32 {
         }
     }
 
+
+    fn v_maxmin_i32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s0) as u64,
+                abs,
+                neg,
+                0,
+                32,
+            ) as u32 as i32;
+            let s1_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s1) as u64,
+                abs,
+                neg,
+                1,
+                32,
+            ) as u32 as i32;
+            let s2_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s2) as u64,
+                abs,
+                neg,
+                2,
+                32,
+            ) as u32 as i32;
+            let d_value = s0_value.max(s1_value).min(s2_value);
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
+
+    fn v_minmax_i32(
+        &mut self,
+        d: usize,
+        s0: SourceOperand,
+        s1: SourceOperand,
+        s2: SourceOperand,
+        abs: u8,
+        neg: u8,
+    ) {
+        for elem in 0..32 {
+            if !self.get_exec_bit(elem) {
+                continue;
+            }
+            let s0_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s0) as u64,
+                abs,
+                neg,
+                0,
+                32,
+            ) as u32 as i32;
+            let s1_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s1) as u64,
+                abs,
+                neg,
+                1,
+                32,
+            ) as u32 as i32;
+            let s2_value = abs_neg_bits(
+                self.read_vector_source_operand_u32(elem, s2) as u64,
+                abs,
+                neg,
+                2,
+                32,
+            ) as u32 as i32;
+            let d_value = s0_value.min(s1_value).max(s2_value);
+            self.write_vgpr(elem, d, d_value as u32);
+        }
+    }
 
     fn v_min3_i32(
         &mut self,
@@ -4658,9 +4752,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -4696,9 +4787,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -4734,9 +4822,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5290,9 +5375,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5318,9 +5400,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5346,9 +5425,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5374,9 +5450,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5403,9 +5476,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5438,9 +5508,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5886,9 +5953,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5912,9 +5976,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5931,9 +5992,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5950,9 +6008,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5969,9 +6024,22 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
+            self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
+        }
+    }
+
+    fn v_cmp_le_u16_e32(&mut self, s0: SourceOperand, s1: usize) {
+        let mut vcc = 0u32;
+        for elem in 0..32 {
             if !self.get_exec_bit(elem) {
                 continue;
             }
+            let s0_value = self.read_vector_source_operand_u32(elem, s0) as u16;
+            let s1_value = self.read_vgpr(elem, s1) as u16;
+            let d_value = s0_value <= s1_value;
+            vcc |= (d_value as u32) << elem;
+        }
+        for elem in 0..32 {
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -5988,9 +6056,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6008,9 +6073,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6028,9 +6090,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6047,9 +6106,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6066,9 +6122,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6085,9 +6138,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6353,9 +6403,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -6379,9 +6426,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8159,9 +8203,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8178,9 +8219,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8206,9 +8244,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8225,9 +8260,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8263,9 +8295,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8282,9 +8311,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8310,9 +8336,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8329,9 +8352,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8367,9 +8387,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8386,9 +8403,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8424,9 +8438,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8443,9 +8454,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8481,9 +8489,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8500,9 +8505,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8538,9 +8540,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8557,9 +8556,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8595,9 +8591,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8614,9 +8607,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8652,9 +8642,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8671,9 +8658,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8709,9 +8693,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8728,9 +8709,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8766,9 +8744,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8785,9 +8760,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8813,9 +8785,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8832,9 +8801,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8870,9 +8836,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8889,9 +8852,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8927,9 +8887,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8946,9 +8903,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8974,9 +8928,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -8993,9 +8944,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9021,9 +8969,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9040,9 +8985,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9068,9 +9010,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9087,9 +9026,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9115,9 +9051,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9134,9 +9067,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9162,9 +9092,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9181,9 +9108,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9209,9 +9133,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -9228,9 +9149,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(106, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10362,9 +10280,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10390,9 +10305,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10418,9 +10330,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10446,9 +10355,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10475,9 +10381,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10503,9 +10406,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10531,9 +10431,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10559,9 +10456,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10813,9 +10707,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -10968,9 +10859,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -11006,9 +10894,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -11044,9 +10929,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -11082,9 +10964,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -11158,9 +11037,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -11196,9 +11072,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -11234,9 +11107,6 @@ impl SIMD32 {
             vcc |= (d_value as u32) << elem;
         }
         for elem in 0..32 {
-            if !self.get_exec_bit(elem) {
-                continue;
-            }
             self.set_sgpr_bit(d, elem, ((vcc >> elem) & 1) != 0);
         }
     }
@@ -13023,6 +12893,9 @@ impl SIMD32 {
             }
             I::V_CMP_GT_U16 => {
                 self.v_cmp_gt_u16_e32(s0, s1);
+            }
+            I::V_CMP_LE_U16 => {
+                self.v_cmp_le_u16_e32(s0, s1);
             }
             I::V_CMP_LG_F32 => {
                 self.v_cmp_lg_f32_e32(s0, s1);

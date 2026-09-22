@@ -323,8 +323,33 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
     Some(b.finish_many(true, outputs))
 }
 
+fn cmov(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
+    let InstFormat::SOP1(i) = inst else {
+        return None;
+    };
+    let ty = match i.op {
+        I::S_CMOV_B32 => Ty::I32,
+        I::S_CMOV_B64 => Ty::I64,
+        _ => return None,
+    };
+    let mut b = Builder::new(
+        registry,
+        vec![
+            input(i.ssrc0.clone(), ty),
+            input(SourceOperand::ScalarRegister(i.sdst), ty),
+            Input {
+                source: InputSource::Scc,
+                ty: Ty::I1,
+            },
+        ],
+    );
+    let result = b.push(ty, Op::Select(ValueId(2), ValueId(0), ValueId(1)));
+    Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, ty), result)]))
+}
+
 pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     masks(inst, registry)
+        .or_else(|| cmov(inst, registry))
         .or_else(|| arithmetic(inst, registry))
         .or_else(|| float(inst, registry))
         .or_else(|| bit_count(inst, registry))

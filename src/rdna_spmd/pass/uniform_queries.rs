@@ -8,6 +8,7 @@ struct Facts<'a> {
     parameter: Vec<Option<(BlockId, usize)>>,
     effect: Vec<bool>,
     target: Vec<Option<(bool, Vec<ValueId>)>>,
+    answered: Vec<bool>,
     inputs: &'a [Parameter],
     state: Vec<Option<bool>>,
 }
@@ -61,6 +62,9 @@ impl Facts<'_> {
         if self.effect[value.0] {
             return false;
         }
+        if self.answered[value.0] {
+            return true;
+        }
         if let Some((pure, args)) = self.target[value.0].clone() {
             return pure && args.into_iter().all(|arg| self.uniform(arg));
         }
@@ -88,6 +92,7 @@ fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
     let mut parameter = vec![None; f.types.len()];
     let mut effect = vec![false; f.types.len()];
     let mut target: Vec<Option<(bool, Vec<ValueId>)>> = vec![None; f.types.len()];
+    let mut answered = vec![false; f.types.len()];
     let mut queries: Vec<(ValueId, ValueId)> = Vec::new();
     for (&id, block) in &f.blocks {
         for (index, &(value, _)) in block.params.iter().enumerate() {
@@ -113,12 +118,13 @@ fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
                     outputs,
                     ..
                 } => {
-                    let answered = matches!(
+                    let query = matches!(
                         op,
                         EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane)
                     );
                     for &(v, _) in outputs {
-                        effect[v.0] = !answered;
+                        effect[v.0] = !query;
+                        answered[v.0] = query;
                     }
                     if matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::ReadFirstLane)) {
                         queries.push((outputs[0].0, inputs[0]));
@@ -136,6 +142,7 @@ fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
         parameter,
         effect,
         target,
+        answered,
         inputs,
         state: vec![None; f.types.len()],
     };
