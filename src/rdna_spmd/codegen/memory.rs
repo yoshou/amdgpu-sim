@@ -44,6 +44,8 @@ pub enum Shape {
         grouped: bool,
         kind: Numeric,
     },
+    AtomicRmw(Rmw),
+    AtomicCmpSwap,
     Store(StoreShape),
     NarrowLoad,
     PrivateTile {
@@ -116,6 +118,12 @@ pub fn shape(
             && !access.returns()
             && !access.semantics.volatile;
         return Shape::AtomicAdd { grouped, kind };
+    }
+    if let MemoryOp::AtomicRmw(op) = access.op {
+        return Shape::AtomicRmw(op);
+    }
+    if access.op == MemoryOp::AtomicCmpSwap {
+        return Shape::AtomicCmpSwap;
     }
     let affine = access.form == (Form::Scratch { uniform: true });
     if access.stores() {
@@ -641,6 +649,15 @@ impl<'a> Cg<'a> {
                 }
                 self.emit_lane_atomic_add(addr, d, exec, kind, words.results.first().copied());
             }
+            Shape::AtomicRmw(op) => {
+                let d = self.vector(words.data[0]);
+                self.emit_lane_atomic_rmw(addr, d, exec, op, words.results.first().copied());
+            }
+            Shape::AtomicCmpSwap => {
+                let new = self.vector(words.data[0]);
+                let cmp = self.vector(words.data[1]);
+                self.emit_lane_cmpswap(addr, new, cmp, exec, words.results.first().copied());
+            }
             Shape::Store(StoreShape::Tile) => self.emit_tile_store(addr, exec, words),
             Shape::Store(kind) => self.emit_word_stores(addr, exec, kind, words),
             Shape::NarrowLoad => {
@@ -693,6 +710,67 @@ impl<'a> Cg<'a> {
                 }
             };
             result = ir.insert_at(result, old, k);
+        }
+        if let Some(r) = result_id {
+            self.define(r, result);
+        }
+    }
+
+    fn lane_pointers(&self, addr: Value, exec: Value) -> Vec<(Value, Value)> {
+        let ir = self.ir;
+        let packed_exec = self.vec_to_mask(exec);
+        let ptrs = self.ptr_at_vec(addr, 0);
+        (0..self.width())
+            .map(|k| {
+                let bit = ir.and(ir.lshr(packed_exec, self.ci32(k)), self.ci32(1));
+                let active = ir.icmp(IntPred::Ne, bit, self.ci32(0));
+                let ptr = ir.extract_at(ptrs, k);
+                (active, ir.select(active, ptr, self.sink))
+            })
+            .collect()
+    }
+
+    fn emit_lane_atomic_rmw(
+        &mut self,
+        addr: Value,
+        d: Value,
+        exec: Value,
+        op: Rmw,
+        result_id: Option<ValueId>,
+    ) {
+        let ir = self.ir;
+        let mut result = self.vi32().poison();
+        for (k, (_, ptr)) in self.lane_pointers(addr, exec).into_iter().enumerate() {
+            let value = ir.extract_at(d, k as u32);
+            let (signed, max) = match op {
+                Rmw::SignedMin => (true, false),
+                Rmw::SignedMax => (true, true),
+                Rmw::UnsignedMin => (false, false),
+                Rmw::UnsignedMax => (false, true),
+            };
+            let old = ir.atomic_min_max(ptr, value, signed, max, Atomic::SequentiallyConsistent);
+            result = ir.insert_at(result, old, k as u32);
+        }
+        if let Some(r) = result_id {
+            self.define(r, result);
+        }
+    }
+
+    fn emit_lane_cmpswap(
+        &mut self,
+        addr: Value,
+        new: Value,
+        cmp: Value,
+        exec: Value,
+        result_id: Option<ValueId>,
+    ) {
+        let ir = self.ir;
+        let mut result = self.vi32().poison();
+        for (k, (_, ptr)) in self.lane_pointers(addr, exec).into_iter().enumerate() {
+            let new = ir.extract_at(new, k as u32);
+            let cmp = ir.extract_at(cmp, k as u32);
+            let old = ir.cmpxchg(ptr, cmp, new, Atomic::SequentiallyConsistent);
+            result = ir.insert_at(result, old, k as u32);
         }
         if let Some(r) = result_id {
             self.define(r, result);

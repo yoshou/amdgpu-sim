@@ -11,7 +11,7 @@ mod verify;
 
 pub use builder::{Expr, ExprInst};
 pub use effect::{
-    CachePolicy, EffectOp, MemSize, MemoryOp, MemorySemantics, Numeric, Ordering, Scope, Space,
+    CachePolicy, EffectOp, MemSize, MemoryOp, MemorySemantics, Numeric, Ordering, Rmw, Scope, Space,
     WaveOp,
 };
 pub use func::{Block, BlockId, Edge, Func, Inst, PacketOp, Term};

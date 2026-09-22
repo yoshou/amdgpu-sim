@@ -79,7 +79,34 @@ pub enum MemoryOp {
     Load(MemSize),
     Store(MemSize),
     AtomicAdd(Numeric),
+    AtomicRmw(Rmw),
+    AtomicCmpSwap,
     Fence,
+}
+impl MemoryOp {
+    pub fn atomic(self) -> bool {
+        matches!(
+            self,
+            MemoryOp::AtomicAdd(_) | MemoryOp::AtomicRmw(_) | MemoryOp::AtomicCmpSwap
+        )
+    }
+    pub fn data_words(self) -> usize {
+        match self {
+            MemoryOp::Load(_) | MemoryOp::Fence => 0,
+            MemoryOp::AtomicCmpSwap => 2,
+            _ => 1,
+        }
+    }
+    pub fn mask_input(self) -> usize {
+        1 + self.data_words()
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Rmw {
+    SignedMin,
+    SignedMax,
+    UnsignedMin,
+    UnsignedMax,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Numeric {
@@ -119,7 +146,10 @@ impl EffectOp {
                 MemoryOp::Load(_) => (vec![space.address_type(), I1], vec![I32]),
                 MemoryOp::Store(MemSize::B64) => (vec![space.address_type(), I64, I1], vec![]),
                 MemoryOp::Store(_) => (vec![space.address_type(), I32, I1], vec![]),
-                MemoryOp::AtomicAdd(_) => (vec![space.address_type(), I32, I1], vec![I32]),
+                MemoryOp::AtomicAdd(_) | MemoryOp::AtomicRmw(_) => {
+                    (vec![space.address_type(), I32, I1], vec![I32])
+                }
+                MemoryOp::AtomicCmpSwap => (vec![space.address_type(), I32, I32, I1], vec![I32]),
                 MemoryOp::Fence => (vec![], vec![]),
             },
             Self::Wave(op) => match op {
@@ -161,7 +191,7 @@ impl EffectOp {
             semantics,
         } = self
         {
-            if space == Space::Scratch && matches!(op, MemoryOp::AtomicAdd(_) | MemoryOp::Fence) {
+            if space == Space::Scratch && (op.atomic() || op == MemoryOp::Fence) {
                 return Err("invalid private-memory effect");
             }
             if matches!(op, MemoryOp::Store(MemSize::I8 | MemSize::I16)) {

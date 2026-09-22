@@ -720,6 +720,10 @@ fn arity(op: I) -> usize {
         | I::V_MAX3_U32
         | I::V_MED3_I32
         | I::V_MED3_U32
+        | I::V_MAXMIN_I32
+        | I::V_MAXMIN_U32
+        | I::V_MINMAX_I32
+        | I::V_MINMAX_U32
         | I::V_MAD_U16
         | I::V_MAD_I16
         | I::V_OR3_B32
@@ -730,6 +734,7 @@ fn arity(op: I) -> usize {
         | I::V_MAD_I32_I24
         | I::V_BFE_U32
         | I::V_BFI_B32
+        | I::V_PERM_B32
         | I::V_ALIGNBIT_B32
         | I::V_FMA_F32
         | I::V_FMA_F64 => 3,
@@ -782,8 +787,15 @@ fn lower_integer(
         | I::V_MAX3_I32
         | I::V_MAX3_U32
         | I::V_MED3_I32
-        | I::V_MED3_U32 => {
-            let signed = matches!(op, I::V_MIN3_I32 | I::V_MAX3_I32 | I::V_MED3_I32);
+        | I::V_MED3_U32
+        | I::V_MAXMIN_I32
+        | I::V_MAXMIN_U32
+        | I::V_MINMAX_I32
+        | I::V_MINMAX_U32 => {
+            let signed = matches!(
+                op,
+                I::V_MIN3_I32 | I::V_MAX3_I32 | I::V_MED3_I32 | I::V_MAXMIN_I32 | I::V_MINMAX_I32
+            );
             let lt = if signed { IntPred::Slt } else { IntPred::Ult };
             let gt = if signed { IntPred::Sgt } else { IntPred::Ugt };
             fn pick(q: &mut Builder, pred: IntPred, x: ValueId, y: ValueId) -> ValueId {
@@ -797,6 +809,14 @@ fn lower_integer(
                 }
                 I::V_MAX3_I32 | I::V_MAX3_U32 => {
                     let ab = pick(q, gt, a, b);
+                    pick(q, gt, ab, c)
+                }
+                I::V_MAXMIN_I32 | I::V_MAXMIN_U32 => {
+                    let ab = pick(q, gt, a, b);
+                    pick(q, lt, ab, c)
+                }
+                I::V_MINMAX_I32 | I::V_MINMAX_U32 => {
+                    let ab = pick(q, lt, a, b);
                     pick(q, gt, ab, c)
                 }
                 _ => {
@@ -1007,6 +1027,51 @@ fn lower_integer(
             let x = q.int(IntOp::And, a, b);
             let y = q.int(IntOp::And, inv, c);
             q.int(IntOp::Or, x, y)
+        }
+        I::V_PERM_B32 => {
+            let byte = q.k(Ty::I32, 0xff);
+            let signs: Vec<ValueId> = [(b, 15u64), (b, 31), (a, 15), (a, 31)]
+                .iter()
+                .map(|&(word, bit)| {
+                    let shift = q.k(Ty::I32, bit);
+                    let sign = q.int(IntOp::LShr, word, shift);
+                    let sign = q.int(IntOp::And, sign, byte);
+                    let zero = q.k(Ty::I32, 0);
+                    let set = q.push(Ty::I1, Op::Cmp(IntPred::Ne, sign, zero));
+                    q.push(Ty::I32, Op::Select(set, byte, zero))
+                })
+                .collect();
+            let mut result = q.k(Ty::I32, 0);
+            for k in 0..4 {
+                let place = q.k(Ty::I32, 8 * k);
+                let sel = q.int(IntOp::LShr, c, place);
+                let sel = q.int(IntOp::And, sel, byte);
+                let three = q.k(Ty::I32, 3);
+                let within = q.int(IntOp::And, sel, three);
+                let eight = q.k(Ty::I32, 8);
+                let shift = q.int(IntOp::Mul, within, eight);
+                let low = q.int(IntOp::LShr, b, shift);
+                let high = q.int(IntOp::LShr, a, shift);
+                let four = q.k(Ty::I32, 4);
+                let upper = q.int(IntOp::And, sel, four);
+                let zero = q.k(Ty::I32, 0);
+                let from_a = q.push(Ty::I1, Op::Cmp(IntPred::Ne, upper, zero));
+                let picked = q.push(Ty::I32, Op::Select(from_a, high, low));
+                let mut value = q.int(IntOp::And, picked, byte);
+                for (n, &sign) in signs.iter().enumerate() {
+                    let code = q.k(Ty::I32, 8 + n as u64);
+                    let is = q.push(Ty::I1, Op::Cmp(IntPred::Eq, sel, code));
+                    value = q.push(Ty::I32, Op::Select(is, sign, value));
+                }
+                let twelve = q.k(Ty::I32, 12);
+                let is_zero = q.push(Ty::I1, Op::Cmp(IntPred::Eq, sel, twelve));
+                value = q.push(Ty::I32, Op::Select(is_zero, zero, value));
+                let ones = q.push(Ty::I1, Op::Cmp(IntPred::Ugt, sel, twelve));
+                value = q.push(Ty::I32, Op::Select(ones, byte, value));
+                let placed = q.int(IntOp::Shl, value, place);
+                result = q.int(IntOp::Or, result, placed);
+            }
+            result
         }
         I::V_MUL_HI_U32 => {
             let a = q.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, a));

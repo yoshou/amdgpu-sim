@@ -84,10 +84,15 @@ impl Memory {
             Address::Lds { vector, .. } => regs.push(vector),
             _ => {}
         }
-        if self.stores() || matches!(self.op, MemoryOp::AtomicAdd(_)) {
-            regs.extend((0..self.words).map(|k| self.data_register(k)));
-        }
+        regs.extend((0..self.data_count()).map(|k| self.data_register(k)));
         regs
+    }
+    fn data_count(&self) -> u32 {
+        match self.op {
+            MemoryOp::AtomicCmpSwap => 2,
+            op if op.data_words() > 0 => self.words,
+            _ => 0,
+        }
     }
     fn space(&self) -> Space {
         match self.address {
@@ -120,7 +125,7 @@ fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
         "reserved memory temporal hint {}",
         th
     );
-    let (cache_policy, deferred_scope) = if matches!(op, MemoryOp::AtomicAdd(_)) {
+    let (cache_policy, deferred_scope) = if op.atomic() {
         (
             if th & 2 == 0 {
                 CachePolicy::Temporal
@@ -156,7 +161,7 @@ fn semantics(scope: u8, th: u8, op: MemoryOp, scalar: bool) -> MemorySemantics {
         cache_policy,
         deferred_scope,
         volatile: false,
-        ordering: if matches!(op, MemoryOp::AtomicAdd(_)) {
+        ordering: if op.atomic() {
             Ordering::Sequential
         } else {
             Ordering::Relaxed
@@ -302,6 +307,11 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         | I::FLAT_LOAD_D16_HI_B16 => (Load(U16), 1),
         I::GLOBAL_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => (AtomicAdd(Numeric::Unsigned), 1),
         I::GLOBAL_ATOMIC_ADD_F32 | I::DS_ADD_F32 | I::DS_ADD_RTN_F32 => (AtomicAdd(Numeric::Float), 1),
+        I::GLOBAL_ATOMIC_MIN_I32 => (AtomicRmw(Rmw::SignedMin), 1),
+        I::GLOBAL_ATOMIC_MAX_I32 => (AtomicRmw(Rmw::SignedMax), 1),
+        I::GLOBAL_ATOMIC_MIN_U32 => (AtomicRmw(Rmw::UnsignedMin), 1),
+        I::GLOBAL_ATOMIC_MAX_U32 => (AtomicRmw(Rmw::UnsignedMax), 1),
+        I::GLOBAL_ATOMIC_CMPSWAP_B32 => (AtomicCmpSwap, 1),
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
         _ => panic!("unsupported memory lift {:?}", opcode),
     };
@@ -345,7 +355,7 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         None
     };
     let returns = matches!(op, Load(_))
-        || matches!(op, AtomicAdd(_)) && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
+        || op.atomic() && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
     let mut semantics = semantics(scope, th, op, matches!(address, Address::Scalar { .. }));
     if matches!(address, Address::Lds { .. }) {
         semantics.scope = Scope::Workgroup;
@@ -426,13 +436,18 @@ impl Memory {
                 offset_by(f, block, ty, address, self.word_offset(k) as u64)
             };
             let exec = flat.as_ref().map_or(mask, |aperture| aperture.outside);
+            let word_data: &[ValueId] = if self.op == MemoryOp::AtomicCmpSwap {
+                &data
+            } else {
+                data.get(k as usize).map_or(&[], std::slice::from_ref)
+            };
             let mut result = self.effect(
                 f,
                 block,
                 next_provenance(),
                 self.space(),
                 word_address,
-                data.get(k as usize).copied(),
+                word_data,
                 exec,
             );
             if let Some(aperture) = &flat {
@@ -447,7 +462,7 @@ impl Memory {
                     next_provenance(),
                     Space::Scratch,
                     private_address,
-                    data.get(k as usize).copied(),
+                    word_data,
                     aperture.inside_exec,
                 );
                 if let (Some(global), Some(private)) = (result, private) {
@@ -532,8 +547,8 @@ impl Memory {
                 Ty::I32,
             ),
         };
-        let data: Vec<_> = if self.stores() || matches!(self.op, MemoryOp::AtomicAdd(_)) {
-            (0..self.words)
+        let data: Vec<_> = if self.data_count() > 0 {
+            (0..self.data_count())
                 .map(|k| {
                     reg(
                         SourceOperand::VectorRegister(self.data_register(k) as u8),
@@ -597,11 +612,11 @@ impl Memory {
         provenance: u64,
         space: Space,
         address: ValueId,
-        data: Option<ValueId>,
+        data: &[ValueId],
         exec: ValueId,
     ) -> Option<ValueId> {
         let mut inputs = vec![address];
-        inputs.extend(data);
+        inputs.extend(data.iter().copied());
         inputs.push(exec);
         let outputs = if self.stores() {
             vec![]

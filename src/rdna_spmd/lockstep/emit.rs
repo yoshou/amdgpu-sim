@@ -1378,9 +1378,8 @@ impl Emit<'_> {
                     unreachable!("every wave operation and barrier is lowered above")
                 };
                 let predicate = match memory {
-                    MemoryOp::Load(_) => 1,
-                    MemoryOp::Store(_) | MemoryOp::AtomicAdd(_) => 2,
                     MemoryOp::Fence => unreachable!("a fence is lowered above"),
+                    _ => memory.mask_input(),
                 };
                 let active = self.access_predicate(rest, *provenance, *op, inputs[predicate], mask);
                 let Some(active) = active else {

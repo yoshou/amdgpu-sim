@@ -554,6 +554,37 @@ impl Builder {
             ))
         }
     }
+    pub fn atomic_min_max(
+        &self,
+        ptr: Value,
+        v: Value,
+        signed: bool,
+        max: bool,
+        order: Atomic,
+    ) -> Value {
+        use llvm_sys::LLVMAtomicRMWBinOp::*;
+        let op = match (signed, max) {
+            (true, false) => LLVMAtomicRMWBinOpMin,
+            (true, true) => LLVMAtomicRMWBinOpMax,
+            (false, false) => LLVMAtomicRMWBinOpUMin,
+            (false, true) => LLVMAtomicRMWBinOpUMax,
+        };
+        unsafe { Value(LLVMBuildAtomicRMW(self.b, op, ptr.0, v.0, ordering(order), 0)) }
+    }
+    pub fn cmpxchg(&self, ptr: Value, cmp: Value, new: Value, order: Atomic) -> Value {
+        unsafe {
+            let pair = LLVMBuildAtomicCmpXchg(
+                self.b,
+                ptr.0,
+                cmp.0,
+                new.0,
+                ordering(order),
+                ordering(order),
+                0,
+            );
+            Value(LLVMBuildExtractValue(self.b, pair, 0, ANON))
+        }
+    }
     pub fn atomic_fadd(&self, ptr: Value, v: Value, order: Atomic) -> Value {
         unsafe {
             Value(LLVMBuildAtomicRMW(

@@ -198,6 +198,7 @@ fn sop2_effects(inst: &crate::rdna_instructions::SOP2) -> InstEffects {
         | I::S_CSELECT_B32
         | I::S_LSHL_B32
         | I::S_LSHR_B32
+        | I::S_ASHR_I32
         | I::S_MUL_I32 => Effects::default()
             .read(&inst.ssrc0, 1)
             .read(&inst.ssrc1, 1)

@@ -62,3 +62,21 @@ extern "C" __global__ void relu_bwd(float* dx, const float* dy, const float* x, 
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) dx[i] = x[i] > 0.0f ? dy[i] : 0.0f;
 }
+
+#include <hip/hip_fp16.h>
+extern "C" __global__ void axpy_half2(__half2* y, const __half2* x, float a, int n2) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n2) return;
+  __half2 a2 = __float2half2_rn(a);
+  y[i] = __hfma2(a2, x[i], y[i]);
+}
+
+extern "C" __global__ void half_to_float(float* o, const __half* i, int n) {
+  int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g < n) o[g] = __half2float(i[g]);
+}
+
+extern "C" __global__ void float_to_half(__half* o, const float* i, int n) {
+  int g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g < n) o[g] = __float2half(i[g]);
+}

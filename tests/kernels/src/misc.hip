@@ -16,7 +16,8 @@ extern "C" __global__ void mandelbrot(unsigned* o, int w, int h, int maxit) {
   o[py * w + px] = it;
 }
 
-extern "C" __global__ void nbody_step(float* px, float* py, const float* mass, int n, float dt) {
+extern "C" __global__ void nbody_step(float* opx, float* opy, const float* px, const float* py,
+                                      const float* mass, int n, float dt) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n) return;
   float ax = 0.0f, ay = 0.0f, xi = px[i], yi = py[i];
@@ -28,8 +29,8 @@ extern "C" __global__ void nbody_step(float* px, float* py, const float* mass, i
     ax += dx * w;
     ay += dy * w;
   }
-  px[i] = xi + ax * dt;
-  py[i] = yi + ay * dt;
+  opx[i] = xi + ax * dt;
+  opy[i] = yi + ay * dt;
 }
 
 extern "C" __global__ void u64_hash(unsigned long long* o, const unsigned long long* i, int n) {

@@ -18,6 +18,7 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
         | I::S_CSELECT_B32
         | I::S_LSHL_B32
         | I::S_LSHR_B32
+        | I::S_ASHR_I32
         | I::S_BFM_B32
         | I::S_BFE_U32
         | I::S_MAX_U32 => Ty::I32,
@@ -34,7 +35,7 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
     };
     let shift64 = matches!(i.op, I::S_LSHL_B64 | I::S_LSHR_B64 | I::S_ASHR_I64);
     let mut inputs = vec![
-        if matches!(i.op, I::S_ASHR_I64) {
+        if matches!(i.op, I::S_ASHR_I32 | I::S_ASHR_I64) {
             signed_input(i.ssrc0, ty)
         } else {
             input(i.ssrc0, ty)
@@ -116,10 +117,15 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
             flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero)));
             value
         }
-        I::S_LSHL_B32 | I::S_LSHR_B32 | I::S_LSHL_B64 | I::S_LSHR_B64 | I::S_ASHR_I64 => {
+        I::S_LSHL_B32
+        | I::S_LSHR_B32
+        | I::S_ASHR_I32
+        | I::S_LSHL_B64
+        | I::S_LSHR_B64
+        | I::S_ASHR_I64 => {
             let op = match i.op {
                 I::S_LSHR_B32 | I::S_LSHR_B64 => IntOp::LShr,
-                I::S_ASHR_I64 => IntOp::AShr,
+                I::S_ASHR_I32 | I::S_ASHR_I64 => IntOp::AShr,
                 _ => IntOp::Shl,
             };
             let value = b.push(ty, Op::Int(op, a, c));
@@ -232,10 +238,14 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         I::S_CVT_F32_U32 => (Ty::I32, Ty::F32, Some(Cvt::UnsignedToFloatRte)),
         I::S_CVT_I32_F32 => (Ty::F32, Ty::I32, Some(Cvt::FloatToSignedSatRtz)),
         I::S_CVT_U32_F32 => (Ty::F32, Ty::I32, Some(Cvt::FloatToUnsignedSatRtz)),
+        I::S_CVT_F16_F32 => (Ty::F32, Ty::I32, None),
         _ => return None,
     };
     let mut b = Builder::new(registry, vec![input(i.ssrc0.clone(), from)]);
-    let result = if let Some(cvt) = cvt {
+    let result = if matches!(i.op, I::S_CVT_F16_F32) {
+        let target = crate::rdna_spmd::rdna4::dialect::unary(registry, I::V_CVT_F16_F32).unwrap();
+        b.target_one(target, Arguments::Unary(ValueId(0)))
+    } else if let Some(cvt) = cvt {
         b.push(to, Op::Convert(cvt, to, ValueId(0)))
     } else if matches!(i.op, I::S_SEXT_I32_I16) {
         let shift = b.k(Ty::I32, 16);
@@ -270,7 +280,7 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
         I::S_CMPK_GE_U32 => Some(IntPred::Uge),
         I::S_CMPK_LT_U32 => Some(IntPred::Ult),
         I::S_CMPK_LE_U32 => Some(IntPred::Ule),
-        I::S_MOVK_I32 | I::S_CMOVK_I32 | I::S_ADDK_I32 | I::S_MULK_I32 => None,
+        I::S_MOVK_I32 | I::S_CMOVK_I32 | I::S_ADDK_I32 | I::S_ADDK_CO_I32 | I::S_MULK_I32 => None,
         _ => return None,
     };
     let mut inputs = if matches!(i.op, I::S_MOVK_I32) {
@@ -294,7 +304,7 @@ fn immediate(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> 
     let result = match i.op {
         I::S_MOVK_I32 => imm,
         I::S_CMOVK_I32 => b.push(Ty::I32, Op::Select(ValueId(1), imm, ValueId(0))),
-        I::S_ADDK_I32 => {
+        I::S_ADDK_I32 | I::S_ADDK_CO_I32 => {
             let result = b.int(IntOp::Add, ValueId(0), imm);
             let x = b.int(IntOp::Xor, ValueId(0), result);
             let y = b.int(IntOp::Xor, imm, result);

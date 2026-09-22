@@ -47,7 +47,7 @@ impl Access {
     }
     pub fn returns(&self) -> bool {
         matches!(self.op, MemoryOp::Load(_))
-            || matches!(self.op, MemoryOp::AtomicAdd(_)) && self.used
+            || self.op.atomic() && self.used
     }
     pub fn stores(&self) -> bool {
         matches!(self.op, MemoryOp::Store(_))
@@ -126,7 +126,7 @@ fn displacement(
 
 struct Word {
     input: ValueId,
-    data: Option<ValueId>,
+    data: Vec<ValueId>,
     mask: ValueId,
     result: Option<ValueId>,
 }
@@ -134,7 +134,7 @@ struct Word {
 fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
     Word {
         input: inputs[0],
-        data: (inputs.len() == 3).then(|| inputs[1]),
+        data: inputs[1..inputs.len() - 1].to_vec(),
         mask: *inputs.last().unwrap(),
         result: outputs.first().map(|o| o.0),
     }
@@ -341,7 +341,7 @@ pub fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Ac
                 mask,
                 inside,
                 offsets: offsets.iter().map(|&d| d as u32).collect(),
-                data: words.iter().filter_map(|w| w.data).collect(),
+                data: words.iter().flat_map(|w| w.data.iter().copied()).collect(),
                 results,
                 private,
                 used,
