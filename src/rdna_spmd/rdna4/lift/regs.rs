@@ -429,7 +429,8 @@ pub fn define(
             }
             Output::Scalar(..) | Output::Scc => result,
 
-            Output::Compare(reg) | Output::Mask(reg) => match Word::scalar(reg) {
+            Output::Compare(_) => core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec)),
+            Output::Mask(reg) => match Word::scalar(reg) {
                 Some(word) => {
                     let old = if matches!(word, Word::Mask(_)) {
                         words[&word]
@@ -446,8 +447,9 @@ pub fn define(
             if let Some(word) = Word::scalar(reg) {
                 let raw = if matches!(word, Word::Mask(_)) {
                     value
+                } else if matches!(output, Output::Compare(_)) {
+                    query(f, insts, WaveOp::Ballot, value)
                 } else {
-
                     let active = query(f, insts, WaveOp::Ballot, exec);
                     let taken = core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec));
                     let written = query(f, insts, WaveOp::Ballot, taken);

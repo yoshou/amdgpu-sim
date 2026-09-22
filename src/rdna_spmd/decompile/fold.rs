@@ -4,9 +4,9 @@ use super::logic::{Atom, Logic};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub fn fold(q: &mut Func, inputs: &[Parameter], exec: Option<usize>) {
+pub fn fold(q: &mut Func, inputs: &[Parameter], words: &BTreeSet<ValueId>, exec: Option<usize>) {
     let decided = {
-        let facts = Facts::new(q, inputs, &BTreeSet::new());
+        let facts = Facts::new(q, inputs, words);
 
         let kept: BTreeSet<ValueId> = q
             .blocks

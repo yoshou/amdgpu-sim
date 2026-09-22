@@ -1,4 +1,5 @@
 mod adjacency;
+mod branch_selects;
 mod dce;
 mod entry;
 mod idioms;
@@ -8,6 +9,7 @@ mod simplify;
 mod uniform_queries;
 
 pub use adjacency::Adjacency;
+pub use branch_selects::BranchSelects;
 pub use dce::{Dce, DeadParams};
 pub use entry::PacketState;
 pub use idioms::{Idiom, Idioms};

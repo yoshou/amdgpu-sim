@@ -43,7 +43,7 @@ pub fn decompile(function: &Program) -> Lane {
         );
     }
     let mut lane = rewrite::lane_program(f, &facts, &kept);
-    fold::fold(&mut lane, &function.parameter_inputs, exec_index);
+    fold::fold(&mut lane, &function.parameter_inputs, &kept.words, exec_index);
     lane.compact();
     if let Err(e) = lane.check(&function.registry) {
         panic!(

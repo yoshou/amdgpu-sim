@@ -171,6 +171,22 @@ fn is_terminator(inst: &InstFormat) -> bool {
         | I::S_CBRANCH_EXECNZ | I::S_BRANCH | I::S_BARRIER_WAIT | I::S_ENDPGM))
 }
 
+fn scc_branch_follows(memory: &[u8], mut pc: usize) -> bool {
+    loop {
+        let Ok((inst, size)) = decode_at(memory, pc) else {
+            return false;
+        };
+        let InstFormat::SOPP(i) = inst else {
+            return false;
+        };
+        match i.op {
+            I::S_CBRANCH_SCC0 | I::S_CBRANCH_SCC1 => return true,
+            I::S_NOP | I::S_DELAY_ALU | I::S_WAIT_ALU => pc += size,
+            _ => return false,
+        }
+    }
+}
+
 fn successors(pc: usize, inst: &InstFormat) -> Vec<usize> {
     let target = |simm16: u16| ((pc as i64) + (simm16 as i16 as i64) * 4) as usize;
     match inst {
@@ -221,7 +237,7 @@ impl Search<'_> {
             pc += size;
             let stop = is_terminator(&inst)
                 || self.containing(pc).is_some()
-                || super::lift::writes_exec(&inst);
+                || super::lift::writes_exec(&inst) && !scc_branch_follows(self.memory, pc);
             last = inst;
             if stop {
                 break;

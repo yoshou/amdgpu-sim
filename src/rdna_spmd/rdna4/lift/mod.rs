@@ -439,18 +439,11 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
     for index in 0..shape.arity {
         let input_ty = q.inputs[index].ty;
         values[index] = if input_ty.integer() {
-            let bits = if matches!(
-                alu.op,
-                I::V_ADD_NC_U16
-                    | I::V_SUB_NC_U16
-                    | I::V_ADD_NC_I16
-                    | I::V_SUB_NC_I16
-                    | I::V_MUL_LO_U16
-                    | I::V_MAD_U16
-                    | I::V_MAD_I16
-                    | I::V_LSHLREV_B16
-                    | I::V_LSHRREV_B16
-            ) {
+            let bits = if halfword_op(alu.op) {
+                if alu.opsel >> index & 1 != 0 {
+                    let sixteen = q.k(Ty::I32, 16);
+                    values[index] = q.int(IntOp::LShr, values[index], sixteen);
+                }
                 16
             } else {
                 input_ty.bits()
@@ -510,6 +503,18 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
     };
     let result = if !output.ty().integer() {
         q.output_mod(output.ty(), result, alu.cm, alu.omod)
+    } else if halfword_op(alu.op) {
+        let old = ValueId(shape.arity);
+        let high = alu.opsel & 8 != 0;
+        let low = q.k(Ty::I32, 0xffff);
+        let mut value = q.int(IntOp::And, result, low);
+        if high {
+            let sixteen = q.k(Ty::I32, 16);
+            value = q.int(IntOp::Shl, value, sixteen);
+        }
+        let keep = q.k(Ty::I32, if high { 0xffff } else { 0xffff_0000 });
+        let kept = q.int(IntOp::And, old, keep);
+        q.int(IntOp::Or, kept, value)
     } else {
         result
     };
@@ -535,7 +540,23 @@ struct Alu {
     neg: u8,
     cm: u8,
     omod: u8,
+    opsel: u8,
     literal: Option<u32>,
+}
+
+fn halfword_op(op: I) -> bool {
+    matches!(
+        op,
+        I::V_ADD_NC_U16
+            | I::V_SUB_NC_U16
+            | I::V_ADD_NC_I16
+            | I::V_SUB_NC_I16
+            | I::V_MUL_LO_U16
+            | I::V_MAD_U16
+            | I::V_MAD_I16
+            | I::V_LSHLREV_B16
+            | I::V_LSHRREV_B16
+    )
 }
 
 impl Alu {
@@ -549,6 +570,7 @@ impl Alu {
                 neg: 0,
                 cm: 0,
                 omod: 0,
+                opsel: 0,
                 literal: None,
             },
             InstFormat::VOP2(i) => Alu {
@@ -559,6 +581,7 @@ impl Alu {
                 neg: 0,
                 cm: 0,
                 omod: 0,
+                opsel: 0,
                 literal: i.literal_constant,
             },
             InstFormat::VOP3(i) => Alu {
@@ -569,6 +592,7 @@ impl Alu {
                 neg: i.neg,
                 cm: i.cm,
                 omod: i.omod,
+                opsel: i.opsel,
                 literal: None,
             },
             _ => panic!("instruction has no typed IR lowering: {:?}", inst),
@@ -596,6 +620,9 @@ impl Alu {
         }
         if matches!(self.op, I::V_FMAC_F32) {
             inputs.push(input(SourceOperand::VectorRegister(self.dst), Ty::F32));
+        }
+        if halfword_op(self.op) {
+            inputs.push(input(SourceOperand::VectorRegister(self.dst), Ty::I32));
         }
         if matches!(self.op, I::V_FMAMK_F32 | I::V_FMAAK_F32) {
             let Some(literal) = self.literal else {
