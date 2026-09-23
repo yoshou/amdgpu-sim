@@ -1652,7 +1652,7 @@ impl SIMD32 {
     fn s_sub_f32(&mut self, d: usize, s0: SourceOperand, s1: SourceOperand) {
         let s0_value = u32_to_f32(self.read_scalar_source_operand_u32(s0));
         let s1_value = u32_to_f32(self.read_scalar_source_operand_u32(s1));
-        let d_value = s0_value + (-s1_value);
+        let d_value = sub_f32(s0_value, s1_value);
         self.write_sop_dst(d, f32_to_u32(d_value));
     }
 
