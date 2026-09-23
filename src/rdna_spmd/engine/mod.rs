@@ -6,7 +6,7 @@ mod scheduler;
 mod wmma;
 mod yields;
 
-pub use dispatch::GridDims;
+pub use dispatch::{EntryLayout, GridDims, WORKGROUP_ID_X, WORKGROUP_ID_YZ};
 pub use fiber::yield_address;
 pub use kernel::{Kernel, Region, Scheduler};
 pub use wmma::warm_wmma;

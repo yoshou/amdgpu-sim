@@ -49,6 +49,7 @@ fn represent(lane: &Program, packing: Packing) -> Program {
         registry: lane.registry.clone(),
         ir,
         parameter_inputs: lane.parameter_inputs.clone(),
+        entry: lane.entry,
     }
 }
 
@@ -92,6 +93,7 @@ pub fn lockstep(lane: &Lane, packing: Packing) -> Program {
                 registry: lane.registry.clone(),
                 ir,
                 parameter_inputs: lane.parameter_inputs.clone(),
+                entry: lane.entry,
             };
         }
         for v in refuted {

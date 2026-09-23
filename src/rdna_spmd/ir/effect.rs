@@ -123,6 +123,7 @@ pub enum WaveOp {
     Bpermute,
     BpermuteFi,
     Wmma,
+    Meet,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectOp {
@@ -160,6 +161,7 @@ impl EffectOp {
                 WaveOp::WriteLane => (vec![I32, I32, I32, I32], vec![I32]),
                 WaveOp::Bpermute | WaveOp::BpermuteFi => (vec![I32, I32, I1], vec![I32]),
                 WaveOp::Wmma => ([vec![I32; 8], vec![F32; 8]].concat(), vec![F32; 8]),
+                WaveOp::Meet => (vec![], vec![]),
             },
             Self::BarrierSignal { is_first } => {
                 (vec![I32], if is_first { vec![I1] } else { vec![] })

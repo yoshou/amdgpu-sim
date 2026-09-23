@@ -1500,6 +1500,9 @@ impl Emit<'_> {
         outputs: &[(ValueId, Ty)],
         mask: Bdd,
     ) {
+        if op == WaveOp::Meet {
+            return self.emit_effect(provenance, EffectOp::Wave(op), inputs, outputs);
+        }
         let (lane, ty) = outputs[0];
         match op {
             WaveOp::Any => {
@@ -1552,6 +1555,7 @@ impl Emit<'_> {
                 self.everyone(mask);
                 self.emit_effect(provenance, EffectOp::Wave(op), inputs, outputs);
             }
+            WaveOp::Meet => unreachable!("a meeting is lowered above"),
         }
     }
 

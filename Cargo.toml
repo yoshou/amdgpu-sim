@@ -21,13 +21,13 @@ aligned-vec = "0.6.4"
 itertools = "0.14.0"
 threadpool = "1.8.1"
 half = "2.6.0"
+object = "0.7.0"
+serde = { version = "1.0.188", features = ["derive"] }
+rmp-serde = "1.1.2"
 
 [dev-dependencies]
 rand = "0.10.2"
-object = "0.7.0"
 yaml-rust = "0.4"
-serde = { version = "1.0.188", features = ["derive"] }
-rmp-serde = "1.1.2"
 png = "0.18.1"
 getopts = "0.2"
 

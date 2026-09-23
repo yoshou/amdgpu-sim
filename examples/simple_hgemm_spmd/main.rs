@@ -1,119 +1,8 @@
-use yaml_rust::yaml::*;
-
-use amdgpu_sim::buffer::*;
-use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
+use amdgpu_sim::rdna_spmd::{Arg, Buffer, Launch, Module};
 use getopts::Options;
 use half::f16;
-use object::*;
 use std::env;
-use std::fs::File;
-use std::io::*;
-
-fn align(value: usize, align: usize) -> usize {
-    ((value + align - 1) / align) * align
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct KernelArgumentMetadataMapV5 {
-    #[serde(alias = ".name")]
-    name: Option<String>,
-    #[serde(alias = ".type_name")]
-    type_name: Option<String>,
-    #[serde(alias = ".size")]
-    size: i32,
-    #[serde(alias = ".offset")]
-    offset: i32,
-    #[serde(alias = ".value_kind")]
-    value_kind: String,
-    #[serde(alias = ".value_type")]
-    value_type: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct KernelMetadataMapV5 {
-    #[serde(alias = ".name")]
-    name: String,
-    #[serde(alias = ".symbol")]
-    symbol: String,
-    #[serde(alias = ".language")]
-    language: Option<String>,
-    #[serde(alias = ".language_version")]
-    language_version: Option<Vec<i32>>,
-    #[serde(alias = ".args")]
-    args: Option<Vec<KernelArgumentMetadataMapV5>>,
-    #[serde(alias = ".kernarg_segment_size")]
-    kernarg_segment_size: i64,
-    #[serde(alias = ".group_segment_fixed_size")]
-    group_segment_fixed_size: i64,
-    #[serde(alias = ".private_segment_fixed_size")]
-    private_segment_fixed_size: i64,
-    #[serde(alias = ".kernarg_segment_align")]
-    kernarg_segment_align: i64,
-    #[serde(alias = ".wavefront_size")]
-    wavefront_size: i64,
-    #[serde(alias = ".sgpr_count")]
-    sgpr_count: i64,
-    #[serde(alias = ".vgpr_count")]
-    vgpr_count: i64,
-    #[serde(alias = ".agpr_count")]
-    agpr_count: Option<i64>,
-    #[serde(alias = ".max_flat_workgroup_size")]
-    max_flat_workgroup_size: i64,
-    #[serde(alias = ".uses_dynamic_stack")]
-    uses_dynamic_stack: Option<bool>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct MetadataMapV5 {
-    #[serde(alias = "amdhsa.version")]
-    amdhsa_version: Vec<i32>,
-    #[serde(alias = "amdhsa.printf")]
-    amdhsa_printf: Option<Vec<String>>,
-    #[serde(alias = "amdhsa.kernels")]
-    amdhsa_kernels: Vec<KernelMetadataMapV5>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct MetadataMapVersion {
-    #[serde(alias = "amdhsa.version")]
-    amdhsa_version: Vec<i32>,
-}
-
-enum Metadata {
-    Yaml(String),
-    MessagePack(Vec<u8>),
-}
-
-fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
-    let mut pos = 0;
-
-    while pos < buffer.len() {
-        let name_size = get_u32(buffer, pos) as usize;
-        pos += 4;
-        let data_size = get_u32(buffer, pos) as usize;
-        pos += 4;
-        let note_type = get_u32(buffer, pos) as usize;
-        pos += 4;
-        let _name = get_str(buffer, pos, name_size);
-        pos += name_size;
-        pos = align(pos, 4);
-        let data = get_bytes(buffer, pos, data_size);
-        pos += data_size;
-        pos = align(pos, 4);
-
-        if note_type == 10 {
-            return Some(Metadata::Yaml(
-                data.iter().map(|&s| s as char).collect::<String>(),
-            ));
-        }
-        if note_type == 32 {
-            return Some(Metadata::MessagePack(data));
-        }
-    }
-
-    None
-}
+use std::io::{Error, ErrorKind, Result};
 
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [OPTIONS]", program);
@@ -226,294 +115,157 @@ fn main() -> Result<()> {
 
     // Reuse the same kernel object as the simple_hgemm example; the wave-wide
     // `v_wmma_f32_16x16x16_f16` matrix multiply is lifted to a coroutine yield
-    // and everything else runs per-lane (W=0) on the scalar backend.
-    let program_filename = format!("examples/simple_hgemm/kernel_{}.o", arch);
-    let kernel_name = "_Z15hgemm_rocwmma_djjjPKDF16_S0_S0_PDF16_jjjjff.kd";
-    let mut file = File::open(program_filename).unwrap();
-    let mut data = vec![];
-    file.read_to_end(&mut data).unwrap();
-    if let Ok(elffile) = ElfFile::parse(&data) {
-        println!("Elf file was successfully loaded.");
+    let to_io = |e: amdgpu_sim::rdna_spmd::Error| Error::new(ErrorKind::Other, e);
+    let module = Module::open(format!("examples/simple_hgemm/kernel_{}.o", arch)).map_err(to_io)?;
+    let function = module
+        .function("_Z15hgemm_rocwmma_djjjPKDF16_S0_S0_PDF16_jjjjff")
+        .map_err(to_io)?;
 
-        let note_section_data = elffile
-            .sections()
-            .find(|section| section.name() == Some(".note"))
-            .unwrap();
+    let vec_width = matches
+        .opt_str("vec_width")
+        .map(|s| s.parse::<u32>().unwrap())
+        .unwrap_or(1);
+    let verify_widths = matches.opt_present("verify_widths");
+    let widths: Vec<u32> = if verify_widths {
+        vec![1, 2, 4, 8, 16, 32]
+    } else {
+        vec![vec_width]
+    };
+    let block_dim = [T_BLOCK_X, T_BLOCK_Y, 1];
+    let grid_dim = [
+        ceil_div(m as u32, ROCWMMA_M * T_BLOCK_X / WAVE_SIZE),
+        ceil_div(n as u32, ROCWMMA_N * T_BLOCK_Y),
+        1,
+    ];
+    let num_threads = match matches.opt_str("num_threads") {
+        Some(s) => s.parse::<usize>().unwrap().max(1),
+        None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
+    };
 
-        let metadata = decode_note_metadata(note_section_data.data()).unwrap();
-        let (kernarg_seg_size, private_segment_size, _wavefront_size) =
-            if let Metadata::Yaml(metadata) = metadata {
-                let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
-                let metadata = &metadatas[0];
+    let bits = |matrix: &[f16]| matrix.iter().map(|value| value.to_bits()).collect::<Vec<u16>>();
+    let buffer_a = Buffer::from_slice(&bits(&matrix_a));
+    let buffer_b = Buffer::from_slice(&bits(&matrix_b));
+    let buffer_c = Buffer::from_slice(&bits(&matrix_c));
+    let mut buffer_d = Buffer::from_slice(&bits(&matrix_d));
 
-                let kernarg_seg_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["KernargSegmentSize"]
-                {
-                    integer
-                } else {
-                    1
-                } as usize;
-                let private_seg_fixed_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["PrivateSegmentFixedSize"]
-                {
-                    integer
-                } else {
-                    1
-                } as usize;
-                let is_dynamic_call_stack = if let Yaml::Boolean(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["IsDynamicCallStack"]
-                {
-                    integer
-                } else {
-                    false
-                };
-
-                let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
-                let private_segment_size = private_seg_fixed_size + stack_size;
-                let wavefront_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
-                {
-                    integer
-                } else {
-                    panic!("Wavefront size not found in metadata")
-                } as usize;
-
-                (kernarg_seg_size, private_segment_size, wavefront_size)
-            } else if let Metadata::MessagePack(metadata) = metadata {
-                let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
-                if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
-                    let map: MetadataMapV5 = rmp_serde::from_slice(&metadata).unwrap();
-                    let kernarg_seg_size = map.amdhsa_kernels[0].kernarg_segment_size as usize;
-                    let private_seg_fixed_size =
-                        map.amdhsa_kernels[0].private_segment_fixed_size as usize;
-
-                    let is_dynamic_call_stack =
-                        if let Some(value) = map.amdhsa_kernels[0].uses_dynamic_stack {
-                            value
-                        } else {
-                            false
-                        };
-
-                    let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
-                    let private_segment_size = private_seg_fixed_size + stack_size;
-                    let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
-
-                    (kernarg_seg_size, private_segment_size, wavefront_size)
-                } else {
-                    panic!()
-                }
+    use std::time::Instant;
+    let mut baseline_bits: Option<Vec<u16>> = None;
+    for width in widths {
+        buffer_d.as_mut_slice::<u16>().fill(f16::NAN.to_bits());
+        println!("vec_width={}", width);
+        let launch = Launch::new(grid_dim, block_dim)
+            .width(width)
+            .threads(num_threads);
+        let args = [
+            Arg::value(m as u32),
+            Arg::value(n as u32),
+            Arg::value(k as u32),
+            Arg::read(&buffer_a),
+            Arg::read(&buffer_b),
+            Arg::read(&buffer_c),
+            Arg::write(&mut buffer_d),
+            Arg::value(lda as u32),
+            Arg::value(ldb as u32),
+            Arg::value(ldc as u32),
+            Arg::value(ldd as u32),
+            Arg::value(alpha),
+            Arg::value(beta),
+        ];
+        function.prepare(&launch, &args).map_err(to_io)?;
+        let start = Instant::now();
+        function.launch(&launch, &args).map_err(to_io)?;
+        println!(
+            "Elapsed time: {:.3} [ms]",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        drop(args);
+        if verify_widths {
+            let actual_bits: Vec<u16> = buffer_d.to_vec();
+            if width == 1 {
+                baseline_bits = Some(actual_bits);
             } else {
-                panic!()
-            };
-
-        let mut arg_buffer = vec![0u8; kernarg_seg_size];
-
-        println!("argument size: {}", arg_buffer.len());
-
-        let kernel_arg_ptr = (&arg_buffer[0] as *const u8) as u64;
-
-        println!("kernel_arg_ptr: 0x{:X}", kernel_arg_ptr);
-
-        let mut mem = Vec::<u8>::new();
-        for segment in elffile.segments() {
-            let offset = segment.address() as usize;
-            let size = segment.size() as usize;
-            let new_size = mem.len().max(offset + size);
-            mem.resize(new_size, 0);
-            mem[offset..(offset + size.min(segment.data().len()))].copy_from_slice(segment.data());
-        }
-
-        if let Some(kernel_sym) = elffile
-            .symbols()
-            .find(|sym| sym.name() == Some(kernel_name))
-        {
-            let kernel_addr = kernel_sym.address() as usize;
-            let kernel_desc = decode_kernel_desc(&mem[kernel_addr..(kernel_addr + 64)]);
-            let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
-            let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
-
-            // Front end: decode CFG -> Scalar IR -> lift cross-lane ops (WMMA,
-            // read/writelane) to coroutine yields. W=0 uses the original scalar
-            // lanes; W>0 advances width-W packets between the same wave-level
-            // rendezvous points.
-            let scalar = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-            let vec_width = matches
-                .opt_str("vec_width")
-                .map(|s| s.parse::<u32>().unwrap())
-                .unwrap_or(1);
-            assert!(matches!(vec_width, 1 | 2 | 4 | 8 | 16 | 32));
-            let verify_widths = matches.opt_present("verify_widths");
-            let widths: Vec<u32> = if verify_widths {
-                vec![1, 2, 4, 8, 16, 32]
-            } else {
-                vec![vec_width]
-            };
-
-            set_u32(&mut arg_buffer, 0, m as u32);
-            set_u32(&mut arg_buffer, 4, n as u32);
-            set_u32(&mut arg_buffer, 8, k as u32);
-            set_u64(&mut arg_buffer, 16, matrix_a_ptr);
-            set_u64(&mut arg_buffer, 24, matrix_b_ptr);
-            set_u64(&mut arg_buffer, 32, matrix_c_ptr);
-            set_u64(&mut arg_buffer, 40, matrix_d_ptr);
-            set_u32(&mut arg_buffer, 48, lda as u32);
-            set_u32(&mut arg_buffer, 52, ldb as u32);
-            set_u32(&mut arg_buffer, 56, ldc as u32);
-            set_u32(&mut arg_buffer, 60, ldd as u32);
-            set_f32(&mut arg_buffer, 64, alpha);
-            set_f32(&mut arg_buffer, 68, beta);
-
-            let block_dim = [T_BLOCK_X, T_BLOCK_Y, 1];
-            let grid_dim = [
-                ceil_div(m as u32, ROCWMMA_M * T_BLOCK_X / WAVE_SIZE),
-                ceil_div(n as u32, ROCWMMA_N * T_BLOCK_Y),
-                1,
-            ];
-
-            set_u32(&mut arg_buffer, 72, grid_dim[0]);
-            set_u32(&mut arg_buffer, 76, grid_dim[1]);
-            set_u32(&mut arg_buffer, 80, grid_dim[2]);
-
-            set_u16(&mut arg_buffer, 84, block_dim[0] as u16);
-            set_u16(&mut arg_buffer, 86, block_dim[1] as u16);
-            set_u16(&mut arg_buffer, 88, block_dim[2] as u16);
-
-            let aql = HsaKernelDispatchPacket {
-                header: 0,
-                setup: 0,
-                workgroup_size_x: block_dim[0] as u16,
-                workgroup_size_y: block_dim[1] as u16,
-                workgroup_size_z: block_dim[2] as u16,
-                grid_size_x: grid_dim[0],
-                grid_size_y: grid_dim[1],
-                grid_size_z: grid_dim[2],
-                private_segment_size: private_segment_size as u32,
-                group_segment_size: 0,
-                kernel_object: Pointer::new(&mem, kernel_addr),
-                kernarg_address: Pointer::new(&arg_buffer, 0),
-            };
-
-            let dims = GridDims {
-                num_wg_x: grid_dim[0],
-                num_wg_y: grid_dim[1],
-                num_wg_z: grid_dim[2],
-                wg_x: block_dim[0],
-                wg_y: block_dim[1],
-                wg_z: block_dim[2],
-            };
-            let kernarg_ptr = (&arg_buffer[0] as *const u8) as u64;
-            let aql_packet_addr = (&aql as *const HsaKernelDispatchPacket) as u64;
-            let num_threads = match matches.opt_str("num_threads") {
-                Some(s) => s.parse::<usize>().unwrap().max(1),
-                None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
-            };
-
-            use std::time::Instant;
-            let mut baseline_bits: Option<Vec<u16>> = None;
-            for width in widths {
-                matrix_d.fill(f16::NAN);
-                println!("vec_width={}", width);
-                let kernel = compile(&scalar, CompileOptions { width, num_vgprs, workgroup_x: Some(block_dim[0] as u32) });
-                let start = Instant::now();
-                dispatch(
-                    &kernel,
-                    &kernel_desc,
-                    kernarg_ptr,
-                    aql_packet_addr,
-                    dims,
-                    private_segment_size as u32,
-                    0,
-                    num_threads,
-                );
-                println!(
-                    "Elapsed time: {:.3} [ms]",
-                    start.elapsed().as_secs_f64() * 1000.0
-                );
-
-                if verify_widths {
-                    let actual_bits: Vec<u16> = matrix_d.iter().map(|value| value.to_bits()).collect();
-                    if width == 1 {
-                        baseline_bits = Some(actual_bits);
-                    } else {
-                        let baseline = baseline_bits.as_ref().unwrap();
-                        let mut mismatches = baseline
-                            .iter()
-                            .zip(&actual_bits)
-                            .enumerate()
-                            .filter(|(_, (expected, actual))| expected != actual);
-                        if let Some((index, (expected, actual))) = mismatches.next() {
-                            let mismatch_count = 1 + mismatches.count();
-                            return Err(Error::new(
-                                ErrorKind::InvalidData,
-                                format!(
-                                    "vec_width={} differs from vec_width=1 at {} elements; first index {}: {:#06x} != {:#06x}",
-                                    width, mismatch_count, index, actual, expected
-                                ),
-                            ));
-                        }
-                        println!("Bitwise match with vec_width=1: passed.");
-                    }
+                let baseline = baseline_bits.as_ref().unwrap();
+                let mut mismatches = baseline
+                    .iter()
+                    .zip(&actual_bits)
+                    .enumerate()
+                    .filter(|(_, (expected, actual))| expected != actual);
+                if let Some((index, (expected, actual))) = mismatches.next() {
+                    let mismatch_count = 1 + mismatches.count();
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "vec_width={} differs from vec_width=1 at {} elements; first index {}: {:#06x} != {:#06x}",
+                            width, mismatch_count, index, actual, expected
+                        ),
+                    ));
                 }
+                println!("Bitwise match with vec_width=1: passed.");
             }
         }
+    }
+    matrix_d = buffer_d
+        .as_slice::<u16>()
+        .iter()
+        .map(|&b| f16::from_bits(b))
+        .collect();
 
-        let mut expect_matrix_d = vec![f16::ZERO; m * n];
-        for i in 0..m {
-            for j in 0..n {
-                let mut acc = 0.0f32;
-                for p in 0..k {
-                    let a = matrix_a[i * lda + p].to_f32();
-                    let b = matrix_b[j * ldb + p].to_f32();
-                    acc += a * b;
-                }
-                let c = matrix_c[i * ldc + j].to_f32();
-                let value = alpha * acc + beta * c;
-                expect_matrix_d[i * ldc + j] = f16::from_f32(value);
+    let mut expect_matrix_d = vec![f16::ZERO; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            let mut acc = 0.0f32;
+            for p in 0..k {
+                let a = matrix_a[i * lda + p].to_f32();
+                let b = matrix_b[j * ldb + p].to_f32();
+                acc += a * b;
             }
+            let c = matrix_c[i * ldc + j].to_f32();
+            let value = alpha * acc + beta * c;
+            expect_matrix_d[i * ldc + j] = f16::from_f32(value);
         }
+    }
 
-        let mut max_relative_error = 0.0f64;
-        let mut mismatch_examples = Vec::new();
+    let mut max_relative_error = 0.0f64;
+    let mut mismatch_examples = Vec::new();
 
-        for i in 0..(m * n) {
-            let val1 = matrix_d[i].to_f64();
-            let val2 = expect_matrix_d[i].to_f64();
+    for i in 0..(m * n) {
+        let val1 = matrix_d[i].to_f64();
+        let val2 = expect_matrix_d[i].to_f64();
 
-            let num = (val1 - val2).abs();
-            let denom = val1.abs() + val2.abs() + 1.0;
+        let num = (val1 - val2).abs();
+        let denom = val1.abs() + val2.abs() + 1.0;
 
-            let relative_error = num / denom;
+        let relative_error = num / denom;
 
-            max_relative_error = max_relative_error.max(relative_error);
-            if relative_error >= 10.0 * f16::EPSILON.to_f64() && mismatch_examples.len() < 8 {
-                mismatch_examples.push((i, val1, val2, relative_error));
-            }
+        max_relative_error = max_relative_error.max(relative_error);
+        if relative_error >= 10.0 * f16::EPSILON.to_f64() && mismatch_examples.len() < 8 {
+            mismatch_examples.push((i, val1, val2, relative_error));
         }
-        let tolerance = 10.0;
-        let eps = f16::EPSILON.to_f64();
+    }
+    let tolerance = 10.0;
+    let eps = f16::EPSILON.to_f64();
 
-        println!("Max relative error: {}", max_relative_error);
+    println!("Max relative error: {}", max_relative_error);
 
-        if max_relative_error < tolerance * eps {
-            println!("Validation passed.");
-        } else {
-            println!("Validation failed.");
-            for (index, actual, expected, error) in mismatch_examples {
-                println!(
-                    "  mismatch[{}] (row {}, col {}): actual={}, expected={}, relative_error={}",
-                    index,
-                    index / n,
-                    index % n,
-                    actual,
-                    expected,
-                    error
-                );
-            }
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("matrix validation failed: max relative error {}", max_relative_error),
-            ));
+    if max_relative_error < tolerance * eps {
+        println!("Validation passed.");
+    } else {
+        println!("Validation failed.");
+        for (index, actual, expected, error) in mismatch_examples {
+            println!(
+                "  mismatch[{}] (row {}, col {}): actual={}, expected={}, relative_error={}",
+                index,
+                index / n,
+                index % n,
+                actual,
+                expected,
+                error
+            );
         }
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("matrix validation failed: max relative error {}", max_relative_error),
+        ));
     }
 
     Ok(())

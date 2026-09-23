@@ -10,7 +10,7 @@ use crate::encoding::{slot_marker, SLOT_BYTES, S_NOP};
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_processor::{Engine as RdnaEngine, RDNAProcessor};
-use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
+use amdgpu_sim::rdna_spmd::{Arg, Buffer, Launch, Module};
 use object::*;
 use std::fs::File;
 use std::io::Read;
@@ -41,6 +41,9 @@ pub(crate) const fn data_word(k: u32) -> u32 {
 pub(crate) struct Harness {
     pub(crate) mem: Vec<u8>,
     pub(crate) slot: usize,
+    object: Vec<u8>,
+    object_slot: usize,
+    kernel: String,
     pub(crate) kernel_addr: usize,
     pub(crate) kernarg_size: usize,
     /// Scratch bytes per work-item, as the kernel declares them.
@@ -195,9 +198,17 @@ impl Harness {
             .unwrap_or_else(|| panic!("{} not found", kernel))
             .address() as usize;
 
+        let object_slot = data
+            .windows(marker.len())
+            .position(|w| w == marker)
+            .expect("the slot marker appears in the harness object");
+
         Harness {
             mem,
             slot,
+            object: data.clone(),
+            object_slot,
+            kernel: kernel.trim_end_matches(".kd").to_string(),
             kernel_addr,
             kernarg_size,
             private_segment_size,
@@ -287,28 +298,37 @@ impl Harness {
                 processor.execute();
             }
             Engine::Spmd(width) => {
-                let kd = decode_kernel_desc(&mem[self.kernel_addr..self.kernel_addr + 64]);
-                // The legacy engine counts workgroups in AQL; SPMD takes
-                // that count in GridDims and work-item counts in AQL.
-                let aql = HsaKernelDispatchPacket {
-                    grid_size_x: LANES as u32,
-                    group_segment_size: kd.group_segment_fixed_size as u32,
-                    ..aql
-                };
-                let program = decode_program("gfx1200", self.kernel_addr + kd.kernel_code_entry_byte_offset, &mem)
-                    .unwrap_or_else(|error| panic!("{} decode: {}", engine_name(engine), error));
-                let kernel = compile(&program, CompileOptions {
-                    width,
-                    num_vgprs: kd.granulated_workitem_vgpr_count,
-                    workgroup_x: Some(LANES as u32),
-                });
-                dispatch(
-                    &kernel, &kd, arg_buffer.as_ptr() as u64,
-                    &aql as *const HsaKernelDispatchPacket as u64,
-                    GridDims { num_wg_x: 1, num_wg_y: 1, num_wg_z: 1,
-                        wg_x: LANES as u32, wg_y: 1, wg_z: 1 },
-                    aql.private_segment_size, aql.group_segment_size as usize, 1,
-                );
+                let mut object = self.object.clone();
+                for i in 0..(SLOT_BYTES / 4) {
+                    let word = words.get(i).copied().unwrap_or(S_NOP);
+                    object[self.object_slot + i * 4..self.object_slot + i * 4 + 4]
+                        .copy_from_slice(&word.to_le_bytes());
+                }
+                let function = Module::load(&object)
+                    .and_then(|module| module.function(&self.kernel))
+                    .unwrap_or_else(|error| panic!("{}: {}", engine_name(engine), error));
+                let mut out_buffer = Buffer::from_slice(&out);
+                let src_buffer = Buffer::from_slice(src);
+                let uni_buffer = Buffer::from_slice(uni);
+                let mut data_buffer = Buffer::new(GUARD + 1024 + GUARD);
+                data_buffer.as_mut_slice::<u32>()[GUARD / 4..GUARD / 4 + 256]
+                    .copy_from_slice(data.words());
+                let mut args = vec![
+                    Arg::write(&mut out_buffer),
+                    Arg::read(&src_buffer),
+                    Arg::read(&uni_buffer),
+                ];
+                if self.kernarg_size >= 32 {
+                    args.push(Arg::Write(&mut data_buffer, GUARD));
+                }
+                let launch = Launch::new([1, 1, 1], [LANES as u32, 1, 1])
+                    .width(width)
+                    .threads(1);
+                function
+                    .launch(&launch, &args)
+                    .unwrap_or_else(|error| panic!("{}: {}", engine_name(engine), error));
+                drop(args);
+                out.copy_from_slice(out_buffer.as_slice());
             }
         }
         out

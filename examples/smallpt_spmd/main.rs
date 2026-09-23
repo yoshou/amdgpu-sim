@@ -3,7 +3,7 @@ use yaml_rust::yaml::*;
 use amdgpu_sim::buffer::*;
 use amdgpu_sim::gcn_processor::*;
 use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::*;
+use amdgpu_sim::rdna_spmd::{Arg, Buffer, Launch, Module};
 use getopts::Options;
 use object::*;
 use png::*;
@@ -354,6 +354,25 @@ static SPHERES: [Sphere; 9] = [
     }, //Light
 ];
 
+fn sphere_words() -> Vec<u64> {
+    let mut words = Vec::new();
+    for sphere in &SPHERES {
+        let vector = |v: &Vector3| [v.x.to_bits(), v.y.to_bits(), v.z.to_bits()];
+        words.push(sphere.r.to_bits());
+        words.extend(vector(&sphere.p));
+        words.extend(vector(&sphere.e));
+        words.extend(vector(&sphere.f));
+        let kind = match sphere.reflection_type {
+            ReflectionType::Diffuse => 0,
+            ReflectionType::Specular => 1,
+            ReflectionType::Refractive => 2,
+        };
+        words.push(kind);
+    }
+    assert_eq!(words.len() * 8, std::mem::size_of_val(&SPHERES));
+    words
+}
+
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [OPTIONS]", program);
     print!("{}", opts.usage(&brief));
@@ -401,7 +420,7 @@ fn main() -> Result<()> {
     let nb_pixels = width * height;
     let kernel_name = "_ZN7smallptL6kernelEPKNS_6SphereEmjjPNS_7Vector3Ej.kd";
 
-    let ls = vec![
+    let mut ls = vec![
         Vector3 {
             x: 0.0,
             y: 0.0,
@@ -562,33 +581,9 @@ fn main() -> Result<()> {
             } else if "gfx1200" == arch {
                 use std::time::Instant;
 
-                let kernel_desc = decode_kernel_desc(&mem[kernel_addr..(kernel_addr + 64)]);
-                let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
-                let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
-                eprintln!("[kd] user_sgpr_count={} priv_seg_buf={} dispatch_ptr={} kernarg_ptr={} flat_scratch={} wgid_x={} wgid_y={} wgid_z={} vgpr_workitem_id={} priv_seg_size={}",
-                    kernel_desc.user_sgpr_count,
-                    kernel_desc.enable_sgpr_private_segment_buffer,
-                    kernel_desc.enable_sgpr_dispatch_ptr,
-                    kernel_desc.enable_sgpr_kernarg_segment_ptr,
-                    kernel_desc.enable_sgpr_flat_scratch_init,
-                    kernel_desc.enable_sgpr_workgroup_id_x,
-                    kernel_desc.enable_sgpr_workgroup_id_y,
-                    kernel_desc.enable_sgpr_workgroup_id_z,
-                    kernel_desc.enable_vgpr_workitem_id,
-                    private_segment_size);
-
-                // Front end: decode CFG -> Scalar IR.
-                let scalar = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-                let dims = GridDims {
-                    num_wg_x: (width / 16) as u32,
-                    num_wg_y: (height / 16) as u32,
-                    num_wg_z: 1,
-                    wg_x: 16,
-                    wg_y: 16,
-                    wg_z: 1,
-                };
-                let kernarg_ptr = (&arg_buffer[0] as *const u8) as u64;
-                let aql_packet_addr = (&aql as *const HsaKernelDispatchPacket) as u64;
+                let to_io = |e: amdgpu_sim::rdna_spmd::Error| Error::new(ErrorKind::Other, e);
+                let module = Module::load(&data).map_err(to_io)?;
+                let function = module.function(kernel_name).map_err(to_io)?;
                 let num_threads = match matches.opt_str("num_threads") {
                     Some(s) => s.parse::<usize>().unwrap().max(1),
                     None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
@@ -600,17 +595,35 @@ fn main() -> Result<()> {
                     Some(s) => s.parse::<u32>().unwrap(),
                     None => 16,
                 };
+                let launch = Launch::new([(width / 16) as u32, (height / 16) as u32, 1], [16, 16, 1])
+                    .width(vec_w)
+                    .threads(num_threads);
+                let spheres = Buffer::from_slice(&sphere_words());
+                let mut radiance = Buffer::zeroed::<f64>(nb_pixels * 3);
+                let args = [
+                    Arg::read(&spheres),
+                    Arg::value(SPHERES.len() as u64),
+                    Arg::value(width as u32),
+                    Arg::value(height as u32),
+                    Arg::write(&mut radiance),
+                    Arg::value(nb_samples as u32),
+                ];
                 let compile_start = Instant::now();
-                let kernel = compile(&scalar, CompileOptions { width: vec_w, num_vgprs, workgroup_x: Some(dims.wg_x) });
+                function.prepare(&launch, &args).map_err(to_io)?;
                 println!("W={} JIT compile: {} ms", vec_w, compile_start.elapsed().as_millis());
                 println!("Dispatching on {} threads...", num_threads);
                 let start = Instant::now();
-                dispatch(
-                    &kernel, &kernel_desc, kernarg_ptr, aql_packet_addr, dims,
-                    private_segment_size as u32, 0, num_threads,
-                );
+                function.launch(&launch, &args).map_err(to_io)?;
                 let end = start.elapsed();
                 println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
+                drop(args);
+                for (l, xyz) in ls.iter_mut().zip(radiance.as_slice::<f64>().chunks(3)) {
+                    *l = Vector3 {
+                        x: xyz[0],
+                        y: xyz[1],
+                        z: xyz[2],
+                    };
+                }
             } else {
                 println!("Unsupported architecture: {}", arch);
                 return Ok(());

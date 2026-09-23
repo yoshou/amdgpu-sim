@@ -12,7 +12,14 @@ pub enum Atom {
     Constant(u32),
     Fresh(usize, ValueId, u32),
     Term(usize, bool),
-    Marker(ValueId),
+    Marker(Choice),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Choice {
+    Query(ValueId),
+    Word(ValueId),
+    Meet(usize),
 }
 
 #[derive(Default)]
@@ -20,11 +27,30 @@ pub struct Kept {
     pub queries: BTreeSet<ValueId>,
 
     pub words: BTreeSet<ValueId>,
+
+    pub meets: BTreeSet<usize>,
+}
+
+impl Kept {
+    pub fn insert(&mut self, choice: Choice) {
+        match choice {
+            Choice::Query(v) => self.queries.insert(v),
+            Choice::Word(v) => self.words.insert(v),
+            Choice::Meet(i) => self.meets.insert(i),
+        };
+    }
+
+    pub fn choices(&self) -> BTreeSet<Choice> {
+        let queries = self.queries.iter().map(|&v| Choice::Query(v));
+        let words = self.words.iter().map(|&v| Choice::Word(v));
+        let meets = self.meets.iter().map(|&i| Choice::Meet(i));
+        queries.chain(words).chain(meets).collect()
+    }
 }
 
 enum Choices {
     Fixed {
-        kept: BTreeSet<ValueId>,
+        kept: BTreeSet<Choice>,
     },
 
     Open {
@@ -44,8 +70,8 @@ pub struct Logic {
     atoms: HashMap<u32, Atom>,
     params: HashMap<ValueId, (usize, usize)>,
     constants: HashMap<u32, u32>,
-    markers: HashMap<ValueId, u32>,
-    listed: Vec<(ValueId, bool)>,
+    markers: HashMap<Choice, u32>,
+    listed: Vec<Choice>,
     detour: HashMap<Atom, u32>,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
@@ -61,7 +87,7 @@ impl Logic {
         facts: &Facts,
         choices: Choices,
         markers_first: bool,
-        listed: &[(ValueId, bool)],
+        listed: &[Choice],
     ) -> Self {
         let mut params = HashMap::default();
         for (rank, id) in facts.order.iter().enumerate() {
@@ -73,7 +99,7 @@ impl Logic {
         let markers = listed
             .iter()
             .enumerate()
-            .map(|(i, &(v, _))| (v, i as u32))
+            .map(|(i, &c)| (c, i as u32))
             .collect();
         Self {
             m: Manager::new(),
@@ -95,17 +121,12 @@ impl Logic {
         }
     }
 
-    pub fn fixed(
-        f: &Func,
-        facts: &Facts,
-        kept: &BTreeSet<ValueId>,
-        tags: &[(ValueId, bool)],
-    ) -> Self {
+    pub fn fixed(f: &Func, facts: &Facts, kept: &BTreeSet<Choice>, tags: &[Choice]) -> Self {
         let choices = Choices::Fixed { kept: kept.clone() };
         Self::with(f, facts, choices, false, tags)
     }
 
-    pub fn open(f: &Func, facts: &Facts, listed: &[(ValueId, bool)]) -> Self {
+    pub fn open(f: &Func, facts: &Facts, listed: &[Choice]) -> Self {
         let placeholder = Choices::Fixed {
             kept: BTreeSet::new(),
         };
@@ -117,10 +138,10 @@ impl Logic {
             .collect();
         let mut pending = Vec::new();
         let mut all_local = Bdd::TRUE;
-        for &(v, word) in listed {
-            let local = logic.atom(Atom::Marker(v));
+        for &c in listed {
+            let local = logic.atom(Atom::Marker(c));
             all_local = logic.m.and(all_local, local);
-            if word {
+            if let Choice::Word(v) = c {
                 let kept = logic.m.not(local);
                 whole[v.0] = logic.m.or(whole[v.0], kept);
                 pending.push(v);
@@ -146,12 +167,16 @@ impl Logic {
         logic
     }
 
-    pub fn local(&mut self, v: ValueId) -> Bdd {
+    pub fn is_open(&self) -> bool {
+        matches!(self.choices, Choices::Open { .. })
+    }
+
+    pub fn local(&mut self, c: Choice) -> Bdd {
         if let Choices::Fixed { kept } = &self.choices {
-            return Manager::constant(!kept.contains(&v));
+            return Manager::constant(!kept.contains(&c));
         }
-        if self.markers.contains_key(&v) {
-            self.atom(Atom::Marker(v))
+        if self.markers.contains_key(&c) {
+            self.atom(Atom::Marker(c))
         } else {
             Bdd::TRUE
         }
@@ -164,9 +189,9 @@ impl Logic {
         }
     }
 
-    pub fn tag(&mut self, v: ValueId) -> Bdd {
-        if matches!(self.choices, Choices::Fixed { .. }) && self.markers.contains_key(&v) {
-            self.atom(Atom::Marker(v))
+    pub fn tag(&mut self, c: Choice) -> Bdd {
+        if matches!(self.choices, Choices::Fixed { .. }) && self.markers.contains_key(&c) {
+            self.atom(Atom::Marker(c))
         } else {
             Bdd::TRUE
         }
@@ -199,25 +224,23 @@ impl Logic {
     pub fn choose(&mut self, mut safe: Bdd) -> Kept {
         assert_ne!(safe, Bdd::FALSE);
         let mut kept = Kept::default();
-        for (v, word) in self.listed.clone() {
-            let var = self.vars[&Atom::Marker(v)];
+        for c in self.listed.clone() {
+            let Some(&var) = self.vars.get(&Atom::Marker(c)) else {
+                continue;
+            };
             let local = self.m.cofactor(safe, var, true);
             if local != Bdd::FALSE {
                 safe = local;
                 continue;
             }
             safe = self.m.cofactor(safe, var, false);
-            if word {
-                kept.words.insert(v);
-            } else {
-                kept.queries.insert(v);
-            }
+            kept.insert(c);
         }
         assert_eq!(safe, Bdd::TRUE);
         kept
     }
 
-    pub fn settled(&mut self, f: Bdd, kept: &BTreeSet<ValueId>) -> Bdd {
+    pub fn settled(&mut self, f: Bdd, kept: &BTreeSet<Choice>) -> Bdd {
         let markers: HashMap<u32, Bdd> = self
             .support(f)
             .iter()
@@ -265,8 +288,8 @@ impl Logic {
 
     fn number(&mut self, atom: Atom) -> u32 {
         let var = match atom {
-            Atom::Marker(v) => {
-                let i = self.markers[&v];
+            Atom::Marker(c) => {
+                let i = self.markers[&c];
                 return if self.markers_first {
                     i
                 } else {
@@ -363,7 +386,7 @@ impl Logic {
                 outputs,
                 ..
             } => {
-                let local = self.local(outputs[0].0);
+                let local = self.local(Choice::Query(outputs[0].0));
                 if local == Bdd::FALSE {
                     return self.atom(opaque);
                 }
@@ -918,7 +941,7 @@ pub fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
     live
 }
 
-pub fn choices(f: &Func, facts: &Facts) -> Vec<(ValueId, bool)> {
+pub fn choices(f: &Func, facts: &Facts) -> Vec<Choice> {
     let live = live_values(f, facts);
     let mut out = Vec::new();
     let mut words = BTreeSet::new();
@@ -929,7 +952,7 @@ pub fn choices(f: &Func, facts: &Facts) -> Vec<(ValueId, bool)> {
                     op: EffectOp::Wave(WaveOp::Any),
                     outputs,
                     ..
-                } if live[outputs[0].0 .0] => out.push((outputs[0].0, false)),
+                } if live[outputs[0].0 .0] => out.push(Choice::Query(outputs[0].0)),
                 Inst::Core {
                     value,
                     op: Op::Cmp(IntPred::Eq | IntPred::Ne, a, b),
@@ -937,7 +960,7 @@ pub fn choices(f: &Func, facts: &Facts) -> Vec<(ValueId, bool)> {
                 } if live[value.0] => {
                     if let Some(w) = lane_test(f, facts, *a, *b) {
                         if !facts.materialized[w.0] && words.insert(w) {
-                            out.push((w, true));
+                            out.push(Choice::Word(w));
                         }
                     }
                 }

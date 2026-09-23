@@ -151,6 +151,7 @@ fn wave_op(w: WaveOp) -> &'static str {
         WaveOp::Bpermute => "bpermute",
         WaveOp::BpermuteFi => "bpermute_fi",
         WaveOp::Wmma => "wmma",
+        WaveOp::Meet => "meet",
     }
 }
 

@@ -188,6 +188,7 @@ pub fn lift(
         registry,
         ir: f,
         parameter_inputs,
+        entry: Default::default(),
     }
 }
 fn invalidate(views: &mut BTreeMap<(Word, Ty, bool), ValueId>, writes: &[Word]) {

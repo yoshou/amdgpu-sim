@@ -3,7 +3,7 @@ use super::scope::Presence;
 use super::{Op, Ty, ValueId};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockId(pub usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

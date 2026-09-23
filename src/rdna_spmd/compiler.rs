@@ -1,5 +1,7 @@
 use super::analysis::{Analyses, Context};
+use super::decompile::{decompile, Hazards, Lane};
 use super::engine::{Kernel, Region, Scheduler};
+use super::environment::Environment;
 use super::ir::{EffectOp, Func};
 use super::pass::{BranchSelects, Dce, Driver, Idiom, Idioms, Simplify, UniformQueries};
 use super::program::Program;
@@ -24,12 +26,10 @@ fn aligned(workgroup_x: Option<u32>, width: u32) -> bool {
 }
 
 fn schedule(shares: &Sharing) -> Scheduler {
-    if shares.barrier {
+    if shares.barrier || shares.group {
         Scheduler::Workgroup
     } else if shares.exchange {
         Scheduler::Wave
-    } else if shares.group {
-        Scheduler::Workgroup
     } else {
         Scheduler::Independent
     }
@@ -85,22 +85,21 @@ fn compile_lockstep(
     )
 }
 
-pub fn decode_program(arch: &str, entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
+pub fn decode_program(
+    arch: &str,
+    descriptor: &crate::processor::KernelDescriptor,
+    entry_pc: usize,
+    memory: &[u8],
+) -> Result<Program, String> {
     if !super::rdna4::supports(arch) {
         return Err(format!("no SPMD target supports {arch}"));
     }
     let mut program = super::rdna4::decode(entry_pc, memory)?;
+    program.entry = super::engine::EntryLayout::of(descriptor);
     wave_passes(&mut program, &super::rdna4::dialect().idioms);
     Ok(program)
 }
 
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CompileOptions {
-    pub width: u32,
-    pub num_vgprs: usize,
-    pub workgroup_x: Option<u32>,
-}
 
 struct Sharing {
     barrier: bool,
@@ -139,12 +138,60 @@ fn sharing(
     out
 }
 
-pub fn compile(program: &Program, options: CompileOptions) -> Kernel {
-    assert!(
-        matches!(options.width, 1 | 2 | 4 | 8 | 16 | 32),
-        "unsupported packet width {}",
-        options.width
-    );
-    let lane = super::decompile::decompile(program);
-    compile_lockstep(&lane, options.num_vgprs, options.width, options.workgroup_x)
+pub struct Jit {
+    program: Program,
+    num_vgprs: usize,
+    last: Option<(Environment, usize)>,
+    lanes: Vec<(Hazards, std::sync::Arc<Lane>)>,
+    kernels: Vec<((usize, u32, u32), std::sync::Arc<Kernel>)>,
+}
+
+impl Jit {
+    pub fn new(program: Program, num_vgprs: usize) -> Self {
+        Self {
+            program,
+            num_vgprs,
+            last: None,
+            lanes: Vec::new(),
+            kernels: Vec::new(),
+        }
+    }
+
+    pub fn kernel(&mut self, width: u32, environment: &Environment) -> std::sync::Arc<Kernel> {
+        assert!(
+            matches!(width, 1 | 2 | 4 | 8 | 16 | 32),
+            "unsupported packet width {}",
+            width
+        );
+        let index = match &self.last {
+            Some((last, index)) if last == environment => *index,
+            _ => {
+                let hazards = Hazards::find(&self.program, environment);
+                let index = match self.lanes.iter().position(|(h, _)| *h == hazards) {
+                    Some(index) => index,
+                    None => {
+                        let lane = decompile(&self.program, &hazards);
+                        self.lanes.push((hazards, std::sync::Arc::new(lane)));
+                        self.lanes.len() - 1
+                    }
+                };
+                self.last = Some((environment.clone(), index));
+                index
+            }
+        };
+        let workgroup_x = environment.block[0];
+        let key = (index, width, workgroup_x);
+        if let Some((_, kernel)) = self.kernels.iter().find(|(k, _)| *k == key) {
+            return kernel.clone();
+        }
+        let lane = self.lanes[index].1.clone();
+        let kernel = std::sync::Arc::new(compile_lockstep(
+            &lane,
+            self.num_vgprs,
+            width,
+            Some(workgroup_x),
+        ));
+        self.kernels.push((key, kernel.clone()));
+        kernel
+    }
 }

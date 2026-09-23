@@ -1,11 +1,18 @@
-use super::check::{Check, Mode};
-use super::logic::{choices, Kept, Logic};
+use super::check::Check;
+use super::hazard::Hazards;
+use super::logic::{Kept, Logic};
+use super::search::listed;
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeSet;
 
-pub fn prove(f: &Func, inputs: &[Parameter], exec_index: Option<usize>) -> (Kept, BTreeSet<u64>) {
+pub fn prove(
+    f: &Func,
+    inputs: &[Parameter],
+    exec_index: Option<usize>,
+    hazards: &Hazards,
+) -> (Kept, BTreeSet<u64>) {
     let facts = Facts::new(f, inputs, &BTreeSet::new());
     let loops = Loops::new(f, &facts).unwrap_or_else(|block| {
         panic!(
@@ -13,9 +20,9 @@ pub fn prove(f: &Func, inputs: &[Parameter], exec_index: Option<usize>) -> (Kept
             block.0
         )
     });
-    let listed = choices(f, &facts);
+    let listed = listed(f, &facts, hazards);
     let logic = Logic::open(f, &facts, &listed);
-    let mut check = Check::new(f, &facts, inputs, exec_index, &loops, logic, Mode::Direct);
+    let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
     if !check.run() {
         let (block, index, reason) = check.exhausted.unwrap();
         panic!(
@@ -24,7 +31,6 @@ pub fn prove(f: &Func, inputs: &[Parameter], exec_index: Option<usize>) -> (Kept
         );
     }
     let kept = check.logic.choose(check.safe);
-    let disabled: BTreeSet<ValueId> = kept.queries.iter().chain(&kept.words).copied().collect();
-    let everyone = check.everyone(&disabled);
+    let everyone = check.everyone(&kept.choices());
     (kept, everyone)
 }

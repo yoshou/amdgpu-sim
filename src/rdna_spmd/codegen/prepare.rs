@@ -19,6 +19,7 @@ pub fn prepare(
         mut ir,
         parameter_inputs: inputs,
         registry,
+        ..
     } = f;
     ir.lowered_to_packets();
     let driver = Driver::new();

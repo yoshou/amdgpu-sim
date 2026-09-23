@@ -96,7 +96,12 @@ fn projection(p: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
     }
 }
 
-pub fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
+pub fn lane_program(
+    p: &Func,
+    facts: &Facts,
+    kept: &Kept,
+    meetings: &std::collections::BTreeMap<(BlockId, usize), u64>,
+) -> Func {
     let reachable: std::collections::BTreeSet<BlockId> = facts.order.iter().copied().collect();
     let mut q = Func::new(p.entry, Presence::Wave);
     q.blocks = p
@@ -118,7 +123,15 @@ pub fn lane_program(p: &Func, facts: &Facts, kept: &Kept) -> Func {
             insts: Vec::with_capacity(old.len()),
             lane: None,
         };
-        for inst in old {
+        for (index, inst) in old.into_iter().enumerate() {
+            if let Some(&provenance) = meetings.get(&(id, index)) {
+                b.insts.push(Inst::Effect {
+                    provenance,
+                    op: EffectOp::Wave(WaveOp::Meet),
+                    inputs: vec![],
+                    outputs: vec![],
+                });
+            }
             rewrite_inst(p, facts, kept, &mut b, inst);
         }
         let mut term = b.q.blocks[&id].term.clone();

@@ -187,6 +187,7 @@ impl YieldValues {
         assert_eq!(fibers.len(), 32 / width);
         assert_ne!(valid, 0);
         let op = match self.op {
+            EffectOp::Wave(WaveOp::Meet) => return,
             EffectOp::Wave(op) => op,
             _ => panic!("not a wave effect"),
         };
@@ -338,6 +339,7 @@ fn evaluate(op: WaveOp, valid: u32, read: impl Fn(usize, usize) -> u32) -> [u32;
             });
         }
         WaveOp::Wmma => panic!("WMMA uses the existing fragment lowering"),
+        WaveOp::Meet => panic!("a meeting exchanges no values"),
     }
     out
 }

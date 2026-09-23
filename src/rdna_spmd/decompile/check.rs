@@ -1,4 +1,5 @@
-use super::logic::{lane_test, projected_word, Atom, Logic};
+use super::hazard::Hazards;
+use super::logic::{lane_test, projected_word, Atom, Choice, Logic};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site, Use};
 use crate::rdna_spmd::analysis::loops::Loops;
@@ -28,6 +29,10 @@ pub struct Check<'a> {
     inputs: &'a [Parameter],
     exec_index: Option<usize>,
     loops: &'a Loops,
+    hazards: &'a Hazards,
+    meetings: BTreeMap<(BlockId, usize), usize>,
+    loaded: BTreeMap<(BlockId, usize), Bdd>,
+    reordered: BTreeMap<(BlockId, usize), Bdd>,
     rank: BTreeMap<BlockId, usize>,
     pub logic: Logic,
     mode: Mode,
@@ -68,9 +73,10 @@ impl<'a> Check<'a> {
         inputs: &'a [Parameter],
         exec_index: Option<usize>,
         loops: &'a Loops,
+        hazards: &'a Hazards,
         logic: Logic,
-        mode: Mode,
     ) -> Self {
+        let mode = if logic.is_open() { Mode::Direct } else { Mode::Search };
         let n = f.types.len();
         let blocks = facts.order.len();
         let search = mode == Mode::Search;
@@ -92,6 +98,15 @@ impl<'a> Check<'a> {
             inputs,
             exec_index,
             loops,
+            hazards,
+            meetings: hazards
+                .meetings
+                .iter()
+                .enumerate()
+                .map(|(i, &position)| (position, i))
+                .collect(),
+            loaded: BTreeMap::new(),
+            reordered: BTreeMap::new(),
             rank: facts
                 .order
                 .iter()
@@ -135,6 +150,7 @@ impl<'a> Check<'a> {
             None => Bdd::TRUE,
         };
         self.reach = self.logic.reach(f, self.facts, f.entry, start);
+        self.order_accesses();
         self.solve_masked();
         loop {
             self.settle();
@@ -180,7 +196,7 @@ impl<'a> Check<'a> {
         }
     }
 
-    pub fn everyone(&mut self, kept: &BTreeSet<ValueId>) -> BTreeSet<u64> {
+    pub fn everyone(&mut self, kept: &BTreeSet<Choice>) -> BTreeSet<u64> {
         let demands = std::mem::take(&mut self.demands);
         demands
             .into_iter()
@@ -188,6 +204,140 @@ impl<'a> Check<'a> {
                 (self.logic.settled(condition, kept) == Bdd::TRUE).then_some(p)
             })
             .collect()
+    }
+
+    fn order_accesses(&mut self) {
+        let hazards = self.hazards;
+        let conflicts = hazards.conflicts();
+        if conflicts.is_empty() {
+            return;
+        }
+        let (f, facts) = (self.f, self.facts);
+        let mut partners: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+        for &(p, q) in &conflicts {
+            partners.entry(p).or_default().insert(q);
+            partners.entry(q).or_default().insert(p);
+        }
+        let pair = |p: usize, q: usize| (p.min(q), p.max(q));
+        let at: BTreeMap<(BlockId, usize), usize> = hazards
+            .accesses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| ((a.block, a.index), i))
+            .collect();
+        let n = facts.order.len();
+        for (&s, targets) in &partners {
+            let source = &hazards.accesses[s];
+            let source_rank = self.rank[&source.block];
+            let mut entry = vec![[Bdd::FALSE; 2]; n];
+            let mut reaches: BTreeMap<usize, [Bdd; 2]> = BTreeMap::new();
+            let mut work: BTreeSet<usize> = BTreeSet::from([source_rank]);
+            while let Some(r) = work.pop_first() {
+                let b = facts.order[r];
+                let [mut within, mut around] = entry[r];
+                let mut fresh = Bdd::FALSE;
+                for (index, inst) in f.blocks[&b].insts.iter().enumerate() {
+                    if let Some(&m) = self.meetings.get(&(b, index)) {
+                        let local = self.logic.local(Choice::Meet(m));
+                        let tag = self.logic.tag(Choice::Meet(m));
+                        let left = self.and(local, tag);
+                        within = self.and(within, left);
+                        around = self.and(around, left);
+                        fresh = self.and(fresh, left);
+                    }
+                    if meets_every_lane(inst) {
+                        within = Bdd::FALSE;
+                        around = Bdd::FALSE;
+                        fresh = Bdd::FALSE;
+                    }
+                    if let Some(&t) = at.get(&(b, index)) {
+                        if targets.contains(&t) {
+                            let key = pair(s, t);
+                            let again = hazards.accesses[t].instruction == source.instruction;
+                            let mut pending = [Bdd::FALSE; 2];
+                            if hazards.together.contains(&key) && !again {
+                                pending[0] = self.or(within, fresh);
+                            }
+                            if hazards.apart.contains(&key) {
+                                pending[1] = around;
+                            }
+                            if pending != [Bdd::FALSE; 2] {
+                                let old = reaches.get(&t).copied().unwrap_or([Bdd::FALSE; 2]);
+                                let joined = [self.or(old[0], pending[0]), self.or(old[1], pending[1])];
+                                reaches.insert(t, joined);
+                            }
+                        }
+                    }
+                    if (b, index) == (source.block, source.index) {
+                        fresh = Bdd::TRUE;
+                    }
+                }
+                let within = self.or(within, fresh);
+                if within == Bdd::FALSE && around == Bdd::FALSE {
+                    continue;
+                }
+                for e in f.blocks[&b].term.edges() {
+                    let d = self.rank[&e.dst];
+                    let back = d <= r
+                        && (0..self.loops.count()).any(|l| {
+                            self.loops.header(l) == d && self.loops.contains(l, source_rank)
+                        });
+                    let (w, a) = if back {
+                        (Bdd::FALSE, self.or(within, around))
+                    } else {
+                        (within, around)
+                    };
+                    let [ow, oa] = entry[d];
+                    let (nw, na) = (self.or(ow, w), self.or(oa, a));
+                    if (nw, na) != (ow, oa) {
+                        entry[d] = [nw, na];
+                        work.insert(d);
+                    }
+                }
+            }
+            for (t, parts) in reaches {
+                let target = &hazards.accesses[t];
+                let key = pair(s, t);
+                let reads = |this: &mut Self, reader: usize| -> Bdd {
+                    let side = if reader == key.0 { 0 } else { 1 };
+                    let mut joined = Bdd::FALSE;
+                    for (k, apart) in [(0, false), (1, true)] {
+                        let mut part = parts[k];
+                        if part == Bdd::FALSE {
+                            continue;
+                        }
+                        if hazards.idle.contains(&(key.0, key.1, apart, side)) {
+                            if let Some(e) = hazards.accesses[reader].exec {
+                                let active = this.bit(e);
+                                let idle = this.not(active);
+                                part = this.and(part, idle);
+                            }
+                        }
+                        joined = this.or(joined, part);
+                    }
+                    joined
+                };
+                let add = |this: &mut Self, loaded: bool, at: (BlockId, usize), extra: Bdd| {
+                    let map = if loaded { &mut this.loaded } else { &mut this.reordered };
+                    let old = map.get(&at).copied().unwrap_or(Bdd::FALSE);
+                    let joined = this.logic.m.or(old, extra);
+                    let map = if loaded { &mut this.loaded } else { &mut this.reordered };
+                    map.insert(at, joined);
+                };
+                if source.kind.writes() && target.kind.reads() {
+                    let extra = reads(self, t);
+                    add(self, true, (target.block, target.index), extra);
+                }
+                if source.kind.reads() && target.kind.writes() {
+                    let extra = reads(self, s);
+                    add(self, true, (source.block, source.index), extra);
+                }
+                if source.kind.writes() && target.kind.writes() {
+                    let extra = self.or(parts[0], parts[1]);
+                    add(self, false, (target.block, target.index), extra);
+                }
+            }
+        }
     }
 
     fn bit(&mut self, v: ValueId) -> Bdd {
@@ -778,14 +928,18 @@ impl<'a> Check<'a> {
                     }
                     let fw = self.view(w);
                     let hw = self.h[w.0];
-                    let tag = self.logic.tag(w);
+                    let tag = self.logic.tag(Choice::Word(w));
                     let local = self.query(fw, hw, tag);
                     let whole = self.whole(w);
                     self.logic.m.ite(mode, whole, local)
                 }
                 _ => self.any_of(&inst.operands()),
             },
-            Inst::Target { args, .. } => self.any_of(args.values()),
+            Inst::Target { args, .. } => {
+                let operands = self.any_of(args.values());
+                let loaded = self.loaded.get(&(b, index)).copied().unwrap_or(Bdd::FALSE);
+                self.or(operands, loaded)
+            }
             Inst::Packet { .. } => unreachable!("a packet query in a wave program"),
             Inst::Effect {
                 provenance,
@@ -795,7 +949,7 @@ impl<'a> Check<'a> {
             } => match op {
                 EffectOp::Wave(WaveOp::Any) => {
                     let (out, x) = (outputs[0].0, inputs[0]);
-                    let local = self.logic.local(out);
+                    let local = self.logic.local(Choice::Query(out));
                     if !self.masked[x.0] {
                         let kept = self.not(local);
                         self.demand(*provenance, kept);
@@ -805,7 +959,7 @@ impl<'a> Check<'a> {
                         return hx;
                     }
                     let fx = self.bit(x);
-                    let tag = self.logic.tag(out);
+                    let tag = self.logic.tag(Choice::Query(out));
                     let answered = self.query(fx, hx, tag);
                     self.logic.m.ite(local, answered, hx)
                 }
@@ -826,7 +980,9 @@ impl<'a> Check<'a> {
                     let fp = self.bit(inputs[1]);
                     let absent = self.not(fp);
                     let operands = self.any_of(&inputs[..2]);
-                    self.or(operands, absent)
+                    let differs = self.or(operands, absent);
+                    let loaded = self.loaded.get(&(b, index)).copied().unwrap_or(Bdd::FALSE);
+                    self.or(differs, loaded)
                 }
                 EffectOp::Memory {
                     op: MemoryOp::Fence,
@@ -864,8 +1020,23 @@ impl<'a> Check<'a> {
                             return Bdd::FALSE;
                         }
                     }
+                    if let Some(&order) = self.reordered.get(&(b, index)) {
+                        let performed = self.and(fp, reachable);
+                        let reordered = self.and(performed, order);
+                        self.require(
+                            b,
+                            index,
+                            "another lane may write these bytes on the other side of the store",
+                            reordered,
+                        );
+                        if self.stopped {
+                            return Bdd::FALSE;
+                        }
+                    }
                     let absent = self.not(fp);
-                    self.or(operands, absent)
+                    let differs = self.or(operands, absent);
+                    let loaded = self.loaded.get(&(b, index)).copied().unwrap_or(Bdd::FALSE);
+                    self.or(differs, loaded)
                 }
                 EffectOp::Wave(_) | EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => {
                     self.any_of(inputs)
@@ -922,6 +1093,24 @@ impl<'a> Check<'a> {
     }
 }
 
+fn meets_every_lane(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Effect {
+            op: EffectOp::BarrierSignal { .. }
+                | EffectOp::BarrierWait
+                | EffectOp::Wave(
+                    WaveOp::ReadLane
+                        | WaveOp::WriteLane
+                        | WaveOp::Bpermute
+                        | WaveOp::BpermuteFi
+                        | WaveOp::Wmma
+                ),
+            ..
+        }
+    )
+}
+
 const WAVE: usize = 0;
 const LANE: usize = 1;
 
@@ -931,6 +1120,7 @@ enum Form {
     Core(Ty, Op),
     Target(TargetOp, Vec<usize>, usize),
     Load(Space, MemSize, usize),
+    Hazard(BlockId, usize, usize),
     Opaque(usize, ValueId),
 }
 
@@ -1110,6 +1300,10 @@ impl<'c, 'a> Explore<'c, 'a> {
                 h
             }
             Form::Load(_, _, a) => self.leaves[*a],
+            Form::Hazard(block, index, a) => {
+                let loaded = self.check.loaded[&(*block, *index)];
+                self.check.or(self.leaves[*a], loaded)
+            }
             Form::Opaque(..) => Bdd::TRUE,
         };
         let t = self.terms.len();
@@ -1635,7 +1829,7 @@ impl<'c, 'a> Explore<'c, 'a> {
             } => match op {
                 EffectOp::Wave(WaveOp::Any) => {
                     let out = outputs[0].0;
-                    let local = self.check.logic.local(out);
+                    let local = self.check.logic.local(Choice::Query(out));
                     let answer = if local == Bdd::FALSE {
                         Bdd::FALSE
                     } else {
@@ -1675,7 +1869,17 @@ impl<'c, 'a> Explore<'c, 'a> {
                     let pred = self.bits_of(ev, inputs[1]);
                     let same = if self.decide(pred, cond, side) == Some(true) {
                         let a = self.operand(ev, inputs[0]);
-                        Some(self.intern(ty, Form::Load(*space, *size, a)))
+                        let at = match facts.site[out.0] {
+                            Site::Inst { block, index } => Some((block, index)),
+                            _ => None,
+                        };
+                        let form = match at {
+                            Some((block, index)) if self.check.loaded.contains_key(&(block, index)) => {
+                                Form::Hazard(block, index, a)
+                            }
+                            _ => Form::Load(*space, *size, a),
+                        };
+                        Some(self.intern(ty, form))
                     } else {
                         None
                     };
@@ -1694,9 +1898,13 @@ impl<'c, 'a> Explore<'c, 'a> {
             } => {
                 let terms: Vec<usize> =
                     args.values().iter().map(|&a| self.operand(ev, a)).collect();
+                let hazard = match outputs.first().map(|o| facts.site[o.0 .0]) {
+                    Some(Site::Inst { block, index }) => self.check.loaded.contains_key(&(block, index)),
+                    _ => false,
+                };
                 for (i, &(v, ty)) in outputs.iter().enumerate() {
-                    let t = self.intern(ty, Form::Target(*op, terms.clone(), i));
-                    let d = self.formed(side, v, Some(t));
+                    let t = (!hazard).then(|| self.intern(ty, Form::Target(*op, terms.clone(), i)));
+                    let d = self.formed(side, v, t);
                     ev.descs.insert(v, d);
                 }
             }
@@ -1707,6 +1915,20 @@ impl<'c, 'a> Explore<'c, 'a> {
     fn check_effects(&mut self, ev: &mut Evaluation) {
         let (f, facts) = (self.check.f, self.check.facts);
         for (index, inst) in f.blocks[&ev.block].insts.iter().enumerate() {
+            if let Some(&m) = self.check.meetings.get(&(ev.block, index)) {
+                let local = self.check.logic.local(Choice::Meet(m));
+                let kept = self.check.not(local);
+                let differs = self.check.and(ev.cond, kept);
+                self.check.require(
+                    ev.block,
+                    index,
+                    "a retained meeting may have different participating lanes",
+                    differs,
+                );
+                if self.check.stopped {
+                    return;
+                }
+            }
             let Inst::Effect {
                 op,
                 inputs,
@@ -1718,7 +1940,7 @@ impl<'c, 'a> Explore<'c, 'a> {
             };
             let collective = match op {
                 EffectOp::Wave(WaveOp::Any) => {
-                    let local = self.check.logic.local(outputs[0].0);
+                    let local = self.check.logic.local(Choice::Query(outputs[0].0));
                     self.check.not(local)
                 }
                 EffectOp::Wave(WaveOp::Ballot) => {

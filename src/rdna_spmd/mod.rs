@@ -4,6 +4,7 @@ mod compiler;
 mod decompile;
 mod dialect;
 mod engine;
+mod environment;
 mod hash;
 mod host;
 mod ir;
@@ -12,7 +13,6 @@ mod native;
 mod pass;
 mod program;
 mod rdna4;
+mod runtime;
 
-pub use compiler::{compile, decode_program, CompileOptions};
-pub use engine::{dispatch, GridDims, Kernel};
-pub use program::Program;
+pub use runtime::{Arg, Buffer, Error, Function, Launch, Module, Pod};

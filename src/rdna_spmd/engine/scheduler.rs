@@ -3,7 +3,7 @@ use std::thread;
 use crate::processor::KernelDescriptor;
 
 use super::super::ir::EffectOp;
-use super::dispatch::{setup_sgprs, GridDims};
+use super::dispatch::{setup_sgprs, EntryLayout, GridDims};
 use super::fiber::{Fiber, KernelArgs};
 use super::kernel::{
     Kernel, Region, Scheduler, SGPR_BUF,
@@ -139,7 +139,7 @@ fn release(shape: Shape, state: State) {
 
 struct Engine<'a> {
     view: View<'a>,
-    kd: &'a KernelDescriptor,
+    layout: EntryLayout,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
     dims: GridDims,
@@ -244,7 +244,7 @@ pub fn run(
     };
     let engine = Engine {
         view,
-        kd,
+        layout: EntryLayout::of(kd),
         kernarg_ptr,
         aql_packet_addr,
         dims,
@@ -320,7 +320,7 @@ impl Engine<'_> {
             let sgprs = &mut state.sgprs[packet];
             setup_sgprs(
                 &mut sgprs[..],
-                self.kd,
+                &self.layout,
                 self.kernarg_ptr,
                 self.aql_packet_addr,
                 scratch_base,

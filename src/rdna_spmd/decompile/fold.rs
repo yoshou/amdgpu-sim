@@ -1,6 +1,6 @@
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::Facts;
-use super::logic::{Atom, Logic};
+use super::logic::{Atom, Choice, Logic};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,7 +8,7 @@ pub fn fold(q: &mut Func, inputs: &[Parameter], words: &BTreeSet<ValueId>, exec:
     let decided = {
         let facts = Facts::new(q, inputs, words);
 
-        let kept: BTreeSet<ValueId> = q
+        let kept: BTreeSet<Choice> = q
             .blocks
             .values()
             .flat_map(|b| &b.insts)
@@ -17,7 +17,7 @@ pub fn fold(q: &mut Func, inputs: &[Parameter], words: &BTreeSet<ValueId>, exec:
                     op: EffectOp::Wave(WaveOp::Any),
                     outputs,
                     ..
-                } => Some(outputs[0].0),
+                } => Some(Choice::Query(outputs[0].0)),
                 _ => None,
             })
             .collect();

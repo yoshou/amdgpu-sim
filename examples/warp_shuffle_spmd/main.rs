@@ -1,118 +1,8 @@
-use yaml_rust::yaml::*;
-
-use amdgpu_sim::buffer::*;
-use amdgpu_sim::processor::*;
-use amdgpu_sim::rdna_spmd::{compile, decode_program, dispatch, CompileOptions, GridDims};
+use amdgpu_sim::rdna_spmd::{Arg, Buffer, Launch, Module};
 use getopts::Options;
-use object::*;
 use std::env;
-use std::fs::File;
-use std::io::*;
-
-fn align(value: usize, align: usize) -> usize {
-    ((value + align - 1) / align) * align
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct KernelArgumentMetadataMapV5 {
-    #[serde(alias = ".name")]
-    name: Option<String>,
-    #[serde(alias = ".type_name")]
-    type_name: Option<String>,
-    #[serde(alias = ".size")]
-    size: i32,
-    #[serde(alias = ".offset")]
-    offset: i32,
-    #[serde(alias = ".value_kind")]
-    value_kind: String,
-    #[serde(alias = ".value_type")]
-    value_type: Option<String>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct KernelMetadataMapV5 {
-    #[serde(alias = ".name")]
-    name: String,
-    #[serde(alias = ".symbol")]
-    symbol: String,
-    #[serde(alias = ".language")]
-    language: Option<String>,
-    #[serde(alias = ".language_version")]
-    language_version: Option<Vec<i32>>,
-    #[serde(alias = ".args")]
-    args: Option<Vec<KernelArgumentMetadataMapV5>>,
-    #[serde(alias = ".kernarg_segment_size")]
-    kernarg_segment_size: i64,
-    #[serde(alias = ".group_segment_fixed_size")]
-    group_segment_fixed_size: i64,
-    #[serde(alias = ".private_segment_fixed_size")]
-    private_segment_fixed_size: i64,
-    #[serde(alias = ".kernarg_segment_align")]
-    kernarg_segment_align: i64,
-    #[serde(alias = ".wavefront_size")]
-    wavefront_size: i64,
-    #[serde(alias = ".sgpr_count")]
-    sgpr_count: i64,
-    #[serde(alias = ".vgpr_count")]
-    vgpr_count: i64,
-    #[serde(alias = ".agpr_count")]
-    agpr_count: Option<i64>,
-    #[serde(alias = ".max_flat_workgroup_size")]
-    max_flat_workgroup_size: i64,
-    #[serde(alias = ".uses_dynamic_stack")]
-    uses_dynamic_stack: Option<bool>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct MetadataMapV5 {
-    #[serde(alias = "amdhsa.version")]
-    amdhsa_version: Vec<i32>,
-    #[serde(alias = "amdhsa.printf")]
-    amdhsa_printf: Option<Vec<String>>,
-    #[serde(alias = "amdhsa.kernels")]
-    amdhsa_kernels: Vec<KernelMetadataMapV5>,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct MetadataMapVersion {
-    #[serde(alias = "amdhsa.version")]
-    amdhsa_version: Vec<i32>,
-}
-
-enum Metadata {
-    Yaml(String),
-    MessagePack(Vec<u8>),
-}
-
-fn decode_note_metadata(buffer: &[u8]) -> Option<Metadata> {
-    let mut pos = 0;
-
-    while pos < buffer.len() {
-        let name_size = get_u32(buffer, pos) as usize;
-        pos += 4;
-        let data_size = get_u32(buffer, pos) as usize;
-        pos += 4;
-        let note_type = get_u32(buffer, pos) as usize;
-        pos += 4;
-        let _name = get_str(buffer, pos, name_size);
-        pos += name_size;
-        pos = align(pos, 4);
-        let data = get_bytes(buffer, pos, data_size);
-        pos += data_size;
-        pos = align(pos, 4);
-
-        if note_type == 10 {
-            return Some(Metadata::Yaml(
-                data.iter().map(|&s| s as char).collect::<String>(),
-            ));
-        }
-        if note_type == 32 {
-            return Some(Metadata::MessagePack(data));
-        }
-    }
-
-    None
-}
+use std::io::{Error, ErrorKind, Result};
+use std::time::Instant;
 
 fn print_usage(program: &str, opts: Options) {
     let brief = format!("Usage: {} [OPTIONS]", program);
@@ -164,184 +54,41 @@ fn main() -> Result<()> {
     let input = (1..=size)
         .map(|value| value as f32 * 10.0)
         .collect::<Vec<_>>();
-    let mut output = vec![0.0f32; size];
     let expected = expected_matrix_transpose(&input, width);
-
-    let input_ptr = input.as_ptr() as u64;
-    let output_ptr = output.as_mut_ptr() as u64;
-    println!("input_ptr: 0x{:16X}", input_ptr);
-    println!("output_ptr: 0x{:16X}", output_ptr);
 
     // Reuse the same kernel object as the warp_shuffle example; the cross-lane
     // `ds_bpermute_b32` warp shuffle is handled on the segmented de-SIMT path.
-    let program_filename = format!("examples/warp_shuffle/kernel_{}.o", arch);
-    let kernel_name = "_Z23matrix_transpose_kernelPfPKfj.kd";
-    let mut file = File::open(program_filename).unwrap();
-    let mut data = vec![];
-    file.read_to_end(&mut data).unwrap();
-    if let Ok(elffile) = ElfFile::parse(&data) {
-        println!("Elf file was successfully loaded.");
+    let to_io = |e: amdgpu_sim::rdna_spmd::Error| Error::new(ErrorKind::Other, e);
+    let module = Module::open(format!("examples/warp_shuffle/kernel_{}.o", arch)).map_err(to_io)?;
+    let function = module.function("_Z23matrix_transpose_kernelPfPKfj").map_err(to_io)?;
 
-        let note_section_data = elffile
-            .sections()
-            .find(|section| section.name() == Some(".note"))
-            .unwrap();
+    let vec_width = matches
+        .opt_str("vec_width")
+        .map(|s| s.parse::<u32>().unwrap())
+        .unwrap_or(1);
+    let num_threads = match matches.opt_str("num_threads") {
+        Some(s) => s.parse::<usize>().unwrap().max(1),
+        None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
+    };
+    let launch = Launch::new([1, 1, 1], [width as u32, width as u32, 1])
+        .width(vec_width)
+        .threads(num_threads);
 
-        let metadata = decode_note_metadata(note_section_data.data()).unwrap();
-        let (kernarg_seg_size, private_segment_size, _wavefront_size) =
-            if let Metadata::Yaml(metadata) = metadata {
-                let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
-                let metadata = &metadatas[0];
+    let mut output = Buffer::zeroed::<f32>(size);
+    let data = Buffer::from_slice(&input);
+    let args = [
+        Arg::write(&mut output),
+        Arg::read(&data),
+        Arg::value(width as u32),
+    ];
+    function.prepare(&launch, &args).map_err(to_io)?;
+    let start = Instant::now();
+    function.launch(&launch, &args).map_err(to_io)?;
+    let end = start.elapsed();
+    println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
+    drop(args);
 
-                let kernarg_seg_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["KernargSegmentSize"]
-                {
-                    integer
-                } else {
-                    1
-                } as usize;
-                let private_seg_fixed_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["PrivateSegmentFixedSize"]
-                {
-                    integer
-                } else {
-                    1
-                } as usize;
-                let is_dynamic_call_stack = if let Yaml::Boolean(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["IsDynamicCallStack"]
-                {
-                    integer
-                } else {
-                    false
-                };
-
-                let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
-                let private_segment_size = private_seg_fixed_size + stack_size;
-                let wavefront_size = if let Yaml::Integer(integer) =
-                    metadata["Kernels"][0]["CodeProps"]["WavefrontSize"]
-                {
-                    integer
-                } else {
-                    panic!("Wavefront size not found in metadata")
-                } as usize;
-
-                (kernarg_seg_size, private_segment_size, wavefront_size)
-            } else if let Metadata::MessagePack(metadata) = metadata {
-                let version: MetadataMapVersion = rmp_serde::from_slice(&metadata).unwrap();
-                if version.amdhsa_version[0] == 1 && version.amdhsa_version[1] == 2 {
-                    let map: MetadataMapV5 = rmp_serde::from_slice(&metadata).unwrap();
-                    let kernarg_seg_size = map.amdhsa_kernels[0].kernarg_segment_size as usize;
-                    let private_seg_fixed_size =
-                        map.amdhsa_kernels[0].private_segment_fixed_size as usize;
-
-                    let is_dynamic_call_stack =
-                        if let Some(value) = map.amdhsa_kernels[0].uses_dynamic_stack {
-                            value
-                        } else {
-                            false
-                        };
-
-                    let stack_size = if is_dynamic_call_stack { 0x2000 } else { 0 };
-                    let private_segment_size = private_seg_fixed_size + stack_size;
-                    let wavefront_size = map.amdhsa_kernels[0].wavefront_size as usize;
-
-                    (kernarg_seg_size, private_segment_size, wavefront_size)
-                } else {
-                    panic!()
-                }
-            } else {
-                panic!()
-            };
-
-        let mut arg_buffer = vec![0u8; kernarg_seg_size];
-
-        println!("argument size: {}", arg_buffer.len());
-
-        let kernel_arg_ptr = (&arg_buffer[0] as *const u8) as u64;
-
-        println!("kernel_arg_ptr: 0x{:X}", kernel_arg_ptr);
-
-        let mut mem = Vec::<u8>::new();
-        for segment in elffile.segments() {
-            let offset = segment.address() as usize;
-            let size = segment.size() as usize;
-            let new_size = mem.len().max(offset + size);
-            mem.resize(new_size, 0);
-            mem[offset..(offset + size.min(segment.data().len()))].copy_from_slice(segment.data());
-        }
-
-        if let Some(kernel_sym) = elffile
-            .symbols()
-            .find(|sym| sym.name() == Some(kernel_name))
-        {
-            let kernel_addr = kernel_sym.address() as usize;
-            let kernel_desc = decode_kernel_desc(&mem[kernel_addr..(kernel_addr + 64)]);
-            let entry_address = kernel_addr + kernel_desc.kernel_code_entry_byte_offset;
-            let num_vgprs = kernel_desc.granulated_workitem_vgpr_count;
-
-            // Front end: decode CFG -> Scalar IR -> segmented (cross-lane) program.
-            let program = decode_program(&arch, entry_address, &mem).map_err(|e| Error::new(ErrorKind::Other, e))?;
-            let vec_width = matches
-                .opt_str("vec_width")
-                .map(|s| s.parse::<u32>().unwrap())
-                .unwrap_or(1);
-            assert!(matches!(vec_width, 1 | 2 | 4 | 8 | 16 | 32));
-
-            set_u64(&mut arg_buffer, 0, output_ptr);
-            set_u64(&mut arg_buffer, 8, input_ptr);
-            set_u32(&mut arg_buffer, 16, width as u32);
-
-            let block_dim = [width as u32, width as u32, 1];
-            let grid_dim = [1u32, 1, 1];
-
-            let aql = HsaKernelDispatchPacket {
-                header: 0,
-                setup: 0,
-                workgroup_size_x: block_dim[0] as u16,
-                workgroup_size_y: block_dim[1] as u16,
-                workgroup_size_z: block_dim[2] as u16,
-                grid_size_x: grid_dim[0],
-                grid_size_y: grid_dim[1],
-                grid_size_z: grid_dim[2],
-                private_segment_size: private_segment_size as u32,
-                group_segment_size: 0,
-                kernel_object: Pointer::new(&mem, kernel_addr),
-                kernarg_address: Pointer::new(&arg_buffer, 0),
-            };
-
-            let dims = GridDims {
-                num_wg_x: grid_dim[0],
-                num_wg_y: grid_dim[1],
-                num_wg_z: grid_dim[2],
-                wg_x: block_dim[0],
-                wg_y: block_dim[1],
-                wg_z: block_dim[2],
-            };
-            let kernarg_ptr = (&arg_buffer[0] as *const u8) as u64;
-            let aql_packet_addr = (&aql as *const HsaKernelDispatchPacket) as u64;
-            let num_threads = match matches.opt_str("num_threads") {
-                Some(s) => s.parse::<usize>().unwrap().max(1),
-                None => std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
-            };
-
-            use std::time::Instant;
-            let kernel = compile(&program, CompileOptions { width: vec_width, num_vgprs, workgroup_x: Some(block_dim[0]) });
-            let start = Instant::now();
-            dispatch(
-                &kernel,
-                &kernel_desc,
-                kernarg_ptr,
-                aql_packet_addr,
-                dims,
-                private_segment_size as u32,
-                0,
-                num_threads,
-            );
-            let end = start.elapsed();
-            println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
-        }
-    }
-
+    let output = output.to_vec::<f32>();
     if output == expected {
         println!("Validation passed.");
     } else {
