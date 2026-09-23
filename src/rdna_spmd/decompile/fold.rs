@@ -21,13 +21,13 @@ pub fn fold(q: &mut Func, inputs: &[Parameter], words: &BTreeSet<ValueId>, exec:
                 _ => None,
             })
             .collect();
-        let mut logic = Logic::new(q, &facts, &kept);
+        let mut logic = Logic::fixed(q, &facts, &kept, &[]);
         let start = match exec {
             Some(index) => logic.atom(Atom::Bit(q.blocks[&q.entry].params[index].0)),
             None => Bdd::TRUE,
         };
 
-        let reach = logic.open_reach(q, &facts, q.entry, start);
+        let reach = logic.reach(q, &facts, q.entry, start);
         decisions(q, &facts, &mut logic, &reach)
     };
     apply(q, &decided);

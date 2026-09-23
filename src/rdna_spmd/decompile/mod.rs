@@ -1,8 +1,9 @@
+mod check;
+mod direct;
 mod fold;
 mod logic;
-mod policy;
-mod proof;
 mod rewrite;
+mod search;
 
 use crate::rdna_spmd::analysis::facts;
 use crate::rdna_spmd::program::Program;
@@ -32,8 +33,12 @@ pub fn decompile(function: &Program) -> Lane {
     let exec_index = function.parameter_inputs.iter().position(
         |p| matches!(p.source, crate::rdna_spmd::ir::ParameterSource::MaskBit(r) if r == exec),
     );
-    let facts = facts::Facts::new(f, &function.parameter_inputs, &BTreeSet::new());
-    let (kept, everyone) = proof::prove(f, &facts, &function.parameter_inputs, exec_index);
+    let inputs = &function.parameter_inputs;
+    let (kept, everyone) = match std::env::var("AMDGPU_SIM_PROOF").as_deref() {
+        Ok("direct") => direct::prove(f, inputs, exec_index),
+        Ok("search") | Err(_) => search::prove(f, inputs, exec_index),
+        Ok(other) => panic!("AMDGPU_SIM_PROOF={}: expected search or direct", other),
+    };
     let facts = facts::Facts::new(f, &function.parameter_inputs, &kept.words);
     if std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() {
         eprintln!(
