@@ -182,8 +182,6 @@ enum Target {
     Slot(u32, u32),
 }
 
-const NESTED: usize = 3;
-
 type Depth = usize;
 const FREE: Depth = usize::MAX;
 
@@ -815,7 +813,7 @@ impl<'a> Addresses<'a> {
     }
 
     fn may_guess(&mut self, header: BlockId, lane: usize) -> bool {
-        if self.guessing_about.contains_key(&(header, lane as u8)) || self.guessing >= NESTED {
+        if self.guessing_about.contains_key(&(header, lane as u8)) {
             self.depend(self.checking);
             return false;
         }
@@ -2024,7 +2022,7 @@ impl<'a> Addresses<'a> {
                     None => match self.facts.op(self.f, x) {
                         Some(Op::Int(IntOp::LShr, w, s)) => {
                             match self.value(s, lane, None).0.form.as_constant() {
-                                Some(k) if k < 32 => self.word_bit(w, k as usize, 12),
+                                Some(k) if k < 32 => self.word_bit(w, k as usize),
                                 _ => None,
                             }
                         }
@@ -2400,7 +2398,7 @@ impl Addresses<'_> {
             let arg = resolve(self, arg);
             let edge = self.edge_condition(pred, slot);
             let added = match self.facts.op(self.f, arg) {
-                Some(Op::Select(c, x, y)) if self.source(y, lane) == (v, lane) && self.implies(mask, c, edge, 8) => x,
+                Some(Op::Select(c, x, y)) if self.source(y, lane) == (v, lane) && self.implies(mask, c, edge) => x,
                 _ => arg,
             };
             let k = match self.source(added, lane) {
@@ -2430,7 +2428,7 @@ impl Addresses<'_> {
 
     fn source(&self, x: ValueId, lane: usize) -> (ValueId, usize) {
         let (mut x, mut lane) = (x, lane);
-        for _ in 0..64 {
+        loop {
             x = self.copies.get(&x).copied().unwrap_or(x);
             match self.facts.inst(self.f, x) {
                 Some(Inst::Effect {
@@ -2599,13 +2597,10 @@ impl Addresses<'_> {
         Some((0, high as u32))
     }
 
-    fn word_bit(&mut self, w: ValueId, bit: usize, depth: usize) -> Option<bool> {
+    fn word_bit(&mut self, w: ValueId, bit: usize) -> Option<bool> {
         let w = self.copies.get(&w).copied().unwrap_or(w);
         if let Some(k) = self.value(w, bit, None).0.form.as_constant() {
             return Some(k >> bit & 1 != 0);
-        }
-        if depth == 0 {
-            return None;
         }
         if let Site::Param { block, index } = self.facts.site[w.0] {
             if block == self.f.entry {
@@ -2620,12 +2615,12 @@ impl Addresses<'_> {
                 let arg = self.f.blocks[&pred].term.edges().nth(slot).unwrap().args[index];
                 if self.headers.contains(&block) && self.rank[&pred] >= own {
                     let edge = self.edge_condition(pred, slot);
-                    if !self.word_implies(arg, w, edge, 8) {
+                    if !self.word_implies(arg, w, edge) {
                         return None;
                     }
                     continue;
                 }
-                let b = self.word_bit(arg, bit, depth - 1);
+                let b = self.word_bit(arg, bit);
                 match entering {
                     None => entering = Some(b),
                     Some(old) if old == b => {}
@@ -2643,13 +2638,13 @@ impl Addresses<'_> {
             Some(Inst::Core { op, .. }) => match *op {
                 Op::Const(_, k) => Some(k >> bit & 1 != 0),
                 Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
-                    let x = self.word_bit(a, bit, depth - 1);
+                    let x = self.word_bit(a, bit);
                     match (k, x) {
                         (IntOp::And, Some(false)) => return Some(false),
                         (IntOp::Or, Some(true)) => return Some(true),
                         _ => {}
                     }
-                    let y = self.word_bit(b, bit, depth - 1);
+                    let y = self.word_bit(b, bit);
                     match (k, x, y) {
                         (IntOp::And, _, Some(false)) => Some(false),
                         (IntOp::Or, _, Some(true)) => Some(true),
@@ -2662,10 +2657,10 @@ impl Addresses<'_> {
                     }
                 }
                 Op::Select(c, a, b) => match self.bit(c, bit, None).0 {
-                    Some(true) => self.word_bit(a, bit, depth - 1),
-                    Some(false) => self.word_bit(b, bit, depth - 1),
+                    Some(true) => self.word_bit(a, bit),
+                    Some(false) => self.word_bit(b, bit),
                     None => {
-                        let (x, y) = (self.word_bit(a, bit, depth - 1), self.word_bit(b, bit, depth - 1));
+                        let (x, y) = (self.word_bit(a, bit), self.word_bit(b, bit));
                         if x == y {
                             x
                         } else {
@@ -2673,7 +2668,7 @@ impl Addresses<'_> {
                         }
                     }
                 },
-                Op::Convert(Cvt::Bitcast, _, a) => self.word_bit(a, bit, depth - 1),
+                Op::Convert(Cvt::Bitcast, _, a) => self.word_bit(a, bit),
                 _ => None,
             },
             Some(Inst::Effect {
@@ -2700,7 +2695,7 @@ impl Addresses<'_> {
             let arg = self.f.blocks[&pred].term.edges().nth(slot).unwrap().args[index];
             if self.rank[&pred] >= own {
                 let edge = self.edge_condition(pred, slot);
-                if !self.implies(arg, v, edge, 8) {
+                if !self.implies(arg, v, edge) {
                     return None;
                 }
             } else {
@@ -2743,7 +2738,7 @@ impl Addresses<'_> {
 
     fn guard(&self, pred: BlockId, slot: usize) -> Option<(ValueId, bool)> {
         let (mut block, mut slot) = (pred, slot);
-        for _ in 0..16 {
+        loop {
             if let Some(condition) = self.edge_condition(block, slot) {
                 return Some(condition);
             }
@@ -2752,7 +2747,6 @@ impl Addresses<'_> {
                 _ => return None,
             }
         }
-        None
     }
 
     fn edge_condition(&self, pred: BlockId, slot: usize) -> Option<(ValueId, bool)> {
@@ -2762,26 +2756,23 @@ impl Addresses<'_> {
         }
     }
 
-    fn implies(&self, a: ValueId, v: ValueId, edge: Option<(ValueId, bool)>, depth: usize) -> bool {
+    fn implies(&self, a: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         let a = self.copies.get(&a).copied().unwrap_or(a);
         let v = self.copies.get(&v).copied().unwrap_or(v);
         if a == v {
             return true;
         }
-        if depth == 0 {
-            return false;
-        }
         match self.facts.op(self.f, a) {
             Some(Op::Int(IntOp::And, x, y)) => {
-                self.implies(x, v, edge, depth - 1) || self.implies(y, v, edge, depth - 1)
+                self.implies(x, v, edge) || self.implies(y, v, edge)
             }
             Some(Op::Select(c, x, y)) => match self.decided(c, edge) {
-                Some(taken) => self.implies(if taken { x } else { y }, v, edge, depth - 1),
-                None => self.implies(x, v, edge, depth - 1) && self.implies(y, v, edge, depth - 1),
+                Some(taken) => self.implies(if taken { x } else { y }, v, edge),
+                None => self.implies(x, v, edge) && self.implies(y, v, edge),
             },
             Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match self.facts.op(self.f, shifted) {
                 Some(Op::Int(IntOp::LShr, w, s)) if self.facts.op(self.f, s) == Some(Op::Env(Env::LaneId)) => {
-                    self.word_holds(w, v, edge, depth - 1)
+                    self.word_holds(w, v, edge)
                 }
                 _ => false,
             },
@@ -2789,29 +2780,26 @@ impl Addresses<'_> {
         }
     }
 
-    fn word_holds(&self, w: ValueId, v: ValueId, edge: Option<(ValueId, bool)>, depth: usize) -> bool {
+    fn word_holds(&self, w: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         let w = self.copies.get(&w).copied().unwrap_or(w);
-        if depth == 0 {
-            return false;
-        }
         match self.facts.inst(self.f, w) {
             Some(Inst::Effect {
                 op: EffectOp::Wave(WaveOp::Ballot),
                 inputs,
                 ..
-            }) => self.implies(inputs[0], v, edge, depth - 1),
+            }) => self.implies(inputs[0], v, edge),
             Some(Inst::Core { op, .. }) => match *op {
                 Op::Int(IntOp::And, x, y) => {
-                    self.word_holds(x, v, edge, depth - 1) || self.word_holds(y, v, edge, depth - 1)
+                    self.word_holds(x, v, edge) || self.word_holds(y, v, edge)
                 }
                 Op::Int(IntOp::Or, x, y) => {
-                    self.word_holds(x, v, edge, depth - 1) && self.word_holds(y, v, edge, depth - 1)
+                    self.word_holds(x, v, edge) && self.word_holds(y, v, edge)
                 }
                 Op::Select(c, x, y) => match self.decided(c, edge) {
-                    Some(taken) => self.word_holds(if taken { x } else { y }, v, edge, depth - 1),
-                    None => self.word_holds(x, v, edge, depth - 1) && self.word_holds(y, v, edge, depth - 1),
+                    Some(taken) => self.word_holds(if taken { x } else { y }, v, edge),
+                    None => self.word_holds(x, v, edge) && self.word_holds(y, v, edge),
                 },
-                Op::Convert(Cvt::Bitcast, _, x) => self.word_holds(x, v, edge, depth - 1),
+                Op::Convert(Cvt::Bitcast, _, x) => self.word_holds(x, v, edge),
                 Op::Const(_, 0) => true,
                 _ => false,
             },
@@ -2819,24 +2807,21 @@ impl Addresses<'_> {
         }
     }
 
-    fn word_implies(&self, a: ValueId, w: ValueId, edge: Option<(ValueId, bool)>, depth: usize) -> bool {
+    fn word_implies(&self, a: ValueId, w: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         let a = self.copies.get(&a).copied().unwrap_or(a);
         let w = self.copies.get(&w).copied().unwrap_or(w);
         if a == w {
             return true;
         }
-        if depth == 0 {
-            return false;
-        }
         match self.facts.op(self.f, a) {
             Some(Op::Int(IntOp::And, x, y)) => {
-                self.word_implies(x, w, edge, depth - 1) || self.word_implies(y, w, edge, depth - 1)
+                self.word_implies(x, w, edge) || self.word_implies(y, w, edge)
             }
             Some(Op::Select(c, x, y)) => match self.decided(c, edge) {
-                Some(taken) => self.word_implies(if taken { x } else { y }, w, edge, depth - 1),
-                None => self.word_implies(x, w, edge, depth - 1) && self.word_implies(y, w, edge, depth - 1),
+                Some(taken) => self.word_implies(if taken { x } else { y }, w, edge),
+                None => self.word_implies(x, w, edge) && self.word_implies(y, w, edge),
             },
-            Some(Op::Convert(Cvt::Bitcast, _, x)) => self.word_implies(x, w, edge, depth - 1),
+            Some(Op::Convert(Cvt::Bitcast, _, x)) => self.word_implies(x, w, edge),
             _ => false,
         }
     }

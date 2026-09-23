@@ -507,9 +507,6 @@ fn excluded(
         if last < first {
             continue;
         }
-        if last - first >= 256 {
-            return false;
-        }
         for j in first..=last {
             candidates.push((base as u64 + j * step) as u32);
         }
