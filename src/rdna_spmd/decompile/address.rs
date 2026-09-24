@@ -153,9 +153,13 @@ enum Entry {
     Bit((ValueId, u8, Option<ValueId>)),
     Key(Key),
     Slot(Slot),
-    LoopBits((BlockId, u8)),
+    LoopBits(BlockId),
     Step(StepKey),
-    KeptBits(KeptKey),
+    Summarized(BlockId),
+    Decision(BlockId),
+    Reach(BlockId),
+    Region(ValueKey, bool),
+    WordBit((ValueId, u8)),
 }
 
 #[derive(Default)]
@@ -164,16 +168,32 @@ struct Fixed {
     bits: Cached<ValueKey, Assumed<Option<bool>>>,
     slots: Cached<Slot, Option<Value>>,
     keys: Cached<Key, Unknown>,
-    loop_bits: Cached<(BlockId, u8), HashMap<usize, bool>>,
+    loop_bits: Cached<BlockId, Bits>,
     steps: Cached<StepKey, (Option<u32>, bool)>,
-    kept_bits: Cached<KeptKey, Vec<(usize, bool)>>,
+    summarized: Cached<BlockId, ()>,
+    word_bits: Cached<(ValueId, u8), Option<bool>>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct Guesses {
     depth: Depth,
-    params: Vec<ValueId>,
-    slots: Vec<(u32, u32)>,
+    params: Vec<(ValueId, u8)>,
+    slots: Vec<(u32, u32, u8)>,
+    summary: bool,
+    found: Vec<(Target, u8, Option<Region>)>,
+}
+
+#[derive(Clone)]
+struct Goal {
+    target: Target,
+    lane: u8,
+    region: Option<Region>,
+    assumed: Option<Region>,
+}
+
+enum Outcome {
+    Bits(Vec<(usize, u8)>, Vec<Goal>),
+    Values(Vec<(Option<u32>, bool)>, Vec<usize>, Vec<Goal>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -188,7 +208,9 @@ const FREE: Depth = usize::MAX;
 type Cached<K, V> = HashMap<K, (V, Depth)>;
 type ValueKey = (ValueId, u8, Option<ValueId>);
 type StepKey = (BlockId, u8, Target, Option<Region>);
-type KeptKey = (BlockId, u8, Vec<(usize, bool)>);
+type Step = (Option<u32>, bool);
+type ImplicationKey = (Implication, ValueId, ValueId, Option<(ValueId, bool)>);
+type Bits = std::rc::Rc<Vec<((usize, u8), bool)>>;
 type Edges = Vec<(BlockId, usize)>;
 
 type Slot = (BlockId, u32, u32, u8);
@@ -197,13 +219,95 @@ type Slot = (BlockId, u32, u32, u8);
 pub struct Reliance {
     used: bool,
     open: bool,
+    lane: bool,
 }
 
 impl std::ops::BitOrAssign for Reliance {
     fn bitor_assign(&mut self, other: Self) {
         self.used |= other.used;
         self.open |= other.open;
+        self.lane |= other.lane;
     }
+}
+
+const ALL: u8 = u8::MAX;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Regions {
+    any: bool,
+    list: Vec<Option<Region>>,
+}
+
+impl Regions {
+    pub fn one(r: Option<Region>) -> Self {
+        Self {
+            any: false,
+            list: vec![r],
+        }
+    }
+
+    fn any() -> Self {
+        Self {
+            any: true,
+            list: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, r: Option<Region>) {
+        if let Err(i) = self.list.binary_search(&r) {
+            self.list.insert(i, r);
+        }
+    }
+
+    pub fn union(&mut self, other: &Regions) {
+        self.any |= other.any;
+        for &r in &other.list {
+            self.add(r);
+        }
+    }
+
+    fn joined(mut self, other: &Regions) -> Self {
+        self.union(other);
+        self
+    }
+
+    fn combine(&self, other: &Regions, f: impl Fn(Option<Region>, Option<Region>) -> Option<Region>) -> Self {
+        if self.any || other.any {
+            return Self::any();
+        }
+        let mut out = Self::default();
+        for &a in &self.list {
+            for &b in &other.list {
+                out.add(f(a, b));
+            }
+        }
+        out
+    }
+
+    fn single(&self) -> Option<Option<Region>> {
+        match self.list.as_slice() {
+            [r] if !self.any => Some(*r),
+            _ => None,
+        }
+    }
+
+    pub fn single_region(&self) -> bool {
+        self.single().is_some()
+    }
+
+    pub fn overlaps(&self, other: &Regions, f: impl Fn(Option<Region>, Option<Region>) -> bool) -> bool {
+        self.any || other.any || self.list.iter().any(|&a| other.list.iter().any(|&b| f(a, b)))
+    }
+}
+
+fn in_lane<T>(x: T) -> Assumed<T> {
+    (
+        x,
+        Reliance {
+            lane: true,
+            ..Reliance::default()
+        },
+    )
 }
 
 type Assumed<T> = (T, Reliance);
@@ -228,27 +332,30 @@ pub struct Addresses<'a> {
     keys: Cached<Key, Unknown>,
     wave: usize,
     entered: Option<usize>,
-    taken: HashSet<(BlockId, usize)>,
-    reached: HashSet<BlockId>,
-    decided: usize,
+    decisions: Cached<BlockId, Option<bool>>,
+    reach: Cached<BlockId, bool>,
+    deciding: HashMap<BlockId, usize>,
+    reaching: HashMap<BlockId, usize>,
     values: Cached<ValueKey, Assumed<Value>>,
     bits: Cached<ValueKey, Assumed<Option<bool>>>,
     fixed: Option<(ValueId, u32)>,
     fixed_values: Cached<ValueKey, Assumed<Value>>,
     fixed_bits: Cached<ValueKey, Assumed<Option<bool>>>,
     fixed_keys: Cached<Key, Unknown>,
-    fixed_loop_bits: Cached<(BlockId, u8), HashMap<usize, bool>>,
+    fixed_loop_bits: Cached<BlockId, Bits>,
     fixed_steps: Cached<StepKey, (Option<u32>, bool)>,
-    fixed_kept_bits: Cached<KeptKey, Vec<(usize, bool)>>,
+    fixed_summarized: Cached<BlockId, ()>,
     steps: Cached<StepKey, (Option<u32>, bool)>,
-    kept_bits: Cached<KeptKey, Vec<(usize, bool)>>,
-    loop_bits: Cached<(BlockId, u8), HashMap<usize, bool>>,
-    guessing_about: HashMap<(BlockId, u8), Guesses>,
+    summarized: Cached<BlockId, ()>,
+    summarizing: HashMap<BlockId, usize>,
+    loop_bits: Cached<BlockId, Bits>,
+    guessing_about: HashMap<BlockId, Guesses>,
     fixed_store: HashMap<(ValueId, u32), Fixed>,
     users: HashMap<ValueId, Vec<ValueId>>,
     affected: HashMap<ValueId, std::rc::Rc<HashSet<ValueId>>>,
     affected_now: Option<std::rc::Rc<HashSet<ValueId>>>,
     implied: HashMap<ValueId, Vec<ValueId>>,
+    implications: std::cell::RefCell<HashMap<ImplicationKey, bool>>,
     assumable: HashSet<ValueId>,
     loops: HashMap<BlockId, Vec<BlockId>>,
     active: HashMap<(ValueId, u8, Option<ValueId>, bool), usize>,
@@ -263,6 +370,19 @@ pub struct Addresses<'a> {
     fixed_slots: Cached<Slot, Option<Value>>,
     guessed_slots: Cached<Slot, Option<Value>>,
     active_slots: HashMap<Slot, usize>,
+    regions: Cached<ValueKey, Assumed<Regions>>,
+    refined: Cached<ValueKey, Assumed<Regions>>,
+    active_regions: HashSet<(ValueId, u8, Option<ValueId>, bool)>,
+    word_bits: Cached<(ValueId, u8), Option<bool>>,
+    fixed_word_bits: Cached<(ValueId, u8), Option<bool>>,
+    active_words: HashMap<(ValueId, u8, bool), usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Implication {
+    Bit,
+    Holds,
+    Word,
 }
 
 impl<'a> Addresses<'a> {
@@ -296,9 +416,10 @@ impl<'a> Addresses<'a> {
             keys: HashMap::default(),
             wave: 0,
             entered: None,
-            taken: HashSet::default(),
-            reached: HashSet::default(),
-            decided: 0,
+            decisions: HashMap::default(),
+            reach: HashMap::default(),
+            deciding: HashMap::default(),
+            reaching: HashMap::default(),
             values: HashMap::default(),
             bits: HashMap::default(),
             fixed: None,
@@ -307,9 +428,10 @@ impl<'a> Addresses<'a> {
             fixed_keys: HashMap::default(),
             fixed_loop_bits: HashMap::default(),
             fixed_steps: HashMap::default(),
-            fixed_kept_bits: HashMap::default(),
+            fixed_summarized: HashMap::default(),
             steps: HashMap::default(),
-            kept_bits: HashMap::default(),
+            summarized: HashMap::default(),
+            summarizing: HashMap::default(),
             loop_bits: HashMap::default(),
             guessing_about: HashMap::default(),
             fixed_store: HashMap::default(),
@@ -317,6 +439,7 @@ impl<'a> Addresses<'a> {
             affected: HashMap::default(),
             affected_now: None,
             implied: HashMap::default(),
+            implications: std::cell::RefCell::new(HashMap::default()),
             assumable: HashSet::default(),
             loops,
             active: HashMap::default(),
@@ -331,6 +454,12 @@ impl<'a> Addresses<'a> {
             fixed_slots: HashMap::default(),
             guessed_slots: HashMap::default(),
             active_slots: HashMap::default(),
+            regions: HashMap::default(),
+            refined: HashMap::default(),
+            active_regions: HashSet::default(),
+            word_bits: HashMap::default(),
+            fixed_word_bits: HashMap::default(),
+            active_words: HashMap::default(),
         };
         for &b in &facts.order {
             for inst in &f.blocks[&b].insts {
@@ -371,19 +500,21 @@ impl<'a> Addresses<'a> {
         self.loop_bits.clear();
         self.fixed_steps.clear();
         self.steps.clear();
-        self.fixed_kept_bits.clear();
-        self.kept_bits.clear();
+        self.fixed_summarized.clear();
+        self.summarized.clear();
         self.fixed_store.clear();
         self.slots.clear();
         self.fixed_slots.clear();
-        self.taken.clear();
-        self.reached.clear();
-        self.decided = 0;
+        self.regions.clear();
+        self.refined.clear();
+        self.word_bits.clear();
+        self.fixed_word_bits.clear();
+        self.decisions.clear();
+        self.reach.clear();
         let mut headers: Vec<BlockId> = self.headers.iter().copied().collect();
         headers.sort_by_key(|h| self.rank[h]);
         let trips: Vec<Unknown> = headers.iter().map(|&h| self.trips(h)).collect();
         self.pending = trips.iter().map(|&u| (u, 1)).collect();
-        self.sandbox(|this| this.decide_branches());
         for (&header, &u) in headers.iter().zip(&trips) {
             let (last, _) = self.sandbox(|this| this.last_trip(header, u));
             if let Some(last) = last {
@@ -393,57 +524,100 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    fn decide_branches(&mut self) {
-        self.reached.insert(self.f.entry);
+    fn decision(&mut self, b: BlockId) -> Option<bool> {
+        if let Some(&(decided, depth)) = self.decisions.get(&b) {
+            self.depend(depth);
+            return decided;
+        }
+        let Term::CondBr { cond, .. } = self.f.blocks[&b].term else {
+            return None;
+        };
+        let outside = match self.deciding.insert(b, self.guessing) {
+            Some(level) if level == self.guessing => return None,
+            outside => outside,
+        };
+        let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
+        let (decided, depth) = self.frame(|this| {
+            if outside.is_some() {
+                this.depend(this.checking);
+            }
+            this.decide(cond)
+        });
+        (self.fixed, self.affected_now) = (fixed, affected);
+        match outside {
+            Some(level) => self.deciding.insert(b, level),
+            None => self.deciding.remove(&b),
+        };
+        if depth != FREE {
+            self.journal.push((Entry::Decision(b), depth));
+        }
+        self.decisions.insert(b, (decided, depth));
+        decided
+    }
+
+    fn decide(&mut self, cond: ValueId) -> Option<bool> {
         let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-        for (rank, b) in self.facts.order.clone().into_iter().enumerate() {
-            self.decided = rank;
-            if !self.reached.contains(&b) {
-                continue;
-            }
-            let decided = match self.f.blocks[&b].term {
-                Term::CondBr { cond, .. } if self.facts.uniform[cond.0] => {
-                    lanes.first().and_then(|&l| self.bit(cond, l, None).0)
-                }
-                Term::CondBr { cond, .. } => {
-                    let mut agreed: Option<Option<bool>> = None;
-                    for &l in &lanes {
-                        let bit = self.bit(cond, l, None).0;
-                        match agreed {
-                            None => agreed = Some(bit),
-                            Some(old) if old == bit => {}
-                            Some(_) => agreed = Some(None),
-                        }
-                    }
-                    agreed.flatten()
-                }
-                _ => None,
-            };
-            let edges: Vec<BlockId> = self.f.blocks[&b].term.edges().map(|e| e.dst).collect();
-            for (slot, dst) in edges.into_iter().enumerate() {
-                if decided.is_none_or(|yes| (slot == 0) == yes) {
-                    self.taken.insert((b, slot));
-                    self.reached.insert(dst);
-                }
+        if self.facts.uniform[cond.0] {
+            return lanes.first().and_then(|&l| self.bit(cond, l, None).0);
+        }
+        let mut agreed: Option<Option<bool>> = None;
+        for l in lanes {
+            let bit = self.bit(cond, l, None).0;
+            match agreed {
+                None => agreed = Some(bit),
+                Some(old) if old == bit => {}
+                Some(_) => return None,
             }
         }
-        self.decided = self.facts.order.len();
+        agreed.flatten()
     }
 
-    pub fn reaches_block(&self, b: BlockId) -> bool {
-        self.reached.contains(&b)
+    fn reached(&mut self, b: BlockId) -> bool {
+        if b == self.f.entry {
+            return true;
+        }
+        if let Some(&(reached, depth)) = self.reach.get(&b) {
+            self.depend(depth);
+            return reached;
+        }
+        let outside = match self.reaching.insert(b, self.guessing) {
+            Some(level) if level == self.guessing => return true,
+            outside => outside,
+        };
+        let (reached, depth) = self.frame(|this| {
+            if outside.is_some() {
+                this.depend(this.checking);
+            }
+            let facts = this.facts;
+            let own = this.rank[&b];
+            facts.incoming[&b]
+                .iter()
+                .any(|&(pred, slot)| this.rank[&pred] < own && this.reached(pred) && this.takes(pred, slot))
+        });
+        match outside {
+            Some(level) => self.reaching.insert(b, level),
+            None => self.reaching.remove(&b),
+        };
+        if depth != FREE {
+            self.journal.push((Entry::Reach(b), depth));
+        }
+        self.reach.insert(b, (reached, depth));
+        reached
     }
 
-    fn can_take(&self, pred: BlockId, slot: usize, block: BlockId) -> bool {
-        let from = self.rank[&pred];
-        if from >= self.rank[&block] {
+    fn takes(&mut self, pred: BlockId, slot: usize) -> bool {
+        self.decision(pred).is_none_or(|yes| (slot == 0) == yes)
+    }
+
+    pub fn reaches_block(&mut self, b: BlockId) -> bool {
+        self.reached(b)
+    }
+
+    fn can_take(&mut self, pred: BlockId, slot: usize, block: BlockId) -> bool {
+        if self.rank[&pred] >= self.rank[&block] {
             return true;
         }
-        if from >= self.decided {
-            self.depend(self.checking);
-            return true;
-        }
-        self.taken.contains(&(pred, slot))
+        self.reached(pred) && self.takes(pred, slot)
     }
 
     pub fn valid(&self, lane: usize) -> bool {
@@ -577,12 +751,36 @@ impl<'a> Addresses<'a> {
                         self.fixed_steps.remove(&key);
                     }
                 }
-                Entry::KeptBits(key) => {
-                    if self.kept_bits.get(&key).is_some_and(|e| e.1 >= depth) {
-                        self.kept_bits.remove(&key);
+                Entry::Region(key, refine) => {
+                    let cache = if refine { &mut self.refined } else { &mut self.regions };
+                    if cache.get(&key).is_some_and(|e| e.1 >= depth) {
+                        cache.remove(&key);
                     }
-                    if self.fixed_kept_bits.get(&key).is_some_and(|e| e.1 >= depth) {
-                        self.fixed_kept_bits.remove(&key);
+                }
+                Entry::WordBit(key) => {
+                    if self.word_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                        self.word_bits.remove(&key);
+                    }
+                    if self.fixed_word_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                        self.fixed_word_bits.remove(&key);
+                    }
+                }
+                Entry::Decision(key) => {
+                    if self.decisions.get(&key).is_some_and(|e| e.1 >= depth) {
+                        self.decisions.remove(&key);
+                    }
+                }
+                Entry::Reach(key) => {
+                    if self.reach.get(&key).is_some_and(|e| e.1 >= depth) {
+                        self.reach.remove(&key);
+                    }
+                }
+                Entry::Summarized(key) => {
+                    if self.summarized.get(&key).is_some_and(|e| e.1 >= depth) {
+                        self.summarized.remove(&key);
+                    }
+                    if self.fixed_summarized.get(&key).is_some_and(|e| e.1 >= depth) {
+                        self.fixed_summarized.remove(&key);
                     }
                 }
             }
@@ -731,13 +929,17 @@ impl<'a> Addresses<'a> {
             self.depend(depth);
             return guess;
         }
-        if let Some(depth) = self.guessing_about.get(&(block, lane as u8)).map(|g| g.depth) {
+        if let Some(depth) = self.guessing_about.get(&block).map(|g| g.depth) {
             self.depend(depth);
+            let region = self.assumed_entry(block, Target::Slot(address, bytes), lane);
             let symbol = self.symbol(Key::GuessSlot(key), block);
-            let guess = Value::of(Form::unknown(symbol));
+            let guess = Value {
+                form: Form::unknown(symbol),
+                region,
+            };
             self.guessed_slots.insert(key, (Some(guess.clone()), depth));
-            if let Some(guesses) = self.guessing_about.get_mut(&(block, lane as u8)) {
-                guesses.slots.push((address, bytes));
+            if let Some(guesses) = self.guessing_about.get_mut(&block) {
+                guesses.slots.push((address, bytes, lane as u8));
             }
             return Some(guess);
         }
@@ -812,39 +1014,65 @@ impl<'a> Addresses<'a> {
         })
     }
 
-    fn may_guess(&mut self, header: BlockId, lane: usize) -> bool {
-        if self.guessing_about.contains_key(&(header, lane as u8)) {
+    fn may_guess(&mut self, header: BlockId) -> bool {
+        if self.guessing_about.contains_key(&header) {
             self.depend(self.checking);
             return false;
         }
         true
     }
 
-    fn guess_about<T>(&mut self, header: BlockId, lane: usize, bits: &HashMap<usize, bool>, f: impl FnOnce(&mut Self) -> T) -> T {
-        let l = lane as u8;
+    fn guess_about<T>(
+        &mut self,
+        header: BlockId,
+        bits: &[((usize, u8), bool)],
+        installs: &[(Target, u8, Option<Region>)],
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         self.sandbox(|this| {
             let depth = this.checking;
             this.guessing += 1;
             let params: Vec<ValueId> = this.f.blocks[&header].params.iter().map(|p| p.0).collect();
-            for (&index, &b) in bits {
+            for &((index, l), b) in bits {
                 this.guessed_bits.insert((params[index], l), (b, depth));
             }
             this.guessing_about.insert(
-                (header, l),
+                header,
                 Guesses {
                     depth,
                     ..Guesses::default()
                 },
             );
+            for &(target, l, region) in installs {
+                let key = match target {
+                    Target::Param(index) => Key::Guess(params[index], l),
+                    Target::Slot(address, bytes) => Key::GuessSlot((header, address, bytes, l)),
+                };
+                let guess = Value {
+                    form: Form::unknown(this.symbol(key, header)),
+                    region,
+                };
+                let guesses = this.guessing_about.get_mut(&header).unwrap();
+                match target {
+                    Target::Param(index) => {
+                        guesses.params.push((params[index], l));
+                        this.guessed.insert((params[index], l), (guess, depth));
+                    }
+                    Target::Slot(address, bytes) => {
+                        guesses.slots.push((address, bytes, l));
+                        this.guessed_slots.insert((header, address, bytes, l), (Some(guess), depth));
+                    }
+                }
+            }
             let result = f(this);
-            for &index in bits.keys() {
+            for &((index, l), _) in bits {
                 this.guessed_bits.remove(&(params[index], l));
             }
-            if let Some(guesses) = this.guessing_about.remove(&(header, l)) {
-                for v in guesses.params {
-                    this.guessed.remove(&(v, l));
+            if let Some(guesses) = this.guessing_about.remove(&header) {
+                for key in guesses.params {
+                    this.guessed.remove(&key);
                 }
-                for (address, bytes) in guesses.slots {
+                for (address, bytes, l) in guesses.slots {
                     this.guessed_slots.remove(&(header, address, bytes, l));
                 }
             }
@@ -854,145 +1082,317 @@ impl<'a> Addresses<'a> {
         .0
     }
 
-    fn loop_bits(&mut self, header: BlockId, lane: usize) -> HashMap<usize, bool> {
-        let key = (header, lane as u8);
+    fn loop_bits(&mut self, header: BlockId) -> Bits {
         let cached = if self.fixed.is_some() {
-            self.fixed_loop_bits.get(&key).cloned()
+            self.fixed_loop_bits.get(&header).cloned()
         } else {
-            self.loop_bits.get(&key).cloned()
+            self.loop_bits.get(&header).cloned()
         };
         if let Some((bits, depth)) = cached {
             self.depend(depth);
             return bits;
         }
-        if !self.may_guess(header, lane) {
-            return HashMap::default();
+        if !self.may_guess(header) {
+            return Bits::default();
         }
-        let (bits, depth) = self.frame(|this| {
-            let params: Vec<(ValueId, Ty)> = this.f.blocks[&header].params.clone();
-            let (entering, back) = this.edges_into(header);
-            let mut bits: HashMap<usize, bool> = HashMap::default();
-            for (index, &(_, ty)) in params.iter().enumerate() {
-                if ty != Ty::I1 {
-                    continue;
-                }
-                let mut first: Option<Option<bool>> = None;
-                for &e in &entering {
-                    let bit = this.bit(this.edge_arg(e, index), lane, None).0;
-                    match first {
-                        None => first = Some(bit),
-                        Some(old) if old == bit => {}
-                        Some(_) => first = Some(None),
-                    }
-                }
-                if let Some(Some(b)) = first {
-                    bits.insert(index, b);
-                }
-            }
-            let mut entered: Vec<(usize, bool)> = bits.iter().map(|(&i, &b)| (i, b)).collect();
-            entered.sort_unstable();
-            let fixpoint_key = (header, lane as u8, entered);
-            let cached = if this.fixed.is_some() {
-                this.fixed_kept_bits.get(&fixpoint_key).cloned()
-            } else {
-                this.kept_bits.get(&fixpoint_key).cloned()
-            };
-            if let Some((kept, depth)) = cached {
-                this.depend(depth);
-                return kept.into_iter().collect();
-            }
-            let (bits, depth) = this.frame(|this| this.keep_bits(header, lane, bits, &back));
-            let mut kept: Vec<(usize, bool)> = bits.iter().map(|(&i, &b)| (i, b)).collect();
-            kept.sort_unstable();
-            if depth != FREE {
-                this.journal.push((Entry::KeptBits(fixpoint_key.clone()), depth));
-            }
-            if this.fixed.is_some() {
-                this.fixed_kept_bits.insert(fixpoint_key, (kept, depth));
-            } else {
-                this.kept_bits.insert(fixpoint_key, (kept, depth));
-            }
-            bits
-        });
-        if depth != FREE {
-            self.journal.push((Entry::LoopBits(key), depth));
-        }
-        if self.fixed.is_some() {
-            self.fixed_loop_bits.insert(key, (bits.clone(), depth));
+        self.summarize(header, None);
+        let cached = if self.fixed.is_some() {
+            self.fixed_loop_bits.get(&header).cloned()
         } else {
-            self.loop_bits.insert(key, (bits.clone(), depth));
+            self.loop_bits.get(&header).cloned()
+        };
+        match cached {
+            Some((bits, depth)) => {
+                self.depend(depth);
+                bits
+            }
+            None => Bits::default(),
         }
-        bits
     }
 
-    fn keep_bits(
-        &mut self,
-        header: BlockId,
-        lane: usize,
-        mut bits: HashMap<usize, bool>,
-        back: &[(BlockId, usize)],
-    ) -> HashMap<usize, bool> {
-        let this = self;
-        {
-            loop {
-                let guessed = bits.clone();
-                let failed: Vec<usize> = this.guess_about(header, lane, &guessed, |this| {
-                    guessed
-                        .iter()
-                        .filter(|&(&index, &b)| {
-                            back.iter().any(|&e| {
-                                let a = this.edge_arg(e, index);
-                                this.bit(a, lane, None).0 != Some(b)
-                            })
-                        })
-                        .map(|(&index, _)| index)
-                        .collect()
-                });
-                if failed.is_empty() {
-                    return bits;
+    fn loop_bit(&mut self, header: BlockId, index: usize, lane: usize) -> Option<bool> {
+        let bits = self.loop_bits(header);
+        let key = (index, lane as u8);
+        bits.binary_search_by(|&(k, _)| k.cmp(&key)).ok().map(|i| bits[i].1)
+    }
+
+    fn assumed_entry(&mut self, header: BlockId, target: Target, lane: usize) -> Option<Region> {
+        if !self.guessing_about.get(&header).is_some_and(|g| g.summary) {
+            return None;
+        }
+        let first = match target {
+            Target::Param(index) => {
+                let (entering, _) = self.edges_into(header);
+                self.entering_value(&entering, header, index, lane)
+            }
+            Target::Slot(address, bytes) => self.entering_slot(header, address, bytes, lane),
+        }?;
+        if let Some(guesses) = self.guessing_about.get_mut(&header) {
+            guesses.found.push((target, lane as u8, first.region));
+        }
+        first.region
+    }
+
+    fn summarize(&mut self, header: BlockId, seed: Option<Target>) {
+        let done = if self.fixed.is_some() {
+            self.fixed_summarized.get(&header).copied()
+        } else {
+            self.summarized.get(&header).copied()
+        };
+        if seed.is_none() {
+            if let Some((_, depth)) = done {
+                self.depend(depth);
+                return;
+            }
+        }
+        if !self.may_guess(header) {
+            return;
+        }
+        let outside = match self.summarizing.insert(header, self.guessing) {
+            Some(level) if level == self.guessing => return,
+            outside => outside,
+        };
+        let ((bits, steps), depth) = self.frame(|this| {
+            if outside.is_some() {
+                this.depend(this.checking);
+            }
+            this.summary(header, seed)
+        });
+        match outside {
+            Some(level) => self.summarizing.insert(header, level),
+            None => self.summarizing.remove(&header),
+        };
+        let fixed = self.fixed.is_some();
+        if depth != FREE {
+            self.journal.push((Entry::LoopBits(header), depth));
+            self.journal.push((Entry::Summarized(header), depth));
+        }
+        if fixed {
+            self.fixed_loop_bits.insert(header, (bits, depth));
+            self.fixed_summarized.insert(header, ((), depth));
+        } else {
+            self.loop_bits.insert(header, (bits, depth));
+            self.summarized.insert(header, ((), depth));
+        }
+        for (key, step) in steps {
+            if depth != FREE {
+                self.journal.push((Entry::Step(key), depth));
+            }
+            if fixed {
+                self.fixed_steps.insert(key, (step, depth));
+            } else {
+                self.steps.insert(key, (step, depth));
+            }
+        }
+    }
+
+    fn summary(&mut self, header: BlockId, seed: Option<Target>) -> (Bits, Vec<(StepKey, Step)>) {
+        let params: Vec<(ValueId, Ty)> = self.f.blocks[&header].params.clone();
+        let (entering, back) = self.edges_into(header);
+        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+        let known = if self.fixed.is_some() {
+            self.fixed_loop_bits.get(&header).cloned()
+        } else {
+            self.loop_bits.get(&header).cloned()
+        };
+        let mut bits: Vec<((usize, u8), bool)> = match known {
+            Some((bits, depth)) => {
+                self.depend(depth);
+                (*bits).clone()
+            }
+            None => {
+                let mut bits = Vec::new();
+                for (index, &(_, ty)) in params.iter().enumerate() {
+                    if ty != Ty::I1 {
+                        continue;
+                    }
+                    for &lane in &lanes {
+                        let mut first: Option<Option<bool>> = None;
+                        for &e in &entering {
+                            let bit = self.bit(self.edge_arg(e, index), lane, None).0;
+                            match first {
+                                None => first = Some(bit),
+                                Some(old) if old == bit => {}
+                                Some(_) => first = Some(None),
+                            }
+                        }
+                        if let Some(Some(b)) = first {
+                            bits.push(((index, lane as u8), b));
+                        }
+                    }
                 }
-                for index in failed {
-                    bits.remove(&index);
+                bits
+            }
+        };
+        let mut goals: Vec<Goal> = Vec::new();
+        if let Some(target) = seed {
+            for &lane in &lanes {
+                let first = match target {
+                    Target::Param(index) => {
+                        if self.canonical(params[index].0, lane) != lane {
+                            continue;
+                        }
+                        self.entering_value(&entering, header, index, lane)
+                    }
+                    Target::Slot(address, bytes) => self.entering_slot(header, address, bytes, lane),
+                };
+                if let Some(first) = first {
+                    goals.push(Goal {
+                        target,
+                        lane: lane as u8,
+                        region: first.region,
+                        assumed: first.region,
+                    });
                 }
             }
         }
+        bits.sort_unstable();
+        loop {
+            let guessed = bits.clone();
+            let installs: Vec<(Target, u8, Option<Region>)> =
+                goals.iter().map(|g| (g.target, g.lane, g.assumed)).collect();
+            let outcome = self.guess_about(header, &guessed, &installs, |this| {
+                if let Some(g) = this.guessing_about.get_mut(&header) {
+                    g.summary = true;
+                }
+                let failed: Vec<(usize, u8)> = guessed
+                    .iter()
+                    .filter(|&&((index, l), b)| {
+                        back.iter().any(|&e| {
+                            let a = this.edge_arg(e, index);
+                            this.bit(a, l as usize, None).0 != Some(b)
+                        })
+                    })
+                    .map(|&(key, _)| key)
+                    .collect();
+                let mut all: Vec<Goal> = goals.clone();
+                let take = |this: &mut Self, all: &mut Vec<Goal>| {
+                    let found = std::mem::take(&mut this.guessing_about.get_mut(&header).unwrap().found);
+                    for (target, lane, region) in found {
+                        if !all.iter().any(|g| g.target == target && g.lane == lane) {
+                            all.push(Goal {
+                                target,
+                                lane,
+                                region,
+                                assumed: region,
+                            });
+                        }
+                    }
+                };
+                take(this, &mut all);
+                if !failed.is_empty() {
+                    return Outcome::Bits(failed, all);
+                }
+                let mut results = Vec::with_capacity(all.len());
+                let mut downgraded = Vec::new();
+                let mut i = 0;
+                while i < all.len() {
+                    let g = all[i].clone();
+                    let lane = g.lane as usize;
+                    let symbol = match g.target {
+                        Target::Param(index) => this.symbol(Key::Guess(params[index].0, g.lane), header),
+                        Target::Slot(address, bytes) => {
+                            this.symbol(Key::GuessSlot((header, address, bytes, g.lane)), header)
+                        }
+                    };
+                    let mut step = None;
+                    let mut stepped = true;
+                    let mut keeps = true;
+                    let mut held = true;
+                    for &e in &back {
+                        let value = match g.target {
+                            Target::Param(index) => {
+                                let a = this.edge_arg(e, index);
+                                Some(this.operand(a, header, lane, None).0)
+                            }
+                            Target::Slot(address, bytes) => {
+                                let end = this.f.blocks[&e.0].insts.len();
+                                this.slot_before((e.0, end), address, bytes, lane)
+                            }
+                        };
+                        keeps &= value.as_ref().is_some_and(|v| v.region == g.region);
+                        held &= value.as_ref().is_some_and(|v| v.region == g.assumed);
+                        stepped = stepped && agree(&mut step, value.as_ref().and_then(|v| added(v, symbol, g.region)));
+                    }
+                    if g.assumed.is_some() && !held {
+                        downgraded.push(i);
+                    }
+                    results.push((if stepped { step } else { None }, keeps));
+                    take(this, &mut all);
+                    i += 1;
+                }
+                Outcome::Values(results, downgraded, all)
+            });
+            match outcome {
+                Outcome::Bits(failed, all) => {
+                    bits.retain(|(key, _)| !failed.contains(key));
+                    goals = all;
+                }
+                Outcome::Values(results, downgraded, all) => {
+                    goals = all;
+                    if downgraded.is_empty() {
+                        let steps = goals
+                            .iter()
+                            .zip(results)
+                            .map(|(g, r)| ((header, g.lane, g.target, g.region), r))
+                            .collect();
+                        return (std::rc::Rc::new(bits), steps);
+                    }
+                    for i in downgraded {
+                        goals[i].assumed = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn entering_value(&mut self, entering: &[(BlockId, usize)], header: BlockId, index: usize, lane: usize) -> Option<Value> {
+        let mut first: Option<Value> = None;
+        for &e in entering {
+            let value = self.operand(self.edge_arg(e, index), header, lane, None).0;
+            match &first {
+                None => first = Some(value),
+                Some(old) if *old == value => {}
+                Some(_) => return None,
+            }
+        }
+        first
     }
 
     fn recur(&mut self, header: BlockId, lane: usize, target: Target) -> Option<Value> {
-        if !self.may_guess(header, lane) {
+        if !self.may_guess(header) {
             return None;
         }
-        let bits = self.loop_bits(header, lane);
         let (entering, back) = self.edges_into(header);
         let first = match target {
-            Target::Param(index) => {
-                let mut first: Option<Value> = None;
-                for &e in &entering {
-                    let value = self.operand(self.edge_arg(e, index), header, lane, None).0;
-                    match &first {
-                        None => first = Some(value),
-                        Some(old) if *old == value => {}
-                        Some(_) => return None,
-                    }
-                }
-                first?
-            }
+            Target::Param(index) => self.entering_value(&entering, header, index, lane)?,
             Target::Slot(address, bytes) => self.entering_slot(header, address, bytes, lane)?,
         };
         let l = lane as u8;
         let region = first.region;
         let step_key = (header, l, target, region);
-        let cached = if self.fixed.is_some() {
-            self.fixed_steps.get(&step_key).cloned()
-        } else {
-            self.steps.get(&step_key).cloned()
-        };
-        let (step, keeps) = match cached {
-            Some((step, depth)) => {
-                self.depend(depth);
+        let lookup = |this: &mut Self| {
+            let cached = if this.fixed.is_some() {
+                this.fixed_steps.get(&step_key).cloned()
+            } else {
+                this.steps.get(&step_key).cloned()
+            };
+            cached.map(|(step, depth)| {
+                this.depend(depth);
                 step
-            }
+            })
+        };
+        let found = match lookup(self) {
+            Some(step) => Some(step),
             None => {
+                self.summarize(header, Some(target));
+                lookup(self)
+            }
+        };
+        let (step, keeps) = match found {
+            Some(step) => step,
+            None => {
+                let bits = self.loop_bits(header);
                 let (step, depth) = self.frame(|this| this.find_step(header, lane, target, region, &bits, &back));
                 if depth != FREE {
                     self.journal.push((Entry::Step(step_key), depth));
@@ -1027,39 +1427,17 @@ impl<'a> Addresses<'a> {
         lane: usize,
         target: Target,
         region: Option<Region>,
-        bits: &HashMap<usize, bool>,
+        bits: &[((usize, u8), bool)],
         back: &[(BlockId, usize)],
     ) -> (Option<u32>, bool) {
         let l = lane as u8;
-        self.guess_about(header, lane, bits, |this| {
-            let depth = this.checking;
+        self.guess_about(header, bits, &[(target, l, region)], |this| {
             let symbol = match target {
                 Target::Param(index) => {
                     let v = this.f.blocks[&header].params[index].0;
-                    let symbol = this.symbol(Key::Guess(v, l), header);
-                    let guess = Value {
-                        form: Form::unknown(symbol),
-                        region,
-                    };
-                    this.guessed.insert((v, l), (guess, depth));
-                    if let Some(guesses) = this.guessing_about.get_mut(&(header, l)) {
-                        guesses.params.push(v);
-                    }
-                    symbol
+                    this.symbol(Key::Guess(v, l), header)
                 }
-                Target::Slot(address, bytes) => {
-                    let key: Slot = (header, address, bytes, l);
-                    let symbol = this.symbol(Key::GuessSlot(key), header);
-                    let guess = Value {
-                        form: Form::unknown(symbol),
-                        region,
-                    };
-                    this.guessed_slots.insert(key, (Some(guess), depth));
-                    if let Some(guesses) = this.guessing_about.get_mut(&(header, l)) {
-                        guesses.slots.push((address, bytes));
-                    }
-                    symbol
-                }
+                Target::Slot(address, bytes) => this.symbol(Key::GuessSlot((header, address, bytes, l)), header),
             };
             let mut step = None;
             let mut stepped = true;
@@ -1099,7 +1477,7 @@ impl<'a> Addresses<'a> {
         if !self.implied.contains_key(&a) {
             self.assumptions(a);
         }
-        self.implied[&a].contains(&v)
+        self.implied[&a].contains(&v) || self.implies(a, v, None)
     }
 
     fn assumptions(&mut self, predicate: ValueId) -> Vec<ValueId> {
@@ -1134,7 +1512,8 @@ impl<'a> Addresses<'a> {
         self.fixed_keys = stored.keys;
         self.fixed_loop_bits = stored.loop_bits;
         self.fixed_steps = stored.steps;
-        self.fixed_kept_bits = stored.kept_bits;
+        self.fixed_summarized = stored.summarized;
+        self.fixed_word_bits = stored.word_bits;
         self.fixed = Some((v, k));
         self.affected_now = Some(affected);
         let r = f(self);
@@ -1147,7 +1526,8 @@ impl<'a> Addresses<'a> {
             keys: std::mem::take(&mut self.fixed_keys),
             loop_bits: std::mem::take(&mut self.fixed_loop_bits),
             steps: std::mem::take(&mut self.fixed_steps),
-            kept_bits: std::mem::take(&mut self.fixed_kept_bits),
+            summarized: std::mem::take(&mut self.fixed_summarized),
+            word_bits: std::mem::take(&mut self.fixed_word_bits),
         };
         self.fixed_store.insert((v, k), stored);
         r
@@ -1196,21 +1576,38 @@ impl<'a> Addresses<'a> {
         everywhere.then_some(v)
     }
 
+    fn canonical(&self, v: ValueId, lane: usize) -> usize {
+        if self.facts.uniform[v.0] && self.valid(lane) {
+            0
+        } else {
+            lane
+        }
+    }
+
     pub fn value(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
+        let lane = self.canonical(v, lane);
         let l = lane as u8;
         if let Some((guess, depth)) = self.guessed.get(&(v, l)).cloned() {
             self.depend(depth);
             return unassumed(guess);
         }
         if let Site::Param { block, index } = self.facts.site[v.0] {
-            let carried = |this: &Self| !this.copies.contains_key(&v) && this.incoming(v, block, index).is_none();
-            if let Some(depth) = self.guessing_about.get(&(block, l)).map(|g| g.depth).filter(|_| carried(self)) {
+            if let Some(depth) = self
+                .guessing_about
+                .get(&block)
+                .map(|g| g.depth)
+                .filter(|_| self.carried(v, block, index))
+            {
                 self.depend(depth);
+                let region = self.assumed_entry(block, Target::Param(index), lane);
                 let symbol = self.symbol(Key::Guess(v, l), block);
-                let guess = Value::of(Form::unknown(symbol));
+                let guess = Value {
+                    form: Form::unknown(symbol),
+                    region,
+                };
                 self.guessed.insert((v, l), (guess.clone(), depth));
-                if let Some(guesses) = self.guessing_about.get_mut(&(block, l)) {
-                    guesses.params.push(v);
+                if let Some(guesses) = self.guessing_about.get_mut(&block) {
+                    guesses.params.push((v, l));
                 }
                 return unassumed(guess);
             }
@@ -1280,7 +1677,7 @@ impl<'a> Addresses<'a> {
                     Some(true),
                     Reliance {
                         used: true,
-                        open: false,
+                        ..Reliance::default()
                     },
                 );
             }
@@ -1294,6 +1691,7 @@ impl<'a> Addresses<'a> {
     }
 
     fn bit_unless_assumed(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Option<bool>> {
+        let lane = self.canonical(v, lane);
         let l = lane as u8;
         if let Some(&(guess, depth)) = self.guessed_bits.get(&(v, l)) {
             self.depend(depth);
@@ -1339,6 +1737,229 @@ impl<'a> Addresses<'a> {
             self.cache_bit((v, l, None), r, depth);
         }
         r
+    }
+
+    pub fn regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Regions {
+        self.assumed_regions(v, lane, assume, refine).0
+    }
+
+    fn assumed_regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Assumed<Regions> {
+        let lane = self.canonical(v, lane);
+        let l = lane as u8;
+        let cache = if refine { &self.refined } else { &self.regions };
+        let open = |e: &(Assumed<Regions>, Depth)| assume.is_some() && e.0 .1.open;
+        let hit = match (cache.get(&(v, ALL, None)), cache.get(&(v, l, None))) {
+            (Some(e), _) if !open(e) => Some(e.clone()),
+            (_, Some(e)) if !open(e) => Some(e.clone()),
+            _ => assume.and_then(|_| cache.get(&(v, ALL, assume)).or_else(|| cache.get(&(v, l, assume))).cloned()),
+        };
+        if let Some((r, depth)) = hit {
+            self.depend(depth);
+            return r;
+        }
+        let key = (v, l, assume, refine);
+        if !self.active_regions.insert(key) {
+            return in_lane(Regions::any());
+        }
+        let mut reliance = Reliance::default();
+        let (set, depth) = self.frame(|this| this.compute_regions(v, lane, assume, refine, &mut reliance));
+        self.active_regions.remove(&key);
+        let r = (set, reliance);
+        let cache = |this: &mut Self, key: ValueKey| {
+            if depth != FREE {
+                this.journal.push((Entry::Region(key, refine), depth));
+            }
+            let cache = if refine { &mut this.refined } else { &mut this.regions };
+            cache.insert(key, (r.clone(), depth));
+        };
+        let lanes = if reliance.lane { l } else { ALL };
+        if assume.is_some() {
+            cache(self, (v, lanes, assume));
+        }
+        if !reliance.used {
+            cache(self, (v, lanes, None));
+        }
+        r
+    }
+
+    fn compute_regions(
+        &mut self,
+        v: ValueId,
+        lane: usize,
+        assume: Option<ValueId>,
+        refine: bool,
+        reliance: &mut Reliance,
+    ) -> Regions {
+        macro_rules! regions {
+            ($x:expr) => {{
+                let (r, u) = self.assumed_regions($x, lane, assume, refine);
+                *reliance |= u;
+                r
+            }};
+        }
+        let none = || Regions::one(None);
+        if let Some(&root) = self.copies.get(&v) {
+            return regions!(root);
+        }
+        let (f, facts) = (self.f, self.facts);
+        match facts.site[v.0] {
+            Site::Param { block, index } if block == f.entry => Regions::one(match self.inputs[index].source {
+                ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => Some(Region::Kernarg),
+                ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => Some(Region::Dispatch),
+                _ => None,
+            }),
+            Site::Param { block, index } => {
+                let header = self.headers.contains(&block);
+                let own = self.rank[&block];
+                let mut set = Regions::default();
+                for &e in &facts.incoming[&block] {
+                    if header && self.rank[&e.0] >= own {
+                        continue;
+                    }
+                    let (r, u) = self.assumed_regions(self.edge_arg(e, index), lane, None, refine);
+                    reliance.lane |= u.lane;
+                    set.union(&r);
+                }
+                if self.carried(v, block, index) || set.single().is_none() {
+                    set.add(None);
+                }
+                set
+            }
+            Site::Inst { block, index } => match &f.blocks[&block].insts[index] {
+                Inst::Core { op, .. } => match *op {
+                    Op::Int(IntOp::Add, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
+                        (Some(r), None) | (None, Some(r)) => Some(r),
+                        _ => None,
+                    }),
+                    Op::Int(IntOp::Sub, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
+                        (Some(r), None) => Some(r),
+                        _ => None,
+                    }),
+                    Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, to, a)
+                        if to.bits() >= 32 && f.types[a.0].bits() >= 32 =>
+                    {
+                        regions!(a)
+                    }
+                    Op::Pack64(lo, _) | Op::UnpackLo(lo) => regions!(lo),
+                    Op::UnpackHi(x) => match facts.op(f, x) {
+                        Some(Op::Pack64(_, hi)) => regions!(hi),
+                        _ => none(),
+                    },
+                    Op::Select(c, a, b) => {
+                        let root = self.copies.get(&c).copied().unwrap_or(c);
+                        if assume.is_some_and(|p| self.assumes(p, root)) {
+                            reliance.used = true;
+                            return regions!(a);
+                        }
+                        let (x, y) = (regions!(a), regions!(b));
+                        if x.single().is_some() && x == y {
+                            return x;
+                        }
+                        if refine {
+                            let (bit, u) = self.bit(c, lane, assume);
+                            *reliance |= u;
+                            reliance.lane |= !facts.uniform[c.0];
+                            match bit {
+                                Some(true) => return x,
+                                Some(false) => return y,
+                                None => {}
+                            }
+                        }
+                        reliance.open = true;
+                        let mut set = x.joined(&y);
+                        set.add(None);
+                        set
+                    }
+                    Op::Int(IntOp::Or | IntOp::Xor, a, b) => {
+                        let mut set = regions!(a).joined(&regions!(b));
+                        set.add(None);
+                        set
+                    }
+                    Op::Int(IntOp::LShr, a, _) if f.types[v.0] != Ty::I64 => {
+                        let mut set = regions!(a);
+                        set.add(None);
+                        set
+                    }
+                    Op::Env(Env::ScratchBase) => Regions::one(Some(Region::Private)),
+                    _ => none(),
+                },
+                Inst::Effect {
+                    op: EffectOp::Memory {
+                        op: MemoryOp::Load(_),
+                        space,
+                        ..
+                    },
+                    inputs,
+                    ..
+                } => {
+                    let address = regions!(inputs[0]);
+                    let kernarg = address.any || address.list.contains(&Some(Region::Kernarg));
+                    if *space == Space::Scratch || kernarg {
+                        let (value, u) = self.value(v, lane, assume);
+                        *reliance |= u;
+                        reliance.lane |= !facts.uniform[v.0];
+                        Regions::one(value.region)
+                    } else {
+                        none()
+                    }
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::ReadFirstLane),
+                    inputs,
+                    ..
+                } => {
+                    let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+                    self.agreed_regions(inputs[0], &lanes)
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::ReadLane),
+                    inputs,
+                    ..
+                } => {
+                    reliance.lane = true;
+                    match self.value(inputs[1], lane, None).0.form.as_constant() {
+                        Some(k) => self.assumed_regions(inputs[0], (k & 31) as usize, None, refine).0,
+                        None => {
+                            let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+                            self.agreed_regions(inputs[0], &lanes)
+                        }
+                    }
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::WriteLane),
+                    inputs,
+                    ..
+                } => {
+                    reliance.lane = true;
+                    match self.value(inputs[1], lane, None).0.form.as_constant() {
+                        Some(k) if (k & 31) as usize == lane => self.assumed_regions(inputs[0], lane, None, refine).0,
+                        Some(_) => self.assumed_regions(inputs[2], lane, None, refine).0,
+                        None => none(),
+                    }
+                }
+                _ => none(),
+            },
+            Site::Unreached => none(),
+        }
+    }
+
+    fn agreed_regions(&mut self, x: ValueId, lanes: &[usize]) -> Regions {
+        let mut agreed: Option<Regions> = None;
+        for &l in lanes {
+            let r = self.regions(x, l, None, false);
+            agreed = Some(match agreed {
+                None => r,
+                Some(old) if old.any => r,
+                Some(old) if r.any => old,
+                Some(old) => Regions {
+                    any: false,
+                    list: old.list.into_iter().filter(|x| r.list.contains(x)).collect(),
+                },
+            });
+        }
+        let mut set = agreed.unwrap_or_default();
+        set.add(None);
+        set
     }
 
     fn compute(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
@@ -1400,11 +2021,21 @@ impl<'a> Addresses<'a> {
         )
     }
 
-    fn incoming(&self, v: ValueId, block: BlockId, index: usize) -> Option<Vec<ValueId>> {
+    fn carried(&self, v: ValueId, block: BlockId, index: usize) -> bool {
+        let own = self.rank[&block];
+        !self.copies.contains_key(&v)
+            && self.headers.contains(&block)
+            && self.facts.incoming[&block]
+                .iter()
+                .any(|&(pred, slot)| self.rank[&pred] >= own && self.edge_arg((pred, slot), index) != v)
+    }
+
+    fn incoming(&mut self, v: ValueId, block: BlockId, index: usize) -> Option<Vec<ValueId>> {
         let header = self.headers.contains(&block);
         let own = self.rank[&block];
         let mut out = Vec::new();
-        for &(pred, slot) in &self.facts.incoming[&block] {
+        let facts = self.facts;
+        for &(pred, slot) in &facts.incoming[&block] {
             if !self.can_take(pred, slot, block) {
                 continue;
             }
@@ -1922,7 +2553,7 @@ impl<'a> Addresses<'a> {
             }
             Site::Param { block, index } => {
                 let Some(arguments) = self.incoming(v, block, index) else {
-                    if let Some(&bit) = self.loop_bits(block, lane).get(&index) {
+                    if let Some(bit) = self.loop_bit(block, index, lane) {
                         return unassumed(Some(bit));
                     }
                     return unassumed(self.narrowed(v, block, index, lane));
@@ -2481,13 +3112,15 @@ impl Addresses<'_> {
         self.f.blocks[&pred].term.edges().nth(slot).unwrap().args[index]
     }
 
-    fn edges_into(&self, block: BlockId) -> (Edges, Edges) {
+    fn edges_into(&mut self, block: BlockId) -> (Edges, Edges) {
         let own = self.rank[&block];
-        self.facts.incoming[&block]
+        let facts = self.facts;
+        let taken: Edges = facts.incoming[&block]
             .iter()
             .copied()
             .filter(|&(pred, slot)| self.can_take(pred, slot, block))
-            .partition(|&(pred, _)| self.rank[&pred] < own)
+            .collect();
+        taken.into_iter().partition(|&(pred, _)| self.rank[&pred] < own)
     }
 
     fn symbol(&mut self, key: Key, header: BlockId) -> Unknown {
@@ -2599,6 +3232,44 @@ impl Addresses<'_> {
 
     fn word_bit(&mut self, w: ValueId, bit: usize) -> Option<bool> {
         let w = self.copies.get(&w).copied().unwrap_or(w);
+        let key = (w, bit as u8);
+        let fixed = self.fixed.is_some();
+        let cached = if fixed {
+            self.fixed_word_bits.get(&key).copied()
+        } else {
+            self.word_bits.get(&key).copied()
+        };
+        if let Some((r, depth)) = cached {
+            self.depend(depth);
+            return r;
+        }
+        let active = (w, bit as u8, fixed);
+        let outside = match self.active_words.insert(active, self.guessing) {
+            Some(level) if level == self.guessing => return None,
+            outside => outside,
+        };
+        let (r, depth) = self.frame(|this| {
+            if outside.is_some() {
+                this.depend(this.checking);
+            }
+            this.compute_word_bit(w, bit)
+        });
+        match outside {
+            Some(level) => self.active_words.insert(active, level),
+            None => self.active_words.remove(&active),
+        };
+        if depth != FREE {
+            self.journal.push((Entry::WordBit(key), depth));
+        }
+        if fixed {
+            self.fixed_word_bits.insert(key, (r, depth));
+        } else {
+            self.word_bits.insert(key, (r, depth));
+        }
+        r
+    }
+
+    fn compute_word_bit(&mut self, w: ValueId, bit: usize) -> Option<bool> {
         if let Some(k) = self.value(w, bit, None).0.form.as_constant() {
             return Some(k >> bit & 1 != 0);
         }
@@ -2756,12 +3427,33 @@ impl Addresses<'_> {
         }
     }
 
+    fn remembered(
+        &self,
+        kind: Implication,
+        a: ValueId,
+        v: ValueId,
+        edge: Option<(ValueId, bool)>,
+        f: impl FnOnce(&Self) -> bool,
+    ) -> bool {
+        let key = (kind, a, v, edge);
+        if let Some(&holds) = self.implications.borrow().get(&key) {
+            return holds;
+        }
+        let holds = f(self);
+        self.implications.borrow_mut().insert(key, holds);
+        holds
+    }
+
     fn implies(&self, a: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         let a = self.copies.get(&a).copied().unwrap_or(a);
         let v = self.copies.get(&v).copied().unwrap_or(v);
         if a == v {
             return true;
         }
+        self.remembered(Implication::Bit, a, v, edge, |this| this.derives(a, v, edge))
+    }
+
+    fn derives(&self, a: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         match self.facts.op(self.f, a) {
             Some(Op::Int(IntOp::And, x, y)) => {
                 self.implies(x, v, edge) || self.implies(y, v, edge)
@@ -2782,6 +3474,11 @@ impl Addresses<'_> {
 
     fn word_holds(&self, w: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         let w = self.copies.get(&w).copied().unwrap_or(w);
+        let v = self.copies.get(&v).copied().unwrap_or(v);
+        self.remembered(Implication::Holds, w, v, edge, |this| this.holds(w, v, edge))
+    }
+
+    fn holds(&self, w: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         match self.facts.inst(self.f, w) {
             Some(Inst::Effect {
                 op: EffectOp::Wave(WaveOp::Ballot),
@@ -2813,6 +3510,10 @@ impl Addresses<'_> {
         if a == w {
             return true;
         }
+        self.remembered(Implication::Word, a, w, edge, |this| this.narrows(a, w, edge))
+    }
+
+    fn narrows(&self, a: ValueId, w: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         match self.facts.op(self.f, a) {
             Some(Op::Int(IntOp::And, x, y)) => {
                 self.word_implies(x, w, edge) || self.word_implies(y, w, edge)

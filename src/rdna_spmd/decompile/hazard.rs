@@ -1,4 +1,4 @@
-use super::address::{Addresses, Form, Region, UnknownInfo, Value, LANES};
+use super::address::{Addresses, Form, Region, Regions, UnknownInfo, Value, LANES};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::environment::Environment;
@@ -131,29 +131,64 @@ impl Hazards {
                 break;
             }
             addresses.enter(wave);
-            let involved: BTreeSet<usize> = state
-                .iter()
-                .filter(|(_, s)| !settled(s))
-                .flat_map(|(&(p, q), _)| [p, q])
-                .collect();
-            let lanes: Vec<Vec<Option<Place>>> = hazards
-                .accesses
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    if involved.contains(&i) && addresses.reaches_block(a.block) {
-                        places(&mut addresses, a)
-                    } else {
-                        vec![None; LANES]
-                    }
-                })
-                .collect();
             let pairs: Vec<(usize, usize)> = state
                 .iter()
                 .filter(|(_, s)| !settled(s))
                 .map(|(&pair, _)| pair)
                 .collect();
-            for (p, q) in pairs {
+            let involved: BTreeSet<usize> = pairs.iter().flat_map(|&(p, q)| [p, q]).collect();
+            let mut regions: Vec<Vec<Option<Regions>>> = hazards
+                .accesses
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    (0..LANES)
+                        .map(|lane| {
+                            (involved.contains(&i) && addresses.valid(lane))
+                                .then(|| region_of(&mut addresses, a, lane, false))
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut sharing: BTreeSet<(usize, usize)> = pairs
+                .iter()
+                .copied()
+                .filter(|&(p, q)| may_share(env, &regions[p], &regions[q]))
+                .collect();
+            let mut refined: BTreeSet<usize> = BTreeSet::new();
+            loop {
+                let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+                for &(p, q) in &sharing {
+                    for i in [p, q] {
+                        if !refined.contains(&i) && regions[i].iter().flatten().any(|r| !r.single_region()) {
+                            *counts.entry(i).or_default() += 1;
+                        }
+                    }
+                }
+                let Some((&next, _)) = counts.iter().max_by_key(|&(&i, &n)| (n, std::cmp::Reverse(i))) else {
+                    break;
+                };
+                refined.insert(next);
+                let a = &hazards.accesses[next];
+                regions[next] = (0..LANES)
+                    .map(|lane| addresses.valid(lane).then(|| region_of(&mut addresses, a, lane, true)))
+                    .collect();
+                sharing.retain(|&(p, q)| (p != next && q != next) || may_share(env, &regions[p], &regions[q]));
+            }
+            let precise: BTreeSet<usize> = sharing.iter().flat_map(|&(p, q)| [p, q]).collect();
+            let lanes: Vec<Vec<Option<Place>>> = hazards
+                .accesses
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if precise.contains(&i) {
+                        places(&mut addresses, a)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+            for (p, q) in sharing {
                 let common = loops_of[p].iter().any(|l| loops_of[q].contains(l));
                 let mut now = state[&(p, q)];
                 for (k, together) in [(0, true), (1, false)] {
@@ -376,7 +411,6 @@ fn relevant(
 struct Place {
     region: Region,
     address: Option<Value>,
-    idle: bool,
 }
 
 fn places(addresses: &mut Addresses, a: &Access) -> Vec<Option<Place>> {
@@ -385,18 +419,10 @@ fn places(addresses: &mut Addresses, a: &Access) -> Vec<Option<Place>> {
             if !addresses.valid(lane) {
                 return None;
             }
-            if let Some(p) = a.predicate {
-                if addresses.bit(p, lane, None).0 == Some(false) {
-                    return None;
-                }
-            }
-            let idle = a.kind == Kind::Read
-                && a.exec.is_some_and(|e| addresses.bit(e, lane, None).0 == Some(false));
             let Some(address) = a.address else {
                 return Some(Place {
                     region: Region::Exposed,
                     address: None,
-                    idle,
                 });
             };
             let (value, _) = addresses.operand(address, a.block, lane, a.predicate);
@@ -408,10 +434,55 @@ fn places(addresses: &mut Addresses, a: &Access) -> Vec<Option<Place>> {
             Some(Place {
                 region,
                 address: Some(value),
-                idle,
             })
         })
         .collect()
+}
+
+fn runs(addresses: &mut Addresses, access: &Access, lane: usize) -> bool {
+    addresses.reaches_block(access.block)
+        && access
+            .predicate
+            .is_none_or(|p| addresses.bit(p, lane, None).0 != Some(false))
+}
+
+fn idles(addresses: &mut Addresses, access: &Access, lane: usize) -> bool {
+    access.kind == Kind::Read && access.exec.is_some_and(|e| addresses.bit(e, lane, None).0 == Some(false))
+}
+
+fn region_of(addresses: &mut Addresses, a: &Access, lane: usize, refine: bool) -> Regions {
+    match a.space {
+        Some(Space::Lds) => Regions::one(Some(Region::Lds)),
+        Some(Space::Scratch) => Regions::one(Some(Region::Private)),
+        _ => match a.address {
+            Some(x) => addresses.regions(x, lane, a.predicate, refine),
+            None => Regions::one(None),
+        },
+    }
+}
+
+fn may_share(env: &Environment, p: &[Option<Regions>], q: &[Option<Regions>]) -> bool {
+    let meets = |x: Option<Region>, y: Option<Region>| {
+        overlapping(env, x.unwrap_or(Region::Exposed), y.unwrap_or(Region::Exposed))
+    };
+    let mut all_p = Regions::default();
+    for x in p.iter().flatten() {
+        all_p.union(x);
+    }
+    let mut all_q = Regions::default();
+    for y in q.iter().flatten() {
+        all_q.union(y);
+    }
+    if !all_p.overlaps(&all_q, meets) {
+        return false;
+    }
+    p.iter().enumerate().any(|(a, x)| {
+        x.as_ref().is_some_and(|x| {
+            q.iter()
+                .enumerate()
+                .any(|(b, y)| a != b && y.as_ref().is_some_and(|y| x.overlaps(y, meets)))
+        })
+    })
 }
 
 fn overlapping(env: &Environment, a: Region, b: Region) -> bool {
@@ -443,8 +514,11 @@ fn meet(
             if a == b || !overlapping(env, x.region, y.region) {
                 continue;
             }
-            let both = [x.idle, y.idle];
             let (Some(xa), Some(ya)) = (&x.address, &y.address) else {
+                if !runs(addresses, pa, a) || !runs(addresses, qa, b) {
+                    continue;
+                }
+                let both = [idles(addresses, pa, a), idles(addresses, qa, b)];
                 let old = idle.unwrap_or([true; 2]);
                 idle = Some([old[0] && both[0], old[1] && both[1]]);
                 continue;
@@ -458,9 +532,13 @@ fn meet(
             } else if !may_overlap(unknowns, &xa.form, &ya.form, pa.bytes, qa.bytes, variant) {
                 continue;
             }
+            if !runs(addresses, pa, a) || !runs(addresses, qa, b) {
+                continue;
+            }
             if excluded(addresses, (pa, a, &xa.form), (qa, b, &ya.form), variant) {
                 continue;
             }
+            let both = [idles(addresses, pa, a), idles(addresses, qa, b)];
             let old = idle.unwrap_or([true; 2]);
             idle = Some([old[0] && both[0], old[1] && both[1]]);
             if idle == Some([false; 2]) {
