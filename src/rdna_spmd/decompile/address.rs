@@ -2682,9 +2682,9 @@ impl<'a> Addresses<'a> {
                 match (pred, difference.as_constant()) {
                     (IntPred::Ne, Some(d)) if d != 0 => Some(true),
                     (IntPred::Eq, Some(d)) if d != 0 => Some(false),
+                    _ if wide => None,
                     (IntPred::Eq, Some(0)) => Some(true),
                     (IntPred::Ne, Some(0)) => Some(false),
-                    _ if wide => None,
                     (_, Some(d)) => match (self.bounds(&x.form), self.bounds(&y.form)) {
                         (Some(bx), Some(by)) => decide(pred, bx, by).or_else(|| offset(pred, d, by)),
                         (_, Some(by)) => offset(pred, d, by),

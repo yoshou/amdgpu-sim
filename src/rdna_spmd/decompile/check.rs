@@ -1300,9 +1300,9 @@ impl<'c, 'a> Explore<'c, 'a> {
                 h
             }
             Form::Load(_, _, a) => self.leaves[*a],
-            Form::Hazard(block, index, a) => {
+            Form::Hazard(block, index, t) => {
                 let loaded = self.check.loaded[&(*block, *index)];
-                self.check.or(self.leaves[*a], loaded)
+                self.check.or(self.leaves[*t], loaded)
             }
             Form::Opaque(..) => Bdd::TRUE,
         };
@@ -1321,6 +1321,15 @@ impl<'c, 'a> Explore<'c, 'a> {
         }
         let assume = self.check.and(self.assume, self.check.safe);
         self.check.and(assume, leaves) == Bdd::FALSE
+    }
+
+    fn loaded(&mut self, ty: Ty, v: ValueId, t: usize) -> usize {
+        match self.check.facts.site[v.0] {
+            Site::Inst { block, index } if self.check.loaded.contains_key(&(block, index)) => {
+                self.intern(ty, Form::Hazard(block, index, t))
+            }
+            _ => t,
+        }
     }
 
     fn form_bits(&mut self, side: usize, v: ValueId, t: usize, view: bool) -> Bdd {
@@ -1869,17 +1878,8 @@ impl<'c, 'a> Explore<'c, 'a> {
                     let pred = self.bits_of(ev, inputs[1]);
                     let same = if self.decide(pred, cond, side) == Some(true) {
                         let a = self.operand(ev, inputs[0]);
-                        let at = match facts.site[out.0] {
-                            Site::Inst { block, index } => Some((block, index)),
-                            _ => None,
-                        };
-                        let form = match at {
-                            Some((block, index)) if self.check.loaded.contains_key(&(block, index)) => {
-                                Form::Hazard(block, index, a)
-                            }
-                            _ => Form::Load(*space, *size, a),
-                        };
-                        Some(self.intern(ty, form))
+                        let t = self.intern(ty, Form::Load(*space, *size, a));
+                        Some(self.loaded(ty, out, t))
                     } else {
                         None
                     };
@@ -1898,13 +1898,10 @@ impl<'c, 'a> Explore<'c, 'a> {
             } => {
                 let terms: Vec<usize> =
                     args.values().iter().map(|&a| self.operand(ev, a)).collect();
-                let hazard = match outputs.first().map(|o| facts.site[o.0 .0]) {
-                    Some(Site::Inst { block, index }) => self.check.loaded.contains_key(&(block, index)),
-                    _ => false,
-                };
                 for (i, &(v, ty)) in outputs.iter().enumerate() {
-                    let t = (!hazard).then(|| self.intern(ty, Form::Target(*op, terms.clone(), i)));
-                    let d = self.formed(side, v, t);
+                    let t = self.intern(ty, Form::Target(*op, terms.clone(), i));
+                    let t = self.loaded(ty, v, t);
+                    let d = self.formed(side, v, Some(t));
                     ev.descs.insert(v, d);
                 }
             }

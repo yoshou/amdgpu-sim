@@ -225,9 +225,7 @@ impl Logic {
         assert_ne!(safe, Bdd::FALSE);
         let mut kept = Kept::default();
         for c in self.listed.clone() {
-            let Some(&var) = self.vars.get(&Atom::Marker(c)) else {
-                continue;
-            };
+            let var = self.vars[&Atom::Marker(c)];
             let local = self.m.cofactor(safe, var, true);
             if local != Bdd::FALSE {
                 safe = local;
