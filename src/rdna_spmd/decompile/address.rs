@@ -202,8 +202,12 @@ enum Target {
     Slot(u32, u32),
 }
 
-type Depth = usize;
-const FREE: Depth = usize::MAX;
+type Depth = (usize, usize);
+const FREE: Depth = (usize::MAX, 0);
+
+fn level(d: usize) -> Depth {
+    (d, d)
+}
 
 type Cached<K, V> = HashMap<K, (V, Depth)>;
 type ValueKey = (ValueId, u8, Option<ValueId>);
@@ -514,7 +518,7 @@ impl<'a> Addresses<'a> {
         let mut headers: Vec<BlockId> = self.headers.iter().copied().collect();
         headers.sort_by_key(|h| self.rank[h]);
         let trips: Vec<Unknown> = headers.iter().map(|&h| self.trips(h)).collect();
-        self.pending = trips.iter().map(|&u| (u, 1)).collect();
+        self.pending = trips.iter().map(|&u| (u, level(1))).collect();
         for (&header, &u) in headers.iter().zip(&trips) {
             let (last, _) = self.sandbox(|this| this.last_trip(header, u));
             if let Some(last) = last {
@@ -539,7 +543,7 @@ impl<'a> Addresses<'a> {
         let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
         let (decided, depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             this.decide(cond)
         });
@@ -586,7 +590,7 @@ impl<'a> Addresses<'a> {
         };
         let (reached, depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             let facts = this.facts;
             let own = this.rank[&b];
@@ -680,7 +684,7 @@ impl<'a> Addresses<'a> {
             return;
         }
         if let Some(top) = self.deps.borrow_mut().last_mut() {
-            *top = (*top).min(depth);
+            *top = (top.0.min(depth.0), top.1.max(depth.1));
         }
     }
 
@@ -698,94 +702,100 @@ impl<'a> Addresses<'a> {
         self.checking -= 1;
         let entries: Vec<(Entry, Depth)> = self.journal.drain(mark..).collect();
         for (entry, at) in entries {
-            if at < depth {
+            if at.1 < depth {
                 self.journal.push((entry, at));
                 continue;
             }
             match entry {
                 Entry::Value(key) => {
-                    if self.values.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.values.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.values.remove(&key);
                     }
-                    if self.fixed_values.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_values.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_values.remove(&key);
                     }
                 }
                 Entry::Bit(key) => {
-                    if self.bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.bits.remove(&key);
                     }
-                    if self.fixed_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_bits.remove(&key);
                     }
                 }
                 Entry::Key(key) => {
-                    if self.keys.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.keys.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.keys.remove(&key);
                     }
-                    if self.fixed_keys.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_keys.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_keys.remove(&key);
                     }
                 }
                 Entry::Slot(key) => {
-                    if self.slots.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.slots.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.slots.remove(&key);
                     }
-                    if self.fixed_slots.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_slots.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_slots.remove(&key);
                     }
                 }
                 Entry::LoopBits(key) => {
-                    if self.loop_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.loop_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.loop_bits.remove(&key);
                     }
-                    if self.fixed_loop_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_loop_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_loop_bits.remove(&key);
                     }
                 }
                 Entry::Step(key) => {
-                    if self.steps.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.steps.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.steps.remove(&key);
                     }
-                    if self.fixed_steps.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_steps.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_steps.remove(&key);
                     }
                 }
                 Entry::Region(key, refine) => {
                     let cache = if refine { &mut self.refined } else { &mut self.regions };
-                    if cache.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if cache.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         cache.remove(&key);
                     }
                 }
                 Entry::WordBit(key) => {
-                    if self.word_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.word_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.word_bits.remove(&key);
                     }
-                    if self.fixed_word_bits.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_word_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_word_bits.remove(&key);
                     }
                 }
                 Entry::Decision(key) => {
-                    if self.decisions.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.decisions.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.decisions.remove(&key);
                     }
                 }
                 Entry::Reach(key) => {
-                    if self.reach.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.reach.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.reach.remove(&key);
                     }
                 }
                 Entry::Summarized(key) => {
-                    if self.summarized.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.summarized.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.summarized.remove(&key);
                     }
-                    if self.fixed_summarized.get(&key).is_some_and(|e| e.1 >= depth) {
+                    if self.fixed_summarized.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.fixed_summarized.remove(&key);
                     }
                 }
             }
         }
-        let outer = if rests < depth { rests } else { FREE };
+        let outer = if rests.1 < depth {
+            rests
+        } else if rests.0 >= depth {
+            FREE
+        } else {
+            (rests.0, depth - 1)
+        };
         self.depend(outer);
         (result, outer)
     }
@@ -955,7 +965,7 @@ impl<'a> Addresses<'a> {
         let outside = self.begin_slot(key)?;
         let (result, depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             this.join_slot(block, address, bytes, lane)
         });
@@ -1016,7 +1026,7 @@ impl<'a> Addresses<'a> {
 
     fn may_guess(&mut self, header: BlockId) -> bool {
         if self.guessing_about.contains_key(&header) {
-            self.depend(self.checking);
+            self.depend(level(self.checking));
             return false;
         }
         true
@@ -1030,7 +1040,7 @@ impl<'a> Addresses<'a> {
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
         self.sandbox(|this| {
-            let depth = this.checking;
+            let depth = level(this.checking);
             this.guessing += 1;
             let params: Vec<ValueId> = this.f.blocks[&header].params.iter().map(|p| p.0).collect();
             for &((index, l), b) in bits {
@@ -1154,7 +1164,7 @@ impl<'a> Addresses<'a> {
         };
         let ((bits, steps), depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             this.summary(header, seed)
         });
@@ -1651,7 +1661,7 @@ impl<'a> Addresses<'a> {
         };
         let (r, depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             this.compute(v, lane, assume)
         });
@@ -1721,7 +1731,7 @@ impl<'a> Addresses<'a> {
         };
         let (r, depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             this.compute_bit(v, lane, assume)
         });
@@ -3250,7 +3260,7 @@ impl Addresses<'_> {
         };
         let (r, depth) = self.frame(|this| {
             if outside.is_some() {
-                this.depend(this.checking);
+                this.depend(level(this.checking));
             }
             this.compute_word_bit(w, bit)
         });
