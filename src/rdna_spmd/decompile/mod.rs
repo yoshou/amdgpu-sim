@@ -4,6 +4,7 @@ mod direct;
 mod fold;
 mod hazard;
 mod logic;
+mod provenance;
 mod rewrite;
 mod search;
 

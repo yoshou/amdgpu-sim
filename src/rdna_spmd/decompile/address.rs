@@ -3,8 +3,9 @@ use crate::rdna_spmd::engine::{EntryLayout, WORKGROUP_ID_X, WORKGROUP_ID_YZ};
 use crate::rdna_spmd::environment::Environment;
 use crate::rdna_spmd::hash::HashMap;
 type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::rdna_spmd::hash::Mix>>;
+use super::provenance::{bounds, Exposure, Spill};
 use crate::rdna_spmd::ir::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const LANES: usize = 32;
 
@@ -243,6 +244,7 @@ pub struct Regions {
 }
 
 impl Regions {
+    #[inline]
     pub fn one(r: Option<Region>) -> Self {
         Self {
             any: false,
@@ -250,6 +252,7 @@ impl Regions {
         }
     }
 
+    #[inline]
     fn any() -> Self {
         Self {
             any: true,
@@ -257,12 +260,14 @@ impl Regions {
         }
     }
 
-    fn add(&mut self, r: Option<Region>) {
+    #[inline]
+    pub(super) fn add(&mut self, r: Option<Region>) {
         if let Err(i) = self.list.binary_search(&r) {
             self.list.insert(i, r);
         }
     }
 
+    #[inline]
     pub fn union(&mut self, other: &Regions) {
         self.any |= other.any;
         for &r in &other.list {
@@ -270,6 +275,7 @@ impl Regions {
         }
     }
 
+    #[inline]
     fn joined(mut self, other: &Regions) -> Self {
         self.union(other);
         self
@@ -299,9 +305,25 @@ impl Regions {
         self.single().is_some()
     }
 
+    #[inline]
+    fn within(&self, other: &Regions) -> bool {
+        other.any || (!self.any && self.list.iter().all(|r| other.list.contains(r)))
+    }
+
     pub fn overlaps(&self, other: &Regions, f: impl Fn(Option<Region>, Option<Region>) -> bool) -> bool {
         self.any || other.any || self.list.iter().any(|&a| other.list.iter().any(|&b| f(a, b)))
     }
+
+    #[inline]
+    pub fn reaches(&self, r: Option<Region>, f: impl Fn(Option<Region>, Option<Region>) -> bool) -> bool {
+        self.any || self.list.iter().any(|&a| f(a, r))
+    }
+
+    #[inline]
+    pub fn lost(&self) -> bool {
+        self.any || self.list.contains(&None)
+    }
+
 }
 
 fn in_lane<T>(x: T) -> Assumed<T> {
@@ -330,7 +352,7 @@ pub struct Addresses<'a> {
     env: &'a Environment,
     headers: BTreeSet<BlockId>,
     rank: HashMap<BlockId, usize>,
-    copies: HashMap<ValueId, ValueId>,
+    copies: Copies,
     stores: HashMap<BlockId, Vec<Store>>,
     pub unknowns: Vec<UnknownInfo>,
     keys: Cached<Key, Unknown>,
@@ -380,6 +402,17 @@ pub struct Addresses<'a> {
     word_bits: Cached<(ValueId, u8), Option<bool>>,
     fixed_word_bits: Cached<(ValueId, u8), Option<bool>>,
     active_words: HashMap<(ValueId, u8, bool), usize>,
+    known: Vec<Option<Option<Region>>>,
+    plain: Vec<bool>,
+    bounds: HashMap<ValueId, Vec<Regions>>,
+    looped: BTreeMap<(ValueId, u8, bool), usize>,
+    checked: BTreeSet<(ValueId, u8, bool)>,
+    grown: HashMap<(ValueId, u8, bool), Regions>,
+    split: HashSet<(ValueId, bool)>,
+    loaded: HashMap<ValueId, Regions>,
+    spills: Vec<Spill>,
+    sources: HashMap<ValueId, Vec<usize>>,
+    exposing: Vec<Exposure>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -398,6 +431,7 @@ impl<'a> Addresses<'a> {
         entry: EntryLayout,
         env: &'a Environment,
         headers: BTreeSet<BlockId>,
+        registry: &DialectRegistry,
     ) -> Self {
         let idom = dominators(f, facts);
         let reaches = reaches(f, facts);
@@ -464,7 +498,34 @@ impl<'a> Addresses<'a> {
             word_bits: HashMap::default(),
             fixed_word_bits: HashMap::default(),
             active_words: HashMap::default(),
+            known: Vec::new(),
+            plain: Vec::new(),
+            bounds: HashMap::default(),
+            looped: BTreeMap::new(),
+            checked: BTreeSet::new(),
+            grown: HashMap::default(),
+            split: HashSet::default(),
+            loaded: HashMap::default(),
+            spills: Vec::new(),
+            sources: HashMap::default(),
+            exposing: Vec::new(),
         };
+        let found = bounds(f, facts, &this.copies, &this.users, inputs, &this.entry, env, &this.headers, registry);
+        (this.known, this.plain, this.bounds, this.loaded) = (found.known, found.plain, found.carried, found.loaded);
+        (this.spills, this.exposing) = (found.spills, found.exposing);
+        for &v in this.bounds.keys() {
+            let Site::Inst { block, index } = facts.site[v.0] else {
+                continue;
+            };
+            let at = this.rank[&block];
+            let from: Vec<usize> = (0..this.spills.len())
+                .filter(|&i| {
+                    let (b, k) = this.spills[i].at;
+                    (b == block && k < index) || reaches[this.rank[&b]][at]
+                })
+                .collect();
+            this.sources.insert(v, from);
+        }
         for &b in &facts.order {
             for inst in &f.blocks[&b].insts {
                 if let Inst::Effect {
@@ -515,6 +576,8 @@ impl<'a> Addresses<'a> {
         self.fixed_word_bits.clear();
         self.decisions.clear();
         self.reach.clear();
+        self.looped.clear();
+        self.checked.clear();
         let mut headers: Vec<BlockId> = self.headers.iter().copied().collect();
         headers.sort_by_key(|h| self.rank[h]);
         let trips: Vec<Unknown> = headers.iter().map(|&h| self.trips(h)).collect();
@@ -1753,7 +1816,23 @@ impl<'a> Addresses<'a> {
         self.assumed_regions(v, lane, assume, refine).0
     }
 
+    pub fn read_regions(&mut self, at: (BlockId, usize), lane: usize, exec: Option<ValueId>, refine: bool) -> Regions {
+        let mut set = Regions::one(None);
+        if let Inst::Target { args, .. } = &self.f.blocks[&at.0].insts[at.1] {
+            for &x in args.values() {
+                match self.known[x.0] {
+                    Some(r) => set.add(r),
+                    None => set.union(&self.regions(x, lane, exec, refine)),
+                }
+            }
+        }
+        set
+    }
+
     fn assumed_regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Assumed<Regions> {
+        if let Some(r) = self.known[v.0] {
+            return unassumed(Regions::one(r));
+        }
         let lane = self.canonical(v, lane);
         let l = lane as u8;
         let cache = if refine { &self.refined } else { &self.regions };
@@ -1813,11 +1892,12 @@ impl<'a> Addresses<'a> {
         }
         let (f, facts) = (self.f, self.facts);
         match facts.site[v.0] {
-            Site::Param { block, index } if block == f.entry => Regions::one(match self.inputs[index].source {
-                ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => Some(Region::Kernarg),
-                ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => Some(Region::Dispatch),
-                _ => None,
-            }),
+            Site::Param { block, index } if block == f.entry => match self.inputs[index].source {
+                ParameterSource::Vgpr(n) if n != 0 => Regions::default(),
+                ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => Regions::one(Some(Region::Kernarg)),
+                ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => Regions::one(Some(Region::Dispatch)),
+                _ => none(),
+            },
             Site::Param { block, index } => {
                 let header = self.headers.contains(&block);
                 let own = self.rank[&block];
@@ -1830,8 +1910,11 @@ impl<'a> Addresses<'a> {
                     reliance.lane |= u.lane;
                     set.union(&r);
                 }
-                if self.carried(v, block, index) || set.single().is_none() {
+                if self.plain[v.0] {
                     set.add(None);
+                }
+                if self.bounds.contains_key(&v) {
+                    self.carry(v, lane, refine, &mut set, reliance);
                 }
                 set
             }
@@ -1876,13 +1959,41 @@ impl<'a> Addresses<'a> {
                             }
                         }
                         reliance.open = true;
-                        let mut set = x.joined(&y);
-                        set.add(None);
-                        set
+                        x.joined(&y)
+                    }
+                    Op::Int(IntOp::And, a, b) => {
+                        let mask = |x: ValueId| match facts.op(f, x) {
+                            Some(Op::Const(_, k)) => Some(k as u32),
+                            _ => None,
+                        };
+                        match (mask(a), mask(b)) {
+                            (None, Some(m)) if aligns(m) => regions!(a),
+                            (Some(m), None) if aligns(m) => regions!(b),
+                            (None, None) => {
+                                let mut set = regions!(a).combine(&regions!(b), |x, y| match (x, y) {
+                                    (Some(r), None) | (None, Some(r)) => Some(r),
+                                    _ => None,
+                                });
+                                set.add(None);
+                                set
+                            }
+                            _ => none(),
+                        }
                     }
                     Op::Int(IntOp::Or | IntOp::Xor, a, b) => {
-                        let mut set = regions!(a).joined(&regions!(b));
-                        set.add(None);
+                        let (x, y) = (regions!(a), regions!(b));
+                        if x.any || y.any {
+                            return Regions::any();
+                        }
+                        let mut set = Regions::default();
+                        for &r in x.list.iter().chain(&y.list) {
+                            if r.is_some() {
+                                set.add(r);
+                            }
+                        }
+                        if x.list.contains(&None) && y.list.contains(&None) {
+                            set.add(None);
+                        }
                         set
                     }
                     Op::Int(IntOp::LShr, a, _) if f.types[v.0] != Ty::I64 => {
@@ -1908,7 +2019,14 @@ impl<'a> Addresses<'a> {
                         let (value, u) = self.value(v, lane, assume);
                         *reliance |= u;
                         reliance.lane |= !facts.uniform[v.0];
-                        Regions::one(value.region)
+                        let mut set = Regions::one(value.region);
+                        if (self.bounds.contains_key(&v) || self.loaded.contains_key(&v)) && self.unresolved(v, lane, &value) {
+                            match self.loaded.get(&v) {
+                                Some(loaded) => set.union(loaded),
+                                None => self.carry(v, lane, refine, &mut set, reliance),
+                            }
+                        }
+                        set
                     } else {
                         none()
                     }
@@ -1917,10 +2035,7 @@ impl<'a> Addresses<'a> {
                     op: EffectOp::Wave(WaveOp::ReadFirstLane),
                     inputs,
                     ..
-                } => {
-                    let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-                    self.agreed_regions(inputs[0], &lanes)
-                }
+                } => self.lanes_regions(inputs[0], false),
                 Inst::Effect {
                     op: EffectOp::Wave(WaveOp::ReadLane),
                     inputs,
@@ -1930,8 +2045,8 @@ impl<'a> Addresses<'a> {
                     match self.value(inputs[1], lane, None).0.form.as_constant() {
                         Some(k) => self.assumed_regions(inputs[0], (k & 31) as usize, None, refine).0,
                         None => {
-                            let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-                            self.agreed_regions(inputs[0], &lanes)
+                            let partial = !(0..LANES).all(|l| self.valid(l));
+                            self.lanes_regions(inputs[0], partial)
                         }
                     }
                 }
@@ -1944,8 +2059,21 @@ impl<'a> Addresses<'a> {
                     match self.value(inputs[1], lane, None).0.form.as_constant() {
                         Some(k) if (k & 31) as usize == lane => self.assumed_regions(inputs[0], lane, None, refine).0,
                         Some(_) => self.assumed_regions(inputs[2], lane, None, refine).0,
-                        None => none(),
+                        None => {
+                            let mut set = self.assumed_regions(inputs[0], lane, None, refine).0;
+                            set.union(&self.assumed_regions(inputs[2], lane, None, refine).0);
+                            set
+                        }
                     }
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)),
+                    inputs,
+                    ..
+                } => {
+                    reliance.lane = true;
+                    let silent = *op == WaveOp::Bpermute || !(0..LANES).all(|l| self.valid(l));
+                    self.lanes_regions(inputs[1], silent)
                 }
                 _ => none(),
             },
@@ -1953,22 +2081,235 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    fn agreed_regions(&mut self, x: ValueId, lanes: &[usize]) -> Regions {
-        let mut agreed: Option<Regions> = None;
-        for &l in lanes {
-            let r = self.regions(x, l, None, false);
-            agreed = Some(match agreed {
-                None => r,
-                Some(old) if old.any => r,
-                Some(old) if r.any => old,
-                Some(old) => Regions {
-                    any: false,
-                    list: old.list.into_iter().filter(|x| r.list.contains(x)).collect(),
-                },
-            });
+    fn carry(&mut self, v: ValueId, lane: usize, refine: bool, set: &mut Regions, reliance: &mut Reliance) {
+        for tier in [false, true] {
+            if tier && !refine {
+                continue;
+            }
+            if let Some(grown) = self.grown.get(&(v, ALL, tier)) {
+                set.union(grown);
+            }
+            if self.split.contains(&(v, tier)) {
+                reliance.lane = true;
+                if let Some(grown) = self.grown.get(&(v, lane as u8, tier)) {
+                    set.union(grown);
+                }
+            }
         }
-        let mut set = agreed.unwrap_or_default();
-        set.add(None);
+        let bound = &self.bounds[&v];
+        if !bound[if bound.len() == 1 { 0 } else { lane }].within(set) {
+            let key = (v, if reliance.lane { lane as u8 } else { ALL }, refine);
+            self.looped.entry(key).or_insert(lane);
+        }
+    }
+
+    fn stored_regions(&mut self, v: ValueId, lane: usize, refine: bool, held: &Regions) -> Assumed<Regions> {
+        let mut set = Regions::default();
+        let Site::Inst { block, index } = self.facts.site[v.0] else {
+            return (set, Reliance::default());
+        };
+        let Inst::Effect {
+            op: EffectOp::Memory {
+                op: MemoryOp::Load(size), ..
+            },
+            inputs,
+            ..
+        } = &self.f.blocks[&block].insts[index]
+        else {
+            return (set, Reliance::default());
+        };
+        let (address, mut reliance) = self.value(inputs[0], lane, Some(inputs[1]));
+        reliance.lane |= !self.facts.uniform[inputs[0].0];
+        let words = self
+            .bounds(&address.form)
+            .map(|(low, high)| ((low / 4) as u32, (high + size.bytes() as u64).div_ceil(4) as u32));
+        let sources = self.sources.get(&v).cloned().unwrap_or_default();
+        for i in sources {
+            if let (Some((a, b)), Some((c, d))) = (words, self.spills[i].words) {
+                if b <= c || d <= a {
+                    continue;
+                }
+            }
+            if self.spills[i].part(lane).within(held) {
+                continue;
+            }
+            let mask = self.spills[i].mask;
+            for k in 0..self.spills[i].data.len() {
+                let (r, u) = self.assumed_regions(self.spills[i].data[k], lane, Some(mask), refine);
+                reliance |= u;
+                set.union(&r);
+            }
+        }
+        (set, reliance)
+    }
+
+    fn feeding(&mut self, v: ValueId, lane: usize, refine: bool, held: &Regions) -> Assumed<Regions> {
+        match self.facts.site[v.0] {
+            Site::Param { .. } => self.back_regions(v, lane, refine),
+            _ => self.stored_regions(v, lane, refine, held),
+        }
+    }
+
+    fn back_regions(&mut self, v: ValueId, lane: usize, refine: bool) -> Assumed<Regions> {
+        let mut set = Regions::default();
+        let mut reliance = Reliance::default();
+        let Site::Param { block, index } = self.facts.site[v.0] else {
+            return (set, reliance);
+        };
+        let own = self.rank[&block];
+        let back: Vec<(BlockId, usize)> = self.facts.incoming[&block]
+            .iter()
+            .copied()
+            .filter(|&(pred, _)| self.rank[&pred] >= own)
+            .collect();
+        for e in back {
+            let (r, u) = self.assumed_regions(self.edge_arg(e, index), lane, None, refine);
+            reliance |= u;
+            set.union(&r);
+        }
+        (set, reliance)
+    }
+
+    pub fn settle_loops(&mut self) -> bool {
+        let mut grew = false;
+        loop {
+            let pending: Vec<((ValueId, u8, bool), usize)> = self
+                .looped
+                .iter()
+                .filter(|(key, _)| !self.checked.contains(key))
+                .map(|(&key, &lane)| (key, lane))
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for ((v, l, refine), first) in pending {
+                self.checked.insert((v, l, refine));
+                let held = self.regions(v, first, None, refine);
+                let bound = self.bounds[&v].clone();
+                let all: Vec<usize> = (0..LANES).filter(|&k| self.valid(k)).collect();
+                let (lanes, mut known) = match (l == ALL, bound.len() > 1) {
+                    (true, true) => (all, None),
+                    (true, false) => {
+                        let (found, u) = self.feeding(v, first, false, &held);
+                        (if u.lane { all } else { vec![first] }, Some((found, u)))
+                    }
+                    _ => (vec![first], None),
+                };
+                for lane in lanes {
+                    let own = &bound[if bound.len() == 1 { 0 } else { lane }];
+                    if own.within(&held) {
+                        continue;
+                    }
+                    let (found, u) = if !own.any && own.list.iter().all(Option::is_none) {
+                        (own.clone(), in_lane(()).1)
+                    } else {
+                        let cached = if lane == first { known.take() } else { None };
+                        let coarse = match cached {
+                            Some(coarse) => coarse,
+                            None => self.feeding(v, lane, false, &held),
+                        };
+                        if coarse.0.within(&held) {
+                            continue;
+                        }
+                        if refine {
+                            self.feeding(v, lane, true, &held)
+                        } else {
+                            coarse
+                        }
+                    };
+                    if found.within(&held) {
+                        continue;
+                    }
+                    let key = if l == ALL && !u.lane {
+                        (v, ALL, refine)
+                    } else {
+                        self.split.insert((v, refine));
+                        (v, lane as u8, refine)
+                    };
+                    let grown = self.grown.entry(key).or_default();
+                    if !found.within(grown) {
+                        grown.union(&found);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if grew {
+            self.regions.clear();
+            self.refined.clear();
+            self.looped.clear();
+            self.checked.clear();
+        }
+        grew
+    }
+
+    fn unresolved(&self, v: ValueId, lane: usize, value: &Value) -> bool {
+        let key = Key::Value(v, (!self.facts.uniform[v.0]).then_some(lane as u8));
+        let found = match self.fixed {
+            Some(_) => self.fixed_keys.get(&key).or_else(|| self.keys.get(&key)),
+            None => self.keys.get(&key),
+        };
+        value.region.is_none() && value.form.constant == 0 && found.is_some_and(|&(u, _)| value.form.terms == [(u, 1)])
+    }
+
+    pub fn pending(&self) -> BTreeSet<(ValueId, u8, bool)> {
+        self.looped.keys().copied().collect()
+    }
+
+    pub fn forget(&mut self, kept: &BTreeSet<(ValueId, u8, bool)>) {
+        self.looped.retain(|key, _| kept.contains(key));
+        self.regions.clear();
+        self.refined.clear();
+    }
+
+    pub fn exposable(&self) -> BTreeSet<u64> {
+        self.exposing.iter().flat_map(|e| e.candidates.iter().copied()).collect()
+    }
+
+    pub fn expose(&mut self, open: &[u64], stake: &[u64]) -> Vec<u64> {
+        let mut found: Vec<u64> = Vec::new();
+        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+        for e in self.exposing.clone() {
+            let mut fresh: Vec<u64> = e
+                .candidates
+                .iter()
+                .copied()
+                .filter(|id| stake.contains(id) && !open.contains(id) && !found.contains(id))
+                .collect();
+            for &lane in &lanes {
+                for &x in &e.operands {
+                    if fresh.is_empty() {
+                        break;
+                    }
+                    let meets = |set: &Regions, id: u64| set.any || set.list.contains(&Some(Region::Allocation(id)));
+                    let coarse = self.regions(x, lane, e.assume, false);
+                    if !fresh.iter().any(|&id| meets(&coarse, id)) {
+                        continue;
+                    }
+                    let refined = self.regions(x, lane, e.assume, true);
+                    fresh.retain(|&id| {
+                        let hit = meets(&refined, id);
+                        if hit {
+                            found.push(id);
+                        }
+                        !hit
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    fn lanes_regions(&mut self, x: ValueId, silent: bool) -> Regions {
+        let mut set = Regions::default();
+        if silent {
+            set.add(None);
+        }
+        for l in 0..LANES {
+            if self.valid(l) {
+                set.union(&self.regions(x, l, None, false));
+            }
+        }
         set
     }
 
@@ -2171,7 +2512,12 @@ impl<'a> Addresses<'a> {
             }
             Op::Int(IntOp::And, a, b) => {
                 let (a, b) = (get!(self, a), get!(self, b));
-                match (a.form.as_constant(), b.form.as_constant()) {
+                let region = match (a.form.as_constant(), b.form.as_constant()) {
+                    (_, Some(m)) if b.region.is_none() && aligns(m) => a.region,
+                    (Some(m), _) if a.region.is_none() && aligns(m) => b.region,
+                    _ => None,
+                };
+                let masked = match (a.form.as_constant(), b.form.as_constant()) {
                     (Some(x), Some(y)) => Value::constant(x & y),
                     (Some(m), None) | (None, Some(m)) => {
                         let form = if a.form.as_constant().is_some() { &b.form } else { &a.form };
@@ -2181,7 +2527,8 @@ impl<'a> Addresses<'a> {
                         }
                     }
                     _ => self.opaque(v, lane, None),
-                }
+                };
+                Value { region, ..masked }
             }
             Op::Int(k @ (IntOp::Or | IntOp::Xor), a, b) => {
                 let (a, b) = (get!(self, a), get!(self, b));
@@ -2798,7 +3145,7 @@ fn dominators(f: &Func, facts: &Facts) -> Vec<usize> {
     idom.into_iter().map(|d| d.unwrap_or(0)).collect()
 }
 
-const PRIVATE_MEMORY: ValueId = ValueId(usize::MAX);
+pub(super) const PRIVATE_MEMORY: ValueId = ValueId(usize::MAX);
 
 fn users(f: &Func, facts: &Facts) -> HashMap<ValueId, Vec<ValueId>> {
     let mut users: HashMap<ValueId, Vec<ValueId>> = HashMap::default();
@@ -2891,112 +3238,130 @@ fn reaches(f: &Func, facts: &Facts) -> Vec<Vec<bool>> {
         .collect()
 }
 
-fn copies(f: &Func, facts: &Facts) -> HashMap<ValueId, ValueId> {
+pub(super) struct Copies(Vec<ValueId>);
+
+impl Copies {
+    pub(super) fn get(&self, v: &ValueId) -> Option<&ValueId> {
+        let root = &self.0[v.0];
+        (root != v).then_some(root)
+    }
+
+    pub(super) fn contains_key(&self, v: &ValueId) -> bool {
+        self.0[v.0] != *v
+    }
+}
+
+fn copies(f: &Func, facts: &Facts) -> Copies {
+    const NONE: u32 = u32::MAX;
+    let n = f.types.len();
+    let edges: Vec<Vec<&[ValueId]>> = facts
+        .order
+        .iter()
+        .map(|b| {
+            facts.incoming[b]
+                .iter()
+                .map(|&(pred, slot)| &f.blocks[&pred].term.edges().nth(slot).unwrap().args[..])
+                .collect()
+        })
+        .collect();
+    let mut place = vec![(NONE, 0u32); n];
     let mut params: Vec<ValueId> = Vec::new();
-    let mut incoming: HashMap<ValueId, Vec<ValueId>> = HashMap::default();
-    for &b in &facts.order {
+    for (r, &b) in facts.order.iter().enumerate() {
         if b == f.entry {
             continue;
         }
         for (index, &(p, _)) in f.blocks[&b].params.iter().enumerate() {
             params.push(p);
-            incoming.insert(p, facts.arguments(f, b, index).collect());
+            place[p.0] = (r as u32, index as u32);
         }
     }
-    struct Walk {
-        index: HashMap<ValueId, usize>,
-        low: HashMap<ValueId, usize>,
-        stack: Vec<ValueId>,
-        on: HashSet<ValueId>,
-        next: usize,
-        components: Vec<Vec<ValueId>>,
-    }
-    let mut w = Walk {
-        index: HashMap::default(),
-        low: HashMap::default(),
-        stack: Vec::new(),
-        on: HashSet::default(),
-        next: 0,
-        components: Vec::new(),
+    let args = |p: ValueId| {
+        let (r, index) = place[p.0];
+        edges[r as usize].iter().map(move |e| e[index as usize])
     };
-    for &root in &params {
-        if w.index.contains_key(&root) {
+    let mut order = vec![NONE; n];
+    let mut low = vec![0u32; n];
+    let mut on = vec![false; n];
+    let mut component = vec![NONE; n];
+    let mut root: Vec<ValueId> = (0..n).map(ValueId).collect();
+    let mut stack: Vec<ValueId> = Vec::new();
+    let mut members: Vec<ValueId> = Vec::new();
+    let (mut next, mut count) = (0u32, 0u32);
+    for &start in &params {
+        if order[start.0] != NONE {
             continue;
         }
-        let mut frames: Vec<(ValueId, usize)> = vec![(root, 0)];
-        w.index.insert(root, w.next);
-        w.low.insert(root, w.next);
-        w.next += 1;
-        w.stack.push(root);
-        w.on.insert(root);
+        let mut frames: Vec<(ValueId, usize)> = vec![(start, 0)];
+        order[start.0] = next;
+        low[start.0] = next;
+        next += 1;
+        stack.push(start);
+        on[start.0] = true;
         while let Some(&mut (v, ref mut at)) = frames.last_mut() {
-            let args = &incoming[&v];
-            if *at < args.len() {
-                let a = args[*at];
+            let (r, index) = place[v.0];
+            let list = &edges[r as usize];
+            if *at < list.len() {
+                let a = list[*at][index as usize];
                 *at += 1;
-                if !incoming.contains_key(&a) {
+                if place[a.0].0 == NONE {
                     continue;
                 }
-                if !w.index.contains_key(&a) {
-                    w.index.insert(a, w.next);
-                    w.low.insert(a, w.next);
-                    w.next += 1;
-                    w.stack.push(a);
-                    w.on.insert(a);
+                if order[a.0] == NONE {
+                    order[a.0] = next;
+                    low[a.0] = next;
+                    next += 1;
+                    stack.push(a);
+                    on[a.0] = true;
                     frames.push((a, 0));
-                } else if w.on.contains(&a) {
-                    let low = w.low[&v].min(w.index[&a]);
-                    w.low.insert(v, low);
+                } else if on[a.0] {
+                    low[v.0] = low[v.0].min(order[a.0]);
                 }
                 continue;
             }
             frames.pop();
             if let Some(&(parent, _)) = frames.last() {
-                let low = w.low[&parent].min(w.low[&v]);
-                w.low.insert(parent, low);
+                low[parent.0] = low[parent.0].min(low[v.0]);
             }
-            if w.low[&v] == w.index[&v] {
-                let mut component = Vec::new();
-                loop {
-                    let x = w.stack.pop().unwrap();
-                    w.on.remove(&x);
-                    component.push(x);
-                    if x == v {
-                        break;
+            if low[v.0] != order[v.0] {
+                continue;
+            }
+            members.clear();
+            loop {
+                let x = stack.pop().unwrap();
+                on[x.0] = false;
+                component[x.0] = count;
+                members.push(x);
+                if x == v {
+                    break;
+                }
+            }
+            let mut outside: Option<ValueId> = None;
+            let mut single = true;
+            'scan: for &p in &members {
+                for a in args(p) {
+                    let a = root[a.0];
+                    if component[a.0] == count {
+                        continue;
                     }
-                }
-                w.components.push(component);
-            }
-        }
-    }
-    let mut copies: HashMap<ValueId, ValueId> = HashMap::default();
-    for component in w.components {
-        let inside: HashSet<ValueId> = component.iter().copied().collect();
-        let mut outside: Option<ValueId> = None;
-        let mut single = true;
-        'scan: for p in &component {
-            for &a in &incoming[p] {
-                let a = copies.get(&a).copied().unwrap_or(a);
-                if inside.contains(&a) {
-                    continue;
-                }
-                match outside {
-                    None => outside = Some(a),
-                    Some(o) if o == a => {}
-                    Some(_) => {
-                        single = false;
-                        break 'scan;
+                    match outside {
+                        None => outside = Some(a),
+                        Some(o) if o == a => {}
+                        Some(_) => {
+                            single = false;
+                            break 'scan;
+                        }
                     }
                 }
             }
-        }
-        if let (true, Some(value)) = (single, outside) {
-            for p in component {
-                copies.insert(p, value);
+            if let (true, Some(value)) = (single, outside) {
+                for &p in &members {
+                    root[p.0] = value;
+                }
             }
+            count += 1;
         }
     }
-    copies
+    Copies(root)
 }
 
 impl Addresses<'_> {
@@ -3551,6 +3916,10 @@ fn agree(step: &mut Option<u32>, found: Option<u32>) -> bool {
         (Some(k), Some(old)) => k == old,
         (None, _) => false,
     }
+}
+
+pub(super) fn aligns(m: u32) -> bool {
+    (!m).wrapping_add(1).is_power_of_two()
 }
 
 fn low_bits(form: &Form, c: u32, op: IntOp) -> Option<Form> {

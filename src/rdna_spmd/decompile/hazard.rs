@@ -101,6 +101,7 @@ impl Hazards {
             program.entry,
             env,
             headers,
+            &program.registry,
         );
         let n = hazards.accesses.len();
         let mut candidates: Vec<(usize, usize)> = Vec::new();
@@ -121,60 +122,31 @@ impl Hazards {
             .iter()
             .map(|a| containing(&loops, rank[&a.block]))
             .collect();
-        let mut state: BTreeMap<(usize, usize), Judgments> = candidates
+        let start: BTreeMap<(usize, usize), Judgments> = candidates
             .into_iter()
             .map(|pair| (pair, [(false, [true; 2]); 2]))
             .collect();
+        let mut state = start.clone();
         let settled = |s: &Judgments| s.iter().all(|&(found, idle)| found && idle == [false; 2]);
-        for wave in 0..waves {
+        let mut open = Opening::default();
+        let mut wave = 0;
+        while wave < waves {
             if state.values().all(settled) {
                 break;
             }
+            let env = open.wide.as_ref().unwrap_or(env);
             addresses.enter(wave);
             let pairs: Vec<(usize, usize)> = state
                 .iter()
-                .filter(|(_, s)| !settled(s))
+                .filter(|(pair, s)| !settled(s) && open.only.as_ref().is_none_or(|o| o.contains(pair)))
                 .map(|(&pair, _)| pair)
                 .collect();
-            let involved: BTreeSet<usize> = pairs.iter().flat_map(|&(p, q)| [p, q]).collect();
-            let mut regions: Vec<Vec<Option<Regions>>> = hazards
-                .accesses
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    (0..LANES)
-                        .map(|lane| {
-                            (involved.contains(&i) && addresses.valid(lane))
-                                .then(|| region_of(&mut addresses, a, lane, false))
-                        })
-                        .collect()
-                })
-                .collect();
-            let mut sharing: BTreeSet<(usize, usize)> = pairs
-                .iter()
-                .copied()
-                .filter(|&(p, q)| may_share(env, &regions[p], &regions[q]))
-                .collect();
-            let mut refined: BTreeSet<usize> = BTreeSet::new();
-            loop {
-                let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
-                for &(p, q) in &sharing {
-                    for i in [p, q] {
-                        if !refined.contains(&i) && regions[i].iter().flatten().any(|r| !r.single_region()) {
-                            *counts.entry(i).or_default() += 1;
-                        }
-                    }
-                }
-                let Some((&next, _)) = counts.iter().max_by_key(|&(&i, &n)| (n, std::cmp::Reverse(i))) else {
-                    break;
-                };
-                refined.insert(next);
-                let a = &hazards.accesses[next];
-                regions[next] = (0..LANES)
-                    .map(|lane| addresses.valid(lane).then(|| region_of(&mut addresses, a, lane, true)))
-                    .collect();
-                sharing.retain(|&(p, q)| (p != next && q != next) || may_share(env, &regions[p], &regions[q]));
-            }
+            let Some((mut regions, sharing)) = shared(&mut addresses, &hazards.accesses, env, &pairs, wave == 0) else {
+                state = start.clone();
+                open.only = None;
+                wave = 0;
+                continue;
+            };
             let precise: BTreeSet<usize> = sharing.iter().flat_map(|&(p, q)| [p, q]).collect();
             let lanes: Vec<Vec<Option<Place>>> = hazards
                 .accesses
@@ -182,13 +154,13 @@ impl Hazards {
                 .enumerate()
                 .map(|(i, a)| {
                     if precise.contains(&i) {
-                        places(&mut addresses, a)
+                        places(&mut addresses, a, &regions[i])
                     } else {
                         Vec::new()
                     }
                 })
                 .collect();
-            for (p, q) in sharing {
+            for &(p, q) in &sharing {
                 let common = loops_of[p].iter().any(|l| loops_of[q].contains(l));
                 let mut now = state[&(p, q)];
                 for (k, together) in [(0, true), (1, false)] {
@@ -221,6 +193,14 @@ impl Hazards {
                 }
                 state.insert((p, q), now);
             }
+            let judged = Judged {
+                accesses: &hazards.accesses,
+                lanes: &lanes,
+                pairs: &pairs,
+                sharing: &sharing,
+            };
+            let outcome = widened(&mut addresses, env, &judged, &mut regions, &mut open.stake, wave == 0);
+            wave = open.after(outcome, &mut state, &start, wave);
         }
         for ((p, q), s) in state {
             for (k, apart) in [(0, false), (1, true)] {
@@ -409,11 +389,27 @@ fn relevant(
 
 #[derive(Clone, Debug)]
 struct Place {
-    region: Region,
+    region: Option<Region>,
+    within: Regions,
     address: Option<Value>,
 }
 
-fn places(addresses: &mut Addresses, a: &Access) -> Vec<Option<Place>> {
+impl Place {
+    fn touches(&self, other: &Place, env: &Environment) -> bool {
+        let meets = |x: Option<Region>, y: Option<Region>| {
+            overlapping(env, x.unwrap_or(Region::Exposed), y.unwrap_or(Region::Exposed))
+        };
+        match (self.region, other.region) {
+            (Some(x), Some(y)) => overlapping(env, x, y),
+            (Some(x), None) => other.within.reaches(Some(x), meets),
+            (None, Some(y)) => self.within.reaches(Some(y), meets),
+            (None, None) => self.within.overlaps(&other.within, meets),
+        }
+    }
+}
+
+fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> Vec<Option<Place>> {
+    let within = |lane: usize| found[lane].clone().unwrap_or_else(|| Regions::one(None));
     (0..LANES)
         .map(|lane| {
             if !addresses.valid(lane) {
@@ -421,18 +417,20 @@ fn places(addresses: &mut Addresses, a: &Access) -> Vec<Option<Place>> {
             }
             let Some(address) = a.address else {
                 return Some(Place {
-                    region: Region::Exposed,
+                    region: None,
+                    within: within(lane),
                     address: None,
                 });
             };
             let (value, _) = addresses.operand(address, a.block, lane, a.predicate);
             let region = match a.space {
-                Some(Space::Lds) => Region::Lds,
-                Some(Space::Scratch) => Region::Private,
-                _ => value.region.unwrap_or(Region::Exposed),
+                Some(Space::Lds) => Some(Region::Lds),
+                Some(Space::Scratch) => Some(Region::Private),
+                _ => value.region,
             };
             Some(Place {
                 region,
+                within: if region.is_some() { Regions::default() } else { within(lane) },
                 address: Some(value),
             })
         })
@@ -450,13 +448,210 @@ fn idles(addresses: &mut Addresses, access: &Access, lane: usize) -> bool {
     access.kind == Kind::Read && access.exec.is_some_and(|e| addresses.bit(e, lane, None).0 == Some(false))
 }
 
+fn shared(
+    addresses: &mut Addresses,
+    accesses: &[Access],
+    env: &Environment,
+    pairs: &[(usize, usize)],
+    first: bool,
+) -> Option<(Vec<Vec<Option<Regions>>>, BTreeSet<(usize, usize)>)> {
+    let involved: BTreeSet<usize> = pairs.iter().flat_map(|&(p, q)| [p, q]).collect();
+    loop {
+        let mut regions: Vec<Vec<Option<Regions>>> = accesses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                (0..LANES)
+                    .map(|lane| {
+                        (involved.contains(&i) && addresses.valid(lane)).then(|| region_of(addresses, a, lane, false))
+                    })
+                    .collect()
+            })
+            .collect();
+        if addresses.settle_loops() {
+            if first {
+                continue;
+            }
+            return None;
+        }
+        let mut sharing: BTreeSet<(usize, usize)> = pairs
+            .iter()
+            .copied()
+            .filter(|&(p, q)| may_share(env, &regions[p], &regions[q]))
+            .collect();
+        let mut refined: BTreeSet<usize> = BTreeSet::new();
+        loop {
+            let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
+            for &(p, q) in &sharing {
+                for i in [p, q] {
+                    if !refined.contains(&i) && regions[i].iter().flatten().any(|r| !r.single_region()) {
+                        *counts.entry(i).or_default() += 1;
+                    }
+                }
+            }
+            let Some((&next, _)) = counts.iter().max_by_key(|&(&i, &n)| (n, std::cmp::Reverse(i))) else {
+                break;
+            };
+            refined.insert(next);
+            let a = &accesses[next];
+            regions[next] = (0..LANES)
+                .map(|lane| addresses.valid(lane).then(|| region_of(addresses, a, lane, true)))
+                .collect();
+            sharing.retain(|&(p, q)| (p != next && q != next) || may_share(env, &regions[p], &regions[q]));
+        }
+        if addresses.settle_loops() {
+            if first {
+                continue;
+            }
+            return None;
+        }
+        return Some((regions, sharing));
+    }
+}
+
+#[derive(Default)]
+struct Opening {
+    wide: Option<Environment>,
+    stake: Vec<u64>,
+    only: Option<BTreeSet<(usize, usize)>>,
+}
+
+impl Opening {
+    fn after(
+        &mut self,
+        outcome: Option<(Environment, Option<BTreeSet<(usize, usize)>>)>,
+        state: &mut BTreeMap<(usize, usize), Judgments>,
+        start: &BTreeMap<(usize, usize), Judgments>,
+        wave: usize,
+    ) -> usize {
+        let Some((wider, affected)) = outcome else {
+            self.only = None;
+            return wave + 1;
+        };
+        self.wide = Some(wider);
+        match affected {
+            Some(affected) => {
+                for pair in &affected {
+                    state.insert(*pair, start[pair]);
+                }
+                self.only = Some(affected);
+                wave
+            }
+            None => {
+                *state = start.clone();
+                self.only = None;
+                0
+            }
+        }
+    }
+}
+
+struct Judged<'a> {
+    accesses: &'a [Access],
+    lanes: &'a [Vec<Option<Place>>],
+    pairs: &'a [(usize, usize)],
+    sharing: &'a BTreeSet<(usize, usize)>,
+}
+
+fn widened(
+    addresses: &mut Addresses,
+    env: &Environment,
+    judged: &Judged,
+    regions: &mut [Vec<Option<Regions>>],
+    stake: &mut Vec<u64>,
+    first: bool,
+) -> Option<(Environment, Option<BTreeSet<(usize, usize)>>)> {
+    let known = stake.len();
+    let mut refined: BTreeSet<usize> = BTreeSet::new();
+    let mut open = env.exposed.clone();
+    loop {
+        for id in addresses.exposable() {
+            if !stake.contains(&id) && !open.contains(&id) && !judged.matters(addresses, env, regions, id, &mut refined).is_empty() {
+                stake.push(id);
+            }
+        }
+        let kept = addresses.pending();
+        let found = addresses.expose(&open, stake);
+        let complete = !found.is_empty() && stake.iter().all(|id| open.contains(id) || found.contains(id));
+        open.extend(found);
+        if complete {
+            addresses.forget(&kept);
+        }
+        if !addresses.settle_loops() {
+            break;
+        }
+        for &i in &refined {
+            regions[i] = judged.refined(addresses, i);
+        }
+    }
+    let found: Vec<u64> = open[env.exposed.len()..].to_vec();
+    if found.is_empty() && (first || stake.len() == known) {
+        return None;
+    }
+    let affected = first.then(|| {
+        found
+            .iter()
+            .flat_map(|&id| judged.matters(addresses, env, regions, id, &mut refined))
+            .collect()
+    });
+    let mut wider = env.clone();
+    wider.exposed = open;
+    Some((wider, affected))
+}
+
+impl Judged<'_> {
+    fn refined(&self, addresses: &mut Addresses, i: usize) -> Vec<Option<Regions>> {
+        (0..LANES)
+            .map(|lane| addresses.valid(lane).then(|| region_of(addresses, &self.accesses[i], lane, true)))
+            .collect()
+    }
+
+    fn matters(
+        &self,
+        addresses: &mut Addresses,
+        env: &Environment,
+        regions: &mut [Vec<Option<Regions>>],
+        id: u64,
+        refined: &mut BTreeSet<usize>,
+    ) -> Vec<(usize, usize)> {
+        let target = Some(Region::Allocation(id));
+        let lost = |x: &Place| x.region.is_none() && x.within.lost();
+        let reaches = |x: &Place| x.region == target || (x.region.is_none() && x.within.reaches(target, |a, b| a == b));
+        let faces = |a: usize, b: usize| self.lanes[a].iter().flatten().any(lost) && self.lanes[b].iter().flatten().any(reaches);
+        let mut wider = env.clone();
+        wider.exposed.push(id);
+        let mut out = Vec::new();
+        for &(p, q) in self.pairs {
+            let placed = !self.lanes[p].is_empty() && !self.lanes[q].is_empty();
+            if placed || self.sharing.contains(&(p, q)) {
+                if faces(p, q) || faces(q, p) {
+                    out.push((p, q));
+                }
+                continue;
+            }
+            if !may_share(&wider, &regions[p], &regions[q]) {
+                continue;
+            }
+            for i in [p, q] {
+                if refined.insert(i) {
+                    regions[i] = self.refined(addresses, i);
+                }
+            }
+            if may_share(&wider, &regions[p], &regions[q]) {
+                out.push((p, q));
+            }
+        }
+        out
+    }
+}
+
 fn region_of(addresses: &mut Addresses, a: &Access, lane: usize, refine: bool) -> Regions {
     match a.space {
         Some(Space::Lds) => Regions::one(Some(Region::Lds)),
         Some(Space::Scratch) => Regions::one(Some(Region::Private)),
         _ => match a.address {
             Some(x) => addresses.regions(x, lane, a.predicate, refine),
-            None => Regions::one(None),
+            None => addresses.read_regions((a.block, a.index), lane, a.exec, refine),
         },
     }
 }
@@ -511,7 +706,7 @@ fn meet(
         let Some(x) = x else { continue };
         for (b, y) in q.iter().enumerate() {
             let Some(y) = y else { continue };
-            if a == b || !overlapping(env, x.region, y.region) {
+            if a == b || !x.touches(y, env) {
                 continue;
             }
             let (Some(xa), Some(ya)) = (&x.address, &y.address) else {
