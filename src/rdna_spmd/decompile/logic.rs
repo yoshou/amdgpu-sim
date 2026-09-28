@@ -1170,7 +1170,40 @@ mod tests {
         Edge2 { b, src, bits }
     }
 
-    fn images(seed: u64, rounds: usize, check: impl Fn(&mut Logic, Bdd, Bdd) -> bool) -> Vec<(usize, &'static str)> {
+    fn images(seed: u64, rounds: usize, check: impl Fn(&mut Logic, Bdd, Bdd, Bdd) -> bool) -> Vec<(usize, &'static str)> {
+        crossings(seed, rounds, false, check)
+    }
+
+    fn projection(logic: &mut Logic, f: &Func, facts: &Facts, src: BlockId, formula: Bdd, linked: &[bool], self_loop: bool) -> Bdd {
+        let edge = f.blocks[&src].term.edges().next().unwrap().clone();
+        let dst = &f.blocks[&edge.dst];
+        let mut fresh = Vec::new();
+        let mut relation = formula;
+        for (k, (&(param, _), &arg)) in dst.params.iter().zip(&edge.args).enumerate() {
+            if !linked[k] {
+                continue;
+            }
+            let target = if self_loop {
+                let t = logic.atom(Atom::Fresh(7, param, 0));
+                fresh.push((t, param));
+                t
+            } else {
+                logic.atom(Atom::Bit(param))
+            };
+            let bound = logic.bit(f, facts, arg);
+            let link = logic.m.iff(target, bound);
+            relation = logic.m.and(relation, link);
+        }
+        let scoped: Vec<u32> = logic.support(relation).iter().copied().filter(|&v| logic.scope(facts, v) == Some(src)).collect();
+        let mut want = logic.exists(&scoped, relation);
+        if self_loop {
+            let renamed: HashMap<u32, Bdd> = fresh.iter().map(|&(t, param)| (logic.support(t)[0], logic.atom(Atom::Bit(param)))).collect();
+            want = logic.m.compose(want, &|v| renamed.get(&v).copied());
+        }
+        want
+    }
+
+    fn crossings(seed: u64, rounds: usize, difference: bool, check: impl Fn(&mut Logic, Bdd, Bdd, Bdd) -> bool) -> Vec<(usize, &'static str)> {
         let mut r = Random::new(seed);
         let mut wrong = Vec::new();
         for round in 0..rounds {
@@ -1190,38 +1223,35 @@ mod tests {
                 }
                 formula = logic.m.or(formula, term);
             }
-            let got = logic.post(f, &facts, src, 0, formula);
+            let got = if difference {
+                logic.image(f, &facts, src, 0, formula)
+            } else {
+                logic.post(f, &facts, src, 0, formula)
+            };
             let edge = f.blocks[&src].term.edges().next().unwrap().clone();
-            let dst = &f.blocks[&edge.dst];
-            let mut fresh = Vec::new();
-            let mut relation = formula;
-            for (&(param, _), &arg) in dst.params.iter().zip(&edge.args) {
-                let target = if self_loop {
-                    let t = logic.atom(Atom::Fresh(7, param, 0));
-                    fresh.push((t, param));
-                    t
-                } else {
-                    logic.atom(Atom::Bit(param))
-                };
-                let bound = logic.bit(f, &facts, arg);
-                let link = logic.m.iff(target, bound);
-                relation = logic.m.and(relation, link);
+            let every = vec![true; edge.args.len()];
+            let full = projection(&mut logic, f, &facts, src, formula, &every, self_loop);
+            let mut linked = vec![!difference; edge.args.len()];
+            if difference {
+                let mut reached: BTreeSet<u32> = logic.support(formula).iter().copied().filter(|&v| logic.scope(&facts, v) == Some(src)).collect();
+                loop {
+                    let mut grew = false;
+                    for (k, &arg) in edge.args.iter().enumerate() {
+                        let bound = logic.bit(f, &facts, arg);
+                        let support: Vec<u32> = logic.support(bound).iter().copied().filter(|&v| logic.scope(&facts, v) == Some(src)).collect();
+                        if !linked[k] && support.iter().any(|v| reached.contains(v)) {
+                            linked[k] = true;
+                            reached.extend(support);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
             }
-            let scoped: Vec<u32> = logic
-                .support(relation)
-                .iter()
-                .copied()
-                .filter(|&v| logic.scope(&facts, v) == Some(src))
-                .collect();
-            let mut want = logic.exists(&scoped, relation);
-            if self_loop {
-                let renamed: HashMap<u32, Bdd> = fresh
-                    .iter()
-                    .map(|&(t, param)| (logic.support(t)[0], logic.atom(Atom::Bit(param))))
-                    .collect();
-                want = logic.m.compose(want, &|v| renamed.get(&v).copied());
-            }
-            if !check(&mut logic, got, want) {
+            let reachable = projection(&mut logic, f, &facts, src, formula, &linked, self_loop);
+            if !check(&mut logic, got, full, reachable) {
                 wrong.push((round, if self_loop { "self-loop" } else { "edge" }));
             }
         }
@@ -1229,14 +1259,26 @@ mod tests {
     }
 
     #[test]
+    fn image_keeps_every_state_the_argument_relations_allow() {
+        let wrong = crossings(31, 400, true, |logic, got, full, _| logic.m.implies(full, got));
+        assert!(wrong.is_empty(), "rounds whose difference image drops a state the edge can reach: {:?}", wrong);
+    }
+
+    #[test]
+    fn image_equals_the_projection_of_the_formula_and_the_relations_it_reaches() {
+        let wrong = crossings(31, 400, true, |_, got, _, reachable| got == reachable);
+        assert!(wrong.is_empty(), "rounds whose difference image differs from the projection over the relations it reaches: {:?}", wrong);
+    }
+
+    #[test]
     fn post_keeps_every_state_the_argument_relations_allow() {
-        let wrong = images(29, 400, |logic, got, want| logic.m.implies(want, got));
+        let wrong = images(29, 400, |logic, got, full, _| logic.m.implies(full, got));
         assert!(wrong.is_empty(), "rounds whose image drops a state the edge can reach: {:?}", wrong);
     }
 
     #[test]
     fn post_equals_the_projection_of_the_formula_and_every_argument_relation() {
-        let wrong = images(29, 400, |_, got, want| got == want);
+        let wrong = images(29, 400, |_, got, full, _| got == full);
         assert!(wrong.is_empty(), "rounds whose image differs from the projection: {:?}", wrong);
     }
 

@@ -915,6 +915,11 @@ fn may_overlap(
     })
 }
 
+#[cfg(test)]
+pub(super) fn may_overlap_for_tests(unknowns: &[UnknownInfo], x: &Form, y: &Form) -> bool {
+    may_overlap(unknowns, x, y, 1, 1, &|_: &UnknownInfo| false)
+}
+
 fn gcd(a: u64, b: u64) -> u64 {
     if b == 0 {
         a
@@ -2508,6 +2513,324 @@ mod tests {
     fn find_carries_a_lane_bit_of_a_ballot_around_a_loop() {
         assert!(ballot_carried(1), "the flag starts set, so every lane stores twice in iteration 0");
         assert!(!ballot_carried(0), "the flag starts clear and each iteration keeps the lane's own bit of flag & fresh");
+    }
+
+    const PATHS: [&str; 16] = [
+        "an 8-byte private spill",
+        "two 4-byte private spills",
+        "global memory",
+        "lds",
+        "xor twice",
+        "mul by one",
+        "shl by zero",
+        "or with zero",
+        "and with all ones",
+        "select between itself",
+        "read lane 3",
+        "read first lane",
+        "backward permute from lane 0",
+        "write lane 2",
+        "a store only lane 0 makes",
+        "nothing",
+    ];
+
+    fn carried_to(path: usize, moved_is_first: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let table = k.buffer(&mut b, e, 16);
+        let pointer = if moved_is_first { first } else { second };
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let zero = b.constant(e, Ty::I32, 0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let halves = |b: &mut Build, f: &dyn Fn(&mut Build, ValueId) -> ValueId| {
+            let lo = b.core(e, Ty::I32, Op::UnpackLo(pointer));
+            let hi = b.core(e, Ty::I32, Op::UnpackHi(pointer));
+            let (lo, hi) = (f(b, lo), f(b, hi));
+            b.core(e, Ty::I64, Op::Pack64(lo, hi))
+        };
+        let moved = match path {
+            0 => {
+                let slot = b.constant(e, Ty::I32, 16);
+                b.store(e, Space::Scratch, MemSize::B64, slot, pointer, k.exec);
+                b.load(e, Space::Scratch, MemSize::B64, slot, k.exec)
+            }
+            1 => {
+                let lo = b.core(e, Ty::I32, Op::UnpackLo(pointer));
+                let hi = b.core(e, Ty::I32, Op::UnpackHi(pointer));
+                let (s0, s1) = (b.constant(e, Ty::I32, 16), b.constant(e, Ty::I32, 20));
+                b.store(e, Space::Scratch, MemSize::B32, s0, lo, k.exec);
+                b.store(e, Space::Scratch, MemSize::B32, s1, hi, k.exec);
+                let lo = b.load(e, Space::Scratch, MemSize::B32, s0, k.exec);
+                let hi = b.load(e, Space::Scratch, MemSize::B32, s1, k.exec);
+                b.core(e, Ty::I64, Op::Pack64(lo, hi))
+            }
+            2 => {
+                b.store(e, Space::Global, MemSize::B64, table, pointer, k.exec);
+                b.load(e, Space::Global, MemSize::B64, table, yes)
+            }
+            3 => {
+                let place = b.constant(e, Ty::I32, 64);
+                b.store(e, Space::Lds, MemSize::B64, place, pointer, k.exec);
+                b.load(e, Space::Lds, MemSize::B64, place, yes)
+            }
+            4 => {
+                let key = b.constant(e, Ty::I64, 0x5a5a);
+                let x = b.int(e, IntOp::Xor, pointer, key);
+                b.int(e, IntOp::Xor, x, key)
+            }
+            5 => {
+                let one = b.constant(e, Ty::I64, 1);
+                b.int(e, IntOp::Mul, pointer, one)
+            }
+            6 => {
+                let z = b.constant(e, Ty::I64, 0);
+                b.int(e, IntOp::Shl, pointer, z)
+            }
+            7 => {
+                let z = b.constant(e, Ty::I64, 0);
+                b.int(e, IntOp::Or, pointer, z)
+            }
+            8 => {
+                let all = b.constant(e, Ty::I64, u64::MAX);
+                b.int(e, IntOp::And, pointer, all)
+            }
+            9 => {
+                let v = b.load(e, Space::Global, MemSize::B32, table, yes);
+                let c = b.cmp(e, IntPred::Eq, v, zero);
+                b.core(e, Ty::I64, Op::Select(c, pointer, pointer))
+            }
+            10 => halves(&mut b, &|b, h| {
+                let three = b.constant(e, Ty::I32, 3);
+                let z = b.constant(e, Ty::I32, 0);
+                b.wave(e, WaveOp::ReadLane, vec![h, three, z])
+            }),
+            11 => halves(&mut b, &|b, h| b.wave(e, WaveOp::ReadFirstLane, vec![h, k.exec])),
+            12 => halves(&mut b, &|b, h| {
+                let z = b.constant(e, Ty::I32, 0);
+                b.wave(e, WaveOp::Bpermute, vec![z, h, k.exec])
+            }),
+            13 => halves(&mut b, &|b, h| {
+                let two = b.constant(e, Ty::I32, 2);
+                let z = b.constant(e, Ty::I32, 0);
+                b.wave(e, WaveOp::WriteLane, vec![h, two, h, z])
+            }),
+            14 => {
+                let only = b.cmp(e, IntPred::Eq, lane, zero);
+                let mask = b.int(e, IntOp::And, only, k.exec);
+                let null = b.constant(e, Ty::I64, 0);
+                let leaked = b.core(e, Ty::I64, Op::Select(only, pointer, null));
+                b.store(e, Space::Global, MemSize::B64, table, leaked, mask);
+                b.load(e, Space::Global, MemSize::B64, table, yes)
+            }
+            _ => pointer,
+        };
+        let s1 = store_at(&mut b, e, moved, k.exec);
+        let s2 = store_at(&mut b, e, first, k.exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]));
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_follows_a_pointer_to_the_same_buffer_through_every_path() {
+        let missed: Vec<&str> = (0..PATHS.len()).filter(|&p| !carried_to(p, true)).map(|p| PATHS[p]).collect();
+        assert!(missed.is_empty(), "{:?}: the pointer that arrives is the first buffer, where every lane stores next", missed);
+    }
+
+    #[test]
+    fn find_keeps_apart_a_pointer_to_another_buffer_through_every_path() {
+        let loose: Vec<&str> = (0..PATHS.len()).filter(|&p| carried_to(p, false)).map(|p| PATHS[p]).collect();
+        assert!(loose.is_empty(), "{:?}: the pointer that arrives is the second buffer, and no one leaks the first", loose);
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_of_one_row() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let mask = b.constant(e, Ty::I32, 0x3ff);
+        let x = b.int(e, IntOp::And, k.item, mask);
+        let address = byte_offset(&mut b, e, buf, x, 4);
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "in a 32 x 1 block every lane has its own x");
+    }
+
+    #[test]
+    fn find_keeps_a_sign_extended_offset_off_words_it_cannot_reach() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let other = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, other, lane, 4);
+        let v = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Eq, v, zero);
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, c));
+        let four = b.constant(e, Ty::I64, 4);
+        let offset = b.int(e, IntOp::Mul, wide, four);
+        let low = b.int(e, IntOp::Add, buf, offset);
+        let eight = b.constant(e, Ty::I64, 8);
+        let far = b.int(e, IntOp::Add, buf, eight);
+        let s1 = store_at(&mut b, e, low, k.exec);
+        let s2 = store_at(&mut b, e, far, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "sext(c) * 4 is 0 or -4, never 8");
+    }
+
+    #[test]
+    fn find_drops_a_store_masked_by_a_projected_bit_that_is_always_clear() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let three = b.constant(e, Ty::I32, 3);
+        let third = b.cmp(e, IntPred::Eq, lane, three);
+        let zero = b.constant(e, Ty::I32, 0);
+        let seven = b.constant(e, Ty::I32, 7);
+        let word = b.core(e, Ty::I32, Op::Select(third, zero, seven));
+        let shifted = b.int(e, IntOp::LShr, word, three);
+        let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let s1 = store_at(&mut b, e, buf, bit);
+        let s2 = store_at(&mut b, e, buf, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "bit 3 of 0 and of 7 is clear, so the first store never runs");
+    }
+
+    #[test]
+    fn find_keeps_apart_the_lanes_of_a_single_wave() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let wave = b.constant(e, Ty::I32, 32);
+        let later = b.cmp(e, IntPred::Uge, k.item, wave);
+        let own = byte_offset(&mut b, e, buf, k.item, 4);
+        let address = b.core(e, Ty::I64, Op::Select(later, buf, own));
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "with 32 lanes every lane stores to its own word");
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_with_their_own_lds_words() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let four = b.constant(e, Ty::I32, 4);
+        let address = b.int(e, IntOp::Mul, lane, four);
+        let zero = b.constant(e, Ty::I32, 0);
+        let s1 = b.here(e);
+        b.store(e, Space::Lds, MemSize::B32, address, zero, k.exec);
+        let s2 = b.here(e);
+        b.store(e, Space::Lds, MemSize::B32, address, zero, k.exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[]));
+        assert!(!h.conflicts().contains(&pair(&h, s1, s2)));
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_that_a_mask_of_the_loop_index_keeps_distinct() {
+        let Looped {
+            mut b,
+            buf,
+            body,
+            exec,
+            index,
+            ..
+        } = looped(4);
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let slid = b.int(body, IntOp::Add, index, lane);
+        let mask = b.constant(body, Ty::I32, 31);
+        let slot = b.int(body, IntOp::And, slid, mask);
+        let address = byte_offset(&mut b, body, buf, slot, 4);
+        let s = store_at(&mut b, body, address, exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        assert!(!h.together.contains(&pair(&h, s, s)), "(i + lane) & 31 differs between the lanes of one iteration");
+    }
+
+    #[test]
+    fn find_keeps_apart_the_lanes_after_a_loop_when_each_adds_its_lane() {
+        let Looped {
+            mut b,
+            buf,
+            exit,
+            last,
+            ..
+        } = looped(4);
+        let exec = b.f.blocks[&exit].params[0].0;
+        let lane = b.core(exit, Ty::I32, Op::Env(Env::LaneId));
+        let index = b.int(exit, IntOp::Add, last, lane);
+        let address = byte_offset(&mut b, exit, buf, index, 4);
+        let s1 = store_at(&mut b, exit, address, exec);
+        let s2 = store_at(&mut b, exit, address, exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "last + lane differs between the lanes");
+    }
+
+    #[test]
+    fn find_keeps_a_pointer_that_swaps_between_two_buffers_off_a_third() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let third = k.buffer(&mut b, e, 16);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I64, Ty::I64, Ty::I64, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, first, first, second, zero, third]);
+        let s1 = store_at(&mut b, body, p[1], p[0]);
+        let s3 = store_at(&mut b, body, p[5], p[0]);
+        let at_first = b.cmp(body, IntPred::Eq, p[1], p[2]);
+        let swapped = b.core(body, Ty::I64, Op::Select(at_first, p[3], p[2]));
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[4], one);
+        let four = b.constant(body, Ty::I32, 4);
+        let again = b.cmp(body, IntPred::Ult, next, four);
+        b.cond_br(body, again, (body, vec![p[0], swapped, p[2], p[3], next, p[5]]), (exit, vec![p[0]]));
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]));
+        assert!(!h.conflicts().contains(&pair(&h, s1, s3)), "the pointer is only ever the first or the second buffer");
+    }
+
+    #[test]
+    fn find_reports_an_index_every_lane_reloads_from_a_private_slot() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let slot = b.constant(e, Ty::I32, 16);
+        let seven = b.constant(e, Ty::I32, 7);
+        b.store(e, Space::Scratch, MemSize::B32, slot, seven, k.exec);
+        let (next, n) = b.block(&[Ty::I1, Ty::I64]);
+        b.br(e, next, vec![k.exec, buf]);
+        let slot = b.constant(next, Ty::I32, 16);
+        let index = b.load(next, Space::Scratch, MemSize::B32, slot, n[0]);
+        let address = byte_offset(&mut b, next, n[1], index, 4);
+        let (s1, s2) = twice(&mut b, next, address, n[0]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        assert!(h.together.contains(&pair(&h, s1, s2)), "every lane reloads 7 and stores to word 7");
+    }
+
+    #[test]
+    fn positions_put_each_meeting_before_the_first_access_of_its_instruction() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let other = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let first_part = b.here(e);
+        for (address, provenance) in [(other, 0x7700u64), (buf, 0x7701)] {
+            b.f.blocks.get_mut(&e).unwrap().insts.push(Inst::Effect {
+                provenance,
+                op: memory(Space::Global, MemoryOp::Store(MemSize::B32)),
+                inputs: vec![address, zero, k.exec],
+                outputs: vec![],
+            });
+        }
+        let second_part = (e, first_part.1 + 1);
+        let later = store_at(&mut b, e, buf, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(second_part, later)], &[], &[]);
+        assert_eq!(hazards.meetings, vec![first_part, later], "one meeting before the whole instruction, one before the later store");
     }
 
     #[test]

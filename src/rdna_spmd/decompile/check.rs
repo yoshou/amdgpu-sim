@@ -3167,6 +3167,187 @@ mod tests {
     }
 
     #[test]
+    fn prove_converts_a_query_whose_arm_stores_only_for_lanes_that_hold_the_bit() {
+        let Flagged { mut b, k, buf, lane, c } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+        let (join, _) = b.block(&[Ty::I1]);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        b.cond_br(e, q, (then, vec![k.exec, own, c]), (join, vec![k.exec]));
+        let one = b.constant(then, Ty::I32, 1);
+        b.store(then, Space::Global, MemSize::B32, t[1], one, t[2]);
+        b.br(then, join, vec![t[0]]);
+        assert!(converted(&b).is_empty(), "{:?}: a lane that stores holds the bit, so it takes the arm in both programs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_moved_address_only_lanes_that_hold_the_bit_use() {
+        let Flagged { mut b, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let near = b.constant(e, Ty::I64, 0);
+        let far = b.constant(e, Ty::I64, 4);
+        let shift = b.core(e, Ty::I64, Op::Select(q, near, far));
+        let own = byte_offset(&mut b, e, buf, lane, 8);
+        let address = b.int(e, IntOp::Add, own, shift);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, address, one, c);
+        assert!(converted(&b).is_empty(), "{:?}: a lane that stores holds the bit and sees the query true in both programs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_picked_word_only_lanes_that_hold_the_bit_load() {
+        let Flagged { mut b, k, buf, lane, c } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let table = k.buffer(&mut b, e, 16);
+        let four = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, four);
+        let from = b.core(e, Ty::I64, Op::Select(q, table, second));
+        let v = b.load(e, Space::Global, MemSize::B32, from, c);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, v, c);
+        assert!(converted(&b).is_empty(), "{:?}: a lane that loads and stores holds the bit and picks the first word in both programs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_that_masks_only_lanes_that_hold_the_bit() {
+        let Flagged { mut b, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let mask = b.int(e, IntOp::And, q, c);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, own, one, mask);
+        assert!(converted(&b).is_empty(), "{:?}: q & c is c in both programs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_ballot_whose_lane_test_only_lanes_that_hold_the_bit_use() {
+        let Flagged { mut b, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let w = b.wave(e, WaveOp::Ballot, vec![c]);
+        let zero = b.constant(e, Ty::I32, 0);
+        let any = b.cmp(e, IntPred::Ne, w, zero);
+        let mask = b.int(e, IntOp::And, any, c);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, own, one, mask);
+        assert!(converted(&b).is_empty(), "{:?}: (ballot(c) != 0) & c is c in both programs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_whole_word_only_lanes_that_hold_the_bit_count() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flag = per_lane(&mut b, &k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let four = b.constant(e, Ty::I32, 4);
+        let low = b.cmp(e, IntPred::Ult, lane, four);
+        let low = b.int(e, IntOp::And, low, k.exec);
+        let w1 = b.wave(e, WaveOp::Ballot, vec![low]);
+        let w2 = b.wave(e, WaveOp::Ballot, vec![k.exec]);
+        let w = b.core(e, Ty::I32, Op::Select(q, w1, w2));
+        let count = b.core(e, Ty::I32, Op::PopulationCount(w));
+        store_own(&mut b, &k, e, count, c);
+        assert!(converted(&b).is_empty(), "{:?}: a lane that stores holds the bit and counts the first word in both programs", converted(&b));
+    }
+
+    fn arms_compute(then_arm: usize, other_arm: usize) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let one = b.constant(e, Ty::I32, 1);
+        let next = b.int(e, IntOp::Add, lane, one);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I32, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64, Ty::I32, Ty::I32]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        b.cond_br(e, q, (then, vec![k.exec, own, lane, next]), (other, vec![k.exec, own, lane, next]));
+        for (block, p, arm) in [(then, t, then_arm), (other, o, other_arm)] {
+            let (x, y) = (p[2], p[3]);
+            let v = match arm {
+                0 => x,
+                1 => {
+                    let pair = b.core(block, Ty::I64, Op::Pack64(x, y));
+                    b.core(block, Ty::I32, Op::UnpackLo(pair))
+                }
+                2 => {
+                    let pair = b.core(block, Ty::I64, Op::Pack64(x, y));
+                    b.core(block, Ty::I32, Op::UnpackHi(pair))
+                }
+                3 => {
+                    let ones = b.constant(block, Ty::I32, 0xffff_ffff);
+                    b.int(block, IntOp::And, x, ones)
+                }
+                4 => {
+                    let zero = b.constant(block, Ty::I32, 0);
+                    b.int(block, IntOp::Xor, x, zero)
+                }
+                5 => {
+                    let float = b.core(block, Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, x));
+                    b.core(block, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, float))
+                }
+                6 => {
+                    let pair = b.core(block, Ty::I64, Op::Pack64(x, y));
+                    let thirty_two = b.constant(block, Ty::I64, 32);
+                    let down = b.int(block, IntOp::LShr, pair, thirty_two);
+                    b.core(block, Ty::I32, Op::UnpackLo(down))
+                }
+                _ => y,
+            };
+            b.br(block, join, vec![p[0], p[1], v]);
+        }
+        b.store(join, Space::Global, MemSize::B32, j[1], j[2], j[0]);
+        (b, q)
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arms_compute_one_word_in_different_ways() {
+        let cases = [
+            ("lo(pack(x, y)) and x", 1, 0),
+            ("x & ~0 and x", 3, 0),
+            ("x ^ 0 and x", 4, 0),
+            ("bitcast round trip and x", 5, 0),
+            ("hi(pack(x, y)) and y", 2, 7),
+            ("lo(pack(x, y) >> 32) and y", 6, 7),
+        ];
+        let kept: Vec<(&str, Vec<&str>)> = cases
+            .iter()
+            .map(|&(name, a, b)| (name, converted(&arms_compute(a, b).0)))
+            .filter(|(_, names)| !names.is_empty())
+            .collect();
+        assert!(kept.is_empty(), "{:?}: both arms hand the store the same word", kept);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arms_compute_different_words() {
+        let cases = [("hi(pack(x, y)) and x", 2, 0), ("lo(pack(x, y)) and y", 1, 7), ("lo(pack(x, y) >> 32) and x", 6, 0), ("x and y", 0, 7)];
+        let wrong: Vec<(&str, Vec<&str>)> = cases
+            .iter()
+            .map(|&(name, a, b)| {
+                let (program, q) = arms_compute(a, b);
+                let names: Vec<&str> = ["search", "direct"]
+                    .iter()
+                    .zip(both(&program))
+                    .filter(|(_, kept)| !kept.queries.contains(&q))
+                    .map(|(n, _)| *n)
+                    .collect();
+                (name, names)
+            })
+            .filter(|(_, names)| !names.is_empty())
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: the arms hand the store the lane id and the lane id + 1", wrong);
+    }
+
+    #[test]
     fn search_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
         let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::WriteLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
             .iter()
@@ -3298,6 +3479,186 @@ mod tests {
             wrong.is_empty(),
             "{:?}: when no lane sets the mask, the read takes lane 0's word, and with the flag clear in lane 0 and set in lane 1, lane 0 answers the query false and hands lane 1 its lane id 0 instead of the pair of halves 1.0",
             wrong
+        );
+    }
+}
+
+#[cfg(test)]
+mod difference_tests {
+    use super::super::testing::*;
+    use super::*;
+
+    type Formula = Box<dyn Fn(&mut Logic, &dyn Fn(ValueId) -> Bdd) -> Bdd>;
+
+    struct Case {
+        name: &'static str,
+        value: ValueId,
+        truth: Formula,
+    }
+
+    fn check_differences(b: &Build, kept: &[Choice], cases: &[Case], exact: bool) -> Vec<String> {
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(f, &facts).unwrap();
+        let hazards = Hazards {
+            accesses: Vec::new(),
+            together: BTreeSet::new(),
+            apart: BTreeSet::new(),
+            idle: BTreeSet::new(),
+            meetings: Vec::new(),
+        };
+        let kept: BTreeSet<Choice> = kept.iter().copied().collect();
+        let logic = Logic::fixed(f, &facts, &kept, &[]);
+        let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+        assert!(check.run(), "the program has no store, so nothing can be violated");
+        let mut wrong = Vec::new();
+        for case in cases {
+            let h = if facts.lane_word[case.value.0] && facts.materialized[case.value.0] {
+                check.words[case.value.0]
+            } else {
+                check.h[case.value.0]
+            };
+            let logic = &mut check.logic;
+            let truth = {
+                let mut atoms: HashMap<ValueId, Bdd> = HashMap::default();
+                for v in 0..f.types.len() {
+                    if f.types[v] == Ty::I1 {
+                        atoms.insert(ValueId(v), logic.atom(Atom::Bit(ValueId(v))));
+                    }
+                }
+                (case.truth)(logic, &|v| atoms[&v])
+            };
+            let ok = if exact { logic.m.implies(h, truth) } else { logic.m.implies(truth, h) };
+            if !ok {
+                wrong.push(case.name.to_string());
+            }
+        }
+        wrong
+    }
+
+    struct Program {
+        b: Build,
+        q: ValueId,
+        cases: Vec<Case>,
+    }
+
+    fn program() -> Program {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let yes = b.constant(e, Ty::I1, 1);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, yes);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let other = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let d = b.cmp(e, IntPred::Ult, other, flag);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let five = b.constant(e, Ty::I32, 5);
+        let mut cases = Vec::new();
+        let exec = k.exec;
+        let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
+            let c = l.m.and(bit(set), bit(exec));
+            l.m.not(c)
+        };
+        cases.push(Case { name: "any(c)", value: q, truth: Box::new(differs) });
+        let v = b.core(e, Ty::I32, Op::Select(q, one, two));
+        cases.push(Case { name: "select(q, 1, 2)", value: v, truth: Box::new(differs) });
+        let v = b.core(e, Ty::I32, Op::Select(q, one, one));
+        cases.push(Case { name: "select(q, 1, 1)", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let v = b.int(e, IntOp::And, q, d);
+        cases.push(Case {
+            name: "q & d",
+            value: v,
+            truth: Box::new(move |l, bit| {
+                let x = differs(l, bit);
+                l.m.and(x, bit(d))
+            }),
+        });
+        let v = b.int(e, IntOp::Or, q, d);
+        cases.push(Case {
+            name: "q | d",
+            value: v,
+            truth: Box::new(move |l, bit| {
+                let x = differs(l, bit);
+                let nd = l.m.not(bit(d));
+                l.m.and(x, nd)
+            }),
+        });
+        let v = b.int(e, IntOp::Xor, q, d);
+        cases.push(Case { name: "q ^ d", value: v, truth: Box::new(differs) });
+        let s = b.core(e, Ty::I32, Op::Select(q, one, two));
+        let v = b.cmp(e, IntPred::Ult, s, two);
+        cases.push(Case { name: "select(q, 1, 2) < 2", value: v, truth: Box::new(differs) });
+        let v = b.cmp(e, IntPred::Ult, s, five);
+        cases.push(Case { name: "select(q, 1, 2) < 5", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let table2 = k.buffer(&mut b, e, 16);
+        let address = b.core(e, Ty::I64, Op::Select(q, table, table2));
+        let v = b.load(e, Space::Global, MemSize::B32, address, yes);
+        cases.push(Case { name: "load from select(q, a, b)", value: v, truth: Box::new(differs) });
+        let v = b.load(e, Space::Global, MemSize::B32, table, q);
+        cases.push(Case { name: "load masked by q", value: v, truth: Box::new(differs) });
+        let v = b.load(e, Space::Global, MemSize::B32, table, yes);
+        cases.push(Case { name: "unmasked load of a fixed word", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let masked = b.int(e, IntOp::And, q, k.exec);
+        let w = b.wave(e, WaveOp::Ballot, vec![masked]);
+        let v = b.core(e, Ty::I32, Op::PopulationCount(w));
+        cases.push(Case { name: "popcount(ballot(q & exec))", value: v, truth: Box::new(|_, _| Bdd::TRUE) });
+        let kept = b.wave(e, WaveOp::Any, vec![masked]);
+        cases.push(Case { name: "any(q & exec)", value: kept, truth: Box::new(differs) });
+        let picked = b.core(e, Ty::I32, Op::Select(q, one, lane));
+        let v = b.wave(e, WaveOp::ReadLane, vec![picked, zero, zero]);
+        cases.push(Case { name: "readlane(select(q, 1, lane), 0)", value: v, truth: Box::new(|_, _| Bdd::TRUE) });
+        let v = b.int(e, IntOp::Add, flag, one);
+        cases.push(Case { name: "flag + 1", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        Program { b, q, cases }
+    }
+
+    #[test]
+    fn differences_hold_every_state_where_the_programs_can_disagree() {
+        let Program { b, cases, .. } = program();
+        let wrong = check_differences(&b, &[], &cases, false);
+        assert!(wrong.is_empty(), "differences that miss a disagreement: {:?}", wrong);
+    }
+
+    #[test]
+    fn differences_hold_only_states_where_the_programs_can_disagree() {
+        let Program { b, cases, .. } = program();
+        let loose = check_differences(&b, &[], &cases, true);
+        assert!(loose.is_empty(), "differences that claim a disagreement that cannot happen: {:?}", loose);
+    }
+
+    #[test]
+    fn differences_vanish_when_the_query_is_kept() {
+        let Program { b, q, cases } = program();
+        let (sound, exact): (Vec<String>, Vec<String>) = {
+            let only: Vec<Case> = cases
+                .into_iter()
+                .filter(|c| matches!(c.name, "any(c)" | "select(q, 1, 2)" | "q & d" | "load masked by q"))
+                .map(|c| Case {
+                    name: c.name,
+                    value: c.value,
+                    truth: if c.name == "load masked by q" {
+                        Box::new(move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| l.m.not(bit(q)))
+                    } else {
+                        Box::new(|_: &mut Logic, _: &dyn Fn(ValueId) -> Bdd| Bdd::FALSE)
+                    },
+                })
+                .collect();
+            (
+                check_differences(&b, &[Choice::Query(q)], &only, false),
+                check_differences(&b, &[Choice::Query(q)], &only, true),
+            )
+        };
+        assert!(
+            sound.is_empty() && exact.is_empty(),
+            "with the query kept only an unperformed load differs: {:?} {:?}",
+            sound,
+            exact
         );
     }
 }

@@ -4308,3 +4308,848 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod facts_tests {
+    use super::super::testing::*;
+    use super::*;
+    use crate::rdna_spmd::analysis::loops::Loops;
+
+    pub(super) fn addresses<T>(b: &Build, env: &Environment, f: impl FnOnce(&mut Addresses) -> T) -> T {
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(&b.f, &facts).expect("a reducible test program");
+        let headers: BTreeSet<BlockId> = (0..loops.count()).map(|l| facts.order[loops.header(l)]).collect();
+        let mut a = Addresses::new(&b.f, &facts, &b.inputs, EXEC, b.entry, env, headers, &b.registry);
+        a.enter(0);
+        f(&mut a)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        Int(IntOp, bool),
+        Cmp(IntPred),
+        Select,
+        Count(u8),
+        Extend(Cvt, Ty),
+        Wide(IntOp),
+        Pack,
+        Bits(IntOp),
+        Truncate,
+    }
+
+    fn leaf(b: &mut Build, e: BlockId, lane: ValueId, m: u32, c: u32) -> ValueId {
+        let km = b.constant(e, Ty::I32, m as u64);
+        let kc = b.constant(e, Ty::I32, c as u64);
+        let scaled = b.int(e, IntOp::Mul, lane, km);
+        b.int(e, IntOp::Add, scaled, kc)
+    }
+
+    fn compare(pred: IntPred, x: u32, y: u32) -> bool {
+        super::compare(pred, x, y)
+    }
+
+    enum Truth {
+        Word(Vec<u32>),
+        Bit(Vec<bool>),
+    }
+
+    fn cases(seed: u64, count: usize) -> Vec<(Build, ValueId, Truth, String)> {
+        use IntOp::*;
+        let mut r = Random::new(seed);
+        let ops = [Add, Sub, Mul, And, Or, Xor, Shl, LShr, AShr];
+        let preds = [
+            IntPred::Eq,
+            IntPred::Ne,
+            IntPred::Ult,
+            IntPred::Ugt,
+            IntPred::Ule,
+            IntPred::Uge,
+            IntPred::Slt,
+            IntPred::Sgt,
+            IntPred::Sle,
+            IntPred::Sge,
+        ];
+        let pick = |r: &mut Random| -> u32 {
+            match r.below(4) {
+                0 => r.below(8) as u32,
+                1 => (r.below(8) as u32).wrapping_neg(),
+                2 => 0x8000_0000u32.wrapping_add(r.below(4) as u32),
+                _ => r.next() as u32,
+            }
+        };
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let (mut b, _) = Build::kernel();
+            let e = BlockId(0);
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let (m1, c1, m2, c2) = (pick(&mut r), pick(&mut r), pick(&mut r), pick(&mut r));
+            let x = leaf(&mut b, e, lane, m1, c1);
+            let y = leaf(&mut b, e, lane, m2, c2);
+            let tx: Vec<u32> = (0..32u32).map(|l| l.wrapping_mul(m1).wrapping_add(c1)).collect();
+            let ty: Vec<u32> = (0..32u32).map(|l| l.wrapping_mul(m2).wrapping_add(c2)).collect();
+            let case = match r.below(9) {
+                0 => Case::Int(ops[r.below(9) as usize], false),
+                1 => Case::Int(ops[r.below(9) as usize], true),
+                2 => Case::Cmp(preds[r.below(10) as usize]),
+                3 => Case::Select,
+                4 => Case::Count(r.below(4) as u8),
+                5 => Case::Extend(if r.below(2) == 0 { Cvt::ZExt } else { Cvt::SExt }, if r.below(2) == 0 { Ty::I32 } else { Ty::I64 }),
+                6 => Case::Wide([Add, Sub, Mul, And, Or, Xor, Shl][r.below(7) as usize]),
+                7 => Case::Pack,
+                _ => {
+                    if r.below(2) == 0 {
+                        Case::Bits([And, Or, Xor][r.below(3) as usize])
+                    } else {
+                        Case::Truncate
+                    }
+                }
+            };
+            let (v, truth) = match case {
+                Case::Int(op, constant_shift) => {
+                    let amount = r.below(32) as u32;
+                    let (y, ty) = if matches!(op, Shl | LShr | AShr) || constant_shift {
+                        if matches!(op, Shl | LShr | AShr) {
+                            (b.constant(e, Ty::I32, amount as u64), vec![amount; 32])
+                        } else {
+                            let k = pick(&mut r);
+                            (b.constant(e, Ty::I32, k as u64), vec![k; 32])
+                        }
+                    } else {
+                        (y, ty.clone())
+                    };
+                    let v = b.int(e, op, x, y);
+                    let t = (0..32)
+                        .map(|l| {
+                            let (a, s) = (tx[l], ty[l]);
+                            match op {
+                                Add => a.wrapping_add(s),
+                                Sub => a.wrapping_sub(s),
+                                Mul => a.wrapping_mul(s),
+                                And => a & s,
+                                Or => a | s,
+                                Xor => a ^ s,
+                                Shl => a << s,
+                                LShr => a >> s,
+                                _ => ((a as i32) >> s) as u32,
+                            }
+                        })
+                        .collect();
+                    (v, Truth::Word(t))
+                }
+                Case::Cmp(pred) => {
+                    let v = b.cmp(e, pred, x, y);
+                    (v, Truth::Bit((0..32).map(|l| compare(pred, tx[l], ty[l])).collect()))
+                }
+                Case::Select => {
+                    let pred = preds[r.below(10) as usize];
+                    let c = b.cmp(e, pred, x, y);
+                    let v = b.core(e, Ty::I32, Op::Select(c, x, y));
+                    (v, Truth::Word((0..32).map(|l| if compare(pred, tx[l], ty[l]) { tx[l] } else { ty[l] }).collect()))
+                }
+                Case::Count(k) => {
+                    let op = [Op::PopulationCount(x), Op::TrailingZeros(x), Op::LeadingZeros(x), Op::ReverseBits(x)][k as usize];
+                    let v = b.core(e, Ty::I32, op);
+                    let t = (0..32)
+                        .map(|l| {
+                            let a = tx[l];
+                            match k {
+                                0 => a.count_ones(),
+                                1 => a.trailing_zeros(),
+                                2 => a.leading_zeros(),
+                                _ => a.reverse_bits(),
+                            }
+                        })
+                        .collect();
+                    (v, Truth::Word(t))
+                }
+                Case::Extend(cvt, to) => {
+                    let pred = preds[r.below(10) as usize];
+                    let c = b.cmp(e, pred, x, y);
+                    let v = b.core(e, to, Op::Convert(cvt, to, c));
+                    let t = (0..32)
+                        .map(|l| match (compare(pred, tx[l], ty[l]), cvt) {
+                            (false, _) => 0,
+                            (true, Cvt::ZExt) => 1,
+                            (true, _) => u32::MAX,
+                        })
+                        .collect();
+                    (v, Truth::Word(t))
+                }
+                Case::Wide(op) => {
+                    let wx = b.core(e, Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, x));
+                    let wy = b.core(e, Ty::I64, Op::Pack64(y, x));
+                    let amount = r.below(64);
+                    let wy = if op == Shl { b.constant(e, Ty::I64, amount) } else { wy };
+                    let v = b.int(e, op, wx, wy);
+                    let t = (0..32)
+                        .map(|l| {
+                            let a = tx[l] as i32 as i64 as u64;
+                            let s = if op == Shl { amount } else { ty[l] as u64 | (tx[l] as u64) << 32 };
+                            let r = match op {
+                                Add => a.wrapping_add(s),
+                                Sub => a.wrapping_sub(s),
+                                Mul => a.wrapping_mul(s),
+                                And => a & s,
+                                Or => a | s,
+                                Xor => a ^ s,
+                                _ => a << s,
+                            };
+                            r as u32
+                        })
+                        .collect();
+                    (v, Truth::Word(t))
+                }
+                Case::Pack => {
+                    let p = b.core(e, Ty::I64, Op::Pack64(x, y));
+                    let high = r.below(2) == 0;
+                    let v = b.core(e, Ty::I32, if high { Op::UnpackHi(p) } else { Op::UnpackLo(p) });
+                    (v, Truth::Word(if high { ty.clone() } else { tx.clone() }))
+                }
+                Case::Bits(op) => {
+                    let p1 = preds[r.below(10) as usize];
+                    let p2 = preds[r.below(10) as usize];
+                    let c1 = b.cmp(e, p1, x, y);
+                    let c2 = b.cmp(e, p2, y, x);
+                    let v = b.int(e, op, c1, c2);
+                    let t = (0..32)
+                        .map(|l| {
+                            let (a, s) = (compare(p1, tx[l], ty[l]), compare(p2, ty[l], tx[l]));
+                            match op {
+                                And => a && s,
+                                Or => a || s,
+                                _ => a != s,
+                            }
+                        })
+                        .collect();
+                    (v, Truth::Bit(t))
+                }
+                Case::Truncate => {
+                    let k = r.below(32);
+                    let amount = b.constant(e, Ty::I32, k);
+                    let shifted = b.int(e, LShr, x, amount);
+                    let v = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+                    (v, Truth::Bit((0..32).map(|l| tx[l] >> k & 1 != 0).collect()))
+                }
+            };
+            out.push((b, v, truth, format!("{:?}", case)));
+        }
+        out
+    }
+
+    fn decided(seed: u64, count: usize) -> (Vec<String>, Vec<String>) {
+        let env = environment(32, &[(0, 1, 0x1000)]);
+        let mut wrong = Vec::new();
+        let mut undecided = Vec::new();
+        for (b, v, truth, name) in cases(seed, count) {
+            addresses(&b, &env, |a| {
+                for lane in 0..32 {
+                    match &truth {
+                        Truth::Word(t) => match a.value(v, lane, None).0.form.as_constant() {
+                            Some(k) if k != t[lane] => wrong.push(format!("{} lane {}: {:#x}, not {:#x}", name, lane, k, t[lane])),
+                            Some(_) => {}
+                            None => undecided.push(format!("{} lane {}", name, lane)),
+                        },
+                        Truth::Bit(t) => match a.bit(v, lane, None).0 {
+                            Some(k) if k != t[lane] => wrong.push(format!("{} lane {}: {}, not {}", name, lane, k, t[lane])),
+                            Some(_) => {}
+                            None => undecided.push(format!("{} lane {}", name, lane)),
+                        },
+                    }
+                }
+            });
+        }
+        (wrong, undecided)
+    }
+
+    struct Unknowns {
+        b: Build,
+        words: Vec<(&'static str, ValueId, Box<dyn Fn(u32, u32, u32) -> u32>)>,
+        bits: Vec<(&'static str, ValueId, Box<dyn Fn(u32, u32, u32) -> bool>)>,
+    }
+
+    fn unknowns() -> Unknowns {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let c = |b: &mut Build, k: u64| b.constant(e, Ty::I32, k);
+        let mut words: Vec<(&'static str, ValueId, Box<dyn Fn(u32, u32, u32) -> u32>)> = Vec::new();
+        let mut bits: Vec<(&'static str, ValueId, Box<dyn Fn(u32, u32, u32) -> bool>)> = Vec::new();
+        let four = c(&mut b, 4);
+        let lane4 = b.int(e, IntOp::Mul, lane, four);
+        let v = b.int(e, IntOp::Add, u, lane4);
+        words.push(("u + 4 lane", v, Box::new(|u, _, l| u.wrapping_add(4 * l))));
+        let eight = c(&mut b, 8);
+        let u4 = b.int(e, IntOp::Mul, u, four);
+        let v = b.int(e, IntOp::Add, u4, eight);
+        words.push(("4u + 8", v, Box::new(|u, _, _| u.wrapping_mul(4).wrapping_add(8))));
+        let one = c(&mut b, 1);
+        let v = b.int(e, IntOp::LShr, u, one);
+        words.push(("u >> 1", v, Box::new(|u, _, _| u >> 1)));
+        let two = c(&mut b, 2);
+        let u2 = b.int(e, IntOp::Add, u, two);
+        let v = b.int(e, IntOp::LShr, u2, one);
+        words.push(("(u + 2) >> 1", v, Box::new(|u, _, _| (u + 2) >> 1)));
+        let ff = c(&mut b, 0xff);
+        let v = b.int(e, IntOp::And, u, ff);
+        words.push(("u & 0xff", v, Box::new(|u, _, _| u & 0xff)));
+        let fffc = c(&mut b, 0xfffc);
+        let v = b.int(e, IntOp::And, u, fffc);
+        words.push(("u & 0xfffc", v, Box::new(|u, _, _| u & 0xfffc)));
+        let high = c(&mut b, 0x1_0000);
+        let v = b.int(e, IntOp::Or, u, high);
+        words.push(("u | 0x10000", v, Box::new(|u, _, _| u | 0x1_0000)));
+        let ones = c(&mut b, 0xffff_ffff);
+        let v = b.int(e, IntOp::Xor, u, ones);
+        words.push(("u ^ ~0", v, Box::new(|u, _, _| !u)));
+        let u_shl = b.int(e, IntOp::Shl, u, two);
+        let v = b.int(e, IntOp::Add, u_shl, lane);
+        words.push(("(u << 2) + lane", v, Box::new(|u, _, l| (u << 2).wrapping_add(l))));
+        let seventeen = c(&mut b, 17);
+        let v = b.int(e, IntOp::LShr, u, seventeen);
+        words.push(("u >> 17", v, Box::new(|u, _, _| u >> 17)));
+        let v = b.int(e, IntOp::Add, w, lane);
+        words.push(("w + lane", v, Box::new(|_, w, l| w.wrapping_add(l))));
+        let three = c(&mut b, 3);
+        let w3 = b.int(e, IntOp::And, w, three);
+        let v = b.int(e, IntOp::Mul, w3, four);
+        words.push(("(w & 3) * 4", v, Box::new(|_, w, _| (w & 3) * 4)));
+        let hundred = c(&mut b, 100);
+        let small = b.cmp(e, IntPred::Ult, u, hundred);
+        let v = b.core(e, Ty::I32, Op::Select(small, u, hundred));
+        words.push(("min(u, 100)", v, Box::new(|u, _, _| u.min(100))));
+        let v = b.int(e, IntOp::Mul, u, u);
+        words.push(("u * u", v, Box::new(|u, _, _| u.wrapping_mul(u))));
+        let sixteen = c(&mut b, 16);
+        let up = b.int(e, IntOp::Shl, u, sixteen);
+        let v = b.int(e, IntOp::LShr, up, sixteen);
+        words.push(("(u << 16) >> 16", v, Box::new(|u, _, _| (u << 16) >> 16)));
+        let v = b.int(e, IntOp::Sub, u, one);
+        words.push(("u - 1", v, Box::new(|u, _, _| u.wrapping_sub(1))));
+        let v = b.int(e, IntOp::Sub, u2, u);
+        words.push(("(u + 2) - u", v, Box::new(|_, _, _| 2)));
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, u));
+        let hi = b.core(e, Ty::I32, Op::UnpackHi(wide));
+        words.push(("hi(zext u)", hi, Box::new(|_, _, _| 0)));
+        let big = c(&mut b, 70000);
+        let v = b.cmp(e, IntPred::Ult, u, big);
+        bits.push(("u < 70000", v, Box::new(|u, _, _| u < 70000)));
+        let v = b.cmp(e, IntPred::Ult, u, hundred);
+        bits.push(("u < 100", v, Box::new(|u, _, _| u < 100)));
+        let top = b.int(e, IntOp::LShr, u, sixteen);
+        let zero = c(&mut b, 0);
+        let v = b.cmp(e, IntPred::Eq, top, zero);
+        bits.push(("u >> 16 == 0", v, Box::new(|u, _, _| u >> 16 == 0)));
+        let v = b.cmp(e, IntPred::Ne, u2, u);
+        bits.push(("u + 2 != u", v, Box::new(|_, _, _| true)));
+        let v = b.cmp(e, IntPred::Ult, w, w);
+        bits.push(("w < w", v, Box::new(|_, _, _| false)));
+        let v = b.cmp(e, IntPred::Slt, u, zero);
+        bits.push(("u < 0 signed", v, Box::new(|u, _, _| (u as i32) < 0)));
+        let v = b.cmp(e, IntPred::Ugt, u2, u);
+        bits.push(("u + 2 > u", v, Box::new(|u, _, _| u.wrapping_add(2) > u)));
+        Unknowns { b, words, bits }
+    }
+
+    fn samples() -> Vec<(u32, Vec<u32>)> {
+        let mut r = Random::new(43);
+        let mut values = vec![0u32, 1, 2, 3, 99, 100, 101, 255, 256, 32767, 32768, 65534, 65535];
+        for _ in 0..8 {
+            values.push(r.below(65536) as u32);
+        }
+        values.into_iter().map(|u| (u, (0..32).map(|_| r.next() as u32).collect())).collect()
+    }
+
+    fn representable(unknowns: &[UnknownInfo], form: &Form, truth: u32) -> bool {
+        super::super::hazard::may_overlap_for_tests(unknowns, form, &Form::constant(truth))
+    }
+
+    fn exactly_representable(unknowns: &[UnknownInfo], form: &Form, truth: u32) -> Option<bool> {
+        let ranges: Vec<(u32, u32)> = form
+            .terms
+            .iter()
+            .map(|&(u, _)| unknowns[u as usize].range.filter(|(lo, hi)| hi - lo < 4096))
+            .collect::<Option<_>>()?;
+        let mut index: Vec<u32> = ranges.iter().map(|r| r.0).collect();
+        loop {
+            let value = form
+                .terms
+                .iter()
+                .zip(&index)
+                .fold(form.constant, |acc, (&(_, c), &t)| acc.wrapping_add(c.wrapping_mul(t)));
+            if value == truth {
+                return Some(true);
+            }
+            let mut k = 0;
+            loop {
+                if k == index.len() {
+                    return Some(false);
+                }
+                if index[k] < ranges[k].1 {
+                    index[k] += 1;
+                    break;
+                }
+                index[k] = ranges[k].0;
+                k += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn value_forms_hold_every_value_the_loaded_words_can_give() {
+        let Unknowns { b, words, bits } = unknowns();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut wrong = Vec::new();
+        addresses(&b, &env, |a| {
+            let forms: Vec<Vec<Form>> = words.iter().map(|&(_, v, _)| (0..32).map(|l| a.value(v, l, None).0.form).collect()).collect();
+            let decided: Vec<Vec<Option<bool>>> = bits.iter().map(|&(_, v, _)| (0..32).map(|l| a.bit(v, l, None).0).collect()).collect();
+            for (u, w) in samples() {
+                for (i, (name, _, truth)) in words.iter().enumerate() {
+                    for l in 0..32 {
+                        let t = truth(u, w[l], l as u32);
+                        if !representable(&a.unknowns, &forms[i][l], t) {
+                            wrong.push(format!("{} lane {} at u = {}: {:?} cannot be {:#x}", name, l, u, forms[i][l], t));
+                        }
+                    }
+                }
+                for (i, (name1, _, t1)) in words.iter().enumerate() {
+                    for (j, (name2, _, t2)) in words.iter().enumerate() {
+                        for (l1, l2) in [(0usize, 0usize), (0, 5), (3, 17)] {
+                            let (f1, f2) = (&forms[i][l1], &forms[j][l2]);
+                            if f1.terms.is_empty() || f1.terms != f2.terms {
+                                continue;
+                            }
+                            let d = f1.constant.wrapping_sub(f2.constant);
+                            let t = t1(u, w[l1], l1 as u32).wrapping_sub(t2(u, w[l2], l2 as u32));
+                            if d != t {
+                                wrong.push(format!("{} lane {} minus {} lane {} at u = {}: {} not {}", name1, l1, name2, l2, u, d as i32, t as i32));
+                            }
+                        }
+                    }
+                }
+                for (i, (name, _, truth)) in bits.iter().enumerate() {
+                    for l in 0..32 {
+                        if let Some(k) = decided[i][l] {
+                            if k != truth(u, w[l], l as u32) {
+                                wrong.push(format!("{} lane {} at u = {}: decided {}", name, l, u, k));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        wrong.sort();
+        wrong.dedup();
+        assert!(wrong.is_empty(), "{} wrong, first {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
+    fn value_forms_keep_what_the_operations_determine() {
+        let Unknowns { b, words, bits } = unknowns();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut loose = Vec::new();
+        addresses(&b, &env, |a| {
+            let form = |a: &mut Addresses, name: &str| {
+                let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
+                a.value(v, 3, None).0.form
+            };
+            let base = form(a, "u + 4 lane");
+            let bounds = |a: &Addresses, f: &Form| a.bounds(f);
+            for (name, expected) in [
+                ("4u + 8", Some((4u32, 8u32))),
+                ("u | 0x10000", Some((1, 0x1_0000))),
+                ("u ^ ~0", Some((u32::MAX, u32::MAX))),
+                ("(u << 16) >> 16", Some((1, 0))),
+                ("u - 1", Some((1, u32::MAX))),
+            ] {
+                let f = form(a, name);
+                let (scale, constant) = expected.unwrap();
+                let want = Form {
+                    constant,
+                    terms: base.terms.iter().map(|&(t, c)| (t, c.wrapping_mul(scale))).collect(),
+                };
+                if f != want {
+                    loose.push(format!("{}: {:?}, not {:?}", name, f, want));
+                }
+            }
+            for (name, range) in [("u >> 1", (0u64, 32767u64)), ("(u + 2) >> 1", (1, 32768)), ("u & 0xff", (0, 255)), ("u >> 17", (0, 0)), ("(u + 2) - u", (2, 2)), ("hi(zext u)", (0, 0))] {
+                let f = form(a, name);
+                match bounds(a, &f) {
+                    Some(found) if found == range => {}
+                    other => loose.push(format!("{}: bounds {:?}, not {:?}", name, other, range)),
+                }
+            }
+            for (name, want) in [("u < 70000", true), ("u >> 16 == 0", true), ("u + 2 != u", true), ("w < w", false), ("u < 0 signed", false)] {
+                let &(_, v, _) = bits.iter().find(|x| x.0 == name).unwrap();
+                if a.bit(v, 3, None).0 != Some(want) {
+                    loose.push(format!("{}: undecided", name));
+                }
+            }
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    struct Placed {
+        b: Build,
+        cases: Vec<(&'static str, ValueId, Box<dyn Fn(usize) -> Option<Region>>)>,
+    }
+
+    fn placed() -> Placed {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let yes = b.constant(e, Ty::I1, 1);
+        let v = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let zero = b.constant(e, Ty::I32, 0);
+        let unknown = b.cmp(e, IntPred::Ne, v, zero);
+        let five = b.constant(e, Ty::I32, 5);
+        let low = b.cmp(e, IntPred::Ult, lane, five);
+        let alloc = |id| Some(Region::Allocation(id));
+        let mut cases: Vec<(&'static str, ValueId, Box<dyn Fn(usize) -> Option<Region>>)> = Vec::new();
+        cases.push(("buf", first, Box::new(move |_| alloc(1))));
+        let own = byte_offset(&mut b, e, first, lane, 4);
+        cases.push(("buf + 4 lane", own, Box::new(move |_| alloc(1))));
+        let lanes = b.core(e, Ty::I64, Op::Select(low, first, second));
+        cases.push(("select(lane < 5, first, second)", lanes, Box::new(move |l| alloc(if l < 5 { 1 } else { 2 }))));
+        let lo = b.core(e, Ty::I32, Op::UnpackLo(first));
+        let hi = b.core(e, Ty::I32, Op::UnpackHi(first));
+        let eight = b.constant(e, Ty::I32, 8);
+        let lo8 = b.int(e, IntOp::Add, lo, eight);
+        let rebuilt = b.core(e, Ty::I64, Op::Pack64(lo8, hi));
+        cases.push(("pack(lo + 8, hi)", rebuilt, Box::new(move |_| alloc(1))));
+        let base = b.core(e, Ty::I64, Op::Env(Env::ScratchBase));
+        let sixteen = b.constant(e, Ty::I64, 16);
+        let private = b.int(e, IntOp::Add, base, sixteen);
+        cases.push(("scratch base + 16", private, Box::new(|_| Some(Region::Private))));
+        let kernarg = b.core(e, Ty::I64, Op::Pack64(k.kernarg.0, k.kernarg.1));
+        cases.push(("kernarg pointer", kernarg, Box::new(|_| Some(Region::Kernarg))));
+        let zero64 = b.constant(e, Ty::I64, 0);
+        let or = b.int(e, IntOp::Or, first, zero64);
+        cases.push(("buf | 0", or, Box::new(move |_| alloc(1))));
+        let three = b.constant(e, Ty::I32, 3);
+        let read = b.wave(e, WaveOp::ReadLane, vec![lo, three, zero]);
+        let back = b.core(e, Ty::I64, Op::Pack64(read, hi));
+        cases.push(("pack(readlane(lo, 3), hi)", back, Box::new(move |_| alloc(1))));
+        let slot = b.constant(e, Ty::I32, 16);
+        b.store(e, Space::Scratch, MemSize::B64, slot, first, k.exec);
+        let spilled = b.load(e, Space::Scratch, MemSize::B64, slot, k.exec);
+        cases.push(("reloaded spill of buf", spilled, Box::new(move |_| alloc(1))));
+        let either = b.core(e, Ty::I64, Op::Select(unknown, first, second));
+        cases.push(("select(loaded bit, first, second)", either, Box::new(move |_| None)));
+        let integer = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+        cases.push(("zext lane", integer, Box::new(|_| None)));
+        Placed { b, cases }
+    }
+
+    fn settle(a: &mut Addresses, cases: &[(&'static str, ValueId, Box<dyn Fn(usize) -> Option<Region>>)]) {
+        loop {
+            for (_, v, _) in cases {
+                for l in 0..32 {
+                    for refine in [false, true] {
+                        a.regions(*v, l, None, refine);
+                    }
+                }
+            }
+            if !a.settle_loops() {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn regions_hold_the_region_every_address_points_into() {
+        let Placed { b, cases } = placed();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut wrong = Vec::new();
+        addresses(&b, &env, |a| {
+            settle(a, &cases);
+            for (name, v, truth) in &cases {
+                for l in [0usize, 3, 7, 31] {
+                    let truths: Vec<Option<Region>> = match truth(l) {
+                        None if *name == "select(loaded bit, first, second)" => vec![Some(Region::Allocation(1)), Some(Region::Allocation(2))],
+                        t => vec![t],
+                    };
+                    for refine in [false, true] {
+                        let set = a.regions(*v, l, None, refine);
+                        for t in &truths {
+                            let meets = |x: Option<Region>, y: Option<Region>| x == y;
+                            if !set.reaches(*t, meets) && !(t.is_none() && set.lost()) {
+                                wrong.push(format!("{} lane {} refine {}: {:?} misses {:?}", name, l, refine, set, t));
+                            }
+                        }
+                    }
+                    let value = a.value(*v, l, None).0;
+                    if let Some(r) = value.region {
+                        if !truths.contains(&Some(r)) {
+                            wrong.push(format!("{} lane {}: value says {:?}, truth {:?}", name, l, r, truths));
+                        }
+                    }
+                }
+            }
+        });
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn regions_name_only_the_region_an_address_points_into_when_it_is_known() {
+        let Placed { b, cases } = placed();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut loose = Vec::new();
+        addresses(&b, &env, |a| {
+            settle(a, &cases);
+            for (name, v, truth) in &cases {
+                if matches!(*name, "select(loaded bit, first, second)" | "zext lane") {
+                    continue;
+                }
+                for l in [0usize, 7] {
+                    let set = a.regions(*v, l, None, true);
+                    if set != Regions::one(truth(l)) {
+                        loose.push(format!("{} lane {}: {:?}", name, l, set));
+                    }
+                }
+            }
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    struct Branches {
+        b: Build,
+        blocks: Vec<(&'static str, BlockId, bool)>,
+    }
+
+    fn branches(lanes: u32) -> Branches {
+        let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(crate::rdna_spmd::engine::WORKGROUP_ID_X), Ty::I32)]);
+        b.entry.workgroup_id_x = true;
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let mut blocks = Vec::new();
+        let mut at = e;
+        let mut exec = k.exec;
+        let mut conditions: Vec<(&'static str, &'static str, Box<dyn Fn(&mut Build, BlockId) -> ValueId>, bool, bool)> = Vec::new();
+        conditions.push((
+            "u < 70000 taken",
+            "u < 70000 not taken",
+            Box::new(move |b, x| {
+                let k = b.constant(x, Ty::I32, 70000);
+                b.cmp(x, IntPred::Ult, u, k)
+            }),
+            true,
+            false,
+        ));
+        conditions.push((
+            "u < 100 taken",
+            "u < 100 not taken",
+            Box::new(move |b, x| {
+                let k = b.constant(x, Ty::I32, 100);
+                b.cmp(x, IntPred::Ult, u, k)
+            }),
+            true,
+            true,
+        ));
+        conditions.push((
+            "any(lane == 3) taken",
+            "any(lane == 3) not taken",
+            Box::new(move |b, x| {
+                let three = b.constant(x, Ty::I32, 3);
+                let is = b.cmp(x, IntPred::Eq, lane, three);
+                b.wave(x, WaveOp::Any, vec![is])
+            }),
+            lanes > 3,
+            lanes <= 3,
+        ));
+        let wgid = extra[0];
+        conditions.push((
+            "workgroup < 4 taken",
+            "workgroup < 4 not taken",
+            Box::new(move |b, x| {
+                let four = b.constant(x, Ty::I32, 4);
+                b.cmp(x, IntPred::Ult, wgid, four)
+            }),
+            true,
+            false,
+        ));
+        let mut reached = true;
+        for (yes_name, no_name, condition, taken, other) in conditions {
+            let c = condition(&mut b, at);
+            let (then, t) = b.block(&[Ty::I1]);
+            let (skip, _) = b.block(&[Ty::I1]);
+            b.cond_br(at, c, (then, vec![exec]), (skip, vec![exec]));
+            blocks.push((yes_name, then, reached && taken));
+            blocks.push((no_name, skip, reached && other));
+            reached = reached && taken;
+            at = then;
+            exec = t[0];
+        }
+        Branches { b, blocks }
+    }
+
+    fn reaching(lanes: u32) -> (Vec<String>, Vec<String>) {
+        let Branches { b, blocks } = branches(lanes);
+        let mut env = environment(lanes, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        env.grid = [4, 1, 1];
+        let (mut wrong, mut loose) = (Vec::new(), Vec::new());
+        addresses(&b, &env, |a| {
+            for (name, block, truth) in &blocks {
+                match (a.reaches_block(*block), *truth) {
+                    (false, true) => wrong.push(format!("{}: said unreachable", name)),
+                    (true, false) => loose.push(format!("{}: said reachable", name)),
+                    _ => {}
+                }
+            }
+        });
+        (wrong, loose)
+    }
+
+    #[test]
+    fn reaches_block_drops_only_blocks_no_execution_reaches() {
+        let mut wrong = reaching(32).0;
+        wrong.extend(reaching(2).0);
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn reaches_block_drops_every_block_whose_branch_is_decided_against_it() {
+        let mut loose = reaching(32).1;
+        loose.extend(reaching(2).1);
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    struct Counted {
+        b: Build,
+        index: ValueId,
+        truth: Vec<u32>,
+    }
+
+    fn counted(start: u32, step: u32, pred: IntPred, limit: u32) -> Counted {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let s = b.constant(e, Ty::I32, start as u64);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, s]);
+        let d = b.constant(body, Ty::I32, step as u64);
+        let next = b.int(body, IntOp::Add, p[1], d);
+        let l = b.constant(body, Ty::I32, limit as u64);
+        let again = b.cmp(body, pred, next, l);
+        b.cond_br(body, again, (body, vec![p[0], next]), (exit, vec![p[0]]));
+        let mut truth = vec![start];
+        let mut i = start;
+        loop {
+            let next = i.wrapping_add(step);
+            if !super::compare(pred, next, limit) || truth.len() > 1000 {
+                break;
+            }
+            truth.push(next);
+            i = next;
+        }
+        Counted { b, index: p[1], truth }
+    }
+
+    fn loops() -> Vec<(&'static str, Counted)> {
+        vec![
+            ("0, 1, ... while < 4", counted(0, 1, IntPred::Ult, 4)),
+            ("0, 2, ... while != 8", counted(0, 2, IntPred::Ne, 8)),
+            ("10, 7, ... while > 0 signed", counted(10, (-3i32) as u32, IntPred::Sgt, 0)),
+            ("0, 5, ... while <= 20", counted(0, 5, IntPred::Ule, 20)),
+            ("3, 4, ... while < 3", counted(3, 1, IntPred::Ult, 3)),
+        ]
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_an_iteration_gives() {
+        let env = environment(32, &[(0, 1, 0x1000)]);
+        let mut wrong = Vec::new();
+        for (name, c) in loops() {
+            addresses(&c.b, &env, |a| {
+                let form = a.value(c.index, 0, None).0.form;
+                for &t in &c.truth {
+                    if !representable(&a.unknowns, &form, t) {
+                        wrong.push(format!("{}: {:?} cannot be {}", name, form, t));
+                    }
+                }
+            });
+        }
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn loop_values_hold_only_the_values_the_iterations_give() {
+        let env = environment(32, &[(0, 1, 0x1000)]);
+        let mut loose = Vec::new();
+        for (name, c) in loops() {
+            addresses(&c.b, &env, |a| {
+                let form = a.value(c.index, 0, None).0.form;
+                let extra: Vec<u32> = vec![c.truth[0].wrapping_sub(1), c.truth.last().unwrap().wrapping_add(1), 0x7fff_ffff]
+                    .into_iter()
+                    .filter(|x| !c.truth.contains(x))
+                    .filter(|&x| exactly_representable(&a.unknowns, &form, x) != Some(false))
+                    .collect();
+                if !extra.is_empty() {
+                    loose.push(format!("{}: {:?} also holds {:?}", name, form, extra));
+                }
+            });
+        }
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    fn carried_param(alternate: bool) -> (Build, ValueId, [u32; 2]) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I64, Ty::I64, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, first, second, zero]);
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[3], one);
+        let four = b.constant(body, Ty::I32, 4);
+        let again = b.cmp(body, IntPred::Ult, next, four);
+        let (carried, spare) = if alternate { (p[2], p[1]) } else { (p[1], p[2]) };
+        b.cond_br(body, again, (body, vec![p[0], carried, spare, next]), (exit, vec![p[0]]));
+        (b, p[1], [0x1000, 0x2000])
+    }
+
+    #[test]
+    fn a_parameter_the_loop_passes_back_unchanged_keeps_its_entering_value() {
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let (b, p, _) = carried_param(false);
+        let form = addresses(&b, &env, |a| a.value(p, 0, None).0.form);
+        assert_eq!(form, Form::constant(0x1000));
+    }
+
+    #[test]
+    fn a_parameter_the_loop_swaps_holds_both_of_its_values() {
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let (b, p, truth) = carried_param(true);
+        let missed: Vec<u32> = addresses(&b, &env, |a| {
+            let form = a.value(p, 0, None).0.form;
+            truth.iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the parameter is the first pointer in even iterations and the second in odd ones: {:?}", missed);
+    }
+
+    #[test]
+    fn value_and_bit_are_right_whenever_they_decide_an_operation_of_lane_known_words() {
+        let (wrong, _) = decided(41, 3000);
+        assert!(wrong.is_empty(), "{} wrong, first {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
+    fn value_and_bit_decide_every_operation_of_lane_known_words() {
+        let (_, undecided) = decided(41, 3000);
+        let mut kinds: Vec<String> = undecided.iter().map(|s| s.split(" lane").next().unwrap().to_string()).collect();
+        kinds.sort();
+        kinds.dedup();
+        assert!(undecided.is_empty(), "{} undecided, kinds {:?}", undecided.len(), kinds);
+    }
+}
