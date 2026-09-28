@@ -12,6 +12,7 @@ pub enum Atom {
     Constant(u32),
     Fresh(usize, ValueId, u32),
     Term(usize, bool),
+    Next(ValueId, bool),
     Marker(Choice),
 }
 
@@ -314,7 +315,7 @@ impl Logic {
                 let next = self.constants.len() as u32;
                 (2 << 30) | *self.constants.entry(k).or_insert(next)
             }
-            Atom::Fresh(..) | Atom::Term(..) => {
+            Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => {
                 let next = self.detour.len() as u32;
                 assert!(next < 1 << 29, "too many detour values");
                 (3 << 30) | *self.detour.entry(atom).or_insert(next)
@@ -341,7 +342,7 @@ impl Logic {
             Atom::Bit(v) => facts.uniform[v.0],
             Atom::View(v) => facts.saturated[v.0],
             Atom::Marker(_) => true,
-            Atom::Constant(_) | Atom::Fresh(..) | Atom::Term(..) => false,
+            Atom::Constant(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
         }
     }
 
@@ -351,7 +352,7 @@ impl Logic {
                 Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),
                 Site::Unreached => None,
             },
-            Atom::Constant(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) => None,
+            Atom::Constant(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
         }
     }
 
@@ -629,12 +630,33 @@ impl Logic {
                 } else {
                     (Atom::View(param), self.view(f, facts, arg))
                 };
-                let link = self.binding(facts, src, atom, bound);
+                let link = self.binding(facts, src, arriving(src, edge.dst, atom), bound);
                 pending.extend(link.support.iter().copied().filter(|v| !seen.contains(v)));
                 links.push(link);
             }
         }
-        self.project(facts, src, formula, &links)
+        let r = self.project(facts, src, formula, &links);
+        self.arrived(src, edge.dst, r)
+    }
+
+    fn arrived(&mut self, src: BlockId, dst: BlockId, r: Bdd) -> Bdd {
+        if src != dst || r.constant().is_some() {
+            return r;
+        }
+        let next: Vec<(u32, Atom)> = self
+            .support(r)
+            .iter()
+            .filter_map(|&var| match self.atoms[&var] {
+                Atom::Next(v, false) => Some((var, Atom::Bit(v))),
+                Atom::Next(v, true) => Some((var, Atom::View(v))),
+                _ => None,
+            })
+            .collect();
+        if next.is_empty() {
+            return r;
+        }
+        let renamed: HashMap<u32, Bdd> = next.into_iter().map(|(var, atom)| (var, self.atom(atom))).collect();
+        self.m.compose(r, &|v| renamed.get(&v).copied())
     }
 
     fn binding(&mut self, facts: &Facts, src: BlockId, atom: Atom, bound: Bdd) -> Binding {
@@ -791,7 +813,7 @@ impl Logic {
                 }
                 _ => continue,
             };
-            links.push(self.binding(facts, src, atom, bound));
+            links.push(self.binding(facts, src, arriving(src, edge.dst, atom), bound));
         }
         let links = Rc::new(links);
         self.relations.insert((src, slot), links.clone());
@@ -803,7 +825,9 @@ impl Logic {
             return formula;
         }
         let links = self.bindings(f, facts, src, slot);
-        self.project(facts, src, formula, &links)
+        let r = self.project(facts, src, formula, &links);
+        let dst = f.blocks[&src].term.edges().nth(slot).unwrap().dst;
+        self.arrived(src, dst, r)
     }
 
     pub fn reach(
@@ -869,6 +893,14 @@ struct Binding {
 struct EdgeIndex {
     by_var: HashMap<u32, Vec<usize>>,
     words: HashMap<ValueId, Vec<usize>>,
+}
+
+fn arriving(src: BlockId, dst: BlockId, atom: Atom) -> Atom {
+    match atom {
+        Atom::Bit(v) if src == dst => Atom::Next(v, false),
+        Atom::View(v) if src == dst => Atom::Next(v, true),
+        other => other,
+    }
 }
 
 pub fn lane_test(f: &Func, facts: &Facts, a: ValueId, b: ValueId) -> Option<ValueId> {
@@ -967,4 +999,111 @@ pub fn choices(f: &Func, facts: &Facts) -> Vec<Choice> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+    use super::*;
+
+    struct SelfLoop {
+        b: Build,
+        body: BlockId,
+        exec: ValueId,
+        carried: ValueId,
+    }
+
+    fn self_loop() -> SelfLoop {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let e = BlockId(0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let (body, q) = b.block(&[Ty::I1, Ty::I1]);
+        let (exit, _) = b.block(&[]);
+        b.br(e, body, vec![p[0], yes]);
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(body, Ty::I32, 5);
+        let fresh = b.cmp(body, IntPred::Ult, lane, five);
+        let one = b.constant(body, Ty::I1, 1);
+        let stale = b.int(body, IntOp::Xor, fresh, one);
+        let conjunction = b.int(body, IntOp::And, q[1], stale);
+        b.cond_br(body, conjunction, (body, vec![q[0], fresh]), (exit, vec![]));
+        SelfLoop {
+            b,
+            body,
+            exec: q[0],
+            carried: q[1],
+        }
+    }
+
+    #[test]
+    fn reach_keeps_the_values_a_self_loop_carries_around() {
+        let SelfLoop {
+            b,
+            body,
+            exec,
+            carried,
+            ..
+        } = self_loop();
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let start = logic.atom(Atom::Bit(f.blocks[&f.entry].params[0].0));
+        let reach = logic.reach(f, &facts, f.entry, start);
+        let exec = logic.atom(Atom::Bit(exec));
+        let carried = logic.atom(Atom::Bit(carried));
+        let lost = logic.m.not(carried);
+        let second = logic.m.and(exec, lost);
+        let state = logic.m.and(reach[&body], second);
+        assert_ne!(
+            state,
+            Bdd::FALSE,
+            "the second iteration starts with the carried bit false, which the first iteration sends when its fresh bit is false"
+        );
+    }
+
+    #[test]
+    fn choose_keeps_the_first_choices_it_can_convert_and_nothing_it_need_not_keep() {
+        let (b, _) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let n = 6;
+        let listed: Vec<Choice> = (0..n).map(Choice::Meet).collect();
+        let mut r = Random::new(3);
+        for _ in 0..300 {
+            let mut logic = Logic::open(f, &facts, &listed);
+            let markers: Vec<Bdd> = listed.iter().map(|&c| logic.atom(Atom::Marker(c))).collect();
+            let table: Vec<bool> = (0..1u32 << n).map(|_| r.below(3) == 0).collect();
+            if !table.iter().any(|&x| x) {
+                continue;
+            }
+            let mut safe = Bdd::FALSE;
+            for (assignment, &allowed) in table.iter().enumerate() {
+                if !allowed {
+                    continue;
+                }
+                let mut term = Bdd::TRUE;
+                for (i, &m) in markers.iter().enumerate() {
+                    let literal = if assignment >> i & 1 != 0 { m } else { logic.m.not(m) };
+                    term = logic.m.and(term, literal);
+                }
+                safe = logic.m.or(safe, term);
+            }
+            let kept = logic.choose(safe);
+            let local = |kept: &BTreeSet<usize>| (0..n).filter(|i| !kept.contains(i)).fold(0usize, |a, i| a | 1 << i);
+            let chosen = local(&kept.meets);
+            assert!(table[chosen], "the choice lies outside the safe set");
+            for &i in &kept.meets {
+                assert!(!table[chosen | 1 << i], "converting Meet({}) alone stays safe", i);
+            }
+            let mut greedy = 0usize;
+            for i in 0..n {
+                let with = greedy | 1 << i;
+                let fits = (0..1usize << n).any(|a| table[a] && a & ((1 << (i + 1)) - 1) == with);
+                if fits {
+                    greedy = with;
+                }
+            }
+            assert_eq!(chosen, greedy, "the choice is not the greedy one in listed order");
+        }
+    }
 }

@@ -7,6 +7,8 @@ mod logic;
 mod provenance;
 mod rewrite;
 mod search;
+#[cfg(test)]
+mod testing;
 
 use crate::rdna_spmd::analysis::facts;
 use crate::rdna_spmd::program::Program;

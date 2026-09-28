@@ -2084,3 +2084,426 @@ impl<'c, 'a> Explore<'c, 'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::logic::Kept;
+    use super::super::testing::*;
+    use super::super::{direct, search};
+    use super::*;
+
+    fn no_hazards() -> Hazards {
+        Hazards {
+            accesses: Vec::new(),
+            together: BTreeSet::new(),
+            apart: BTreeSet::new(),
+            idle: BTreeSet::new(),
+            meetings: Vec::new(),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Reader {
+        ReadLane,
+        ReadFirstLane,
+        Bpermute,
+        BpermuteFi,
+        Wmma,
+    }
+
+    fn reads_another_lane(reader: Reader) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let flags = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
+        let x = b.core(e, Ty::I32, Op::Select(q, ones, lane));
+        let y = match reader {
+            Reader::ReadLane => b.wave(e, WaveOp::ReadLane, vec![x, zero, zero]),
+            Reader::ReadFirstLane => b.wave(e, WaveOp::ReadFirstLane, vec![x, k.exec]),
+            Reader::Bpermute => b.wave(e, WaveOp::Bpermute, vec![zero, x, k.exec]),
+            Reader::BpermuteFi => b.wave(e, WaveOp::BpermuteFi, vec![zero, x, k.exec]),
+            Reader::Wmma => {
+                let fzero = b.constant(e, Ty::F32, 0);
+                let mut inputs = vec![x; 8];
+                inputs.extend([fzero; 8]);
+                let outputs = b.effect(e, EffectOp::Wave(WaveOp::Wmma), inputs);
+                b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, outputs[0]))
+            }
+        };
+        let address = byte_offset(&mut b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, address, y, c);
+        (b, q)
+    }
+
+    struct Flagged {
+        b: Build,
+        k: Kernel,
+        buf: ValueId,
+        lane: ValueId,
+        set: ValueId,
+        c: ValueId,
+    }
+
+    fn flagged() -> Flagged {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let flags = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        Flagged {
+            b,
+            k,
+            buf,
+            lane,
+            set,
+            c,
+        }
+    }
+
+    fn both(b: &Build) -> [Kept; 2] {
+        [
+            search::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0,
+            direct::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0,
+        ]
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_decides_whether_lanes_store() {
+        let Flagged { mut b, k, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, _) = b.block(&[Ty::I1]);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        b.cond_br(e, q, (then, vec![k.exec, own]), (join, vec![k.exec]));
+        let one = b.constant(then, Ty::I32, 1);
+        b.store(then, Space::Global, MemSize::B32, t[1], one, t[0]);
+        b.br(then, join, vec![t[0]]);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag skips the store the wave makes", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_moves_the_address() {
+        let Flagged { mut b, k, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let near = b.constant(e, Ty::I64, 0);
+        let far = b.constant(e, Ty::I64, 4);
+        let shift = b.core(e, Ty::I64, Op::Select(q, near, far));
+        let own = byte_offset(&mut b, e, buf, lane, 8);
+        let address = b.int(e, IntOp::Add, own, shift);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, address, one, k.exec);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag stores four bytes further", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_picks_the_word_a_lane_loads() {
+        let Flagged { mut b, k, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let table = k.buffer(&mut b, e, 16);
+        let four = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, four);
+        let from = b.core(e, Ty::I64, Op::Select(q, table, second));
+        let v = b.load(e, Space::Global, MemSize::B32, from, k.exec);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, v, k.exec);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag loads the second word of the table", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_masks_a_store() {
+        let Flagged { mut b, k, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let mask = b.int(e, IntOp::And, q, k.exec);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, own, one, mask);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag skips its store", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_ballot_whose_lane_test_masks_a_store() {
+        let Flagged { mut b, k, buf, lane, c, .. } = flagged();
+        let e = BlockId(0);
+        let w = b.wave(e, WaveOp::Ballot, vec![c]);
+        let zero = b.constant(e, Ty::I32, 0);
+        let any = b.cmp(e, IntPred::Ne, w, zero);
+        let mask = b.int(e, IntOp::And, any, k.exec);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, own, one, mask);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.words.contains(&w))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag reads its own bit of the ballot as zero", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_ends_a_loop() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let flags = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, zero, buf, flags]);
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let wave = b.constant(body, Ty::I32, 32);
+        let row = b.int(body, IntOp::Mul, p[1], wave);
+        let item = b.int(body, IntOp::Add, row, lane);
+        let own = byte_offset(&mut b, body, p[3], item, 4);
+        let flag = b.load(body, Space::Global, MemSize::B32, own, p[0]);
+        let z = b.constant(body, Ty::I32, 0);
+        let set = b.cmp(body, IntPred::Ne, flag, z);
+        let c = b.int(body, IntOp::And, set, p[0]);
+        let out = byte_offset(&mut b, body, p[2], item, 4);
+        let one = b.constant(body, Ty::I32, 1);
+        b.store(body, Space::Global, MemSize::B32, out, one, p[0]);
+        let next = b.int(body, IntOp::Add, p[1], one);
+        let q = b.wave(body, WaveOp::Any, vec![c]);
+        b.cond_br(body, q, (body, vec![p[0], next, p[2], p[3]]), (exit, vec![p[0]]));
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag leaves the loop while the wave stores another row", wrong);
+    }
+
+    fn carried_query(latch: bool) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let flags = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let shape = [Ty::I1, Ty::I1, Ty::I32, Ty::I64, Ty::I64];
+        let (body, p) = b.block(&shape);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, yes, zero, buf, flags]);
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let wave = b.constant(body, Ty::I32, 32);
+        let row = b.int(body, IntOp::Mul, p[2], wave);
+        let item = b.int(body, IntOp::Add, row, lane);
+        let own = byte_offset(&mut b, body, p[4], item, 4);
+        let always = b.constant(body, Ty::I1, 1);
+        let flag = b.load(body, Space::Global, MemSize::B32, own, always);
+        let z = b.constant(body, Ty::I32, 0);
+        let c = b.cmp(body, IntPred::Ne, flag, z);
+        let q = b.wave(body, WaveOp::Any, vec![c]);
+        let mask = b.int(body, IntOp::And, p[1], p[0]);
+        let out = byte_offset(&mut b, body, p[3], item, 4);
+        let one = b.constant(body, Ty::I32, 1);
+        b.store(body, Space::Global, MemSize::B32, out, one, mask);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let four = b.constant(body, Ty::I32, 4);
+        let below = b.cmp(body, IntPred::Ult, next, four);
+        let again = b.int(body, IntOp::And, p[1], below);
+        let back = vec![p[0], q, next, p[3], p[4]];
+        if latch {
+            let (latch, l) = b.block(&shape);
+            b.cond_br(body, again, (latch, back), (exit, vec![p[0]]));
+            b.br(latch, body, l);
+        } else {
+            b.cond_br(body, again, (body, back), (exit, vec![p[0]]));
+        }
+        (b, q)
+    }
+
+    #[test]
+    fn prove_keeps_a_query_a_self_loop_carries_into_its_own_condition() {
+        let (b, q) = carried_query(false);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag in row 0 leaves the loop and skips row 1, which the wave stores", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_a_loop_with_a_latch_carries_into_its_own_condition() {
+        let (b, q) = carried_query(true);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag in row 0 leaves the loop and skips row 1, which the wave stores", wrong);
+    }
+
+    fn detour_home(join: bool) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let flags = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let head_shape = [Ty::I1, Ty::I1, Ty::I32, Ty::I64, Ty::I64];
+        let arm_shape = [Ty::I1, Ty::I32, Ty::I64, Ty::I64];
+        let (head, h) = b.block(&head_shape);
+        let (taken, t) = b.block(&arm_shape);
+        let (other, o) = b.block(&arm_shape);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, head, vec![k.exec, yes, zero, buf, flags]);
+        let lane = b.core(head, Ty::I32, Op::Env(Env::LaneId));
+        let wave = b.constant(head, Ty::I32, 32);
+        let row = b.int(head, IntOp::Mul, h[2], wave);
+        let item = b.int(head, IntOp::Add, row, lane);
+        let out = byte_offset(&mut b, head, h[3], item, 4);
+        let mask = b.int(head, IntOp::And, h[1], h[0]);
+        let one = b.constant(head, Ty::I32, 1);
+        b.store(head, Space::Global, MemSize::B32, out, one, mask);
+        let own = byte_offset(&mut b, head, h[4], item, 4);
+        let always = b.constant(head, Ty::I1, 1);
+        let flag = b.load(head, Space::Global, MemSize::B32, own, always);
+        let z = b.constant(head, Ty::I32, 0);
+        let c = b.cmp(head, IntPred::Ne, flag, z);
+        let q = b.wave(head, WaveOp::Any, vec![c]);
+        let go = b.int(head, IntOp::And, q, h[1]);
+        let next = b.int(head, IntOp::Add, h[2], one);
+        b.cond_br(head, go, (taken, vec![h[0], next, h[3], h[4]]), (other, vec![h[0], next, h[3], h[4]]));
+        let on = b.constant(taken, Ty::I1, 1);
+        let off = b.constant(other, Ty::I1, 0);
+        if join {
+            let (meet, m) = b.block(&head_shape);
+            b.br(taken, meet, vec![t[0], on, t[1], t[2], t[3]]);
+            let four = b.constant(other, Ty::I32, 4);
+            let below = b.cmp(other, IntPred::Ult, o[1], four);
+            b.cond_br(other, below, (meet, vec![o[0], off, o[1], o[2], o[3]]), (exit, vec![o[0]]));
+            b.br(meet, head, m);
+        } else {
+            b.br(taken, head, vec![t[0], on, t[1], t[2], t[3]]);
+            let four = b.constant(other, Ty::I32, 4);
+            let below = b.cmp(other, IntPred::Ult, o[1], four);
+            b.cond_br(other, below, (head, vec![o[0], off, o[1], o[2], o[3]]), (exit, vec![o[0]]));
+        }
+        (b, q)
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_detour_ends_where_it_began() {
+        let (b, q) = detour_home(false);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag takes the other arm, clears its bit and skips row 1, which the wave stores", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_detour_ends_at_a_join_before_the_header() {
+        let (b, q) = detour_home(true);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&q))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag takes the other arm, clears its bit and skips row 1, which the wave stores", wrong);
+    }
+
+    #[test]
+    fn prove_demands_every_lane_for_a_kept_query_over_unmasked_bits() {
+        let Flagged { mut b, k, buf, lane, set, .. } = flagged();
+        let e = BlockId(0);
+        let at = b.here(e);
+        let q = b.wave(e, WaveOp::Any, vec![set]);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let data = b.core(e, Ty::I32, Op::Select(q, one, zero));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, data, k.exec);
+        let Inst::Effect { provenance, .. } = b.f.blocks[&e].insts[at.1] else { unreachable!() };
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            assert!(kept.queries.contains(&q), "{}: a lane without the flag stores zero", name);
+            assert!(everyone.contains(&provenance), "{}: the query reads the flags of lanes whose exec is clear", name);
+        }
+    }
+
+    #[test]
+    fn search_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
+        let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
+            .iter()
+            .copied()
+            .filter(|&reader| {
+                let (b, q) = reads_another_lane(reader);
+                let (kept, _) = search::prove(&b.f, &b.inputs, Some(0), &no_hazards());
+                !kept.queries.contains(&q)
+            })
+            .collect();
+        assert!(
+            converted.is_empty(),
+            "{:?}: when lane 0 alone has a zero flag, lane 0 answers the query false and hands the storing lanes its own lane id instead of the pair of halves 1.0",
+            converted
+        );
+    }
+
+    #[test]
+    fn direct_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
+        let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
+            .iter()
+            .copied()
+            .filter(|&reader| {
+                let (b, q) = reads_another_lane(reader);
+                let (kept, _) = direct::prove(&b.f, &b.inputs, Some(0), &no_hazards());
+                !kept.queries.contains(&q)
+            })
+            .collect();
+        assert!(
+            converted.is_empty(),
+            "{:?}: when lane 0 alone has a zero flag, lane 0 answers the query false and hands the storing lanes its own lane id instead of the pair of halves 1.0",
+            converted
+        );
+    }
+}

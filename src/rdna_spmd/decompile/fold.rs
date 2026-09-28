@@ -250,3 +250,36 @@ fn remove_dead(q: &mut Func) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+    use super::*;
+
+    #[test]
+    fn fold_keeps_a_bit_that_a_self_loop_changes() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let e = BlockId(0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let (body, q) = b.block(&[Ty::I1, Ty::I1]);
+        let (exit, _) = b.block(&[]);
+        b.br(e, body, vec![p[0], yes]);
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(body, Ty::I32, 5);
+        let fresh = b.cmp(body, IntPred::Ult, lane, five);
+        let one = b.constant(body, Ty::I1, 1);
+        let stale = b.int(body, IntOp::Xor, fresh, one);
+        let conjunction = b.int(body, IntOp::And, q[1], stale);
+        b.cond_br(body, conjunction, (body, vec![q[0], fresh]), (exit, vec![]));
+        let mut f = b.f;
+        fold(&mut f, &b.inputs, &BTreeSet::new(), Some(0));
+        let kept = f.blocks[&body].insts.iter().any(|inst| {
+            matches!(inst, Inst::Core { op: Op::Int(IntOp::And, x, _), .. } if *x == q[1])
+        });
+        assert!(
+            kept,
+            "the carried bit is true on entry and false after an iteration whose fresh bit is false, but fold made it constant: {:?}",
+            f.blocks[&body].insts
+        );
+    }
+}

@@ -2575,12 +2575,13 @@ impl<'a> Addresses<'a> {
                     }
                 }
             }
-            Op::Convert(Cvt::ZExt | Cvt::SExt, _, a) if self.f.types[a.0] == Ty::I1 => {
+            Op::Convert(k @ (Cvt::ZExt | Cvt::SExt), _, a) if self.f.types[a.0] == Ty::I1 => {
                 let (bit, u) = self.bit(a, lane, assume);
                 used |= u;
+                let ones = if k == Cvt::SExt { u32::MAX } else { 1 };
                 match bit {
-                    Some(b) => Value::constant(b as u32),
-                    None => self.opaque(v, lane, Some((0, 1))),
+                    Some(b) => Value::constant(if b { ones } else { 0 }),
+                    None => Value::of(self.opaque(v, lane, Some((0, 1))).form.scale(ones)),
                 }
             }
             Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, to, a)
@@ -3010,7 +3011,9 @@ impl<'a> Addresses<'a> {
                     None => match self.facts.op(self.f, x) {
                         Some(Op::Int(IntOp::LShr, w, s)) => {
                             match self.value(s, lane, None).0.form.as_constant() {
-                                Some(k) if k < 32 => self.word_bit(w, k as usize),
+                                Some(k) if k < 32 && (self.facts.uniform[w.0] || k as usize == lane) => {
+                                    self.word_bit(w, k as usize)
+                                }
                                 _ => None,
                             }
                         }
@@ -4102,5 +4105,206 @@ fn compare(pred: IntPred, x: u32, y: u32) -> bool {
         IntPred::Sle => sx <= sy,
         IntPred::Sgt => sx > sy,
         IntPred::Sge => sx >= sy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+    use super::*;
+
+    const PREDICATES: [IntPred; 10] = [
+        IntPred::Eq,
+        IntPred::Ne,
+        IntPred::Ult,
+        IntPred::Ugt,
+        IntPred::Ule,
+        IntPred::Uge,
+        IntPred::Slt,
+        IntPred::Sgt,
+        IntPred::Sle,
+        IntPred::Sge,
+    ];
+
+    fn at(x: (u32, u32), t: u32) -> u32 {
+        x.0.wrapping_add(x.1.wrapping_mul(t))
+    }
+
+    fn interesting(r: &mut Random) -> u32 {
+        match r.below(5) {
+            0 => r.below(16) as u32,
+            1 => (r.below(16) as u32).wrapping_neg(),
+            2 => 0x8000_0000u32.wrapping_add(r.below(16) as u32).wrapping_sub(8),
+            3 => [1, 2, 3, 4, 0xffff_ffff, 0xffff_fffe, 0x8000_0000, 0x7fff_ffff][r.below(8) as usize],
+            _ => r.next() as u32,
+        }
+    }
+
+    #[test]
+    fn first_failure_names_an_iteration_that_leaves_the_loop() {
+        let mut r = Random::new(5);
+        for _ in 0..200000 {
+            let pred = PREDICATES[r.below(10) as usize];
+            let taken = r.below(2) == 0;
+            let x = (interesting(&mut r), if r.below(2) == 0 { 0 } else { interesting(&mut r) });
+            let y = (interesting(&mut r), if r.below(3) == 0 { interesting(&mut r) } else { 0 });
+            if let Some(last) = first_failure(pred, taken, x, y) {
+                assert_ne!(
+                    compare(pred, at(x, last), at(y, last)),
+                    taken,
+                    "{:?} taken={} {:?} {:?}: the loop still runs after iteration {}",
+                    pred, taken, x, y, last
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_failure_names_the_first_iteration_that_leaves_the_loop() {
+        let mut r = Random::new(9);
+        for _ in 0..200000 {
+            let pred = PREDICATES[r.below(10) as usize];
+            let taken = r.below(2) == 0;
+            let x = (interesting(&mut r), if r.below(2) == 0 { 0 } else { interesting(&mut r) });
+            let y = (interesting(&mut r), if r.below(3) == 0 { interesting(&mut r) } else { 0 });
+            if let Some(last) = first_failure(pred, taken, x, y) {
+                if let Some(t) = (0..last.min(1 << 12)).find(|&t| compare(pred, at(x, t), at(y, t)) != taken) {
+                    panic!(
+                        "{:?} taken={} {:?} {:?}: the loop leaves after iteration {}, before {}",
+                        pred, taken, x, y, t, last
+                    );
+                }
+            }
+        }
+    }
+
+    fn range(r: &mut Random) -> (u64, u64) {
+        let low = interesting(r) as u64;
+        let width = r.below(4);
+        (low, (low + width).min(u32::MAX as u64))
+    }
+
+    #[test]
+    fn decide_answers_only_what_holds_across_both_ranges() {
+        let mut r = Random::new(13);
+        for _ in 0..100000 {
+            let pred = PREDICATES[r.below(10) as usize];
+            let (x, y) = (range(&mut r), range(&mut r));
+            if let Some(answer) = decide(pred, x, y) {
+                for a in x.0..=x.1 {
+                    for b in y.0..=y.1 {
+                        assert_eq!(
+                            compare(pred, a as u32, b as u32),
+                            answer,
+                            "{:?} over {:?} and {:?} at {} and {}",
+                            pred, x, y, a, b
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn offset_answers_only_what_holds_for_every_value_in_range() {
+        let mut r = Random::new(17);
+        for _ in 0..100000 {
+            let pred = PREDICATES[r.below(10) as usize];
+            let y = range(&mut r);
+            let d = interesting(&mut r);
+            if let Some(answer) = offset(pred, d, y) {
+                for b in y.0..=y.1 {
+                    let b = b as u32;
+                    assert_eq!(
+                        compare(pred, b.wrapping_add(d), b),
+                        answer,
+                        "{:?}: y in {:?}, x = y + {:#x}, at y = {}",
+                        pred, y, d, b
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn low_bits_matches_the_operation_for_every_value_of_the_unknowns() {
+        let mut r = Random::new(19);
+        for _ in 0..20000 {
+            let form = Form {
+                constant: interesting(&mut r),
+                terms: vec![(0, (interesting(&mut r) | 1) << r.below(8)), (1, (interesting(&mut r) | 1) << r.below(8))],
+            };
+            let c = r.below(512) as u32;
+            for op in [IntOp::And, IntOp::Or, IntOp::Xor] {
+                let Some(result) = low_bits(&form, c, op) else { continue };
+                for _ in 0..16 {
+                    let values = [r.next() as u32, r.next() as u32];
+                    let value = |f: &Form| {
+                        f.terms
+                            .iter()
+                            .fold(f.constant, |a, &(u, k)| a.wrapping_add(k.wrapping_mul(values[u as usize])))
+                    };
+                    let v = value(&form);
+                    let expected = match op {
+                        IntOp::And => v & c,
+                        IntOp::Or => v | c,
+                        _ => v ^ c,
+                    };
+                    assert_eq!(value(&result), expected, "{:?} {:?} {:#x} at {:?}", form, op, c, values);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forms_add_subtract_and_scale_as_words() {
+        let mut r = Random::new(23);
+        for _ in 0..20000 {
+            let form = |r: &mut Random| {
+                let mut terms: Vec<(Unknown, u32)> = Vec::new();
+                for u in 0..4 {
+                    let c = interesting(r);
+                    if r.below(2) == 0 && c != 0 {
+                        terms.push((u, c));
+                    }
+                }
+                terms.sort();
+                Form {
+                    constant: interesting(r),
+                    terms,
+                }
+            };
+            let (a, b) = (form(&mut r), form(&mut r));
+            let k = interesting(&mut r);
+            let values: Vec<u32> = (0..4).map(|_| r.next() as u32).collect();
+            let value = |f: &Form| {
+                f.terms
+                    .iter()
+                    .fold(f.constant, |acc, &(u, c)| acc.wrapping_add(c.wrapping_mul(values[u as usize])))
+            };
+            let canonical = |f: &Form| {
+                f.terms.windows(2).all(|w| w[0].0 < w[1].0) && f.terms.iter().all(|&(_, c)| c != 0)
+            };
+            for (result, expected) in [
+                (a.add(&b), value(&a).wrapping_add(value(&b))),
+                (a.sub(&b), value(&a).wrapping_sub(value(&b))),
+                (a.scale(k), value(&a).wrapping_mul(k)),
+            ] {
+                assert_eq!(value(&result), expected);
+                assert!(canonical(&result), "{:?}", result);
+            }
+            assert_eq!(a.sub(&a).as_constant(), Some(0));
+        }
+    }
+
+    #[test]
+    fn extend_widens_each_size_as_the_load_does() {
+        for word in [0u32, 0x7f, 0x80, 0xff, 0x7fff, 0x8000, 0xffff, 0x1234_5678, 0xffff_ffff] {
+            assert_eq!(extend(word, MemSize::U8), word & 0xff);
+            assert_eq!(extend(word, MemSize::I8), word as u8 as i8 as i32 as u32);
+            assert_eq!(extend(word, MemSize::U16), word & 0xffff);
+            assert_eq!(extend(word, MemSize::I16), word as u16 as i16 as i32 as u32);
+            assert_eq!(extend(word, MemSize::B32), word);
+        }
     }
 }
