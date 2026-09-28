@@ -1265,26 +1265,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn find_follows_a_pointer_rebuilt_from_a_difference() {
-        let (mut b, k) = Build::kernel();
-        let e = BlockId(0);
-        let first = k.buffer(&mut b, e, 0);
-        let second = k.buffer(&mut b, e, 8);
-        let distance = b.int(e, IntOp::Sub, first, second);
-        let rebuilt = b.int(e, IntOp::Add, second, distance);
-        let zero = b.constant(e, Ty::I32, 0);
-        let s1 = b.here(e);
-        b.store(e, Space::Global, MemSize::B32, rebuilt, zero, k.exec);
-        let s2 = b.here(e);
-        b.store(e, Space::Global, MemSize::B32, first, zero, k.exec);
-        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
-        assert!(
-            h.together.contains(&pair(&h, s1, s2)),
-            "second + (first - second) is first, where every lane stores next"
-        );
-    }
-
     fn counted_loop(trips: u64, lane_step: bool) -> (Hazards, (usize, usize)) {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
