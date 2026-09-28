@@ -1,4 +1,4 @@
-use super::address::{Addresses, Form, Region, Regions, UnknownInfo, Value, LANES};
+use super::address::{Addresses, Form, Region, Regions, Unknown, UnknownInfo, Value, LANES};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::environment::Environment;
@@ -192,26 +192,37 @@ impl Hazards {
                         continue;
                     }
                     let (lp, lq) = (&loops_of[p], &loops_of[q]);
-                    let variant = |info: &UnknownInfo| {
-                        around[info.rank].iter().any(|l| {
-                            let (in_p, in_q) = (lp.contains(l), lq.contains(l));
-                            if together {
-                                in_p != in_q
-                            } else {
-                                in_p || in_q
-                            }
-                        })
+                    let outer: Vec<usize> = lp.iter().rev().copied().filter(|l| lq.contains(l)).collect();
+                    let cases: Vec<(&[usize], Option<Unknown>)> = if together {
+                        vec![(&[][..], None)]
+                    } else {
+                        (0..outer.len())
+                            .map(|j| (&outer[..j], addresses.trip(facts.order[loops.header(outer[j])])))
+                            .collect()
                     };
-                    let found = meet(
-                        &mut addresses,
-                        env,
-                        (&hazards.accesses[p], &lanes[p]),
-                        (&hazards.accesses[q], &lanes[q]),
-                        &variant,
-                    );
-                    if let Some(idle) = found {
-                        now[k].0 = true;
-                        now[k].1 = [now[k].1[0] && idle[0], now[k].1[1] && idle[1]];
+                    for (same, differ) in cases {
+                        let variant = |info: &UnknownInfo| {
+                            around[info.rank].iter().any(|l| {
+                                let (in_p, in_q) = (lp.contains(l), lq.contains(l));
+                                if together {
+                                    in_p != in_q
+                                } else {
+                                    (in_p || in_q) && !same.contains(l)
+                                }
+                            })
+                        };
+                        let found = meet(
+                            &mut addresses,
+                            env,
+                            (&hazards.accesses[p], &lanes[p]),
+                            (&hazards.accesses[q], &lanes[q]),
+                            &variant,
+                            differ,
+                        );
+                        if let Some(idle) = found {
+                            now[k].0 = true;
+                            now[k].1 = [now[k].1[0] && idle[0], now[k].1[1] && idle[1]];
+                        }
                     }
                 }
                 state.insert((p, q), now);
@@ -764,6 +775,7 @@ fn meet(
     (pa, p): (&Access, &[Option<Place>]),
     (qa, q): (&Access, &[Option<Place>]),
     variant: &dyn Fn(&UnknownInfo) -> bool,
+    differ: Option<Unknown>,
 ) -> Option<[bool; 2]> {
     let mut idle: Option<[bool; 2]> = None;
     for (a, x) in p.iter().enumerate() {
@@ -788,7 +800,7 @@ fn meet(
                 if d >= qa.bytes && d.wrapping_neg() >= pa.bytes {
                     continue;
                 }
-            } else if !may_overlap(unknowns, &xa.form, &ya.form, pa.bytes, qa.bytes, variant) {
+            } else if !may_overlap(unknowns, &xa.form, &ya.form, pa.bytes, qa.bytes, variant, differ) {
                 continue;
             }
             if !runs(addresses, pa, a) || !runs(addresses, qa, b) {
@@ -853,9 +865,10 @@ fn excluded(
     candidates.into_iter().all(|value| {
         addresses.with_value(v, value, |this| {
             let runs = |this: &mut Addresses, access: &Access, lane: usize| {
-                access
-                    .predicate
-                    .is_none_or(|p| this.bit(p, lane, None).0 != Some(false))
+                this.reaches_block_with_value(access.block)
+                    && access
+                        .predicate
+                        .is_none_or(|p| this.bit(p, lane, None).0 != Some(false))
             };
             !(runs(this, pa, a) && runs(this, qa, b))
         })
@@ -869,26 +882,10 @@ fn may_overlap(
     x_bytes: u32,
     y_bytes: u32,
     variant: &dyn Fn(&UnknownInfo) -> bool,
+    differ: Option<Unknown>,
 ) -> bool {
-    let constant = x.constant.wrapping_sub(y.constant) as i64;
-    let (mut low, mut high) = (0i64, 0i64);
-    let mut modulus: u64 = 1 << 32;
-    let mut divisor: u64 = 0;
-    let mut term = |c: u32, range: Option<(u32, u32)>| {
-        if c == 0 {
-            return;
-        }
-        let signed = c as i32 as i64;
-        match range {
-            Some((lo, hi)) if (hi as i64 - lo as i64) * signed.abs() < 1 << 32 => {
-                let (a, b) = (signed * lo as i64, signed * hi as i64);
-                low = low.wrapping_add(a.min(b));
-                high = high.wrapping_add(a.max(b));
-                divisor = gcd(divisor, signed.unsigned_abs());
-            }
-            _ => modulus = modulus.min(1u64 << c.trailing_zeros()),
-        }
-    };
+    let mut sum = Sum::default();
+    let mut apart = None;
     let (mut i, mut j) = (0, 0);
     while i < x.terms.len() || j < y.terms.len() {
         let u = match (x.terms.get(i), y.terms.get(j)) {
@@ -913,33 +910,164 @@ fn may_overlap(
         };
         let info = &unknowns[u as usize];
         if variant(info) {
-            term(cx, info.range);
-            term(cy.wrapping_neg(), info.range);
+            if let (true, true, Some((lo, hi))) = (Some(u) == differ, cx == cy, info.range) {
+                apart = Some((cx, hi - lo));
+                continue;
+            }
+            sum.add(cx, info.range);
+            sum.add(cy.wrapping_neg(), info.range);
         } else {
-            term(cx.wrapping_sub(cy), info.range);
+            sum.add(cx.wrapping_sub(cy), info.range);
         }
     }
-    let step = gcd(divisor, modulus) as i64;
-    let window = -(x_bytes as i64) + 1..y_bytes as i64;
-    if !window.clone().any(|t| (t - constant).rem_euclid(step) == 0) {
+    let constant = x.constant.wrapping_sub(y.constant) as i64;
+    match apart {
+        None => sum.within(constant, x_bytes, y_bytes),
+        Some((_, 0)) => false,
+        Some((c, span)) => [c, c.wrapping_neg()].iter().any(|&c| {
+            let mut sum = sum;
+            sum.add(c, Some((1, span)));
+            sum.within(constant, x_bytes, y_bytes)
+        }),
+    }
+}
+
+const BOUNDED: usize = 8;
+const PARTIAL_SUMS: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct Sum {
+    low: i64,
+    high: i64,
+    modulus: u64,
+    divisor: u64,
+    free: u64,
+    terms: [(u32, u32, u32); BOUNDED],
+    count: usize,
+}
+
+impl Default for Sum {
+    fn default() -> Self {
+        Sum {
+            low: 0,
+            high: 0,
+            modulus: 1 << 32,
+            divisor: 0,
+            free: 1 << 32,
+            terms: [(0, 0, 0); BOUNDED],
+            count: 0,
+        }
+    }
+}
+
+impl Sum {
+    fn add(&mut self, c: u32, range: Option<(u32, u32)>) {
+        if c == 0 {
+            return;
+        }
+        let signed = c as i32 as i64;
+        match range {
+            Some((lo, hi)) if (hi as i64 - lo as i64) * signed.abs() < 1 << 32 => {
+                let (a, b) = (signed * lo as i64, signed * hi as i64);
+                self.low = self.low.wrapping_add(a.min(b));
+                self.high = self.high.wrapping_add(a.max(b));
+                self.divisor = gcd(self.divisor, signed.unsigned_abs());
+            }
+            _ => self.modulus = self.modulus.min(1u64 << c.trailing_zeros()),
+        }
+        match range {
+            Some((lo, hi)) if self.count < BOUNDED => {
+                self.terms[self.count] = (c, lo, hi);
+                self.count += 1;
+            }
+            Some(_) => self.count = BOUNDED + 1,
+            None => self.free = self.free.min(1u64 << c.trailing_zeros()),
+        }
+    }
+
+    fn within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
+        self.roughly_within(constant, x_bytes, y_bytes) && self.exactly_within(constant, x_bytes, y_bytes)
+    }
+
+    fn roughly_within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
+        let step = gcd(self.divisor, self.modulus) as i64;
+        let window = -(x_bytes as i64) + 1..y_bytes as i64;
+        if !window.clone().any(|t| (t - constant).rem_euclid(step) == 0) {
+            return false;
+        }
+        let span = self.high.wrapping_sub(self.low);
+        if span + 1 >= self.modulus as i64 {
+            return true;
+        }
+        let m = self.modulus as i64;
+        window.into_iter().any(|t| {
+            let target = (t - constant).rem_euclid(m);
+            let start = self.low.rem_euclid(m);
+            let offset = (target - start).rem_euclid(m);
+            offset <= span
+        })
+    }
+
+    fn exactly_within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
+        if self.count == 0 || self.count > BOUNDED {
+            return true;
+        }
+        let m = self.free as i64;
+        let terms = &self.terms[..self.count];
+        let widest = (0..terms.len()).max_by_key(|&k| terms[k].2 - terms[k].1).unwrap();
+        let (c, lo, hi) = terms[widest];
+        let hits = |s: i64| (-(x_bytes as i64) + 1..y_bytes as i64).any(|t| solvable(c, lo, hi, (t - constant - s).rem_euclid(m) as u64, m as u64));
+        if terms.len() == 1 {
+            return hits(0);
+        }
+        let mask = self.free - 1;
+        let mut sums: Vec<u64> = vec![0];
+        for (k, &(c, lo, hi)) in terms.iter().enumerate() {
+            if k == widest {
+                continue;
+            }
+            let width = (hi - lo) as usize + 1;
+            if width > PARTIAL_SUMS || sums.len() * width > PARTIAL_SUMS * 4 {
+                return true;
+            }
+            let mut next: Vec<u64> = Vec::with_capacity(sums.len() * width);
+            for &s in &sums {
+                for u in lo..=hi {
+                    next.push(s.wrapping_add((c as u64).wrapping_mul(u as u64)) & mask);
+                }
+            }
+            next.sort_unstable();
+            next.dedup();
+            if next.len() > PARTIAL_SUMS {
+                return true;
+            }
+            sums = next;
+        }
+        sums.into_iter().any(|s| hits(s as i64))
+    }
+}
+
+fn solvable(c: u32, lo: u32, hi: u32, target: u64, m: u64) -> bool {
+    let c = c as u64 % m;
+    if c == 0 {
+        return target % m == 0;
+    }
+    let g = 1u64 << c.trailing_zeros();
+    if target % g != 0 {
         return false;
     }
-    let span = high.wrapping_sub(low);
-    if span + 1 >= modulus as i64 {
-        return true;
-    }
-    let m = modulus as i64;
-    window.into_iter().any(|t| {
-        let target = (t - constant).rem_euclid(m);
-        let start = low.rem_euclid(m);
-        let offset = (target - start).rem_euclid(m);
-        offset <= span
-    })
+    let reduced = m / g;
+    let mask = reduced - 1;
+    let odd = c / g;
+    let inverse = (0..6).fold(odd, |inv: u64, _| inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv))));
+    let r = ((target / g).wrapping_mul(inverse)) & mask;
+    let first = lo as u64 + (r.wrapping_sub(lo as u64) & mask);
+    first <= hi as u64
 }
 
 #[cfg(test)]
 pub(super) fn may_overlap_for_tests(unknowns: &[UnknownInfo], x: &Form, y: &Form) -> bool {
-    may_overlap(unknowns, x, y, 1, 1, &|_: &UnknownInfo| false)
+    may_overlap(unknowns, x, y, 1, 1, &|_: &UnknownInfo| false, None)
 }
 
 fn gcd(a: u64, b: u64) -> u64 {
@@ -1070,7 +1198,7 @@ mod tests {
         for _ in 0..20000 {
             let (unknowns, variant, x, y, a, b) = random_case(&mut r, false);
             let exact = exact_overlap(&unknowns, &variant, &x, &y, a, b);
-            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank]);
+            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank], None);
             assert!(
                 found || !exact,
                 "{:?} ({} bytes) and {:?} ({} bytes) over {:?} with variant {:?} overlap, but may_overlap says they do not",
@@ -1085,7 +1213,7 @@ mod tests {
         for _ in 0..20000 {
             let (unknowns, variant, x, y, a, b) = random_case(&mut r, true);
             let exact = exact_overlap(&unknowns, &variant, &x, &y, a, b);
-            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank]);
+            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank], None);
             assert_eq!(
                 found, exact,
                 "{:?} ({} bytes) and {:?} ({} bytes) over {:?} with variant {:?}",
@@ -1103,7 +1231,18 @@ mod tests {
         };
         let y = Form::constant(0);
         assert!(exact_overlap(&unknowns, &[false, false], &x, &y, 1, 1));
-        assert!(may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false));
+        assert!(may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None));
+    }
+
+    #[test]
+    fn may_overlap_sees_that_four_u_plus_six_v_never_hits_two_over_wide_ranges() {
+        let unknowns = [info(0, Some((0, 10000))), info(1, Some((0, 10000)))];
+        let x = Form {
+            constant: 0,
+            terms: vec![(0, 4), (1, 6)],
+        };
+        let y = Form::constant(2);
+        assert!(!may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None), "4u + 6v is 0, 4, 6, 8, ... for u, v >= 0, never 2");
     }
 
     #[test]
@@ -1115,7 +1254,7 @@ mod tests {
         };
         let y = Form::constant(2);
         assert!(!exact_overlap(&unknowns, &[false, false], &x, &y, 1, 1));
-        assert!(!may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false));
+        assert!(!may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None));
     }
 
     #[test]
@@ -1127,7 +1266,7 @@ mod tests {
         };
         for (y, bytes, expected) in [(4, 4, false), (4, 5, true), (0x1_0000_0000u64 as u32, 1, true), (7, 1, false), (16, 1, true)] {
             assert_eq!(
-                may_overlap(&unknowns, &x, &Form::constant(y), 4, bytes, &|_: &UnknownInfo| false),
+                may_overlap(&unknowns, &x, &Form::constant(y), 4, bytes, &|_: &UnknownInfo| false, None),
                 expected,
                 "8u (4 bytes) against {} ({} bytes)",
                 y,
@@ -1487,8 +1626,7 @@ mod tests {
         assert!(!h.together.contains(&key), "within one iteration the lanes store their own words");
     }
 
-    #[test]
-    fn find_reports_nested_loops_within_one_inner_iteration_only() {
+    fn nested(item: impl Fn(&mut Build, BlockId, ValueId, ValueId) -> ValueId) -> (Hazards, (usize, usize)) {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
@@ -1501,8 +1639,7 @@ mod tests {
         let z = b.constant(outer, Ty::I32, 0);
         b.br(outer, inner, vec![o[0], o[1], z]);
         let four = b.constant(inner, Ty::I32, 4);
-        let row = b.int(inner, IntOp::Mul, i[1], four);
-        let item = b.int(inner, IntOp::Add, row, i[2]);
+        let item = item(&mut b, inner, i[1], i[2]);
         let address = byte_offset(&mut b, inner, buf, item, 4);
         let s = store_at(&mut b, inner, address, i[0]);
         let one = b.constant(inner, Ty::I32, 1);
@@ -1516,8 +1653,66 @@ mod tests {
         b.cond_br(step, again, (outer, vec![t[0], next]), (exit, vec![t[0]]));
         let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
         let key = pair(&h, s, s);
+        (h, key)
+    }
+
+    #[test]
+    fn find_reports_nested_loops_within_one_inner_iteration_only() {
+        let (h, key) = nested(|b, inner, o, i| {
+            let four = b.constant(inner, Ty::I32, 4);
+            let row = b.int(inner, IntOp::Mul, o, four);
+            b.int(inner, IntOp::Add, row, i)
+        });
         assert!(h.together.contains(&key), "all lanes store to one word in each inner iteration");
         assert!(!h.apart.contains(&key), "different inner iterations store to different words");
+    }
+
+    #[test]
+    fn find_reports_nested_loops_whose_outer_iterations_reuse_the_inner_words() {
+        let (h, key) = nested(|_, _, _, i| i);
+        assert!(h.together.contains(&key), "all lanes store to one word in each inner iteration");
+        assert!(h.apart.contains(&key), "the same inner iteration of two outer iterations stores to one word");
+    }
+
+    #[test]
+    fn find_reports_a_loop_whose_iterations_pair_up_on_a_halved_index() {
+        let (h, key) = nested(|b, inner, _, i| {
+            let one = b.constant(inner, Ty::I32, 1);
+            b.int(inner, IntOp::LShr, i, one)
+        });
+        assert!(h.apart.contains(&key), "inner iterations 0 and 1 both store to word 0");
+    }
+
+    #[test]
+    fn find_reports_stores_whose_indices_scale_the_iteration_differently() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, zero]);
+        let first = byte_offset(&mut b, body, buf, p[1], 4);
+        let s1 = store_at(&mut b, body, first, p[0]);
+        let two = b.constant(body, Ty::I32, 2);
+        let doubled = b.int(body, IntOp::Mul, p[1], two);
+        let second = byte_offset(&mut b, body, buf, doubled, 4);
+        let s2 = store_at(&mut b, body, second, p[0]);
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[1], one);
+        let limit = b.constant(body, Ty::I32, 4);
+        let again = b.cmp(body, IntPred::Ult, next, limit);
+        b.cond_br(body, again, (body, vec![p[0], next]), (exit, vec![p[0]]));
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        let key = pair(&h, s1, s2);
+        assert!(h.apart.contains(&key), "iteration 2 of the first store and iteration 1 of the second both store to word 2");
+    }
+
+    #[test]
+    fn find_reports_no_other_iteration_of_a_loop_that_runs_once() {
+        let (h, key) = counted_loop(1, false);
+        assert!(h.together.contains(&key), "all lanes store to word 0");
+        assert!(!h.apart.contains(&key), "the loop runs once, so no two iterations exist");
     }
 
     fn guarded(distance: u64) -> (Hazards, (usize, usize)) {
@@ -2243,14 +2438,13 @@ mod tests {
         assert!(!h.together.contains(&pair(&h, s1, s2)), "the index runs 1, 2, 4, 8 and never names word 3");
     }
 
-    #[test]
-    fn find_uses_what_the_branch_into_a_block_says_about_the_workgroup() {
+    fn workgroup_branch(entered: u64) -> bool {
         let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(WORKGROUP_ID_X), Ty::I32)]);
         b.entry.workgroup_id_x = true;
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
-        let zero = b.constant(e, Ty::I32, 0);
-        let first = b.cmp(e, IntPred::Eq, extra[0], zero);
+        let entered = b.constant(e, Ty::I32, entered);
+        let first = b.cmp(e, IntPred::Eq, extra[0], entered);
         let address = byte_offset(&mut b, e, buf, extra[0], 4);
         let four = b.constant(e, Ty::I64, 4);
         let word = b.int(e, IntOp::Add, buf, four);
@@ -2262,7 +2456,17 @@ mod tests {
         let mut env = env2();
         env.grid = [4, 1, 1];
         let h = Hazards::find(&b.program(), &env);
-        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "only workgroup 0 enters the block, and it stores to words 0 and 1");
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_uses_what_the_branch_into_a_block_says_about_the_workgroup() {
+        assert!(!workgroup_branch(0), "only workgroup 0 enters the block, and it stores to words 0 and 1");
+    }
+
+    #[test]
+    fn find_reports_the_workgroup_the_branch_into_a_block_lets_in() {
+        assert!(workgroup_branch(1), "workgroup 1 enters the block and stores to word 1 twice");
     }
 
     #[test]
@@ -2312,25 +2516,58 @@ mod tests {
         );
     }
 
-    #[test]
-    fn find_excludes_stores_that_each_run_only_at_a_different_word() {
+    fn at_named_words(first: u64, second: u64, pred: IntPred) -> bool {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let u = uniform_word(&mut b, &k, e, 0, MemSize::U8);
         let w = uniform_word(&mut b, &k, e, 4, MemSize::U8);
-        let seven = b.constant(e, Ty::I32, 7);
-        let eight = b.constant(e, Ty::I32, 8);
-        let at_seven = b.cmp(e, IntPred::Eq, u, seven);
-        let at_eight = b.cmp(e, IntPred::Eq, w, eight);
-        let m1 = b.int(e, IntOp::And, at_seven, k.exec);
-        let m2 = b.int(e, IntOp::And, at_eight, k.exec);
+        let first = b.constant(e, Ty::I32, first);
+        let second = b.constant(e, Ty::I32, second);
+        let at_first = b.cmp(e, pred, u, first);
+        let at_second = b.cmp(e, pred, w, second);
+        let m1 = b.int(e, IntOp::And, at_first, k.exec);
+        let m2 = b.int(e, IntOp::And, at_second, k.exec);
         let a1 = byte_offset(&mut b, e, buf, u, 4);
         let a2 = byte_offset(&mut b, e, buf, w, 4);
         let s1 = store_at(&mut b, e, a1, m1);
         let s2 = store_at(&mut b, e, a2, m2);
         let h = Hazards::find(&b.program(), &env2());
-        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "the first store runs only at word 7, the second only at word 8");
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_excludes_stores_that_each_run_only_at_a_different_word() {
+        assert!(!at_named_words(7, 8, IntPred::Eq), "the first store runs only at word 7, the second only at word 8");
+    }
+
+    #[test]
+    fn find_reports_stores_that_both_run_at_one_named_word() {
+        assert!(at_named_words(7, 7, IntPred::Eq), "both stores run at word 7 when both loaded words are 7");
+    }
+
+    #[test]
+    fn find_reports_an_unguarded_store_at_a_word_another_store_names_under_its_guard() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::U8);
+        let seven = b.constant(e, Ty::I32, 7);
+        let at_seven = b.cmp(e, IntPred::Eq, u, seven);
+        let m1 = b.int(e, IntOp::And, at_seven, k.exec);
+        let address = byte_offset(&mut b, e, buf, u, 4);
+        store_at(&mut b, e, address, m1);
+        let s2 = store_at(&mut b, e, address, k.exec);
+        let eight = b.constant(e, Ty::I64, 32);
+        let word = b.int(e, IntOp::Add, buf, eight);
+        let s3 = store_at(&mut b, e, word, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(h.conflicts().contains(&pair(&h, s2, s3)), "the unguarded store runs at word 8 when u is 8");
+    }
+
+    #[test]
+    fn find_reports_stores_that_skip_different_words() {
+        assert!(at_named_words(7, 8, IntPred::Ne), "u = w = 3 runs both stores at word 3");
     }
 
     #[test]

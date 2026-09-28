@@ -383,6 +383,7 @@ pub struct Addresses<'a> {
     implied: HashMap<ValueId, Vec<ValueId>>,
     implications: std::cell::RefCell<HashMap<ImplicationKey, bool>>,
     assumable: HashSet<ValueId>,
+    equated: HashSet<ValueId>,
     loops: HashMap<BlockId, Vec<BlockId>>,
     active: HashMap<(ValueId, u8, Option<ValueId>, bool), usize>,
     guessed: HashMap<(ValueId, u8), (Value, Depth)>,
@@ -479,6 +480,7 @@ impl<'a> Addresses<'a> {
             implied: HashMap::default(),
             implications: std::cell::RefCell::new(HashMap::default()),
             assumable: HashSet::default(),
+            equated: HashSet::default(),
             loops,
             active: HashMap::default(),
             guessed: HashMap::default(),
@@ -536,12 +538,21 @@ impl<'a> Addresses<'a> {
                 {
                     if let Some(&p) = inputs.get(op.mask_input()) {
                         let implied = this.assumptions(p);
+                        for &c in &implied {
+                            if let Some((x, _)) = this.equated_in(c) {
+                                this.equated.insert(x);
+                            }
+                        }
                         this.assumable.extend(implied);
                     }
                 }
             }
         }
         this
+    }
+
+    pub fn trip(&self, header: BlockId) -> Option<Unknown> {
+        self.keys.get(&Key::Trip(header)).map(|&(u, _)| u)
     }
 
     pub fn waves(&self) -> usize {
@@ -678,6 +689,43 @@ impl<'a> Addresses<'a> {
 
     pub fn reaches_block(&mut self, b: BlockId) -> bool {
         self.reached(b)
+    }
+
+    pub fn reaches_block_with_value(&mut self, b: BlockId) -> bool {
+        if self.fixed.is_none() {
+            return self.reached(b);
+        }
+        self.reached_with_value(b, &mut HashMap::default())
+    }
+
+    fn reached_with_value(&mut self, b: BlockId, memo: &mut HashMap<BlockId, bool>) -> bool {
+        if b == self.f.entry {
+            return true;
+        }
+        if let Some(&r) = memo.get(&b) {
+            return r;
+        }
+        if !self.reached(b) {
+            return false;
+        }
+        memo.insert(b, true);
+        let own = self.rank[&b];
+        let incoming = self.facts.incoming[&b].clone();
+        let r = incoming.into_iter().any(|(pred, slot)| {
+            self.rank[&pred] < own && self.reached_with_value(pred, memo) && self.takes_with_value(pred, slot)
+        });
+        memo.insert(b, r);
+        r
+    }
+
+    fn takes_with_value(&mut self, pred: BlockId, slot: usize) -> bool {
+        if let Some(yes) = self.decision(pred) {
+            return (slot == 0) == yes;
+        }
+        let Term::CondBr { cond, .. } = self.f.blocks[&pred].term else {
+            return true;
+        };
+        self.decide(cond).is_none_or(|yes| (slot == 0) == yes)
     }
 
     fn can_take(&mut self, pred: BlockId, slot: usize, block: BlockId) -> bool {
@@ -1546,6 +1594,28 @@ impl<'a> Addresses<'a> {
         (high < 1 << 32).then_some((low, high))
     }
 
+    fn equated_in(&self, c: ValueId) -> Option<(ValueId, u32)> {
+        let Some(Op::Cmp(IntPred::Eq, x, y)) = self.facts.op(self.f, c) else {
+            return None;
+        };
+        let root = |v: ValueId| self.copies.get(&v).copied().unwrap_or(v);
+        match (self.facts.constant(self.f, x), self.facts.constant(self.f, y)) {
+            (None, Some(k)) if self.f.types[x.0] == Ty::I32 => Some((root(x), k as u32)),
+            (Some(k), None) if self.f.types[y.0] == Ty::I32 => Some((root(y), k as u32)),
+            _ => None,
+        }
+    }
+
+    fn assumed_constant(&mut self, a: ValueId, v: ValueId) -> Option<u32> {
+        let root = self.copies.get(&v).copied().unwrap_or(v);
+        if !self.equated.contains(&root) {
+            return None;
+        }
+        self.assumptions(a)
+            .into_iter()
+            .find_map(|c| self.equated_in(c).filter(|&(x, _)| x == root).map(|(_, k)| k))
+    }
+
     fn assumes(&mut self, a: ValueId, v: ValueId) -> bool {
         if !self.implied.contains_key(&a) {
             self.assumptions(a);
@@ -1638,15 +1708,21 @@ impl<'a> Addresses<'a> {
     }
 
     pub fn program_value(&mut self, u: Unknown) -> Option<ValueId> {
-        let v = self.keys.iter().find_map(|(key, &(x, _))| match key {
-            Key::Value(v, None) if x == u => Some(*v),
-            Key::Derived(v, ..) if x == u => Some(*v),
+        let found = self.keys.iter().find_map(|(key, &(x, _))| match key {
+            Key::Value(v, None) if x == u => Some(Some(*v)),
+            Key::Derived(v, ..) if x == u => Some(Some(*v)),
+            Key::Workgroup(_) if x == u => Some(None),
             _ => None,
         })?;
+        let candidates: Vec<ValueId> = match found {
+            Some(v) => vec![v],
+            None => self.f.blocks[&self.f.entry].params.iter().map(|&(p, _)| p).collect(),
+        };
         let unknown = Form::unknown(u);
         let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-        let everywhere = lanes.into_iter().all(|l| self.value(v, l, None).0.form == unknown);
-        everywhere.then_some(v)
+        candidates
+            .into_iter()
+            .find(|&v| lanes.iter().all(|&l| self.value(v, l, None).0.form == unknown))
     }
 
     fn canonical(&self, v: ValueId, lane: usize) -> usize {
@@ -1658,6 +1734,15 @@ impl<'a> Addresses<'a> {
     }
 
     pub fn value(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
+        if let Some(k) = assume.and_then(|a| self.assumed_constant(a, v)) {
+            return (
+                Value::constant(k),
+                Reliance {
+                    used: true,
+                    ..Reliance::default()
+                },
+            );
+        }
         let lane = self.canonical(v, lane);
         let l = lane as u8;
         if let Some((guess, depth)) = self.guessed.get(&(v, l)).cloned() {
@@ -1736,6 +1821,12 @@ impl<'a> Addresses<'a> {
         if assume.is_some() {
             self.cache_value((v, l, assume), r.clone(), depth);
         }
+        let root = self.copies.get(&v).copied().unwrap_or(v);
+        let r = if assume.is_none() && self.equated.contains(&root) {
+            (r.0, Reliance { open: true, ..r.1 })
+        } else {
+            r
+        };
         if !r.1.used {
             self.cache_value((v, l, None), r.clone(), depth);
         }
@@ -2690,9 +2781,9 @@ impl<'a> Addresses<'a> {
             if let Some(x) = rest.as_constant() {
                 return Value::constant(x & m);
             }
-            if let Some((_, high)) = self.bounds(&rest) {
-                if high <= m as u64 {
-                    return Value::of(rest);
+            if let Some((low, high)) = self.bounds(&rest) {
+                if high <= u32::MAX as u64 && low & !(m as u64) == high & !(m as u64) {
+                    return Value::of(rest.sub(&Form::constant((low & !(m as u64)) as u32)));
                 }
             }
             let j = rest.alignment();
@@ -4617,6 +4708,16 @@ mod facts_tests {
         let fffc = c(&mut b, 0xfffc);
         let v = b.int(e, IntOp::And, u, fffc);
         words.push(("u & 0xfffc", v, Box::new(|u, _, _| u & 0xfffc)));
+        let fourteen = c(&mut b, 14);
+        let quarter = b.int(e, IntOp::LShr, u, fourteen);
+        let seven = c(&mut b, 7);
+        for base in [8u32, 6] {
+            let k = c(&mut b, base as u64);
+            let shifted = b.int(e, IntOp::Add, quarter, k);
+            let v = b.int(e, IntOp::And, shifted, seven);
+            let name: &'static str = if base == 8 { "((u >> 14) + 8) & 7" } else { "((u >> 14) + 6) & 7" };
+            words.push((name, v, Box::new(move |u, _, _| ((u >> 14) + base) & 7)));
+        }
         let high = c(&mut b, 0x1_0000);
         let v = b.int(e, IntOp::Or, u, high);
         words.push(("u | 0x10000", v, Box::new(|u, _, _| u | 0x1_0000)));
@@ -4793,7 +4894,7 @@ mod facts_tests {
                     loose.push(format!("{}: {:?}, not {:?}", name, f, want));
                 }
             }
-            for (name, range) in [("u >> 1", (0u64, 32767u64)), ("(u + 2) >> 1", (1, 32768)), ("u & 0xff", (0, 255)), ("u >> 17", (0, 0)), ("(u + 2) - u", (2, 2)), ("hi(zext u)", (0, 0))] {
+            for (name, range) in [("u >> 1", (0u64, 32767u64)), ("(u + 2) >> 1", (1, 32768)), ("u & 0xff", (0, 255)), ("((u >> 14) + 8) & 7", (0, 3)), ("u >> 17", (0, 0)), ("(u + 2) - u", (2, 2)), ("hi(zext u)", (0, 0))] {
                 let f = form(a, name);
                 match bounds(a, &f) {
                     Some(found) if found == range => {}

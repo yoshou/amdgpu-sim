@@ -1,3 +1,4 @@
+use super::address::compare;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
@@ -9,7 +10,7 @@ use std::rc::Rc;
 pub enum Atom {
     Bit(ValueId),
     View(ValueId),
-    Constant(u32),
+    Lane(u8),
     Fresh(usize, ValueId, u32),
     Term(usize, bool),
     Next(ValueId, bool),
@@ -70,12 +71,12 @@ pub struct Logic {
     vars: HashMap<Atom, u32>,
     atoms: HashMap<u32, Atom>,
     params: HashMap<ValueId, (usize, usize)>,
-    constants: HashMap<u32, u32>,
     markers: HashMap<Choice, u32>,
     listed: Vec<Choice>,
     detour: HashMap<Atom, u32>,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
+    lane_values: HashMap<ValueId, Option<[u32; 32]>>,
     orders: HashMap<BlockId, Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>>>,
     supports: HashMap<Bdd, Rc<Vec<u32>>>,
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
@@ -110,12 +111,12 @@ impl Logic {
             vars: HashMap::default(),
             atoms: HashMap::default(),
             params,
-            constants: HashMap::default(),
             markers,
             listed: listed.to_vec(),
             detour: HashMap::default(),
             bits: HashMap::default(),
             views: HashMap::default(),
+            lane_values: HashMap::default(),
             orders: HashMap::default(),
             supports: HashMap::default(),
             edges: BTreeMap::new(),
@@ -313,10 +314,7 @@ impl Logic {
                     }
                 }
             }
-            Atom::Constant(k) => {
-                let next = self.constants.len() as u32;
-                (2 << 30) | *self.constants.entry(k).or_insert(next)
-            }
+            Atom::Lane(i) => (2 << 30) | i as u32,
             Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => {
                 let next = self.detour.len() as u32;
                 assert!(next < 1 << 29, "too many detour values");
@@ -344,7 +342,7 @@ impl Logic {
             Atom::Bit(v) => facts.uniform[v.0],
             Atom::View(v) => facts.saturated[v.0],
             Atom::Marker(_) => true,
-            Atom::Constant(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
+            Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
         }
     }
 
@@ -354,7 +352,7 @@ impl Logic {
                 Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),
                 Site::Unreached => None,
             },
-            Atom::Constant(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
+            Atom::Lane(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
         }
     }
 
@@ -420,6 +418,10 @@ impl Logic {
                     Some(w) => self.view(f, facts, w),
                     None => self.atom(opaque),
                 },
+                _ if self.lane_values(f, facts, v, 0).is_some() => {
+                    let values = self.lane_values(f, facts, v, 0).unwrap();
+                    self.lanes(|l| values[l as usize] & 1 == 1)
+                }
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
                     self.compare(f, facts, p, a, b, opaque, &mut HashMap::default())
                 }
@@ -429,23 +431,68 @@ impl Logic {
                         Site::Inst { block, .. } => self.first_order(f, block)[&(q, x, y)],
                         _ => v,
                     };
-                    if first == v {
-                        return self.atom(opaque);
-                    }
-                    let bit = self.bit(f, facts, first);
-                    let Some(Op::Cmp(p, a, b)) = facts.op(f, first) else {
-                        unreachable!("the first order of a block is a comparison")
-                    };
-                    if ordered(p, a, b).3 == negated {
-                        bit
-                    } else {
-                        self.m.not(bit)
-                    }
+                    let relation = self.relation(f, facts, first, (q, x, y));
+                    let leaf = if negated { self.m.not(relation) } else { relation };
+                    self.order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 _ => self.atom(opaque),
             },
             _ => self.atom(opaque),
         }
+    }
+
+    fn relation(&mut self, f: &Func, facts: &Facts, first: ValueId, (q, x, y): (IntPred, ValueId, ValueId)) -> Bdd {
+        let atom = self.atom(Atom::Bit(first));
+        let Some(Op::Cmp(p, a, b)) = facts.op(f, first) else {
+            unreachable!("the first order of a block is a comparison")
+        };
+        let holds = if ordered(p, a, b).3 { self.m.not(atom) } else { atom };
+        let Site::Inst { block, index } = facts.site[first.0] else {
+            return holds;
+        };
+        let reversed = self.first_order(f, block).get(&(q, y, x)).copied();
+        match reversed {
+            Some(r) if matches!(facts.site[r.0], Site::Inst { index: i, .. } if i < index) => {
+                let other = self.relation(f, facts, r, (q, y, x));
+                let not_other = self.m.not(other);
+                self.m.and(holds, not_other)
+            }
+            _ => holds,
+        }
+    }
+
+    fn order(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        pred: IntPred,
+        a: ValueId,
+        b: ValueId,
+        leaf: Bdd,
+        memo: &mut HashMap<(ValueId, ValueId), Bdd>,
+    ) -> Bdd {
+        if let Some(&g) = memo.get(&(a, b)) {
+            return g;
+        }
+        let g = if a == b {
+            Manager::constant(compare(pred, 0, 0))
+        } else if let (Some(x), Some(y), Ty::I32) = (facts.constant(f, a), facts.constant(f, b), f.types[a.0]) {
+            Manager::constant(compare(pred, x as u32, y as u32))
+        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
+            let c = self.bit(f, facts, c);
+            let yes = self.order(f, facts, pred, yes, b, leaf, memo);
+            let no = self.order(f, facts, pred, no, b, leaf, memo);
+            self.m.ite(c, yes, no)
+        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, b) {
+            let c = self.bit(f, facts, c);
+            let yes = self.order(f, facts, pred, a, yes, leaf, memo);
+            let no = self.order(f, facts, pred, a, no, leaf, memo);
+            self.m.ite(c, yes, no)
+        } else {
+            leaf
+        };
+        memo.insert((a, b), g);
+        g
     }
 
     fn first_order(&mut self, f: &Func, block: BlockId) -> Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>> {
@@ -561,11 +608,11 @@ impl Logic {
                 ..
             } => self.bit(f, facts, inputs[0]),
             Inst::Core { op, .. } => match *op {
-                Op::Const(_, k) => match k as u32 {
-                    0 => Bdd::FALSE,
-                    u32::MAX => Bdd::TRUE,
-                    k => self.atom(Atom::Constant(k)),
-                },
+                _ if self.lane_values(f, facts, w, 0).is_some() => {
+                    let values = self.lane_values(f, facts, w, 0).unwrap();
+                    self.lanes(|l| values[l as usize] >> l & 1 == 1)
+                }
+                Op::Const(_, k) => self.word(k as u32),
                 Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
                     if constant_choices(f, facts, a).is_some() && constant_choices(f, facts, b).is_some() {
                         return self.constant_word(f, facts, k, a, b);
@@ -607,11 +654,92 @@ impl Logic {
             IntOp::Or => x | y,
             _ => x ^ y,
         } as u32;
-        match word {
-            0 => Bdd::FALSE,
-            u32::MAX => Bdd::TRUE,
-            word => self.atom(Atom::Constant(word)),
+        self.word(word)
+    }
+
+    pub fn word(&mut self, k: u32) -> Bdd {
+        self.lanes(|l| k >> l & 1 == 1)
+    }
+
+    fn lane_values(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; 32]> {
+        if let Some(&r) = self.lane_values.get(&v) {
+            return r;
         }
+        if depth > 64 {
+            return None;
+        }
+        let r = self.compute_lane_values(f, facts, v, depth);
+        self.lane_values.insert(v, r);
+        r
+    }
+
+    fn compute_lane_values(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; 32]> {
+        let bits = match f.types[v.0] {
+            Ty::I1 => 1,
+            Ty::I32 => u32::MAX,
+            _ => return None,
+        };
+        let mut out = [0u32; 32];
+        match facts.op(f, v)? {
+            Op::Const(_, k) => out = [k as u32; 32],
+            Op::Env(Env::LaneId) => out = std::array::from_fn(|l| l as u32),
+            Op::Int(k, a, b) => {
+                let a = self.lane_values(f, facts, a, depth + 1)?;
+                let b = self.lane_values(f, facts, b, depth + 1)?;
+                for l in 0..32 {
+                    let (x, y) = (a[l], b[l]);
+                    out[l] = match k {
+                        IntOp::Add => x.wrapping_add(y),
+                        IntOp::Sub => x.wrapping_sub(y),
+                        IntOp::Mul => x.wrapping_mul(y),
+                        IntOp::And => x & y,
+                        IntOp::Or => x | y,
+                        IntOp::Xor => x ^ y,
+                        IntOp::Shl | IntOp::LShr | IntOp::AShr if y >= 32 => return None,
+                        IntOp::Shl => x << y,
+                        IntOp::LShr => x >> y,
+                        IntOp::AShr => ((x as i32) >> y) as u32,
+                    };
+                }
+            }
+            Op::Cmp(p, a, b) if f.types[a.0] == Ty::I32 => {
+                let a = self.lane_values(f, facts, a, depth + 1)?;
+                let b = self.lane_values(f, facts, b, depth + 1)?;
+                out = std::array::from_fn(|l| compare(p, a[l], b[l]) as u32);
+            }
+            Op::Select(c, a, b) => {
+                let c = self.lane_values(f, facts, c, depth + 1)?;
+                let a = self.lane_values(f, facts, a, depth + 1)?;
+                let b = self.lane_values(f, facts, b, depth + 1)?;
+                out = std::array::from_fn(|l| if c[l] & 1 == 1 { a[l] } else { b[l] });
+            }
+            _ => return None,
+        }
+        Some(out.map(|x| x & bits))
+    }
+
+    pub fn at_lane(&mut self, f: Bdd, lane: u32) -> Bdd {
+        let mut f = f;
+        for i in 0..5u8 {
+            if let Some(&var) = self.vars.get(&Atom::Lane(i)) {
+                f = self.m.cofactor(f, var, lane >> i & 1 == 1);
+            }
+        }
+        f
+    }
+
+    pub fn lanes(&mut self, holds: impl Fn(u32) -> bool) -> Bdd {
+        let bits: Vec<Bdd> = (0..5).map(|i| self.atom(Atom::Lane(i))).collect();
+        let mut any = Bdd::FALSE;
+        for l in (0..32u32).filter(|&l| holds(l)) {
+            let mut one = Bdd::TRUE;
+            for (i, &bit) in bits.iter().enumerate() {
+                let literal = if l >> i & 1 == 1 { bit } else { self.m.not(bit) };
+                one = self.m.and(one, literal);
+            }
+            any = self.m.or(any, one);
+        }
+        any
     }
 
     fn edge_index(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Rc<EdgeIndex> {
@@ -1171,13 +1299,14 @@ mod tests {
 
     #[test]
     fn bit_and_view_follow_the_operations() {
-        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)]);
         let e = BlockId(0);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let item = p[1];
         let three = b.constant(e, Ty::I32, 3);
         let seven = b.constant(e, Ty::I32, 7);
-        let c = b.cmp(e, IntPred::Ult, lane, three);
-        let d = b.cmp(e, IntPred::Ult, lane, seven);
+        let c = b.cmp(e, IntPred::Ult, item, three);
+        let d = b.cmp(e, IntPred::Ult, item, seven);
         let one = b.constant(e, Ty::I32, 1);
         let two = b.constant(e, Ty::I32, 2);
         let x = b.core(e, Ty::I32, Op::Select(c, one, two));
@@ -1208,11 +1337,35 @@ mod tests {
         let kept = b.int(e, IntOp::And, three, other);
         let z = b.core(e, Ty::I32, Op::Select(d, one, two));
         let paired = b.int(e, IntOp::Xor, x, z);
-        let not_c = b.cmp(e, IntPred::Uge, lane, three);
-        let swapped_c = b.cmp(e, IntPred::Ugt, three, lane);
-        let not_d = b.cmp(e, IntPred::Ule, seven, lane);
-        let signed = b.cmp(e, IntPred::Slt, lane, three);
-        let not_signed = b.cmp(e, IntPred::Sge, lane, three);
+        let not_c = b.cmp(e, IntPred::Uge, item, three);
+        let swapped_c = b.cmp(e, IntPred::Ugt, three, item);
+        let not_d = b.cmp(e, IntPred::Ule, seven, item);
+        let signed = b.cmp(e, IntPred::Slt, item, three);
+        let not_signed = b.cmp(e, IntPred::Sge, item, three);
+        let far = b.constant(e, Ty::I32, 99);
+        let low_lanes = b.cmp(e, IntPred::Ult, lane, three);
+        let high_lanes = b.cmp(e, IntPred::Ugt, lane, seven);
+        let no_lane = b.cmp(e, IntPred::Eq, lane, far);
+        let every_lane = b.cmp(e, IntPred::Ne, far, lane);
+        let minus = b.constant(e, Ty::I32, 0xffff_fffe);
+        let signed_lanes = b.cmp(e, IntPred::Sgt, lane, minus);
+        let hundred = b.constant(e, Ty::I32, 100);
+        let five = b.constant(e, Ty::I32, 5);
+        let kept_item = b.core(e, Ty::I32, Op::Select(c, item, hundred));
+        let small = b.cmp(e, IntPred::Ult, kept_item, five);
+        let large = b.cmp(e, IntPred::Ugt, five, kept_item);
+        let chosen_small = b.cmp(e, IntPred::Ult, x, two);
+        let chosen_any = b.cmp(e, IntPred::Ule, x, two);
+        let odd_bit = b.int(e, IntOp::And, lane, one);
+        let odd = b.cmp(e, IntPred::Eq, odd_bit, one);
+        let group = b.int(e, IntOp::LShr, lane, three);
+        let third_group = b.cmp(e, IntPred::Eq, group, two);
+        let own_bit = b.int(e, IntOp::Shl, one, lane);
+        let thirty_two = b.constant(e, Ty::I32, 32);
+        let gone = b.int(e, IntOp::Shl, lane, thirty_two);
+        let undefined = b.cmp(e, IntPred::Eq, gone, zero);
+        let mixed = b.int(e, IntOp::Add, lane, item);
+        let with_item = b.cmp(e, IntPred::Ult, mixed, three);
         let f = &b.f;
         let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
         let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
@@ -1238,20 +1391,49 @@ mod tests {
         expect.push(("converted any(c)", logic.bit(f, &facts, q), bc));
         expect.push(("1 & 2", logic.view(f, &facts, apart), Bdd::FALSE));
         expect.push(("1 & select(c, 2, 4)", logic.view(f, &facts, missed), Bdd::FALSE));
-        let k2 = logic.atom(Atom::Constant(2));
+        let k2 = logic.word(2);
         let kept_formula = logic.m.and(bc, k2);
         expect.push(("3 & select(c, 2, 4)", logic.view(f, &facts, kept), kept_formula));
-        let k3 = logic.atom(Atom::Constant(3));
+        let k3 = logic.word(3);
         let unequal = logic.m.and(xor, k3);
         expect.push(("select(c, 1, 2) ^ select(d, 1, 2)", logic.view(f, &facts, paired), unequal));
         let (nbc, nbd) = (logic.m.not(bc), logic.m.not(bd));
-        expect.push(("lane >= 3", logic.bit(f, &facts, not_c), nbc));
-        expect.push(("3 > lane", logic.bit(f, &facts, swapped_c), bc));
-        expect.push(("7 <= lane", logic.bit(f, &facts, not_d), nbd));
+        expect.push(("item >= 3", logic.bit(f, &facts, not_c), nbc));
+        expect.push(("3 > item", logic.bit(f, &facts, swapped_c), bc));
+        expect.push(("7 <= item", logic.bit(f, &facts, not_d), nbd));
         let bs = logic.atom(Atom::Bit(signed));
         let nbs = logic.m.not(bs);
-        expect.push(("lane s< 3", logic.bit(f, &facts, signed), bs));
-        expect.push(("lane s>= 3", logic.bit(f, &facts, not_signed), nbs));
+        expect.push(("item s< 3", logic.bit(f, &facts, signed), bs));
+        expect.push(("item s>= 3", logic.bit(f, &facts, not_signed), nbs));
+        let low = logic.lanes(|l| l < 3);
+        expect.push(("lane < 3", logic.bit(f, &facts, low_lanes), low));
+        let high = logic.lanes(|l| l > 7);
+        expect.push(("lane > 7", logic.bit(f, &facts, high_lanes), high));
+        expect.push(("lane == 99", logic.bit(f, &facts, no_lane), Bdd::FALSE));
+        expect.push(("99 != lane", logic.bit(f, &facts, every_lane), Bdd::TRUE));
+        expect.push(("lane s> -2", logic.bit(f, &facts, signed_lanes), Bdd::TRUE));
+        let small_leaf = logic.atom(Atom::Bit(small));
+        let small_formula = logic.m.and(bc, small_leaf);
+        expect.push(("select(c, item, 100) < 5", logic.bit(f, &facts, small), small_formula));
+        expect.push(("5 > select(c, item, 100)", logic.bit(f, &facts, large), small_formula));
+        expect.push(("select(c, 1, 2) < 2", logic.bit(f, &facts, chosen_small), bc));
+        expect.push(("select(c, 1, 2) <= 2", logic.bit(f, &facts, chosen_any), Bdd::TRUE));
+        let odd_lanes = logic.lanes(|l| l & 1 == 1);
+        expect.push(("(lane & 1) == 1", logic.bit(f, &facts, odd), odd_lanes));
+        let lanes_16_to_23 = logic.lanes(|l| (16..24).contains(&l));
+        expect.push(("lane >> 3 == 2", logic.bit(f, &facts, third_group), lanes_16_to_23));
+        expect.push(("the lane bit of 1 << lane", logic.view(f, &facts, own_bit), Bdd::TRUE));
+        let undefined_atom = logic.atom(Atom::Bit(undefined));
+        expect.push(("(lane << 32) == 0", logic.bit(f, &facts, undefined), undefined_atom));
+        let with_item_atom = logic.atom(Atom::Bit(with_item));
+        expect.push(("lane + item < 3", logic.bit(f, &facts, with_item), with_item_atom));
+        let lane_one = logic.lanes(|l| l == 1);
+        let bits_of_two = logic.word(2);
+        expect.push(("the lanes of 2", bits_of_two, lane_one));
+        let five = logic.word(5);
+        let seven_bits = logic.word(7);
+        let both = logic.m.and(five, seven_bits);
+        expect.push(("5 & 7 by lanes", both, five));
         let wrong: Vec<&str> = expect.iter().filter(|(_, got, want)| got != want).map(|(name, ..)| *name).collect();
         assert!(wrong.is_empty(), "{:?}", wrong);
         let _ = crossed_formula;

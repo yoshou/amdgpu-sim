@@ -1061,8 +1061,22 @@ impl<'a> Check<'a> {
                     self.or(first, zero)
                 }
                 EffectOp::Wave(WaveOp::ReadLane) => {
-                    let read = self.any_of(inputs);
-                    self.some_lane(read)
+                    let (x, selector) = (inputs[0], inputs[1]);
+                    let own = self.whole(selector);
+                    let hx = self.whole(x);
+                    let read = match constant_choices(f, facts, selector) {
+                        Some(lanes) => {
+                            let mut any = Bdd::FALSE;
+                            for lane in lanes {
+                                let there = self.logic.at_lane(hx, lane as u32 & 31);
+                                let there = self.some_lane(there);
+                                any = self.or(any, there);
+                            }
+                            any
+                        }
+                        None => self.some_lane(hx),
+                    };
+                    self.or(own, read)
                 }
                 EffectOp::Wave(WaveOp::WriteLane) => {
                     let written = self.any_of(&inputs[..2]);
@@ -1828,11 +1842,7 @@ impl<'c, 'a> Explore<'c, 'a> {
                     Op::Const(_, k) => {
                         let bits = match ty {
                             Ty::I1 => Some(Manager::constant(k != 0)),
-                            Ty::I32 if facts.viewed[value.0] => Some(match k as u32 {
-                                0 => Bdd::FALSE,
-                                u32::MAX => Bdd::TRUE,
-                                k => self.logic().atom(Atom::Constant(k)),
-                            }),
+                            Ty::I32 if facts.viewed[value.0] => Some(self.logic().word(k as u32)),
                             _ => None,
                         };
                         Desc {
@@ -3050,6 +3060,48 @@ mod tests {
     }
 
     #[test]
+    fn prove_keeps_a_query_whose_store_two_opposite_orders_that_hold_at_equality_mask() {
+        let b = two_orders((IntPred::Ule, false), (IntPred::Ule, true));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: v <= w and w <= v both hold when v == w", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_opposite_orders_of_different_signedness_mask() {
+        let b = two_orders((IntPred::Slt, false), (IntPred::Ult, true));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: v = -1 and w = 0 give v s< w and w u< v", wrong);
+    }
+
+    fn two_bounds(below: u64, above: u64) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let v = per_lane(&mut b, &k, e, 16);
+        let below = b.constant(e, Ty::I32, below);
+        let above = b.constant(e, Ty::I32, above);
+        let small = b.cmp(e, IntPred::Ult, v, below);
+        let large = b.cmp(e, IntPred::Ugt, v, above);
+        let both = b.int(e, IntOp::And, small, large);
+        let mask = b.int(e, IntOp::And, both, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_disjoint_ranges_mask() {
+        let b = two_bounds(5, 10);
+        assert!(converted(&b).is_empty(), "{:?}: v < 5 and v > 10 never hold together, so the store never runs", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_overlapping_ranges_mask() {
+        let b = two_bounds(10, 5);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: v < 10 and v > 5 both hold for v = 7", wrong);
+    }
+
+    #[test]
     fn prove_converts_a_query_whose_store_opposite_orders_mask() {
         let b = two_orders((IntPred::Ult, false), (IntPred::Ult, true));
         assert!(converted(&b).is_empty(), "{:?}: v < w and w < v never hold together, so the store never runs", converted(&b));
@@ -3186,20 +3238,61 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: every lane stores 0 whatever the query answers", converted(&b));
     }
 
-    #[test]
-    fn prove_converts_a_query_no_lane_can_answer_true() {
+    fn lane_query(target: u64) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
-        let far = b.constant(e, Ty::I32, 99);
-        let never = b.cmp(e, IntPred::Eq, lane, far);
-        let c = b.int(e, IntOp::And, never, k.exec);
+        let target = b.constant(e, Ty::I32, target);
+        let only = b.cmp(e, IntPred::Eq, lane, target);
+        let c = b.int(e, IntOp::And, only, k.exec);
         let q = b.wave(e, WaveOp::Any, vec![c]);
         let one = b.constant(e, Ty::I32, 1);
         let two = b.constant(e, Ty::I32, 2);
         let data = b.core(e, Ty::I32, Op::Select(q, one, two));
         store_own(&mut b, &k, e, data, k.exec);
+        b
+    }
+
+    fn lane_bits_query(target: u64) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let one = b.constant(e, Ty::I32, 1);
+        let odd = b.int(e, IntOp::And, lane, one);
+        let target = b.constant(e, Ty::I32, target);
+        let hit = b.cmp(e, IntPred::Eq, odd, target);
+        let c = b.int(e, IntOp::And, hit, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let two = b.constant(e, Ty::I32, 2);
+        let data = b.core(e, Ty::I32, Op::Select(q, one, two));
+        store_own(&mut b, &k, e, data, k.exec);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_lane_bit_never_matches() {
+        let b = lane_bits_query(2);
+        assert!(converted(&b).is_empty(), "{:?}: lane & 1 is 0 or 1, never 2", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_lane_bit_matches_in_odd_lanes() {
+        let b = lane_bits_query(1);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: odd lanes answer true, even lanes alone answer false", wrong);
+    }
+
+    #[test]
+    fn prove_converts_a_query_no_lane_can_answer_true() {
+        let b = lane_query(99);
         assert!(converted(&b).is_empty(), "{:?}: no lane is lane 99, so the query is false in the wave and in every lane", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_one_lane_can_answer_true() {
+        let b = lane_query(5);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: when lane 5 is active the wave answers true, but every other lane alone answers false", wrong);
     }
 
     #[test]
@@ -3226,8 +3319,7 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: both arms store 1 to the lane's own word", converted(&b));
     }
 
-    #[test]
-    fn prove_demands_no_lane_for_a_kept_query_over_bits_only_active_lanes_set() {
+    fn over_active_bits(outside: u64, every: bool) {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
@@ -3242,8 +3334,8 @@ mod tests {
         let own = byte_offset(&mut b, then, t[1], lane, 4);
         let yes = b.constant(then, Ty::I1, 1);
         let flag = b.load(then, Space::Global, MemSize::B32, own, yes);
-        let hundred = b.constant(then, Ty::I32, 100);
-        let v = b.core(then, Ty::I32, Op::Select(t[0], flag, hundred));
+        let other = b.constant(then, Ty::I32, outside);
+        let v = b.core(then, Ty::I32, Op::Select(t[0], flag, other));
         let five = b.constant(then, Ty::I32, 5);
         let small = b.cmp(then, IntPred::Ult, v, five);
         let at = b.here(then);
@@ -3257,8 +3349,18 @@ mod tests {
         for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
             let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
             assert!(kept.queries.contains(&q), "{}: a lane whose flag is small stores 1, the others 2", name);
-            assert!(!everyone.contains(&provenance), "{}: a lane with exec clear sees 100, so its bit is clear", name);
+            assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear sees {}", name, outside);
         }
+    }
+
+    #[test]
+    fn prove_demands_no_lane_for_a_kept_query_over_bits_only_active_lanes_set() {
+        over_active_bits(100, false);
+    }
+
+    #[test]
+    fn prove_demands_every_lane_for_a_kept_query_over_bits_inactive_lanes_set() {
+        over_active_bits(3, true);
     }
 
     fn flag_query(b: &mut Build, k: &Kernel, e: BlockId) -> ValueId {
@@ -3685,8 +3787,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prove_converts_a_query_whose_word_only_lanes_a_lane_read_skips_hold() {
+    fn lane_read(selector: impl Fn(&mut Build, BlockId, &Kernel) -> ValueId) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let q = flag_query(&mut b, &k, e);
@@ -3696,9 +3797,36 @@ mod tests {
         let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
         let picked = b.core(e, Ty::I32, Op::Select(q, ones, lane));
         let x = b.core(e, Ty::I32, Op::Select(first, lane, picked));
-        let y = b.wave(e, WaveOp::ReadLane, vec![x, zero, zero]);
+        let selector = selector(&mut b, e, &k);
+        let y = b.wave(e, WaveOp::ReadLane, vec![x, selector, zero]);
         store_own(&mut b, &k, e, y, k.exec);
-        assert!(converted(&b).is_empty(), "{:?}: the read takes lane 0's word, which is its lane id 0 whatever the query answers", converted(&b));
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_only_lanes_a_lane_read_skips_hold() {
+        let b = lane_read(|b, e, _| b.constant(e, Ty::I32, 32));
+        assert!(converted(&b).is_empty(), "{:?}: the read takes lane 32 & 31 = 0, whose word is its lane id 0 whatever the query answers", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_the_lane_a_lane_read_takes_holds() {
+        let b = lane_read(|b, e, _| b.constant(e, Ty::I32, 1));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: lane 1's word is 0x3c003c00 or 1 by the query", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_one_of_the_lanes_a_lane_read_may_take_holds() {
+        let b = lane_read(|b, e, k| {
+            let flag = per_lane(b, k, e, 24);
+            let zero = b.constant(e, Ty::I32, 0);
+            let set = b.cmp(e, IntPred::Ne, flag, zero);
+            let one = b.constant(e, Ty::I32, 1);
+            b.core(e, Ty::I32, Op::Select(set, zero, one))
+        });
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: lanes without the flag read lane 1, whose word depends on the query", wrong);
     }
 
     fn accumulator_query(stored: usize) -> Build {
