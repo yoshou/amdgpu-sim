@@ -796,16 +796,32 @@ impl<'a> Check<'a> {
         }
     }
 
-    fn query(&mut self, x: Bdd, hx: Bdd, tag: Bdd) -> Bdd {
-        let whole = self.or(x, hx);
+    fn some_lane(&mut self, x: Bdd) -> Bdd {
         let varying: Vec<u32> = self
             .logic
-            .support(whole)
+            .support(x)
             .iter()
             .copied()
             .filter(|&n| !self.logic.uniform_atom(self.facts, n))
             .collect();
-        let others = self.logic.exists(&varying, whole);
+        self.logic.exists(&varying, x)
+    }
+
+    fn masked_read(&mut self, mask: ValueId, x: ValueId) -> Bdd {
+        let hm = self.h[mask.0];
+        let hx = self.whole(x);
+        if hm == Bdd::FALSE && hx == Bdd::FALSE {
+            return Bdd::FALSE;
+        }
+        let fm = self.bit(mask);
+        let set = self.and(fm, hx);
+        let read = self.or(hm, set);
+        self.some_lane(read)
+    }
+
+    fn query(&mut self, x: Bdd, hx: Bdd, tag: Bdd) -> Bdd {
+        let whole = self.or(x, hx);
+        let others = self.some_lane(whole);
         let absent = self.not(x);
         let differs = self.and(absent, others);
         let differs = self.and(differs, tag);
@@ -828,17 +844,7 @@ impl<'a> Check<'a> {
                     self.demand(*provenance, whole);
                 }
                 let x = self.h[inputs[0].0];
-                if x == Bdd::FALSE {
-                    return x;
-                }
-                let varying: Vec<u32> = self
-                    .logic
-                    .support(x)
-                    .iter()
-                    .copied()
-                    .filter(|&n| !self.logic.uniform_atom(self.facts, n))
-                    .collect();
-                self.logic.exists(&varying, x)
+                self.some_lane(x)
             }
             Inst::Core {
                 op: Op::Select(c, a, b),
@@ -956,22 +962,64 @@ impl<'a> Check<'a> {
                     }
                     let hx = self.h[x.0];
                     if local == Bdd::FALSE {
-                        return hx;
+                        return self.some_lane(hx);
                     }
                     let fx = self.bit(x);
                     let tag = self.logic.tag(Choice::Query(out));
                     let answered = self.query(fx, hx, tag);
-                    self.logic.m.ite(local, answered, hx)
+                    if local == Bdd::TRUE {
+                        return answered;
+                    }
+                    let gathered = self.some_lane(hx);
+                    self.logic.m.ite(local, answered, gathered)
                 }
                 EffectOp::Wave(WaveOp::Ballot) => self.h[inputs[0].0],
                 EffectOp::Wave(WaveOp::ReadFirstLane) => {
-                    if facts.uniform[inputs[0].0] {
-                        return self.whole(inputs[0]);
+                    let (x, mask) = (inputs[0], inputs[1]);
+                    if facts.uniform[x.0] {
+                        return self.whole(x);
                     }
-                    if !self.masked[inputs[1].0] {
+                    if !self.masked[mask.0] {
                         self.demand(*provenance, Bdd::TRUE);
                     }
-                    self.h[inputs[0].0]
+                    let first = self.masked_read(mask, x);
+                    let hx = self.whole(x);
+                    if hx == Bdd::FALSE {
+                        return first;
+                    }
+                    let fm = self.bit(mask);
+                    let clear = self.not(fm);
+                    let unset = self.and(clear, hx);
+                    let zero = self.some_lane(unset);
+                    let zero = self.and(clear, zero);
+                    self.or(first, zero)
+                }
+                EffectOp::Wave(WaveOp::ReadLane) => {
+                    let read = self.any_of(inputs);
+                    self.some_lane(read)
+                }
+                EffectOp::Wave(WaveOp::WriteLane) => {
+                    let written = self.any_of(&inputs[..2]);
+                    let written = self.some_lane(written);
+                    let old = self.any_of(&inputs[2..]);
+                    self.or(old, written)
+                }
+                EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)) => {
+                    let (index, x, mask) = (inputs[0], inputs[1], inputs[2]);
+                    let read = if *op == WaveOp::Bpermute {
+                        self.masked_read(mask, x)
+                    } else {
+                        let hx = self.whole(x);
+                        self.some_lane(hx)
+                    };
+                    let own = self.whole(index);
+                    self.or(own, read)
+                }
+                EffectOp::Wave(WaveOp::Wmma) => {
+                    let fragments = self.any_of(&inputs[..8]);
+                    let fragments = self.some_lane(fragments);
+                    let accumulators = self.any_of(&inputs[8..]);
+                    self.or(accumulators, fragments)
                 }
                 EffectOp::Memory {
                     op: MemoryOp::Load(_),
@@ -2106,9 +2154,32 @@ mod tests {
     enum Reader {
         ReadLane,
         ReadFirstLane,
+        WriteLane,
         Bpermute,
         BpermuteFi,
         Wmma,
+    }
+
+    fn exchange(b: &mut Build, e: BlockId, reader: Reader, x: ValueId, exec: ValueId) -> ValueId {
+        let zero = b.constant(e, Ty::I32, 0);
+        match reader {
+            Reader::ReadLane => b.wave(e, WaveOp::ReadLane, vec![x, zero, zero]),
+            Reader::ReadFirstLane => b.wave(e, WaveOp::ReadFirstLane, vec![x, exec]),
+            Reader::WriteLane => {
+                let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+                let one = b.constant(e, Ty::I32, 1);
+                b.wave(e, WaveOp::WriteLane, vec![x, one, lane, zero])
+            }
+            Reader::Bpermute => b.wave(e, WaveOp::Bpermute, vec![zero, x, exec]),
+            Reader::BpermuteFi => b.wave(e, WaveOp::BpermuteFi, vec![zero, x, exec]),
+            Reader::Wmma => {
+                let fzero = b.constant(e, Ty::F32, 0);
+                let mut inputs = vec![x; 8];
+                inputs.extend([fzero; 8]);
+                let outputs = b.effect(e, EffectOp::Wave(WaveOp::Wmma), inputs);
+                b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, outputs[0]))
+            }
+        }
     }
 
     fn reads_another_lane(reader: Reader) -> (Build, ValueId) {
@@ -2124,22 +2195,27 @@ mod tests {
         let c = b.int(e, IntOp::And, set, k.exec);
         let q = b.wave(e, WaveOp::Any, vec![c]);
         let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
-        let x = b.core(e, Ty::I32, Op::Select(q, ones, lane));
-        let y = match reader {
-            Reader::ReadLane => b.wave(e, WaveOp::ReadLane, vec![x, zero, zero]),
-            Reader::ReadFirstLane => b.wave(e, WaveOp::ReadFirstLane, vec![x, k.exec]),
-            Reader::Bpermute => b.wave(e, WaveOp::Bpermute, vec![zero, x, k.exec]),
-            Reader::BpermuteFi => b.wave(e, WaveOp::BpermuteFi, vec![zero, x, k.exec]),
-            Reader::Wmma => {
-                let fzero = b.constant(e, Ty::F32, 0);
-                let mut inputs = vec![x; 8];
-                inputs.extend([fzero; 8]);
-                let outputs = b.effect(e, EffectOp::Wave(WaveOp::Wmma), inputs);
-                b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, outputs[0]))
-            }
+        let other = match reader {
+            Reader::WriteLane => zero,
+            _ => lane,
         };
+        let x = b.core(e, Ty::I32, Op::Select(q, ones, other));
+        let y = exchange(&mut b, e, reader, x, k.exec);
         let address = byte_offset(&mut b, e, buf, lane, 4);
         b.store(e, Space::Global, MemSize::B32, address, y, c);
+        (b, q)
+    }
+
+    fn reads_outside_exec(reader: Reader) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
+        let idle = b.core(e, Ty::I32, Op::Select(q, ones, lane));
+        let x = b.core(e, Ty::I32, Op::Select(k.exec, lane, idle));
+        let y = exchange(&mut b, e, reader, x, k.exec);
+        store_own(&mut b, &k, e, y, k.exec);
         (b, q)
     }
 
@@ -2148,7 +2224,6 @@ mod tests {
         k: Kernel,
         buf: ValueId,
         lane: ValueId,
-        set: ValueId,
         c: ValueId,
     }
 
@@ -2168,7 +2243,6 @@ mod tests {
             k,
             buf,
             lane,
-            set,
             c,
         }
     }
@@ -2454,12 +2528,19 @@ mod tests {
 
     #[test]
     fn prove_demands_every_lane_for_a_kept_query_over_unmasked_bits() {
-        let Flagged { mut b, k, buf, lane, set, .. } = flagged();
+        let (mut b, k) = Build::kernel();
         let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let flags = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let yes = b.constant(e, Ty::I1, 1);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, yes);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
         let at = b.here(e);
         let q = b.wave(e, WaveOp::Any, vec![set]);
         let one = b.constant(e, Ty::I32, 1);
-        let zero = b.constant(e, Ty::I32, 0);
         let data = b.core(e, Ty::I32, Op::Select(q, one, zero));
         let own = byte_offset(&mut b, e, buf, lane, 4);
         b.store(e, Space::Global, MemSize::B32, own, data, k.exec);
@@ -3087,7 +3168,7 @@ mod tests {
 
     #[test]
     fn search_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
-        let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
+        let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::WriteLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
             .iter()
             .copied()
             .filter(|&reader| {
@@ -3098,14 +3179,14 @@ mod tests {
             .collect();
         assert!(
             converted.is_empty(),
-            "{:?}: when lane 0 alone has a zero flag, lane 0 answers the query false and hands the storing lanes its own lane id instead of the pair of halves 1.0",
+            "{:?}: when lane 0 alone has a zero flag, lane 0 answers the query false and hands the storing lanes 0 instead of the pair of halves 1.0",
             converted
         );
     }
 
     #[test]
     fn direct_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
-        let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
+        let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::WriteLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]
             .iter()
             .copied()
             .filter(|&reader| {
@@ -3116,8 +3197,107 @@ mod tests {
             .collect();
         assert!(
             converted.is_empty(),
-            "{:?}: when lane 0 alone has a zero flag, lane 0 answers the query false and hands the storing lanes its own lane id instead of the pair of halves 1.0",
+            "{:?}: when lane 0 alone has a zero flag, lane 0 answers the query false and hands the storing lanes 0 instead of the pair of halves 1.0",
             converted
+        );
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_lanes_outside_exec_hand_to_a_read_that_ignores_exec() {
+        let converted: Vec<(Reader, &str)> = [Reader::ReadLane, Reader::BpermuteFi, Reader::Wmma]
+            .iter()
+            .flat_map(|&reader| {
+                let (b, q) = reads_outside_exec(reader);
+                ["search", "direct"]
+                    .iter()
+                    .zip(both(&b))
+                    .filter(|(_, kept)| !kept.queries.contains(&q))
+                    .map(|(name, _)| (reader, *name))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            converted.is_empty(),
+            "{:?}: when lane 0 has exec clear and lane 1 the flag, lane 0 answers the query false and hands the storing lanes 0 instead of the pair of halves 1.0",
+            converted
+        );
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_only_lanes_a_masked_read_skips_hold() {
+        let kept: Vec<(Reader, Vec<&str>)> = [Reader::ReadFirstLane, Reader::Bpermute]
+            .iter()
+            .map(|&reader| (reader, converted(&reads_outside_exec(reader).0)))
+            .filter(|(_, names)| !names.is_empty())
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "{:?}: only lanes with exec clear hold a word the query picks, and these reads take no such lane's word while a lane stores",
+            kept
+        );
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_only_lanes_a_lane_read_skips_hold() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let zero = b.constant(e, Ty::I32, 0);
+        let first = b.cmp(e, IntPred::Eq, lane, zero);
+        let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
+        let picked = b.core(e, Ty::I32, Op::Select(q, ones, lane));
+        let x = b.core(e, Ty::I32, Op::Select(first, lane, picked));
+        let y = b.wave(e, WaveOp::ReadLane, vec![x, zero, zero]);
+        store_own(&mut b, &k, e, y, k.exec);
+        assert!(converted(&b).is_empty(), "{:?}: the read takes lane 0's word, which is its lane id 0 whatever the query answers", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_only_an_accumulator_the_stored_output_skips_holds() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let fzero = b.constant(e, Ty::F32, 0);
+        let fone = b.constant(e, Ty::F32, 0x3f80_0000);
+        let second = b.core(e, Ty::F32, Op::Select(q, fone, fzero));
+        let mut inputs = vec![lane; 8];
+        inputs.extend([fzero, second]);
+        inputs.extend([fzero; 6]);
+        let outputs = b.effect(e, EffectOp::Wave(WaveOp::Wmma), inputs);
+        let word = b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, outputs[0]));
+        store_own(&mut b, &k, e, word, k.exec);
+        assert!(converted(&b).is_empty(), "{:?}: output 0 adds the products to accumulator 0 alone, and only accumulator 1 depends on the query", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_lane_zero_hands_to_a_first_lane_read_over_an_empty_mask() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let flag = per_lane(&mut b, &k, e, 16);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let mask = b.int(e, IntOp::And, set, k.exec);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let first = b.cmp(e, IntPred::Eq, lane, zero);
+        let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
+        let picked = b.core(e, Ty::I32, Op::Select(q, ones, lane));
+        let idle = b.core(e, Ty::I32, Op::Select(first, picked, lane));
+        let x = b.core(e, Ty::I32, Op::Select(mask, lane, idle));
+        let y = b.wave(e, WaveOp::ReadFirstLane, vec![x, mask]);
+        let yes = b.constant(e, Ty::I1, 1);
+        let clear = b.int(e, IntOp::Xor, mask, yes);
+        let others = b.int(e, IntOp::Xor, first, yes);
+        let stores = b.int(e, IntOp::And, clear, others);
+        let stores = b.int(e, IntOp::And, stores, k.exec);
+        store_own(&mut b, &k, e, y, stores);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| !kept.queries.contains(&q)).map(|(n, _)| *n).collect();
+        assert!(
+            wrong.is_empty(),
+            "{:?}: when no lane sets the mask, the read takes lane 0's word, and with the flag clear in lane 0 and set in lane 1, lane 0 answers the query false and hands lane 1 its lane id 0 instead of the pair of halves 1.0",
+            wrong
         );
     }
 }
