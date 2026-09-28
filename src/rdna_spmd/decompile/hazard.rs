@@ -67,6 +67,7 @@ impl Hazards {
         let exec_index = program.parameter_inputs.iter().position(
             |p| matches!(p.source, ParameterSource::MaskBit(r) if r == exec),
         );
+        super::assert_exec_position(f, &facts, exec_index);
         let accesses = accesses(program, &facts, exec_index);
         let mut hazards = Hazards {
             accesses,
@@ -1851,9 +1852,9 @@ mod tests {
         let e = BlockId(0);
         let first = k.buffer(&mut b, e, 0);
         let second = k.buffer(&mut b, e, 8);
-        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
-        let five = b.constant(e, Ty::I32, 5);
-        let c = b.cmp(e, IntPred::Ult, lane, five);
+        let v = uniform_word(&mut b, &k, e, 16, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, v, zero);
         let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
         let (other, o) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
         let (join, j) = b.block(&[Ty::I1, Ty::I64]);
@@ -1876,7 +1877,7 @@ mod tests {
     #[test]
     fn find_follows_a_pointer_spilled_on_both_paths_into_a_join() {
         assert!(joined_spill(true), "both paths spill the first buffer, which every lane stores to next");
-        assert!(joined_spill(false), "lanes 0 to 4 spill the first buffer, which every lane stores to next");
+        assert!(joined_spill(false), "a wave that takes the first arm spills the first buffer, which every lane stores to next");
     }
 
     fn by_workgroup(other: u64, grid: u32) -> bool {
@@ -2407,8 +2408,9 @@ mod tests {
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
-        let five = b.constant(e, Ty::I32, 5);
-        let c = b.cmp(e, IntPred::Ult, lane, five);
+        let v = uniform_word(&mut b, &k, e, 16, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, v, zero);
         let slot = b.constant(e, Ty::I32, 16);
         let wave = b.constant(e, Ty::I32, 32);
         let shifted = b.int(e, IntOp::Add, lane, wave);
@@ -2444,7 +2446,7 @@ mod tests {
 
     #[test]
     fn find_keeps_apart_indices_that_differ_between_the_paths_into_a_private_slot() {
-        assert!(!slot_index(true, false), "a lane reloads its lane id or its lane id + 32, which no other lane stores to");
+        assert!(!slot_index(true, false), "every lane reloads its lane id, or every lane its lane id + 32, which no other lane stores to");
     }
 
     fn ballot_bit(bit: u64) -> bool {
