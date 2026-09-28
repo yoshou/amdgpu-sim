@@ -10,6 +10,8 @@ pub(super) const KERNARG: u32 = 4;
 pub(super) struct Build {
     pub(super) f: Func,
     pub(super) inputs: Vec<Parameter>,
+    pub(super) registry: DialectRegistry,
+    pub(super) entry: EntryLayout,
     next: u64,
 }
 
@@ -26,16 +28,45 @@ impl Build {
             },
         );
         let inputs = sources.iter().map(|&(source, ty)| Parameter { source, ty }).collect();
-        (Self { f, inputs, next: 1 }, params.into_iter().map(|p| p.0).collect())
+        let mut registry = DialectRegistry::default();
+        registry.set_registers(Registers {
+            exec: EXEC,
+            vcc: 106,
+            null: 124,
+            scc_slot: 128,
+            sgprs: 128,
+            vgprs: 256,
+        });
+        let entry = EntryLayout {
+            kernarg_ptr: Some(KERNARG),
+            ..EntryLayout::default()
+        };
+        (
+            Self {
+                f,
+                inputs,
+                registry,
+                entry,
+                next: 1,
+            },
+            params.into_iter().map(|p| p.0).collect(),
+        )
     }
 
     pub(super) fn kernel() -> (Self, Kernel) {
-        let (b, p) = Self::new(&[
+        let (b, k, _) = Self::kernel_with(&[]);
+        (b, k)
+    }
+
+    pub(super) fn kernel_with(extra: &[(ParameterSource, Ty)]) -> (Self, Kernel, Vec<ValueId>) {
+        let mut sources = vec![
             (ParameterSource::MaskBit(EXEC), Ty::I1),
             (ParameterSource::Vgpr(0), Ty::I32),
             (ParameterSource::Sgpr(KERNARG), Ty::I32),
             (ParameterSource::Sgpr(KERNARG + 1), Ty::I32),
-        ]);
+        ];
+        sources.extend_from_slice(extra);
+        let (b, p) = Self::new(&sources);
         (
             b,
             Kernel {
@@ -43,7 +74,36 @@ impl Build {
                 item: p[1],
                 kernarg: (p[2], p[3]),
             },
+            p[4..].to_vec(),
         )
+    }
+
+    pub(super) fn resource(&mut self, b: BlockId, descriptor: ValueId) -> ValueId {
+        let op = self.registry.lookup(7, "resource_read").unwrap_or_else(|_| {
+            self.registry
+                .register(
+                    7,
+                    1,
+                    Operation {
+                        name: "resource_read",
+                        inputs: &[Ty::I64],
+                        outputs: vec![Ty::I32],
+                        effect: Effect::ReadGlobal { every_lane: false },
+                        immediates: &[],
+                    },
+                )
+                .unwrap()
+        });
+        let value = self.f.value(Ty::I32);
+        let provenance = Some(self.next << 8);
+        self.next += 1;
+        self.f.blocks.get_mut(&b).unwrap().insts.push(Inst::Target {
+            provenance,
+            op,
+            args: Arguments::Unary(descriptor),
+            outputs: vec![(value, Ty::I32)],
+        });
+        value
     }
 
     pub(super) fn block(&mut self, types: &[Ty]) -> (BlockId, Vec<ValueId>) {
@@ -122,24 +182,11 @@ impl Build {
     }
 
     pub(super) fn program(self) -> Program {
-        let mut registry = DialectRegistry::default();
-        registry.set_registers(Registers {
-            exec: EXEC,
-            vcc: 106,
-            null: 124,
-            scc_slot: 128,
-            sgprs: 128,
-            vgprs: 256,
-        });
-        let entry = EntryLayout {
-            kernarg_ptr: Some(KERNARG),
-            ..EntryLayout::default()
-        };
         Program {
-            registry: Arc::new(registry),
+            registry: Arc::new(self.registry),
             ir: self.f,
             parameter_inputs: self.inputs,
-            entry,
+            entry: self.entry,
         }
     }
 }

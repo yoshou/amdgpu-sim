@@ -2471,6 +2471,620 @@ mod tests {
         }
     }
 
+    type Position = (BlockId, usize);
+
+    fn meetings(program: &crate::rdna_spmd::program::Program, hazards: &Hazards) -> Vec<(&'static str, BTreeSet<Position>)> {
+        let (f, inputs) = (&program.ir, &program.parameter_inputs);
+        let search = search::prove(f, inputs, Some(0), hazards).0;
+        let direct = direct::prove(f, inputs, Some(0), hazards).0;
+        vec![("search", search), ("direct", direct)]
+            .into_iter()
+            .map(|(name, kept)| (name, kept.meets.iter().map(|&m| hazards.meetings[m]).collect()))
+            .collect()
+    }
+
+    fn keeps_exactly(program: &crate::rdna_spmd::program::Program, hazards: &Hazards, expected: &[Position], why: &str) {
+        let expected: BTreeSet<Position> = expected.iter().copied().collect();
+        let wrong: Vec<(&str, BTreeSet<Position>)> =
+            meetings(program, hazards).into_iter().filter(|(_, kept)| *kept != expected).collect();
+        assert!(wrong.is_empty(), "{}: expected meetings before {:?}, kept {:?}", why, expected, wrong);
+    }
+
+    fn store(b: &mut Build, block: BlockId, address: ValueId, data: u64, mask: ValueId) -> Position {
+        let value = b.constant(block, Ty::I32, data);
+        let at = b.here(block);
+        b.store(block, Space::Global, MemSize::B32, address, value, mask);
+        at
+    }
+
+    #[test]
+    fn prove_orders_two_stores_to_one_word_with_one_meeting() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let s1 = store(&mut b, e, buf, 1, k.exec);
+        let s2 = store(&mut b, e, buf, 2, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s2], "every lane's second store must follow every lane's first");
+    }
+
+    #[test]
+    fn prove_orders_three_stores_to_one_word_with_the_two_meetings_between_them() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let s1 = store(&mut b, e, buf, 1, k.exec);
+        let s2 = store(&mut b, e, buf, 2, k.exec);
+        let s3 = store(&mut b, e, buf, 3, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s1, s2), (s2, s3), (s1, s3)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s2, s3], "each store to the word must follow the one before it");
+    }
+
+    #[test]
+    fn prove_orders_stores_of_disjoint_lane_halves() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+        let high = b.cmp(e, IntPred::Uge, lane, sixteen);
+        let low = b.int(e, IntOp::And, low, k.exec);
+        let high = b.int(e, IntOp::And, high, k.exec);
+        let s1 = store(&mut b, e, buf, 1, low);
+        let s2 = store(&mut b, e, buf, 2, high);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s2], "the upper half's store must follow the lower half's");
+    }
+
+    #[test]
+    fn prove_orders_a_store_in_a_later_block() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let s1 = store(&mut b, e, buf, 1, k.exec);
+        let (next, n) = b.block(&[Ty::I1, Ty::I64]);
+        b.br(e, next, vec![k.exec, buf]);
+        let s2 = store(&mut b, next, n[1], 2, n[0]);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s2], "the store in the next block must follow the first");
+    }
+
+    fn read_after(write: impl Fn(&mut Build, BlockId, ValueId) -> ValueId) -> (crate::rdna_spmd::program::Program, Position, Position) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let out = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let data = write(&mut b, e, lane);
+        let s = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, buf, data, k.exec);
+        let l = b.here(e);
+        let v = b.load(e, Space::Global, MemSize::B32, buf, k.exec);
+        let own = byte_offset(&mut b, e, out, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, v, k.exec);
+        (b.program(), s, l)
+    }
+
+    #[test]
+    fn prove_orders_a_load_after_the_stores_whose_word_it_reads() {
+        let (program, s, l) = read_after(|_, _, lane| lane);
+        let hazards = Hazards::given(&program, &[(s, l)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[l], "every lane must read the one word the wave's store leaves, not its own");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_when_every_lane_stores_the_word_it_reads_back() {
+        let (program, s, l) = read_after(|b, e, _| b.constant(e, Ty::I32, 7));
+        let hazards = Hazards::given(&program, &[(s, l)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "every lane stores 7 before it reads, and no lane stores anything else there");
+    }
+
+    #[test]
+    fn prove_orders_a_store_after_the_loads_that_read_the_old_word() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let out = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let l = b.here(e);
+        let v = b.load(e, Space::Global, MemSize::B32, buf, k.exec);
+        let s = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, buf, lane, k.exec);
+        let own = byte_offset(&mut b, e, out, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, v, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(l, s)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s], "no lane may overwrite the word before every lane has read it");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_for_a_load_whose_word_nothing_uses() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let s = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, buf, lane, k.exec);
+        let l = b.here(e);
+        b.load(e, Space::Global, MemSize::B32, buf, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s, l)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "the loaded word reaches no store");
+    }
+
+    fn with_between(between: impl Fn(&mut Build, BlockId, &Kernel)) -> (crate::rdna_spmd::program::Program, Position, Position) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let s1 = store(&mut b, e, buf, 1, k.exec);
+        between(&mut b, e, &k);
+        let s2 = store(&mut b, e, buf, 2, k.exec);
+        (b.program(), s1, s2)
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_across_a_barrier() {
+        let (program, s1, s2) = with_between(|b, e, _| {
+            let id = b.constant(e, Ty::I32, 0);
+            b.effect(e, EffectOp::BarrierSignal { is_first: false }, vec![id]);
+            b.effect(e, EffectOp::BarrierWait, vec![id]);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "the barrier already aligns every lane between the stores");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_across_a_lane_read() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let zero = b.constant(e, Ty::I32, 0);
+            let y = b.wave(e, WaveOp::ReadLane, vec![lane, zero, zero]);
+            let out = k.buffer(b, e, 8);
+            let own = byte_offset(b, e, out, lane, 4);
+            b.store(e, Space::Global, MemSize::B32, own, y, k.exec);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "the lane read already aligns every lane between the stores");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_across_a_kept_query() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let flags = k.buffer(b, e, 8);
+            let own = byte_offset(b, e, flags, lane, 4);
+            let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+            let zero = b.constant(e, Ty::I32, 0);
+            let set = b.cmp(e, IntPred::Ne, flag, zero);
+            let c = b.int(e, IntOp::And, set, k.exec);
+            let q = b.wave(e, WaveOp::Any, vec![c]);
+            let one = b.constant(e, Ty::I32, 1);
+            let data = b.core(e, Ty::I32, Op::Select(q, one, zero));
+            let out = k.buffer(b, e, 16);
+            let slot = byte_offset(b, e, out, lane, 4);
+            b.store(e, Space::Global, MemSize::B32, slot, data, k.exec);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+            assert_eq!(kept.queries.len(), 1, "{}: a lane without the flag stores 0 unless the query stays", name);
+        }
+        keeps_exactly(&program, &hazards, &[], "the kept query already aligns every lane between the stores");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_when_only_inactive_lanes_read_the_word() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let out = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let zero = b.constant(e, Ty::I32, 0);
+        let first = b.cmp(e, IntPred::Eq, lane, zero);
+        let exec = b.int(e, IntOp::And, first, k.exec);
+        let own = byte_offset(&mut b, e, out, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
+        b.br(e, then, vec![exec, buf, own]);
+        let s = store(&mut b, then, t[1], 7, t[0]);
+        let yes = b.constant(then, Ty::I1, 1);
+        let l = b.here(then);
+        let v = b.load(then, Space::Global, MemSize::B32, t[1], yes);
+        b.store(then, Space::Global, MemSize::B32, t[2], v, t[0]);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s, l)], &[], &[(l, s, false)]);
+        keeps_exactly(&program, &hazards, &[], "only lane 0 keeps what it loads, and only lanes with exec clear read lane 0's word");
+    }
+
+    fn sliding_loop(lane_step: bool) -> (crate::rdna_spmd::program::Program, Position) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, zero, buf]);
+        let index = if lane_step {
+            let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+            b.int(body, IntOp::Add, p[1], lane)
+        } else {
+            p[1]
+        };
+        let address = byte_offset(&mut b, body, p[2], index, 4);
+        let s = b.here(body);
+        b.store(body, Space::Global, MemSize::B32, address, p[1], p[0]);
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[1], one);
+        let four = b.constant(body, Ty::I32, 4);
+        let again = b.cmp(body, IntPred::Ult, next, four);
+        b.cond_br(body, again, (body, vec![p[0], next, p[2]]), (exit, vec![p[0]]));
+        (b.program(), s)
+    }
+
+    #[test]
+    fn prove_orders_iterations_that_store_to_each_other_words() {
+        let (program, s) = sliding_loop(true);
+        let hazards = Hazards::given(&program, &[], &[(s, s)], &[]);
+        keeps_exactly(&program, &hazards, &[s], "lane a's store in iteration i + 1 must follow lane a + 1's in iteration i");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_for_one_instruction_within_one_iteration() {
+        let (program, s) = sliding_loop(false);
+        let hazards = Hazards::given(&program, &[(s, s)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "lanes of one instruction have no order in the wave either");
+    }
+
+    fn converted(b: &Build) -> Vec<&'static str> {
+        ["search", "direct"]
+            .iter()
+            .zip(both(b))
+            .filter(|(_, kept)| !kept.queries.is_empty() || !kept.words.is_empty())
+            .map(|(name, _)| *name)
+            .collect()
+    }
+
+    fn per_lane(b: &mut Build, k: &Kernel, e: BlockId, offset: u64) -> ValueId {
+        let table = k.buffer(b, e, offset);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(b, e, table, lane, 4);
+        b.load(e, Space::Global, MemSize::B32, own, k.exec)
+    }
+
+    fn query_data(b: &mut Build, k: &Kernel, e: BlockId) -> ValueId {
+        let flag = per_lane(b, k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        b.core(e, Ty::I32, Op::Select(q, one, two))
+    }
+
+    fn store_own(b: &mut Build, k: &Kernel, e: BlockId, data: ValueId, mask: ValueId) {
+        let buf = k.buffer(b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, data, mask);
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_a_contradiction_masks() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let v = per_lane(&mut b, &k, e, 16);
+        let w = per_lane(&mut b, &k, e, 24);
+        let below = b.cmp(e, IntPred::Ult, v, w);
+        let above = b.cmp(e, IntPred::Uge, v, w);
+        let never = b.int(e, IntOp::And, below, above);
+        let mask = b.int(e, IntOp::And, never, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        assert!(converted(&b).is_empty(), "{:?}: v < w and v >= w never hold together, so the store never runs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_disjoint_constants_mask() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let none = b.int(e, IntOp::And, one, two);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let shifted = b.int(e, IntOp::LShr, none, lane);
+        let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let mask = b.int(e, IntOp::And, bit, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        assert!(converted(&b).is_empty(), "{:?}: 1 & 2 is 0, so the store never runs", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_the_branch_into_its_block_rules_out() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let table = k.buffer(&mut b, e, 16);
+        let yes = b.constant(e, Ty::I1, 1);
+        let x = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let five = b.constant(e, Ty::I32, 5);
+        let is_five = b.cmp(e, IntPred::Eq, x, five);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, is_five, (then, vec![k.exec, x, data, own]), (exit, vec![k.exec]));
+        let five = b.constant(then, Ty::I32, 5);
+        let still = b.cmp(then, IntPred::Ne, t[1], five);
+        let mask = b.int(then, IntOp::And, still, t[0]);
+        b.store(then, Space::Global, MemSize::B32, t[3], t[2], mask);
+        assert!(converted(&b).is_empty(), "{:?}: the block runs only when x is 5, where the store's mask x != 5 is false", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_value_an_and_with_zero_drops() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let zero = b.constant(e, Ty::I32, 0);
+        let nothing = b.int(e, IntOp::And, data, zero);
+        store_own(&mut b, &k, e, nothing, k.exec);
+        assert!(converted(&b).is_empty(), "{:?}: every lane stores 0 whatever the query answers", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_no_lane_can_answer_true() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let far = b.constant(e, Ty::I32, 99);
+        let never = b.cmp(e, IntPred::Eq, lane, far);
+        let c = b.int(e, IntOp::And, never, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let data = b.core(e, Ty::I32, Op::Select(q, one, two));
+        store_own(&mut b, &k, e, data, k.exec);
+        assert!(converted(&b).is_empty(), "{:?}: no lane is lane 99, so the query is false in the wave and in every lane", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arms_store_the_same_word() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flag = per_lane(&mut b, &k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (then, vec![k.exec, own]), (other, vec![k.exec, own]));
+        for (block, p) in [(then, t), (other, o)] {
+            let one = b.constant(block, Ty::I32, 1);
+            b.store(block, Space::Global, MemSize::B32, p[1], one, p[0]);
+            b.br(block, join, vec![p[0]]);
+        }
+        assert!(converted(&b).is_empty(), "{:?}: both arms store 1 to the lane's own word", converted(&b));
+    }
+
+    #[test]
+    fn prove_demands_no_lane_for_a_kept_query_over_bits_only_active_lanes_set() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+        let exec = b.int(e, IntOp::And, low, k.exec);
+        let flags = k.buffer(&mut b, e, 8);
+        let buf = k.buffer(&mut b, e, 0);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
+        b.br(e, then, vec![exec, flags, buf]);
+        let lane = b.core(then, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, then, t[1], lane, 4);
+        let yes = b.constant(then, Ty::I1, 1);
+        let flag = b.load(then, Space::Global, MemSize::B32, own, yes);
+        let hundred = b.constant(then, Ty::I32, 100);
+        let v = b.core(then, Ty::I32, Op::Select(t[0], flag, hundred));
+        let five = b.constant(then, Ty::I32, 5);
+        let small = b.cmp(then, IntPred::Ult, v, five);
+        let at = b.here(then);
+        let q = b.wave(then, WaveOp::Any, vec![small]);
+        let one = b.constant(then, Ty::I32, 1);
+        let two = b.constant(then, Ty::I32, 2);
+        let data = b.core(then, Ty::I32, Op::Select(q, one, two));
+        let out = byte_offset(&mut b, then, t[2], lane, 4);
+        b.store(then, Space::Global, MemSize::B32, out, data, t[0]);
+        let Inst::Effect { provenance, .. } = b.f.blocks[&then].insts[at.1] else { unreachable!() };
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            assert!(kept.queries.contains(&q), "{}: a lane whose flag is small stores 1, the others 2", name);
+            assert!(!everyone.contains(&provenance), "{}: a lane with exec clear sees 100, so its bit is clear", name);
+        }
+    }
+
+    fn flag_query(b: &mut Build, k: &Kernel, e: BlockId) -> ValueId {
+        let flag = per_lane(b, k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        b.wave(e, WaveOp::Any, vec![c])
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_holds_a_meeting() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 16);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (then, vec![k.exec, buf]), (join, vec![k.exec]));
+        let s1 = store(&mut b, then, t[1], 1, t[0]);
+        let s2 = store(&mut b, then, t[1], 2, t[0]);
+        b.br(then, join, vec![t[0]]);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+            assert!(kept.queries.contains(&q), "{}: a lane without the flag skips the arm whose meeting every lane must reach", name);
+            let meets: BTreeSet<Position> = kept.meets.iter().map(|&m| hazards.meetings[m]).collect();
+            assert_eq!(meets, BTreeSet::from([s2]), "{}: the second store must follow the first", name);
+        }
+    }
+
+    fn arms_carry(first: u64, second: u64) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        b.cond_br(e, q, (then, vec![k.exec, own]), (other, vec![k.exec, own]));
+        let x = b.constant(then, Ty::I32, first);
+        b.br(then, join, vec![t[0], t[1], x]);
+        let y = b.constant(other, Ty::I32, second);
+        b.br(other, join, vec![o[0], o[1], y]);
+        b.store(join, Space::Global, MemSize::B32, j[1], j[2], j[0]);
+        (b, q)
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arms_carry_different_words_to_a_store() {
+        let (b, q) = arms_carry(1, 2);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| !kept.queries.contains(&q)).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag stores 2 where the wave stores 1", wrong);
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arms_carry_the_same_word() {
+        let (b, _) = arms_carry(1, 1);
+        assert!(converted(&b).is_empty(), "{:?}: both arms hand the store 1", converted(&b));
+    }
+
+    fn ballot_count(masked: bool) -> (Build, u64) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(e, Ty::I32, 5);
+        let low = b.cmp(e, IntPred::Ult, lane, five);
+        let x = if masked { b.int(e, IntOp::And, low, k.exec) } else { low };
+        let at = b.here(e);
+        let w = b.wave(e, WaveOp::Ballot, vec![x]);
+        let count = b.core(e, Ty::I32, Op::PopulationCount(w));
+        store_own(&mut b, &k, e, count, k.exec);
+        let Inst::Effect { provenance, .. } = b.f.blocks[&e].insts[at.1] else { unreachable!() };
+        (b, provenance)
+    }
+
+    #[test]
+    fn prove_demands_every_lane_for_a_ballot_of_unmasked_bits() {
+        let (b, provenance) = ballot_count(false);
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (_, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            assert!(everyone.contains(&provenance), "{}: the ballot counts the bits of lanes whose exec is clear", name);
+        }
+    }
+
+    #[test]
+    fn prove_demands_no_lane_for_a_ballot_of_masked_bits() {
+        let (b, provenance) = ballot_count(true);
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (_, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            assert!(!everyone.contains(&provenance), "{}: a lane with exec clear adds no bit", name);
+        }
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_picks_which_whole_word_a_count_reads() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let four = b.constant(e, Ty::I32, 4);
+        let low = b.cmp(e, IntPred::Ult, lane, four);
+        let low = b.int(e, IntOp::And, low, k.exec);
+        let w1 = b.wave(e, WaveOp::Ballot, vec![low]);
+        let w2 = b.wave(e, WaveOp::Ballot, vec![k.exec]);
+        let w = b.core(e, Ty::I32, Op::Select(q, w1, w2));
+        let count = b.core(e, Ty::I32, Op::PopulationCount(w));
+        store_own(&mut b, &k, e, count, k.exec);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| !kept.queries.contains(&q)).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: a lane without the flag counts 32 bits where the wave counts 4", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_answer_a_kept_query_gathers_from_other_lanes() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = flag_query(&mut b, &k, e);
+        let flag = per_lane(&mut b, &k, e, 16);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let x = b.int(e, IntOp::And, first, c);
+        let second = b.wave(e, WaveOp::Any, vec![x]);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let data = b.core(e, Ty::I32, Op::Select(second, one, two));
+        store_own(&mut b, &k, e, data, k.exec);
+        let wrong: Vec<(&str, usize)> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&first) || !kept.queries.contains(&second))
+            .map(|(n, kept)| (*n, kept.queries.len()))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{:?}: with the first query converted, the second gathers d_i & c_i instead of any(d) & c_i, which differ when d and c are set in different lanes",
+            wrong
+        );
+    }
+
+    #[test]
+    fn prove_keeps_a_query_that_only_other_lanes_feed_into_a_kept_query() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = flag_query(&mut b, &k, e);
+        let flag = per_lane(&mut b, &k, e, 16);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let x = b.int(e, IntOp::And, first, c);
+        let second = b.wave(e, WaveOp::Any, vec![x]);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let data = b.core(e, Ty::I32, Op::Select(second, one, two));
+        let yes = b.constant(e, Ty::I1, 1);
+        let clear = b.int(e, IntOp::Xor, set, yes);
+        let mask = b.int(e, IntOp::And, clear, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        let wrong: Vec<(&str, Vec<bool>)> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&first) || !kept.queries.contains(&second))
+            .map(|(n, kept)| (*n, vec![kept.queries.contains(&first), kept.queries.contains(&second)]))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "{:?} (first kept, second kept): the lanes that store have c clear, yet the second query gathers d_i & c_i from the others instead of any(d) & c_i",
+            wrong
+        );
+    }
+
     #[test]
     fn search_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
         let converted: Vec<Reader> = [Reader::ReadLane, Reader::ReadFirstLane, Reader::Bpermute, Reader::BpermuteFi, Reader::Wmma]

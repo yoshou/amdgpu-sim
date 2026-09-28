@@ -256,6 +256,159 @@ mod tests {
     use super::super::testing::*;
     use super::*;
 
+    struct Branched {
+        f: Func,
+        inputs: Vec<Parameter>,
+        then: BlockId,
+        other: BlockId,
+        join: BlockId,
+        carried: ValueId,
+        joined: ValueId,
+    }
+
+    fn branched() -> Branched {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(e, Ty::I32, 5);
+        let c = b.cmp(e, IntPred::Ult, lane, five);
+        let (then, t) = b.block(&[Ty::I1, Ty::I1, Ty::I64]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I1, Ty::I64]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I1, Ty::I64]);
+        b.cond_br(e, c, (then, vec![k.exec, c, buf]), (other, vec![k.exec, c, buf]));
+        let one = b.constant(then, Ty::I32, 1);
+        let two = b.constant(then, Ty::I32, 2);
+        let data = b.core(then, Ty::I32, Op::Select(t[1], one, two));
+        let mask = b.int(then, IntOp::And, t[1], t[0]);
+        b.store(then, Space::Global, MemSize::B32, t[2], data, mask);
+        b.br(then, join, vec![t[0], t[1], t[2]]);
+        let three = b.constant(other, Ty::I32, 3);
+        let mask = b.int(other, IntOp::And, o[1], o[0]);
+        b.store(other, Space::Global, MemSize::B32, o[2], three, mask);
+        b.br(other, join, vec![o[0], o[1], o[2]]);
+        let four = b.constant(join, Ty::I32, 4);
+        let mask = b.int(join, IntOp::And, j[1], j[0]);
+        b.store(join, Space::Global, MemSize::B32, j[2], four, mask);
+        Branched {
+            f: b.f,
+            inputs: b.inputs,
+            then,
+            other,
+            join,
+            carried: t[1],
+            joined: j[1],
+        }
+    }
+
+    fn stores(f: &Func, block: BlockId) -> Vec<(ValueId, ValueId)> {
+        f.blocks[&block]
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                Inst::Effect {
+                    op: EffectOp::Memory { op: MemoryOp::Store(_), .. },
+                    inputs,
+                    ..
+                } => Some((inputs[1], inputs[2])),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn constant(f: &Func, v: ValueId) -> Option<u64> {
+        f.blocks.values().flat_map(|b| &b.insts).find_map(|inst| match inst {
+            Inst::Core { value, op: Op::Const(_, k), .. } if *value == v => Some(*k),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn fold_decides_the_condition_inside_each_arm() {
+        let Branched { mut f, inputs, then, other, carried, .. } = branched();
+        fold(&mut f, &inputs, &BTreeSet::new(), Some(0));
+        let taken = stores(&f, then);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(constant(&f, taken[0].0), Some(1), "the arm runs only when the condition holds, so the select picks 1");
+        assert!(!f.blocks[&then].insts.iter().any(|i| i.operands().contains(&carried)), "nothing in the arm still reads the condition");
+        assert!(stores(&f, other).is_empty(), "the other arm's store is masked by a condition that is false there");
+    }
+
+    #[test]
+    fn fold_keeps_a_bit_that_differs_between_the_paths_into_a_join() {
+        let Branched { mut f, inputs, join, joined, .. } = branched();
+        fold(&mut f, &inputs, &BTreeSet::new(), Some(0));
+        let kept = stores(&f, join);
+        assert_eq!(kept.len(), 1, "the store after the join runs on one path only");
+        let mask = kept[0].1;
+        assert_eq!(constant(&f, mask), None);
+        assert!(
+            f.blocks[&join].insts.iter().any(|i| i.operands().contains(&joined)),
+            "the joined condition is true on one path and false on the other"
+        );
+    }
+
+    #[test]
+    fn fold_removes_an_arm_the_entry_decides_against() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64]);
+        b.cond_br(e, k.exec, (then, vec![k.exec, buf]), (other, vec![k.exec, buf]));
+        let one = b.constant(then, Ty::I32, 1);
+        b.store(then, Space::Global, MemSize::B32, t[1], one, t[0]);
+        let two = b.constant(other, Ty::I32, 2);
+        b.store(other, Space::Global, MemSize::B32, o[1], two, o[0]);
+        let mut f = b.f;
+        fold(&mut f, &b.inputs, &BTreeSet::new(), Some(0));
+        assert!(!f.blocks.contains_key(&other), "every lane that runs has exec set at the entry");
+        assert!(matches!(f.blocks[&e].term, Term::Br(Edge { dst, .. }) if dst == then));
+    }
+
+    #[test]
+    fn fold_removes_unused_values_and_loads_and_keeps_every_other_effect() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let unused = b.int(e, IntOp::Add, lane, lane);
+        let loaded = b.load(e, Space::Global, MemSize::B32, buf, k.exec);
+        let five = b.constant(e, Ty::I32, 5);
+        let c = b.cmp(e, IntPred::Ult, lane, five);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        b.effect(e, EffectOp::Wave(WaveOp::Meet), vec![]);
+        b.store(e, Space::Global, MemSize::B32, buf, lane, k.exec);
+        let mut f = b.f;
+        fold(&mut f, &b.inputs, &BTreeSet::new(), Some(0));
+        let outputs: Vec<ValueId> = f.blocks[&e].insts.iter().flat_map(Inst::outputs).collect();
+        assert!(!outputs.contains(&unused));
+        assert!(!outputs.contains(&loaded), "a load nothing reads has no effect on memory");
+        assert!(outputs.contains(&q), "a kept query is a collective every lane meets at");
+        assert!(f.blocks[&e].insts.iter().any(|i| matches!(i, Inst::Effect { op: EffectOp::Wave(WaveOp::Meet), .. })));
+        assert_eq!(stores(&f, e).len(), 1);
+    }
+
+    #[test]
+    fn fold_keeps_an_atomic_and_a_store_whose_masks_it_cannot_decide() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(e, Ty::I32, 5);
+        let c = b.cmp(e, IntPred::Ult, lane, five);
+        let mask = b.int(e, IntOp::And, c, k.exec);
+        b.store(e, Space::Global, MemSize::B32, buf, lane, mask);
+        b.effect(e, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned)), vec![buf, lane, mask]);
+        let mut f = b.f;
+        fold(&mut f, &b.inputs, &BTreeSet::new(), Some(0));
+        assert_eq!(stores(&f, e).len(), 1);
+        assert!(f.blocks[&e]
+            .insts
+            .iter()
+            .any(|i| matches!(i, Inst::Effect { op: EffectOp::Memory { op: MemoryOp::AtomicAdd(_), .. }, .. })));
+    }
+
     #[test]
     fn fold_keeps_a_bit_that_a_self_loop_changes() {
         let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);

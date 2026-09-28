@@ -1062,6 +1062,185 @@ mod tests {
     }
 
     #[test]
+    fn bit_and_view_follow_the_operations() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let three = b.constant(e, Ty::I32, 3);
+        let seven = b.constant(e, Ty::I32, 7);
+        let c = b.cmp(e, IntPred::Ult, lane, three);
+        let d = b.cmp(e, IntPred::Ult, lane, seven);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let x = b.core(e, Ty::I32, Op::Select(c, one, two));
+        let y = b.core(e, Ty::I32, Op::Select(d, two, one));
+        let crossed = b.cmp(e, IntPred::Eq, x, y);
+        let picked = b.cmp(e, IntPred::Eq, x, one);
+        let same = b.cmp(e, IntPred::Ne, lane, lane);
+        let constants = b.cmp(e, IntPred::Eq, three, seven);
+        let bits = b.cmp(e, IntPred::Ne, c, d);
+        let w = b.wave(e, WaveOp::Ballot, vec![c]);
+        let v = b.wave(e, WaveOp::Ballot, vec![d]);
+        let own = b.int(e, IntOp::LShr, w, lane);
+        let own = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, own));
+        let zero = b.constant(e, Ty::I32, 0);
+        let ones = b.constant(e, Ty::I32, 0xffff_ffff);
+        let nothing = b.int(e, IntOp::And, w, zero);
+        let everything = b.int(e, IntOp::Or, v, ones);
+        let differ = b.int(e, IntOp::Xor, w, v);
+        let chosen = b.core(e, Ty::I32, Op::Select(c, w, v));
+        let cast = b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, differ));
+        let valid = b.core(e, Ty::I1, Op::Env(Env::ValidLane));
+        let exec = p[0];
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let (bc, bd) = (logic.atom(Atom::Bit(c)), logic.atom(Atom::Bit(d)));
+        let _ = exec;
+        let mut expect = Vec::new();
+        let xor = logic.m.xor(bc, bd);
+        let ndd = logic.m.not(bd);
+        let crossed_formula = logic.m.ite(bc, ndd, bd);
+        expect.push(("select(c, 1, 2) == select(d, 2, 1)", logic.bit(f, &facts, crossed), crossed_formula));
+        expect.push(("select(c, 1, 2) == 1", logic.bit(f, &facts, picked), bc));
+        expect.push(("lane != lane", logic.bit(f, &facts, same), Bdd::FALSE));
+        expect.push(("3 == 7", logic.bit(f, &facts, constants), Bdd::FALSE));
+        expect.push(("c != d on bits", logic.bit(f, &facts, bits), xor));
+        expect.push(("trunc(ballot(c) >> lane)", logic.bit(f, &facts, own), bc));
+        expect.push(("ballot(c) & 0", logic.view(f, &facts, nothing), Bdd::FALSE));
+        expect.push(("ballot(d) | ~0", logic.view(f, &facts, everything), Bdd::TRUE));
+        expect.push(("ballot(c) ^ ballot(d)", logic.view(f, &facts, differ), xor));
+        let chosen_formula = logic.m.ite(bc, bc, bd);
+        expect.push(("select(c, ballot(c), ballot(d))", logic.view(f, &facts, chosen), chosen_formula));
+        expect.push(("bitcast of the xor", logic.view(f, &facts, cast), xor));
+        expect.push(("valid lane", logic.bit(f, &facts, valid), Bdd::TRUE));
+        expect.push(("converted any(c)", logic.bit(f, &facts, q), bc));
+        let wrong: Vec<&str> = expect.iter().filter(|(_, got, want)| got != want).map(|(name, ..)| *name).collect();
+        assert!(wrong.is_empty(), "{:?}", wrong);
+        let _ = crossed_formula;
+        assert_eq!(xor, logic.m.xor(bc, bd));
+    }
+
+    struct Edge2 {
+        b: Build,
+        src: BlockId,
+        bits: Vec<ValueId>,
+    }
+
+    fn edge(r: &mut Random, self_loop: bool) -> Edge2 {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)]);
+        let e = BlockId(0);
+        let n = 4;
+        let (src, s) = b.block(&vec![Ty::I1; n]);
+        let seeds: Vec<ValueId> = (0..n).map(|_| b.constant(e, Ty::I1, r.below(2))).collect();
+        b.br(e, src, seeds);
+        let mut bits: Vec<ValueId> = s.clone();
+        for k in 0..3 {
+            let bound = b.constant(src, Ty::I32, k + 1);
+            bits.push(b.cmp(src, IntPred::Ult, p[1], bound));
+        }
+        let one = b.constant(src, Ty::I1, 1);
+        let zero = b.constant(src, Ty::I1, 0);
+        let pick = |r: &mut Random, bits: &[ValueId]| bits[r.below(bits.len() as u64) as usize];
+        let args: Vec<ValueId> = (0..n)
+            .map(|_| match r.below(6) {
+                0 => one,
+                1 => zero,
+                2 => {
+                    let x = pick(r, &bits);
+                    b.int(src, IntOp::Xor, x, one)
+                }
+                3 => {
+                    let (x, y) = (pick(r, &bits), pick(r, &bits));
+                    b.int(src, IntOp::And, x, y)
+                }
+                _ => pick(r, &bits),
+            })
+            .collect();
+        let (exit, _) = b.block(&[]);
+        let dst = if self_loop {
+            src
+        } else {
+            let (dst, _) = b.block(&vec![Ty::I1; n]);
+            dst
+        };
+        let cond = pick(r, &bits);
+        b.cond_br(src, cond, (dst, args), (exit, vec![]));
+        Edge2 { b, src, bits }
+    }
+
+    fn images(seed: u64, rounds: usize, check: impl Fn(&mut Logic, Bdd, Bdd) -> bool) -> Vec<(usize, &'static str)> {
+        let mut r = Random::new(seed);
+        let mut wrong = Vec::new();
+        for round in 0..rounds {
+            let self_loop = round % 2 == 1;
+            let Edge2 { b, src, bits } = edge(&mut r, self_loop);
+            let f = &b.f;
+            let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+            let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+            let mut formula = Bdd::FALSE;
+            for _ in 0..3 {
+                let mut term = Bdd::TRUE;
+                for _ in 0..2 {
+                    let v = bits[r.below(bits.len() as u64) as usize];
+                    let a = logic.bit(f, &facts, v);
+                    let a = if r.below(2) == 0 { a } else { logic.m.not(a) };
+                    term = logic.m.and(term, a);
+                }
+                formula = logic.m.or(formula, term);
+            }
+            let got = logic.post(f, &facts, src, 0, formula);
+            let edge = f.blocks[&src].term.edges().next().unwrap().clone();
+            let dst = &f.blocks[&edge.dst];
+            let mut fresh = Vec::new();
+            let mut relation = formula;
+            for (&(param, _), &arg) in dst.params.iter().zip(&edge.args) {
+                let target = if self_loop {
+                    let t = logic.atom(Atom::Fresh(7, param, 0));
+                    fresh.push((t, param));
+                    t
+                } else {
+                    logic.atom(Atom::Bit(param))
+                };
+                let bound = logic.bit(f, &facts, arg);
+                let link = logic.m.iff(target, bound);
+                relation = logic.m.and(relation, link);
+            }
+            let scoped: Vec<u32> = logic
+                .support(relation)
+                .iter()
+                .copied()
+                .filter(|&v| logic.scope(&facts, v) == Some(src))
+                .collect();
+            let mut want = logic.exists(&scoped, relation);
+            if self_loop {
+                let renamed: HashMap<u32, Bdd> = fresh
+                    .iter()
+                    .map(|&(t, param)| (logic.support(t)[0], logic.atom(Atom::Bit(param))))
+                    .collect();
+                want = logic.m.compose(want, &|v| renamed.get(&v).copied());
+            }
+            if !check(&mut logic, got, want) {
+                wrong.push((round, if self_loop { "self-loop" } else { "edge" }));
+            }
+        }
+        wrong
+    }
+
+    #[test]
+    fn post_keeps_every_state_the_argument_relations_allow() {
+        let wrong = images(29, 400, |logic, got, want| logic.m.implies(want, got));
+        assert!(wrong.is_empty(), "rounds whose image drops a state the edge can reach: {:?}", wrong);
+    }
+
+    #[test]
+    fn post_equals_the_projection_of_the_formula_and_every_argument_relation() {
+        let wrong = images(29, 400, |_, got, want| got == want);
+        assert!(wrong.is_empty(), "rounds whose image differs from the projection: {:?}", wrong);
+    }
+
+    #[test]
     fn choose_keeps_the_first_choices_it_can_convert_and_nothing_it_need_not_keep() {
         let (b, _) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
         let f = &b.f;

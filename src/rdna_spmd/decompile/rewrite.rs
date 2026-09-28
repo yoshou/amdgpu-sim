@@ -273,3 +273,331 @@ fn rewrite_inst(p: &Func, facts: &Facts, kept: &Kept, b: &mut Block, inst: Inst)
         other => b.insts.push(other),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::logic::{Atom, Choice, Logic};
+    use super::super::testing::*;
+    use super::*;
+    use crate::rdna_spmd::analysis::bdd::Bdd;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn canonical(l: &Lowered, atom: Atom) -> Atom {
+        match atom {
+            Atom::View(v) if l.lane.types[v.0] == Ty::I1 => Atom::Bit(v),
+            other => other,
+        }
+    }
+
+    fn value(l: &Lowered, logic: &Logic, f: Bdd, assignment: &std::collections::HashMap<Atom, bool>) -> bool {
+        let mut f = f;
+        while let Some((var, low, high)) = logic.m.decompose(f) {
+            f = if assignment[&canonical(l, logic.atom_of(var))] { high } else { low };
+        }
+        f == Bdd::TRUE
+    }
+
+    fn atoms(l: &Lowered, logic: &mut Logic, f: Bdd) -> Vec<Atom> {
+        logic.support(f).iter().map(|&var| canonical(l, logic.atom_of(var))).collect()
+    }
+
+    struct Lowered {
+        wave: Func,
+        wave_facts: Facts,
+        lane: Func,
+        kept: BTreeSet<Choice>,
+        words: BTreeSet<ValueId>,
+    }
+
+    fn lower(b: &Build, kept: &Kept, meetings: &BTreeMap<(BlockId, usize), u64>) -> Lowered {
+        let facts = Facts::new(&b.f, &b.inputs, &kept.words);
+        let lane = lane_program(&b.f, &facts, kept, meetings);
+        Lowered {
+            wave: b.f.clone(),
+            wave_facts: facts,
+            lane,
+            kept: kept.choices(),
+            words: kept.words.clone(),
+        }
+    }
+
+    fn valid(b: &Build, l: &Lowered) -> Result<(), &'static str> {
+        let mut lane = l.lane.clone();
+        lane.compact();
+        lane.check(&b.registry)
+    }
+
+    fn mismatches(b: &Build, l: &Lowered) -> Vec<ValueId> {
+        let mut wave = Logic::fixed(&l.wave, &l.wave_facts, &l.kept, &[]);
+        let lane_facts = Facts::new(&l.lane, &b.inputs, &l.words);
+        let queries: BTreeSet<Choice> = l
+            .lane
+            .blocks
+            .values()
+            .flat_map(|b| &b.insts)
+            .filter_map(|inst| match inst {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any),
+                    outputs,
+                    ..
+                } => Some(Choice::Query(outputs[0].0)),
+                _ => None,
+            })
+            .collect();
+        let mut lane = Logic::fixed(&l.lane, &lane_facts, &queries, &[]);
+        let mut wrong = Vec::new();
+        let same = |l: &Lowered, wave: &mut Logic, lane: &mut Logic, expected: Bdd, got: Bdd| {
+            let mut all: Vec<Atom> = atoms(l, wave, expected);
+            all.extend(atoms(l, lane, got));
+            all.sort_by_key(|a| format!("{:?}", a));
+            all.dedup();
+            assert!(all.len() <= 16, "too many atoms to enumerate");
+            (0..1u32 << all.len()).all(|bits| {
+                let assignment: std::collections::HashMap<Atom, bool> =
+                    all.iter().enumerate().map(|(i, &a)| (a, bits >> i & 1 != 0)).collect();
+                value(l, wave, expected, &assignment) == value(l, lane, got, &assignment)
+            })
+        };
+        for &id in &l.wave_facts.order {
+            let edges = l.wave.blocks[&id].term.edges().zip(l.lane.blocks[&id].term.edges());
+            for (we, le) in edges.collect::<Vec<_>>() {
+                for ((&wa, &la), &(param, _)) in we.args.iter().zip(&le.args).zip(&l.lane.blocks[&we.dst].params) {
+                    if l.lane.types[param.0] != Ty::I1 {
+                        continue;
+                    }
+                    let expected = if l.wave.types[wa.0] == Ty::I1 {
+                        wave.bit(&l.wave, &l.wave_facts, wa)
+                    } else {
+                        wave.view(&l.wave, &l.wave_facts, wa)
+                    };
+                    let got = lane.bit(&l.lane, &lane_facts, la);
+                    if !same(l, &mut wave, &mut lane, expected, got) {
+                        eprintln!("b{} -> b{}: the argument for v{} differs", id.0, we.dst.0, param.0);
+                        wrong.push(param);
+                    }
+                }
+            }
+        }
+        for &id in &l.wave_facts.order {
+            let block = &l.wave.blocks[&id];
+            let values: Vec<ValueId> = block
+                .params
+                .iter()
+                .map(|p| p.0)
+                .chain(block.insts.iter().flat_map(Inst::outputs))
+                .collect();
+            for v in values {
+                if lane_facts.site[v.0] == crate::rdna_spmd::analysis::facts::Site::Unreached || l.lane.types[v.0] != Ty::I1 {
+                    continue;
+                }
+                let expected = if l.wave.types[v.0] == Ty::I1 {
+                    wave.bit(&l.wave, &l.wave_facts, v)
+                } else {
+                    wave.view(&l.wave, &l.wave_facts, v)
+                };
+                let got = lane.bit(&l.lane, &lane_facts, v);
+                let mut all: Vec<Atom> = atoms(l, &mut wave, expected);
+                all.extend(atoms(l, &mut lane, got));
+                all.sort_by_key(|a| format!("{:?}", a));
+                all.dedup();
+                assert!(all.len() <= 16, "too many atoms to enumerate");
+                let same = (0..1u32 << all.len()).all(|bits| {
+                    let assignment: std::collections::HashMap<Atom, bool> =
+                        all.iter().enumerate().map(|(i, &a)| (a, bits >> i & 1 != 0)).collect();
+                    value(l, &wave, expected, &assignment) == value(l, &lane, got, &assignment)
+                });
+                if !same {
+                    eprintln!(
+                        "v{}: wave {:?} lane {:?}\n  wave inst {:?}\n  lane inst {:?}",
+                        v.0,
+                        atoms(l, &mut wave, expected),
+                        atoms(l, &mut lane, got),
+                        l.wave_facts.inst(&l.wave, v),
+                        lane_facts.inst(&l.lane, v)
+                    );
+                    wrong.push(v);
+                }
+            }
+        }
+        wrong
+    }
+
+    struct Words {
+        b: Build,
+        q: ValueId,
+        kept_query: ValueId,
+        w: ValueId,
+        tests: Vec<ValueId>,
+    }
+
+    fn words() -> Words {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flags = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let five = b.constant(e, Ty::I32, 5);
+        let small = b.cmp(e, IntPred::Ult, flag, five);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let kept_query = b.wave(e, WaveOp::Any, vec![small]);
+        let w = b.wave(e, WaveOp::Ballot, vec![c]);
+        let v = b.wave(e, WaveOp::Ballot, vec![small]);
+        let shifted = b.int(e, IntOp::LShr, w, lane);
+        let own_bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let any = b.cmp(e, IntPred::Ne, w, zero);
+        let none = b.cmp(e, IntPred::Eq, zero, w);
+        let mask = b.constant(e, Ty::I32, 0xf0);
+        let masked = b.int(e, IntOp::And, w, mask);
+        let masked_any = b.cmp(e, IntPred::Ne, masked, zero);
+        let ones = b.constant(e, Ty::I32, 0xffff_ffff);
+        let chosen = b.core(e, Ty::I32, Op::Select(small, w, ones));
+        let chosen_any = b.cmp(e, IntPred::Ne, chosen, zero);
+        let both = b.int(e, IntOp::Xor, w, v);
+        let both_any = b.cmp(e, IntPred::Ne, both, zero);
+        let cast = b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, w));
+        let cast_none = b.cmp(e, IntPred::Eq, cast, zero);
+        let valid = b.core(e, Ty::I1, Op::Env(Env::ValidLane));
+        let mixed = b.int(e, IntOp::And, q, kept_query);
+        let mixed = b.int(e, IntOp::Or, mixed, valid);
+        let tests = vec![own_bit, any, none, masked_any, chosen_any, both_any, cast_none, mixed];
+        let buf = k.buffer(&mut b, e, 0);
+        let out = byte_offset(&mut b, e, buf, lane, 4);
+        let one = b.constant(e, Ty::I32, 1);
+        for &t in &tests {
+            b.store(e, Space::Global, MemSize::B32, out, one, t);
+        }
+        Words {
+            b,
+            q,
+            kept_query,
+            w,
+            tests,
+        }
+    }
+
+    #[test]
+    fn lane_program_computes_the_bits_the_proof_assumed_when_it_converts_everything() {
+        let Words { b, kept_query, .. } = words();
+        let mut kept = Kept::default();
+        kept.insert(Choice::Query(kept_query));
+        let l = lower(&b, &kept, &BTreeMap::new());
+        assert_eq!(mismatches(&b, &l), Vec::<ValueId>::new());
+        assert_eq!(valid(&b, &l), Ok(()));
+    }
+
+    #[test]
+    fn lane_program_computes_the_bits_the_proof_assumed_when_it_keeps_the_words() {
+        let Words { b, q, kept_query, w, tests } = words();
+        let mut kept = Kept::default();
+        kept.insert(Choice::Query(q));
+        kept.insert(Choice::Query(kept_query));
+        kept.insert(Choice::Word(w));
+        let l = lower(&b, &kept, &BTreeMap::new());
+        assert_eq!(mismatches(&b, &l), Vec::<ValueId>::new());
+        assert_eq!(valid(&b, &l), Ok(()));
+        assert_eq!(l.lane.types[w.0], Ty::I32, "a kept word stays a word");
+        assert!(!tests.is_empty());
+    }
+
+    #[test]
+    fn lane_program_hands_a_materialized_word_to_a_converted_parameter_as_its_own_bit() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(e, Ty::I32, 5);
+        let small = b.cmp(e, IntPred::Ult, lane, five);
+        let w = b.wave(e, WaveOp::Ballot, vec![small]);
+        let count = b.core(e, Ty::I32, Op::PopulationCount(w));
+        let out = byte_offset(&mut b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, out, count, k.exec);
+        let (next, n) = b.block(&[Ty::I1, Ty::I32, Ty::I64]);
+        b.br(e, next, vec![k.exec, w, out]);
+        let zero = b.constant(next, Ty::I32, 0);
+        let any = b.cmp(next, IntPred::Ne, n[1], zero);
+        let one = b.constant(next, Ty::I32, 1);
+        b.store(next, Space::Global, MemSize::B32, n[2], one, any);
+        let l = lower(&b, &Kept::default(), &BTreeMap::new());
+        assert_eq!(l.lane.types[w.0], Ty::I32, "the population count needs the whole word");
+        assert_eq!(l.lane.types[n[1].0], Ty::I1, "the parameter is read only by a lane test");
+        assert_eq!(valid(&b, &l), Ok(()));
+        assert_eq!(mismatches(&b, &l), Vec::<ValueId>::new());
+    }
+
+    #[test]
+    fn lane_program_puts_each_kept_meeting_right_before_its_instruction() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, buf, one, k.exec);
+        let second = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, buf, one, k.exec);
+        let meetings = BTreeMap::from([(second, 0xc000_0000_0000_0005u64)]);
+        let l = lower(&b, &Kept::default(), &meetings);
+        let insts = &l.lane.blocks[&e].insts;
+        let stores: Vec<usize> = insts
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, Inst::Effect { op: EffectOp::Memory { op: MemoryOp::Store(_), .. }, .. }))
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(stores.len(), 2);
+        let meets: Vec<(usize, u64)> = insts
+            .iter()
+            .enumerate()
+            .filter_map(|(k, i)| match i {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Meet),
+                    provenance,
+                    ..
+                } => Some((k, *provenance)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meets, vec![(stores[1] - 1, 0xc000_0000_0000_0005)], "one meeting, between the stores");
+        assert!(stores[0] < stores[1] - 1);
+    }
+
+    #[test]
+    fn lane_program_reads_a_uniform_first_lane_locally_and_keeps_the_others() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lo = b.core(e, Ty::I32, Op::UnpackLo(buf));
+        let uniform = b.wave(e, WaveOp::ReadFirstLane, vec![lo, k.exec]);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let varying = b.wave(e, WaveOp::ReadFirstLane, vec![lane, k.exec]);
+        let sum = b.int(e, IntOp::Add, uniform, varying);
+        let out = byte_offset(&mut b, e, buf, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, out, sum, k.exec);
+        let l = lower(&b, &Kept::default(), &BTreeMap::new());
+        let defined = |v: ValueId| l.lane.blocks[&e].insts.iter().find(|i| i.outputs().contains(&v)).cloned();
+        assert!(
+            matches!(defined(uniform), Some(Inst::Core { op: Op::Convert(Cvt::Bitcast, Ty::I32, x), .. }) if x == lo),
+            "every lane holds the same word, so each reads its own: {:?}",
+            defined(uniform)
+        );
+        assert!(
+            matches!(defined(varying), Some(Inst::Effect { op: EffectOp::Wave(WaveOp::ReadFirstLane), .. })),
+            "the lanes hold different words, so the read stays collective"
+        );
+        assert_eq!(valid(&b, &l), Ok(()));
+    }
+
+    #[test]
+    fn lane_program_drops_blocks_the_entry_does_not_reach_and_the_values_ret_returns() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let (dead, _) = b.block(&[Ty::I1]);
+        b.f.blocks.get_mut(&e).unwrap().term = Term::Ret(vec![k.exec]);
+        let _ = dead;
+        let l = lower(&b, &Kept::default(), &BTreeMap::new());
+        assert!(!l.lane.blocks.contains_key(&dead));
+        assert_eq!(l.lane.blocks[&e].term, Term::Ret(Vec::new()));
+    }
+}
