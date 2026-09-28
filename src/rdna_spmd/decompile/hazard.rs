@@ -118,6 +118,24 @@ impl Hazards {
         }
         let waves = addresses.waves();
         let around: Vec<Vec<usize>> = (0..facts.order.len()).map(|r| containing(&loops, r)).collect();
+        let successors: Vec<Vec<usize>> = facts
+            .order
+            .iter()
+            .map(|b| f.blocks[b].term.edges().map(|e| rank[&e.dst]).collect())
+            .collect();
+        let reaches: Vec<Vec<bool>> = (0..facts.order.len())
+            .map(|start| {
+                let mut seen = vec![false; facts.order.len()];
+                let mut stack = successors[start].clone();
+                while let Some(x) = stack.pop() {
+                    if !seen[x] {
+                        seen[x] = true;
+                        stack.extend(successors[x].iter().copied());
+                    }
+                }
+                seen
+            })
+            .collect();
         let loops_of: Vec<Vec<usize>> = hazards
             .accesses
             .iter()
@@ -163,6 +181,10 @@ impl Hazards {
                 .collect();
             for &(p, q) in &sharing {
                 let common = loops_of[p].iter().any(|l| loops_of[q].contains(l));
+                let (rp, rq) = (rank[&hazards.accesses[p].block], rank[&hazards.accesses[q].block]);
+                if !common && rp != rq && !reaches[rp][rq] && !reaches[rq][rp] {
+                    continue;
+                }
                 let mut now = state[&(p, q)];
                 for (k, together) in [(0, true), (1, false)] {
                     if !together && !common {
@@ -2811,6 +2833,100 @@ mod tests {
         let program = b.program();
         let hazards = Hazards::given(&program, &[(second_part, later)], &[], &[]);
         assert_eq!(hazards.meetings, vec![first_part, later], "one meeting before the whole instruction, one before the later store");
+    }
+
+    fn first_lane(mask: usize, other: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let three = b.constant(e, Ty::I32, 3);
+        let mask = match mask {
+            0 => b.cmp(e, IntPred::Uge, lane, three),
+            1 => b.constant(e, Ty::I1, 0),
+            _ => {
+                let flags = k.buffer(&mut b, e, 8);
+                let own = byte_offset(&mut b, e, flags, lane, 4);
+                let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+                let zero = b.constant(e, Ty::I32, 0);
+                b.cmp(e, IntPred::Ne, flag, zero)
+            }
+        };
+        let index = b.wave(e, WaveOp::ReadFirstLane, vec![lane, mask]);
+        let address = byte_offset(&mut b, e, buf, index, 4);
+        let s1 = store_at(&mut b, e, address, k.exec);
+        let at = b.constant(e, Ty::I64, other * 4);
+        let there = b.int(e, IntOp::Add, buf, at);
+        let s2 = store_at(&mut b, e, there, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reads_the_first_lane_whose_mask_is_set() {
+        let cases = [
+            ("mask lane >= 3, other word 3", 0, 3, true),
+            ("mask lane >= 3, other word 0", 0, 0, false),
+            ("empty mask, other word 0", 1, 0, true),
+            ("empty mask, other word 1", 1, 1, false),
+            ("loaded mask, other word 5", 2, 5, true),
+        ];
+        let wrong: Vec<(&str, bool)> = cases
+            .iter()
+            .filter(|&&(_, mask, other, expected)| first_lane(mask, other) != expected)
+            .map(|&(name, .., expected)| (name, expected))
+            .collect();
+        assert!(wrong.is_empty(), "(case, whether the stores meet): {:?}", wrong);
+    }
+
+    #[test]
+    fn find_reports_an_arm_and_the_join_after_it() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let v = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, v, zero);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I64]);
+        b.cond_br(e, c, (then, vec![k.exec, buf]), (join, vec![k.exec, buf]));
+        let s1 = store_at(&mut b, then, t[1], t[0]);
+        b.br(then, join, vec![t[0], t[1]]);
+        let s2 = store_at(&mut b, join, j[1], j[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(h.together.contains(&pair(&h, s1, s2)), "a wave that takes the arm stores there and then at the join");
+    }
+
+    #[test]
+    fn find_reports_exclusive_arms_that_different_iterations_take() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let table = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (head, h) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+        let (latch, l) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, head, vec![k.exec, zero, buf, table]);
+        let at = byte_offset(&mut b, head, h[3], h[1], 4);
+        let yes = b.constant(head, Ty::I1, 1);
+        let v = b.load(head, Space::Global, MemSize::B32, at, yes);
+        let z = b.constant(head, Ty::I32, 0);
+        let c = b.cmp(head, IntPred::Ne, v, z);
+        b.cond_br(head, c, (then, h.clone()), (other, h.clone()));
+        let s1 = store_at(&mut b, then, t[2], t[0]);
+        b.br(then, latch, t.clone());
+        let s2 = store_at(&mut b, other, o[2], o[0]);
+        b.br(other, latch, o.clone());
+        let one = b.constant(latch, Ty::I32, 1);
+        let next = b.int(latch, IntOp::Add, l[1], one);
+        let four = b.constant(latch, Ty::I32, 4);
+        let again = b.cmp(latch, IntPred::Ult, next, four);
+        b.cond_br(latch, again, (head, vec![l[0], next, l[2], l[3]]), (exit, vec![l[0]]));
+        let hz = Hazards::find(&b.program(), &env2());
+        assert!(hz.apart.contains(&pair(&hz, s1, s2)), "one iteration may take the first arm and another the second");
     }
 
     #[test]

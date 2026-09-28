@@ -936,10 +936,10 @@ impl<'a> Addresses<'a> {
             let u = if leaves {
                 let info = self.unknowns[u as usize].clone();
                 self.intern(
-                    Key::Left(u, lane as u8),
+                    Key::Left(u, if info.shared { ALL } else { lane as u8 }),
                     UnknownInfo {
                         rank: 0,
-                        shared: false,
+                        shared: info.shared,
                         block: info.block,
                         range: info.range,
                         through: Vec::new(),
@@ -2634,7 +2634,7 @@ impl<'a> Addresses<'a> {
         if form.terms.iter().any(|&(u, _)| !self.unknowns[u as usize].shared) {
             return self.opaque(v, lane, None);
         }
-        let Some((_, high)) = self.bounds(form) else {
+        let Some((low, high)) = self.bounds(form) else {
             return self.opaque(v, lane, None);
         };
         let j = form.alignment();
@@ -2653,7 +2653,7 @@ impl<'a> Addresses<'a> {
                 rank: 0,
                 shared: true,
                 block,
-                range: Some((0, (high >> k) as u32)),
+                range: Some(((low >> k) as u32, (high >> k) as u32)),
                 through,
             },
         );
@@ -2755,7 +2755,24 @@ impl<'a> Addresses<'a> {
                 let (address, used) = self.operand(inputs[0], at, lane, assume);
                 (self.load(v, &address, size, lane), used)
             }
-            EffectOp::Wave(WaveOp::ReadFirstLane) => unassumed(self.uniform_read(v, inputs[0], None)),
+            EffectOp::Wave(WaveOp::ReadFirstLane) => {
+                let mut first = Some(0);
+                let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+                for l in lanes {
+                    match self.bit(inputs[1], l, None).0 {
+                        Some(true) => {
+                            first = Some(l);
+                            break;
+                        }
+                        Some(false) => {}
+                        None => {
+                            first = None;
+                            break;
+                        }
+                    }
+                }
+                unassumed(self.uniform_read(v, inputs[0], first))
+            }
             EffectOp::Wave(WaveOp::ReadLane) => {
                 let (selector, _) = self.value(inputs[1], lane, None);
                 let chosen = selector.form.as_constant().map(|k| (k & 31) as usize);
@@ -2838,8 +2855,8 @@ impl<'a> Addresses<'a> {
                 ..
             } = &self.f.blocks[&block].insts[index]
             {
-                if let (MemSize::B32, Some(a)) = (size, address.form.as_constant()) {
-                    if let Some(value) = self.slot_before((block, index), a, bytes, lane) {
+                if let (MemSize::B32 | MemSize::B64, Some(a)) = (size, address.form.as_constant()) {
+                    if let Some(value) = self.slot_before((block, index), a, size.bytes(), lane) {
                         return self.leave(value, block, lane);
                     }
                 }
@@ -3043,8 +3060,8 @@ impl<'a> Addresses<'a> {
                     (IntPred::Ne, Some(d)) if d != 0 => Some(true),
                     (IntPred::Eq, Some(d)) if d != 0 => Some(false),
                     _ if wide => None,
-                    (IntPred::Eq, Some(0)) => Some(true),
-                    (IntPred::Ne, Some(0)) => Some(false),
+                    (IntPred::Eq | IntPred::Ule | IntPred::Uge | IntPred::Sle | IntPred::Sge, Some(0)) => Some(true),
+                    (IntPred::Ne | IntPred::Ult | IntPred::Ugt | IntPred::Slt | IntPred::Sgt, Some(0)) => Some(false),
                     (_, Some(d)) => match (self.bounds(&x.form), self.bounds(&y.form)) {
                         (Some(bx), Some(by)) => decide(pred, bx, by).or_else(|| offset(pred, d, by)),
                         (_, Some(by)) => offset(pred, d, by),
@@ -4092,7 +4109,7 @@ fn decide(pred: IntPred, x: (u64, u64), y: (u64, u64)) -> Option<bool> {
     }
 }
 
-fn compare(pred: IntPred, x: u32, y: u32) -> bool {
+pub(super) fn compare(pred: IntPred, x: u32, y: u32) -> bool {
     let (sx, sy) = (x as i32, y as i32);
     match pred {
         IntPred::Eq => x == y,

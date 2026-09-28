@@ -1,5 +1,6 @@
 use super::hazard::Hazards;
-use super::logic::{lane_test, projected_word, Atom, Choice, Logic};
+use super::address::compare;
+use super::logic::{constant_choices, lane_test, projected_word, Atom, Choice, Logic};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site, Use};
 use crate::rdna_spmd::analysis::loops::Loops;
@@ -206,6 +207,37 @@ impl<'a> Check<'a> {
             .collect()
     }
 
+    fn collective(&mut self, inst: &Inst) -> Option<Bdd> {
+        let Inst::Effect {
+            op: EffectOp::Wave(op),
+            outputs,
+            ..
+        } = inst
+        else {
+            return None;
+        };
+        let out = outputs[0].0;
+        match op {
+            WaveOp::Any => {
+                let local = self.logic.local(Choice::Query(out));
+                Some(self.not(local))
+            }
+            WaveOp::Ballot => Some(self.logic.materialized(self.facts, out)),
+            _ => None,
+        }
+    }
+
+    fn reads_a_varying_first_lane(&self, inst: &Inst) -> bool {
+        match inst {
+            Inst::Effect {
+                op: EffectOp::Wave(WaveOp::ReadFirstLane),
+                inputs,
+                ..
+            } => !self.facts.uniform[inputs[0].0],
+            _ => false,
+        }
+    }
+
     fn order_accesses(&mut self) {
         let hazards = self.hazards;
         let conflicts = hazards.conflicts();
@@ -245,10 +277,16 @@ impl<'a> Check<'a> {
                         around = self.and(around, left);
                         fresh = self.and(fresh, left);
                     }
-                    if meets_every_lane(inst) {
+                    if meets_every_lane(inst) || self.reads_a_varying_first_lane(inst) {
                         within = Bdd::FALSE;
                         around = Bdd::FALSE;
                         fresh = Bdd::FALSE;
+                    }
+                    if let Some(kept) = self.collective(inst) {
+                        let converted = self.not(kept);
+                        within = self.and(within, converted);
+                        around = self.and(around, converted);
+                        fresh = self.and(fresh, converted);
                     }
                     if let Some(&t) = at.get(&(b, index)) {
                         if targets.contains(&t) {
@@ -370,6 +408,13 @@ impl<'a> Check<'a> {
         } else {
             self.h[v.0]
         }
+    }
+
+    fn wmma_output(&mut self, inputs: &[ValueId], m: usize) -> Bdd {
+        let fragments = self.any_of(&inputs[..8]);
+        let fragments = self.some_lane(fragments);
+        let accumulator = self.whole(inputs[8 + m]);
+        self.or(accumulator, fragments)
     }
 
     fn any_of(&mut self, values: &[ValueId]) -> Bdd {
@@ -780,7 +825,15 @@ impl<'a> Check<'a> {
             if self.stopped {
                 return;
             }
-            for v in inst.outputs() {
+            for (m, v) in inst.outputs().into_iter().enumerate() {
+                let x = match inst {
+                    Inst::Effect {
+                        op: EffectOp::Wave(WaveOp::Wmma),
+                        inputs,
+                        ..
+                    } => self.wmma_output(inputs, m),
+                    _ => x,
+                };
                 self.raise_h(v, x);
                 if facts.lane_word[v.0] {
                     let mode = self.logic.materialized(facts, v);
@@ -880,6 +933,10 @@ impl<'a> Check<'a> {
                     } else {
                         (self.whole(x), self.whole(y))
                     };
+                    let same = x == y || facts.constant(f, x).is_some_and(|k| facts.constant(f, y) == Some(k));
+                    if same {
+                        return self.or(hx, hy);
+                    }
                     let hc = self.h[c.0];
                     let arms = if hx == Bdd::FALSE && hy == Bdd::FALSE {
                         Bdd::FALSE
@@ -916,6 +973,14 @@ impl<'a> Check<'a> {
                 Op::Int(IntOp::Xor, x, y) if facts.lane_word[value.0] => {
                     self.or(self.h[x.0], self.h[y.0])
                 }
+                Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Mul), x, y)
+                    if [x, y].iter().any(|&v| {
+                        let ones = if *ty == Ty::I64 { u64::MAX } else { u32::MAX as u64 };
+                        facts.constant(f, v) == Some(if k == IntOp::Or { ones } else { 0 })
+                    }) =>
+                {
+                    Bdd::FALSE
+                }
                 Op::Convert(Cvt::Bitcast, Ty::I32, x) if facts.lane_word[value.0] => self.h[x.0],
                 Op::Convert(Cvt::Trunc, Ty::I1, s) => match projected_word(f, facts, s) {
                     Some(w) if facts.lane_word[w.0] => self.h[w.0],
@@ -939,6 +1004,7 @@ impl<'a> Check<'a> {
                     let whole = self.whole(w);
                     self.logic.m.ite(mode, whole, local)
                 }
+                Op::Cmp(pred, x, y) if f.types[x.0] == Ty::I32 && settled(f, facts, pred, x, y) => Bdd::FALSE,
                 _ => self.any_of(&inst.operands()),
             },
             Inst::Target { args, .. } => {
@@ -1016,10 +1082,12 @@ impl<'a> Check<'a> {
                     self.or(own, read)
                 }
                 EffectOp::Wave(WaveOp::Wmma) => {
-                    let fragments = self.any_of(&inputs[..8]);
-                    let fragments = self.some_lane(fragments);
-                    let accumulators = self.any_of(&inputs[8..]);
-                    self.or(accumulators, fragments)
+                    let mut any = Bdd::FALSE;
+                    for m in 0..8 {
+                        let output = self.wmma_output(inputs, m);
+                        any = self.or(any, output);
+                    }
+                    any
                 }
                 EffectOp::Memory {
                     op: MemoryOp::Load(_),
@@ -2133,6 +2201,17 @@ impl<'c, 'a> Explore<'c, 'a> {
     }
 }
 
+fn settled(f: &Func, facts: &Facts, pred: IntPred, x: ValueId, y: ValueId) -> bool {
+    let (Some(xs), Some(ys)) = (constant_choices(f, facts, x), constant_choices(f, facts, y)) else {
+        return false;
+    };
+    let answers: Vec<bool> = xs
+        .iter()
+        .flat_map(|&a| ys.iter().map(move |&b| compare(pred, a as u32, b as u32)))
+        .collect();
+    answers.iter().all(|&t| t == answers[0])
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::logic::Kept;
@@ -2759,6 +2838,93 @@ mod tests {
     }
 
     #[test]
+    fn prove_orders_two_stores_across_a_converted_query() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let flags = k.buffer(b, e, 8);
+            let own = byte_offset(b, e, flags, lane, 4);
+            let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+            let zero = b.constant(e, Ty::I32, 0);
+            let set = b.cmp(e, IntPred::Ne, flag, zero);
+            let c = b.int(e, IntOp::And, set, k.exec);
+            let q = b.wave(e, WaveOp::Any, vec![c]);
+            let one = b.constant(e, Ty::I32, 1);
+            let data = b.core(e, Ty::I32, Op::Select(q, one, zero));
+            let out = k.buffer(b, e, 16);
+            let slot = byte_offset(b, e, out, lane, 4);
+            b.store(e, Space::Global, MemSize::B32, slot, data, c);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+            assert!(kept.queries.is_empty(), "{}: only lanes with the flag store the answer, and they see true either way", name);
+        }
+        keeps_exactly(&program, &hazards, &[s2], "the converted query aligns no lanes, so the second store needs its meeting");
+    }
+
+    fn flag_between(b: &mut Build, e: BlockId, k: &Kernel) -> (ValueId, ValueId, ValueId) {
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let flags = k.buffer(b, e, 8);
+        let own = byte_offset(b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let out = k.buffer(b, e, 16);
+        let slot = byte_offset(b, e, out, lane, 4);
+        (flag, c, slot)
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_across_a_ballot_whose_whole_word_is_stored() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let (_, c, slot) = flag_between(b, e, k);
+            let w = b.wave(e, WaveOp::Ballot, vec![c]);
+            b.store(e, Space::Global, MemSize::B32, slot, w, k.exec);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "the stored ballot word is computed by the whole wave, which aligns every lane between the stores");
+    }
+
+    #[test]
+    fn prove_orders_two_stores_across_a_ballot_whose_own_bit_alone_is_used() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let (_, c, slot) = flag_between(b, e, k);
+            let w = b.wave(e, WaveOp::Ballot, vec![c]);
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let shifted = b.int(e, IntOp::LShr, w, lane);
+            let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+            let one = b.constant(e, Ty::I32, 1);
+            b.store(e, Space::Global, MemSize::B32, slot, one, bit);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s2], "each lane computes its own bit of the ballot, which aligns no lanes");
+    }
+
+    #[test]
+    fn prove_needs_no_meeting_across_a_first_lane_read_of_a_varying_word() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let (flag, _, slot) = flag_between(b, e, k);
+            let x = b.wave(e, WaveOp::ReadFirstLane, vec![flag, k.exec]);
+            b.store(e, Space::Global, MemSize::B32, slot, x, k.exec);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[], "reading the first lane's flag stays a wave operation, which aligns every lane between the stores");
+    }
+
+    #[test]
+    fn prove_orders_two_stores_across_a_first_lane_read_of_a_uniform_word() {
+        let (program, s1, s2) = with_between(|b, e, k| {
+            let (_, _, slot) = flag_between(b, e, k);
+            let seven = b.constant(e, Ty::I32, 7);
+            let x = b.wave(e, WaveOp::ReadFirstLane, vec![seven, k.exec]);
+            b.store(e, Space::Global, MemSize::B32, slot, x, k.exec);
+        });
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[s2], "every lane holds 7, so the read becomes the lane's own 7 and aligns no lanes");
+    }
+
+    #[test]
     fn prove_needs_no_meeting_when_only_inactive_lanes_read_the_word() {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -2854,6 +3020,41 @@ mod tests {
         b.store(e, Space::Global, MemSize::B32, own, data, mask);
     }
 
+    fn two_orders(first: (IntPred, bool), second: (IntPred, bool)) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let v = per_lane(&mut b, &k, e, 16);
+        let w = per_lane(&mut b, &k, e, 24);
+        let order = |b: &mut Build, (p, swap): (IntPred, bool)| if swap { b.cmp(e, p, w, v) } else { b.cmp(e, p, v, w) };
+        let one = order(&mut b, first);
+        let other = order(&mut b, second);
+        let both = b.int(e, IntOp::And, one, other);
+        let mask = b.int(e, IntOp::And, both, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_two_orders_that_may_both_hold_mask() {
+        let b = two_orders((IntPred::Ult, false), (IntPred::Ule, false));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: v < w and v <= w both hold when v < w, so lanes store the answer", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_an_order_and_its_swap_mask() {
+        let b = two_orders((IntPred::Slt, false), (IntPred::Sgt, true));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: w s> v is v s< w, so lanes with v s< w store the answer", wrong);
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_opposite_orders_mask() {
+        let b = two_orders((IntPred::Ult, false), (IntPred::Ult, true));
+        assert!(converted(&b).is_empty(), "{:?}: v < w and w < v never hold together, so the store never runs", converted(&b));
+    }
+
     #[test]
     fn prove_converts_a_query_whose_store_a_contradiction_masks() {
         let (mut b, k) = Build::kernel();
@@ -2906,6 +3107,72 @@ mod tests {
         let mask = b.int(then, IntOp::And, still, t[0]);
         b.store(then, Space::Global, MemSize::B32, t[3], t[2], mask);
         assert!(converted(&b).is_empty(), "{:?}: the block runs only when x is 5, where the store's mask x != 5 is false", converted(&b));
+    }
+
+    fn chosen_constants(low: u64) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let flag = per_lane(&mut b, &k, e, 16);
+        let zero = b.constant(e, Ty::I32, 0);
+        let pick = b.cmp(e, IntPred::Ne, flag, zero);
+        let (two, four) = (b.constant(e, Ty::I32, 2), b.constant(e, Ty::I32, 4));
+        let chosen = b.core(e, Ty::I32, Op::Select(pick, two, four));
+        let low = b.constant(e, Ty::I32, low);
+        let both = b.int(e, IntOp::And, low, chosen);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let shifted = b.int(e, IntOp::LShr, both, lane);
+        let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let mask = b.int(e, IntOp::And, bit, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    fn constants_over_a_ballot(low: u64) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let flag = per_lane(&mut b, &k, e, 16);
+        let zero = b.constant(e, Ty::I32, 0);
+        let pick = b.cmp(e, IntPred::Ne, flag, zero);
+        let pick = b.int(e, IntOp::And, pick, k.exec);
+        let word = b.wave(e, WaveOp::Ballot, vec![pick]);
+        let low = b.constant(e, Ty::I32, low);
+        let two = b.constant(e, Ty::I32, 2);
+        let inner = b.int(e, IntOp::And, word, low);
+        let both = b.int(e, IntOp::And, inner, two);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let shifted = b.int(e, IntOp::LShr, both, lane);
+        let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let mask = b.int(e, IntOp::And, bit, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_two_constants_over_a_ballot_mask_off() {
+        let b = constants_over_a_ballot(1);
+        assert!(converted(&b).is_empty(), "{:?}: ballot & 1 & 2 is 0, so the store never runs", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_two_constants_over_a_ballot_may_mask_on() {
+        let b = constants_over_a_ballot(3);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: ballot & 3 & 2 keeps bit 1, so lane 1 stores whenever its flag is set", wrong);
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_a_constant_and_a_chosen_constant_mask_off() {
+        let b = chosen_constants(1);
+        assert!(converted(&b).is_empty(), "{:?}: 1 & 2 and 1 & 4 are 0, so the store never runs", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_a_constant_and_a_chosen_constant_may_mask_on() {
+        let b = chosen_constants(3);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: 3 & 2 sets bit 1, so lane 1 stores whenever it picks 2", wrong);
     }
 
     #[test]
@@ -3434,8 +3701,7 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: the read takes lane 0's word, which is its lane id 0 whatever the query answers", converted(&b));
     }
 
-    #[test]
-    fn prove_converts_a_query_whose_word_only_an_accumulator_the_stored_output_skips_holds() {
+    fn accumulator_query(stored: usize) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let q = flag_query(&mut b, &k, e);
@@ -3447,9 +3713,22 @@ mod tests {
         inputs.extend([fzero, second]);
         inputs.extend([fzero; 6]);
         let outputs = b.effect(e, EffectOp::Wave(WaveOp::Wmma), inputs);
-        let word = b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, outputs[0]));
+        let word = b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, outputs[stored]));
         store_own(&mut b, &k, e, word, k.exec);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_only_an_accumulator_the_stored_output_skips_holds() {
+        let b = accumulator_query(0);
         assert!(converted(&b).is_empty(), "{:?}: output 0 adds the products to accumulator 0 alone, and only accumulator 1 depends on the query", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_the_accumulator_of_the_stored_output_holds() {
+        let b = accumulator_query(1);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: output 1 starts from accumulator 1, which is 1 or 0 by the query", wrong);
     }
 
     #[test]
@@ -3615,6 +3894,21 @@ mod difference_tests {
         cases.push(Case { name: "readlane(select(q, 1, lane), 0)", value: v, truth: Box::new(|_, _| Bdd::TRUE) });
         let v = b.int(e, IntOp::Add, flag, one);
         cases.push(Case { name: "flag + 1", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let v = b.core(e, Ty::I32, Op::Select(d, s, s));
+        cases.push(Case { name: "select(d, s, s) for s = select(q, 1, 2)", value: v, truth: Box::new(differs) });
+        let v = b.int(e, IntOp::And, s, one);
+        cases.push(Case { name: "select(q, 1, 2) & 1", value: v, truth: Box::new(differs) });
+        let v = b.int(e, IntOp::And, s, zero);
+        cases.push(Case { name: "select(q, 1, 2) & 0", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let all = b.constant(e, Ty::I32, 0xffff_ffff);
+        let v = b.int(e, IntOp::Or, s, all);
+        cases.push(Case { name: "select(q, 1, 2) | ~0", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let v = b.int(e, IntOp::Or, s, two);
+        cases.push(Case { name: "select(q, 1, 2) | 2", value: v, truth: Box::new(differs) });
+        let v = b.int(e, IntOp::Mul, s, zero);
+        cases.push(Case { name: "select(q, 1, 2) * 0", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let v = b.int(e, IntOp::Mul, s, one);
+        cases.push(Case { name: "select(q, 1, 2) * 1", value: v, truth: Box::new(differs) });
         Program { b, q, cases }
     }
 

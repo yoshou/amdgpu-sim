@@ -76,6 +76,7 @@ pub struct Logic {
     detour: HashMap<Atom, u32>,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
+    orders: HashMap<BlockId, Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>>>,
     supports: HashMap<Bdd, Rc<Vec<u32>>>,
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
     relations: BTreeMap<(BlockId, usize), Rc<Vec<Binding>>>,
@@ -115,6 +116,7 @@ impl Logic {
             detour: HashMap::default(),
             bits: HashMap::default(),
             views: HashMap::default(),
+            orders: HashMap::default(),
             supports: HashMap::default(),
             edges: BTreeMap::new(),
             relations: BTreeMap::new(),
@@ -421,10 +423,52 @@ impl Logic {
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
                     self.compare(f, facts, p, a, b, opaque, &mut HashMap::default())
                 }
+                Op::Cmp(p, a, b) => {
+                    let (q, x, y, negated) = ordered(p, a, b);
+                    let first = match facts.site[v.0] {
+                        Site::Inst { block, .. } => self.first_order(f, block)[&(q, x, y)],
+                        _ => v,
+                    };
+                    if first == v {
+                        return self.atom(opaque);
+                    }
+                    let bit = self.bit(f, facts, first);
+                    let Some(Op::Cmp(p, a, b)) = facts.op(f, first) else {
+                        unreachable!("the first order of a block is a comparison")
+                    };
+                    if ordered(p, a, b).3 == negated {
+                        bit
+                    } else {
+                        self.m.not(bit)
+                    }
+                }
                 _ => self.atom(opaque),
             },
             _ => self.atom(opaque),
         }
+    }
+
+    fn first_order(&mut self, f: &Func, block: BlockId) -> Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>> {
+        if let Some(index) = self.orders.get(&block) {
+            return index.clone();
+        }
+        let mut index = HashMap::default();
+        for inst in &f.blocks[&block].insts {
+            if let Inst::Core {
+                value,
+                op: Op::Cmp(p, a, b),
+                ..
+            } = inst
+            {
+                if !matches!(p, IntPred::Eq | IntPred::Ne) {
+                    let (q, x, y, _) = ordered(*p, *a, *b);
+                    index.entry((q, x, y)).or_insert(*value);
+                }
+            }
+        }
+        let index = Rc::new(index);
+        self.orders.insert(block, index.clone());
+        index
     }
 
     fn compare(
@@ -523,6 +567,9 @@ impl Logic {
                     k => self.atom(Atom::Constant(k)),
                 },
                 Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
+                    if constant_choices(f, facts, a).is_some() && constant_choices(f, facts, b).is_some() {
+                        return self.constant_word(f, facts, k, a, b);
+                    }
                     let (a, b) = (self.view(f, facts, a), self.view(f, facts, b));
                     match k {
                         IntOp::And => self.m.and(a, b),
@@ -542,6 +589,28 @@ impl Logic {
                 _ => self.atom(opaque),
             },
             _ => self.atom(opaque),
+        }
+    }
+
+    fn constant_word(&mut self, f: &Func, facts: &Facts, k: IntOp, a: ValueId, b: ValueId) -> Bdd {
+        for (x, other) in [(a, b), (b, a)] {
+            if let Some(Op::Select(c, p, q)) = facts.op(f, x) {
+                let c = self.bit(f, facts, c);
+                let p = self.constant_word(f, facts, k, p, other);
+                let q = self.constant_word(f, facts, k, q, other);
+                return self.m.ite(c, p, q);
+            }
+        }
+        let (x, y) = (facts.constant(f, a).unwrap(), facts.constant(f, b).unwrap());
+        let word = match k {
+            IntOp::And => x & y,
+            IntOp::Or => x | y,
+            _ => x ^ y,
+        } as u32;
+        match word {
+            0 => Bdd::FALSE,
+            u32::MAX => Bdd::TRUE,
+            word => self.atom(Atom::Constant(word)),
         }
     }
 
@@ -732,16 +801,23 @@ impl Logic {
                 *occurrences.entry(v).or_default() += 1;
             }
         }
+        let foreign: Vec<bool> = links
+            .iter()
+            .map(|link| self.support(link.bound).iter().any(|v| !link.support.contains(v)))
+            .collect();
         let mut pending: Vec<&Binding> = links
             .iter()
-            .filter(|link| {
-                link.support.is_empty()
+            .zip(&foreign)
+            .filter(|&(link, &foreign)| {
+                foreign
+                    || link.support.is_empty()
                     || link.bound.constant().is_some()
                     || link
                         .support
                         .iter()
                         .any(|v| occurrences[v] > 1 || formula_atoms.contains(v))
             })
+            .map(|(link, _)| link)
             .collect();
         occurrences.clear();
         for link in &pending {
@@ -901,6 +977,38 @@ fn arriving(src: BlockId, dst: BlockId, atom: Atom) -> Atom {
         Atom::View(v) if src == dst => Atom::Next(v, true),
         other => other,
     }
+}
+
+fn ordered(p: IntPred, a: ValueId, b: ValueId) -> (IntPred, ValueId, ValueId, bool) {
+    match p {
+        IntPred::Uge => (IntPred::Ult, a, b, true),
+        IntPred::Ugt => (IntPred::Ult, b, a, false),
+        IntPred::Ule => (IntPred::Ult, b, a, true),
+        IntPred::Sge => (IntPred::Slt, a, b, true),
+        IntPred::Sgt => (IntPred::Slt, b, a, false),
+        IntPred::Sle => (IntPred::Slt, b, a, true),
+        _ => (p, a, b, false),
+    }
+}
+
+pub fn constant_choices(f: &Func, facts: &Facts, v: ValueId) -> Option<Vec<u64>> {
+    let mut found = Vec::new();
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match facts.op(f, v)? {
+            Op::Const(_, k) => {
+                if !found.contains(&k) {
+                    found.push(k);
+                }
+            }
+            Op::Select(_, a, b) => stack.extend([a, b]),
+            _ => return None,
+        }
+        if found.len() + stack.len() > 8 {
+            return None;
+        }
+    }
+    Some(found)
 }
 
 pub fn lane_test(f: &Func, facts: &Facts, a: ValueId, b: ValueId) -> Option<ValueId> {
@@ -1093,6 +1201,18 @@ mod tests {
         let valid = b.core(e, Ty::I1, Op::Env(Env::ValidLane));
         let exec = p[0];
         let q = b.wave(e, WaveOp::Any, vec![c]);
+        let four = b.constant(e, Ty::I32, 4);
+        let apart = b.int(e, IntOp::And, one, two);
+        let other = b.core(e, Ty::I32, Op::Select(c, two, four));
+        let missed = b.int(e, IntOp::And, one, other);
+        let kept = b.int(e, IntOp::And, three, other);
+        let z = b.core(e, Ty::I32, Op::Select(d, one, two));
+        let paired = b.int(e, IntOp::Xor, x, z);
+        let not_c = b.cmp(e, IntPred::Uge, lane, three);
+        let swapped_c = b.cmp(e, IntPred::Ugt, three, lane);
+        let not_d = b.cmp(e, IntPred::Ule, seven, lane);
+        let signed = b.cmp(e, IntPred::Slt, lane, three);
+        let not_signed = b.cmp(e, IntPred::Sge, lane, three);
         let f = &b.f;
         let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
         let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
@@ -1116,6 +1236,22 @@ mod tests {
         expect.push(("bitcast of the xor", logic.view(f, &facts, cast), xor));
         expect.push(("valid lane", logic.bit(f, &facts, valid), Bdd::TRUE));
         expect.push(("converted any(c)", logic.bit(f, &facts, q), bc));
+        expect.push(("1 & 2", logic.view(f, &facts, apart), Bdd::FALSE));
+        expect.push(("1 & select(c, 2, 4)", logic.view(f, &facts, missed), Bdd::FALSE));
+        let k2 = logic.atom(Atom::Constant(2));
+        let kept_formula = logic.m.and(bc, k2);
+        expect.push(("3 & select(c, 2, 4)", logic.view(f, &facts, kept), kept_formula));
+        let k3 = logic.atom(Atom::Constant(3));
+        let unequal = logic.m.and(xor, k3);
+        expect.push(("select(c, 1, 2) ^ select(d, 1, 2)", logic.view(f, &facts, paired), unequal));
+        let (nbc, nbd) = (logic.m.not(bc), logic.m.not(bd));
+        expect.push(("lane >= 3", logic.bit(f, &facts, not_c), nbc));
+        expect.push(("3 > lane", logic.bit(f, &facts, swapped_c), bc));
+        expect.push(("7 <= lane", logic.bit(f, &facts, not_d), nbd));
+        let bs = logic.atom(Atom::Bit(signed));
+        let nbs = logic.m.not(bs);
+        expect.push(("lane s< 3", logic.bit(f, &facts, signed), bs));
+        expect.push(("lane s>= 3", logic.bit(f, &facts, not_signed), nbs));
         let wrong: Vec<&str> = expect.iter().filter(|(_, got, want)| got != want).map(|(name, ..)| *name).collect();
         assert!(wrong.is_empty(), "{:?}", wrong);
         let _ = crossed_formula;
