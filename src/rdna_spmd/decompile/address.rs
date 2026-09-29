@@ -5719,4 +5719,110 @@ mod facts_tests {
         kinds.dedup();
         assert!(undecided.is_empty(), "{} undecided, kinds {:?}", undecided.len(), kinds);
     }
+
+    fn scratch(b: &mut Build, e: BlockId, offset: u64) -> (ValueId, ValueId) {
+        let base = b.core(e, Ty::I64, Op::Env(Env::ScratchBase));
+        let k = b.constant(e, Ty::I64, offset);
+        (base, b.int(e, IntOp::Add, base, k))
+    }
+
+    fn aperture(bound: impl Fn(&mut Build, BlockId, ValueId) -> ValueId) -> Option<bool> {
+        let (mut b, _) = Build::kernel();
+        let e = BlockId(0);
+        let (base, p) = scratch(&mut b, e, 8);
+        let end = bound(&mut b, e, base);
+        let above = b.cmp(e, IntPred::Uge, p, base);
+        let below = b.cmp(e, IntPred::Ult, p, end);
+        let inside = b.int(e, IntOp::And, above, below);
+        addresses(&b, &environment(32, &[]), |a| a.bit(inside, 0, None).0)
+    }
+
+    #[test]
+    fn aperture_tests_find_a_scratch_pointer_below_the_scratch_size() {
+        let found = aperture(|b, e, base| {
+            let size = b.core(e, Ty::I64, Op::Env(Env::ScratchSize));
+            b.int(e, IntOp::Add, base, size)
+        });
+        assert_eq!(found, Some(true));
+    }
+
+    #[test]
+    fn aperture_tests_decide_only_what_their_bound_gives() {
+        let found = aperture(|b, e, base| {
+            let four = b.constant(e, Ty::I64, 4);
+            b.int(e, IntOp::Add, base, four)
+        });
+        assert_ne!(found, Some(true), "base + 8 is not below base + 4");
+    }
+
+    #[test]
+    fn comparisons_of_offsets_into_one_region_decide_what_holds_for_every_base() {
+        let (mut b, _) = Build::kernel();
+        let e = BlockId(0);
+        let (_, far) = scratch(&mut b, e, 16);
+        let (_, near) = scratch(&mut b, e, 8);
+        let far_low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, far));
+        let near_low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, near));
+        let cases = [
+            ("base + 16 != base + 8", b.cmp(e, IntPred::Ne, far, near)),
+            ("low(base + 16) != low(base + 8)", b.cmp(e, IntPred::Ne, far_low, near_low)),
+            ("low(base + 16) == low(base + 16)", b.cmp(e, IntPred::Eq, far_low, far_low)),
+        ];
+        let undecided: Vec<&str> = addresses(&b, &environment(32, &[]), |a| {
+            cases.iter().filter(|c| a.bit(c.1, 0, None).0 != Some(true)).map(|c| c.0).collect()
+        });
+        assert!(undecided.is_empty(), "{:?}", undecided);
+    }
+
+    #[test]
+    fn comparisons_of_offsets_into_a_region_decide_nothing_that_depends_on_its_base() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let (_, p) = scratch(&mut b, e, 16);
+        let low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, p));
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let hundred = b.constant(e, Ty::I32, 100);
+        let zero = b.constant(e, Ty::I32, 0);
+        let address = b.constant(e, Ty::I64, 0x1010);
+        let cases = [
+            ("low(base + 16) == 16", b.cmp(e, IntPred::Eq, low, sixteen)),
+            ("low(base + 16) < 100", b.cmp(e, IntPred::Ult, low, hundred)),
+            ("low(kernarg) == 0", b.cmp(e, IntPred::Eq, k.kernarg.0, zero)),
+            ("base + 16 == 0x1010", b.cmp(e, IntPred::Eq, p, address)),
+        ];
+        let decided: Vec<&str> = addresses(&b, &environment(32, &[]), |a| {
+            cases.iter().filter(|c| a.bit(c.1, 0, None).0.is_some()).map(|c| c.0).collect()
+        });
+        assert!(decided.is_empty(), "each holds for some bases and not for others: {:?}", decided);
+    }
+
+    #[test]
+    fn values_computed_from_offsets_into_a_region_fix_nothing_that_depends_on_its_base() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let (_, p) = scratch(&mut b, e, 16);
+        let low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, p));
+        let four = b.constant(e, Ty::I32, 4);
+        let two = b.constant(e, Ty::I32, 2);
+        let three = b.constant(e, Ty::I64, 3);
+        let kernarg = b.core(e, Ty::I64, Op::Pack64(k.kernarg.0, k.kernarg.1));
+        let cases = [
+            ("low(base + 16) >> 4", b.int(e, IntOp::LShr, low, four)),
+            ("low(base + 16) * 2", b.int(e, IntOp::Mul, low, two)),
+            ("(base + 16) | 3", b.int(e, IntOp::Or, p, three)),
+            ("(base + 16) - kernarg", b.int(e, IntOp::Sub, p, kernarg)),
+            ("low(kernarg) >> 4", b.int(e, IntOp::LShr, k.kernarg.0, four)),
+        ];
+        let fixed: Vec<String> = addresses(&b, &environment(32, &[]), |a| {
+            cases
+                .iter()
+                .filter_map(|c| {
+                    let value = a.value(c.1, 0, None).0;
+                    (value.region.is_none() && value.form.as_constant().is_some())
+                        .then(|| format!("{} = {:#x}", c.0, value.form.constant))
+                })
+                .collect()
+        });
+        assert!(fixed.is_empty(), "each depends on where the regions start: {:?}", fixed);
+    }
 }

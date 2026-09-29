@@ -106,6 +106,19 @@ impl Build {
         value
     }
 
+    pub(super) fn target(&mut self, b: BlockId, op: TargetOp, args: Arguments, types: &[Ty]) -> Vec<ValueId> {
+        let outputs: Vec<(ValueId, Ty)> = types.iter().map(|&ty| (self.f.value(ty), ty)).collect();
+        let provenance = Some(self.next << 8);
+        self.next += 1;
+        self.f.blocks.get_mut(&b).unwrap().insts.push(Inst::Target {
+            provenance,
+            op,
+            args,
+            outputs: outputs.clone(),
+        });
+        outputs.into_iter().map(|o| o.0).collect()
+    }
+
     pub(super) fn block(&mut self, types: &[Ty]) -> (BlockId, Vec<ValueId>) {
         let id = BlockId(self.f.blocks.keys().last().map_or(0, |b| b.0 + 1));
         let params: Vec<(ValueId, Ty)> = types.iter().map(|&ty| (self.f.value(ty), ty)).collect();

@@ -2458,6 +2458,78 @@ mod tests {
         assert!(!resource(false));
     }
 
+    fn rdna4(b: &mut Build, name: &str) -> TargetOp {
+        b.registry = crate::rdna_spmd::rdna4::dialect().registry;
+        b.registry.lookup(0x5244_4e34, name).unwrap()
+    }
+
+    fn base_units(b: &mut Build, e: BlockId, buf: ValueId) -> ValueId {
+        let eight = b.constant(e, Ty::I64, 8);
+        let units = b.int(e, IntOp::LShr, buf, eight);
+        b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, units))
+    }
+
+    fn node_read(offset: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_bvh64_intersect_ray");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let mut args = [b.constant(e, Ty::I32, 0); 14];
+        args[0] = base_units(&mut b, e, buf);
+        args[2] = b.constant(e, Ty::I64, 5);
+        args[13] = k.exec;
+        let r = b.here(e);
+        b.target(e, op, Arguments::Fourteen(args), &[Ty::I32; 4]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_a_node_read_after_stores_into_the_node() {
+        assert!(node_read(64), "the box node at the base of the BVH spans 128 bytes");
+    }
+
+    #[test]
+    fn find_keeps_a_node_read_apart_from_stores_past_the_node() {
+        assert!(!node_read(4096), "the box node at the base of the BVH ends 128 bytes in");
+    }
+
+    fn texel_read(offset: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_sample_lz");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let mut args = [zero; 16];
+        args[0] = base_units(&mut b, e, buf);
+        args[1] = b.constant(e, Ty::I32, 3 << 30 | 5 << 17);
+        args[2] = b.constant(e, Ty::I32, 15 << 14 | 3);
+        args[3] = b.constant(e, Ty::I32, 4);
+        args[13] = b.constant(e, Ty::I1, 1);
+        args[14] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, k.item));
+        args[15] = b.constant(e, Ty::F32, 0);
+        let r = b.here(e);
+        b.target(e, op, Arguments::Sixteen(args), &[Ty::I32]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_after_stores_into_the_image() {
+        assert!(texel_read(8), "lanes 8 to 11 read the texels of the first row the store writes");
+    }
+
+    #[test]
+    fn find_keeps_a_texel_read_apart_from_stores_past_the_image() {
+        assert!(!texel_read(4096), "a 16 x 16 image of bytes with 128-byte rows ends 1936 bytes in");
+    }
+
     fn twice(b: &mut Build, block: BlockId, address: ValueId, mask: ValueId) -> ((BlockId, usize), (BlockId, usize)) {
         (store_at(b, block, address, mask), store_at(b, block, address, mask))
     }
