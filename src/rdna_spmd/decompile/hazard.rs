@@ -32,6 +32,37 @@ impl Kind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reach {
+    Anywhere,
+    Node {
+        offset: &'static [(usize, u64)],
+        shift: u32,
+        bytes: u32,
+    },
+    Image,
+}
+
+fn reach(registry: &DialectRegistry, op: TargetOp) -> Reach {
+    let Ok(spec) = registry.operation(op) else {
+        return Reach::Anywhere;
+    };
+    match (registry.dialect_name(op.dialect()), spec.name) {
+        (Some("rdna4"), "image_sample_lz") => Reach::Image,
+        (Some("rdna4"), "image_bvh64_intersect_ray") => Reach::Node {
+            offset: &[(2, !7)],
+            shift: 3,
+            bytes: 128,
+        },
+        (Some("rdna4"), "image_bvh8_intersect_ray") => Reach::Node {
+            offset: &[(2, u64::MAX), (11, !15)],
+            shift: 3,
+            bytes: 128,
+        },
+        _ => Reach::Anywhere,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Access {
     pub block: BlockId,
@@ -44,6 +75,7 @@ pub struct Access {
     pub predicate: Option<ValueId>,
     pub output: Option<ValueId>,
     pub exec: Option<ValueId>,
+    pub reach: Reach,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -380,18 +412,20 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                         predicate: Some(inputs[op.mask_input()]),
                         output,
                         exec,
+                        reach: Reach::Anywhere,
                     });
                 }
                 Inst::Target {
                     provenance,
                     op,
+                    args,
                     outputs,
-                    ..
                 } => {
-                    let reads = program.registry.operation(*op).is_ok_and(|spec| {
-                        matches!(spec.effect, Effect::ReadGlobal { .. })
-                    });
-                    if reads {
+                    let effect = program.registry.operation(*op).map(|spec| spec.effect);
+                    if let Ok(Effect::ReadGlobal { every_lane }) = effect {
+                        let predicate = (!every_lane)
+                            .then(|| args.values().iter().copied().find(|a| f.types[a.0] == Ty::I1))
+                            .flatten();
                         out.push(Access {
                             block: b,
                             index,
@@ -400,9 +434,10 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                             space: None,
                             bytes: RESOURCE_BYTES,
                             address: None,
-                            predicate: None,
+                            predicate,
                             output: outputs.first().map(|o| o.0),
                             exec,
+                            reach: reach(&program.registry, *op),
                         });
                     }
                 }
@@ -467,6 +502,7 @@ struct Place {
     region: Option<Region>,
     within: Regions,
     address: Option<Value>,
+    bytes: u32,
 }
 
 impl Place {
@@ -491,10 +527,12 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
                 return None;
             }
             let Some(address) = a.address else {
+                let reached = addresses.resource_span((a.block, a.index), a.reach, lane);
                 return Some(Place {
                     region: None,
                     within: within(lane),
-                    address: None,
+                    address: reached.as_ref().map(|r| r.0.clone()),
+                    bytes: reached.map_or(a.bytes, |r| r.1),
                 });
             };
             let (value, _) = addresses.operand(address, a.block, lane, a.predicate);
@@ -507,6 +545,7 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
                 region,
                 within: if region.is_some() { Regions::default() } else { within(lane) },
                 address: Some(value),
+                bytes: a.bytes,
             })
         })
         .collect()
@@ -797,16 +836,19 @@ fn meet(
             let unknowns = &addresses.unknowns;
             if xa.form.terms == ya.form.terms && xa.form.terms.iter().all(|&(u, _)| !variant(&unknowns[u as usize])) {
                 let d = xa.form.constant.wrapping_sub(ya.form.constant);
-                if d >= qa.bytes && d.wrapping_neg() >= pa.bytes {
+                if d >= y.bytes && d.wrapping_neg() >= x.bytes {
                     continue;
                 }
-            } else if !may_overlap(unknowns, &xa.form, &ya.form, pa.bytes, qa.bytes, variant, differ) {
+            } else if !may_overlap(unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ) {
+                continue;
+            }
+            if above(addresses, (pa, a, xa), (qa, b, ya), variant, differ) {
                 continue;
             }
             if !runs(addresses, pa, a) || !runs(addresses, qa, b) {
                 continue;
             }
-            if excluded(addresses, (pa, a, &xa.form), (qa, b, &ya.form), variant) {
+            if excluded(addresses, (pa, a, &xa.form, x.bytes), (qa, b, &ya.form, y.bytes), variant) {
                 continue;
             }
             let both = [idles(addresses, pa, a), idles(addresses, qa, b)];
@@ -822,8 +864,8 @@ fn meet(
 
 fn excluded(
     addresses: &mut Addresses,
-    (pa, a, x): (&Access, usize, &Form),
-    (qa, b, y): (&Access, usize, &Form),
+    (pa, a, x, x_bytes): (&Access, usize, &Form, u32),
+    (qa, b, y, y_bytes): (&Access, usize, &Form, u32),
     variant: &dyn Fn(&UnknownInfo) -> bool,
 ) -> bool {
     let difference = x.sub(y);
@@ -843,7 +885,7 @@ fn excluded(
     let inverse = (0..5).fold(odd, |inv, _| inv.wrapping_mul(2u32.wrapping_sub(odd.wrapping_mul(inv))));
     let low_mask = if shift == 0 { u32::MAX } else { (1u32 << (32 - shift)) - 1 };
     let mut candidates = Vec::new();
-    for t in -(pa.bytes as i64) + 1..qa.bytes as i64 {
+    for t in -(x_bytes as i64) + 1..y_bytes as i64 {
         let target = (t as u32).wrapping_sub(difference.constant);
         if target & ((1u64 << shift) - 1) as u32 != 0 {
             continue;
@@ -873,6 +915,26 @@ fn excluded(
             !(runs(this, pa, a) && runs(this, qa, b))
         })
     })
+}
+
+fn above(
+    addresses: &mut Addresses,
+    (pa, a, x): (&Access, usize, &Value),
+    (qa, b, y): (&Access, usize, &Value),
+    variant: &dyn Fn(&UnknownInfo) -> bool,
+    differ: Option<Unknown>,
+) -> bool {
+    let (Some(xv), Some(yv)) = (pa.address, qa.address) else {
+        return false;
+    };
+    if !addresses.wide(xv) || !addresses.wide(yv) {
+        return false;
+    }
+    let (hx, hy) = (addresses.high(xv, a), addresses.high(yv, b));
+    let unknowns = &addresses.unknowns;
+    let same = x.form == y.form && x.form.terms.iter().all(|&(u, _)| !variant(&unknowns[u as usize]));
+    let window = if same { 1 } else { 2 };
+    !may_overlap(unknowns, &hx, &hy, window, window, variant, differ)
 }
 
 fn may_overlap(
@@ -909,31 +971,33 @@ fn may_overlap(
             _ => 0,
         };
         let info = &unknowns[u as usize];
+        let set = if info.values.is_some() { u } else { NO_SET };
         if variant(info) {
-            if let (true, true, Some((lo, hi))) = (Some(u) == differ, cx == cy, info.range) {
+            if let (true, true, Some((lo, hi)), NO_SET) = (Some(u) == differ, cx == cy, info.range, set) {
                 apart = Some((cx, hi - lo));
                 continue;
             }
-            sum.add(cx, info.range);
-            sum.add(cy.wrapping_neg(), info.range);
+            sum.add(cx, info.range, set);
+            sum.add(cy.wrapping_neg(), info.range, set);
         } else {
-            sum.add(cx.wrapping_sub(cy), info.range);
+            sum.add(cx.wrapping_sub(cy), info.range, set);
         }
     }
     let constant = x.constant.wrapping_sub(y.constant) as i64;
     match apart {
-        None => sum.within(constant, x_bytes, y_bytes),
+        None => sum.within(unknowns, constant, x_bytes, y_bytes),
         Some((_, 0)) => false,
         Some((c, span)) => [c, c.wrapping_neg()].iter().any(|&c| {
             let mut sum = sum;
-            sum.add(c, Some((1, span)));
-            sum.within(constant, x_bytes, y_bytes)
+            sum.add(c, Some((1, span)), NO_SET);
+            sum.within(unknowns, constant, x_bytes, y_bytes)
         }),
     }
 }
 
 const BOUNDED: usize = 8;
 const PARTIAL_SUMS: usize = 4096;
+const NO_SET: Unknown = Unknown::MAX;
 
 #[derive(Clone, Copy)]
 struct Sum {
@@ -942,7 +1006,7 @@ struct Sum {
     modulus: u64,
     divisor: u64,
     free: u64,
-    terms: [(u32, u32, u32); BOUNDED],
+    terms: [(u32, u32, u32, Unknown); BOUNDED],
     count: usize,
 }
 
@@ -954,14 +1018,14 @@ impl Default for Sum {
             modulus: 1 << 32,
             divisor: 0,
             free: 1 << 32,
-            terms: [(0, 0, 0); BOUNDED],
+            terms: [(0, 0, 0, NO_SET); BOUNDED],
             count: 0,
         }
     }
 }
 
 impl Sum {
-    fn add(&mut self, c: u32, range: Option<(u32, u32)>) {
+    fn add(&mut self, c: u32, range: Option<(u32, u32)>, set: Unknown) {
         if c == 0 {
             return;
         }
@@ -977,7 +1041,7 @@ impl Sum {
         }
         match range {
             Some((lo, hi)) if self.count < BOUNDED => {
-                self.terms[self.count] = (c, lo, hi);
+                self.terms[self.count] = (c, lo, hi, set);
                 self.count += 1;
             }
             Some(_) => self.count = BOUNDED + 1,
@@ -985,8 +1049,8 @@ impl Sum {
         }
     }
 
-    fn within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
-        self.roughly_within(constant, x_bytes, y_bytes) && self.exactly_within(constant, x_bytes, y_bytes)
+    fn within(&self, unknowns: &[UnknownInfo], constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
+        self.roughly_within(constant, x_bytes, y_bytes) && self.exactly_within(unknowns, constant, x_bytes, y_bytes)
     }
 
     fn roughly_within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
@@ -1008,24 +1072,27 @@ impl Sum {
         })
     }
 
-    fn exactly_within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
+    fn exactly_within(&self, unknowns: &[UnknownInfo], constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
         if self.count == 0 || self.count > BOUNDED {
             return true;
         }
         let m = self.free;
         let mask = m - 1;
         let terms = &self.terms[..self.count];
-        let mut widest: Vec<usize> = (0..terms.len()).collect();
+        let mut widest: Vec<usize> = (0..terms.len()).filter(|&k| terms[k].3 == NO_SET).collect();
         widest.sort_by_key(|&k| std::cmp::Reverse(terms[k].2 - terms[k].1));
-        let (first, second) = (widest[0], widest.get(1).copied());
+        let (first, second) = (widest.first().copied(), widest.get(1).copied());
         let hits = |s: u64| {
             (-(x_bytes as i64) + 1..y_bytes as i64).any(|t| {
                 let target = ((t - constant).rem_euclid(m as i64) as u64).wrapping_sub(s) & mask;
-                let (c1, lo1, hi1) = terms[first];
+                let Some(first) = first else {
+                    return target == 0;
+                };
+                let (c1, lo1, hi1, _) = terms[first];
                 match second {
                     None => solvable(c1, lo1, hi1, target, m),
                     Some(k) => {
-                        let (c2, lo2, hi2) = terms[k];
+                        let (c2, lo2, hi2, _) = terms[k];
                         let start = (c1 as u64).wrapping_mul(lo1 as u64).wrapping_add((c2 as u64).wrapping_mul(lo2 as u64));
                         let target = target.wrapping_sub(start) & mask;
                         two_solvable(c1 as u64, (hi1 - lo1) as u64, c2 as u64, (hi2 - lo2) as u64, target, m)
@@ -1034,18 +1101,28 @@ impl Sum {
             })
         };
         let mut sums: Vec<u64> = vec![0];
-        for (k, &(c, lo, hi)) in terms.iter().enumerate() {
-            if k == first || Some(k) == second {
+        for (k, &(c, lo, hi, set)) in terms.iter().enumerate() {
+            if Some(k) == first || Some(k) == second {
                 continue;
             }
-            let width = (hi - lo) as usize + 1;
+            let values = (set != NO_SET).then(|| unknowns[set as usize].values.clone()).flatten();
+            let width = values.as_ref().map_or((hi - lo) as usize + 1, |v| v.len());
             if width > PARTIAL_SUMS || sums.len() * width > PARTIAL_SUMS * 4 {
                 return true;
             }
             let mut next: Vec<u64> = Vec::with_capacity(sums.len() * width);
             for &s in &sums {
-                for u in lo..=hi {
-                    next.push(s.wrapping_add((c as u64).wrapping_mul(u as u64)) & mask);
+                match &values {
+                    Some(values) => {
+                        for &u in values.iter() {
+                            next.push(s.wrapping_add((c as u64).wrapping_mul(u as u64)) & mask);
+                        }
+                    }
+                    None => {
+                        for u in lo..=hi {
+                            next.push(s.wrapping_add((c as u64).wrapping_mul(u as u64)) & mask);
+                        }
+                    }
                 }
             }
             next.sort_unstable();
@@ -1189,10 +1266,14 @@ mod tests {
             rank,
             range,
             through: Vec::new(),
+            values: None,
         }
     }
 
     fn values(info: &UnknownInfo) -> Vec<u32> {
+        if let Some(set) = &info.values {
+            return set.to_vec();
+        }
         let (lo, hi) = info.range.expect("a small range");
         (lo..=hi).collect()
     }
@@ -1272,6 +1353,55 @@ mod tests {
         let sizes = [1, 2, 4, 8, 64];
         let (a, b) = (sizes[r.below(5) as usize], sizes[r.below(5) as usize]);
         (unknowns, variant, x, y, a, b)
+    }
+
+    fn random_set_case(r: &mut Random) -> (Vec<UnknownInfo>, Vec<bool>, Form, Form, u32, u32) {
+        let (mut unknowns, variant, x, y, a, b) = random_case(r, false);
+        for (u, info) in unknowns.iter_mut().enumerate() {
+            if r.below(3) == 0 {
+                continue;
+            }
+            let lo = info.range.unwrap().0;
+            let mut set: Vec<u32> = (0..1 + r.below(5)).map(|_| lo.wrapping_add(1 << r.below(6)).wrapping_sub(1)).collect();
+            set.sort_unstable();
+            set.dedup();
+            *info = UnknownInfo {
+                range: Some((set[0], set[set.len() - 1])),
+                values: Some(set.into()),
+                ..self::info(u, None)
+            };
+        }
+        (unknowns, variant, x, y, a, b)
+    }
+
+    #[test]
+    fn may_overlap_never_misses_an_overlap_over_value_sets() {
+        let mut r = Random::new(13);
+        for _ in 0..20000 {
+            let (unknowns, variant, x, y, a, b) = random_set_case(&mut r);
+            let exact = exact_overlap(&unknowns, &variant, &x, &y, a, b);
+            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank], None);
+            assert!(
+                found || !exact,
+                "{:?} ({} bytes) and {:?} ({} bytes) over {:?} with variant {:?} overlap, but may_overlap says they do not",
+                x, a, y, b, unknowns.iter().map(|i| (i.range, i.values.clone())).collect::<Vec<_>>(), variant
+            );
+        }
+    }
+
+    #[test]
+    fn may_overlap_is_exact_over_value_sets() {
+        let mut r = Random::new(17);
+        for _ in 0..20000 {
+            let (unknowns, variant, x, y, a, b) = random_set_case(&mut r);
+            let exact = exact_overlap(&unknowns, &variant, &x, &y, a, b);
+            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank], None);
+            assert_eq!(
+                found, exact,
+                "{:?} ({} bytes) and {:?} ({} bytes) over {:?} with variant {:?}",
+                x, a, y, b, unknowns.iter().map(|i| (i.range, i.values.clone())).collect::<Vec<_>>(), variant
+            );
+        }
     }
 
     #[test]
@@ -2469,7 +2599,7 @@ mod tests {
         b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, units))
     }
 
-    fn node_read(offset: u64) -> bool {
+    fn node_read_at(node: u64, offset: u64, active: bool) -> bool {
         let (mut b, k) = Build::kernel();
         let op = rdna4(&mut b, "image_bvh64_intersect_ray");
         let e = BlockId(0);
@@ -2479,12 +2609,16 @@ mod tests {
         let s = store_at(&mut b, e, address, k.exec);
         let mut args = [b.constant(e, Ty::I32, 0); 14];
         args[0] = base_units(&mut b, e, buf);
-        args[2] = b.constant(e, Ty::I64, 5);
-        args[13] = k.exec;
+        args[2] = b.constant(e, Ty::I64, node);
+        args[13] = if active { k.exec } else { b.constant(e, Ty::I1, 0) };
         let r = b.here(e);
         b.target(e, op, Arguments::Fourteen(args), &[Ty::I32; 4]);
         let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
         h.together.contains(&pair(&h, s, r))
+    }
+
+    fn node_read(offset: u64) -> bool {
+        node_read_at(5, offset, true)
     }
 
     #[test]
@@ -2497,7 +2631,55 @@ mod tests {
         assert!(!node_read(4096), "the box node at the base of the BVH ends 128 bytes in");
     }
 
+    #[test]
+    fn find_orders_a_read_of_a_later_node_after_stores_into_it() {
+        assert!(node_read_at(0x2d, 0x140 + 124, true), "node 0x2d of type 5 sits 0x28 << 3 = 0x140 bytes in and spans 128 bytes");
+    }
+
+    #[test]
+    fn find_keeps_a_read_of_a_later_node_apart_from_stores_before_it() {
+        assert!(!node_read_at(0x2d, 0x140 - 4, true), "node 0x2d starts 0x140 bytes in");
+    }
+
+    #[test]
+    fn find_keeps_a_node_read_no_lane_makes_apart_from_stores_into_the_node() {
+        assert!(!node_read_at(5, 64, false), "the read's own exec is false in every lane");
+    }
+
+    fn node8_read(offset: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_bvh8_intersect_ray");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let mut args = [b.constant(e, Ty::I32, 0); 13];
+        args[0] = base_units(&mut b, e, buf);
+        args[2] = b.constant(e, Ty::I64, 0x20);
+        args[11] = b.constant(e, Ty::I32, 0x13);
+        args[12] = k.exec;
+        let r = b.here(e);
+        b.target(e, op, Arguments::Thirteen(args), &[Ty::I32; 10]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_an_eight_wide_node_read_after_stores_into_the_node() {
+        assert!(node8_read(0x180 + 124), "base 0x20 plus index 0x13 & !15 = 0x30 gives 0x30 << 3 = 0x180 bytes in, 128 bytes long");
+    }
+
+    #[test]
+    fn find_keeps_an_eight_wide_node_read_apart_from_stores_before_the_node() {
+        assert!(!node8_read(0x180 - 4), "the node starts 0x180 bytes in");
+    }
+
     fn texel_read(offset: u64) -> bool {
+        texel_read_in(offset, false)
+    }
+
+    fn texel_read_in(offset: u64, rows: bool) -> bool {
         let (mut b, k) = Build::kernel();
         let op = rdna4(&mut b, "image_sample_lz");
         let e = BlockId(0);
@@ -2513,7 +2695,7 @@ mod tests {
         args[3] = b.constant(e, Ty::I32, 4);
         args[13] = b.constant(e, Ty::I1, 1);
         args[14] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, k.item));
-        args[15] = b.constant(e, Ty::F32, 0);
+        args[15] = if rows { args[14] } else { b.constant(e, Ty::F32, 0) };
         let r = b.here(e);
         b.target(e, op, Arguments::Sixteen(args), &[Ty::I32]);
         let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
@@ -2528,6 +2710,16 @@ mod tests {
     #[test]
     fn find_keeps_a_texel_read_apart_from_stores_past_the_image() {
         assert!(!texel_read(4096), "a 16 x 16 image of bytes with 128-byte rows ends 1936 bytes in");
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_after_stores_into_the_last_row() {
+        assert!(texel_read_in(15 * 128 + 12, true), "lanes 15 to 31 read texel (15, 15), byte 15 * 128 + 15");
+    }
+
+    #[test]
+    fn find_keeps_a_texel_read_apart_from_stores_just_past_the_last_texel() {
+        assert!(!texel_read_in(15 * 128 + 16, true), "the last texel is byte 15 * 128 + 15");
     }
 
     fn twice(b: &mut Build, block: BlockId, address: ValueId, mask: ValueId) -> ((BlockId, usize), (BlockId, usize)) {
@@ -2726,6 +2918,76 @@ mod tests {
     }
 
     #[test]
+    fn find_reports_lanes_whose_words_meet_across_a_four_gigabyte_boundary() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let edge = b.constant(e, Ty::I64, 0xffff_fffe);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+        let two = b.constant(e, Ty::I64, 2);
+        let step = b.int(e, IntOp::Mul, wide, two);
+        let address = b.int(e, IntOp::Add, edge, step);
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(h.conflicts().contains(&pair(&h, s1, s2)), "lane 0 writes bytes 2^32 - 2 to 2^32 + 1 and lane 1 writes 2^32 to 2^32 + 3");
+    }
+
+    fn read_back_index(extra: impl Fn(&mut Build, &Kernel, BlockId, ValueId, ValueId), shared: bool, mask: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let slot = if shared {
+            let one = b.constant(e, Ty::I32, 1);
+            b.int(e, IntOp::And, lane, one)
+        } else {
+            lane
+        };
+        let own = byte_offset(&mut b, e, table, slot, 4);
+        let stored = if mask {
+            let sixteen = b.constant(e, Ty::I32, 16);
+            let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+            b.int(e, IntOp::And, low, k.exec)
+        } else {
+            k.exec
+        };
+        b.store(e, Space::Global, MemSize::B32, own, lane, stored);
+        extra(&mut b, &k, e, table, lane);
+        let back = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let address = byte_offset(&mut b, e, buf, back, 4);
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_an_index_another_store_may_overwrite() {
+        let collide = read_back_index(
+            |b, k, e, table, lane| {
+                let one = b.constant(e, Ty::I32, 1);
+                let next = b.int(e, IntOp::Xor, lane, one);
+                let neighbour = byte_offset(b, e, table, next, 4);
+                let zero = b.constant(e, Ty::I32, 0);
+                b.store(e, Space::Global, MemSize::B32, neighbour, zero, k.exec);
+            },
+            false,
+            false,
+        );
+        assert!(collide, "the second store writes 0 into every word, so every lane may read back 0");
+    }
+
+    #[test]
+    fn find_reports_an_index_lanes_share_a_word_for() {
+        assert!(read_back_index(|_, _, _, _, _| {}, true, false), "lanes 0 and 2 both write word 0, so lane 2 may read back 0");
+    }
+
+    #[test]
+    fn find_reports_an_index_only_some_lanes_stored() {
+        assert!(read_back_index(|_, _, _, _, _| {}, false, true), "lanes 16 to 31 read words nothing in this wave wrote");
+    }
+
+    #[test]
     fn find_follows_an_index_the_lane_stored_and_loaded_back() {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -2840,6 +3102,40 @@ mod tests {
         b.cond_br(body, again, (body, vec![p[0], doubled, next, p[3]]), (exit, vec![p[0]]));
         let h = Hazards::find(&b.program(), &env2());
         assert!(!h.together.contains(&pair(&h, s1, s2)), "the index runs 1, 2, 4, 8 and never names word 3");
+    }
+
+    fn doubling_index(word: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, one, zero, buf]);
+        let address = byte_offset(&mut b, body, p[3], p[1], 4);
+        let s1 = store_at(&mut b, body, address, p[0]);
+        let at = b.constant(body, Ty::I64, word * 4);
+        let fixed = b.int(body, IntOp::Add, p[3], at);
+        let s2 = store_at(&mut b, body, fixed, p[0]);
+        let doubled = b.int(body, IntOp::Add, p[1], p[1]);
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let four = b.constant(body, Ty::I32, 4);
+        let again = b.cmp(body, IntPred::Ult, next, four);
+        b.cond_br(body, again, (body, vec![p[0], doubled, next, p[3]]), (exit, vec![p[0]]));
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_doubling_index_on_a_word_it_names() {
+        assert!(doubling_index(8), "the index runs 1, 2, 4, 8 and names word 8 in the last iteration");
+    }
+
+    #[test]
+    fn find_keeps_a_doubling_index_off_a_word_past_its_last_value() {
+        assert!(!doubling_index(16), "the index stops at 8");
     }
 
     fn workgroup_branch(entered: u64) -> bool {

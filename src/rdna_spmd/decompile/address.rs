@@ -3,11 +3,13 @@ use crate::rdna_spmd::engine::{EntryLayout, WORKGROUP_ID_X, WORKGROUP_ID_YZ};
 use crate::rdna_spmd::environment::Environment;
 use crate::rdna_spmd::hash::HashMap;
 type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::rdna_spmd::hash::Mix>>;
+use super::hazard::Reach;
 use super::provenance::{bounds, Exposure, Spill};
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const LANES: usize = 32;
+const SEQUENCE: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Region {
@@ -28,6 +30,7 @@ pub struct UnknownInfo {
     pub rank: usize,
     pub range: Option<(u32, u32)>,
     pub through: Vec<BlockId>,
+    pub values: Option<std::rc::Rc<[u32]>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -151,6 +154,9 @@ enum Key {
     HeldSpread(Slot, usize, Vec<Form>),
     Left(Unknown, u8),
     Base(Region),
+    Sequence(ValueId, u8),
+    High(ValueId, u8),
+    Carry(ValueId, u8),
     Cycle(ValueId, u8),
     Guess(ValueId, u8),
     GuessSlot(Slot),
@@ -169,6 +175,7 @@ enum Entry {
     Reach(BlockId),
     Region(ValueKey, bool),
     WordBit((ValueId, u8)),
+    High((ValueId, u8)),
 }
 
 #[derive(Default)]
@@ -178,9 +185,10 @@ struct Fixed {
     slots: Cached<Slot, Option<Value>>,
     keys: Cached<Key, Unknown>,
     loop_bits: Cached<BlockId, Bits>,
-    steps: Cached<StepKey, (Option<u32>, bool)>,
+    steps: Cached<StepKey, Step>,
     summarized: Cached<BlockId, ()>,
     word_bits: Cached<(ValueId, u8), Option<bool>>,
+    highs: Cached<(ValueId, u8), Form>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -202,7 +210,7 @@ struct Goal {
 
 enum Outcome {
     Bits(Vec<(usize, u8)>, Vec<Goal>),
-    Values(Vec<(Option<u32>, bool)>, Vec<usize>, Vec<Goal>),
+    Values(Vec<Step>, Vec<usize>, Vec<Goal>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -221,7 +229,7 @@ fn level(d: usize) -> Depth {
 type Cached<K, V> = HashMap<K, (V, Depth)>;
 type ValueKey = (ValueId, u8, Option<ValueId>);
 type StepKey = (BlockId, u8, Target, Option<Region>);
-type Step = (Option<u32>, bool);
+type Step = (Option<u32>, bool, Option<(u32, u32)>);
 type ImplicationKey = (Implication, ValueId, ValueId, Option<(ValueId, bool)>);
 type Bits = std::rc::Rc<Vec<((usize, u8), bool)>>;
 type Edges = Vec<(BlockId, usize)>;
@@ -377,9 +385,9 @@ pub struct Addresses<'a> {
     fixed_bits: Cached<ValueKey, Assumed<Option<bool>>>,
     fixed_keys: Cached<Key, Unknown>,
     fixed_loop_bits: Cached<BlockId, Bits>,
-    fixed_steps: Cached<StepKey, (Option<u32>, bool)>,
+    fixed_steps: Cached<StepKey, Step>,
     fixed_summarized: Cached<BlockId, ()>,
-    steps: Cached<StepKey, (Option<u32>, bool)>,
+    steps: Cached<StepKey, Step>,
     summarized: Cached<BlockId, ()>,
     summarizing: HashMap<BlockId, usize>,
     loop_bits: Cached<BlockId, Bits>,
@@ -423,6 +431,12 @@ pub struct Addresses<'a> {
     spills: Vec<Spill>,
     sources: HashMap<ValueId, Vec<usize>>,
     exposing: Vec<Exposure>,
+    highs: Cached<(ValueId, u8), Form>,
+    fixed_highs: Cached<(ValueId, u8), Form>,
+    active_highs: HashSet<(ValueId, u8)>,
+    opaque_highs: HashSet<Unknown>,
+    readbacks: HashMap<(BlockId, usize), Option<(ValueId, ValueId, u64)>>,
+    written: HashMap<(BlockId, usize), Regions>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -521,10 +535,16 @@ impl<'a> Addresses<'a> {
             spills: Vec::new(),
             sources: HashMap::default(),
             exposing: Vec::new(),
+            highs: HashMap::default(),
+            fixed_highs: HashMap::default(),
+            active_highs: HashSet::default(),
+            opaque_highs: HashSet::default(),
+            readbacks: HashMap::default(),
+            written: HashMap::default(),
         };
         let found = bounds(f, facts, &this.copies, &this.users, inputs, &this.entry, env, &this.headers, registry);
         (this.known, this.plain, this.bounds, this.loaded) = (found.known, found.plain, found.carried, found.loaded);
-        (this.spills, this.exposing) = (found.spills, found.exposing);
+        (this.spills, this.exposing, this.written) = (found.spills, found.exposing, found.written);
         for &v in this.bounds.keys() {
             let Site::Inst { block, index } = facts.site[v.0] else {
                 continue;
@@ -596,6 +616,9 @@ impl<'a> Addresses<'a> {
         self.refined.clear();
         self.word_bits.clear();
         self.fixed_word_bits.clear();
+        self.highs.clear();
+        self.fixed_highs.clear();
+        self.opaque_highs.clear();
         self.decisions.clear();
         self.reach.clear();
         self.looped.clear();
@@ -890,6 +913,14 @@ impl<'a> Addresses<'a> {
                         self.fixed_word_bits.remove(&key);
                     }
                 }
+                Entry::High(key) => {
+                    if self.highs.get(&key).is_some_and(|e| e.1 .1 >= depth) {
+                        self.highs.remove(&key);
+                    }
+                    if self.fixed_highs.get(&key).is_some_and(|e| e.1 .1 >= depth) {
+                        self.fixed_highs.remove(&key);
+                    }
+                }
                 Entry::Decision(key) => {
                     if self.decisions.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.decisions.remove(&key);
@@ -970,6 +1001,7 @@ impl<'a> Addresses<'a> {
                 block,
                 range,
                 through: Vec::new(),
+                values: None,
             },
         );
         Value::of(Form::unknown(u))
@@ -1001,6 +1033,7 @@ impl<'a> Addresses<'a> {
                         block: info.block,
                         range: info.range,
                         through: Vec::new(),
+                        values: info.values.clone(),
                     },
                 )
             } else {
@@ -1179,6 +1212,7 @@ impl<'a> Addresses<'a> {
                 block,
                 range: Some((0, (high - low) / step)),
                 through: Vec::new(),
+                values: None,
             },
         );
         let base = Form {
@@ -1211,6 +1245,7 @@ impl<'a> Addresses<'a> {
                 block: slot.0,
                 range: None,
                 through: Vec::new(),
+                values: None,
             },
         );
         Some(Value {
@@ -1504,6 +1539,7 @@ impl<'a> Addresses<'a> {
                     let mut stepped = true;
                     let mut keeps = true;
                     let mut held = true;
+                    let mut affine = Some(None);
                     for &e in &back {
                         let value = match g.target {
                             Target::Param(index) => {
@@ -1518,11 +1554,12 @@ impl<'a> Addresses<'a> {
                         keeps &= value.as_ref().is_some_and(|v| v.region == g.region);
                         held &= value.as_ref().is_some_and(|v| v.region == g.assumed);
                         stepped = stepped && agree(&mut step, value.as_ref().and_then(|v| added(v, symbol, g.region)));
+                        affine = recurrence(affine, value.as_ref(), symbol);
                     }
                     if g.assumed.is_some() && !held {
                         downgraded.push(i);
                     }
-                    results.push((if stepped { step } else { None }, keeps));
+                    results.push((if stepped { step } else { None }, keeps, affine.flatten()));
                     take(this, &mut all);
                     i += 1;
                 }
@@ -1594,7 +1631,7 @@ impl<'a> Addresses<'a> {
                 lookup(self)
             }
         };
-        let (step, keeps) = match found {
+        let (step, keeps, _) = match found {
             Some(step) => step,
             None => {
                 let bits = self.loop_bits(header);
@@ -1626,6 +1663,48 @@ impl<'a> Addresses<'a> {
         })
     }
 
+    fn sequence(&mut self, v: ValueId, header: BlockId, index: usize, lane: usize) -> Option<Value> {
+        let trips = self.trips(header);
+        let last = self.unknowns[trips as usize].range?.1;
+        if last as usize >= SEQUENCE {
+            return None;
+        }
+        let l = lane as u8;
+        let key = (header, l, Target::Param(index), None);
+        let cached = if self.fixed.is_some() {
+            self.fixed_steps.get(&key).cloned()
+        } else {
+            self.steps.get(&key).cloned()
+        };
+        let ((_, _, affine), depth) = cached?;
+        self.depend(depth);
+        let (scale, step) = affine?;
+        let (entering, _) = self.edges_into(header);
+        let first = self.entering_value(&entering, header, index, lane)?;
+        let start = first.form.as_constant().filter(|_| first.region.is_none())?;
+        let mut values = Vec::with_capacity(last as usize + 1);
+        let mut x = start;
+        for _ in 0..=last {
+            values.push(x);
+            x = x.wrapping_mul(scale).wrapping_add(step);
+        }
+        values.sort_unstable();
+        values.dedup();
+        let shared = self.facts.uniform[v.0];
+        let u = self.intern(
+            Key::Sequence(v, if shared { ALL } else { l }),
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block: header,
+                range: Some((values[0], values[values.len() - 1])),
+                through: vec![header],
+                values: Some(values.into()),
+            },
+        );
+        Some(Value::of(Form::unknown(u)))
+    }
+
     fn find_step(
         &mut self,
         header: BlockId,
@@ -1634,7 +1713,7 @@ impl<'a> Addresses<'a> {
         region: Option<Region>,
         bits: &[((usize, u8), bool)],
         back: &[(BlockId, usize)],
-    ) -> (Option<u32>, bool) {
+    ) -> Step {
         let l = lane as u8;
         self.guess_about(header, bits, &[(target, l, region)], |this| {
             let symbol = match target {
@@ -1647,6 +1726,7 @@ impl<'a> Addresses<'a> {
             let mut step = None;
             let mut stepped = true;
             let mut keeps = true;
+            let mut affine = Some(None);
             for &e in back {
                 let value = match target {
                     Target::Param(index) => {
@@ -1660,11 +1740,12 @@ impl<'a> Addresses<'a> {
                 };
                 keeps &= value.as_ref().is_some_and(|v| v.region == region);
                 stepped = stepped && agree(&mut step, value.as_ref().and_then(|v| added(v, symbol, region)));
-                if !stepped && !keeps {
+                affine = recurrence(affine, value.as_ref(), symbol);
+                if !stepped && !keeps && affine.is_none() {
                     break;
                 }
             }
-            (if stepped { step } else { None }, keeps)
+            (if stepped { step } else { None }, keeps, affine.flatten())
         })
     }
 
@@ -1741,6 +1822,7 @@ impl<'a> Addresses<'a> {
         self.fixed_steps = stored.steps;
         self.fixed_summarized = stored.summarized;
         self.fixed_word_bits = stored.word_bits;
+        self.fixed_highs = stored.highs;
         self.fixed = Some((v, k));
         self.affected_now = Some(affected);
         let r = f(self);
@@ -1755,6 +1837,7 @@ impl<'a> Addresses<'a> {
             steps: std::mem::take(&mut self.fixed_steps),
             summarized: std::mem::take(&mut self.fixed_summarized),
             word_bits: std::mem::take(&mut self.fixed_word_bits),
+            highs: std::mem::take(&mut self.fixed_highs),
         };
         self.fixed_store.insert((v, k), stored);
         r
@@ -1891,6 +1974,7 @@ impl<'a> Addresses<'a> {
                     block,
                     range: None,
                     through: Vec::new(),
+                    values: None,
                 },
             );
             return unassumed(Value::of(Form::unknown(u)));
@@ -2541,6 +2625,7 @@ impl<'a> Addresses<'a> {
                 block: entry,
                 range: None,
                 through: Vec::new(),
+                values: None,
             },
         );
         Value {
@@ -2560,6 +2645,7 @@ impl<'a> Addresses<'a> {
                 block: entry,
                 range: Some((0, count - 1)),
                 through: Vec::new(),
+                values: None,
             },
         )
     }
@@ -2600,6 +2686,9 @@ impl<'a> Addresses<'a> {
                 return unassumed(value);
             }
             if let Some(value) = self.recur(block, lane, Target::Param(index)) {
+                return unassumed(value);
+            }
+            if let Some(value) = self.sequence(v, block, index, lane) {
                 return unassumed(value);
             }
             let range = self.induction(v, block, index, lane);
@@ -2683,6 +2772,10 @@ impl<'a> Addresses<'a> {
             }
             Op::Int(IntOp::Shl, a, s) => {
                 let (a, s) = (get!(self, a), get!(self, s));
+                let s = Value::of(match s.form.as_constant() {
+                    Some(k) => Form::constant(k & (ty.bits() - 1)),
+                    None => s.form,
+                });
                 match s.form.as_constant() {
                     Some(k) if k < 32 => Value::of(a.form.scale(1 << k)),
                     Some(k) if wide && k < 64 => Value::constant(0),
@@ -2691,19 +2784,39 @@ impl<'a> Addresses<'a> {
             }
             Op::Int(IntOp::LShr, a, s) if !wide => {
                 let (a, s) = (get!(self, a), get!(self, s));
-                match s.form.as_constant() {
+                match s.form.as_constant().map(|k| k & 31) {
                     Some(0) => a,
-                    Some(k) if k < 32 => self.shift(v, &a.form, k, lane),
+                    Some(k) => self.shift(v, &a.form, k, lane),
                     _ => self.opaque(v, lane, None),
                 }
             }
             Op::Int(IntOp::AShr, a, s) if !wide => {
                 let (a, s) = (get!(self, a), get!(self, s));
-                match (a.form.as_constant(), s.form.as_constant()) {
-                    (Some(x), Some(k)) if k < 32 => Value::constant(((x as i32) >> k) as u32),
-                    (None, Some(k)) if k < 32 && self.bounds(&a.form).is_some_and(|(_, high)| high < 1 << 31) => {
+                match (a.form.as_constant(), s.form.as_constant().map(|k| k & 31)) {
+                    (Some(x), Some(k)) => Value::constant(((x as i32) >> k) as u32),
+                    (None, Some(k)) if self.bounds(&a.form).is_some_and(|(_, high)| high < 1 << 31) => {
                         self.shift(v, &a.form, k, lane)
                     }
+                    _ => self.opaque(v, lane, None),
+                }
+            }
+            Op::Int(kind @ (IntOp::LShr | IntOp::AShr), x, s) => {
+                let (a, s) = (get!(self, x), get!(self, s));
+                let Some(high) = self.known_high(x, at, lane) else {
+                    return (self.opaque(v, lane, None), used);
+                };
+                let signed = kind == IntOp::AShr;
+                let non_negative = self.bounds(&high).is_some_and(|(_, top)| top < 1 << 31);
+                match s.form.as_constant().map(|k| k & 63) {
+                    Some(0) => a,
+                    Some(k) if k >= 32 && (!signed || non_negative) => match self.shifted_part(v, &high, k - 32, lane) {
+                        Some(form) => Value::of(form),
+                        None => self.opaque(v, lane, None),
+                    },
+                    Some(k) if k < 32 => match self.shifted_part(v, &a.form, k, lane) {
+                        Some(form) => Value::of(form.add(&high.scale(1u32 << (32 - k)))),
+                        None => self.opaque(v, lane, None),
+                    },
                     _ => self.opaque(v, lane, None),
                 }
             }
@@ -2810,10 +2923,10 @@ impl<'a> Addresses<'a> {
             Op::Pack64(lo, _) | Op::UnpackLo(lo) => get!(self, lo),
             Op::UnpackHi(x) => match self.facts.op(self.f, x) {
                 Some(Op::Pack64(_, hi)) => get!(self, hi),
-                Some(Op::Convert(Cvt::ZExt, _, a)) if self.f.types[a.0] == Ty::I32 => {
-                    Value::constant(0)
-                }
-                _ => self.opaque(v, lane, None),
+                _ => match self.known_high(x, at, lane) {
+                    Some(high) => Value::of(high),
+                    None => self.opaque(v, lane, None),
+                },
             },
             Op::TrailingZeros(a) | Op::LeadingZeros(a) | Op::PopulationCount(a) | Op::ReverseBits(a)
                 if !wide =>
@@ -2850,6 +2963,312 @@ impl<'a> Addresses<'a> {
             (Ty::I64, false) => x as u64,
             _ => return None,
         })
+    }
+
+    fn shifted_part(&mut self, v: ValueId, form: &Form, k: u32, lane: usize) -> Option<Form> {
+        if let Some(x) = form.as_constant() {
+            return Some(Form::constant(x >> k));
+        }
+        if k == 0 {
+            return Some(form.clone());
+        }
+        form.terms
+            .iter()
+            .all(|&(u, _)| self.unknowns[u as usize].shared)
+            .then(|| self.shift(v, form, k, lane).form)
+    }
+
+    fn high_operand(&mut self, x: ValueId, at: BlockId, lane: usize) -> Form {
+        let high = self.high(x, lane);
+        self.leave(Value::of(high), at, lane).form
+    }
+
+    pub fn resource_span(&mut self, at: (BlockId, usize), reach: Reach, lane: usize) -> Option<(Value, u32)> {
+        let Inst::Target { args, outputs, .. } = &self.f.blocks[&at.0].insts[at.1] else {
+            return None;
+        };
+        let (args, v) = (args.values().to_vec(), outputs.first()?.0);
+        let word = |this: &mut Self, index: usize| -> Option<Form> {
+            let x = *args.get(index)?;
+            Some(this.operand(x, at.0, lane, None).0.form)
+        };
+        let base = word(self, 0)?.scale(256);
+        match reach {
+            Reach::Anywhere => None,
+            Reach::Node { offset, shift, bytes } => {
+                let mut sum = Form::constant(0);
+                for &(index, mask) in offset {
+                    let arg = *args.get(index)?;
+                    if !self.facts.uniform[arg.0] && self.facts.constant(self.f, arg).is_none() {
+                        return None;
+                    }
+                    let x = word(self, index)?;
+                    sum = sum.add(&self.masked_part(v, &x, mask as u32, lane)?);
+                }
+                Some((Value::of(base.add(&sum.scale(1u32 << shift))), bytes))
+            }
+            Reach::Image => {
+                let (w1, w2, w4) = (word(self, 1)?.as_constant()?, word(self, 2)?.as_constant()?, word(self, 4)?.as_constant()?);
+                let width = ((w1 >> 30) | (w2 & 0x3fff) << 2) as u64 + 1;
+                let height = ((w2 >> 14) & 0xffff) as u64 + 1;
+                let pitch = (w4 & 0xffff) as u64;
+                let row = if pitch != 0 { pitch + 1 } else { width }.div_ceil(128) * 128;
+                let extent = (height - 1) * row + width;
+                (extent < 1 << 31).then(|| (Value::of(base), extent as u32))
+            }
+        }
+    }
+
+    fn masked_part(&mut self, v: ValueId, form: &Form, m: u32, lane: usize) -> Option<Form> {
+        if m == u32::MAX {
+            return Some(form.clone());
+        }
+        if let Some(x) = form.as_constant() {
+            return Some(Form::constant(x & m));
+        }
+        if let Some(low) = low_bits(form, m, IntOp::And) {
+            return Some(low);
+        }
+        let aligning = (!m).wrapping_add(1).is_power_of_two();
+        let shared = form.terms.iter().all(|&(u, _)| self.unknowns[u as usize].shared);
+        (aligning && shared).then(|| self.mask(v, form, m, lane).form)
+    }
+
+    pub fn wide(&self, v: ValueId) -> bool {
+        self.f.types[v.0] == Ty::I64
+    }
+
+    pub fn high(&mut self, v: ValueId, lane: usize) -> Form {
+        let v = self.copies.get(&v).copied().unwrap_or(v);
+        let lane = self.canonical(v, lane);
+        let key = (v, lane as u8);
+        let fixed = self.fixed.is_some();
+        let cached = if fixed { self.fixed_highs.get(&key).cloned() } else { self.highs.get(&key).cloned() };
+        if let Some((form, depth)) = cached {
+            self.depend(depth);
+            return form;
+        }
+        if !self.active_highs.insert(key) {
+            return self.opaque_high(v, lane);
+        }
+        let (found, depth) = self.frame(|this| {
+            let found = this.compute_high(v, lane);
+            found.unwrap_or_else(|| this.opaque_high(v, lane))
+        });
+        self.active_highs.remove(&key);
+        if depth != FREE {
+            self.journal.push((Entry::High(key), depth));
+        }
+        if fixed {
+            self.fixed_highs.insert(key, (found.clone(), depth));
+        } else {
+            self.highs.insert(key, (found.clone(), depth));
+        }
+        found
+    }
+
+    fn opaque_high(&mut self, v: ValueId, lane: usize) -> Form {
+        let shared = self.facts.uniform[v.0];
+        let block = self.block_of(v);
+        let u = self.intern(
+            Key::High(v, if shared { ALL } else { lane as u8 }),
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block,
+                range: None,
+                through: Vec::new(),
+                values: None,
+            },
+        );
+        self.opaque_highs.insert(u);
+        Form::unknown(u)
+    }
+
+    fn known_high(&mut self, x: ValueId, at: BlockId, lane: usize) -> Option<Form> {
+        let x = self.copies.get(&x).copied().unwrap_or(x);
+        let plain = match self.facts.inst(self.f, x) {
+            Some(Inst::Core { op, .. }) => matches!(op, Op::Const(..) | Op::Pack64(..) | Op::Convert(Cvt::ZExt | Cvt::SExt, ..)),
+            Some(Inst::Effect {
+                op: EffectOp::Memory {
+                    op: MemoryOp::Load(MemSize::B64),
+                    ..
+                },
+                ..
+            }) => true,
+            _ => false,
+        };
+        if !plain {
+            return None;
+        }
+        let high = self.high_operand(x, at, lane);
+        (!high.terms.iter().any(|(u, _)| self.opaque_highs.contains(u))).then_some(high)
+    }
+
+    fn compute_high(&mut self, v: ValueId, lane: usize) -> Option<Form> {
+        let f = self.f;
+        if f.types[v.0] != Ty::I64 {
+            return None;
+        }
+        let low = |this: &mut Self, x: ValueId, at: BlockId| this.operand(x, at, lane, None).0.form;
+        match self.facts.site[v.0] {
+            Site::Param { block, .. } if block == f.entry || self.headers.contains(&block) => None,
+            Site::Param { block, index } => {
+                let mut joined: Option<Form> = None;
+                for a in self.incoming(v, block, index)? {
+                    let high = self.high_operand(a, block, lane);
+                    match &joined {
+                        None => joined = Some(high),
+                        Some(old) if *old == high => {}
+                        Some(_) => return None,
+                    }
+                }
+                joined
+            }
+            Site::Inst { block, index } => match &f.blocks[&block].insts[index] {
+                Inst::Core { op, .. } => match *op {
+                    Op::Const(_, k) => Some(Form::constant((k >> 32) as u32)),
+                    Op::Pack64(_, hi) => Some(low(self, hi, block)),
+                    Op::Convert(Cvt::ZExt, _, _) => Some(Form::constant(0)),
+                    Op::Convert(Cvt::SExt, _, a) => {
+                        let negative = if f.types[a.0] == Ty::I1 {
+                            self.bit(a, lane, None).0?
+                        } else {
+                            let word = low(self, a, block);
+                            let (lowest, highest) = self.bounds(&word)?;
+                            if highest < 1 << 31 {
+                                false
+                            } else if lowest >= 1 << 31 {
+                                true
+                            } else {
+                                return None;
+                            }
+                        };
+                        Some(Form::constant(if negative { u32::MAX } else { 0 }))
+                    }
+                    Op::Int(k @ (IntOp::Add | IntOp::Sub), a, b) => {
+                        let (la, lb) = (low(self, a, block), low(self, b, block));
+                        let (ha, hb) = (self.high_operand(a, block, lane), self.high_operand(b, block, lane));
+                        let carry = self.word_carry(v, lane, &la, &lb, k == IntOp::Sub);
+                        Some(if k == IntOp::Add {
+                            ha.add(&hb).add(&carry)
+                        } else {
+                            ha.sub(&hb).sub(&carry)
+                        })
+                    }
+                    Op::Int(k @ (IntOp::Shl | IntOp::LShr | IntOp::AShr), a, s) => {
+                        let amount = low(self, s, block).as_constant()? & 63;
+                        let (la, ha) = (low(self, a, block), self.high_operand(a, block, lane));
+                        match (k, amount) {
+                            (_, 0) => Some(ha),
+                            (IntOp::Shl, k) if k >= 32 => Some(la.scale(1u32 << (k - 32))),
+                            (IntOp::Shl, k) => {
+                                let spilled = self.shifted_part(v, &la, 32 - k, lane)?;
+                                Some(ha.scale(1u32 << k).add(&spilled))
+                            }
+                            (IntOp::LShr, k) if k >= 32 => Some(Form::constant(0)),
+                            (_, k) if self.bounds(&ha).is_some_and(|(_, top)| top < 1 << 31) => {
+                                if k >= 32 {
+                                    Some(Form::constant(0))
+                                } else {
+                                    self.shifted_part(v, &ha, k, lane)
+                                }
+                            }
+                            (IntOp::LShr, k) => self.shifted_part(v, &ha, k, lane),
+                            _ => None,
+                        }
+                    }
+                    Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
+                        let (m, other) = match (self.facts.constant(f, a), self.facts.constant(f, b)) {
+                            (_, Some(m)) => (m, a),
+                            (Some(m), _) => (m, b),
+                            _ => return None,
+                        };
+                        let m = (m >> 32) as u32;
+                        let high = self.high_operand(other, block, lane);
+                        match (k, m, high.as_constant()) {
+                            (_, _, Some(h)) => Some(Form::constant(match k {
+                                IntOp::And => h & m,
+                                IntOp::Or => h | m,
+                                _ => h ^ m,
+                            })),
+                            (IntOp::And, 0, _) => Some(Form::constant(0)),
+                            (IntOp::And, u32::MAX, _) | (IntOp::Or | IntOp::Xor, 0, _) => Some(high),
+                            _ => None,
+                        }
+                    }
+                    Op::Select(c, a, b) => match self.bit(c, lane, None).0 {
+                        Some(true) => Some(self.high_operand(a, block, lane)),
+                        Some(false) => Some(self.high_operand(b, block, lane)),
+                        None => {
+                            let (x, y) = (self.high_operand(a, block, lane), self.high_operand(b, block, lane));
+                            (x == y).then_some(x)
+                        }
+                    },
+                    _ => None,
+                },
+                Inst::Effect {
+                    op:
+                        EffectOp::Memory {
+                            op: MemoryOp::Load(MemSize::B64),
+                            ..
+                        },
+                    inputs,
+                    ..
+                } => {
+                    let address = self.operand(inputs[0], block, lane, None).0;
+                    if address.region != Some(Region::Kernarg) {
+                        return None;
+                    }
+                    let at = address.form.sub(&self.base(Region::Kernarg).form).as_constant()?;
+                    Some(Form::constant(match self.env.binding(at) {
+                        Some(binding) => (binding.pointer >> 32) as u32,
+                        None => self.env.kernarg_word(at + 4, 4),
+                    }))
+                }
+                _ => None,
+            },
+            Site::Unreached => None,
+        }
+    }
+
+    fn word_carry(&mut self, v: ValueId, lane: usize, la: &Form, lb: &Form, borrow: bool) -> Form {
+        let decided = if borrow {
+            if lb.as_constant() == Some(0) || la == lb {
+                Some(false)
+            } else {
+                match (self.bounds(la), self.bounds(lb)) {
+                    (Some((low_a, high_a)), Some((low_b, high_b))) if low_a >= high_b || high_a < low_b => Some(high_a < low_b),
+                    _ => None,
+                }
+            }
+        } else if la.as_constant() == Some(0) || lb.as_constant() == Some(0) {
+            Some(false)
+        } else {
+            match (self.bounds(la), self.bounds(lb)) {
+                (Some((low_a, high_a)), Some((low_b, high_b))) if high_a + high_b < 1 << 32 || low_a + low_b >= 1 << 32 => {
+                    Some(low_a + low_b >= 1 << 32)
+                }
+                _ => None,
+            }
+        };
+        if let Some(c) = decided {
+            return Form::constant(c as u32);
+        }
+        let shared = self.facts.uniform[v.0];
+        let block = self.block_of(v);
+        let u = self.intern(
+            Key::Carry(v, if shared { ALL } else { lane as u8 }),
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block,
+                range: Some((0, 1)),
+                through: Vec::new(),
+                values: None,
+            },
+        );
+        Form::unknown(u)
     }
 
     fn through(&self, form: &Form) -> Vec<BlockId> {
@@ -2901,6 +3320,7 @@ impl<'a> Addresses<'a> {
                     block,
                     range: Some(((low >> k) as u32, (high >> k) as u32)),
                     through,
+                    values: None,
                 },
             );
             self.derived.entry(u).or_default().push(v);
@@ -2915,6 +3335,7 @@ impl<'a> Addresses<'a> {
                         block,
                         range: Some((0, 1)),
                         through: Vec::new(),
+                        values: None,
                     },
                 );
                 high_part = high_part.add(&Form::unknown(carry));
@@ -2935,6 +3356,7 @@ impl<'a> Addresses<'a> {
                     block,
                     range: Some((0, wrap)),
                     through: Vec::new(),
+                    values: None,
                 },
             );
             result = result.sub(&Form::unknown(w).scale(1u32 << (32 - k)));
@@ -3002,6 +3424,7 @@ impl<'a> Addresses<'a> {
                                 block,
                                 range: Some((0, m >> j)),
                                 through,
+                                values: None,
                             },
                         );
                         self.derived.entry(u).or_default().push(v);
@@ -3020,6 +3443,7 @@ impl<'a> Addresses<'a> {
                             block,
                             range: Some((0, 1)),
                             through: Vec::new(),
+                            values: None,
                         },
                     );
                     result = result.add(&Form::constant(carried)).sub(&Form::unknown(carry).scale(m + 1));
@@ -3072,6 +3496,7 @@ impl<'a> Addresses<'a> {
                 block,
                 range: Some(range),
                 through,
+                values: None,
             },
         );
         Some(Value::of(above.add(&Form::unknown(low))))
@@ -3105,6 +3530,9 @@ impl<'a> Addresses<'a> {
             } => {
                 let at = self.block_of(v);
                 let (address, used) = self.operand(inputs[0], at, lane, assume);
+                if let Some(value) = self.read_back(v, lane) {
+                    return (value, used);
+                }
                 (self.load(v, &address, size, lane), used)
             }
             EffectOp::Wave(WaveOp::ReadFirstLane) => {
@@ -3205,6 +3633,102 @@ impl<'a> Addresses<'a> {
         }
     }
 
+    fn read_back(&mut self, v: ValueId, lane: usize) -> Option<Value> {
+        let Site::Inst { block, index } = self.facts.site[v.0] else {
+            return None;
+        };
+        let found = match self.readbacks.get(&(block, index)) {
+            Some(&found) => found,
+            None => {
+                let found = self.written_back(block, index);
+                self.readbacks.insert((block, index), found);
+                found
+            }
+        };
+        let (data, base, target) = found?;
+        let start = self.operand(base, block, lane, None).0;
+        if start.form.as_constant().is_none() || self.high(base, lane).as_constant().is_none() {
+            return None;
+        }
+        let Inst::Effect { inputs, .. } = &self.f.blocks[&block].insts[index] else {
+            return None;
+        };
+        if self.operand(inputs[0], block, lane, None).0.region != Some(Region::Allocation(target)) {
+            return None;
+        }
+        Some(self.operand(data, block, lane, None).0)
+    }
+
+    fn written_back(&self, block: BlockId, index: usize) -> Option<(ValueId, ValueId, u64)> {
+        let (f, facts) = (self.f, self.facts);
+        let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
+        let insts = &f.blocks[&block].insts;
+        let Inst::Effect {
+            op:
+                EffectOp::Memory {
+                    space: Space::Global,
+                    op: MemoryOp::Load(MemSize::B32),
+                    ..
+                },
+            inputs,
+            ..
+        } = &insts[index]
+        else {
+            return None;
+        };
+        let (address, predicate) = (root(inputs[0]), root(inputs[1]));
+        let (store, data, mask) = insts[..index].iter().enumerate().rev().find_map(|(i, inst)| match inst {
+            Inst::Effect {
+                op:
+                    EffectOp::Memory {
+                        space: Space::Global,
+                        op: MemoryOp::Store(MemSize::B32),
+                        ..
+                    },
+                inputs,
+                ..
+            } if root(inputs[0]) == address => Some((i, root(inputs[1]), root(inputs[2]))),
+            _ => None,
+        })?;
+        if mask != predicate && facts.constant(f, mask) != Some(1) {
+            return None;
+        }
+        let set = self.written.get(&(block, store))?;
+        let [Some(Region::Allocation(target))] = set.list.iter().filter(|r| r.is_some()).copied().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        if set.any || self.env.exposed.contains(&target) || self.exposable().contains(&target) {
+            return None;
+        }
+        let base = self.determined(address, data)?;
+        let region = Some(Region::Allocation(target));
+        let alone = self.written.iter().all(|(&at, set)| at == (block, store) || (!set.any && !set.list.contains(&region)));
+        alone.then_some((data, base, target))
+    }
+
+    fn determined(&self, address: ValueId, data: ValueId) -> Option<ValueId> {
+        let (f, facts) = (self.f, self.facts);
+        let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
+        let Some(Op::Int(IntOp::Add, x, y)) = facts.op(f, address) else {
+            return None;
+        };
+        [(x, y), (y, x)].iter().find_map(|&(base, offset)| {
+            let (wide, scale) = match facts.op(f, root(offset))? {
+                Op::Int(IntOp::Mul, a, b) => match (facts.constant(f, a), facts.constant(f, b)) {
+                    (_, Some(k)) => (a, k),
+                    (Some(k), _) => (b, k),
+                    _ => return None,
+                },
+                Op::Int(IntOp::Shl, a, s) => (a, 1u64 << (facts.constant(f, s)? & 63)),
+                _ => return None,
+            };
+            let Some(Op::Convert(Cvt::ZExt, Ty::I64, d)) = facts.op(f, root(wide)) else {
+                return None;
+            };
+            ((4..=1 << 32).contains(&scale) && root(d) == data).then_some(base)
+        })
+    }
+
     fn uniform_read(&mut self, v: ValueId, x: ValueId, from: Option<usize>) -> Value {
         let lanes: Vec<usize> = match from {
             Some(l) => vec![l],
@@ -3232,6 +3756,7 @@ impl<'a> Addresses<'a> {
                 block,
                 range: None,
                 through: Vec::new(),
+                values: None,
             },
         );
         Value::of(Form::unknown(u))
@@ -3943,6 +4468,7 @@ impl Addresses<'_> {
                 block: header,
                 range: None,
                 through: vec![header],
+                values: None,
             },
         )
     }
@@ -3967,6 +4493,7 @@ impl Addresses<'_> {
                 block: header,
                 range: None,
                 through: vec![header],
+                values: None,
             },
         )
     }
@@ -4341,6 +4868,20 @@ impl Addresses<'_> {
 
 fn added(value: &Value, symbol: Unknown, region: Option<Region>) -> Option<u32> {
     (value.region == region && value.form.terms == [(symbol, 1)]).then_some(value.form.constant)
+}
+
+fn recurrence(sofar: Option<Option<(u32, u32)>>, value: Option<&Value>, symbol: Unknown) -> Option<Option<(u32, u32)>> {
+    let value = value.filter(|v| v.region.is_none())?;
+    let affine = match value.form.terms.as_slice() {
+        [] => (0, value.form.constant),
+        [(u, c)] if *u == symbol => (*c, value.form.constant),
+        _ => return None,
+    };
+    match sofar? {
+        None => Some(Some(affine)),
+        Some(old) if old == affine => Some(Some(affine)),
+        Some(_) => None,
+    }
 }
 
 fn agree(step: &mut Option<u32>, found: Option<u32>) -> bool {
@@ -6050,6 +6591,138 @@ mod facts_tests {
                 .collect()
         });
         assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    struct Wide {
+        b: Build,
+        cases: Vec<(&'static str, ValueId, Vec<u64>)>,
+    }
+
+    fn wide_values() -> Wide {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let c64 = |b: &mut Build, k: u64| b.constant(e, Ty::I64, k);
+        let c32 = |b: &mut Build, k: u64| b.constant(e, Ty::I32, k);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U8, table, yes);
+        let wide_u = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, u));
+        let mut cases = Vec::new();
+        let lo = c32(&mut b, 0x89ab_cdef);
+        let hi = c32(&mut b, 0x0123_4567);
+        let packed = b.core(e, Ty::I64, Op::Pack64(lo, hi));
+        cases.push(("pack", packed, vec![0x0123_4567_89ab_cdef]));
+        let near = c64(&mut b, 0xffff_fff0);
+        let twenty = c64(&mut b, 0x20);
+        let carried = b.int(e, IntOp::Add, near, twenty);
+        cases.push(("0xfffffff0 + 0x20", carried, vec![0x1_0000_0010]));
+        let sixteen = c64(&mut b, 0x10);
+        let small = b.int(e, IntOp::Sub, sixteen, twenty);
+        cases.push(("0x10 - 0x20", small, vec![0xffff_ffff_ffff_fff0]));
+        let edge = c64(&mut b, 0xffff_ff80);
+        let maybe = b.int(e, IntOp::Add, edge, wide_u);
+        cases.push(("0xffffff80 + u", maybe, (0..256u64).map(|x| 0xffff_ff80 + x).collect()));
+        let four = c64(&mut b, 36);
+        let lifted = b.int(e, IntOp::Shl, wide_u, four);
+        cases.push(("u << 36", lifted, (0..256u64).map(|x| x << 36).collect()));
+        let eight = c64(&mut b, 8);
+        let dropped = b.int(e, IntOp::LShr, packed, eight);
+        cases.push(("pack >> 8", dropped, vec![0x0123_4567_89ab_cdef >> 8]));
+        let far = c64(&mut b, 40);
+        let top = b.int(e, IntOp::LShr, packed, far);
+        cases.push(("pack >> 40", top, vec![0x0123_4567_89ab_cdef >> 40]));
+        let minus = c32(&mut b, 0xffff_fff0);
+        let extended = b.core(e, Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, minus));
+        cases.push(("sext -16", extended, vec![0xffff_ffff_ffff_fff0]));
+        let masked_bits = c64(&mut b, 0xff00_0000_ffff_0000);
+        let masked = b.int(e, IntOp::And, packed, masked_bits);
+        cases.push(("pack & mask", masked, vec![0x0123_4567_89ab_cdef & 0xff00_0000_ffff_0000]));
+        let shifted_up = b.int(e, IntOp::Shl, packed, eight);
+        cases.push(("pack << 8", shifted_up, vec![0x0123_4567_89ab_cdef << 8]));
+        Wide { b, cases }
+    }
+
+    #[test]
+    fn high_words_hold_the_high_half_of_every_wide_value() {
+        let Wide { b, cases } = wide_values();
+        let missed: Vec<String> = addresses(&b, &environment(32, &[(8, 1, 0x1000)]), |a| {
+            let mut missed = Vec::new();
+            for (name, v, truths) in &cases {
+                let (low, high) = (a.value(*v, 0, None).0.form, a.high(*v, 0));
+                for &t in truths {
+                    if !representable(&a.unknowns, &low, t as u32) || !representable(&a.unknowns, &high, (t >> 32) as u32) {
+                        missed.push(format!("{}: {:#x} with {:?} and {:?}", name, t, low, high));
+                        break;
+                    }
+                }
+            }
+            missed
+        });
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn high_words_are_exact_where_the_operations_determine_them() {
+        let Wide { b, cases } = wide_values();
+        let loose: Vec<String> = addresses(&b, &environment(32, &[(8, 1, 0x1000)]), |a| {
+            cases
+                .iter()
+                .filter(|(_, _, truths)| truths.len() == 1)
+                .filter_map(|(name, v, truths)| {
+                    let (low, high) = (a.value(*v, 0, None).0.form, a.high(*v, 0));
+                    let t = truths[0];
+                    (low.as_constant() != Some(t as u32) || high.as_constant() != Some((t >> 32) as u32))
+                        .then(|| format!("{}: {:?} and {:?}", name, low, high))
+                })
+                .collect()
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    fn affine_loop(trips: u64) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, one, zero]);
+        let three = b.constant(body, Ty::I32, 3);
+        let tripled = b.int(body, IntOp::Mul, p[1], three);
+        let one = b.constant(body, Ty::I32, 1);
+        let next_value = b.int(body, IntOp::Add, tripled, one);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let limit = b.constant(body, Ty::I32, trips);
+        let again = b.cmp(body, IntPred::Ult, next, limit);
+        b.cond_br(body, again, (body, vec![p[0], next_value, next]), (exit, vec![p[0]]));
+        (b, p[1])
+    }
+
+    fn carried_values(b: &Build, v: ValueId) -> Option<Vec<u32>> {
+        addresses(b, &environment(32, &[]), |a| {
+            let form = a.value(v, 0, None).0.form;
+            match form.terms.as_slice() {
+                [(u, 1)] if form.constant == 0 => a.unknowns[*u as usize].values.as_ref().map(|s| s.to_vec()),
+                _ => None,
+            }
+        })
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_an_affine_step_carries() {
+        let (b, v) = affine_loop(5);
+        let truth = [1u32, 4, 13, 40, 121];
+        let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
+            let form = a.value(v, 0, None).0.form;
+            truth.iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the parameter runs 1, 4, 13, 40, 121: {:?}", missed);
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_an_affine_step_carries() {
+        let (b, v) = affine_loop(5);
+        assert_eq!(carried_values(&b, v), Some(vec![1, 4, 13, 40, 121]));
     }
 
     #[test]

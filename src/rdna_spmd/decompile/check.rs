@@ -437,6 +437,15 @@ impl<'a> Check<'a> {
         self.logic.m.not(a)
     }
 
+    fn partnered(&self, at: (BlockId, usize)) -> bool {
+        let hazards = self.hazards;
+        hazards
+            .accesses
+            .iter()
+            .position(|a| (a.block, a.index) == at)
+            .is_some_and(|i| hazards.together.iter().chain(&hazards.apart).any(|&(p, q)| p == i || q == i))
+    }
+
     fn reachable(&self, b: BlockId) -> Bdd {
         self.reach.get(&b).copied().unwrap_or(Bdd::FALSE)
     }
@@ -1357,6 +1366,17 @@ struct Desc {
 struct Pair {
     cond: Bdd,
     sides: [Vec<Desc>; 2],
+    writes: [Vec<Write>; 2],
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Write {
+    at: (BlockId, usize),
+    space: Space,
+    size: MemSize,
+    address: Option<usize>,
+    data: Option<usize>,
+    mask: Bdd,
 }
 
 type Key = [Option<BlockId>; 2];
@@ -1366,6 +1386,8 @@ struct Evaluation {
     block: BlockId,
     cond: Bdd,
     descs: HashMap<ValueId, Desc>,
+    writes: Vec<Write>,
+    stored: bool,
 }
 
 struct Explore<'c, 'a> {
@@ -1782,19 +1804,30 @@ impl<'c, 'a> Explore<'c, 'a> {
             Pair {
                 cond: self.assume,
                 sides,
+                writes: [Vec::new(), Vec::new()],
             },
         )]);
         let mut worklist = vec![first];
         while let Some(key) = worklist.pop() {
             let pair = &pairs[&key];
-            let (cond, sides) = (pair.cond, pair.sides.clone());
+            let (cond, sides, writes) = (pair.cond, pair.sides.clone(), pair.writes.clone());
             let cond = self.check.and(cond, self.check.safe);
             if cond == Bdd::FALSE {
                 continue;
             }
             let side = match key {
-                [None, None] => continue,
+                [None, None] => {
+                    self.match_writes(cond, &writes);
+                    if self.check.stopped {
+                        return;
+                    }
+                    continue;
+                }
                 [Some(a), Some(b)] if a == b => {
+                    self.match_writes(cond, &writes);
+                    if self.check.stopped {
+                        return;
+                    }
                     self.meet(a, cond, &sides, arrivals);
                     continue;
                 }
@@ -1813,11 +1846,11 @@ impl<'c, 'a> Explore<'c, 'a> {
                 [None, Some(_)] => LANE,
             };
             let block = key[side].unwrap();
-            let steps = self.step(side, block, &sides[side], cond);
+            let steps = self.step(side, block, &sides[side], cond, !writes[side].is_empty());
             if self.check.stopped {
                 return;
             }
-            for (dst, descs, constraint) in steps {
+            for (dst, descs, constraint, done) in steps {
                 let c = self.check.and(cond, constraint);
                 let c = self.check.and(c, self.check.safe);
                 if c == Bdd::FALSE {
@@ -1830,13 +1863,26 @@ impl<'c, 'a> Explore<'c, 'a> {
                 } else {
                     [sides[WAVE].clone(), descs]
                 };
+                let mut traces = writes.clone();
+                traces[side].extend(done);
                 let merged = match pairs.get(&next) {
                     None => Pair {
                         cond: c,
                         sides: incoming,
+                        writes: traces,
                     },
                     Some(old) => {
                         let (ocond, osides) = (old.cond, old.sides.clone());
+                        if old.writes != traces {
+                            for s in [WAVE, LANE] {
+                                self.unmatched(c, &traces[s][..], s);
+                                self.unmatched(ocond, &old.writes[s][..], s);
+                            }
+                            if self.check.stopped {
+                                return;
+                            }
+                        }
+                        let kept = old.writes.clone();
                         let mcond = self.check.or(ocond, c);
                         let mut grew = mcond != ocond;
                         let mut merged = osides.clone();
@@ -1863,6 +1909,7 @@ impl<'c, 'a> Explore<'c, 'a> {
                         Pair {
                             cond: mcond,
                             sides: merged,
+                            writes: kept,
                         }
                     }
                 };
@@ -1880,7 +1927,8 @@ impl<'c, 'a> Explore<'c, 'a> {
         x: BlockId,
         params: &[Desc],
         cond: Bdd,
-    ) -> Vec<(Option<BlockId>, Vec<Desc>, Bdd)> {
+        stored: bool,
+    ) -> Vec<(Option<BlockId>, Vec<Desc>, Bdd, Vec<Write>)> {
         let f = self.check.f;
         let block = &f.blocks[&x];
         let mut ev = Evaluation {
@@ -1893,13 +1941,15 @@ impl<'c, 'a> Explore<'c, 'a> {
                 .map(|&(v, _)| v)
                 .zip(params.iter().copied())
                 .collect(),
+            writes: Vec::new(),
+            stored,
         };
         self.check_effects(&mut ev);
         if self.check.stopped {
             return Vec::new();
         }
         let followed: Vec<(usize, Bdd)> = match &block.term {
-            Term::Ret(_) => return vec![(None, Vec::new(), Bdd::TRUE)],
+            Term::Ret(_) => return vec![(None, Vec::new(), Bdd::TRUE, ev.writes)],
             Term::Br(_) => vec![(0, Bdd::TRUE)],
             Term::CondBr { cond: c, .. } => {
                 let g = match self.get(&mut ev, *c).bits {
@@ -1934,7 +1984,7 @@ impl<'c, 'a> Explore<'c, 'a> {
                 }
                 args.push(d);
             }
-            out.push((Some(edge.dst), args, constraint));
+            out.push((Some(edge.dst), args, constraint, ev.writes.clone()));
         }
         out
     }
@@ -2189,7 +2239,7 @@ impl<'c, 'a> Explore<'c, 'a> {
                 } => {
                     let (out, ty) = outputs[0];
                     let pred = self.bits_of(ev, inputs[1]);
-                    let same = if self.decide(pred, cond, side) == Some(true) {
+                    let same = if !ev.stored && self.decide(pred, cond, side) == Some(true) {
                         let a = self.operand(ev, inputs[0]);
                         let t = self.intern(ty, Form::Load(*space, *size, a));
                         Some(self.loaded(ty, out, t))
@@ -2287,14 +2337,36 @@ impl<'c, 'a> Explore<'c, 'a> {
             {
                 let pred = self.bits_of(ev, inputs[memory.mask_input()]);
                 if self.decide(pred, ev.cond, ev.side) != Some(false) {
-                    let reason = if ev.side == WAVE {
-                        "the wave program may store while the programs are apart"
-                    } else {
-                        "the lane program may store while the programs are apart"
+                    let at = (ev.block, index);
+                    let space = match op {
+                        EffectOp::Memory { space, .. } => *space,
+                        _ => unreachable!(),
                     };
-                    self.check.require(ev.block, index, reason, ev.cond);
-                    if self.check.stopped {
-                        return;
+                    match memory {
+                        MemoryOp::Store(size) if !self.check.partnered(at) => {
+                            let address = self.get(ev, inputs[0]).same;
+                            let data = self.get(ev, inputs[1]).same;
+                            ev.writes.push(Write {
+                                at,
+                                space,
+                                size: *size,
+                                address,
+                                data,
+                                mask: pred,
+                            });
+                            ev.stored = true;
+                        }
+                        _ => {
+                            let reason = if ev.side == WAVE {
+                                "the wave program may store while the programs are apart"
+                            } else {
+                                "the lane program may store while the programs are apart"
+                            };
+                            self.check.require(ev.block, index, reason, ev.cond);
+                            if self.check.stopped {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -2310,6 +2382,55 @@ impl<'c, 'a> Explore<'c, 'a> {
         }
         let others = self.fresh(side, v, 0);
         self.logic().m.or(bit, others)
+    }
+
+    fn unmatched(&mut self, cond: Bdd, writes: &[Write], side: usize) {
+        let reason = if side == WAVE {
+            "the wave program may store while the programs are apart"
+        } else {
+            "the lane program may store while the programs are apart"
+        };
+        for w in writes {
+            self.check.require(w.at.0, w.at.1, reason, cond);
+            if self.check.stopped {
+                return;
+            }
+        }
+    }
+
+    fn match_writes(&mut self, cond: Bdd, writes: &[Vec<Write>; 2]) {
+        let (wave, lane) = (&writes[WAVE], &writes[LANE]);
+        let common = wave.iter().zip(lane).take_while(|(w, l)| {
+            w.space == l.space
+                && w.size == l.size
+                && w.address.is_some()
+                && w.address == l.address
+                && w.data.is_some()
+                && w.data == l.data
+                && w.mask == l.mask
+        });
+        let matched = common.count();
+        for w in &wave[..matched] {
+            let mut differs = self.check.or(self.leaves[w.address.unwrap()], self.leaves[w.data.unwrap()]);
+            let atoms: Vec<u32> = self.logic().support(w.mask).iter().copied().collect();
+            for var in atoms {
+                if let Atom::Bit(v) | Atom::View(v) = self.check.logic.atom_of(var) {
+                    differs = self.check.or(differs, self.check.h[v.0]);
+                } else if !matches!(self.check.logic.atom_of(var), Atom::Lane(_) | Atom::Marker(_)) {
+                    differs = Bdd::TRUE;
+                }
+            }
+            let differs = self.check.and(cond, differs);
+            self.check.require(w.at.0, w.at.1, "the programs may store different words while apart", differs);
+            if self.check.stopped {
+                return;
+            }
+        }
+        self.unmatched(cond, &wave[matched..], WAVE);
+        if self.check.stopped {
+            return;
+        }
+        self.unmatched(cond, &lane[matched..], LANE);
     }
 
     fn meet(
@@ -3503,6 +3624,62 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: the block runs only when x is 5, where the store's mask x != 5 is false", converted(&b));
     }
 
+    fn branch_then_store(entry: (IntPred, u64), store: (IntPred, u64)) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let table = k.buffer(&mut b, e, 16);
+        let yes = b.constant(e, Ty::I1, 1);
+        let x = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let bound = b.constant(e, Ty::I32, entry.1);
+        let enters = b.cmp(e, entry.0, x, bound);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, enters, (then, vec![k.exec, x, data, own]), (exit, vec![k.exec]));
+        let limit = b.constant(then, Ty::I32, store.1);
+        let test = b.cmp(then, store.0, t[1], limit);
+        let mask = b.int(then, IntOp::And, test, t[0]);
+        b.store(then, Space::Global, MemSize::B32, t[3], t[2], mask);
+        b
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_the_branch_into_its_block_lets_through() {
+        let b = branch_then_store((IntPred::Eq, 5), (IntPred::Eq, 5));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: the block runs only when x is 5, where the store's mask x == 5 holds", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_a_branch_on_another_constant_lets_through() {
+        let b = branch_then_store((IntPred::Eq, 6), (IntPred::Ne, 5));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: x is 6 in the block, where x != 5 holds", wrong);
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_the_bound_into_its_block_rules_out() {
+        let b = branch_then_store((IntPred::Ult, 10), (IntPred::Uge, 10));
+        assert!(converted(&b).is_empty(), "{:?}: x < 10 in the block, where x >= 10 is false", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_the_bound_into_its_block_lets_through() {
+        let b = branch_then_store((IntPred::Ult, 10), (IntPred::Ult, 10));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: x < 10 in the block, where the store's mask x < 10 holds", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_a_bound_of_the_other_signedness_lets_through() {
+        let b = branch_then_store((IntPred::Slt, 10), (IntPred::Uge, 10));
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: x = -1 is below 10 signed and at least 10 unsigned", wrong);
+    }
+
     fn chosen_constants(low: u64) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -3887,6 +4064,115 @@ mod tests {
             b.store(block, Space::Global, MemSize::B32, p[1], one, p[0]);
             b.br(block, join, vec![p[0]]);
         }
+        assert!(converted(&b).is_empty(), "{:?}: both arms store 1 to the lane's own word", converted(&b));
+    }
+
+    fn arms_store(arm: impl Fn(&mut Build, BlockId, usize, &[ValueId]) -> Option<ValueId>) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flag = per_lane(&mut b, &k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I32]);
+        b.cond_br(e, q, (then, vec![k.exec, own, lane]), (other, vec![k.exec, own, lane]));
+        for (side, (block, p)) in [(then, t), (other, o)].iter().enumerate() {
+            let carried = arm(&mut b, *block, side, p).unwrap_or(p[2]);
+            b.br(*block, join, vec![p[0], carried]);
+        }
+        let out = k.buffer(&mut b, join, 16);
+        let target = byte_offset(&mut b, join, out, j[1], 4);
+        let one = b.constant(join, Ty::I32, 1);
+        b.store(join, Space::Global, MemSize::B32, target, one, j[0]);
+        b
+    }
+
+    fn keeps(b: &Build) -> Vec<&'static str> {
+        ["search", "direct"].iter().zip(both(b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect()
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arms_store_different_values() {
+        let b = arms_store(|b, block, side, p| {
+            let value = b.constant(block, Ty::I32, 1 + side as u64);
+            b.store(block, Space::Global, MemSize::B32, p[1], value, p[0]);
+            None
+        });
+        assert!(keeps(&b).is_empty(), "{:?}: one arm stores 1 and the other 2", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arms_store_to_different_words() {
+        let b = arms_store(|b, block, side, p| {
+            let at = b.constant(block, Ty::I64, 4 * side as u64);
+            let address = b.int(block, IntOp::Add, p[1], at);
+            let one = b.constant(block, Ty::I32, 1);
+            b.store(block, Space::Global, MemSize::B32, address, one, p[0]);
+            None
+        });
+        assert!(keeps(&b).is_empty(), "{:?}: one arm stores to the lane's word and the other to the next", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_only_one_of_whose_arms_stores() {
+        let b = arms_store(|b, block, side, p| {
+            if side == 0 {
+                let one = b.constant(block, Ty::I32, 1);
+                b.store(block, Space::Global, MemSize::B32, p[1], one, p[0]);
+            }
+            None
+        });
+        assert!(keeps(&b).is_empty(), "{:?}: only one arm stores", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arms_store_under_different_masks() {
+        let b = arms_store(|b, block, side, p| {
+            let mask = if side == 0 {
+                p[0]
+            } else {
+                let sixteen = b.constant(block, Ty::I32, 16);
+                let low = b.cmp(block, IntPred::Ult, p[2], sixteen);
+                b.int(block, IntOp::And, low, p[0])
+            };
+            let one = b.constant(block, Ty::I32, 1);
+            b.store(block, Space::Global, MemSize::B32, p[1], one, mask);
+            None
+        });
+        assert!(keeps(&b).is_empty(), "{:?}: lanes 16 to 31 store in one arm only", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arms_load_the_stored_word_at_different_times() {
+        let b = arms_store(|b, block, side, p| {
+            let one = b.constant(block, Ty::I32, 1);
+            if side == 0 {
+                b.store(block, Space::Global, MemSize::B32, p[1], one, p[0]);
+                Some(b.load(block, Space::Global, MemSize::B32, p[1], p[0]))
+            } else {
+                let old = b.load(block, Space::Global, MemSize::B32, p[1], p[0]);
+                b.store(block, Space::Global, MemSize::B32, p[1], one, p[0]);
+                Some(old)
+            }
+        });
+        assert!(keeps(&b).is_empty(), "{:?}: one arm reads back 1 and the other the word before the store", keeps(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arms_store_one_word_computed_in_each_arm() {
+        let b = arms_store(|b, block, _, p| {
+            let zero = b.constant(block, Ty::I64, 0);
+            let address = b.int(block, IntOp::Add, p[1], zero);
+            let one = b.constant(block, Ty::I32, 1);
+            b.store(block, Space::Global, MemSize::B32, address, one, p[0]);
+            None
+        });
         assert!(converted(&b).is_empty(), "{:?}: both arms store 1 to the lane's own word", converted(&b));
     }
 

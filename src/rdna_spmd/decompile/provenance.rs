@@ -15,6 +15,7 @@ pub(super) struct Bounds {
     pub(super) loaded: HashMap<ValueId, Regions>,
     pub(super) spills: Vec<Spill>,
     pub(super) exposing: Vec<Exposure>,
+    pub(super) written: HashMap<(BlockId, usize), Regions>,
 }
 
 pub(super) struct Spill {
@@ -969,6 +970,26 @@ pub(super) fn bounds(
             }
         }
     }
+    let mut written = HashMap::default();
+    for &b in &facts.order {
+        for (index, inst) in f.blocks[&b].insts.iter().enumerate() {
+            if let Inst::Effect {
+                op:
+                    EffectOp::Memory {
+                        op,
+                        space: Space::Global,
+                        ..
+                    },
+                inputs,
+                ..
+            } = inst
+            {
+                if !matches!(op, MemoryOp::Load(_) | MemoryOp::Fence) {
+                    written.insert((b, index), sets.regions(sets.of(inputs[0])));
+                }
+            }
+        }
+    }
     Bounds {
         known,
         plain,
@@ -976,6 +997,7 @@ pub(super) fn bounds(
         loaded,
         spills,
         exposing,
+        written,
     }
 }
 

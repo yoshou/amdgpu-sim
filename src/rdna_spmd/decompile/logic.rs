@@ -1207,9 +1207,41 @@ impl Logic {
             };
             links.push(self.binding(facts, src, arriving(src, edge.dst, atom), bound));
         }
+        for (atom, bound) in self.passed_tests(f, facts, src, slot) {
+            links.push(self.binding(facts, src, atom, bound));
+        }
         let links = Rc::new(links);
         self.relations.insert((src, slot), links.clone());
         links
+    }
+
+    fn passed_tests(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<(Atom, Bdd)> {
+        let edge = f.blocks[&src].term.edges().nth(slot).unwrap();
+        let targets = self.block_thresholds(f, facts, edge.dst);
+        if targets.is_empty() {
+            return Vec::new();
+        }
+        let sources = self.block_thresholds(f, facts, src);
+        let mut seen: Vec<(ValueId, bool, bool, i64)> = Vec::new();
+        let mut out = Vec::new();
+        for t in targets.iter() {
+            let Site::Param { block, index } = facts.site[t.value.0] else {
+                continue;
+            };
+            let test = (t.value, t.equal, t.signed, t.at);
+            if block != edge.dst || !self.carried(t.value) || seen.contains(&test) {
+                continue;
+            }
+            seen.push(test);
+            let arg = edge.args[index];
+            let Some(e) = sources.iter().find(|e| e.value == arg && e.equal == t.equal && e.signed == t.signed && e.at == t.at) else {
+                continue;
+            };
+            let atom = self.atom(Atom::Bit(e.of));
+            let bound = if e.flip != t.flip { self.m.not(atom) } else { atom };
+            out.push((arriving(src, edge.dst, Atom::Bit(t.of)), bound));
+        }
+        out
     }
 
     fn post(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
