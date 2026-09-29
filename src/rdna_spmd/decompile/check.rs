@@ -1,6 +1,6 @@
 use super::hazard::{Hazards, Kind};
 use super::address::compare;
-use super::logic::{constant_choices, lane_test, projected_word, Atom, Choice, Logic};
+use super::logic::{constant_choices, lane_test, projected_word, Atom, Choice, Logic, PATH};
 #[cfg(test)]
 use super::logic::float_compare;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
@@ -1441,6 +1441,8 @@ fn meets_every_lane(inst: &Inst) -> bool {
 
 const WAVE: usize = 0;
 const LANE: usize = 1;
+const JOINT: usize = 2;
+const PATHS: u32 = 1 << 15;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Form {
@@ -1463,6 +1465,7 @@ struct Pair {
     cond: Bdd,
     sides: [Vec<Desc>; 2],
     writes: [Vec<Write>; 2],
+    entries: BTreeMap<(Key, usize), (Bdd, [Vec<Desc>; 2])>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1498,10 +1501,13 @@ struct Explore<'c, 'a> {
     leaves: Vec<Bdd>,
     index: HashMap<Form, usize>,
     visited: BTreeSet<BlockId>,
+    headers: BTreeSet<BlockId>,
+    paths: u32,
 }
 
 impl<'c, 'a> Explore<'c, 'a> {
     fn new(check: &'c mut Check<'a>, branch: BlockId, assume: Bdd) -> Self {
+        let headers = (0..check.loops.count()).map(|l| check.facts.order[check.loops.header(l)]).collect();
         Self {
             check,
             branch,
@@ -1513,6 +1519,8 @@ impl<'c, 'a> Explore<'c, 'a> {
             leaves: Vec::new(),
             index: HashMap::default(),
             visited: BTreeSet::new(),
+            headers,
+            paths: PATHS,
         }
     }
 
@@ -1774,6 +1782,7 @@ impl<'c, 'a> Explore<'c, 'a> {
             .iter()
             .copied()
             .filter(|&v| match self.check.logic.atom_of(v) {
+                Atom::Fresh(PATH, ..) => false,
                 Atom::Fresh(..) => true,
                 Atom::Term(..) => forms,
                 _ => side == WAVE && self.is_unreliable(v),
@@ -1823,22 +1832,99 @@ impl<'c, 'a> Explore<'c, 'a> {
         Desc { same, bits }
     }
 
-    fn canon(&mut self, side: usize, param: ValueId, g: Bdd) -> Bdd {
+    fn fresh_support(&mut self, g: Bdd) -> Vec<u32> {
         let support = self.logic().support(g);
-        let fresh: Vec<u32> = support
+        support
             .iter()
             .copied()
             .filter(|&v| matches!(self.check.logic.atom_of(v), Atom::Fresh(..)))
-            .collect();
-        if fresh.is_empty() {
-            return g;
+            .collect()
+    }
+
+    fn canonical(&mut self, cond: Bdd, sides: [Vec<Desc>; 2]) -> (Bdd, [Vec<Desc>; 2]) {
+        let mut order: Vec<u32> = Vec::new();
+        for g in sides.iter().flatten().filter_map(|d| d.bits) {
+            if self.has_fresh(g) {
+                for v in self.fresh_support(g) {
+                    if !order.contains(&v) {
+                        order.push(v);
+                    }
+                }
+            }
         }
-        let renamed: Vec<Bdd> = (0..fresh.len())
-            .map(|i| self.fresh(side, param, i as u32 + 1))
+        let absent: Vec<u32> = self
+            .fresh_support(cond)
+            .into_iter()
+            .filter(|v| !order.contains(v))
             .collect();
-        self.logic().m.compose(g, &|v| {
-            fresh.iter().position(|&x| x == v).map(|i| renamed[i])
-        })
+        let cond = self.logic().exists(&absent, cond);
+        let (paths, values): (Vec<u32>, Vec<u32>) = order
+            .iter()
+            .partition(|&&v| matches!(self.check.logic.atom_of(v), Atom::Fresh(PATH, ..)));
+        assert!(paths.len() < PATHS as usize, "too many paths");
+        let mut map: HashMap<u32, Bdd> = HashMap::default();
+        let targets = values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v, JOINT, i as u32 + 1))
+            .chain(paths.iter().enumerate().map(|(i, &v)| (v, PATH, PATHS + i as u32)));
+        for (v, kind, position) in targets.collect::<Vec<_>>() {
+            let atom = Atom::Fresh(kind, ValueId(0), position);
+            if self.check.logic.atom_of(v) != atom {
+                let target = self.logic().atom(atom);
+                map.insert(v, target);
+            }
+        }
+        let Some(&last) = map.keys().max() else {
+            return (cond, sides);
+        };
+        let mut roots: Vec<Bdd> = sides.iter().flatten().filter_map(|d| d.bits).collect();
+        roots.push(cond);
+        let renamed = self.logic().m.compose_many(&roots, &|v| map.get(&v).copied(), last);
+        let mut renamed = renamed.into_iter();
+        let mut out = sides;
+        for d in out.iter_mut().flatten() {
+            if d.bits.is_some() {
+                d.bits = renamed.next();
+            }
+        }
+        (renamed.next().unwrap(), out)
+    }
+
+    fn join(&mut self, (oc, old): (Bdd, &[Vec<Desc>; 2]), (nc, new): (Bdd, &[Vec<Desc>; 2])) -> (Bdd, [Vec<Desc>; 2]) {
+        let mut out = old.clone();
+        let differ = old.iter().flatten().zip(new.iter().flatten()).any(|(o, n)| o.bits != n.bits);
+        if !differ {
+            for (d, n) in out.iter_mut().flatten().zip(new.iter().flatten()) {
+                if d.same != n.same {
+                    d.same = None;
+                }
+            }
+            return (self.check.or(oc, nc), out);
+        }
+        assert!(self.paths > 0, "too many joins");
+        self.paths -= 1;
+        let path = self.fresh(PATH, ValueId(0), self.paths);
+        for (d, n) in out.iter_mut().flatten().zip(new.iter().flatten()) {
+            let same = if d.same == n.same { d.same } else { None };
+            let bits = match (d.bits, n.bits) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), Some(b)) => Some(self.logic().m.ite(path, a, b)),
+                _ => None,
+            };
+            *d = Desc { same, bits };
+        }
+        (self.logic().m.ite(path, oc, nc), out)
+    }
+
+    fn joined(&mut self, entries: &BTreeMap<(Key, usize), (Bdd, [Vec<Desc>; 2])>) -> (Bdd, [Vec<Desc>; 2]) {
+        let mut values = entries.values();
+        let (c, s) = values.next().unwrap();
+        let mut joined = (*c, s.clone());
+        for (c, s) in values {
+            joined = self.join((joined.0, &joined.1), (*c, s));
+        }
+        joined
     }
 
     fn has_fresh(&mut self, g: Bdd) -> bool {
@@ -1905,16 +1991,21 @@ impl<'c, 'a> Explore<'c, 'a> {
             e1.args.iter().map(|&a| self.start(a)).collect(),
         ];
         let first: Key = [Some(e0.dst), Some(e1.dst)];
+        let exit = f.blocks.len();
+        let priority = |check: &Check, key: &Key| -> usize {
+            key.iter().map(|b| b.map_or(exit, |b| check.rank[&b])).sum()
+        };
         let mut pairs: BTreeMap<Key, Pair> = BTreeMap::from([(
             first,
             Pair {
                 cond: self.assume,
-                sides,
+                sides: sides.clone(),
                 writes: [Vec::new(), Vec::new()],
+                entries: BTreeMap::from([(([None, None], 0), (self.assume, sides))]),
             },
         )]);
-        let mut worklist = vec![first];
-        while let Some(key) = worklist.pop() {
+        let mut worklist = BTreeSet::from([(priority(self.check, &first), first)]);
+        while let Some((_, key)) = worklist.pop_first() {
             let pair = &pairs[&key];
             let (cond, sides, writes) = (pair.cond, pair.sides.clone(), pair.writes.clone());
             let cond = self.check.and(cond, self.check.safe);
@@ -1956,7 +2047,7 @@ impl<'c, 'a> Explore<'c, 'a> {
             if self.check.stopped {
                 return;
             }
-            for (dst, descs, constraint, done) in steps {
+            for (slot, (dst, descs, constraint, done)) in steps.into_iter().enumerate() {
                 let c = self.check.and(cond, constraint);
                 let c = self.check.and(c, self.check.safe);
                 if c == Bdd::FALSE {
@@ -1969,13 +2060,16 @@ impl<'c, 'a> Explore<'c, 'a> {
                 } else {
                     [sides[WAVE].clone(), descs]
                 };
+                let looped = next.iter().flatten().any(|b| self.headers.contains(b));
+                let (c, incoming) = if looped { self.canonical(c, incoming) } else { (c, incoming) };
                 let mut traces = writes.clone();
                 traces[side].extend(done);
                 let merged = match pairs.get(&next) {
                     None => Pair {
                         cond: c,
-                        sides: incoming,
+                        sides: incoming.clone(),
                         writes: traces,
+                        entries: BTreeMap::from([((key, slot), (c, incoming))]),
                     },
                     Some(old) => {
                         let (ocond, osides) = (old.cond, old.sides.clone());
@@ -1989,6 +2083,31 @@ impl<'c, 'a> Explore<'c, 'a> {
                             }
                         }
                         let kept = old.writes.clone();
+                        if !looped {
+                            let mut entries = old.entries.clone();
+                            let arrival = (c, incoming);
+                            if entries.get(&(key, slot)) == Some(&arrival) {
+                                continue;
+                            }
+                            let (mcond, msides) = match entries.insert((key, slot), arrival.clone()) {
+                                None => self.join((ocond, &osides), (arrival.0, &arrival.1)),
+                                Some(_) => self.joined(&entries),
+                            };
+                            let changed = mcond != ocond || msides != osides;
+                            pairs.insert(
+                                next,
+                                Pair {
+                                    cond: mcond,
+                                    sides: msides,
+                                    writes: kept,
+                                    entries,
+                                },
+                            );
+                            if changed {
+                                worklist.insert((priority(self.check, &next), next));
+                            }
+                            continue;
+                        }
                         let mcond = self.check.or(ocond, c);
                         let mut grew = mcond != ocond;
                         let mut merged = osides.clone();
@@ -2012,17 +2131,20 @@ impl<'c, 'a> Explore<'c, 'a> {
                         if !grew {
                             continue;
                         }
+                        let (mcond, merged) = self.canonical(mcond, merged);
+                        if merged == osides && mcond == ocond {
+                            continue;
+                        }
                         Pair {
                             cond: mcond,
                             sides: merged,
                             writes: kept,
+                            entries: BTreeMap::new(),
                         }
                     }
                 };
                 pairs.insert(next, merged);
-                if !worklist.contains(&next) {
-                    worklist.push(next);
-                }
+                worklist.insert((priority(self.check, &next), next));
             }
         }
     }
@@ -2077,18 +2199,12 @@ impl<'c, 'a> Explore<'c, 'a> {
         let mut out = Vec::new();
         for (slot, constraint) in followed {
             let edge = block.term.edges().nth(slot).unwrap();
-            let dst = &f.blocks[&edge.dst];
             let mut args = Vec::with_capacity(edge.args.len());
-            for (&arg, &(param, _)) in edge.args.iter().zip(&dst.params) {
-                let mut d = match position.get(&arg) {
+            for &arg in &edge.args {
+                let d = match position.get(&arg) {
                     Some(&j) => params[j],
                     None => self.get(&mut ev, arg),
                 };
-                if let Some(g) = d.bits {
-                    if self.has_fresh(g) {
-                        d.bits = Some(self.canon(side, param, g));
-                    }
-                }
                 args.push(d);
             }
             out.push((Some(edge.dst), args, constraint, ev.writes.clone()));
@@ -4560,6 +4676,340 @@ mod tests {
     fn prove_keeps_a_query_whose_arm_merges_an_answer_that_stores_and_another_path() {
         let b = apart_merge_answer(true);
         assert!(keeps(&b).is_empty(), "{:?}: z is c & any(v) on the first path, so lanes with c store when the wave takes the arm and v holds", keeps(&b));
+    }
+
+    fn with_explore(test: impl FnOnce(&mut Explore)) {
+        let (b, _) = Build::kernel();
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(f, &facts).unwrap();
+        let hazards = no_hazards();
+        let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+        let mut explore = Explore::new(&mut check, f.entry, Bdd::TRUE);
+        test(&mut explore);
+    }
+
+    fn evaluate(m: &Manager, mut g: Bdd, value: &dyn Fn(u32) -> bool) -> bool {
+        while let Some((var, low, high)) = m.decompose(g) {
+            g = if value(var) { high } else { low };
+        }
+        g == Bdd::TRUE
+    }
+
+    fn variable(logic: &mut Logic, atom: Atom) -> u32 {
+        let g = logic.atom(atom);
+        logic.m.decompose(g).unwrap().0
+    }
+
+    fn random_function(logic: &mut Logic, r: &mut Random, pool: &[Atom], most: usize) -> Bdd {
+        let mut atoms: Vec<Atom> = Vec::new();
+        for _ in 0..1 + r.below(most as u64) {
+            let a = pool[r.below(pool.len() as u64) as usize];
+            if !atoms.contains(&a) {
+                atoms.push(a);
+            }
+        }
+        let vars: Vec<Bdd> = atoms.iter().map(|&a| logic.atom(a)).collect();
+        let mut g = Bdd::FALSE;
+        for row in 0..1u32 << vars.len() {
+            if r.below(2) == 0 {
+                continue;
+            }
+            let mut minterm = Bdd::TRUE;
+            for (i, &v) in vars.iter().enumerate() {
+                let literal = if row >> i & 1 == 1 { v } else { logic.m.not(v) };
+                minterm = logic.m.and(minterm, literal);
+            }
+            g = logic.m.or(g, minterm);
+        }
+        g
+    }
+
+    fn random_state(logic: &mut Logic, r: &mut Random, context: &[Atom], unknowns: &[Atom], paths: &[Atom]) -> (Bdd, [Vec<Desc>; 2]) {
+        let tied: Vec<Atom> = context.iter().chain(paths).copied().collect();
+        let all: Vec<Atom> = tied.iter().chain(unknowns).copied().collect();
+        let cond = random_function(logic, r, &tied, 3);
+        let desc = |logic: &mut Logic, r: &mut Random| Desc {
+            same: None,
+            bits: Some(random_function(logic, r, &all, 4)),
+        };
+        let wave = vec![desc(logic, r), desc(logic, r)];
+        let lane = vec![desc(logic, r)];
+        (cond, [wave, lane])
+    }
+
+    fn held(logic: &mut Logic, (cond, sides): (Bdd, &[Vec<Desc>; 2]), context: &[(u32, bool)]) -> BTreeSet<Vec<bool>> {
+        let roots: Vec<Bdd> = sides.iter().flatten().filter_map(|d| d.bits).collect();
+        let mut hidden: Vec<u32> = Vec::new();
+        for &g in roots.iter().chain([cond].iter()) {
+            for &v in logic.support(g).iter() {
+                if matches!(logic.atom_of(v), Atom::Fresh(..)) && !hidden.contains(&v) {
+                    hidden.push(v);
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        for row in 0..1u64 << hidden.len() {
+            let value = |var: u32| match hidden.iter().position(|&h| h == var) {
+                Some(i) => row >> i & 1 == 1,
+                None => context.iter().find(|&&(v, _)| v == var).unwrap().1,
+            };
+            if evaluate(&logic.m, cond, &value) {
+                out.insert(roots.iter().map(|&g| evaluate(&logic.m, g, &value)).collect());
+            }
+        }
+        out
+    }
+
+    fn contexts(logic: &mut Logic, context: &[Atom]) -> Vec<Vec<(u32, bool)>> {
+        let vars: Vec<u32> = context.iter().map(|&a| variable(logic, a)).collect();
+        (0..1u32 << vars.len())
+            .map(|row| vars.iter().enumerate().map(|(i, &v)| (v, row >> i & 1 == 1)).collect())
+            .collect()
+    }
+
+    #[test]
+    fn join_holds_exactly_the_states_of_every_arrival() {
+        with_explore(|e| {
+            let mut r = Random::new(43);
+            let context = [Atom::Lane(0), Atom::Lane(1)];
+            let unknowns = [Atom::Fresh(WAVE, ValueId(1000), 0), Atom::Fresh(LANE, ValueId(1001), 0), Atom::Fresh(JOINT, ValueId(0), 1)];
+            e.paths = PATHS - 8;
+            let paths = [Atom::Fresh(PATH, ValueId(0), PATHS - 1), Atom::Fresh(PATH, ValueId(0), PATHS - 2), Atom::Fresh(PATH, ValueId(0), PATHS)];
+            let contexts = contexts(e.logic(), &context);
+            let mut wrong = Vec::new();
+            for trial in 0..300 {
+                let mut arrivals = vec![random_state(e.logic(), &mut r, &context, &unknowns, &paths)];
+                for _ in 0..2 {
+                    let mut next = random_state(e.logic(), &mut r, &context, &unknowns, &paths);
+                    let first = arrivals[0].1.clone();
+                    match r.below(4) {
+                        0 => next.1 = first,
+                        1 => next.1[WAVE][0] = first[WAVE][0],
+                        _ => {}
+                    }
+                    arrivals.push(next);
+                }
+                let two = e.join((arrivals[0].0, &arrivals[0].1), (arrivals[1].0, &arrivals[1].1));
+                let entries: BTreeMap<(Key, usize), (Bdd, [Vec<Desc>; 2])> =
+                    arrivals.iter().enumerate().map(|(i, a)| (([None, None], i), a.clone())).collect();
+                let three = e.joined(&entries);
+                for context in &contexts {
+                    let each: Vec<BTreeSet<Vec<bool>>> = arrivals.iter().map(|a| held(e.logic(), (a.0, &a.1), context)).collect();
+                    let expected_two: BTreeSet<Vec<bool>> = each[0].union(&each[1]).cloned().collect();
+                    let expected_three: BTreeSet<Vec<bool>> = expected_two.union(&each[2]).cloned().collect();
+                    if held(e.logic(), (two.0, &two.1), context) != expected_two {
+                        wrong.push(format!("trial {} two arrivals under {:?}", trial, context));
+                    }
+                    if held(e.logic(), (three.0, &three.1), context) != expected_three {
+                        wrong.push(format!("trial {} three arrivals under {:?}", trial, context));
+                    }
+                }
+            }
+            assert!(wrong.is_empty(), "the join must hold the states of the arrivals and nothing else: {:?}", &wrong[..wrong.len().min(8)]);
+        });
+    }
+
+    #[test]
+    fn canonical_names_hold_the_same_states_in_normal_form() {
+        with_explore(|e| {
+            let mut r = Random::new(47);
+            let context = [Atom::Lane(0), Atom::Lane(1)];
+            let unknowns = [
+                Atom::Fresh(WAVE, ValueId(1000), 0),
+                Atom::Fresh(LANE, ValueId(1001), 0),
+                Atom::Fresh(WAVE, ValueId(1002), u32::MAX),
+                Atom::Fresh(JOINT, ValueId(0), 3),
+                Atom::Fresh(JOINT, ValueId(0), 1),
+            ];
+            let paths = [Atom::Fresh(PATH, ValueId(0), PATHS - 1), Atom::Fresh(PATH, ValueId(0), PATHS + 2), Atom::Fresh(PATH, ValueId(0), 5)];
+            for position in 1..=unknowns.len() as u32 {
+                e.fresh(JOINT, ValueId(0), position);
+            }
+            let contexts = contexts(e.logic(), &context);
+            let mut wrong = Vec::new();
+            for trial in 0..300 {
+                let (cond, sides) = random_state(e.logic(), &mut r, &context, &unknowns, &paths);
+                let (cc, cs) = e.canonical(cond, sides.clone());
+                for context in &contexts {
+                    if held(e.logic(), (cc, &cs), context) != held(e.logic(), (cond, &sides), context) {
+                        wrong.push(format!("trial {} changes the states under {:?}", trial, context));
+                    }
+                }
+                let mut names: Vec<Atom> = Vec::new();
+                for g in cs.iter().flatten().filter_map(|d| d.bits).chain([cc]) {
+                    for v in e.fresh_support(g) {
+                        let a = e.check.logic.atom_of(v);
+                        if !names.contains(&a) {
+                            names.push(a);
+                        }
+                    }
+                }
+                let values = names.iter().filter(|a| matches!(a, Atom::Fresh(JOINT, ..))).count() as u32;
+                let tied = names.iter().filter(|a| matches!(a, Atom::Fresh(PATH, ..))).count() as u32;
+                let normal = names.iter().all(|a| match *a {
+                    Atom::Fresh(JOINT, ValueId(0), p) => (1..=values).contains(&p),
+                    Atom::Fresh(PATH, ValueId(0), p) => (PATHS..PATHS + tied).contains(&p),
+                    _ => false,
+                });
+                if !normal {
+                    wrong.push(format!("trial {} leaves names {:?}", trial, names));
+                }
+                if e.canonical(cc, cs.clone()) != (cc, cs) {
+                    wrong.push(format!("trial {} is not settled by one pass", trial));
+                }
+            }
+            assert!(wrong.is_empty(), "renaming must keep the states and settle the names: {:?}", &wrong[..wrong.len().min(8)]);
+        });
+    }
+
+    #[test]
+    fn decide_and_weaken_answer_over_the_paths_the_condition_allows() {
+        with_explore(|e| {
+            let mut r = Random::new(53);
+            let context = [Atom::Lane(0), Atom::Lane(1)];
+            let unknowns = [Atom::Fresh(LANE, ValueId(1001), 0), Atom::Fresh(JOINT, ValueId(0), 1)];
+            let paths = [Atom::Fresh(PATH, ValueId(0), PATHS - 1), Atom::Fresh(PATH, ValueId(0), PATHS)];
+            let tied: Vec<Atom> = context.iter().chain(&paths).copied().collect();
+            let all: Vec<Atom> = tied.iter().chain(&unknowns).copied().collect();
+            let tied_vars: Vec<u32> = tied.iter().map(|&a| variable(e.logic(), a)).collect();
+            let unknown_vars: Vec<u32> = unknowns.iter().map(|&a| variable(e.logic(), a)).collect();
+            let mut wrong = Vec::new();
+            for trial in 0..400 {
+                let cond = random_function(e.logic(), &mut r, &tied, 3);
+                if cond == Bdd::FALSE {
+                    continue;
+                }
+                let g = random_function(e.logic(), &mut r, &all, 4);
+                let (mut every, mut none) = (true, true);
+                let mut expected_weak = Vec::new();
+                for row in 0..1u32 << tied_vars.len() {
+                    let mut some = false;
+                    for hidden in 0..1u32 << unknown_vars.len() {
+                        let value = |var: u32| match tied_vars.iter().position(|&v| v == var) {
+                            Some(i) => row >> i & 1 == 1,
+                            None => hidden >> unknown_vars.iter().position(|&v| v == var).unwrap() & 1 == 1,
+                        };
+                        let holds = evaluate(&e.check.logic.m, g, &value);
+                        some |= holds;
+                        if evaluate(&e.check.logic.m, cond, &value) {
+                            every &= holds;
+                            none &= !holds;
+                        }
+                    }
+                    expected_weak.push(some);
+                }
+                let expected = if every { Some(true) } else if none { Some(false) } else { None };
+                if e.decide(g, cond, LANE) != expected {
+                    wrong.push(format!("trial {} decides {:?}, expected {:?}", trial, e.decide(g, cond, LANE), expected));
+                }
+                let weak = e.weaken(g, LANE);
+                for (row, &some) in expected_weak.iter().enumerate() {
+                    let value = |var: u32| row >> tied_vars.iter().position(|&v| v == var).unwrap() & 1 == 1;
+                    if evaluate(&e.check.logic.m, weak, &value) != some {
+                        wrong.push(format!("trial {} weakens to {} at {}, expected {}", trial, !some, row, some));
+                    }
+                }
+            }
+            assert!(wrong.is_empty(), "decide and weaken must quantify the unknowns and keep the paths: {:?}", &wrong[..wrong.len().min(8)]);
+        });
+    }
+
+    fn apart_merge_pair(differ: bool) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let u = uniform_load(&mut b, &k, e, 24);
+        let five = b.constant(e, Ty::I32, 5);
+        let uniform = b.cmp(e, IntPred::Eq, u, five);
+        let flag = per_lane(&mut b, &k, e, 28);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, flag, zero);
+        let (arm, a) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (first, x) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+        let (second, y) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+        let (merged, m) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (arm, vec![k.exec, own, c, uniform]), (join, vec![k.exec]));
+        b.cond_br(arm, a[3], (first, vec![a[0], a[1], a[2]]), (second, vec![a[0], a[1], a[2]]));
+        b.br(first, merged, vec![x[0], x[1], x[2], x[2]]);
+        let yes = b.constant(second, Ty::I1, 1);
+        let not_c = b.int(second, IntOp::Xor, y[2], yes);
+        let other = if differ { y[2] } else { not_c };
+        b.br(second, merged, vec![y[0], y[1], not_c, other]);
+        let yes = b.constant(merged, Ty::I1, 1);
+        let not_other = b.int(merged, IntOp::Xor, m[3], yes);
+        let only = b.int(merged, IntOp::And, m[2], not_other);
+        let mask = b.int(merged, IntOp::And, only, m[0]);
+        let one = b.constant(merged, Ty::I32, 1);
+        b.store(merged, Space::Global, MemSize::B32, m[1], one, mask);
+        b.br(merged, join, vec![m[0]]);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arm_merges_two_bits_that_every_path_keeps_equal() {
+        let b = apart_merge_pair(false);
+        assert!(converted(&b).is_empty(), "{:?}: the two bits are (c, c) on one path and (!c, !c) on the other, so s & !t never holds and the arm never stores", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_merges_two_bits_that_one_path_sets_apart() {
+        let b = apart_merge_pair(true);
+        assert!(keeps(&b).is_empty(), "{:?}: the two bits are (!c, c) on the second path, so lanes without c store when the wave takes it", keeps(&b));
+    }
+
+    fn apart_merge_branch(reach_store: bool) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let u = uniform_load(&mut b, &k, e, 24);
+        let five = b.constant(e, Ty::I32, 5);
+        let uniform = b.cmp(e, IntPred::Eq, u, five);
+        let flag = per_lane(&mut b, &k, e, 28);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, flag, zero);
+        let (arm, a) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (first, x) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (second, y) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (merged, m) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (arm, vec![k.exec, own, c, uniform]), (join, vec![k.exec]));
+        b.cond_br(arm, a[3], (first, vec![a[0], a[1], a[2], a[3]]), (second, vec![a[0], a[1], a[2], a[3]]));
+        b.br(first, merged, vec![x[0], x[1], x[2], x[3]]);
+        let never = b.constant(second, Ty::I1, 0);
+        b.br(second, merged, vec![y[0], y[1], never, y[3]]);
+        let branch = if reach_store {
+            m[3]
+        } else {
+            let yes = b.constant(merged, Ty::I1, 1);
+            b.int(merged, IntOp::Xor, m[3], yes)
+        };
+        let only = b.int(merged, IntOp::And, m[2], branch);
+        let mask = b.int(merged, IntOp::And, only, m[0]);
+        let one = b.constant(merged, Ty::I32, 1);
+        b.store(merged, Space::Global, MemSize::B32, m[1], one, mask);
+        b.br(merged, join, vec![m[0]]);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arm_merges_a_bit_only_the_branch_to_it_sets() {
+        let b = apart_merge_branch(false);
+        assert!(converted(&b).is_empty(), "{:?}: z is c on the path taken when u holds and false on the other, so z & !u never holds and the arm never stores", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_merges_a_bit_that_stores_where_the_branch_to_it_holds() {
+        let b = apart_merge_branch(true);
+        assert!(keeps(&b).is_empty(), "{:?}: z is c on the path taken when u holds, so lanes with c store when the wave takes the arm and u holds", keeps(&b));
     }
 
     fn apart_lane_mask(contradiction: bool) -> Build {

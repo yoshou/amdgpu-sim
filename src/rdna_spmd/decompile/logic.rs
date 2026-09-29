@@ -64,6 +64,7 @@ enum Choices {
 }
 
 const MARKERS_LAST: u32 = 0xfffe_0000;
+pub const PATH: usize = 3;
 
 pub struct Logic {
     pub m: Manager,
@@ -328,13 +329,17 @@ impl Logic {
                 }
             }
             Atom::Lane(i) => (2 << 30) | i as u32,
+            Atom::Fresh(PATH, _, i) => {
+                assert!(i < 1 << 16, "too many paths");
+                return (1 << 16) + i;
+            }
             Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => {
                 let next = self.detour.len() as u32;
                 assert!(next < 1 << 29, "too many detour values");
                 (3 << 30) | *self.detour.entry(atom).or_insert(next)
             }
         };
-        var + (1 << 16)
+        var + (1 << 17)
     }
 
     pub fn atom_of(&self, var: u32) -> Atom {

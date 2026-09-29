@@ -299,24 +299,30 @@ impl Manager {
 
     pub fn compose(&mut self, f: Bdd, map: &dyn Fn(u32) -> Option<Bdd>) -> Bdd {
         let mut memo = HashMap::default();
-        self.compose_memo(f, map, &mut memo)
+        self.compose_memo(f, map, u32::MAX, &mut memo)
+    }
+
+    pub fn compose_many(&mut self, fs: &[Bdd], map: &dyn Fn(u32) -> Option<Bdd>, last: u32) -> Vec<Bdd> {
+        let mut memo = HashMap::default();
+        fs.iter().map(|&f| self.compose_memo(f, map, last, &mut memo)).collect()
     }
 
     fn compose_memo(
         &mut self,
         f: Bdd,
         map: &dyn Fn(u32) -> Option<Bdd>,
+        last: u32,
         memo: &mut HashMap<Bdd, Bdd>,
     ) -> Bdd {
-        if f.constant().is_some() {
+        if f.constant().is_some() || self.top(f) > last {
             return f;
         }
         if let Some(&r) = memo.get(&f) {
             return r;
         }
         let node = self.nodes[f.0 as usize];
-        let low = self.compose_memo(node.low, map, memo);
-        let high = self.compose_memo(node.high, map, memo);
+        let low = self.compose_memo(node.low, map, last, memo);
+        let high = self.compose_memo(node.high, map, last, memo);
         let v = match map(node.var) {
             Some(g) => g,
             None => self.var(node.var),
@@ -340,5 +346,74 @@ impl Manager {
             stack.push(node.high);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    fn random_function(m: &mut Manager, state: &mut u64, vars: u32) -> Bdd {
+        let mut g = Manager::constant(random(state) & 1 == 1);
+        for _ in 0..6 {
+            let v = m.var(random(state) as u32 % vars);
+            let w = m.var(random(state) as u32 % vars);
+            g = match random(state) % 3 {
+                0 => {
+                    let both = m.and(v, w);
+                    m.xor(g, both)
+                }
+                1 => m.or(g, v),
+                _ => {
+                    let not = m.not(w);
+                    m.and(g, not)
+                }
+            };
+        }
+        g
+    }
+
+    fn evaluate(m: &Manager, mut g: Bdd, value: &dyn Fn(u32) -> bool) -> bool {
+        while let Some((var, low, high)) = m.decompose(g) {
+            g = if value(var) { high } else { low };
+        }
+        g == Bdd::TRUE
+    }
+
+    #[test]
+    fn compose_many_substitutes_every_mapped_variable_in_every_root() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut m = Manager::new();
+        let vars = 10;
+        for _ in 0..300 {
+            let roots: Vec<Bdd> = (0..3).map(|_| random_function(&mut m, &mut state, vars)).collect();
+            let mut map: HashMap<u32, Bdd> = HashMap::default();
+            for _ in 0..1 + random(&mut state) % 4 {
+                let v = random(&mut state) as u32 % vars;
+                let target = random_function(&mut m, &mut state, vars);
+                map.insert(v, target);
+            }
+            let last = *map.keys().max().unwrap();
+            let many = m.compose_many(&roots, &|v| map.get(&v).copied(), last);
+            let one: Vec<Bdd> = roots.iter().map(|&f| m.compose(f, &|v| map.get(&v).copied())).collect();
+            assert_eq!(many, one, "composing the roots together must give what composing each gives");
+            for row in 0..1u32 << vars {
+                let before = |v: u32| row >> v & 1 == 1;
+                let after = |v: u32| match map.get(&v) {
+                    Some(&target) => evaluate(&m, target, &before),
+                    None => before(v),
+                };
+                for (&f, &g) in roots.iter().zip(&many) {
+                    assert_eq!(evaluate(&m, g, &before), evaluate(&m, f, &after), "the result must read each mapped variable as its function");
+                }
+            }
+        }
     }
 }
