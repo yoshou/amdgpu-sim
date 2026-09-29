@@ -39,6 +39,7 @@ pub enum Reach {
         offset: &'static [(usize, u64)],
         shift: u32,
         bytes: u32,
+        kinds: Option<(usize, u64, &'static [(u64, u32)])>,
     },
     Image,
 }
@@ -53,11 +54,13 @@ fn reach(registry: &DialectRegistry, op: TargetOp) -> Reach {
             offset: &[(2, !7)],
             shift: 3,
             bytes: 128,
+            kinds: Some((2, 7, &[(0, 64), (1, 64), (5, 128)])),
         },
         (Some("rdna4"), "image_bvh8_intersect_ray") => Reach::Node {
             offset: &[(2, u64::MAX), (11, !15)],
             shift: 3,
             bytes: 128,
+            kinds: None,
         },
         _ => Reach::Anywhere,
     }
@@ -503,6 +506,7 @@ struct Place {
     within: Regions,
     address: Option<Value>,
     bytes: u32,
+    high: Option<Form>,
 }
 
 impl Place {
@@ -532,7 +536,8 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
                     region: None,
                     within: within(lane),
                     address: reached.as_ref().map(|r| r.0.clone()),
-                    bytes: reached.map_or(a.bytes, |r| r.1),
+                    bytes: reached.as_ref().map_or(a.bytes, |r| r.1),
+                    high: reached.and_then(|r| r.2),
                 });
             };
             let (value, _) = addresses.operand(address, a.block, lane, a.predicate);
@@ -546,6 +551,7 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
                 within: if region.is_some() { Regions::default() } else { within(lane) },
                 address: Some(value),
                 bytes: a.bytes,
+                high: None,
             })
         })
         .collect()
@@ -842,7 +848,7 @@ fn meet(
             } else if !may_overlap(unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ) {
                 continue;
             }
-            if above(addresses, (pa, a, xa), (qa, b, ya), variant, differ) {
+            if above(addresses, (pa, a, xa, x.high.as_ref(), x.bytes), (qa, b, ya, y.high.as_ref(), y.bytes), variant, differ) {
                 continue;
             }
             if !runs(addresses, pa, a) || !runs(addresses, qa, b) {
@@ -919,19 +925,28 @@ fn excluded(
 
 fn above(
     addresses: &mut Addresses,
-    (pa, a, x): (&Access, usize, &Value),
-    (qa, b, y): (&Access, usize, &Value),
+    (pa, a, x, xh, x_bytes): (&Access, usize, &Value, Option<&Form>, u32),
+    (qa, b, y, yh, y_bytes): (&Access, usize, &Value, Option<&Form>, u32),
     variant: &dyn Fn(&UnknownInfo) -> bool,
     differ: Option<Unknown>,
 ) -> bool {
-    let (Some(xv), Some(yv)) = (pa.address, qa.address) else {
+    let mut high = |access: &Access, lane: usize, given: Option<&Form>| match access.address {
+        Some(v) if addresses.wide(v) => Some(addresses.high(v, lane)),
+        Some(_) => None,
+        None => given.cloned(),
+    };
+    let (Some(hx), Some(hy)) = (high(pa, a, xh), high(qa, b, yh)) else {
         return false;
     };
-    if !addresses.wide(xv) || !addresses.wide(yv) {
-        return false;
-    }
-    let (hx, hy) = (addresses.high(xv, a), addresses.high(yv, b));
     let unknowns = &addresses.unknowns;
+    if let (Some(lx), Some(ly)) = (x.form.as_constant(), y.form.as_constant()) {
+        let low = ly as i64 - lx as i64;
+        return [-1i64, 0, 1].iter().all(|&k| {
+            let d = k * (1i64 << 32) + low;
+            !(d > -(y_bytes as i64) && d < x_bytes as i64)
+                || !may_overlap(unknowns, &hx.add(&Form::constant(k as u32)), &hy, 1, 1, variant, differ)
+        });
+    }
     let same = x.form == y.form && x.form.terms.iter().all(|&(u, _)| !variant(&unknowns[u as usize]));
     let window = if same { 1 } else { 2 };
     !may_overlap(unknowns, &hx, &hy, window, window, variant, differ)
@@ -2755,6 +2770,44 @@ mod tests {
 
     fn texel_read(offset: u64) -> bool {
         texel_read_in(offset, false)
+    }
+
+    fn texel_read_at_row(offset: u64, v: f32) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_sample_lz");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let mut args = [zero; 16];
+        args[0] = base_units(&mut b, e, buf);
+        args[1] = b.constant(e, Ty::I32, 3 << 30 | 5 << 17);
+        args[2] = b.constant(e, Ty::I32, 15 << 14 | 3);
+        args[3] = b.constant(e, Ty::I32, 4);
+        args[13] = b.constant(e, Ty::I1, 1);
+        args[14] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, k.item));
+        args[15] = b.constant(e, Ty::F32, v.to_bits() as u64);
+        let r = b.here(e);
+        b.target(e, op, Arguments::Sixteen(args), &[Ty::I32]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_clamped_to_the_last_row_after_stores_into_it() {
+        assert!(texel_read_at_row(15 * 128 + 3, 20.0), "v = 20 clamps to row 15, whose texel 3 the store writes");
+    }
+
+    #[test]
+    fn find_keeps_a_texel_read_clamped_to_the_last_row_apart_from_stores_into_row_fourteen() {
+        assert!(!texel_read_at_row(14 * 128 + 3, 20.0), "v = 20 clamps to row 15, and the store writes row 14");
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_of_row_three_after_stores_into_it() {
+        assert!(texel_read_at_row(3 * 128 + 5, 3.5), "v = 3.5 reads row 3, whose texel 5 the store writes");
     }
 
     fn texel_read_in(offset: u64, rows: bool) -> bool {

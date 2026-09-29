@@ -2,6 +2,7 @@ use super::address::compare;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
+type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::rdna_spmd::hash::Mix>>;
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
@@ -83,6 +84,8 @@ pub struct Logic {
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
     relations: BTreeMap<(BlockId, usize), Rc<Vec<Binding>>>,
     images: HashMap<(usize, usize, Bdd), Bdd>,
+    uniform_tests: HashSet<ValueId>,
+    comparisons: HashMap<BlockId, Rc<Vec<(usize, ValueId, IntPred, ValueId, ValueId)>>>,
 }
 
 impl Logic {
@@ -124,6 +127,8 @@ impl Logic {
             edges: BTreeMap::new(),
             relations: BTreeMap::new(),
             images: HashMap::default(),
+            uniform_tests: HashSet::default(),
+            comparisons: HashMap::default(),
         }
     }
 
@@ -347,7 +352,7 @@ impl Logic {
 
     pub fn uniform_atom(&self, facts: &Facts, var: u32) -> bool {
         match self.atoms[&var] {
-            Atom::Bit(v) => facts.uniform[v.0],
+            Atom::Bit(v) => facts.uniform[v.0] || self.uniform_tests.contains(&v),
             Atom::View(v) => facts.saturated[v.0],
             Atom::Marker(_) => true,
             Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
@@ -440,12 +445,25 @@ impl Logic {
                                 equal
                             }
                         }
+                        (None, Site::Inst { .. })
+                            if f.types[a.0] == Ty::I32 && a != b && facts.constant(f, a).is_none() && facts.constant(f, b).is_none() =>
+                        {
+                            if !facts.uniform[v.0] && uniform_difference(f, facts, a, b) {
+                                self.uniform_tests.insert(v);
+                            }
+                            let equal = self.value_equality(f, facts, v, a, b, p == IntPred::Ne);
+                            if p == IntPred::Ne {
+                                self.m.not(equal)
+                            } else {
+                                equal
+                            }
+                        }
                         _ => self.atom(opaque),
                     };
                     self.compare(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::FCmp(p, a, b) => {
-                    let leaf = self.atom(opaque);
+                    let leaf = self.float_within(f, facts, v, p, a, b);
                     self.float_order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::Cmp(p, a, b) => {
@@ -481,81 +499,123 @@ impl Logic {
     }
 
     fn below(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, t: Threshold) -> Bdd {
-        let (min, max) = if t.signed {
-            (i32::MIN as i64, i32::MAX as i64)
-        } else {
-            (0, u32::MAX as i64)
-        };
-        if t.at <= min {
-            return Bdd::FALSE;
-        }
-        if t.at > max {
-            return Bdd::TRUE;
-        }
-        let list = self.block_thresholds(f, facts, block);
-        let earlier = list.iter().filter(|e| e.index < index && e.value == t.value && !e.equal && e.signed == t.signed);
-        let (mut lower, mut upper): (Option<Threshold>, Option<Threshold>) = (None, None);
-        for e in earlier {
-            if e.at == t.at {
-                let bit = self.bit(f, facts, e.of);
-                return if e.flip { self.m.not(bit) } else { bit };
-            }
-            if e.at < t.at && lower.is_none_or(|l| l.at < e.at) {
-                lower = Some(*e);
-            }
-            if e.at > t.at && upper.is_none_or(|u| u.at > e.at) {
-                upper = Some(*e);
-            }
-        }
-        let atom = self.atom(Atom::Bit(v));
-        let mut holds = if t.flip { self.m.not(atom) } else { atom };
-        if let Some(u) = upper {
-            let bit = self.bit(f, facts, u.of);
-            let upper = if u.flip { self.m.not(bit) } else { bit };
-            holds = self.m.and(holds, upper);
-        }
-        if let Some(l) = lower {
-            let bit = self.bit(f, facts, l.of);
-            let lower = if l.flip { self.m.not(bit) } else { bit };
-            holds = self.m.or(holds, lower);
-        }
-        let equalities: Vec<Threshold> = list.iter().filter(|e| e.index < index && e.value == t.value && e.equal).copied().collect();
-        for e in equalities {
-            let k = e.constant(t.signed);
-            let bit = self.bit(f, facts, e.of);
-            let equal = if e.flip { self.m.not(bit) } else { bit };
-            holds = if k < t.at {
-                self.m.or(holds, equal)
-            } else {
-                let unequal = self.m.not(equal);
-                self.m.and(holds, unequal)
-            };
-        }
-        holds
+        self.within(f, facts, block, index, v, t)
     }
 
     fn equal(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, e: Threshold) -> Bdd {
+        self.within(f, facts, block, index, v, e)
+    }
+
+    fn within(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, t: Threshold) -> Bdd {
+        let target = t.truth();
+        if target.is_empty() {
+            return Bdd::FALSE;
+        }
+        if target == [(0, u32::MAX as u64)] {
+            return Bdd::TRUE;
+        }
         let list = self.block_thresholds(f, facts, block);
-        let earlier: Vec<Threshold> = list.iter().filter(|x| x.index < index && x.value == e.value).copied().collect();
-        if let Some(same) = earlier.iter().find(|x| x.equal && x.at == e.at) {
-            let bit = self.bit(f, facts, same.of);
-            return if same.flip { self.m.not(bit) } else { bit };
+        let earlier: Vec<Threshold> = list.iter().filter(|e| e.index < index && e.value == t.value).copied().collect();
+        let mut sets: Vec<(Bdd, Vec<(u64, u64)>)> = Vec::new();
+        for e in &earlier {
+            let bit = self.bit(f, facts, e.of);
+            let holds = if e.flip { self.m.not(bit) } else { bit };
+            let set = e.truth();
+            if set == target {
+                return holds;
+            }
+            sets.push((holds, set));
         }
         let atom = self.atom(Atom::Bit(v));
-        let mut holds = if e.flip { self.m.not(atom) } else { atom };
-        for x in earlier {
-            let bit = self.bit(f, facts, x.of);
-            let other = if x.flip { self.m.not(bit) } else { bit };
-            let implied = if x.equal {
-                self.m.not(other)
-            } else if e.constant(x.signed) < x.at {
-                other
-            } else {
-                self.m.not(other)
-            };
-            holds = self.m.and(holds, implied);
+        let free = if t.flip { self.m.not(atom) } else { atom };
+        self.cells(&sets, &target, free, u32::MAX as u64)
+    }
+
+    fn float_within(&mut self, f: &Func, facts: &Facts, v: ValueId, p: FloatPred, a: ValueId, b: ValueId) -> Bdd {
+        let atom = self.atom(Atom::Bit(v));
+        let (Some((x, target)), Site::Inst { block, index }) = (float_test(f, facts, p, a, b), facts.site[v.0]) else {
+            return atom;
+        };
+        if target.is_empty() {
+            return Bdd::FALSE;
         }
-        holds
+        if target == [(0, FLOAT_TOP), (FLOAT_NAN, FLOAT_NAN)] {
+            return Bdd::TRUE;
+        }
+        let mut sets = Vec::new();
+        for inst in &f.blocks[&block].insts[..index] {
+            let Inst::Core { value, op: Op::FCmp(q, c, d), .. } = inst else {
+                continue;
+            };
+            let Some((y, set)) = float_test(f, facts, *q, *c, *d) else {
+                continue;
+            };
+            if y != x {
+                continue;
+            }
+            let holds = self.bit(f, facts, *value);
+            if set == target {
+                return holds;
+            }
+            sets.push((holds, set));
+        }
+        if sets.is_empty() {
+            return atom;
+        }
+        self.cells(&sets, &target, atom, FLOAT_NAN)
+    }
+
+    fn cells(&mut self, sets: &[(Bdd, Vec<(u64, u64)>)], target: &[(u64, u64)], free: Bdd, top: u64) -> Bdd {
+        let mut points: Vec<u64> = vec![0, top + 1];
+        for (_, set) in sets {
+            for &(low, high) in set {
+                points.push(low);
+                points.push(high + 1);
+            }
+        }
+        points.sort_unstable();
+        points.dedup();
+        let member = |set: &[(u64, u64)], x: u64| set.iter().any(|&(low, high)| low <= x && x <= high);
+        let mut regions: Vec<(Vec<bool>, bool, bool)> = Vec::new();
+        for w in points.windows(2) {
+            let (low, high) = (w[0], w[1] - 1);
+            let covered: u64 = target
+                .iter()
+                .map(|&(a, b)| {
+                    let (a, b) = (a.max(low), b.min(high));
+                    if a <= b {
+                        b - a + 1
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            let (some, all) = (covered > 0, covered == high - low + 1);
+            let key: Vec<bool> = sets.iter().map(|(_, set)| member(set, low)).collect();
+            match regions.iter_mut().find(|(k, _, _)| *k == key) {
+                Some(region) => {
+                    region.1 |= some;
+                    region.2 &= all;
+                }
+                None => regions.push((key, some, all)),
+            }
+        }
+        let mut result = Bdd::FALSE;
+        for (key, some, all) in regions {
+            if !some {
+                continue;
+            }
+            let mut cell = if all { Bdd::TRUE } else { free };
+            for ((holds, _), inside) in sets.iter().zip(key) {
+                let literal = if inside { *holds } else { self.m.not(*holds) };
+                cell = self.m.and(cell, literal);
+                if cell == Bdd::FALSE {
+                    break;
+                }
+            }
+            result = self.m.or(result, cell);
+        }
+        result
     }
 
     fn block_thresholds(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<Vec<Threshold>> {
@@ -589,15 +649,145 @@ impl Logic {
         let Site::Inst { block, index } = facts.site[first.0] else {
             return holds;
         };
-        let reversed = self.first_order(f, block).get(&(q, y, x)).copied();
-        match reversed {
-            Some(r) if matches!(facts.site[r.0], Site::Inst { index: i, .. } if i < index) => {
-                let other = self.relation(f, facts, r, (q, y, x));
-                let not_other = self.m.not(other);
-                self.m.and(holds, not_other)
-            }
-            _ => holds,
+        let edges = self.order_edges(f, facts, block, index, Some(q));
+        if edges.is_empty() {
+            return holds;
         }
+        let (back, _) = self.paths(&edges, y, x);
+        let (_, forward) = self.paths(&edges, x, y);
+        let open = self.m.not(back);
+        let allowed = self.m.and(holds, open);
+        self.m.or(allowed, forward)
+    }
+
+    fn value_equality(&mut self, f: &Func, facts: &Facts, v: ValueId, x: ValueId, y: ValueId, flip: bool) -> Bdd {
+        let atom = self.atom(Atom::Bit(v));
+        let holds = if flip { self.m.not(atom) } else { atom };
+        let Site::Inst { block, index } = facts.site[v.0] else {
+            return holds;
+        };
+        let mut must = Bdd::FALSE;
+        let mut apart = Bdd::FALSE;
+        for q in [IntPred::Ult, IntPred::Slt] {
+            let edges = self.order_edges(f, facts, block, index, Some(q));
+            if edges.is_empty() {
+                continue;
+            }
+            let (up, above) = self.paths(&edges, x, y);
+            let (down, below) = self.paths(&edges, y, x);
+            let both = self.m.and(up, down);
+            must = self.m.or(must, both);
+            let strict = self.m.or(above, below);
+            apart = self.m.or(apart, strict);
+        }
+        let edges = self.order_edges(f, facts, block, index, None);
+        if !edges.is_empty() {
+            let (joined, _) = self.paths(&edges, x, y);
+            must = self.m.or(must, joined);
+            let unequal: Vec<(ValueId, ValueId, Bdd)> = edges.iter().step_by(2).map(|&(a, b, _, equal)| (a, b, self.m.not(equal))).collect();
+            for (a, b, differ) in unequal {
+                let (xa, _) = self.paths(&edges, x, a);
+                let (by, _) = self.paths(&edges, b, y);
+                let (xb, _) = self.paths(&edges, x, b);
+                let (ay, _) = self.paths(&edges, a, y);
+                let direct = self.m.and(xa, by);
+                let crossed = self.m.and(xb, ay);
+                let linked = self.m.or(direct, crossed);
+                let split = self.m.and(differ, linked);
+                apart = self.m.or(apart, split);
+            }
+        }
+        let open = self.m.not(apart);
+        let allowed = self.m.and(holds, open);
+        self.m.or(allowed, must)
+    }
+
+    fn block_comparisons(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<Vec<(usize, ValueId, IntPred, ValueId, ValueId)>> {
+        if let Some(list) = self.comparisons.get(&block) {
+            return list.clone();
+        }
+        let list: Vec<(usize, ValueId, IntPred, ValueId, ValueId)> = f.blocks[&block]
+            .insts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, inst)| match inst {
+                Inst::Core {
+                    value,
+                    op: Op::Cmp(p, a, b),
+                    ..
+                } if f.types[a.0] == Ty::I32 && facts.constant(f, *a).is_none() && facts.constant(f, *b).is_none() && a != b => {
+                    Some((i, *value, *p, *a, *b))
+                }
+                _ => None,
+            })
+            .collect();
+        let list = Rc::new(list);
+        self.comparisons.insert(block, list.clone());
+        list
+    }
+
+    fn order_edges(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, family: Option<IntPred>) -> Vec<(ValueId, ValueId, bool, Bdd)> {
+        let list = self.block_comparisons(f, facts, block);
+        let mut edges = Vec::new();
+        for &(i, c, p, a, b) in list.iter() {
+            if i >= index {
+                break;
+            }
+            let bit = self.bit(f, facts, c);
+            match p {
+                IntPred::Eq | IntPred::Ne => {
+                    let equal = if p == IntPred::Ne { self.m.not(bit) } else { bit };
+                    edges.push((a, b, false, equal));
+                    edges.push((b, a, false, equal));
+                }
+                _ => {
+                    let (q, u, w, negated) = ordered(p, a, b);
+                    if family.is_some_and(|family| family != q) || family.is_none() {
+                        continue;
+                    }
+                    let less = if negated { self.m.not(bit) } else { bit };
+                    let not_less = self.m.not(less);
+                    edges.push((u, w, true, less));
+                    edges.push((w, u, false, not_less));
+                }
+            }
+        }
+        edges
+    }
+
+    fn paths(&mut self, edges: &[(ValueId, ValueId, bool, Bdd)], from: ValueId, to: ValueId) -> (Bdd, Bdd) {
+        let mut any: HashMap<ValueId, Bdd> = HashMap::default();
+        let mut strict: HashMap<ValueId, Bdd> = HashMap::default();
+        any.insert(from, Bdd::TRUE);
+        loop {
+            let mut changed = false;
+            for &(a, b, is_strict, guard) in edges {
+                let reach = any.get(&a).copied().unwrap_or(Bdd::FALSE);
+                let sharp = strict.get(&a).copied().unwrap_or(Bdd::FALSE);
+                if reach == Bdd::FALSE && sharp == Bdd::FALSE {
+                    continue;
+                }
+                let step = self.m.and(reach, guard);
+                let old = any.get(&b).copied().unwrap_or(Bdd::FALSE);
+                let new = self.m.or(old, step);
+                if new != old {
+                    any.insert(b, new);
+                    changed = true;
+                }
+                let through = if is_strict { step } else { self.m.and(sharp, guard) };
+                let old = strict.get(&b).copied().unwrap_or(Bdd::FALSE);
+                let new = self.m.or(old, through);
+                if new != old {
+                    strict.insert(b, new);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let reach = if from == to { Bdd::TRUE } else { any.get(&to).copied().unwrap_or(Bdd::FALSE) };
+        (reach, strict.get(&to).copied().unwrap_or(Bdd::FALSE))
     }
 
     fn float_order(
@@ -840,6 +1030,58 @@ impl Logic {
         self.lanes(|l| k >> l & 1 == 1)
     }
 
+    pub fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); 32]> {
+        if f.types[v.0] != Ty::I32 {
+            return None;
+        }
+        Some(self.known_bits(f, facts, v, 0))
+    }
+
+    fn known_bits(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> [(u32, u32); 32] {
+        if let Some(values) = self.lane_values(f, facts, v, 0) {
+            return std::array::from_fn(|l| (u32::MAX, values[l]));
+        }
+        if depth > 16 || f.types[v.0] != Ty::I32 {
+            return [(0, 0); 32];
+        }
+        let constant = |x: ValueId| facts.constant(f, x).map(|k| k as u32);
+        match facts.op(f, v) {
+            Some(Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b)) => {
+                let (x, y) = (self.known_bits(f, facts, a, depth + 1), self.known_bits(f, facts, b, depth + 1));
+                std::array::from_fn(|l| {
+                    let ((mx, vx), (my, vy)) = (x[l], y[l]);
+                    let mask = match k {
+                        IntOp::And => (mx & my) | (mx & !vx) | (my & !vy),
+                        IntOp::Or => (mx & my) | (mx & vx) | (my & vy),
+                        _ => mx & my,
+                    };
+                    let value = match k {
+                        IntOp::And => vx & vy,
+                        IntOp::Or => vx | vy,
+                        _ => vx ^ vy,
+                    };
+                    (mask, value & mask)
+                })
+            }
+            Some(Op::Int(IntOp::Shl, a, s)) if constant(s).is_some() => {
+                let k = constant(s).unwrap() & 31;
+                let x = self.known_bits(f, facts, a, depth + 1);
+                std::array::from_fn(|l| ((x[l].0 << k) | ((1u32 << k) - 1), x[l].1 << k))
+            }
+            Some(Op::Int(IntOp::Mul, a, s)) if constant(s).is_some_and(|k| k.is_power_of_two()) => {
+                let k = constant(s).unwrap().trailing_zeros();
+                let x = self.known_bits(f, facts, a, depth + 1);
+                std::array::from_fn(|l| ((x[l].0 << k) | ((1u32 << k) - 1), x[l].1 << k))
+            }
+            Some(Op::Int(IntOp::LShr, a, s)) if constant(s).is_some() => {
+                let k = constant(s).unwrap() & 31;
+                let x = self.known_bits(f, facts, a, depth + 1);
+                std::array::from_fn(|l| ((x[l].0 >> k) | !(u32::MAX >> k), x[l].1 >> k))
+            }
+            _ => [(0, 0); 32],
+        }
+    }
+
     pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
         self.lane_values(f, facts, v, 0)
     }
@@ -1017,6 +1259,12 @@ impl Logic {
                 };
                 let link = self.binding(facts, src, arriving(src, edge.dst, atom), bound);
                 pending.extend(link.support.iter().copied().filter(|v| !seen.contains(v)));
+                links.push(link);
+            }
+        }
+        for (atom, bound) in self.passed_tests(f, facts, src, slot) {
+            let link = self.binding(facts, src, atom, bound);
+            if link.support.iter().any(|v| seen.contains(v)) {
                 links.push(link);
             }
         }
@@ -1217,29 +1465,71 @@ impl Logic {
 
     fn passed_tests(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<(Atom, Bdd)> {
         let edge = f.blocks[&src].term.edges().nth(slot).unwrap();
-        let targets = self.block_thresholds(f, facts, edge.dst);
-        if targets.is_empty() {
-            return Vec::new();
-        }
-        let sources = self.block_thresholds(f, facts, src);
-        let mut seen: Vec<(ValueId, bool, bool, i64)> = Vec::new();
+        let dst = edge.dst;
         let mut out = Vec::new();
-        for t in targets.iter() {
-            let Site::Param { block, index } = facts.site[t.value.0] else {
-                continue;
-            };
-            let test = (t.value, t.equal, t.signed, t.at);
-            if block != edge.dst || !self.carried(t.value) || seen.contains(&test) {
-                continue;
+        let targets = self.block_thresholds(f, facts, dst);
+        if !targets.is_empty() {
+            let sources = self.block_thresholds(f, facts, src);
+            let mut seen: Vec<(ValueId, bool, bool, i64)> = Vec::new();
+            for t in targets.iter() {
+                let Site::Param { block, index } = facts.site[t.value.0] else {
+                    continue;
+                };
+                let test = (t.value, t.equal, t.signed, t.at);
+                if block != dst || !self.carried(t.value) || seen.contains(&test) {
+                    continue;
+                }
+                seen.push(test);
+                let arg = f.blocks[&src].term.edges().nth(slot).unwrap().args[index];
+                let relevant: Vec<Threshold> = sources.iter().filter(|e| e.value == arg).copied().collect();
+                if relevant.is_empty() {
+                    continue;
+                }
+                let mut sets = Vec::new();
+                for e in &relevant {
+                    let bit = self.bit(f, facts, e.of);
+                    let holds = if e.flip { self.m.not(bit) } else { bit };
+                    sets.push((holds, e.truth()));
+                }
+                let atom = arriving(src, dst, Atom::Bit(t.of));
+                let own = self.atom(atom);
+                let free = if t.flip { self.m.not(own) } else { own };
+                let truth = self.cells(&sets, &t.truth(), free, u32::MAX as u64);
+                let bound = if t.flip { self.m.not(truth) } else { truth };
+                out.push((atom, bound));
             }
-            seen.push(test);
-            let arg = edge.args[index];
-            let Some(e) = sources.iter().find(|e| e.value == arg && e.equal == t.equal && e.signed == t.signed && e.at == t.at) else {
-                continue;
+        }
+        let args: Vec<ValueId> = f.blocks[&src].term.edges().nth(slot).unwrap().args.clone();
+        let orders = self.first_order(f, dst);
+        if !orders.is_empty() {
+            let at = |p: ValueId| match facts.site[p.0] {
+                Site::Param { block, index } if block == dst => Some(index),
+                _ => None,
             };
-            let atom = self.atom(Atom::Bit(e.of));
-            let bound = if e.flip != t.flip { self.m.not(atom) } else { atom };
-            out.push((arriving(src, edge.dst, Atom::Bit(t.of)), bound));
+            let sources = self.first_order(f, src);
+            let mut pairs: Vec<((IntPred, ValueId, ValueId), ValueId)> = orders.iter().map(|(&k, &v)| (k, v)).collect();
+            pairs.sort_by_key(|&(_, v)| v.0);
+            for ((q, x, y), t) in pairs {
+                let (Some(i), Some(j)) = (at(x), at(y)) else {
+                    continue;
+                };
+                if !self.carried(x) || !self.carried(y) {
+                    continue;
+                }
+                let Some(&e) = sources.get(&(q, args[i], args[j])) else {
+                    continue;
+                };
+                let Some(Op::Cmp(pe, ae, be)) = facts.op(f, e) else {
+                    continue;
+                };
+                let Some(Op::Cmp(pt, at_, bt)) = facts.op(f, t) else {
+                    continue;
+                };
+                let bit = self.bit(f, facts, e);
+                let canonical = if ordered(pe, ae, be).3 { self.m.not(bit) } else { bit };
+                let bound = if ordered(pt, at_, bt).3 { self.m.not(canonical) } else { canonical };
+                out.push((arriving(src, dst, Atom::Bit(t)), bound));
+            }
         }
         out
     }
@@ -1327,7 +1617,7 @@ fn arriving(src: BlockId, dst: BlockId, atom: Atom) -> Atom {
     }
 }
 
-fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
+pub(super) fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
     let unordered = x.is_nan() || y.is_nan();
     match pred {
         FloatPred::Oeq => !unordered && x == y,
@@ -1359,11 +1649,128 @@ struct Threshold {
 }
 
 impl Threshold {
-    fn constant(&self, signed: bool) -> i64 {
-        if signed {
-            self.at as u32 as i32 as i64
+    fn truth(&self) -> Vec<(u64, u64)> {
+        let top = u32::MAX as u64;
+        if self.equal {
+            let k = self.at as u32 as u64;
+            return vec![(k, k)];
+        }
+        if !self.signed {
+            return if self.at <= 0 {
+                Vec::new()
+            } else if self.at > top as i64 {
+                vec![(0, top)]
+            } else {
+                vec![(0, self.at as u64 - 1)]
+            };
+        }
+        let half = 1u64 << 31;
+        if self.at <= i32::MIN as i64 {
+            Vec::new()
+        } else if self.at > i32::MAX as i64 {
+            vec![(0, top)]
+        } else if self.at <= 0 {
+            vec![(half, (self.at - 1) as i32 as u32 as u64)]
         } else {
-            self.at as u32 as i64
+            vec![(0, self.at as u64 - 1), (half, top)]
+        }
+    }
+
+}
+
+const FLOAT_OFFSET: u64 = 0x7f80_0000;
+const FLOAT_TOP: u64 = 2 * FLOAT_OFFSET;
+const FLOAT_NAN: u64 = FLOAT_TOP + 1;
+
+fn float_key(bits: u32) -> Option<u64> {
+    if f32::from_bits(bits).is_nan() {
+        return None;
+    }
+    let magnitude = (bits & 0x7fff_ffff) as u64;
+    Some(if bits >> 31 == 1 { FLOAT_OFFSET - magnitude } else { FLOAT_OFFSET + magnitude })
+}
+
+fn float_test(f: &Func, facts: &Facts, p: FloatPred, a: ValueId, b: ValueId) -> Option<(ValueId, Vec<(u64, u64)>)> {
+    if f.types[a.0] != Ty::F32 {
+        return None;
+    }
+    let (x, k, p) = match (facts.constant(f, a), facts.constant(f, b)) {
+        (None, Some(k)) => (a, k, p),
+        (Some(k), None) => {
+            let swapped = match p {
+                FloatPred::Olt => FloatPred::Ogt,
+                FloatPred::Ogt => FloatPred::Olt,
+                FloatPred::Ole => FloatPred::Oge,
+                FloatPred::Oge => FloatPred::Ole,
+                FloatPred::Ult => FloatPred::Ugt,
+                FloatPred::Ugt => FloatPred::Ult,
+                FloatPred::Ule => FloatPred::Uge,
+                FloatPred::Uge => FloatPred::Ule,
+                other => other,
+            };
+            (b, k, swapped)
+        }
+        _ => return None,
+    };
+    let unordered = matches!(p, FloatPred::Uno | FloatPred::Ueq | FloatPred::Ugt | FloatPred::Uge | FloatPred::Ult | FloatPred::Ule | FloatPred::Une);
+    let mut set = match float_key(k as u32) {
+        None if unordered => vec![(0, FLOAT_TOP)],
+        None => Vec::new(),
+        Some(t) => {
+            let below = if t == 0 { Vec::new() } else { vec![(0, t - 1)] };
+            let above = if t == FLOAT_TOP { Vec::new() } else { vec![(t + 1, FLOAT_TOP)] };
+            match p {
+                FloatPred::Olt | FloatPred::Ult => below,
+                FloatPred::Ole | FloatPred::Ule => vec![(0, t)],
+                FloatPred::Ogt | FloatPred::Ugt => above,
+                FloatPred::Oge | FloatPred::Uge => vec![(t, FLOAT_TOP)],
+                FloatPred::Oeq | FloatPred::Ueq => vec![(t, t)],
+                FloatPred::One | FloatPred::Une => below.into_iter().chain(above).collect(),
+                FloatPred::Ord => vec![(0, FLOAT_TOP)],
+                FloatPred::Uno => Vec::new(),
+            }
+        }
+    };
+    if unordered {
+        set.push((FLOAT_NAN, FLOAT_NAN));
+    }
+    Some((x, set))
+}
+
+fn uniform_difference(f: &Func, facts: &Facts, x: ValueId, y: ValueId) -> bool {
+    let mut terms: HashMap<ValueId, u32> = HashMap::default();
+    linear_terms(f, facts, x, 1, &mut terms, 0);
+    linear_terms(f, facts, y, u32::MAX, &mut terms, 0);
+    terms.iter().all(|(&leaf, &c)| c == 0 || facts.uniform[leaf.0])
+}
+
+fn linear_terms(f: &Func, facts: &Facts, v: ValueId, scale: u32, terms: &mut HashMap<ValueId, u32>, depth: u32) {
+    let constant = |x: ValueId| facts.constant(f, x).map(|k| k as u32);
+    if constant(v).is_some() {
+        return;
+    }
+    let op = if depth > 16 { None } else { facts.op(f, v) };
+    match op {
+        Some(Op::Int(IntOp::Add, a, b)) => {
+            linear_terms(f, facts, a, scale, terms, depth + 1);
+            linear_terms(f, facts, b, scale, terms, depth + 1);
+        }
+        Some(Op::Int(IntOp::Sub, a, b)) => {
+            linear_terms(f, facts, a, scale, terms, depth + 1);
+            linear_terms(f, facts, b, scale.wrapping_neg(), terms, depth + 1);
+        }
+        Some(Op::Int(IntOp::Mul, a, b)) if constant(b).is_some() => {
+            linear_terms(f, facts, a, scale.wrapping_mul(constant(b).unwrap()), terms, depth + 1);
+        }
+        Some(Op::Int(IntOp::Mul, a, b)) if constant(a).is_some() => {
+            linear_terms(f, facts, b, scale.wrapping_mul(constant(a).unwrap()), terms, depth + 1);
+        }
+        Some(Op::Int(IntOp::Shl, a, b)) if constant(b).is_some() => {
+            linear_terms(f, facts, a, scale.wrapping_mul(1u32 << (constant(b).unwrap() & 31)), terms, depth + 1);
+        }
+        _ => {
+            let c = terms.entry(v).or_insert(0);
+            *c = c.wrapping_add(scale);
         }
     }
 }
@@ -1546,6 +1953,115 @@ mod tests {
     use super::super::testing::*;
     use super::*;
 
+    type Word = std::rc::Rc<dyn Fn(u32, u32, u32) -> u32>;
+
+    fn lane_words() -> (Build, Vec<(String, ValueId, Word)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let table = k.buffer(&mut b, e, 8);
+        let u = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let at = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, at);
+        let v = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let mut words: Vec<(String, ValueId, Word)> = vec![
+            ("lane".into(), lane, std::rc::Rc::new(|_, _, l| l)),
+            ("u".into(), u, std::rc::Rc::new(|u, _, _| u)),
+            ("v".into(), v, std::rc::Rc::new(|_, v, _| v)),
+        ];
+        let mut r = Random::new(53);
+        for _ in 0..60 {
+            let (i, j) = (r.below(words.len() as u64) as usize, r.below(words.len() as u64) as usize);
+            let k = [1u32, 2, 3, 4, 5, 8, 31, 0x80, 0xf0f0][r.below(9) as usize];
+            let ((nx, x, fx), (ny, y, fy)) = (words[i].clone(), words[j].clone());
+            let kc = b.constant(e, Ty::I32, k as u64);
+            let (name, value, truth): (String, ValueId, Word) = match r.below(9) {
+                0 => (format!("({} & {})", nx, ny), b.int(e, IntOp::And, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l) & fy(u, v, l))),
+                1 => (format!("({} | {})", nx, ny), b.int(e, IntOp::Or, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l) | fy(u, v, l))),
+                2 => (format!("({} ^ {})", nx, ny), b.int(e, IntOp::Xor, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l) ^ fy(u, v, l))),
+                3 => (format!("({} & {})", nx, k), b.int(e, IntOp::And, x, kc), std::rc::Rc::new(move |u, v, l| fx(u, v, l) & k)),
+                4 => (format!("({} | {})", nx, k), b.int(e, IntOp::Or, x, kc), std::rc::Rc::new(move |u, v, l| fx(u, v, l) | k)),
+                5 => (format!("({} << {})", nx, k & 31), b.int(e, IntOp::Shl, x, kc), std::rc::Rc::new(move |u, v, l| fx(u, v, l) << (k & 31))),
+                6 => (format!("({} >> {})", nx, k & 31), b.int(e, IntOp::LShr, x, kc), std::rc::Rc::new(move |u, v, l| fx(u, v, l) >> (k & 31))),
+                7 => (format!("({} + {})", nx, ny), b.int(e, IntOp::Add, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l).wrapping_add(fy(u, v, l)))),
+                _ => (format!("({} - {})", nx, ny), b.int(e, IntOp::Sub, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l).wrapping_sub(fy(u, v, l)))),
+            };
+            words.push((name, value, truth));
+        }
+        (b, words)
+    }
+
+    #[test]
+    fn known_bits_hold_the_bits_of_every_lane_value() {
+        let (b, words) = lane_words();
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
+        let mut r = Random::new(59);
+        let mut wrong = Vec::new();
+        for (name, v, truth) in &words {
+            let Some(bits) = logic.lane_bits(&b.f, &facts, *v) else {
+                continue;
+            };
+            for _ in 0..40 {
+                let (u, w) = (r.next() as u32, r.next() as u32);
+                for l in 0..32u32 {
+                    let (mask, value) = bits[l as usize];
+                    let t = truth(u, w, l);
+                    if t & mask != value {
+                        wrong.push(format!("{} lane {} is {:#x}, not {:#x} under {:#x}", name, l, t, value, mask));
+                    }
+                }
+            }
+        }
+        wrong.truncate(5);
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn uniform_tests_are_equal_in_every_lane() {
+        let (mut b, mut words) = lane_words();
+        let e = BlockId(0);
+        let (lane, u) = (words[0].1, words[1].1);
+        let difference = b.int(e, IntOp::Sub, u, lane);
+        words.push(("(u - lane)".into(), difference, std::rc::Rc::new(|u, _, l| u.wrapping_sub(l))));
+        let doubled = b.int(e, IntOp::Add, lane, lane);
+        words.push(("(lane + lane)".into(), doubled, std::rc::Rc::new(|_, _, l| l.wrapping_add(l))));
+        let mut tests = Vec::new();
+        let mut r = Random::new(61);
+        for _ in 0..3000 {
+            let i = r.below(words.len() as u64) as usize;
+            let j = r.below(words.len() as u64) as usize;
+            let t = b.cmp(e, IntPred::Eq, words[i].1, words[j].1);
+            tests.push((i, j, t));
+        }
+        let n = words.len();
+        for (i, j) in [(n - 2, 0), (n - 2, n - 1), (0, n - 2)] {
+            let t = b.cmp(e, IntPred::Eq, words[i].1, words[j].1);
+            tests.push((i, j, t));
+        }
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut wrong = Vec::new();
+        let mut decided = 0;
+        for &(i, j, t) in &tests {
+            if facts.uniform[t.0] || !uniform_difference(&b.f, &facts, words[i].1, words[j].1) {
+                continue;
+            }
+            decided += 1;
+            for _ in 0..40 {
+                let mut pick = |r: &mut Random| if r.below(2) == 0 { r.below(64) as u32 } else { r.next() as u32 };
+                let (u, w) = (pick(&mut r), pick(&mut r));
+                let first = (words[i].2)(u, w, 0) == (words[j].2)(u, w, 0);
+                if (1..32).any(|l| ((words[i].2)(u, w, l) == (words[j].2)(u, w, l)) != first) {
+                    wrong.push(format!("{} == {}", words[i].0, words[j].0));
+                    break;
+                }
+            }
+        }
+        wrong.truncate(5);
+        assert!(decided > 0 && wrong.is_empty(), "{} uniform, wrong {:?}", decided, wrong);
+    }
+
     struct SelfLoop {
         b: Build,
         body: BlockId,
@@ -1709,9 +2225,11 @@ mod tests {
         expect.push(("3 > item", logic.bit(f, &facts, swapped_c), bc));
         expect.push(("7 <= item", logic.bit(f, &facts, not_d), nbd));
         let bs = logic.atom(Atom::Bit(signed));
-        let nbs = logic.m.not(bs);
-        expect.push(("item s< 3", logic.bit(f, &facts, signed), bs));
-        expect.push(("item s>= 3", logic.bit(f, &facts, not_signed), nbs));
+        let negative = logic.m.and(bs, nbd);
+        let signed_formula = logic.m.or(bc, negative);
+        let not_signed_formula = logic.m.not(signed_formula);
+        expect.push(("item s< 3", logic.bit(f, &facts, signed), signed_formula));
+        expect.push(("item s>= 3", logic.bit(f, &facts, not_signed), not_signed_formula));
         let low = logic.lanes(|l| l < 3);
         expect.push(("lane < 3", logic.bit(f, &facts, low_lanes), low));
         let high = logic.lanes(|l| l > 7);
