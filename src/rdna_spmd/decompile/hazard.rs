@@ -1506,6 +1506,25 @@ mod tests {
         assert!(!may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None), "4u + 6v is 0, 4, 6, 8, ... for u, v >= 0, never 2");
     }
 
+    fn three_wide_terms(target: u32) -> bool {
+        let unknowns = [info(0, Some((0, 10000))), info(1, Some((0, 10000))), info(2, Some((0, 10000)))];
+        let x = Form {
+            constant: 0,
+            terms: vec![(0, 4), (1, 6), (2, 10)],
+        };
+        may_overlap(&unknowns, &x, &Form::constant(target), 1, 1, &|_: &UnknownInfo| false, None)
+    }
+
+    #[test]
+    fn may_overlap_finds_four_u_plus_six_v_plus_ten_w_hitting_fourteen_over_wide_ranges() {
+        assert!(three_wide_terms(14), "u = w = 1, v = 0 gives 14");
+    }
+
+    #[test]
+    fn may_overlap_sees_that_four_u_plus_six_v_plus_ten_w_never_hits_two_over_wide_ranges() {
+        assert!(!three_wide_terms(2), "2u + 3v + 5w = 1 has no solution with u, v, w >= 0");
+    }
+
     #[test]
     fn may_overlap_sees_that_four_u_plus_six_v_never_hits_two() {
         let unknowns = [info(0, Some((0, 1))), info(1, Some((0, 1)))];
@@ -2622,6 +2641,16 @@ mod tests {
     }
 
     #[test]
+    fn find_orders_a_node_read_four_gigabytes_up_after_stores_into_that_node() {
+        assert!(node_read_at((1 << 29) + 5, (1 << 32) + 64, true), "node 2^29 + 5 starts 2^32 bytes into the BVH");
+    }
+
+    #[test]
+    fn find_keeps_a_node_read_four_gigabytes_up_apart_from_stores_into_the_first_node() {
+        assert!(!node_read_at((1 << 29) + 5, 64, true), "node 2^29 + 5 reads 2^32 bytes past the store");
+    }
+
+    #[test]
     fn find_orders_a_node_read_after_stores_into_the_node() {
         assert!(node_read(64), "the box node at the base of the BVH spans 128 bytes");
     }
@@ -2639,6 +2668,55 @@ mod tests {
     #[test]
     fn find_keeps_a_read_of_a_later_node_apart_from_stores_before_it() {
         assert!(!node_read_at(0x2d, 0x140 - 4, true), "node 0x2d starts 0x140 bytes in");
+    }
+
+    fn lane_nodes(offset: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_bvh64_intersect_ray");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let scaled = b.int(e, IntOp::Mul, lane, sixteen);
+        let five = b.constant(e, Ty::I32, 5);
+        let node = b.int(e, IntOp::Add, scaled, five);
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, node));
+        let mut args = [b.constant(e, Ty::I32, 0); 14];
+        args[0] = base_units(&mut b, e, buf);
+        args[2] = wide;
+        args[13] = k.exec;
+        let r = b.here(e);
+        b.target(e, op, Arguments::Fourteen(args), &[Ty::I32; 4]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_reads_of_lanes_own_nodes_after_stores_into_one_of_them() {
+        assert!(lane_nodes(128 * 3 + 4), "lane 3 reads node 3 * 16 + 5, 128 * 3 bytes in");
+    }
+
+    #[test]
+    fn find_keeps_reads_of_lanes_own_nodes_apart_from_stores_past_the_last() {
+        assert!(!lane_nodes(128 * 32 + 4), "the 32 lanes read the first 128 * 32 bytes");
+    }
+
+    #[test]
+    fn find_orders_a_triangle_node_read_after_stores_into_the_node() {
+        assert!(node_read_at(0, 60, true), "a triangle pair node spans 64 bytes");
+    }
+
+    #[test]
+    fn find_keeps_a_triangle_node_read_apart_from_stores_past_the_node() {
+        assert!(!node_read_at(0, 64, true), "a triangle pair node ends 64 bytes in");
+    }
+
+    #[test]
+    fn find_keeps_a_texel_read_of_the_first_row_apart_from_stores_into_a_later_row() {
+        assert!(!texel_read(5 * 128 + 4), "every lane reads row 0 when v is 0");
     }
 
     #[test]
@@ -2987,6 +3065,69 @@ mod tests {
         assert!(read_back_index(|_, _, _, _, _| {}, false, true), "lanes 16 to 31 read words nothing in this wave wrote");
     }
 
+    fn squared_back(shared: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let slot = if shared {
+            let one = b.constant(e, Ty::I32, 1);
+            b.int(e, IntOp::And, lane, one)
+        } else {
+            lane
+        };
+        let own = byte_offset(&mut b, e, table, slot, 4);
+        let square = b.int(e, IntOp::Mul, lane, lane);
+        b.store(e, Space::Global, MemSize::B32, own, square, k.exec);
+        let back = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let address = byte_offset(&mut b, e, buf, back, 4);
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_square_lanes_share_a_word_for() {
+        assert!(squared_back(true), "lanes 0 and 2 both write word 0, so lane 2 may read back lane 0's square 0");
+    }
+
+    #[test]
+    fn find_follows_a_square_the_lane_stored_and_loaded_back() {
+        assert!(!squared_back(false), "word w of the table only ever holds w * w, so each lane reads back its own square");
+    }
+
+    fn loaded_back_in_the_next_block(overwritten: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, lane, k.exec);
+        let (next, p) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
+        b.br(e, next, vec![k.exec, buf, own]);
+        if overwritten {
+            let zero = b.constant(next, Ty::I32, 0);
+            b.store(next, Space::Global, MemSize::B32, p[2], zero, p[0]);
+        }
+        let back = b.load(next, Space::Global, MemSize::B32, p[2], p[0]);
+        let address = byte_offset(&mut b, next, p[1], back, 4);
+        let (s1, s2) = twice(&mut b, next, address, p[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_an_index_the_next_block_overwrites_before_loading_it_back() {
+        assert!(loaded_back_in_the_next_block(true), "the next block writes 0 into every lane's word, so every lane reads back 0");
+    }
+
+    #[test]
+    fn find_follows_an_index_the_lane_stored_and_loaded_back_in_the_next_block() {
+        assert!(!loaded_back_in_the_next_block(false), "word w of the table only ever holds w, so each lane reads back its own lane id");
+    }
+
     #[test]
     fn find_follows_an_index_the_lane_stored_and_loaded_back() {
         let (mut b, k) = Build::kernel();
@@ -3136,6 +3277,160 @@ mod tests {
     #[test]
     fn find_keeps_a_doubling_index_off_a_word_past_its_last_value() {
         assert!(!doubling_index(16), "the index stops at 8");
+    }
+
+    fn joined_twice(same: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::U16);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, v, zero);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        b.cond_br(e, c, (then, vec![k.exec, u]), (other, vec![k.exec, u]));
+        let one = b.constant(then, Ty::I32, 1);
+        let next = b.int(then, IntOp::Add, t[1], one);
+        let second = if same { t[1] } else { next };
+        b.br(then, join, vec![t[0], t[1], second]);
+        let one = b.constant(other, Ty::I32, 1);
+        let next = b.int(other, IntOp::Add, o[1], one);
+        let two = b.constant(other, Ty::I32, 2);
+        let after = b.int(other, IntOp::Add, o[1], two);
+        let second = if same { next } else { after };
+        b.br(other, join, vec![o[0], next, second]);
+        let first_word = byte_offset(&mut b, join, buf, j[1], 4);
+        let second_word = byte_offset(&mut b, join, buf, j[2], 4);
+        let s1 = store_at(&mut b, join, first_word, j[0]);
+        let s2 = store_at(&mut b, join, second_word, j[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_two_joins_of_one_branch_that_take_the_same_word() {
+        assert!(joined_twice(true), "both joins bring u on one path and u + 1 on the other");
+    }
+
+    #[test]
+    fn find_keeps_apart_two_joins_of_one_branch_one_word_apart() {
+        assert!(!joined_twice(false), "the second join is always the first plus one");
+    }
+
+    fn joined_with_another_term(apart: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::U8);
+        let flag = uniform_word(&mut b, &k, e, 8, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, flag, zero);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+        b.cond_br(e, c, (then, vec![k.exec, u, v]), (other, vec![k.exec, u, v]));
+        b.br(then, join, vec![t[0], t[1], t[1], t[2]]);
+        let sum = b.int(other, IntOp::Add, o[1], o[2]);
+        b.br(other, join, vec![o[0], sum, o[1], o[2]]);
+        let offset = b.int(join, IntOp::Sub, j[1], j[2]);
+        let first = byte_offset(&mut b, join, buf, offset, 4);
+        let shift = b.constant(join, Ty::I32, apart);
+        let moved = b.int(join, IntOp::Add, j[3], shift);
+        let second = byte_offset(&mut b, join, buf, moved, 4);
+        let s1 = store_at(&mut b, join, first, j[0]);
+        let s2 = store_at(&mut b, join, second, j[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_join_of_different_terms_that_meets_the_other_word() {
+        assert!(joined_with_another_term(0), "on the second path the first word is v, the second word's index");
+    }
+
+    #[test]
+    fn find_keeps_apart_a_join_of_different_terms_from_a_word_it_never_takes() {
+        assert!(!joined_with_another_term(300), "the first index is 0 or v < 256, the second v + 300");
+    }
+
+    fn spilled_across_blocks(overwritten: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let at = uniform_word(&mut b, &k, e, 16, MemSize::U8);
+        let four = b.constant(e, Ty::I32, 4);
+        let slot = b.int(e, IntOp::Mul, at, four);
+        let sixty_four = b.constant(e, Ty::I32, 64);
+        let elsewhere = b.int(e, IntOp::Add, slot, sixty_four);
+        let spill = |b: &mut Build, pointer: ValueId, at: ValueId| {
+            let low = b.core(e, Ty::I32, Op::UnpackLo(pointer));
+            let high = b.core(e, Ty::I32, Op::UnpackHi(pointer));
+            let four = b.constant(e, Ty::I32, 4);
+            let above = b.int(e, IntOp::Add, at, four);
+            b.store(e, Space::Scratch, MemSize::B32, at, low, k.exec);
+            b.store(e, Space::Scratch, MemSize::B32, above, high, k.exec);
+        };
+        spill(&mut b, first, slot);
+        spill(&mut b, second, if overwritten { slot } else { elsewhere });
+        let (next, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64]);
+        b.br(e, next, vec![k.exec, slot, second]);
+        let four = b.constant(next, Ty::I32, 4);
+        let above = b.int(next, IntOp::Add, p[1], four);
+        let low = b.load(next, Space::Scratch, MemSize::B32, p[1], p[0]);
+        let high = b.load(next, Space::Scratch, MemSize::B32, above, p[0]);
+        let pointer = b.core(next, Ty::I64, Op::Pack64(low, high));
+        let lane = b.core(next, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, next, pointer, lane, 4);
+        let s1 = store_at(&mut b, next, own, p[0]);
+        let zero = b.constant(next, Ty::I32, 0);
+        let word = byte_offset(&mut b, next, p[2], zero, 4);
+        let s2 = store_at(&mut b, next, word, p[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_pointer_reloaded_in_a_later_block_from_a_slot_a_second_spill_overwrote() {
+        assert!(spilled_across_blocks(true), "the second spill overwrites the slot, so the reload is the second buffer");
+    }
+
+    #[test]
+    fn find_keeps_a_pointer_reloaded_in_a_later_block_off_a_buffer_spilled_elsewhere() {
+        assert!(!spilled_across_blocks(false), "the slot holds the first buffer; the second went 64 bytes further");
+    }
+
+    fn bounded_pair(below: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::B32);
+        let three = b.constant(e, Ty::I32, 3);
+        let small = b.cmp(e, IntPred::Ult, u, three);
+        let ten = b.constant(e, Ty::I32, 10);
+        let other = if below { b.cmp(e, IntPred::Ult, v, three) } else { b.cmp(e, IntPred::Ugt, v, ten) };
+        let first_mask = b.int(e, IntOp::And, small, k.exec);
+        let second_mask = b.int(e, IntOp::And, other, k.exec);
+        let first = byte_offset(&mut b, e, buf, u, 4);
+        let second = byte_offset(&mut b, e, buf, v, 4);
+        let s1 = store_at(&mut b, e, first, first_mask);
+        let s2 = store_at(&mut b, e, second, second_mask);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_stores_whose_predicates_let_their_indices_meet() {
+        assert!(bounded_pair(true), "u = v = 0 passes both predicates");
+    }
+
+    #[test]
+    fn find_keeps_apart_stores_whose_predicates_keep_their_indices_apart() {
+        assert!(!bounded_pair(false), "the first index is below 3 and the second above 10");
     }
 
     fn workgroup_branch(entered: u64) -> bool {

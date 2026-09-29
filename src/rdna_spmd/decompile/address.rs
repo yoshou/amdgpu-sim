@@ -6725,6 +6725,73 @@ mod facts_tests {
         assert_eq!(carried_values(&b, v), Some(vec![1, 4, 13, 40, 121]));
     }
 
+    fn affine_loop_from_either() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let is_zero = b.cmp(e, IntPred::Eq, u, zero);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let start = b.core(e, Ty::I32, Op::Select(is_zero, one, two));
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, start, zero]);
+        let three = b.constant(body, Ty::I32, 3);
+        let tripled = b.int(body, IntOp::Mul, p[1], three);
+        let one = b.constant(body, Ty::I32, 1);
+        let next_value = b.int(body, IntOp::Add, tripled, one);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let limit = b.constant(body, Ty::I32, 5);
+        let again = b.cmp(body, IntPred::Ult, next, limit);
+        b.cond_br(body, again, (body, vec![p[0], next_value, next]), (exit, vec![p[0]]));
+        (b, p[1])
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_an_affine_step_carries_from_either_start() {
+        let (b, v) = affine_loop_from_either();
+        let truth = [1u32, 2, 4, 7, 13, 22, 40, 67, 121, 202];
+        let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
+            let form = a.value(v, 0, None).0.form;
+            truth.iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the parameter runs 1, 4, 13, 40, 121 or 2, 7, 22, 67, 202: {:?}", missed);
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_an_affine_step_carries_from_either_start() {
+        let (b, v) = affine_loop_from_either();
+        assert_eq!(carried_values(&b, v), Some(vec![1, 2, 4, 7, 13, 22, 40, 67, 121, 202]));
+    }
+
+    fn hundred_affine_values() -> Vec<u32> {
+        let mut values: Vec<u32> = std::iter::successors(Some(1u32), |x| Some(x.wrapping_mul(3).wrapping_add(1))).take(100).collect();
+        values.sort_unstable();
+        values
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_an_affine_step_carries_over_a_hundred_iterations() {
+        let (b, v) = affine_loop(100);
+        let truth = hundred_affine_values();
+        let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
+            let form = a.value(v, 0, None).0.form;
+            truth.iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the parameter runs 1, 4, 13 and on for 100 iterations: {:?}", missed);
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_an_affine_step_carries_over_a_hundred_iterations() {
+        let (b, v) = affine_loop(100);
+        let carried = carried_values(&b, v).map(|mut s| {
+            s.sort_unstable();
+            s
+        });
+        assert_eq!(carried, Some(hundred_affine_values()));
+    }
+
     #[test]
     fn float_conversions_to_integers_give_what_the_saturating_conversion_gives() {
         let (mut b, _) = Build::kernel();
@@ -6764,5 +6831,271 @@ mod facts_tests {
                 .collect()
         });
         assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    fn loaded_word(b: &mut Build, k: &Kernel, e: BlockId, offset: u64, size: MemSize) -> ValueId {
+        let table = k.buffer(b, e, 8);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, table, at);
+        let yes = b.constant(e, Ty::I1, 1);
+        b.load(e, Space::Global, size, address, yes)
+    }
+
+    fn two_words() -> Environment {
+        environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)])
+    }
+
+    fn identities() -> (Build, Vec<(&'static str, ValueId)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = loaded_word(&mut b, &k, e, 4, MemSize::B32);
+        let byte = loaded_word(&mut b, &k, e, 8, MemSize::U8);
+        let thirty_one = b.constant(e, Ty::I32, 31);
+        let s = b.int(e, IntOp::And, byte, thirty_one);
+        let uv = b.int(e, IntOp::Mul, u, v);
+        let vu = b.int(e, IntOp::Mul, v, u);
+        let products = b.int(e, IntOp::Sub, uv, vu);
+        let both = b.int(e, IntOp::And, u, v);
+        let either = b.int(e, IntOp::Or, u, v);
+        let sum = b.int(e, IntOp::Add, u, v);
+        let parts = b.int(e, IntOp::Add, both, either);
+        let bits = b.int(e, IntOp::Sub, parts, sum);
+        let shifted = b.int(e, IntOp::Shl, u, s);
+        let one = b.constant(e, Ty::I32, 1);
+        let power = b.int(e, IntOp::Shl, one, s);
+        let scaled = b.int(e, IntOp::Mul, u, power);
+        let shifts = b.int(e, IntOp::Sub, shifted, scaled);
+        (b, vec![("u * v - v * u", products), ("(u & v) + (u | v) - (u + v)", bits), ("(u << s) - u * (1 << s)", shifts)])
+    }
+
+    #[test]
+    fn identities_of_nonlinear_operations_hold_zero() {
+        let (b, cases) = identities();
+        let missed: Vec<&str> = addresses(&b, &two_words(), |a| {
+            cases
+                .iter()
+                .filter(|c| {
+                    let form = a.value(c.1, 3, None).0.form;
+                    !representable(&a.unknowns, &form, 0)
+                })
+                .map(|c| c.0)
+                .collect()
+        });
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn identities_of_nonlinear_operations_give_zero() {
+        let (b, cases) = identities();
+        let loose: Vec<&str> = addresses(&b, &two_words(), |a| {
+            cases.iter().filter(|c| a.value(c.1, 3, None).0.form.as_constant() != Some(0)).map(|c| c.0).collect()
+        });
+        assert!(loose.is_empty(), "each is 0 for every u, v and s: {:?}", loose);
+    }
+
+    fn counted_bits() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let count = b.core(e, Ty::I32, Op::PopulationCount(u));
+        let limit = b.constant(e, Ty::I32, 32);
+        let within = b.cmp(e, IntPred::Ule, count, limit);
+        (b, within)
+    }
+
+    #[test]
+    fn bit_counts_decide_nothing_false() {
+        let (b, within) = counted_bits();
+        let found = addresses(&b, &two_words(), |a| a.bit(within, 0, None).0);
+        assert_ne!(found, Some(false), "a word has at most 32 bits set");
+    }
+
+    #[test]
+    fn bit_counts_stay_within_the_width() {
+        let (b, within) = counted_bits();
+        let found = addresses(&b, &two_words(), |a| a.bit(within, 0, None).0);
+        assert_eq!(found, Some(true), "a word has at most 32 bits set");
+    }
+
+    fn wide_sums() -> (Build, Vec<(&'static str, ValueId, u32)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let step = b.constant(e, Ty::I64, 256);
+        let past = b.int(e, IntOp::Add, buf, step);
+        let eight = b.constant(e, Ty::I64, 8);
+        let units = b.int(e, IntOp::LShr, past, eight);
+        let low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, units));
+        let far = b.constant(e, Ty::I64, 0x1_0000_0000);
+        let above = b.int(e, IntOp::Add, buf, far);
+        let high = b.core(e, Ty::I32, Op::UnpackHi(above));
+        (b, vec![("low((buf + 256) >> 8)", low, 0x11), ("high(buf + 2^32)", high, 1)])
+    }
+
+    #[test]
+    fn wide_shifts_and_high_halves_of_sums_hold_their_values() {
+        let (b, cases) = wide_sums();
+        let missed: Vec<&str> = addresses(&b, &two_words(), |a| {
+            cases
+                .iter()
+                .filter(|c| {
+                    let form = a.value(c.1, 0, None).0.form;
+                    !representable(&a.unknowns, &form, c.2)
+                })
+                .map(|c| c.0)
+                .collect()
+        });
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn wide_shifts_and_high_halves_of_sums_give_their_values() {
+        let (b, cases) = wide_sums();
+        let loose: Vec<String> = addresses(&b, &two_words(), |a| {
+            cases
+                .iter()
+                .filter_map(|c| {
+                    let form = a.value(c.1, 0, None).0.form;
+                    (form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, form))
+                })
+                .collect()
+        });
+        assert!(loose.is_empty(), "buf is 0x1000: {:?}", loose);
+    }
+
+    fn shared_word() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let four = b.constant(e, Ty::I32, 4);
+        let own = b.int(e, IntOp::Mul, lane, four);
+        b.store(e, Space::Lds, MemSize::B32, own, lane, k.exec);
+        let back = b.load(e, Space::Lds, MemSize::B32, own, k.exec);
+        (b, back)
+    }
+
+    #[test]
+    fn lds_words_read_back_hold_the_word_the_lane_stored() {
+        let (b, back) = shared_word();
+        let held = addresses(&b, &two_words(), |a| {
+            let form = a.value(back, 3, None).0.form;
+            representable(&a.unknowns, &form, 3)
+        });
+        assert!(held, "lane 3 reads back the 3 it stored");
+    }
+
+    #[test]
+    fn lds_words_read_back_give_the_word_the_lane_stored() {
+        let (b, back) = shared_word();
+        let form = addresses(&b, &two_words(), |a| a.value(back, 3, None).0.form);
+        assert_eq!(form, Form::constant(3), "word 3 of the LDS only ever holds 3");
+    }
+
+    fn squared_loop() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, one, zero]);
+        let squared = b.int(body, IntOp::Mul, p[1], p[1]);
+        let one = b.constant(body, Ty::I32, 1);
+        let next_value = b.int(body, IntOp::Add, squared, one);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let three = b.constant(body, Ty::I32, 3);
+        let again = b.cmp(body, IntPred::Ult, next, three);
+        b.cond_br(body, again, (body, vec![p[0], next_value, next]), (exit, vec![p[0]]));
+        (b, p[1])
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_a_square_step_carries() {
+        let (b, v) = squared_loop();
+        let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
+            let form = a.value(v, 0, None).0.form;
+            [1u32, 2, 5].iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the parameter runs 1, 2, 5: {:?}", missed);
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_a_square_step_carries() {
+        let (b, v) = squared_loop();
+        assert_eq!(carried_values(&b, v), Some(vec![1, 2, 5]));
+    }
+
+    fn halves_in_two_blocks() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let one = b.constant(e, Ty::I32, 1);
+        let x = b.int(e, IntOp::LShr, u, one);
+        let (next, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        b.br(e, next, vec![k.exec, u, x]);
+        let one = b.constant(next, Ty::I32, 1);
+        let y = b.int(next, IntOp::LShr, p[1], one);
+        let difference = b.int(next, IntOp::Sub, p[2], y);
+        (b, difference)
+    }
+
+    #[test]
+    fn halves_of_one_word_in_two_blocks_hold_their_difference() {
+        let (b, difference) = halves_in_two_blocks();
+        let held = addresses(&b, &two_words(), |a| {
+            let form = a.value(difference, 0, None).0.form;
+            representable(&a.unknowns, &form, 0)
+        });
+        assert!(held);
+    }
+
+    #[test]
+    fn halves_of_one_word_in_two_blocks_are_equal() {
+        let (b, difference) = halves_in_two_blocks();
+        let form = addresses(&b, &two_words(), |a| a.value(difference, 0, None).0.form);
+        assert_eq!(form, Form::constant(0), "both are u >> 1 of the same u");
+    }
+
+    fn chosen_after_branch(entered: bool) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let is_zero = b.cmp(e, IntPred::Eq, u, zero);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32]);
+        b.cond_br(e, is_zero, (then, vec![k.exec, u]), (other, vec![k.exec, u]));
+        let (block, p) = if entered { (then, t) } else { (other, o) };
+        let zero = b.constant(block, Ty::I32, 0);
+        let test = b.cmp(block, IntPred::Eq, p[1], zero);
+        let seven = b.constant(block, Ty::I32, 7);
+        let nine = b.constant(block, Ty::I32, 9);
+        let chosen = b.core(block, Ty::I32, Op::Select(test, seven, nine));
+        (b, chosen)
+    }
+
+    #[test]
+    fn selects_after_a_branch_hold_the_arm_the_branch_leaves() {
+        let missed: Vec<bool> = [true, false]
+            .iter()
+            .copied()
+            .filter(|&entered| {
+                let (b, chosen) = chosen_after_branch(entered);
+                let truth = if entered { 7 } else { 9 };
+                !addresses(&b, &two_words(), |a| {
+                    let form = a.value(chosen, 0, None).0.form;
+                    representable(&a.unknowns, &form, truth)
+                })
+            })
+            .collect();
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn selects_after_a_branch_take_the_arm_the_branch_decides() {
+        let (b, chosen) = chosen_after_branch(true);
+        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        assert_eq!(form, Form::constant(7), "the block runs only when u is 0");
     }
 }
