@@ -78,6 +78,7 @@ pub struct Logic {
     views: HashMap<ValueId, Bdd>,
     lane_values: HashMap<ValueId, Option<[u32; 32]>>,
     orders: HashMap<BlockId, Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>>>,
+    thresholds: HashMap<BlockId, Rc<Vec<Threshold>>>,
     supports: HashMap<Bdd, Rc<Vec<u32>>>,
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
     relations: BTreeMap<(BlockId, usize), Rc<Vec<Binding>>>,
@@ -118,6 +119,7 @@ impl Logic {
             views: HashMap::default(),
             lane_values: HashMap::default(),
             orders: HashMap::default(),
+            thresholds: HashMap::default(),
             supports: HashMap::default(),
             edges: BTreeMap::new(),
             relations: BTreeMap::new(),
@@ -426,19 +428,99 @@ impl Logic {
                     self.compare(f, facts, p, a, b, opaque, &mut HashMap::default())
                 }
                 Op::Cmp(p, a, b) => {
-                    let (q, x, y, negated) = ordered(p, a, b);
-                    let first = match facts.site[v.0] {
-                        Site::Inst { block, .. } => self.first_order(f, block)[&(q, x, y)],
-                        _ => v,
+                    let leaf = match (threshold(f, facts, p, a, b), facts.site[v.0]) {
+                        (Some(t), Site::Inst { block, index }) => {
+                            let below = self.below(f, facts, block, index, v, t);
+                            if t.flip {
+                                self.m.not(below)
+                            } else {
+                                below
+                            }
+                        }
+                        _ => {
+                            let (q, x, y, negated) = ordered(p, a, b);
+                            let first = match facts.site[v.0] {
+                                Site::Inst { block, .. } => self.first_order(f, block)[&(q, x, y)],
+                                _ => v,
+                            };
+                            let relation = self.relation(f, facts, first, (q, x, y));
+                            if negated {
+                                self.m.not(relation)
+                            } else {
+                                relation
+                            }
+                        }
                     };
-                    let relation = self.relation(f, facts, first, (q, x, y));
-                    let leaf = if negated { self.m.not(relation) } else { relation };
                     self.order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 _ => self.atom(opaque),
             },
             _ => self.atom(opaque),
         }
+    }
+
+    fn below(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, t: Threshold) -> Bdd {
+        let (min, max) = if t.signed {
+            (i32::MIN as i64, i32::MAX as i64)
+        } else {
+            (0, u32::MAX as i64)
+        };
+        if t.at <= min {
+            return Bdd::FALSE;
+        }
+        if t.at > max {
+            return Bdd::TRUE;
+        }
+        let list = self.block_thresholds(f, facts, block);
+        let earlier = list.iter().filter(|e| e.index < index && e.value == t.value && e.signed == t.signed);
+        let (mut lower, mut upper): (Option<Threshold>, Option<Threshold>) = (None, None);
+        for e in earlier {
+            if e.at == t.at {
+                let bit = self.bit(f, facts, e.of);
+                return if e.flip { self.m.not(bit) } else { bit };
+            }
+            if e.at < t.at && lower.is_none_or(|l| l.at < e.at) {
+                lower = Some(*e);
+            }
+            if e.at > t.at && upper.is_none_or(|u| u.at > e.at) {
+                upper = Some(*e);
+            }
+        }
+        let atom = self.atom(Atom::Bit(v));
+        let mut holds = if t.flip { self.m.not(atom) } else { atom };
+        if let Some(u) = upper {
+            let bit = self.bit(f, facts, u.of);
+            let upper = if u.flip { self.m.not(bit) } else { bit };
+            holds = self.m.and(holds, upper);
+        }
+        if let Some(l) = lower {
+            let bit = self.bit(f, facts, l.of);
+            let lower = if l.flip { self.m.not(bit) } else { bit };
+            holds = self.m.or(holds, lower);
+        }
+        holds
+    }
+
+    fn block_thresholds(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<Vec<Threshold>> {
+        if let Some(list) = self.thresholds.get(&block) {
+            return list.clone();
+        }
+        let mut list = Vec::new();
+        for (index, inst) in f.blocks[&block].insts.iter().enumerate() {
+            if let Inst::Core {
+                value,
+                op: Op::Cmp(p, a, b),
+                ..
+            } = inst
+            {
+                if let Some(t) = threshold(f, facts, *p, *a, *b) {
+                    list.push(Threshold { index, of: *value, ..t });
+                }
+            }
+        }
+        let list = Rc::new(list);
+        self.thresholds.insert(block, list.clone());
+        list
     }
 
     fn relation(&mut self, f: &Func, facts: &Facts, first: ValueId, (q, x, y): (IntPred, ValueId, ValueId)) -> Bdd {
@@ -1107,6 +1189,38 @@ fn arriving(src: BlockId, dst: BlockId, atom: Atom) -> Atom {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Threshold {
+    value: ValueId,
+    signed: bool,
+    at: i64,
+    flip: bool,
+    index: usize,
+    of: ValueId,
+}
+
+fn threshold(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Threshold> {
+    if matches!(p, IntPred::Eq | IntPred::Ne) || f.types[a.0] != Ty::I32 {
+        return None;
+    }
+    let (q, x, y, negated) = ordered(p, a, b);
+    let signed = q == IntPred::Slt;
+    let at = |k: u64| if signed { k as u32 as i32 as i64 } else { k as u32 as i64 };
+    let (value, at, flip) = match (facts.constant(f, x), facts.constant(f, y)) {
+        (None, Some(k)) => (x, at(k), negated),
+        (Some(k), None) => (y, at(k) + 1, !negated),
+        _ => return None,
+    };
+    Some(Threshold {
+        value,
+        signed,
+        at,
+        flip,
+        index: 0,
+        of: value,
+    })
+}
+
 fn ordered(p: IntPred, a: ValueId, b: ValueId) -> (IntPred, ValueId, ValueId, bool) {
     match p {
         IntPred::Uge => (IntPred::Ult, a, b, true),
@@ -1369,12 +1483,15 @@ mod tests {
         let f = &b.f;
         let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
         let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
-        let (bc, bd) = (logic.atom(Atom::Bit(c)), logic.atom(Atom::Bit(d)));
+        let bc = logic.atom(Atom::Bit(c));
+        let own_d = logic.atom(Atom::Bit(d));
+        let bd = logic.m.or(own_d, bc);
         let _ = exec;
         let mut expect = Vec::new();
         let xor = logic.m.xor(bc, bd);
         let ndd = logic.m.not(bd);
         let crossed_formula = logic.m.ite(bc, ndd, bd);
+        expect.push(("item < 7 after item < 3", logic.bit(f, &facts, d), bd));
         expect.push(("select(c, 1, 2) == select(d, 2, 1)", logic.bit(f, &facts, crossed), crossed_formula));
         expect.push(("select(c, 1, 2) == 1", logic.bit(f, &facts, picked), bc));
         expect.push(("lane != lane", logic.bit(f, &facts, same), Bdd::FALSE));

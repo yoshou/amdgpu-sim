@@ -3088,6 +3088,52 @@ mod tests {
         b
     }
 
+    fn bounded(first: (IntPred, u64), second: (IntPred, u64)) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let v = per_lane(&mut b, &k, e, 16);
+        let mut bits = Vec::new();
+        for (p, bound) in [first, second] {
+            let bound = b.constant(e, Ty::I32, bound);
+            bits.push(b.cmp(e, p, v, bound));
+        }
+        let both = b.int(e, IntOp::And, bits[0], bits[1]);
+        let mask = b.int(e, IntOp::And, both, k.exec);
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    #[test]
+    fn prove_follows_pairs_of_bounds_on_one_word() {
+        let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge];
+        let bounds = [0u32, 1, 4, 5, 6, 10, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+        let holds = |p: IntPred, v: u32, k: u32| super::super::address::compare(p, v, k);
+        let signed = |p: IntPred| matches!(p, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
+        let mut r = Random::new(29);
+        let mut wrong = Vec::new();
+        for _ in 0..300 {
+            let (p1, k1) = (preds[r.below(8) as usize], bounds[r.below(9) as usize]);
+            let (p2, k2) = (preds[r.below(8) as usize], bounds[r.below(9) as usize]);
+            let mut candidates = vec![0u32, 1, 2, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+            for k in [k1, k2] {
+                candidates.extend([k.wrapping_sub(1), k, k.wrapping_add(1)]);
+            }
+            let possible = candidates.iter().any(|&v| holds(p1, v, k1) && holds(p2, v, k2));
+            let b = bounded((p1, k1 as u64), (p2, k2 as u64));
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                let converted = kept.queries.is_empty();
+                if possible && converted {
+                    wrong.push(format!("{}: v {:?} {} and v {:?} {} can both hold, yet the query was converted", name, p1, k1, p2, k2));
+                }
+                if !possible && !converted && signed(p1) == signed(p2) {
+                    wrong.push(format!("{}: v {:?} {} and v {:?} {} never both hold, yet the query stays", name, p1, k1, p2, k2));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+
     #[test]
     fn prove_converts_a_query_whose_store_disjoint_ranges_mask() {
         let b = two_bounds(5, 10);

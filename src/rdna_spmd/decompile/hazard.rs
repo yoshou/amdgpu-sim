@@ -2343,20 +2343,45 @@ mod tests {
         environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)])
     }
 
-    #[test]
-    fn find_keeps_apart_lanes_scaled_by_an_odd_word() {
+    fn scaled_lanes(scale: impl Fn(&mut Build, BlockId, ValueId) -> ValueId) -> bool {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
-        let one = b.constant(e, Ty::I32, 1);
-        let odd = b.int(e, IntOp::Or, u, one);
+        let factor = scale(&mut b, e, u);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
-        let index = b.int(e, IntOp::Mul, lane, odd);
+        let index = b.int(e, IntOp::Mul, lane, factor);
         let address = byte_offset(&mut b, e, buf, index, 4);
         let (s1, s2) = twice(&mut b, e, address, k.exec);
         let h = Hazards::find(&b.program(), &env2());
-        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "an odd multiplier keeps the lanes 0 to 31 on distinct words");
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_scaled_by_an_odd_word() {
+        let collide = scaled_lanes(|b, e, u| {
+            let one = b.constant(e, Ty::I32, 1);
+            b.int(e, IntOp::Or, u, one)
+        });
+        assert!(!collide, "an odd multiplier keeps the lanes 0 to 31 on distinct words");
+    }
+
+    #[test]
+    fn find_reports_lanes_scaled_by_a_word_with_its_low_bit_cleared() {
+        let collide = scaled_lanes(|b, e, u| {
+            let even = b.constant(e, Ty::I32, !1u32 as u64);
+            b.int(e, IntOp::And, u, even)
+        });
+        assert!(collide, "u = 2^31 makes every lane's word 0");
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_scaled_by_a_word_with_its_second_bit_set() {
+        let collide = scaled_lanes(|b, e, u| {
+            let two = b.constant(e, Ty::I32, 2);
+            b.int(e, IntOp::Or, u, two)
+        });
+        assert!(!collide, "u | 2 is odd or twice an odd number, so 4 lane (u | 2) differs between the lanes 0 to 31");
     }
 
     #[test]
@@ -2388,6 +2413,59 @@ mod tests {
         let (s1, s2) = twice(&mut b, e, address, k.exec);
         let h = Hazards::find(&b.program(), &env2());
         assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "word w of the table only ever holds w, so each lane reads back its own lane id");
+    }
+
+    #[test]
+    fn find_reports_the_lanes_after_a_join_where_one_path_halves_the_index() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let v = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, v, zero);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let one = b.constant(e, Ty::I32, 1);
+        let half = b.int(e, IntOp::LShr, lane, one);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I32]);
+        b.cond_br(e, c, (then, vec![k.exec, lane]), (other, vec![k.exec, half]));
+        b.br(then, join, vec![t[0], t[1]]);
+        b.br(other, join, vec![o[0], o[1]]);
+        let address = byte_offset(&mut b, join, buf, j[1], 4);
+        let (s1, s2) = twice(&mut b, join, address, j[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(h.conflicts().contains(&pair(&h, s1, s2)), "on the second path lanes 0 and 1 both store to word 0");
+    }
+
+    #[test]
+    fn find_reports_indices_a_path_into_a_private_slot_halves() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let v = uniform_word(&mut b, &k, e, 16, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, v, zero);
+        let slot = b.constant(e, Ty::I32, 16);
+        let one = b.constant(e, Ty::I32, 1);
+        let half = b.int(e, IntOp::LShr, lane, one);
+        b.store(e, Space::Scratch, MemSize::B32, slot, lane, k.exec);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        let (last, l) = b.block(&[Ty::I1, Ty::I64]);
+        b.cond_br(e, c, (then, vec![k.exec, buf]), (other, vec![k.exec, buf, half]));
+        let slot_other = b.constant(other, Ty::I32, 16);
+        b.store(other, Space::Scratch, MemSize::B32, slot_other, o[2], o[0]);
+        b.br(other, last, vec![o[0], o[1]]);
+        b.br(then, last, vec![t[0], t[1]]);
+        let slot = b.constant(last, Ty::I32, 16);
+        let index = b.load(last, Space::Scratch, MemSize::B32, slot, l[0]);
+        let address = byte_offset(&mut b, last, l[1], index, 4);
+        let s1 = store_at(&mut b, last, address, l[0]);
+        let s2 = store_at(&mut b, last, address, l[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        assert!(h.conflicts().contains(&pair(&h, s1, s2)), "on the second path lanes 0 and 1 reload 0 and store to word 0");
     }
 
     #[test]

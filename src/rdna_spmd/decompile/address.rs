@@ -142,6 +142,10 @@ enum Key {
     Workgroup(usize),
     Trip(BlockId),
     Derived(ValueId, Vec<(Unknown, u32)>, u32),
+    Low(ValueId),
+    Spread(ValueId, u8),
+    HeldSpread(Slot, usize),
+    Carry(ValueId, u8),
     Left(Unknown, u8),
     Cycle(ValueId, u8),
     Guess(ValueId, u8),
@@ -1113,10 +1117,53 @@ impl<'a> Addresses<'a> {
         self.merge_held(values, (block, address, bytes, lane as u8), 0)
     }
 
+    fn spread(&mut self, key: Key, shared: bool, block: BlockId, forms: &[Form]) -> Option<Form> {
+        let first = forms.first()?;
+        if forms.iter().any(|f| f.terms != first.terms) {
+            return None;
+        }
+        let low = forms.iter().map(|f| f.constant).min()?;
+        let high = forms.iter().map(|f| f.constant).max()?;
+        let step = forms.iter().fold(0u32, |g, f| {
+            let (mut a, mut b) = (g, f.constant - low);
+            while b != 0 {
+                (a, b) = (b, a % b);
+            }
+            a
+        });
+        if step == 0 {
+            return Some(first.clone());
+        }
+        let u = self.intern(
+            key,
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block,
+                range: Some((0, (high - low) / step)),
+                through: Vec::new(),
+            },
+        );
+        let base = Form {
+            constant: low,
+            terms: first.terms.clone(),
+        };
+        Some(base.add(&Form::unknown(u).scale(step)))
+    }
+
     fn merge_held(&mut self, values: Vec<Value>, slot: Slot, index: usize) -> Option<Value> {
         let first = values.first()?.clone();
         if values.iter().all(|v| *v == first) {
             return Some(first);
+        }
+        if values.iter().all(|v| v.region == first.region) {
+            let forms: Vec<Form> = values.iter().map(|v| v.form.clone()).collect();
+            if let Some(form) = self.spread(Key::HeldSpread(slot, index), false, slot.0, &forms) {
+                return Some(Value {
+                    form,
+                    region: first.region,
+                });
+            }
         }
         let region = first.region.filter(|r| values.iter().all(|v| v.region == Some(*r)))?;
         let u = self.intern(
@@ -2507,6 +2554,7 @@ impl<'a> Addresses<'a> {
         let mut joined: Option<Value> = None;
         let mut region: Option<Option<Region>> = None;
         let mut agreed = true;
+        let mut forms: Vec<Form> = Vec::new();
         for a in arguments {
             let (value, _) = self.operand(a, block, lane, None);
             region = Some(match region {
@@ -2514,6 +2562,7 @@ impl<'a> Addresses<'a> {
                 Some(r) if r == value.region => r,
                 Some(_) => None,
             });
+            forms.push(value.form.clone());
             match &joined {
                 None => joined = Some(value),
                 Some(old) if *old == value => {}
@@ -2521,9 +2570,12 @@ impl<'a> Addresses<'a> {
             }
         }
         if !agreed {
+            let shared = self.facts.uniform[v.0];
+            let key = Key::Spread(v, if shared { 0 } else { lane as u8 });
+            let spread = self.spread(key, shared, block, &forms);
             return unassumed(Value {
                 region: region.flatten(),
-                ..self.opaque(v, lane, None)
+                ..spread.map(Value::of).unwrap_or_else(|| self.opaque(v, lane, None))
             });
         }
         unassumed(joined.unwrap_or_else(|| self.opaque(v, lane, None)))
@@ -2643,6 +2695,14 @@ impl<'a> Addresses<'a> {
                         form: low_bits(&b.form, c, k).unwrap(),
                         region: b.region,
                     },
+                    (None, Some(c)) if c != 0 => match self.split_low_bits(v, &a.form, c, k, lane) {
+                        Some(x) => Value { region: a.region, ..x },
+                        None => self.opaque(v, lane, None),
+                    },
+                    (Some(c), None) if c != 0 => match self.split_low_bits(v, &b.form, c, k, lane) {
+                        Some(x) => Value { region: b.region, ..x },
+                        None => self.opaque(v, lane, None),
+                    },
                     _ => self.opaque(v, lane, None),
                 }
             }
@@ -2725,9 +2785,7 @@ impl<'a> Addresses<'a> {
         if form.terms.iter().any(|&(u, _)| !self.unknowns[u as usize].shared) {
             return self.opaque(v, lane, None);
         }
-        let Some((low, high)) = self.bounds(form) else {
-            return self.opaque(v, lane, None);
-        };
+        let (low, high) = self.bounds(form).unwrap_or((0, u32::MAX as u64));
         let j = form.alignment();
         if k <= j {
             return Value::of(Form {
@@ -2788,21 +2846,54 @@ impl<'a> Addresses<'a> {
             }
             let j = rest.alignment();
             if rest.terms.iter().all(|&(u, _)| self.unknowns[u as usize].shared) {
-                let above = form.constant >> j;
                 let block = self.block_of(v);
                 let through = self.through(&rest);
-                let u = self.intern(
-                    Key::Derived(v, rest.terms.clone(), above),
-                    UnknownInfo {
-                        rank: 0,
-                        shared: true,
-                        block,
-                        range: Some((0, m >> j)),
-                        through,
-                    },
-                );
+                let terms = Form {
+                    constant: 0,
+                    terms: rest.terms.clone(),
+                };
+                let whole = match self.bounds(&terms) {
+                    Some((low, high)) if low & !(m as u64) == high & !(m as u64) => {
+                        Some((terms.sub(&Form::constant((low & !(m as u64)) as u32)), high - (low & !(m as u64))))
+                    }
+                    _ => None,
+                };
+                let (masked, top) = match whole {
+                    Some(exact) => exact,
+                    None => {
+                        let u = self.intern(
+                            Key::Derived(v, rest.terms.clone(), 0),
+                            UnknownInfo {
+                                rank: 0,
+                                shared: true,
+                                block,
+                                range: Some((0, m >> j)),
+                                through,
+                            },
+                        );
+                        (Form::unknown(u).scale(1 << j), m as u64)
+                    }
+                };
                 let below = form.constant & ((1u32 << j) - 1);
-                return Value::of(Form::unknown(u).scale(1 << j).add(&Form::constant(below)));
+                let carried = (form.constant - below) & m;
+                let mut result = masked.add(&Form::constant(below));
+                if carried != 0 && top + carried as u64 + below as u64 > m as u64 {
+                    let shared = self.facts.uniform[v.0];
+                    let carry = self.intern(
+                        Key::Carry(v, if shared { 0 } else { lane as u8 }),
+                        UnknownInfo {
+                            rank: 0,
+                            shared,
+                            block,
+                            range: Some((0, 1)),
+                            through: Vec::new(),
+                        },
+                    );
+                    result = result.add(&Form::constant(carried)).sub(&Form::unknown(carry).scale(m + 1));
+                } else {
+                    result = result.add(&Form::constant(carried));
+                }
+                return Value::of(result);
             }
             return self.opaque(v, lane, Some((0, m)));
         }
@@ -2812,8 +2903,38 @@ impl<'a> Addresses<'a> {
             if form.alignment() >= k {
                 return Value::of(form.sub(&Form::constant(form.constant & high)));
             }
+            if form.terms.iter().all(|&(u, _)| self.unknowns[u as usize].shared) {
+                let above = self.shift(v, form, k, lane);
+                return Value::of(above.form.scale(1 << k));
+            }
         }
         self.opaque(v, lane, Some((0, m)))
+    }
+
+    fn split_low_bits(&mut self, v: ValueId, form: &Form, c: u32, op: IntOp, lane: usize) -> Option<Value> {
+        if form.terms.iter().any(|&(u, _)| !self.unknowns[u as usize].shared) {
+            return None;
+        }
+        let j = 32 - c.leading_zeros();
+        let top = if j == 32 { u32::MAX } else { (1u32 << j) - 1 };
+        let above = if j == 32 { Form::constant(0) } else { self.shift(v, form, j, lane).form.scale(1 << j) };
+        if op == IntOp::Or && c == top {
+            return Some(Value::of(above.add(&Form::constant(c))));
+        }
+        let range = if op == IntOp::Or { (c, top) } else { (0, top) };
+        let block = self.block_of(v);
+        let through = self.through(form);
+        let low = self.intern(
+            Key::Low(v),
+            UnknownInfo {
+                rank: 0,
+                shared: true,
+                block,
+                range: Some(range),
+                through,
+            },
+        );
+        Some(Value::of(above.add(&Form::unknown(low))))
     }
 
     fn disjoint_bits(&self, a: &Form, b: &Form) -> bool {
@@ -4815,6 +4936,157 @@ mod facts_tests {
                 k += 1;
             }
         }
+    }
+
+    fn joined_values() -> (Build, Vec<(ValueId, Vec<Box<dyn Fn(u32) -> u32>>)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let x = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let zero = b.constant(e, Ty::I32, 0);
+        let first = b.cmp(e, IntPred::Ne, x, zero);
+        let one = b.constant(e, Ty::I32, 1);
+        let second = b.cmp(e, IntPred::Ugt, x, one);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let thirty_one = b.constant(e, Ty::I32, 31);
+        let mirrored = b.int(e, IntOp::Sub, thirty_one, lane);
+        let eight = b.constant(e, Ty::I32, 8);
+        let past = b.int(e, IntOp::Add, lane, eight);
+        let (five, nine, thirteen) = (b.constant(e, Ty::I32, 5), b.constant(e, Ty::I32, 9), b.constant(e, Ty::I32, 13));
+        let (middle, _) = b.block(&[Ty::I1]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+        b.cond_br(e, first, (middle, vec![k.exec]), (join, vec![k.exec, lane, five, lane]));
+        let exec = b.f.blocks[&middle].params[0].0;
+        b.cond_br(middle, second, (join, vec![exec, mirrored, nine, past]), (join, vec![exec, mirrored, thirteen, lane]));
+        let values: Vec<(ValueId, Vec<Box<dyn Fn(u32) -> u32>>)> = vec![
+            (j[1], vec![Box::new(|l| l), Box::new(|l| 31 - l)]),
+            (j[2], vec![Box::new(|_| 5), Box::new(|_| 9), Box::new(|_| 13)]),
+            (j[3], vec![Box::new(|l| l), Box::new(|l| l + 8)]),
+        ];
+        (b, values)
+    }
+
+    #[test]
+    fn joins_hold_every_value_an_incoming_edge_brings() {
+        let (b, values) = joined_values();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut wrong = Vec::new();
+        addresses(&b, &env, |a| {
+            for (v, truths) in &values {
+                for l in 0..32 {
+                    let f = a.value(*v, l, None).0.form;
+                    for truth in truths {
+                        if !representable(&a.unknowns, &f, truth(l as u32)) {
+                            wrong.push(format!("{:?} lane {}: {:?} cannot be {}", v, l, f, truth(l as u32)));
+                        }
+                    }
+                }
+            }
+        });
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn joins_hold_only_the_values_on_the_steps_between_them() {
+        let (b, values) = joined_values();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut loose = Vec::new();
+        addresses(&b, &env, |a| {
+            let f = a.value(values[1].0, 3, None).0.form;
+            for (value, holds) in [(5u32, true), (7, false), (9, true), (11, false), (13, true), (17, false)] {
+                if exactly_representable(&a.unknowns, &f, value) != Some(holds) {
+                    loose.push(format!("{:?} at {}: not {}", f, value, holds));
+                }
+            }
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    fn low_bit_masks() -> (Build, Vec<(&'static str, ValueId, Box<dyn Fn(u32) -> u32>)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let z = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let c = |b: &mut Build, k: u64| b.constant(e, Ty::I32, k);
+        let mut words: Vec<(&'static str, ValueId, Box<dyn Fn(u32) -> u32>)> = Vec::new();
+        let one = c(&mut b, 1);
+        let v = b.int(e, IntOp::Or, z, one);
+        words.push(("z | 1", v, Box::new(|z| z | 1)));
+        let seven = c(&mut b, 7);
+        let v = b.int(e, IntOp::Or, seven, z);
+        words.push(("7 | z", v, Box::new(|z| z | 7)));
+        let clear = c(&mut b, !7u32 as u64);
+        let v = b.int(e, IntOp::And, z, clear);
+        words.push(("z & ~7", v, Box::new(|z| z & !7)));
+        let two = c(&mut b, 2);
+        let v = b.int(e, IntOp::Or, z, two);
+        words.push(("z | 2", v, Box::new(|z| z | 2)));
+        let three = c(&mut b, 3);
+        let bumped = b.int(e, IntOp::Add, z, three);
+        let v = b.int(e, IntOp::Or, bumped, one);
+        words.push(("(z + 3) | 1", v, Box::new(|z| z.wrapping_add(3) | 1)));
+        let five = c(&mut b, 5);
+        let v = b.int(e, IntOp::Or, z, five);
+        words.push(("z | 5", v, Box::new(|z| z | 5)));
+        let v = b.int(e, IntOp::Xor, z, three);
+        words.push(("z ^ 3", v, Box::new(|z| z ^ 3)));
+        let top = c(&mut b, 0x8000_0001);
+        let v = b.int(e, IntOp::Xor, z, top);
+        words.push(("z ^ 0x80000001", v, Box::new(|z| z ^ 0x8000_0001)));
+        (b, words)
+    }
+
+    #[test]
+    fn low_bit_masks_hold_every_value_of_a_uniform_word() {
+        let (b, words) = low_bit_masks();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut wrong = Vec::new();
+        addresses(&b, &env, |a| {
+            let forms: Vec<Form> = words.iter().map(|&(_, v, _)| a.value(v, 0, None).0.form).collect();
+            let mut r = Random::new(71);
+            let mut values = vec![0u32, 1, 2, 6, 7, 8, 0x7fff_ffff, 0x8000_0000, u32::MAX - 2, u32::MAX];
+            values.extend((0..40).map(|_| r.next() as u32));
+            for z in values {
+                for (i, (name, _, truth)) in words.iter().enumerate() {
+                    if !representable(&a.unknowns, &forms[i], truth(z)) {
+                        wrong.push(format!("{} at z = {:#x}: {:?} cannot be {:#x}", name, z, forms[i], truth(z)));
+                    }
+                }
+            }
+        });
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn low_bit_masks_keep_the_high_part_of_a_uniform_word() {
+        let (b, words) = low_bit_masks();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut loose = Vec::new();
+        addresses(&b, &env, |a| {
+            for (name, scale, constant) in [("z | 1", 2u32, 1u32), ("7 | z", 8, 7), ("z & ~7", 8, 0), ("(z + 3) | 1", 2, 1)] {
+                let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
+                let f = a.value(v, 0, None).0.form;
+                let shaped = f.constant == constant && f.terms.len() == 1 && f.terms[0].1 == scale;
+                if !shaped {
+                    loose.push(format!("{}: {:?}, not {} times one unknown plus {}", name, f, scale, constant));
+                }
+            }
+            for (name, scale, low) in [("z | 2", 4u32, (2u32, 3u32)), ("z | 5", 8, (5, 7)), ("z ^ 3", 4, (0, 3))] {
+                let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
+                let f = a.value(v, 0, None).0.form;
+                let ranges: Vec<Option<(u32, u32)>> = f.terms.iter().map(|&(u, _)| a.unknowns[u as usize].range).collect();
+                let shaped = f.constant == 0
+                    && f.terms.len() == 2
+                    && f.terms.iter().any(|&(_, c)| c == scale)
+                    && f.terms.iter().zip(&ranges).any(|(&(_, c), &r)| c == 1 && r == Some(low));
+                if !shaped {
+                    loose.push(format!("{}: {:?} over {:?}, not {} times the high part plus a low part in {:?}", name, f, ranges, scale, low));
+                }
+            }
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
     }
 
     #[test]
