@@ -1,4 +1,4 @@
-use super::hazard::Hazards;
+use super::hazard::{Hazards, Kind};
 use super::address::compare;
 use super::logic::{constant_choices, lane_test, projected_word, Atom, Choice, Logic};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
@@ -142,6 +142,13 @@ impl<'a> Check<'a> {
         }
     }
 
+    pub fn orderings(&mut self) -> (BTreeMap<(BlockId, usize), Bdd>, BTreeMap<(BlockId, usize), Bdd>) {
+        self.loaded.clear();
+        self.reordered.clear();
+        self.order_accesses();
+        (self.loaded.clone(), self.reordered.clone())
+    }
+
     pub fn run(&mut self) -> bool {
         let f = self.f;
         let start = match self.exec_index {
@@ -236,6 +243,38 @@ impl<'a> Check<'a> {
             } => !self.facts.uniform[inputs[0].0],
             _ => false,
         }
+    }
+
+    fn reads_back_its_own_constant(&self, s: usize, t: usize) -> bool {
+        let accesses = &self.hazards.accesses;
+        let (w, r) = (&accesses[s], &accesses[t]);
+        let same = w.block == r.block
+            && w.index < r.index
+            && w.kind == Kind::Write
+            && r.kind == Kind::Read
+            && w.space == r.space
+            && w.address.is_some()
+            && w.address == r.address
+            && w.predicate == r.predicate
+            && w.bytes >= r.bytes;
+        if !same || !w.address.is_some_and(|a| self.facts.uniform[a.0]) {
+            return false;
+        }
+        let Inst::Effect {
+            op: EffectOp::Memory {
+                op: MemoryOp::Store(_),
+                ..
+            },
+            inputs,
+            ..
+        } = &self.f.blocks[&w.block].insts[w.index]
+        else {
+            return false;
+        };
+        self.facts.constant(self.f, inputs[1]).is_some()
+            && !accesses
+                .iter()
+                .any(|a| a.block == w.block && a.index > w.index && a.index < r.index && a.kind != Kind::Read)
     }
 
     fn order_accesses(&mut self) {
@@ -362,7 +401,7 @@ impl<'a> Check<'a> {
                     let map = if loaded { &mut this.loaded } else { &mut this.reordered };
                     map.insert(at, joined);
                 };
-                if source.kind.writes() && target.kind.reads() {
+                if source.kind.writes() && target.kind.reads() && !self.reads_back_its_own_constant(s, t) {
                     let extra = reads(self, t);
                     add(self, true, (target.block, target.index), extra);
                 }
@@ -1306,6 +1345,7 @@ enum Form {
     Load(Space, MemSize, usize),
     Hazard(BlockId, usize, usize),
     Opaque(usize, ValueId),
+    Linear(Ty, Vec<(usize, u64)>, u64),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1361,6 +1401,53 @@ impl<'c, 'a> Explore<'c, 'a> {
 
     fn fresh(&mut self, side: usize, v: ValueId, position: u32) -> Bdd {
         self.logic().atom(Atom::Fresh(side, v, position))
+    }
+
+    fn linear_parts(&self, t: usize) -> (Vec<(usize, u64)>, u64) {
+        match &self.terms[t] {
+            Form::Linear(_, terms, constant) => (terms.clone(), *constant),
+            Form::Core(_, Op::Const(_, k)) => (Vec::new(), *k),
+            _ => (vec![(t, 1)], 0),
+        }
+    }
+
+    fn combine(&self, ty: Ty, k: IntOp, x: usize, y: usize) -> Option<(Vec<(usize, u64)>, u64)> {
+        let (mut xs, xk) = self.linear_parts(x);
+        let (ys, yk) = self.linear_parts(y);
+        let scale = |terms: &[(usize, u64)], constant: u64, by: u64| -> (Vec<(usize, u64)>, u64) {
+            (terms.iter().map(|&(t, c)| (t, c.wrapping_mul(by))).collect(), constant.wrapping_mul(by))
+        };
+        Some(match k {
+            IntOp::Add => {
+                xs.extend(ys);
+                (xs, xk.wrapping_add(yk))
+            }
+            IntOp::Sub => {
+                xs.extend(ys.iter().map(|&(t, c)| (t, c.wrapping_neg())));
+                (xs, xk.wrapping_sub(yk))
+            }
+            IntOp::Mul if ys.is_empty() => scale(&xs, xk, yk),
+            IntOp::Mul if xs.is_empty() => scale(&ys, yk, xk),
+            IntOp::Shl if ys.is_empty() && yk < 32 => scale(&xs, xk, 1u64 << yk),
+            _ => return None,
+        })
+        .filter(|_| matches!(ty, Ty::I32 | Ty::I64))
+    }
+
+    fn intern_linear(&mut self, ty: Ty, terms: Vec<(usize, u64)>, constant: u64) -> usize {
+        let mask = if ty == Ty::I64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
+        let mut merged: BTreeMap<usize, u64> = BTreeMap::new();
+        for (t, c) in terms {
+            let e = merged.entry(t).or_insert(0);
+            *e = e.wrapping_add(c) & mask;
+        }
+        let terms: Vec<(usize, u64)> = merged.into_iter().filter(|&(_, c)| c != 0).collect();
+        let constant = constant & mask;
+        match terms.as_slice() {
+            [] => self.intern(ty, Form::Core(ty, Op::Const(ty, constant))),
+            [(t, 1)] if constant == 0 => *t,
+            _ => self.intern(ty, Form::Linear(ty, terms, constant)),
+        }
     }
 
     fn constant_of(&self, t: usize) -> Option<u64> {
@@ -1457,6 +1544,13 @@ impl<'c, 'a> Explore<'c, 'a> {
                     }
                 }
             }
+            Form::Core(_, Op::Int(k @ (IntOp::Add | IntOp::Sub | IntOp::Mul | IntOp::Shl), x, y))
+                if matches!(ty, Ty::I32 | Ty::I64) =>
+            {
+                if let Some((terms, constant)) = self.combine(ty, *k, x.0, y.0) {
+                    return self.intern_linear(ty, terms, constant);
+                }
+            }
             _ => {}
         }
         if let Some(&t) = self.index.get(&form) {
@@ -1489,6 +1583,13 @@ impl<'c, 'a> Explore<'c, 'a> {
                 self.check.or(self.leaves[*t], loaded)
             }
             Form::Opaque(..) => Bdd::TRUE,
+            Form::Linear(_, terms, _) => {
+                let mut h = Bdd::FALSE;
+                for &(c, _) in terms {
+                    h = self.check.or(h, self.leaves[c]);
+                }
+                h
+            }
         };
         let t = self.terms.len();
         self.terms.push(form.clone());
@@ -1630,11 +1731,25 @@ impl<'c, 'a> Explore<'c, 'a> {
             (Some(a), Some(b)) if a == b => Some(a),
             (Some(a), Some(b)) => match (self.decide(a, cond, side), self.decide(b, cond, side)) {
                 (Some(x), Some(y)) if x == y => Some(Manager::constant(x)),
-                _ => Some(self.fresh(side, param, 0)),
+                _ => Some(self.between(side, param, a, b)),
             },
             _ => None,
         };
         Desc { same, bits }
+    }
+
+    fn between(&mut self, side: usize, param: ValueId, a: Bdd, b: Bdd) -> Bdd {
+        if self.has_fresh(a) || self.has_fresh(b) {
+            return self.fresh(side, param, 0);
+        }
+        let low = self.check.and(a, b);
+        let high = self.check.or(a, b);
+        if low == Bdd::FALSE && high == Bdd::TRUE {
+            return self.fresh(side, param, 0);
+        }
+        let choice = self.fresh(side, param, u32::MAX);
+        let open = self.check.and(choice, high);
+        self.check.or(low, open)
     }
 
     fn positions(&mut self, x: BlockId) -> Rc<HashMap<ValueId, usize>> {
@@ -2844,6 +2959,28 @@ mod tests {
     }
 
     #[test]
+    fn prove_orders_a_load_after_a_constant_store_only_some_lanes_make() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let out = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+        let some = b.int(e, IntOp::And, low, k.exec);
+        let seven = b.constant(e, Ty::I32, 7);
+        let s = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, buf, seven, some);
+        let l = b.here(e);
+        let v = b.load(e, Space::Global, MemSize::B32, buf, k.exec);
+        let own = byte_offset(&mut b, e, out, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, v, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s, l)], &[], &[]);
+        keeps_exactly(&program, &hazards, &[l], "lanes 16 to 31 read the word without storing it, so they must wait for lanes 0 to 15");
+    }
+
+    #[test]
     fn prove_needs_no_meeting_when_every_lane_stores_the_word_it_reads_back() {
         let (program, s, l) = read_after(|b, e, _| b.constant(e, Ty::I32, 7));
         let hazards = Hazards::given(&program, &[(s, l)], &[], &[]);
@@ -2916,6 +3053,35 @@ mod tests {
         });
         let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
         keeps_exactly(&program, &hazards, &[], "the lane read already aligns every lane between the stores");
+    }
+
+    #[test]
+    fn search_needs_no_meeting_a_query_kept_later_already_orders() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let s1 = store(&mut b, e, buf, 1, k.exec);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let flags = k.buffer(&mut b, e, 8);
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let s2 = store(&mut b, e, buf, 2, k.exec);
+        let one = b.constant(e, Ty::I32, 1);
+        let data = b.core(e, Ty::I32, Op::Select(q, one, zero));
+        let out = k.buffer(&mut b, e, 16);
+        let slot = byte_offset(&mut b, e, out, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, slot, data, k.exec);
+        let program = b.program();
+        let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+            assert_eq!(kept.queries.len(), 1, "{}: a lane without the flag stores 0 unless the query stays", name);
+        }
+        keeps_exactly(&program, &hazards, &[], "the kept query between the stores already aligns every lane");
     }
 
     #[test]
@@ -3099,6 +3265,12 @@ mod tests {
             .filter(|(_, kept)| !kept.queries.is_empty() || !kept.words.is_empty())
             .map(|(name, _)| *name)
             .collect()
+    }
+
+    fn uniform_load(b: &mut Build, k: &Kernel, e: BlockId, offset: u64) -> ValueId {
+        let table = k.buffer(b, e, offset);
+        let yes = b.constant(e, Ty::I1, 1);
+        b.load(e, Space::Global, MemSize::B32, table, yes)
     }
 
     fn per_lane(b: &mut Build, k: &Kernel, e: BlockId, offset: u64) -> ValueId {
@@ -3546,6 +3718,56 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "lane 0 reads lane 1, whose word depends on the query: {:?}", wrong);
+    }
+
+    fn apart_merge(reach_store: bool) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let u = uniform_load(&mut b, &k, e, 24);
+        let five = b.constant(e, Ty::I32, 5);
+        let uniform = b.cmp(e, IntPred::Eq, u, five);
+        let flag = per_lane(&mut b, &k, e, 28);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, flag, zero);
+        let (arm, a) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (first, x) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+        let (second, y) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+        let (merged, m) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (arm, vec![k.exec, own, c, uniform]), (join, vec![k.exec]));
+        b.cond_br(arm, a[3], (first, vec![a[0], a[1], a[2]]), (second, vec![a[0], a[1], a[2]]));
+        b.br(first, merged, vec![x[0], x[1], x[2], x[2]]);
+        let never = b.constant(second, Ty::I1, 0);
+        b.br(second, merged, vec![y[0], y[1], y[2], never]);
+        let mask = if reach_store {
+            m[3]
+        } else {
+            let yes = b.constant(merged, Ty::I1, 1);
+            let not_c = b.int(merged, IntOp::Xor, m[2], yes);
+            let only = b.int(merged, IntOp::And, m[3], not_c);
+            b.int(merged, IntOp::And, only, m[0])
+        };
+        let one = b.constant(merged, Ty::I32, 1);
+        b.store(merged, Space::Global, MemSize::B32, m[1], one, mask);
+        b.br(merged, join, vec![m[0]]);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arm_merges_two_paths_that_never_store() {
+        let b = apart_merge(false);
+        assert!(converted(&b).is_empty(), "{:?}: z is c or false, so z & !c never holds and the arm never stores", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_merges_two_paths_one_of_which_stores() {
+        let b = apart_merge(true);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: z is c on the first path, so lanes with c store when the wave takes the arm", wrong);
     }
 
     fn apart_lane_mask(contradiction: bool) -> Build {
@@ -4064,6 +4286,28 @@ mod tests {
                     let down = b.int(block, IntOp::LShr, pair, thirty_two);
                     b.core(block, Ty::I32, Op::UnpackLo(down))
                 }
+                8 => b.int(block, IntOp::Add, x, x),
+                9 => {
+                    let two = b.constant(block, Ty::I32, 2);
+                    b.int(block, IntOp::Mul, x, two)
+                }
+                10 => {
+                    let one = b.constant(block, Ty::I32, 1);
+                    b.int(block, IntOp::Shl, x, one)
+                }
+                11 => {
+                    let one = b.constant(block, Ty::I32, 1);
+                    let up = b.int(block, IntOp::Add, x, one);
+                    b.int(block, IntOp::Sub, up, one)
+                }
+                12 => {
+                    let three = b.constant(block, Ty::I32, 3);
+                    b.int(block, IntOp::Mul, x, three)
+                }
+                13 => {
+                    let two = b.constant(block, Ty::I32, 2);
+                    b.int(block, IntOp::Shl, x, two)
+                }
                 _ => y,
             };
             b.br(block, join, vec![p[0], p[1], v]);
@@ -4081,6 +4325,9 @@ mod tests {
             ("bitcast round trip and x", 5, 0),
             ("hi(pack(x, y)) and y", 2, 7),
             ("lo(pack(x, y) >> 32) and y", 6, 7),
+            ("x + x and x * 2", 8, 9),
+            ("x << 1 and x * 2", 10, 9),
+            ("(x + 1) - 1 and x", 11, 0),
         ];
         let kept: Vec<(&str, Vec<&str>)> = cases
             .iter()
@@ -4092,7 +4339,15 @@ mod tests {
 
     #[test]
     fn prove_keeps_a_query_whose_arms_compute_different_words() {
-        let cases = [("hi(pack(x, y)) and x", 2, 0), ("lo(pack(x, y)) and y", 1, 7), ("lo(pack(x, y) >> 32) and x", 6, 0), ("x and y", 0, 7)];
+        let cases = [
+            ("hi(pack(x, y)) and x", 2, 0),
+            ("lo(pack(x, y)) and y", 1, 7),
+            ("lo(pack(x, y) >> 32) and x", 6, 0),
+            ("x and y", 0, 7),
+            ("x + x and x * 3", 8, 12),
+            ("x << 1 and x << 2", 10, 13),
+            ("(x + 1) - 1 and y", 11, 7),
+        ];
         let wrong: Vec<(&str, Vec<&str>)> = cases
             .iter()
             .map(|&(name, a, b)| {

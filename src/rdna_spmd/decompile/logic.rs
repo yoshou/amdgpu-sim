@@ -24,7 +24,7 @@ pub enum Choice {
     Meet(usize),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Kept {
     pub queries: BTreeSet<ValueId>,
 
@@ -171,6 +171,12 @@ impl Logic {
             all_local,
         };
         logic
+    }
+
+    pub fn keep(&mut self, kept: &BTreeSet<Choice>) {
+        if let Choices::Fixed { kept: fixed } = &mut self.choices {
+            *fixed = kept.clone();
+        }
     }
 
     pub fn is_open(&self) -> bool {

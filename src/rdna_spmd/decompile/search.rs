@@ -34,6 +34,7 @@ pub fn prove(
         let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
         if check.run() {
             let everyone = check.everyone(&BTreeSet::new());
+            let kept = without_covered_meetings(&mut check, kept);
             return (kept, everyone);
         }
         let mut blamed = BTreeSet::new();
@@ -61,6 +62,25 @@ pub fn prove(
             kept.insert(c);
         }
     }
+}
+
+fn without_covered_meetings(check: &mut Check, mut kept: Kept) -> Kept {
+    if kept.meets.is_empty() {
+        return kept;
+    }
+    let base = check.orderings();
+    let meets: Vec<usize> = kept.meets.iter().copied().collect();
+    for m in meets {
+        let mut trial = kept.clone();
+        trial.meets.remove(&m);
+        check.logic.keep(&trial.choices());
+        if check.orderings() == base {
+            kept = trial;
+        } else {
+            check.logic.keep(&kept.choices());
+        }
+    }
+    kept
 }
 
 pub fn listed(f: &Func, facts: &Facts, hazards: &Hazards) -> Vec<Choice> {

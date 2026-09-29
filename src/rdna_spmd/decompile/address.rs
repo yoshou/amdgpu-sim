@@ -141,11 +141,11 @@ enum Key {
     Value(ValueId, Option<u8>),
     Workgroup(usize),
     Trip(BlockId),
-    Shifted(ValueId, Vec<(Unknown, u32)>, u32),
-    ShiftCarry(ValueId, Vec<(Unknown, u32)>, u32, u32),
-    ShiftWrap(ValueId, Vec<(Unknown, u32)>, u32, u32),
-    Masked(ValueId, Vec<(Unknown, u32)>, u32),
-    MaskCarry(ValueId, Vec<(Unknown, u32)>, u32, u32),
+    Shifted(BlockId, Vec<(Unknown, u32)>, u32),
+    ShiftCarry(BlockId, Vec<(Unknown, u32)>, u32, u32),
+    ShiftWrap(BlockId, Vec<(Unknown, u32)>, u32, u32),
+    Masked(BlockId, Vec<(Unknown, u32)>, u32),
+    MaskCarry(BlockId, Vec<(Unknown, u32)>, u32, u32),
     Low(ValueId, Form, u32),
     Spread(ValueId, u8, Vec<Form>),
     HeldSpread(Slot, usize, Vec<Form>),
@@ -391,6 +391,7 @@ pub struct Addresses<'a> {
     implications: std::cell::RefCell<HashMap<ImplicationKey, bool>>,
     assumable: HashSet<ValueId>,
     equated: HashSet<ValueId>,
+    derived: HashMap<Unknown, Vec<ValueId>>,
     loops: HashMap<BlockId, Vec<BlockId>>,
     active: HashMap<(ValueId, u8, Option<ValueId>, bool), usize>,
     guessed: HashMap<(ValueId, u8), (Value, Depth)>,
@@ -488,6 +489,7 @@ impl<'a> Addresses<'a> {
             implications: std::cell::RefCell::new(HashMap::default()),
             assumable: HashSet::default(),
             equated: HashSet::default(),
+            derived: HashMap::default(),
             loops,
             active: HashMap::default(),
             guessed: HashMap::default(),
@@ -574,6 +576,7 @@ impl<'a> Addresses<'a> {
         self.wave = wave;
         self.unknowns.clear();
         self.keys.clear();
+        self.derived.clear();
         self.values.clear();
         self.bits.clear();
         self.fixed_values.clear();
@@ -645,16 +648,15 @@ impl<'a> Addresses<'a> {
         if self.facts.uniform[cond.0] {
             return lanes.first().and_then(|&l| self.bit(cond, l, None).0);
         }
-        let mut agreed: Option<Option<bool>> = None;
+        let mut known: Option<bool> = None;
         for l in lanes {
-            let bit = self.bit(cond, l, None).0;
-            match agreed {
-                None => agreed = Some(bit),
-                Some(old) if old == bit => {}
-                Some(_) => return None,
+            match (self.bit(cond, l, None).0, known) {
+                (Some(bit), None) => known = Some(bit),
+                (Some(bit), Some(old)) if bit != old => return None,
+                _ => {}
             }
         }
-        agreed.flatten()
+        known
     }
 
     fn reached(&mut self, b: BlockId) -> bool {
@@ -1016,6 +1018,37 @@ impl<'a> Addresses<'a> {
             self.depend(depth);
         }
         self.unknowns[u as usize].range
+    }
+
+    fn slot_in_block(&mut self, at: (BlockId, usize), address: &Form, bytes: u32, lane: usize) -> Option<Value> {
+        let (block, index) = at;
+        let stores: Vec<Store> = self
+            .stores
+            .get(&block)
+            .map(|list| list.iter().filter(|w| w.index < index).rev().copied().collect())
+            .unwrap_or_default();
+        for w in stores {
+            let ran = self.bit(w.predicate, lane, None).0;
+            if ran == Some(false) {
+                continue;
+            }
+            let target = self.value(w.address, lane, Some(w.predicate)).0.form;
+            if target.terms != address.terms {
+                return None;
+            }
+            let d = target.constant.wrapping_sub(address.constant);
+            if d != 0 {
+                if d >= bytes && d.wrapping_neg() >= w.bytes {
+                    continue;
+                }
+                return None;
+            }
+            if w.bytes != bytes || ran != Some(true) {
+                return None;
+            }
+            return Some(self.value(w.data?, lane, Some(w.predicate)).0);
+        }
+        None
     }
 
     fn slot_before(&mut self, at: (BlockId, usize), address: u32, bytes: u32, lane: usize) -> Option<Value> {
@@ -1758,15 +1791,19 @@ impl<'a> Addresses<'a> {
     }
 
     pub fn program_value(&mut self, u: Unknown) -> Option<ValueId> {
-        let found = self.keys.iter().find_map(|(key, &(x, _))| match key {
-            Key::Value(v, None) if x == u => Some(Some(*v)),
-            Key::Shifted(v, ..) | Key::Masked(v, ..) if x == u => Some(Some(*v)),
-            Key::Workgroup(_) if x == u => Some(None),
-            _ => None,
-        })?;
-        let candidates: Vec<ValueId> = match found {
-            Some(v) => vec![v],
-            None => self.f.blocks[&self.f.entry].params.iter().map(|&(p, _)| p).collect(),
+        let candidates: Vec<ValueId> = match self.derived.get(&u) {
+            Some(list) => list.clone(),
+            None => {
+                let found = self.keys.iter().find_map(|(key, &(x, _))| match key {
+                    Key::Value(v, None) if x == u => Some(Some(*v)),
+                    Key::Workgroup(_) if x == u => Some(None),
+                    _ => None,
+                })?;
+                match found {
+                    Some(v) => vec![v],
+                    None => self.f.blocks[&self.f.entry].params.iter().map(|&(p, _)| p).collect(),
+                }
+            }
         };
         let unknown = Form::unknown(u);
         let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
@@ -2821,7 +2858,7 @@ impl<'a> Addresses<'a> {
             let (low, high) = bounds.unwrap_or((0, u32::MAX as u64));
             let through = self.through(&terms);
             let u = self.intern(
-                Key::Shifted(v, form.terms.clone(), k),
+                Key::Shifted(block, form.terms.clone(), k),
                 UnknownInfo {
                     rank: 0,
                     shared: true,
@@ -2830,11 +2867,12 @@ impl<'a> Addresses<'a> {
                     through,
                 },
             );
+            self.derived.entry(u).or_default().push(v);
             let mut high_part = Form::unknown(u);
             let below = c & ((1u32 << k) - 1);
             if below != 0 {
                 let carry = self.intern(
-                    Key::ShiftCarry(v, form.terms.clone(), k, below),
+                    Key::ShiftCarry(block, form.terms.clone(), k, below),
                     UnknownInfo {
                         rank: 0,
                         shared: true,
@@ -2854,7 +2892,7 @@ impl<'a> Addresses<'a> {
         }
         if wrap > 0 {
             let w = self.intern(
-                Key::ShiftWrap(v, form.terms.clone(), k, c),
+                Key::ShiftWrap(block, form.terms.clone(), k, c),
                 UnknownInfo {
                     rank: 0,
                     shared: true,
@@ -2921,7 +2959,7 @@ impl<'a> Addresses<'a> {
                     Some(exact) => exact,
                     None => {
                         let u = self.intern(
-                            Key::Masked(v, rest.terms.clone(), m),
+                            Key::Masked(block, rest.terms.clone(), m),
                             UnknownInfo {
                                 rank: 0,
                                 shared: true,
@@ -2930,6 +2968,7 @@ impl<'a> Addresses<'a> {
                                 through,
                             },
                         );
+                        self.derived.entry(u).or_default().push(v);
                         (Form::unknown(u).scale(1 << j), m as u64)
                     }
                 };
@@ -2938,7 +2977,7 @@ impl<'a> Addresses<'a> {
                 let mut result = masked.add(&Form::constant(below));
                 if carried != 0 && top + carried as u64 + below as u64 > m as u64 {
                     let carry = self.intern(
-                        Key::MaskCarry(v, rest.terms.clone(), m, carried + below),
+                        Key::MaskCarry(block, rest.terms.clone(), m, carried + below),
                         UnknownInfo {
                             rank: 0,
                             shared: true,
@@ -3154,6 +3193,10 @@ impl<'a> Addresses<'a> {
             {
                 if let (MemSize::B32 | MemSize::B64, Some(a)) = (size, address.form.as_constant()) {
                     if let Some(value) = self.slot_before((block, index), a, size.bytes(), lane) {
+                        return self.leave(value, block, lane);
+                    }
+                } else if matches!(size, MemSize::B32 | MemSize::B64) {
+                    if let Some(value) = self.slot_in_block((block, index), &address.form, size.bytes(), lane) {
                         return self.leave(value, block, lane);
                     }
                 }

@@ -1012,18 +1012,30 @@ impl Sum {
         if self.count == 0 || self.count > BOUNDED {
             return true;
         }
-        let m = self.free as i64;
+        let m = self.free;
+        let mask = m - 1;
         let terms = &self.terms[..self.count];
-        let widest = (0..terms.len()).max_by_key(|&k| terms[k].2 - terms[k].1).unwrap();
-        let (c, lo, hi) = terms[widest];
-        let hits = |s: i64| (-(x_bytes as i64) + 1..y_bytes as i64).any(|t| solvable(c, lo, hi, (t - constant - s).rem_euclid(m) as u64, m as u64));
-        if terms.len() == 1 {
-            return hits(0);
-        }
-        let mask = self.free - 1;
+        let mut widest: Vec<usize> = (0..terms.len()).collect();
+        widest.sort_by_key(|&k| std::cmp::Reverse(terms[k].2 - terms[k].1));
+        let (first, second) = (widest[0], widest.get(1).copied());
+        let hits = |s: u64| {
+            (-(x_bytes as i64) + 1..y_bytes as i64).any(|t| {
+                let target = ((t - constant).rem_euclid(m as i64) as u64).wrapping_sub(s) & mask;
+                let (c1, lo1, hi1) = terms[first];
+                match second {
+                    None => solvable(c1, lo1, hi1, target, m),
+                    Some(k) => {
+                        let (c2, lo2, hi2) = terms[k];
+                        let start = (c1 as u64).wrapping_mul(lo1 as u64).wrapping_add((c2 as u64).wrapping_mul(lo2 as u64));
+                        let target = target.wrapping_sub(start) & mask;
+                        two_solvable(c1 as u64, (hi1 - lo1) as u64, c2 as u64, (hi2 - lo2) as u64, target, m)
+                    }
+                }
+            })
+        };
         let mut sums: Vec<u64> = vec![0];
         for (k, &(c, lo, hi)) in terms.iter().enumerate() {
-            if k == widest {
+            if k == first || Some(k) == second {
                 continue;
             }
             let width = (hi - lo) as usize + 1;
@@ -1043,8 +1055,78 @@ impl Sum {
             }
             sums = next;
         }
-        sums.into_iter().any(|s| hits(s as i64))
+        sums.into_iter().any(hits)
     }
+}
+
+fn odd_inverse(odd: u64) -> u64 {
+    (0..6).fold(odd, |inv: u64, _| inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv))))
+}
+
+fn floor_sum(mut n: u128, mut m: u128, mut a: u128, mut b: u128) -> u128 {
+    let mut sum = 0u128;
+    loop {
+        if a >= m {
+            sum += n * n.saturating_sub(1) / 2 * (a / m);
+            a %= m;
+        }
+        if b >= m {
+            sum += n * (b / m);
+            b %= m;
+        }
+        let top = a * n + b;
+        if top < m {
+            return sum;
+        }
+        n = top / m;
+        b = top % m;
+        std::mem::swap(&mut m, &mut a);
+    }
+}
+
+fn some_low_residue(n: u64, modulus: u64, a: u64, b: u64, bound: u64) -> bool {
+    if n == 0 {
+        return false;
+    }
+    if bound >= modulus - 1 {
+        return true;
+    }
+    let (n, m, a, b, bound) = (n as u128, modulus as u128, a as u128, b as u128, bound as u128);
+    floor_sum(n, m, b, a) + n > floor_sum(n, m, b, a + m - 1 - bound)
+}
+
+fn two_solvable(c1: u64, w1: u64, c2: u64, w2: u64, target: u64, m: u64) -> bool {
+    let mask = m - 1;
+    let (c1, c2, target) = (c1 & mask, c2 & mask, target & mask);
+    if c1 == 0 {
+        return solvable(c2 as u32, 0, w2 as u32, target, m);
+    }
+    if c2 == 0 {
+        return solvable(c1 as u32, 0, w1 as u32, target, m);
+    }
+    let g = 1u64 << c1.trailing_zeros();
+    let g2 = (1u64 << c2.trailing_zeros()).min(g);
+    if target % g2 != 0 {
+        return false;
+    }
+    let step = g / g2;
+    let first = if step == 1 {
+        0
+    } else {
+        ((target / g2) % step).wrapping_mul(odd_inverse(c2 / g2)) & (step - 1)
+    };
+    if first > w2 {
+        return false;
+    }
+    let count = (w2 - first) / step + 1;
+    let big = m / g;
+    let low = big - 1;
+    let inverse = odd_inverse(c1 / g) & low;
+    let base = target.wrapping_sub(c2.wrapping_mul(first)) & mask;
+    let a = (base / g).wrapping_mul(inverse) & low;
+    let delta = (c2.wrapping_mul(step) & mask) / g;
+    let b = (big - (delta & low)).wrapping_mul(inverse) & low;
+    some_low_residue(count, big, a, b, w1)
 }
 
 fn solvable(c: u32, lo: u32, hi: u32, target: u64, m: u64) -> bool {
@@ -1232,6 +1314,55 @@ mod tests {
         let y = Form::constant(0);
         assert!(exact_overlap(&unknowns, &[false, false], &x, &y, 1, 1));
         assert!(may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None));
+    }
+
+    #[test]
+    fn two_solvable_matches_enumeration() {
+        let mut r = Random::new(53);
+        let mut wrong = Vec::new();
+        for _ in 0..3000 {
+            let m = 1u64 << (1 + r.below(32));
+            let pick = |r: &mut Random| match r.below(4) {
+                0 => r.below(8),
+                1 => (r.next() as u32 as u64) << r.below(8),
+                2 => r.next() as u32 as u64,
+                _ => 1u64 << r.below(32),
+            };
+            let (c1, c2, target) = (pick(&mut r) & (m - 1), pick(&mut r) & (m - 1), r.next() as u32 as u64 & (m - 1));
+            let (w1, w2) = (r.below(70), r.below(70));
+            let brute = (0..=w1).any(|u| (0..=w2).any(|v| (c1.wrapping_mul(u).wrapping_add(c2.wrapping_mul(v)).wrapping_sub(target)) & (m - 1) == 0));
+            if two_solvable(c1, w1, c2, w2, target, m) != brute {
+                wrong.push(format!("{} u + {} v = {} mod {:#x}, u <= {}, v <= {}: expected {}", c1, c2, target, m, w1, w2, brute));
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
+    }
+
+    #[test]
+    fn some_low_residue_matches_enumeration() {
+        let mut r = Random::new(59);
+        let mut wrong = Vec::new();
+        for _ in 0..3000 {
+            let bits = r.below(20);
+            let m = 1 + r.below(1 << bits);
+            let (a, b, bound, n) = (r.below(m), r.below(m), r.below(m), r.below(200));
+            let brute = (0..n).any(|j| (a + b * j) % m <= bound);
+            if some_low_residue(n, m, a, b, bound) != brute {
+                wrong.push(format!("({} + {} j) mod {} <= {} for j < {}: expected {}", a, b, m, bound, n, brute));
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
+    }
+
+    #[test]
+    fn may_overlap_finds_four_u_plus_six_v_hitting_ten_over_wide_ranges() {
+        let unknowns = [info(0, Some((0, 10000))), info(1, Some((0, 10000)))];
+        let x = Form {
+            constant: 0,
+            terms: vec![(0, 4), (1, 6)],
+        };
+        let y = Form::constant(10);
+        assert!(may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None), "u = 1, v = 1 gives 10");
     }
 
     #[test]
@@ -2660,6 +2791,156 @@ mod tests {
         h.conflicts().contains(&pair(&h, s1, s2))
     }
 
+    fn branch_some_lanes_decide(cond: impl Fn(&mut Build, BlockId, ValueId, ValueId) -> ValueId) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let five = b.constant(e, Ty::I32, 5);
+        let is_five = b.cmp(e, IntPred::Eq, u, five);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let c = cond(&mut b, e, lane, is_five);
+        let (then, t) = b.block(&[Ty::I1]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, c, (then, vec![k.exec]), (other, vec![k.exec, buf]));
+        b.br(then, join, vec![t[0]]);
+        let s1 = store_at(&mut b, other, o[1], o[0]);
+        let s2 = store_at(&mut b, other, o[1], o[0]);
+        b.br(other, join, vec![o[0]]);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_decides_a_uniform_branch_that_some_lanes_decide() {
+        let collide = branch_some_lanes_decide(|b, e, lane, is_five| {
+            let sixteen = b.constant(e, Ty::I32, 16);
+            let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+            b.int(e, IntOp::Or, low, is_five)
+        });
+        assert!(!collide, "lanes 0 to 15 take the branch, so the uniform branch always skips the storing arm");
+    }
+
+    #[test]
+    fn find_reports_the_arm_a_uniform_branch_takes_when_some_lanes_decide() {
+        let collide = branch_some_lanes_decide(|b, e, lane, is_five| {
+            let sixteen = b.constant(e, Ty::I32, 16);
+            let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+            b.int(e, IntOp::And, low, is_five)
+        });
+        assert!(collide, "lanes 16 to 31 skip the branch, so the uniform branch always takes the storing arm");
+        let unknown = branch_some_lanes_decide(|_, _, _, is_five| is_five);
+        assert!(unknown, "u == 5 is unknown in every lane, so both arms may run");
+    }
+
+    fn spilled_pointer(later: bool, known_slot: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let four = b.constant(e, Ty::I32, 4);
+        let at = if known_slot { lane } else { uniform_word(&mut b, &k, e, 16, MemSize::U8) };
+        let slot = b.int(e, IntOp::Mul, at, four);
+        let low = b.core(e, Ty::I32, Op::UnpackLo(first));
+        let high = b.core(e, Ty::I32, Op::UnpackHi(first));
+        let eight = b.constant(e, Ty::I32, 8);
+        let slot_high = b.int(e, IntOp::Add, slot, eight);
+        b.store(e, Space::Scratch, MemSize::B32, slot, low, k.exec);
+        b.store(e, Space::Scratch, MemSize::B32, slot_high, high, k.exec);
+        let reload_low = b.load(e, Space::Scratch, MemSize::B32, slot, k.exec);
+        let reload_high = b.load(e, Space::Scratch, MemSize::B32, slot_high, k.exec);
+        let pointer = b.core(e, Ty::I64, Op::Pack64(reload_low, reload_high));
+        let own = byte_offset(&mut b, e, pointer, lane, 4);
+        let s1 = store_at(&mut b, e, own, k.exec);
+        if later {
+            let low = b.core(e, Ty::I32, Op::UnpackLo(second));
+            let high = b.core(e, Ty::I32, Op::UnpackHi(second));
+            b.store(e, Space::Scratch, MemSize::B32, slot, low, k.exec);
+            b.store(e, Space::Scratch, MemSize::B32, slot_high, high, k.exec);
+        }
+        let zero = b.constant(e, Ty::I32, 0);
+        let word = byte_offset(&mut b, e, second, zero, 4);
+        let s2 = store_at(&mut b, e, word, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    fn spilled_in_a_loop(respill_first: bool) -> bool {
+        spilled_in_a_loop_when(respill_first, false)
+    }
+
+    fn spilled_in_a_loop_when(respill_first: bool, sometimes: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let at = uniform_word(&mut b, &k, e, 16, MemSize::U8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, zero, at, first, second]);
+        let four = b.constant(body, Ty::I32, 4);
+        let slot = b.int(body, IntOp::Mul, p[2], four);
+        let eight = b.constant(body, Ty::I32, 8);
+        let slot_high = b.int(body, IntOp::Add, slot, eight);
+        let five = b.constant(body, Ty::I32, 5);
+        let is_five = b.cmp(body, IntPred::Eq, p[2], five);
+        let rarely = b.int(body, IntOp::And, is_five, p[0]);
+        let spill = |b: &mut Build, pointer: ValueId, mask: ValueId| {
+            let low = b.core(body, Ty::I32, Op::UnpackLo(pointer));
+            let high = b.core(body, Ty::I32, Op::UnpackHi(pointer));
+            b.store(body, Space::Scratch, MemSize::B32, slot, low, mask);
+            b.store(body, Space::Scratch, MemSize::B32, slot_high, high, mask);
+        };
+        if respill_first {
+            spill(&mut b, p[3], if sometimes { rarely } else { p[0] });
+        }
+        let reload_low = b.load(body, Space::Scratch, MemSize::B32, slot, p[0]);
+        let reload_high = b.load(body, Space::Scratch, MemSize::B32, slot_high, p[0]);
+        let pointer = b.core(body, Ty::I64, Op::Pack64(reload_low, reload_high));
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, body, pointer, lane, 4);
+        let s1 = store_at(&mut b, body, own, p[0]);
+        spill(&mut b, p[4], p[0]);
+        let word = byte_offset(&mut b, body, p[4], zero, 4);
+        let s2 = store_at(&mut b, body, word, p[0]);
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[1], one);
+        let again = b.cmp(body, IntPred::Ult, next, four);
+        b.cond_br(body, again, (body, vec![p[0], next, p[2], p[3], p[4]]), (exit, vec![p[0]]));
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_a_reloaded_pointer_off_a_buffer_the_loop_spills_after_the_reload() {
+        assert!(!spilled_in_a_loop(true), "each iteration spills the first buffer right before the reload, so the reload never returns the second");
+    }
+
+    #[test]
+    fn find_reports_a_reloaded_pointer_a_conditional_spill_may_leave_behind() {
+        assert!(spilled_in_a_loop_when(true, true), "when u != 5 the spill before the reload does not run, so iteration 2 reloads the second buffer");
+    }
+
+    #[test]
+    fn find_reports_a_reloaded_pointer_the_previous_iteration_spilled() {
+        assert!(spilled_in_a_loop(false), "without the spill before the reload, iteration 2 reloads the second buffer");
+    }
+
+    #[test]
+    fn find_keeps_a_reloaded_pointer_off_a_buffer_only_a_later_spill_names() {
+        assert!(!spilled_pointer(true, true), "the reload can only return the first buffer; the second is spilled after it");
+        assert!(!spilled_pointer(true, false), "the same holds when the slot's address is an unknown word");
+    }
+
+    #[test]
+    fn find_keeps_a_reloaded_pointer_off_a_buffer_no_spill_names() {
+        assert!(!spilled_pointer(false, true), "only the first buffer is ever spilled");
+        assert!(!spilled_pointer(false, false), "only the first buffer is ever spilled");
+    }
+
     #[test]
     fn find_uses_what_the_branch_into_a_block_says_about_the_workgroup() {
         assert!(!workgroup_branch(0), "only workgroup 0 enters the block, and it stores to words 0 and 1");
@@ -2670,23 +2951,32 @@ mod tests {
         assert!(workgroup_branch(1), "workgroup 1 enters the block and stores to word 1 twice");
     }
 
-    #[test]
-    fn find_relates_two_indices_derived_from_one_word() {
+    fn two_halves(bump: u64) -> bool {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let u = uniform_word(&mut b, &k, e, 0, MemSize::U16);
         let one = b.constant(e, Ty::I32, 1);
-        let two = b.constant(e, Ty::I32, 2);
+        let bump = b.constant(e, Ty::I32, bump);
         let low = b.int(e, IntOp::LShr, u, one);
-        let bumped = b.int(e, IntOp::Add, u, two);
+        let bumped = b.int(e, IntOp::Add, u, bump);
         let high = b.int(e, IntOp::LShr, bumped, one);
         let a1 = byte_offset(&mut b, e, buf, low, 4);
         let a2 = byte_offset(&mut b, e, buf, high, 4);
         let s1 = store_at(&mut b, e, a1, k.exec);
         let s2 = store_at(&mut b, e, a2, k.exec);
         let h = Hazards::find(&b.program(), &env2());
-        assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "(u + 2) >> 1 is always (u >> 1) + 1");
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_relates_two_indices_derived_from_one_word() {
+        assert!(!two_halves(2), "(u + 2) >> 1 is always (u >> 1) + 1");
+    }
+
+    #[test]
+    fn find_reports_two_indices_derived_from_one_word_that_can_meet() {
+        assert!(two_halves(1), "(u + 1) >> 1 is u >> 1 whenever u is even");
     }
 
     #[test]
