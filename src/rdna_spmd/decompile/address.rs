@@ -150,6 +150,7 @@ enum Key {
     Spread(ValueId, u8, Vec<Form>),
     HeldSpread(Slot, usize, Vec<Form>),
     Left(Unknown, u8),
+    Base(Region, Option<u8>),
     Cycle(ValueId, u8),
     Guess(ValueId, u8),
     GuessSlot(Slot),
@@ -2516,14 +2517,8 @@ impl<'a> Addresses<'a> {
                 let (x, y, z) = self.ids(lane);
                 Value::constant(x | y << 10 | z << 20)
             }
-            ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => Value {
-                form: Form::constant(0),
-                region: Some(Region::Kernarg),
-            },
-            ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => Value {
-                form: Form::constant(0),
-                region: Some(Region::Dispatch),
-            },
+            ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => self.base(Region::Kernarg, lane),
+            ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => self.base(Region::Dispatch, lane),
             ParameterSource::Sgpr(WORKGROUP_ID_X) if self.entry.workgroup_id_x => {
                 Value::of(Form::unknown(self.workgroup(0)))
             }
@@ -2532,6 +2527,25 @@ impl<'a> Addresses<'a> {
                 Value::of(Form::unknown(y).add(&Form::unknown(z).scale(1 << 16)))
             }
             _ => self.opaque(v, lane, None),
+        }
+    }
+
+    fn base(&mut self, region: Region, lane: usize) -> Value {
+        let shared = region != Region::Private;
+        let entry = self.f.entry;
+        let u = self.intern(
+            Key::Base(region, (!shared).then_some(lane as u8)),
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block: entry,
+                range: None,
+                through: Vec::new(),
+            },
+        );
+        Value {
+            form: Form::unknown(u),
+            region: Some(region),
         }
     }
 
@@ -2636,10 +2650,7 @@ impl<'a> Addresses<'a> {
         let value = match op {
             Op::Const(_, k) => Value::constant(k as u32),
             Op::Env(Env::LaneId) => Value::constant(lane as u32),
-            Op::Env(Env::ScratchBase) => Value {
-                form: Form::constant(0),
-                region: Some(Region::Private),
-            },
+            Op::Env(Env::ScratchBase) => self.base(Region::Private, lane),
             Op::Int(IntOp::Add, a, b) => {
                 let (a, b) = (get!(self, a), get!(self, b));
                 let region = match (a.region, b.region) {
@@ -3179,7 +3190,10 @@ impl<'a> Addresses<'a> {
     }
 
     fn load(&mut self, v: ValueId, address: &Value, size: MemSize, lane: usize) -> Value {
-        let offset = address.form.as_constant();
+        let offset = match address.region {
+            Some(r @ (Region::Kernarg | Region::Dispatch)) => address.form.sub(&self.base(r, lane).form).as_constant(),
+            _ => None,
+        };
         let bytes = size.bytes().min(4);
         if let Site::Inst { block, index } = self.facts.site[v.0] {
             if let Inst::Effect {
@@ -3726,12 +3740,23 @@ fn copies(f: &Func, facts: &Facts) -> Copies {
 
 impl Addresses<'_> {
     fn aperture(&mut self, a: ValueId, b: ValueId, lane: usize) -> Option<bool> {
-        let (Some(Op::Cmp(IntPred::Uge, base, low)), Some(Op::Cmp(IntPred::Ult, again, _))) =
-            (self.facts.op(self.f, a), self.facts.op(self.f, b))
+        let (f, facts) = (self.f, self.facts);
+        let (Some(Op::Cmp(IntPred::Uge, base, low)), Some(Op::Cmp(IntPred::Ult, again, high))) = (facts.op(f, a), facts.op(f, b))
         else {
             return None;
         };
-        if base != again || self.facts.op(self.f, low) != Some(Op::Env(Env::ScratchBase)) {
+        let env = |x: ValueId| match facts.op(f, x) {
+            Some(Op::Env(e)) => Some(e),
+            _ => None,
+        };
+        let bounded = match facts.op(f, high) {
+            Some(Op::Int(IntOp::Add, x, y)) => matches!(
+                (env(x), env(y)),
+                (Some(Env::ScratchBase), Some(Env::ScratchSize)) | (Some(Env::ScratchSize), Some(Env::ScratchBase))
+            ),
+            _ => false,
+        };
+        if base != again || env(low) != Some(Env::ScratchBase) || !bounded {
             return None;
         }
         let (pointer, _) = self.value(base, lane, None);
@@ -5824,5 +5849,36 @@ mod facts_tests {
                 .collect()
         });
         assert!(fixed.is_empty(), "each depends on where the regions start: {:?}", fixed);
+    }
+
+    #[test]
+    fn values_computed_from_offsets_into_one_region_keep_what_holds_for_every_base() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let (base, far) = scratch(&mut b, e, 16);
+        let (_, near) = scratch(&mut b, e, 8);
+        let far_low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, far));
+        let near_low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, near));
+        let high = b.constant(e, Ty::I64, 0xffff_ffff_0000_0000);
+        let aperture = b.int(e, IntOp::And, base, high);
+        let kernarg = b.core(e, Ty::I64, Op::Pack64(k.kernarg.0, k.kernarg.1));
+        let twelve = b.constant(e, Ty::I64, 12);
+        let past = b.int(e, IntOp::Add, kernarg, twelve);
+        let cases = [
+            ("(base + 16) - base", b.int(e, IntOp::Sub, far, base), 16),
+            ("low(base + 16) - low(base + 8)", b.int(e, IntOp::Sub, far_low, near_low), 8),
+            ("base & 0xffffffff00000000", aperture, 0),
+            ("(kernarg + 12) - kernarg", b.int(e, IntOp::Sub, past, kernarg), 12),
+        ];
+        let loose: Vec<String> = addresses(&b, &environment(32, &[]), |a| {
+            cases
+                .iter()
+                .filter_map(|c| {
+                    let value = a.value(c.1, 0, None).0;
+                    (value.form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, value.form))
+                })
+                .collect()
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
     }
 }
