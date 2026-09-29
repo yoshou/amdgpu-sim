@@ -2357,6 +2357,129 @@ mod tests {
         h.conflicts().contains(&pair(&h, s1, s2))
     }
 
+    fn lane_indexed(index: impl Fn(&mut Build, BlockId, &Kernel, ValueId) -> ValueId) -> bool {
+        lane_indexed_by(4, index)
+    }
+
+    fn lane_indexed_by(scale: u64, index: impl Fn(&mut Build, BlockId, &Kernel, ValueId) -> ValueId) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let index = index(&mut b, e, &k, lane);
+        let address = byte_offset(&mut b, e, buf, index, scale);
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_that_shift_a_word_they_offset_by_four_lanes() {
+        let collide = lane_indexed(|b, e, k, lane| {
+            let u = uniform_word(b, k, e, 0, MemSize::B32);
+            let four = b.constant(e, Ty::I32, 4);
+            let step = b.int(e, IntOp::Mul, lane, four);
+            let sum = b.int(e, IntOp::Add, u, step);
+            let two = b.constant(e, Ty::I32, 2);
+            b.int(e, IntOp::LShr, sum, two)
+        });
+        assert!(!collide, "(u + 4 lane) >> 2 differs by the lane distance modulo 2^30, so the lanes name distinct words");
+    }
+
+    #[test]
+    fn find_reports_lanes_that_shift_a_word_they_offset_by_one_lane() {
+        let collide = lane_indexed(|b, e, k, lane| {
+            let u = uniform_word(b, k, e, 0, MemSize::B32);
+            let sum = b.int(e, IntOp::Add, u, lane);
+            let two = b.constant(e, Ty::I32, 2);
+            b.int(e, IntOp::LShr, sum, two)
+        });
+        assert!(collide, "u = 0 puts lanes 0 to 3 on word 0");
+    }
+
+    fn shifted_lanes(lane_zero: u64, lane_one: u64, scale: u64) -> bool {
+        lane_indexed_by(scale, |b, e, k, lane| {
+            let u = uniform_word(b, k, e, 0, MemSize::B32);
+            let one = b.constant(e, Ty::I32, 1);
+            let second = b.cmp(e, IntPred::Eq, lane, one);
+            let special = b.constant(e, Ty::I32, lane_one);
+            let far = b.constant(e, Ty::I32, 1024);
+            let spread = b.int(e, IntOp::Mul, lane, far);
+            let zero = b.constant(e, Ty::I32, 0);
+            let first = b.cmp(e, IntPred::Eq, lane, zero);
+            let zeroth = b.constant(e, Ty::I32, lane_zero);
+            let low = b.core(e, Ty::I32, Op::Select(first, zeroth, spread));
+            let offset = b.core(e, Ty::I32, Op::Select(second, special, low));
+            let sum = b.int(e, IntOp::Add, u, offset);
+            let two = b.constant(e, Ty::I32, 2);
+            b.int(e, IntOp::LShr, sum, two)
+        })
+    }
+
+    #[test]
+    fn find_reports_lanes_whose_shifted_indices_meet_through_a_carry() {
+        assert!(shifted_lanes(3, 4, 4), "(u + 3) >> 2 and (u + 4) >> 2 name one word whenever u mod 4 is not 0");
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_whose_shifted_offsets_are_a_word_apart() {
+        assert!(!shifted_lanes(3, 0xffff_ffff, 4), "(u + 3) >> 2 and (u - 1) >> 2 always differ by exactly 1");
+    }
+
+    #[test]
+    fn find_reports_lanes_whose_shifted_indices_meet_through_a_wrap() {
+        assert!(shifted_lanes(1, 0xffff_ffff, 1), "(u + 1) >> 2 and (u - 1) >> 2 are one index when u mod 4 is 1 or 2");
+    }
+
+    #[test]
+    fn find_keeps_apart_the_lanes_after_a_select_of_two_offsets() {
+        let collide = lane_indexed(|b, e, k, lane| {
+            let v = uniform_word(b, k, e, 0, MemSize::B32);
+            let zero = b.constant(e, Ty::I32, 0);
+            let c = b.cmp(e, IntPred::Ne, v, zero);
+            let two = b.constant(e, Ty::I32, 2);
+            let even = b.int(e, IntOp::Mul, lane, two);
+            let one = b.constant(e, Ty::I32, 1);
+            let odd = b.int(e, IntOp::Add, even, one);
+            b.core(e, Ty::I32, Op::Select(c, even, odd))
+        });
+        assert!(!collide, "every lane takes 2 lane or every lane 2 lane + 1, and no two lanes meet either way");
+    }
+
+    #[test]
+    fn find_reports_the_lanes_after_a_select_where_one_arm_halves_the_index() {
+        let collide = lane_indexed(|b, e, k, lane| {
+            let v = uniform_word(b, k, e, 0, MemSize::B32);
+            let zero = b.constant(e, Ty::I32, 0);
+            let c = b.cmp(e, IntPred::Ne, v, zero);
+            let one = b.constant(e, Ty::I32, 1);
+            let half = b.int(e, IntOp::LShr, lane, one);
+            b.core(e, Ty::I32, Op::Select(c, lane, half))
+        });
+        assert!(collide, "on the second arm lanes 0 and 1 both name word 0");
+    }
+
+    #[test]
+    fn find_keeps_apart_lanes_that_permute_their_neighbours_lane_ids() {
+        let collide = lane_indexed(|b, e, k, lane| {
+            let one = b.constant(e, Ty::I32, 1);
+            let neighbour = b.int(e, IntOp::Xor, lane, one);
+            let two = b.constant(e, Ty::I32, 2);
+            let byte = b.int(e, IntOp::Shl, neighbour, two);
+            b.wave(e, WaveOp::BpermuteFi, vec![byte, lane, k.exec])
+        });
+        assert!(!collide, "lane l reads lane l ^ 1's lane id, so the lanes name distinct words");
+    }
+
+    #[test]
+    fn find_reports_lanes_that_permute_one_lanes_id() {
+        let collide = lane_indexed(|b, e, k, lane| {
+            let zero = b.constant(e, Ty::I32, 0);
+            b.wave(e, WaveOp::BpermuteFi, vec![zero, lane, k.exec])
+        });
+        assert!(collide, "every lane reads lane 0's id and names word 0");
+    }
+
     #[test]
     fn find_keeps_apart_lanes_scaled_by_an_odd_word() {
         let collide = scaled_lanes(|b, e, u| {

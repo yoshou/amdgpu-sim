@@ -425,7 +425,22 @@ impl Logic {
                     self.lanes(|l| values[l as usize] & 1 == 1)
                 }
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
-                    self.compare(f, facts, p, a, b, opaque, &mut HashMap::default())
+                    let leaf = match (equality(f, facts, p, a, b), facts.site[v.0]) {
+                        (Some(e), Site::Inst { block, index }) => {
+                            let equal = self.equal(f, facts, block, index, v, e);
+                            if e.flip {
+                                self.m.not(equal)
+                            } else {
+                                equal
+                            }
+                        }
+                        _ => self.atom(opaque),
+                    };
+                    self.compare(f, facts, p, a, b, leaf, &mut HashMap::default())
+                }
+                Op::FCmp(p, a, b) => {
+                    let leaf = self.atom(opaque);
+                    self.float_order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::Cmp(p, a, b) => {
                     let leaf = match (threshold(f, facts, p, a, b), facts.site[v.0]) {
@@ -472,7 +487,7 @@ impl Logic {
             return Bdd::TRUE;
         }
         let list = self.block_thresholds(f, facts, block);
-        let earlier = list.iter().filter(|e| e.index < index && e.value == t.value && e.signed == t.signed);
+        let earlier = list.iter().filter(|e| e.index < index && e.value == t.value && !e.equal && e.signed == t.signed);
         let (mut lower, mut upper): (Option<Threshold>, Option<Threshold>) = (None, None);
         for e in earlier {
             if e.at == t.at {
@@ -498,6 +513,42 @@ impl Logic {
             let lower = if l.flip { self.m.not(bit) } else { bit };
             holds = self.m.or(holds, lower);
         }
+        let equalities: Vec<Threshold> = list.iter().filter(|e| e.index < index && e.value == t.value && e.equal).copied().collect();
+        for e in equalities {
+            let k = e.constant(t.signed);
+            let bit = self.bit(f, facts, e.of);
+            let equal = if e.flip { self.m.not(bit) } else { bit };
+            holds = if k < t.at {
+                self.m.or(holds, equal)
+            } else {
+                let unequal = self.m.not(equal);
+                self.m.and(holds, unequal)
+            };
+        }
+        holds
+    }
+
+    fn equal(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, e: Threshold) -> Bdd {
+        let list = self.block_thresholds(f, facts, block);
+        let earlier: Vec<Threshold> = list.iter().filter(|x| x.index < index && x.value == e.value).copied().collect();
+        if let Some(same) = earlier.iter().find(|x| x.equal && x.at == e.at) {
+            let bit = self.bit(f, facts, same.of);
+            return if same.flip { self.m.not(bit) } else { bit };
+        }
+        let atom = self.atom(Atom::Bit(v));
+        let mut holds = if e.flip { self.m.not(atom) } else { atom };
+        for x in earlier {
+            let bit = self.bit(f, facts, x.of);
+            let other = if x.flip { self.m.not(bit) } else { bit };
+            let implied = if x.equal {
+                self.m.not(other)
+            } else if e.constant(x.signed) < x.at {
+                other
+            } else {
+                self.m.not(other)
+            };
+            holds = self.m.and(holds, implied);
+        }
         holds
     }
 
@@ -513,7 +564,7 @@ impl Logic {
                 ..
             } = inst
             {
-                if let Some(t) = threshold(f, facts, *p, *a, *b) {
+                if let Some(t) = threshold(f, facts, *p, *a, *b).or_else(|| equality(f, facts, *p, *a, *b)) {
                     list.push(Threshold { index, of: *value, ..t });
                 }
             }
@@ -541,6 +592,46 @@ impl Logic {
             }
             _ => holds,
         }
+    }
+
+    fn float_order(
+        &mut self,
+        f: &Func,
+        facts: &Facts,
+        pred: FloatPred,
+        a: ValueId,
+        b: ValueId,
+        leaf: Bdd,
+        memo: &mut HashMap<(ValueId, ValueId), Bdd>,
+    ) -> Bdd {
+        if let Some(&g) = memo.get(&(a, b)) {
+            return g;
+        }
+        let float = |v: ValueId| -> Option<f64> {
+            let k = facts.constant(f, v)?;
+            match f.types[v.0] {
+                Ty::F32 => Some(f32::from_bits(k as u32) as f64),
+                Ty::F64 => Some(f64::from_bits(k)),
+                _ => None,
+            }
+        };
+        let g = if let (Some(x), Some(y)) = (float(a), float(b)) {
+            Manager::constant(float_compare(pred, x, y))
+        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
+            let c = self.bit(f, facts, c);
+            let yes = self.float_order(f, facts, pred, yes, b, leaf, memo);
+            let no = self.float_order(f, facts, pred, no, b, leaf, memo);
+            self.m.ite(c, yes, no)
+        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, b) {
+            let c = self.bit(f, facts, c);
+            let yes = self.float_order(f, facts, pred, a, yes, leaf, memo);
+            let no = self.float_order(f, facts, pred, a, no, leaf, memo);
+            self.m.ite(c, yes, no)
+        } else {
+            leaf
+        };
+        memo.insert((a, b), g);
+        g
     }
 
     fn order(
@@ -607,7 +698,7 @@ impl Logic {
         pred: IntPred,
         a: ValueId,
         b: ValueId,
-        opaque: Atom,
+        leaf: Bdd,
         memo: &mut HashMap<(ValueId, ValueId), Bdd>,
     ) -> Bdd {
         let test = lane_test(f, facts, a, b);
@@ -637,16 +728,16 @@ impl Logic {
             }
         } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
             let c = self.bit(f, facts, c);
-            let yes = self.compare(f, facts, pred, yes, b, opaque, memo);
-            let no = self.compare(f, facts, pred, no, b, opaque, memo);
+            let yes = self.compare(f, facts, pred, yes, b, leaf, memo);
+            let no = self.compare(f, facts, pred, no, b, leaf, memo);
             self.m.ite(c, yes, no)
         } else if let Some(Op::Select(c, yes, no)) = facts.op(f, b) {
             let c = self.bit(f, facts, c);
-            let yes = self.compare(f, facts, pred, a, yes, opaque, memo);
-            let no = self.compare(f, facts, pred, a, no, opaque, memo);
+            let yes = self.compare(f, facts, pred, a, yes, leaf, memo);
+            let no = self.compare(f, facts, pred, a, no, leaf, memo);
             self.m.ite(c, yes, no)
         } else {
-            self.atom(opaque)
+            leaf
         };
         let g = match test {
             Some(w) => {
@@ -743,6 +834,10 @@ impl Logic {
         self.lanes(|l| k >> l & 1 == 1)
     }
 
+    pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
+        self.lane_values(f, facts, v, 0)
+    }
+
     fn lane_values(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; 32]> {
         if let Some(&r) = self.lane_values.get(&v) {
             return r;
@@ -798,6 +893,11 @@ impl Logic {
             _ => return None,
         }
         Some(out.map(|x| x & bits))
+    }
+
+    pub fn lane_dependent(&mut self, f: Bdd) -> bool {
+        let support = self.support(f);
+        support.iter().any(|v| matches!(self.atoms.get(v), Some(Atom::Lane(_))))
     }
 
     pub fn at_lane(&mut self, f: Bdd, lane: u32) -> Bdd {
@@ -1189,6 +1289,26 @@ fn arriving(src: BlockId, dst: BlockId, atom: Atom) -> Atom {
     }
 }
 
+fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
+    let unordered = x.is_nan() || y.is_nan();
+    match pred {
+        FloatPred::Oeq => !unordered && x == y,
+        FloatPred::Ogt => !unordered && x > y,
+        FloatPred::Oge => !unordered && x >= y,
+        FloatPred::Olt => !unordered && x < y,
+        FloatPred::Ole => !unordered && x <= y,
+        FloatPred::One => !unordered && x != y,
+        FloatPred::Ord => !unordered,
+        FloatPred::Uno => unordered,
+        FloatPred::Ueq => unordered || x == y,
+        FloatPred::Ugt => unordered || x > y,
+        FloatPred::Uge => unordered || x >= y,
+        FloatPred::Ult => unordered || x < y,
+        FloatPred::Ule => unordered || x <= y,
+        FloatPred::Une => unordered || x != y,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Threshold {
     value: ValueId,
@@ -1197,6 +1317,37 @@ struct Threshold {
     flip: bool,
     index: usize,
     of: ValueId,
+    equal: bool,
+}
+
+impl Threshold {
+    fn constant(&self, signed: bool) -> i64 {
+        if signed {
+            self.at as u32 as i32 as i64
+        } else {
+            self.at as u32 as i64
+        }
+    }
+}
+
+fn equality(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Threshold> {
+    if !matches!(p, IntPred::Eq | IntPred::Ne) || f.types[a.0] != Ty::I32 {
+        return None;
+    }
+    let (value, k) = match (facts.constant(f, a), facts.constant(f, b)) {
+        (None, Some(k)) => (a, k),
+        (Some(k), None) => (b, k),
+        _ => return None,
+    };
+    Some(Threshold {
+        value,
+        signed: false,
+        at: k as u32 as i64,
+        flip: p == IntPred::Ne,
+        index: 0,
+        of: value,
+        equal: true,
+    })
 }
 
 fn threshold(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Threshold> {
@@ -1218,6 +1369,7 @@ fn threshold(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Opt
         flip,
         index: 0,
         of: value,
+        equal: false,
     })
 }
 

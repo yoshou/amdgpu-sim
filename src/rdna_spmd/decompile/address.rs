@@ -141,11 +141,14 @@ enum Key {
     Value(ValueId, Option<u8>),
     Workgroup(usize),
     Trip(BlockId),
-    Derived(ValueId, Vec<(Unknown, u32)>, u32),
-    Low(ValueId),
-    Spread(ValueId, u8),
-    HeldSpread(Slot, usize),
-    Carry(ValueId, u8),
+    Shifted(ValueId, Vec<(Unknown, u32)>, u32),
+    ShiftCarry(ValueId, Vec<(Unknown, u32)>, u32, u32),
+    ShiftWrap(ValueId, Vec<(Unknown, u32)>, u32, u32),
+    Masked(ValueId, Vec<(Unknown, u32)>, u32),
+    MaskCarry(ValueId, Vec<(Unknown, u32)>, u32, u32),
+    Low(ValueId, Form, u32),
+    Spread(ValueId, u8, Vec<Form>),
+    HeldSpread(Slot, usize, Vec<Form>),
     Left(Unknown, u8),
     Cycle(ValueId, u8),
     Guess(ValueId, u8),
@@ -1158,7 +1161,7 @@ impl<'a> Addresses<'a> {
         }
         if values.iter().all(|v| v.region == first.region) {
             let forms: Vec<Form> = values.iter().map(|v| v.form.clone()).collect();
-            if let Some(form) = self.spread(Key::HeldSpread(slot, index), false, slot.0, &forms) {
+            if let Some(form) = self.spread(Key::HeldSpread(slot, index, forms.clone()), false, slot.0, &forms) {
                 return Some(Value {
                     form,
                     region: first.region,
@@ -1757,7 +1760,7 @@ impl<'a> Addresses<'a> {
     pub fn program_value(&mut self, u: Unknown) -> Option<ValueId> {
         let found = self.keys.iter().find_map(|(key, &(x, _))| match key {
             Key::Value(v, None) if x == u => Some(Some(*v)),
-            Key::Derived(v, ..) if x == u => Some(Some(*v)),
+            Key::Shifted(v, ..) | Key::Masked(v, ..) if x == u => Some(Some(*v)),
             Key::Workgroup(_) if x == u => Some(None),
             _ => None,
         })?;
@@ -2571,7 +2574,7 @@ impl<'a> Addresses<'a> {
         }
         if !agreed {
             let shared = self.facts.uniform[v.0];
-            let key = Key::Spread(v, if shared { 0 } else { lane as u8 });
+            let key = Key::Spread(v, if shared { 0 } else { lane as u8 }, forms.clone());
             let spread = self.spread(key, shared, block, &forms);
             return unassumed(Value {
                 region: region.flatten(),
@@ -2650,6 +2653,9 @@ impl<'a> Addresses<'a> {
                 let (a, s) = (get!(self, a), get!(self, s));
                 match (a.form.as_constant(), s.form.as_constant()) {
                     (Some(x), Some(k)) if k < 32 => Value::constant(((x as i32) >> k) as u32),
+                    (None, Some(k)) if k < 32 && self.bounds(&a.form).is_some_and(|(_, high)| high < 1 << 31) => {
+                        self.shift(v, &a.form, k, lane)
+                    }
                     _ => self.opaque(v, lane, None),
                 }
             }
@@ -2718,9 +2724,16 @@ impl<'a> Addresses<'a> {
                             x
                         } else {
                             let region = if x.region == y.region { x.region } else { None };
-                            Value {
-                                region,
-                                ..self.opaque(v, lane, None)
+                            let shared = self.facts.uniform[v.0];
+                            let forms = vec![x.form.clone(), y.form.clone()];
+                            let key = Key::Spread(v, if shared { 0 } else { lane as u8 }, forms.clone());
+                            let block = self.block_of(v);
+                            match self.spread(key, shared, block, &forms) {
+                                Some(form) => Value { form, region },
+                                None => Value {
+                                    region,
+                                    ..self.opaque(v, lane, None)
+                                },
                             }
                         }
                     }
@@ -2782,31 +2795,77 @@ impl<'a> Addresses<'a> {
         if let Some(x) = form.as_constant() {
             return Value::constant(x >> k);
         }
+        if k == 0 {
+            return Value::of(form.clone());
+        }
         if form.terms.iter().any(|&(u, _)| !self.unknowns[u as usize].shared) {
             return self.opaque(v, lane, None);
         }
-        let (low, high) = self.bounds(form).unwrap_or((0, u32::MAX as u64));
-        let j = form.alignment();
-        if k <= j {
-            return Value::of(Form {
-                constant: form.constant >> k,
-                terms: form.terms.iter().map(|&(u, c)| (u, c >> k)).collect(),
-            });
-        }
-        let above = form.constant >> j;
+        let terms = Form {
+            constant: 0,
+            terms: form.terms.clone(),
+        };
+        let bounds = self.bounds(&terms);
+        let c = form.constant;
         let block = self.block_of(v);
-        let through = self.through(form);
-        let u = self.intern(
-            Key::Derived(v, form.terms.clone(), above),
-            UnknownInfo {
-                rank: 0,
-                shared: true,
-                block,
-                range: Some(((low >> k) as u32, (high >> k) as u32)),
-                through,
-            },
-        );
-        Value::of(Form::unknown(u))
+        let mut wrap = 0u32;
+        let mut result = if k <= terms.alignment() {
+            if bounds.is_none() {
+                wrap = (1u32 << k) - 1;
+            }
+            Form {
+                constant: 0,
+                terms: form.terms.iter().map(|&(u, c)| (u, c >> k)).collect(),
+            }
+        } else {
+            let (low, high) = bounds.unwrap_or((0, u32::MAX as u64));
+            let through = self.through(&terms);
+            let u = self.intern(
+                Key::Shifted(v, form.terms.clone(), k),
+                UnknownInfo {
+                    rank: 0,
+                    shared: true,
+                    block,
+                    range: Some(((low >> k) as u32, (high >> k) as u32)),
+                    through,
+                },
+            );
+            let mut high_part = Form::unknown(u);
+            let below = c & ((1u32 << k) - 1);
+            if below != 0 {
+                let carry = self.intern(
+                    Key::ShiftCarry(v, form.terms.clone(), k, below),
+                    UnknownInfo {
+                        rank: 0,
+                        shared: true,
+                        block,
+                        range: Some((0, 1)),
+                        through: Vec::new(),
+                    },
+                );
+                high_part = high_part.add(&Form::unknown(carry));
+            }
+            high_part
+        };
+        result = result.add(&Form::constant(c >> k));
+        let wraps = c != 0 && bounds.is_none_or(|(_, high)| high + c as u64 >= 1 << 32);
+        if wraps {
+            wrap += 1;
+        }
+        if wrap > 0 {
+            let w = self.intern(
+                Key::ShiftWrap(v, form.terms.clone(), k, c),
+                UnknownInfo {
+                    rank: 0,
+                    shared: true,
+                    block,
+                    range: Some((0, wrap)),
+                    through: Vec::new(),
+                },
+            );
+            result = result.sub(&Form::unknown(w).scale(1u32 << (32 - k)));
+        }
+        Value::of(result)
     }
 
     fn mask(&mut self, v: ValueId, form: &Form, m: u32, lane: usize) -> Value {
@@ -2862,7 +2921,7 @@ impl<'a> Addresses<'a> {
                     Some(exact) => exact,
                     None => {
                         let u = self.intern(
-                            Key::Derived(v, rest.terms.clone(), 0),
+                            Key::Masked(v, rest.terms.clone(), m),
                             UnknownInfo {
                                 rank: 0,
                                 shared: true,
@@ -2878,12 +2937,11 @@ impl<'a> Addresses<'a> {
                 let carried = (form.constant - below) & m;
                 let mut result = masked.add(&Form::constant(below));
                 if carried != 0 && top + carried as u64 + below as u64 > m as u64 {
-                    let shared = self.facts.uniform[v.0];
                     let carry = self.intern(
-                        Key::Carry(v, if shared { 0 } else { lane as u8 }),
+                        Key::MaskCarry(v, rest.terms.clone(), m, carried + below),
                         UnknownInfo {
                             rank: 0,
-                            shared,
+                            shared: true,
                             block,
                             range: Some((0, 1)),
                             through: Vec::new(),
@@ -2908,6 +2966,13 @@ impl<'a> Addresses<'a> {
                 return Value::of(above.form.scale(1 << k));
             }
         }
+        let s = m.trailing_zeros();
+        let field = m >> s;
+        if s > 0 && field.wrapping_add(1).is_power_of_two() && form.terms.iter().all(|&(u, _)| self.unknowns[u as usize].shared) {
+            let above = self.shift(v, form, s, lane);
+            let inner = self.mask(v, &above.form, field, lane);
+            return Value::of(inner.form.scale(1 << s));
+        }
         self.opaque(v, lane, Some((0, m)))
     }
 
@@ -2925,7 +2990,7 @@ impl<'a> Addresses<'a> {
         let block = self.block_of(v);
         let through = self.through(form);
         let low = self.intern(
-            Key::Low(v),
+            Key::Low(v, form.clone(), c),
             UnknownInfo {
                 rank: 0,
                 shared: true,
@@ -3001,6 +3066,26 @@ impl<'a> Addresses<'a> {
                         let at = self.block_of(v);
                         unassumed(self.operand(inputs[2], at, lane, None).0)
                     }
+                    None => unassumed(self.opaque(v, lane, None)),
+                }
+            }
+            EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)) => {
+                let (index, _) = self.value(inputs[0], lane, None);
+                let Some(byte) = index.form.as_constant() else {
+                    return unassumed(self.opaque(v, lane, None));
+                };
+                let source = ((byte >> 2) & 31) as usize;
+                if !self.valid(source) {
+                    return unassumed(Value::constant(0));
+                }
+                let taken = match op {
+                    WaveOp::Bpermute => self.bit(inputs[2], source, None).0,
+                    _ => Some(true),
+                };
+                let at = self.block_of(v);
+                match taken {
+                    Some(true) => unassumed(self.operand(inputs[1], at, source, None).0),
+                    Some(false) => unassumed(Value::constant(0)),
                     None => unassumed(self.opaque(v, lane, None)),
                 }
             }
@@ -4938,6 +5023,50 @@ mod facts_tests {
         }
     }
 
+    #[test]
+    fn shifts_of_wrapping_words_decide_only_what_holds() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let z = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let two = b.constant(e, Ty::I32, 2);
+        let scaled = b.int(e, IntOp::Shl, z, two);
+        let back = b.int(e, IntOp::LShr, scaled, two);
+        let same = b.cmp(e, IntPred::Eq, back, z);
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let decided = addresses(&b, &env, |a| a.bit(same, 0, None).0);
+        assert_eq!(decided, None, "(z << 2) >> 2 == z fails for z >= 2^30, so it cannot be decided true");
+    }
+
+    #[test]
+    fn arithmetic_shifts_and_field_masks_keep_what_the_operations_determine() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let one = b.constant(e, Ty::I32, 1);
+        let halved = b.int(e, IntOp::AShr, u, one);
+        let field = b.constant(e, Ty::I32, 0x0ff0);
+        let masked = b.int(e, IntOp::And, u, field);
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        let mut loose = Vec::new();
+        addresses(&b, &env, |a| {
+            let f = a.value(halved, 0, None).0.form;
+            if a.bounds(&f) != Some((0, 32767)) {
+                loose.push(format!("u ashr 1: {:?} over {:?}, not within [0, 32767]", f, a.bounds(&f)));
+            }
+            let f = a.value(masked, 0, None).0.form;
+            for (value, holds) in [(0u32, true), (0x10, true), (0x0ff0, true), (0x0ff1, false), (0x18, false)] {
+                if exactly_representable(&a.unknowns, &f, value) != Some(holds) {
+                    loose.push(format!("u & 0xff0: {:?} at {:#x}: not {}", f, value, holds));
+                }
+            }
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
     fn joined_values() -> (Build, Vec<(ValueId, Vec<Box<dyn Fn(u32) -> u32>>)>) {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -5065,7 +5194,12 @@ mod facts_tests {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let mut loose = Vec::new();
         addresses(&b, &env, |a| {
-            for (name, scale, constant) in [("z | 1", 2u32, 1u32), ("7 | z", 8, 7), ("z & ~7", 8, 0), ("(z + 3) | 1", 2, 1)] {
+            let &(_, odd, _) = words.iter().find(|w| w.0 == "(z + 3) | 1").unwrap();
+            let f = a.value(odd, 0, None).0.form;
+            if f.terms.is_empty() || f.terms.iter().any(|&(_, c)| c % 2 != 0) || f.constant % 2 != 1 {
+                loose.push(format!("(z + 3) | 1: {:?} can be even", f));
+            }
+            for (name, scale, constant) in [("z | 1", 2u32, 1u32), ("7 | z", 8, 7), ("z & ~7", 8, 0)] {
                 let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
                 let f = a.value(v, 0, None).0.form;
                 let shaped = f.constant == constant && f.terms.len() == 1 && f.terms[0].1 == scale;

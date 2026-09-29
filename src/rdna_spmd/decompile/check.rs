@@ -860,6 +860,27 @@ impl<'a> Check<'a> {
         self.logic.exists(&varying, x)
     }
 
+    fn read_from(&mut self, h: Bdd, source: impl Fn(usize) -> u32) -> Bdd {
+        let mut seen: HashMap<u32, Bdd> = HashMap::default();
+        let mut any = Bdd::FALSE;
+        for l in 0..32 {
+            let s = source(l);
+            let there = match seen.get(&s) {
+                Some(&there) => there,
+                None => {
+                    let at = self.logic.at_lane(h, s);
+                    let there = self.some_lane(at);
+                    seen.insert(s, there);
+                    there
+                }
+            };
+            let here = self.logic.lanes(|x| x == l as u32);
+            let reads = self.and(here, there);
+            any = self.or(any, reads);
+        }
+        any
+    }
+
     fn masked_read(&mut self, mask: ValueId, x: ValueId) -> Bdd {
         let hm = self.h[mask.0];
         let hx = self.whole(x);
@@ -872,9 +893,27 @@ impl<'a> Check<'a> {
         self.some_lane(read)
     }
 
+    fn other_lanes(&mut self, x: Bdd) -> Bdd {
+        if !self.logic.lane_dependent(x) {
+            return self.some_lane(x);
+        }
+        let mut any = Bdd::FALSE;
+        for l in 0..32u32 {
+            let at = self.logic.at_lane(x, l);
+            let there = self.some_lane(at);
+            if there == Bdd::FALSE {
+                continue;
+            }
+            let elsewhere = self.logic.lanes(|y| y != l);
+            let reads = self.and(elsewhere, there);
+            any = self.or(any, reads);
+        }
+        any
+    }
+
     fn query(&mut self, x: Bdd, hx: Bdd, tag: Bdd) -> Bdd {
         let whole = self.or(x, hx);
-        let others = self.some_lane(whole);
+        let others = self.other_lanes(whole);
         let absent = self.not(x);
         let differs = self.and(absent, others);
         let differs = self.and(differs, tag);
@@ -1004,7 +1043,7 @@ impl<'a> Check<'a> {
                     let whole = self.whole(w);
                     self.logic.m.ite(mode, whole, local)
                 }
-                Op::Cmp(pred, x, y) if f.types[x.0] == Ty::I32 && settled(f, facts, pred, x, y) => Bdd::FALSE,
+                other if settled(f, facts, other) => Bdd::FALSE,
                 _ => self.any_of(&inst.operands()),
             },
             Inst::Target { args, .. } => {
@@ -1064,8 +1103,9 @@ impl<'a> Check<'a> {
                     let (x, selector) = (inputs[0], inputs[1]);
                     let own = self.whole(selector);
                     let hx = self.whole(x);
-                    let read = match constant_choices(f, facts, selector) {
-                        Some(lanes) => {
+                    let read = match (self.logic.lane_function(f, facts, selector), constant_choices(f, facts, selector)) {
+                        (Some(sources), _) => self.read_from(hx, |l| sources[l] & 31),
+                        (None, Some(lanes)) => {
                             let mut any = Bdd::FALSE;
                             for lane in lanes {
                                 let there = self.logic.at_lane(hx, lane as u32 & 31);
@@ -1074,23 +1114,37 @@ impl<'a> Check<'a> {
                             }
                             any
                         }
-                        None => self.some_lane(hx),
+                        (None, None) => self.some_lane(hx),
                     };
                     self.or(own, read)
                 }
                 EffectOp::Wave(WaveOp::WriteLane) => {
                     let written = self.any_of(&inputs[..2]);
+                    let written = self.logic.at_lane(written, 0);
                     let written = self.some_lane(written);
                     let old = self.any_of(&inputs[2..]);
                     self.or(old, written)
                 }
                 EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)) => {
                     let (index, x, mask) = (inputs[0], inputs[1], inputs[2]);
-                    let read = if *op == WaveOp::Bpermute {
-                        self.masked_read(mask, x)
-                    } else {
-                        let hx = self.whole(x);
-                        self.some_lane(hx)
+                    let read = match self.logic.lane_function(f, facts, index) {
+                        Some(indices) => {
+                            let hx = self.whole(x);
+                            let h = if *op == WaveOp::Bpermute {
+                                let hm = self.h[mask.0];
+                                let fm = self.bit(mask);
+                                let set = self.and(fm, hx);
+                                self.or(hm, set)
+                            } else {
+                                hx
+                            };
+                            self.read_from(h, |l| (indices[l] >> 2) & 31)
+                        }
+                        None if *op == WaveOp::Bpermute => self.masked_read(mask, x),
+                        None => {
+                            let hx = self.whole(x);
+                            self.some_lane(hx)
+                        }
                     };
                     let own = self.whole(index);
                     self.or(own, read)
@@ -1838,7 +1892,25 @@ impl<'c, 'a> Explore<'c, 'a> {
         match inst {
             Inst::Core { value, ty, op } => {
                 let (value, ty, op) = (*value, *ty, *op);
+                let lane_only = match ty {
+                    Ty::I1 => true,
+                    Ty::I32 => facts.viewed[value.0],
+                    _ => false,
+                };
+                let lanes = if lane_only { self.logic().lane_function(f, facts, value) } else { None };
                 let desc = match op {
+                    _ if lanes.is_some() => {
+                        let values = lanes.unwrap();
+                        let bits = if ty == Ty::I1 {
+                            self.logic().lanes(|l| values[l as usize] & 1 == 1)
+                        } else {
+                            self.logic().lanes(|l| values[l as usize] >> l & 1 == 1)
+                        };
+                        Desc {
+                            same: Some(self.form(ev, ty, op)),
+                            bits: Some(bits),
+                        }
+                    }
                     Op::Const(_, k) => {
                         let bits = match ty {
                             Ty::I1 => Some(Manager::constant(k != 0)),
@@ -2211,14 +2283,38 @@ impl<'c, 'a> Explore<'c, 'a> {
     }
 }
 
-fn settled(f: &Func, facts: &Facts, pred: IntPred, x: ValueId, y: ValueId) -> bool {
+fn settled(f: &Func, facts: &Facts, op: Op) -> bool {
+    let (Op::Cmp(_, x, y) | Op::Int(_, x, y)) = op else {
+        return false;
+    };
+    if f.types[x.0] != Ty::I32 {
+        return false;
+    }
     let (Some(xs), Some(ys)) = (constant_choices(f, facts, x), constant_choices(f, facts, y)) else {
         return false;
     };
-    let answers: Vec<bool> = xs
-        .iter()
-        .flat_map(|&a| ys.iter().map(move |&b| compare(pred, a as u32, b as u32)))
-        .collect();
+    let mut answers = Vec::new();
+    for &a in &xs {
+        for &b in &ys {
+            let (a, b) = (a as u32, b as u32);
+            answers.push(match op {
+                Op::Cmp(p, ..) => compare(p, a, b) as u32,
+                Op::Int(k, ..) => match k {
+                    IntOp::Add => a.wrapping_add(b),
+                    IntOp::Sub => a.wrapping_sub(b),
+                    IntOp::Mul => a.wrapping_mul(b),
+                    IntOp::And => a & b,
+                    IntOp::Or => a | b,
+                    IntOp::Xor => a ^ b,
+                    IntOp::Shl | IntOp::LShr | IntOp::AShr if b >= 32 => return false,
+                    IntOp::Shl => a << b,
+                    IntOp::LShr => a >> b,
+                    IntOp::AShr => ((a as i32) >> b) as u32,
+                },
+                _ => return false,
+            });
+        }
+    }
     answers.iter().all(|&t| t == answers[0])
 }
 
@@ -3106,15 +3202,16 @@ mod tests {
 
     #[test]
     fn prove_follows_pairs_of_bounds_on_one_word() {
-        let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge];
+        let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge, IntPred::Eq, IntPred::Ne];
         let bounds = [0u32, 1, 4, 5, 6, 10, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
         let holds = |p: IntPred, v: u32, k: u32| super::super::address::compare(p, v, k);
         let signed = |p: IntPred| matches!(p, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
+        let equality = |p: IntPred| matches!(p, IntPred::Eq | IntPred::Ne);
         let mut r = Random::new(29);
         let mut wrong = Vec::new();
-        for _ in 0..300 {
-            let (p1, k1) = (preds[r.below(8) as usize], bounds[r.below(9) as usize]);
-            let (p2, k2) = (preds[r.below(8) as usize], bounds[r.below(9) as usize]);
+        for _ in 0..400 {
+            let (p1, k1) = (preds[r.below(10) as usize], bounds[r.below(9) as usize]);
+            let (p2, k2) = (preds[r.below(10) as usize], bounds[r.below(9) as usize]);
             let mut candidates = vec![0u32, 1, 2, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
             for k in [k1, k2] {
                 candidates.extend([k.wrapping_sub(1), k, k.wrapping_add(1)]);
@@ -3126,12 +3223,39 @@ mod tests {
                 if possible && converted {
                     wrong.push(format!("{}: v {:?} {} and v {:?} {} can both hold, yet the query was converted", name, p1, k1, p2, k2));
                 }
-                if !possible && !converted && signed(p1) == signed(p2) {
+                if !possible && !converted && (signed(p1) == signed(p2) || equality(p1) || equality(p2)) {
                     wrong.push(format!("{}: v {:?} {} and v {:?} {} never both hold, yet the query stays", name, p1, k1, p2, k2));
                 }
             }
         }
         assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_two_different_equalities_mask() {
+        let b = bounded((IntPred::Eq, 5), (IntPred::Eq, 7));
+        assert!(converted(&b).is_empty(), "{:?}: v == 5 and v == 7 never hold together", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_an_equality_and_its_negation_mask() {
+        let b = bounded((IntPred::Eq, 5), (IntPred::Ne, 5));
+        assert!(converted(&b).is_empty(), "{:?}: v == 5 and v != 5 never hold together", converted(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_store_an_equality_outside_a_bound_masks() {
+        let b = bounded((IntPred::Eq, 5), (IntPred::Ult, 3));
+        assert!(converted(&b).is_empty(), "{:?}: v == 5 and v < 3 never hold together", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_store_an_equality_inside_a_bound_masks() {
+        for second in [(IntPred::Ult, 6), (IntPred::Eq, 5), (IntPred::Ne, 7)] {
+            let b = bounded((IntPred::Eq, 5), second);
+            let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+            assert!(wrong.is_empty(), "{:?}: v == 5 and v {:?} {} both hold for v = 5", wrong, second.0, second.1);
+        }
     }
 
     #[test]
@@ -3284,6 +3408,185 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: every lane stores 0 whatever the query answers", converted(&b));
     }
 
+    fn written_first_lane(only: u64) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flag = per_lane(&mut b, &k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let target = b.constant(e, Ty::I32, only);
+        let mine = b.cmp(e, IntPred::Eq, lane, target);
+        let both = b.int(e, IntOp::And, set, mine);
+        let c = b.int(e, IntOp::And, both, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let x = b.core(e, Ty::I32, Op::Select(q, one, two));
+        let five = b.constant(e, Ty::I32, 5);
+        let y = b.wave(e, WaveOp::WriteLane, vec![x, five, lane]);
+        store_own(&mut b, &k, e, y, k.exec);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_a_lane_write_takes_from_the_one_lane_that_answers() {
+        let b = written_first_lane(0);
+        assert!(converted(&b).is_empty(), "{:?}: the write takes lane 0's word, and lane 0's own answer is the wave's", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_a_lane_write_takes_from_a_lane_that_cannot_answer() {
+        let b = written_first_lane(1);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: lane 0 alone answers false while the wave answers lane 1's flag", wrong);
+    }
+
+    fn permuted(op: WaveOp, index: impl Fn(&mut Build, BlockId, ValueId) -> ValueId) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let zero = b.constant(e, Ty::I32, 0);
+        let fifteen = b.constant(e, Ty::I32, 15);
+        let low = b.int(e, IntOp::And, lane, fifteen);
+        let first = b.cmp(e, IntPred::Eq, low, zero);
+        let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
+        let picked = b.core(e, Ty::I32, Op::Select(q, ones, lane));
+        let x = b.core(e, Ty::I32, Op::Select(first, lane, picked));
+        let index = index(&mut b, e, lane);
+        let y = match op {
+            WaveOp::ReadLane => b.wave(e, WaveOp::ReadLane, vec![x, index, zero]),
+            _ => b.wave(e, op, vec![index, x, k.exec]),
+        };
+        store_own(&mut b, &k, e, y, k.exec);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_only_lanes_a_permute_skips_hold() {
+        let mut wrong = Vec::new();
+        for op in [WaveOp::Bpermute, WaveOp::BpermuteFi] {
+            let b = permuted(op, |b, e, _| b.constant(e, Ty::I32, 0));
+            if !converted(&b).is_empty() {
+                wrong.push(format!("{:?} of lane 0: {:?}", op, converted(&b)));
+            }
+            let b = permuted(op, |b, e, lane| {
+                let sixteen = b.constant(e, Ty::I32, 16);
+                let pick = b.int(e, IntOp::And, lane, sixteen);
+                let two = b.constant(e, Ty::I32, 2);
+                b.int(e, IntOp::Shl, pick, two)
+            });
+            if !converted(&b).is_empty() {
+                wrong.push(format!("{:?} of lane 0 or 16: {:?}", op, converted(&b)));
+            }
+        }
+        let b = permuted(WaveOp::ReadLane, |b, e, lane| {
+            let sixteen = b.constant(e, Ty::I32, 16);
+            b.int(e, IntOp::And, lane, sixteen)
+        });
+        if !converted(&b).is_empty() {
+            wrong.push(format!("lane read of lane 0 or 16: {:?}", converted(&b)));
+        }
+        assert!(wrong.is_empty(), "lanes 0 and 16 hold their lane id whatever the query answers: {:?}", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_lane_zero_alone_reads_from_lane_one() {
+        let mut wrong = Vec::new();
+        for op in [WaveOp::Bpermute, WaveOp::BpermuteFi, WaveOp::ReadLane] {
+            let (mut b, k) = Build::kernel();
+            let e = BlockId(0);
+            let q = flag_query(&mut b, &k, e);
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let (zero, one) = (b.constant(e, Ty::I32, 0), b.constant(e, Ty::I32, 1));
+            let second = b.cmp(e, IntPred::Eq, lane, one);
+            let ones = b.constant(e, Ty::I32, 0x3c00_3c00);
+            let picked = b.core(e, Ty::I32, Op::Select(q, ones, zero));
+            let x = b.core(e, Ty::I32, Op::Select(second, picked, lane));
+            let next = b.int(e, IntOp::Xor, lane, one);
+            let y = match op {
+                WaveOp::ReadLane => b.wave(e, WaveOp::ReadLane, vec![x, next, zero]),
+                _ => {
+                    let two = b.constant(e, Ty::I32, 2);
+                    let byte = b.int(e, IntOp::Shl, next, two);
+                    b.wave(e, op, vec![byte, x, k.exec])
+                }
+            };
+            let first = b.cmp(e, IntPred::Eq, lane, zero);
+            let mask = b.int(e, IntOp::And, first, k.exec);
+            store_own(&mut b, &k, e, y, mask);
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                if kept.queries.is_empty() {
+                    wrong.push(format!("{:?} {}", op, name));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "lane 0 stores lane 1's word, which depends on the query: {:?}", wrong);
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_the_lane_a_permute_takes_holds() {
+        let mut wrong = Vec::new();
+        for op in [WaveOp::Bpermute, WaveOp::BpermuteFi, WaveOp::ReadLane] {
+            let b = permuted(op, |b, e, lane| {
+                let one = b.constant(e, Ty::I32, 1);
+                let next = b.int(e, IntOp::Xor, lane, one);
+                if op == WaveOp::ReadLane {
+                    next
+                } else {
+                    let two = b.constant(e, Ty::I32, 2);
+                    b.int(e, IntOp::Shl, next, two)
+                }
+            });
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                if kept.queries.is_empty() {
+                    wrong.push(format!("{:?} {}", op, name));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "lane 0 reads lane 1, whose word depends on the query: {:?}", wrong);
+    }
+
+    fn apart_lane_mask(contradiction: bool) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (then, vec![k.exec, own]), (join, vec![k.exec]));
+        let lane = b.core(then, Ty::I32, Op::Env(Env::LaneId));
+        let sixteen = b.constant(then, Ty::I32, 16);
+        let low = b.cmp(then, IntPred::Ult, lane, sixteen);
+        let mask = if contradiction {
+            let high = b.cmp(then, IntPred::Uge, lane, sixteen);
+            b.int(then, IntOp::And, low, high)
+        } else {
+            low
+        };
+        let mask = b.int(then, IntOp::And, mask, t[0]);
+        let one = b.constant(then, Ty::I32, 1);
+        b.store(then, Space::Global, MemSize::B32, t[1], one, mask);
+        b.br(then, join, vec![t[0]]);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_arm_stores_under_a_lane_contradiction() {
+        let b = apart_lane_mask(true);
+        assert!(converted(&b).is_empty(), "{:?}: lane < 16 and lane >= 16 never hold together, so the arm never stores", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_stores_in_the_low_lanes() {
+        let b = apart_lane_mask(false);
+        let wrong: Vec<&str> = ["search", "direct"].iter().zip(both(&b)).filter(|(_, kept)| kept.queries.is_empty()).map(|(n, _)| *n).collect();
+        assert!(wrong.is_empty(), "{:?}: lanes 0 to 15 store when the wave takes the arm", wrong);
+    }
+
     fn lane_query(target: u64) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -3397,6 +3700,51 @@ mod tests {
             assert!(kept.queries.contains(&q), "{}: a lane whose flag is small stores 1, the others 2", name);
             assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear sees {}", name, outside);
         }
+    }
+
+    fn over_active_floats(outside: u64, every: bool) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+        let exec = b.int(e, IntOp::And, low, k.exec);
+        let flags = k.buffer(&mut b, e, 8);
+        let buf = k.buffer(&mut b, e, 0);
+        let (then, t) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
+        b.br(e, then, vec![exec, flags, buf]);
+        let lane = b.core(then, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, then, t[1], lane, 4);
+        let yes = b.constant(then, Ty::I1, 1);
+        let word = b.load(then, Space::Global, MemSize::B32, own, yes);
+        let flag = b.core(then, Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, word));
+        let other = b.constant(then, Ty::F32, outside);
+        let v = b.core(then, Ty::F32, Op::Select(t[0], flag, other));
+        let five = b.constant(then, Ty::F32, 0x40a0_0000);
+        let small = b.core(then, Ty::I1, Op::FCmp(FloatPred::Olt, v, five));
+        let at = b.here(then);
+        let q = b.wave(then, WaveOp::Any, vec![small]);
+        let one = b.constant(then, Ty::I32, 1);
+        let two = b.constant(then, Ty::I32, 2);
+        let data = b.core(then, Ty::I32, Op::Select(q, one, two));
+        let out = byte_offset(&mut b, then, t[2], lane, 4);
+        b.store(then, Space::Global, MemSize::B32, out, data, t[0]);
+        let Inst::Effect { provenance, .. } = b.f.blocks[&then].insts[at.1] else { unreachable!() };
+        for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+            let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            assert!(kept.queries.contains(&q), "{}: a lane whose flag is small stores 1, the others 2", name);
+            assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear sees {:#x}", name, outside);
+        }
+    }
+
+    #[test]
+    fn prove_demands_no_lane_for_a_kept_query_over_float_bits_only_active_lanes_set() {
+        over_active_floats(0x42c8_0000, false);
+    }
+
+    #[test]
+    fn prove_demands_every_lane_for_a_kept_query_over_float_bits_inactive_lanes_set() {
+        over_active_floats(0x4040_0000, true);
     }
 
     #[test]
@@ -4091,6 +4439,55 @@ mod difference_tests {
         let Program { b, cases, .. } = program();
         let wrong = check_differences(&b, &[], &cases, false);
         assert!(wrong.is_empty(), "differences that miss a disagreement: {:?}", wrong);
+    }
+
+    fn choices_program() -> (Build, Vec<Case>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let yes = b.constant(e, Ty::I1, 1);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, yes);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let exec = k.exec;
+        let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
+            let c = l.m.and(bit(set), bit(exec));
+            l.m.not(c)
+        };
+        let k = |b: &mut Build, x: u64| b.constant(e, Ty::I32, x);
+        let mut cases = Vec::new();
+        let (one, two, three, four, five) = (k(&mut b, 1), k(&mut b, 2), k(&mut b, 3), k(&mut b, 4), k(&mut b, 5));
+        let s = b.core(e, Ty::I32, Op::Select(q, one, three));
+        let v = b.int(e, IntOp::And, s, one);
+        cases.push(Case { name: "select(q, 1, 3) & 1", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let s = b.core(e, Ty::I32, Op::Select(q, four, five));
+        let v = b.int(e, IntOp::LShr, s, one);
+        cases.push(Case { name: "select(q, 4, 5) >> 1", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let s = b.core(e, Ty::I32, Op::Select(q, one, two));
+        let v = b.int(e, IntOp::And, s, one);
+        cases.push(Case { name: "select(q, 1, 2) & 1", value: v, truth: Box::new(differs) });
+        let s = b.core(e, Ty::I32, Op::Select(q, two, four));
+        let v = b.int(e, IntOp::LShr, s, one);
+        cases.push(Case { name: "select(q, 2, 4) >> 1", value: v, truth: Box::new(differs) });
+        (b, cases)
+    }
+
+    #[test]
+    fn differences_vanish_for_operations_every_constant_choice_agrees_on() {
+        let (b, cases) = choices_program();
+        let loose = check_differences(&b, &[], &cases, true);
+        assert!(loose.is_empty(), "differences that claim a disagreement that cannot happen: {:?}", loose);
+    }
+
+    #[test]
+    fn differences_hold_for_operations_the_constant_choices_split() {
+        let (b, cases) = choices_program();
+        let missed = check_differences(&b, &[], &cases, false);
+        assert!(missed.is_empty(), "differences that miss a possible disagreement: {:?}", missed);
     }
 
     #[test]
