@@ -150,7 +150,7 @@ enum Key {
     Spread(ValueId, u8, Vec<Form>),
     HeldSpread(Slot, usize, Vec<Form>),
     Left(Unknown, u8),
-    Base(Region, Option<u8>),
+    Base(Region),
     Cycle(ValueId, u8),
     Guess(ValueId, u8),
     GuessSlot(Slot),
@@ -2222,6 +2222,7 @@ impl<'a> Addresses<'a> {
                 } => {
                     reliance.lane = true;
                     match self.value(inputs[1], lane, None).0.form.as_constant() {
+                        Some(k) if !self.valid((k & 31) as usize) => none(),
                         Some(k) => self.assumed_regions(inputs[0], (k & 31) as usize, None, refine).0,
                         None => {
                             let partial = !(0..LANES).all(|l| self.valid(l));
@@ -2517,8 +2518,8 @@ impl<'a> Addresses<'a> {
                 let (x, y, z) = self.ids(lane);
                 Value::constant(x | y << 10 | z << 20)
             }
-            ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => self.base(Region::Kernarg, lane),
-            ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => self.base(Region::Dispatch, lane),
+            ParameterSource::Sgpr(n) if Some(n) == self.entry.kernarg_ptr => self.base(Region::Kernarg),
+            ParameterSource::Sgpr(n) if Some(n) == self.entry.dispatch_ptr => self.base(Region::Dispatch),
             ParameterSource::Sgpr(WORKGROUP_ID_X) if self.entry.workgroup_id_x => {
                 Value::of(Form::unknown(self.workgroup(0)))
             }
@@ -2530,14 +2531,13 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    fn base(&mut self, region: Region, lane: usize) -> Value {
-        let shared = region != Region::Private;
+    fn base(&mut self, region: Region) -> Value {
         let entry = self.f.entry;
         let u = self.intern(
-            Key::Base(region, (!shared).then_some(lane as u8)),
+            Key::Base(region),
             UnknownInfo {
                 rank: 0,
-                shared,
+                shared: true,
                 block: entry,
                 range: None,
                 through: Vec::new(),
@@ -2650,7 +2650,7 @@ impl<'a> Addresses<'a> {
         let value = match op {
             Op::Const(_, k) => Value::constant(k as u32),
             Op::Env(Env::LaneId) => Value::constant(lane as u32),
-            Op::Env(Env::ScratchBase) => self.base(Region::Private, lane),
+            Op::Env(Env::ScratchBase) => self.base(Region::Private),
             Op::Int(IntOp::Add, a, b) => {
                 let (a, b) = (get!(self, a), get!(self, b));
                 let region = match (a.region, b.region) {
@@ -2801,6 +2801,12 @@ impl<'a> Addresses<'a> {
             {
                 get!(self, a)
             }
+            Op::Convert(k @ (Cvt::FloatToSignedSatRtz | Cvt::FloatToUnsignedSatRtz), to, a) => {
+                match self.converted(k, to, a) {
+                    Some(bits) => Value::constant(bits as u32),
+                    None => self.opaque(v, lane, None),
+                }
+            }
             Op::Pack64(lo, _) | Op::UnpackLo(lo) => get!(self, lo),
             Op::UnpackHi(x) => match self.facts.op(self.f, x) {
                 Some(Op::Pack64(_, hi)) => get!(self, hi),
@@ -2825,6 +2831,25 @@ impl<'a> Addresses<'a> {
             _ => self.opaque(v, lane, None),
         };
         (value, used)
+    }
+
+    fn converted(&self, k: Cvt, to: Ty, a: ValueId) -> Option<u64> {
+        let bits = self.facts.constant(self.f, a)?;
+        let x = match self.f.types[a.0] {
+            Ty::F32 => f32::from_bits(bits as u32) as f64,
+            Ty::F64 => f64::from_bits(bits),
+            _ => return None,
+        };
+        let signed = k == Cvt::FloatToSignedSatRtz;
+        Some(match (to, signed) {
+            (Ty::I1, true) => (x <= -1.0) as u64,
+            (Ty::I1, false) => (x >= 1.0) as u64,
+            (Ty::I32, true) => x as i32 as u32 as u64,
+            (Ty::I32, false) => x as u32 as u64,
+            (Ty::I64, true) => x as i64 as u64,
+            (Ty::I64, false) => x as u64,
+            _ => return None,
+        })
     }
 
     fn through(&self, form: &Form) -> Vec<BlockId> {
@@ -3102,8 +3127,11 @@ impl<'a> Addresses<'a> {
             }
             EffectOp::Wave(WaveOp::ReadLane) => {
                 let (selector, _) = self.value(inputs[1], lane, None);
-                let chosen = selector.form.as_constant().map(|k| (k & 31) as usize);
-                unassumed(self.uniform_read(v, inputs[0], chosen))
+                match selector.form.as_constant().map(|k| (k & 31) as usize) {
+                    Some(chosen) if !self.valid(chosen) => unassumed(Value::constant(0)),
+                    Some(chosen) => unassumed(self.uniform_read(v, inputs[0], Some(chosen))),
+                    None => unassumed(self.any_lane_read(v, inputs[0], inputs[1], lane)),
+                }
             }
             EffectOp::Wave(WaveOp::WriteLane) => {
                 let (selector, _) = self.value(inputs[1], lane, None);
@@ -3157,6 +3185,26 @@ impl<'a> Addresses<'a> {
         }
     }
 
+    fn any_lane_read(&mut self, v: ValueId, x: ValueId, selector: ValueId, lane: usize) -> Value {
+        let at = self.block_of(v);
+        let mut agreed: Option<Value> = None;
+        let mut differ = false;
+        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+        for l in lanes {
+            let (value, _) = self.operand(x, at, l, None);
+            differ |= agreed.as_ref().is_some_and(|a| *a != value);
+            agreed = Some(value);
+        }
+        if !(0..LANES).all(|l| self.valid(l)) && agreed.as_ref().is_some_and(|a| a.form.as_constant() != Some(0)) {
+            differ = true;
+        }
+        match agreed {
+            Some(value) if !differ => value,
+            _ if self.facts.uniform[selector.0] => self.uniform(v),
+            _ => self.opaque(v, lane, None),
+        }
+    }
+
     fn uniform_read(&mut self, v: ValueId, x: ValueId, from: Option<usize>) -> Value {
         let lanes: Vec<usize> = match from {
             Some(l) => vec![l],
@@ -3191,7 +3239,7 @@ impl<'a> Addresses<'a> {
 
     fn load(&mut self, v: ValueId, address: &Value, size: MemSize, lane: usize) -> Value {
         let offset = match address.region {
-            Some(r @ (Region::Kernarg | Region::Dispatch)) => address.form.sub(&self.base(r, lane).form).as_constant(),
+            Some(r @ (Region::Kernarg | Region::Dispatch)) => address.form.sub(&self.base(r).form).as_constant(),
             _ => None,
         };
         let bytes = size.bytes().min(4);
@@ -3391,6 +3439,9 @@ impl<'a> Addresses<'a> {
                         _ => None,
                     },
                 }
+            }
+            Op::Convert(k @ (Cvt::FloatToSignedSatRtz | Cvt::FloatToUnsignedSatRtz), Ty::I1, x) => {
+                self.converted(k, Ty::I1, x).map(|b| b != 0)
             }
             Op::Convert(_, Ty::I1, x) => bit!(self, x),
             Op::Cmp(pred, a, b) if self.f.types[a.0] == Ty::I1 => {
@@ -5876,6 +5927,166 @@ mod facts_tests {
                 .filter_map(|c| {
                     let value = a.value(c.1, 0, None).0;
                     (value.form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, value.form))
+                })
+                .collect()
+        });
+        assert!(loose.is_empty(), "{:?}", loose);
+    }
+
+    fn lane_read(selector: impl Fn(&mut Build, &Kernel, BlockId, ValueId) -> ValueId) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let four = b.constant(e, Ty::I32, 4);
+        let eight = b.constant(e, Ty::I32, 8);
+        let scaled = b.int(e, IntOp::Mul, lane, four);
+        let x = b.int(e, IntOp::Add, scaled, eight);
+        let s = selector(&mut b, &k, e, lane);
+        let register = b.constant(e, Ty::I32, 0);
+        let read = b.wave(e, WaveOp::ReadLane, vec![x, s, register]);
+        (b, read)
+    }
+
+    #[test]
+    fn lane_reads_of_lanes_the_wave_lacks_fix_no_value_but_zero() {
+        let (b, read) = lane_read(|b, _, e, _| b.constant(e, Ty::I32, 20));
+        let form = addresses(&b, &environment(16, &[]), |a| a.value(read, 3, None).0.form);
+        assert!(form.as_constant().is_none_or(|k| k == 0), "lane 20 is not in a wave of 16 lanes, so the read gives 0, not {:?}", form);
+    }
+
+    #[test]
+    fn lane_reads_of_lanes_the_wave_lacks_give_zero() {
+        let (b, read) = lane_read(|b, _, e, _| b.constant(e, Ty::I32, 20));
+        let form = addresses(&b, &environment(16, &[]), |a| a.value(read, 3, None).0.form);
+        assert_eq!(form, Form::constant(0));
+    }
+
+    #[test]
+    fn lane_reads_of_one_word_in_a_partial_wave_fix_no_value_but_zero() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let seven = b.constant(e, Ty::I32, 7);
+        let table = k.buffer(&mut b, e, 0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let selector = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let register = b.constant(e, Ty::I32, 0);
+        let read = b.wave(e, WaveOp::ReadLane, vec![seven, selector, register]);
+        let form = addresses(&b, &environment(16, &[(0, 1, 0x1000)]), |a| a.value(read, 3, None).0.form);
+        assert!(form.as_constant().is_none_or(|k| k == 0), "the selector may name a lane the wave of 16 lacks: {:?}", form);
+    }
+
+    #[test]
+    fn lane_reads_with_a_uniform_selector_give_every_lane_one_value() {
+        let (b, read) = lane_read(|b, k, e, _| {
+            let table = k.buffer(b, e, 0);
+            let yes = b.constant(e, Ty::I1, 1);
+            b.load(e, Space::Global, MemSize::B32, table, yes)
+        });
+        let env = environment(32, &[(0, 1, 0x1000)]);
+        let (third, fifth) = addresses(&b, &env, |a| (a.value(read, 3, None).0.form, a.value(read, 5, None).0.form));
+        assert_eq!(third, fifth, "every lane reads the lane the one selector names");
+    }
+
+    #[test]
+    fn lane_reads_with_a_varying_selector_read_each_lane_own_source() {
+        let (b, read) = lane_read(|_, _, _, lane| lane);
+        let form = addresses(&b, &environment(32, &[]), |a| a.value(read, 3, None).0.form);
+        assert!(form.as_constant().is_none_or(|k| k == 20), "lane 3 reads its own 3 * 4 + 8, not {:?}", form);
+    }
+
+    #[test]
+    fn lane_reads_with_a_selector_each_lane_loads_leave_the_lanes_apart() {
+        let (b, read) = lane_read(|b, k, e, lane| {
+            let buf = k.buffer(b, e, 0);
+            let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+            let address = b.int(e, IntOp::Add, buf, wide);
+            let yes = b.constant(e, Ty::I1, 1);
+            b.load(e, Space::Global, MemSize::U8, address, yes)
+        });
+        let env = environment(32, &[(0, 1, 0x1000)]);
+        let (third, fifth) = addresses(&b, &env, |a| (a.value(read, 3, None).0.form, a.value(read, 5, None).0.form));
+        assert!(third != fifth || third.as_constant().is_some(), "lanes 3 and 5 may read different lanes: {:?}", third);
+    }
+
+    #[test]
+    fn scratch_pointers_read_from_another_lane_equal_the_lane_own() {
+        let (mut b, _) = Build::kernel();
+        let e = BlockId(0);
+        let (_, p) = scratch(&mut b, e, 16);
+        let low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, p));
+        let zero = b.constant(e, Ty::I32, 0);
+        let register = b.constant(e, Ty::I32, 0);
+        let read = b.wave(e, WaveOp::ReadLane, vec![low, zero, register]);
+        let same = b.cmp(e, IntPred::Eq, read, low);
+        let found = addresses(&b, &environment(32, &[]), |a| a.bit(same, 3, None).0);
+        assert_eq!(found, Some(true), "every lane has the same scratch base");
+    }
+
+    #[test]
+    fn float_conversions_to_a_bit_decide_only_what_the_saturating_conversion_gives() {
+        let (mut b, _) = Build::kernel();
+        let e = BlockId(0);
+        let cases: Vec<(&str, Cvt, f32, bool)> = vec![
+            ("signed -1.0", Cvt::FloatToSignedSatRtz, -1.0, true),
+            ("signed 1.0000001", Cvt::FloatToSignedSatRtz, f32::from_bits(0x3f80_0001), false),
+            ("signed -2.5", Cvt::FloatToSignedSatRtz, -2.5, true),
+            ("unsigned 1.0", Cvt::FloatToUnsignedSatRtz, 1.0, true),
+            ("unsigned 3.0", Cvt::FloatToUnsignedSatRtz, 3.0, true),
+            ("unsigned 0.5", Cvt::FloatToUnsignedSatRtz, 0.5, false),
+        ];
+        let bits: Vec<(&str, ValueId, bool)> = cases
+            .iter()
+            .map(|&(name, cvt, x, truth)| {
+                let k = b.constant(e, Ty::F32, x.to_bits() as u64);
+                (name, b.core(e, Ty::I1, Op::Convert(cvt, Ty::I1, k)), truth)
+            })
+            .collect();
+        let wrong: Vec<String> = addresses(&b, &environment(32, &[]), |a| {
+            bits.iter()
+                .filter_map(|&(name, v, truth)| {
+                    let found = a.bit(v, 0, None).0;
+                    found.is_some_and(|x| x != truth).then(|| format!("{}: {:?}", name, found))
+                })
+                .collect()
+        });
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn float_conversions_to_integers_give_what_the_saturating_conversion_gives() {
+        let (mut b, _) = Build::kernel();
+        let e = BlockId(0);
+        let cases: Vec<(&str, Cvt, Ty, f32, u32)> = vec![
+            ("signed bit of -1.0", Cvt::FloatToSignedSatRtz, Ty::I1, -1.0, 1),
+            ("signed bit of -0.5", Cvt::FloatToSignedSatRtz, Ty::I1, -0.5, 0),
+            ("signed bit of 1.0", Cvt::FloatToSignedSatRtz, Ty::I1, 1.0, 0),
+            ("unsigned bit of 1.0", Cvt::FloatToUnsignedSatRtz, Ty::I1, 1.0, 1),
+            ("unsigned bit of 0.99", Cvt::FloatToUnsignedSatRtz, Ty::I1, 0.99, 0),
+            ("unsigned bit of NaN", Cvt::FloatToUnsignedSatRtz, Ty::I1, f32::NAN, 0),
+            ("signed word of -2.5", Cvt::FloatToSignedSatRtz, Ty::I32, -2.5, (-2i32) as u32),
+            ("signed word of 3e9", Cvt::FloatToSignedSatRtz, Ty::I32, 3e9, i32::MAX as u32),
+            ("unsigned word of -7.0", Cvt::FloatToUnsignedSatRtz, Ty::I32, -7.0, 0),
+            ("unsigned word of 5e9", Cvt::FloatToUnsignedSatRtz, Ty::I32, 5e9, u32::MAX),
+            ("signed low word of -1.0", Cvt::FloatToSignedSatRtz, Ty::I64, -1.0, u32::MAX),
+            ("unsigned low word of 2^33 + 2^10", Cvt::FloatToUnsignedSatRtz, Ty::I64, 8589935616.0, 1024),
+        ];
+        let converted: Vec<(&str, ValueId, Ty, u32)> = cases
+            .iter()
+            .map(|&(name, cvt, to, x, truth)| {
+                let k = b.constant(e, Ty::F32, x.to_bits() as u64);
+                (name, b.core(e, to, Op::Convert(cvt, to, k)), to, truth)
+            })
+            .collect();
+        let loose: Vec<String> = addresses(&b, &environment(32, &[]), |a| {
+            converted
+                .iter()
+                .filter_map(|&(name, v, to, truth)| {
+                    let found = if to == Ty::I1 {
+                        a.bit(v, 0, None).0.map(|x| x as u32)
+                    } else {
+                        a.value(v, 0, None).0.form.as_constant()
+                    };
+                    (found != Some(truth)).then(|| format!("{}: {:?}", name, found))
                 })
                 .collect()
         });
