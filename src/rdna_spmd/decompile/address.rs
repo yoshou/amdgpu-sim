@@ -152,6 +152,7 @@ enum Key {
     Product(Option<BlockId>, u8, Box<(Form, Form)>),
     Both(Option<BlockId>, u8, Box<(Form, Form)>),
     Power(Option<BlockId>, u8, Box<Form>),
+    Shift(Option<BlockId>, u8, IntOp, Box<(Form, Form)>),
     Selector(BlockId, u64),
     Chosen(ValueId, u8),
     Low(ValueId, Form, u32),
@@ -166,6 +167,12 @@ enum Key {
     Guess(ValueId, u8),
     GuessSlot(Slot),
     Held(Slot, usize),
+}
+
+#[derive(Clone, PartialEq)]
+enum Reached {
+    Value(Value),
+    Same,
 }
 
 enum Entry {
@@ -1097,10 +1104,22 @@ impl<'a> Addresses<'a> {
     }
 
     fn slot_in_block(&mut self, at: (BlockId, usize), address: &Form, bytes: u32, lane: usize) -> Option<Value> {
-        self.symbolic_slot(at, address, bytes, lane, 0)
+        let mut memo = HashMap::default();
+        match self.symbolic_slot(at, address, bytes, lane, None, &mut memo)? {
+            Reached::Value(value) => Some(value),
+            Reached::Same => None,
+        }
     }
 
-    fn symbolic_slot(&mut self, at: (BlockId, usize), address: &Form, bytes: u32, lane: usize, depth: usize) -> Option<Value> {
+    fn symbolic_slot(
+        &mut self,
+        at: (BlockId, usize),
+        address: &Form,
+        bytes: u32,
+        lane: usize,
+        boundary: Option<BlockId>,
+        memo: &mut HashMap<(BlockId, Option<BlockId>), Option<Reached>>,
+    ) -> Option<Reached> {
         let (block, index) = at;
         let stores: Vec<Store> = self
             .stores
@@ -1126,22 +1145,51 @@ impl<'a> Addresses<'a> {
             if w.bytes != bytes || ran != Some(true) {
                 return None;
             }
-            return Some(self.value(w.data?, lane, Some(w.predicate)).0);
+            return Some(Reached::Value(self.value(w.data?, lane, Some(w.predicate)).0));
         }
-        if depth >= 8 || block == self.f.entry {
+        if Some(block) == boundary {
+            return Some(Reached::Same);
+        }
+        if block == self.f.entry {
             return None;
         }
+        if let Some(known) = memo.get(&(block, boundary)) {
+            return known.clone();
+        }
+        memo.insert((block, boundary), None);
+        let found = self.reaching_block_start(block, address, bytes, lane, boundary, memo);
+        memo.insert((block, boundary), found.clone());
+        found
+    }
+
+    fn reaching_block_start(
+        &mut self,
+        block: BlockId,
+        address: &Form,
+        bytes: u32,
+        lane: usize,
+        boundary: Option<BlockId>,
+        memo: &mut HashMap<(BlockId, Option<BlockId>), Option<Reached>>,
+    ) -> Option<Reached> {
         let (entering, back) = self.edges_into(block);
-        if !back.is_empty() || entering.is_empty() || entering.len() > 2 {
+        if entering.is_empty() {
             return None;
         }
-        let mut found: Option<Value> = None;
+        let mut found: Option<Reached> = None;
         for (pred, _) in entering {
             let end = self.f.blocks[&pred].insts.len();
-            let value = self.symbolic_slot((pred, end), address, bytes, lane, depth + 1)?;
+            let reached = self.symbolic_slot((pred, end), address, bytes, lane, boundary, memo)?;
             match &found {
-                Some(old) if *old != value => return None,
-                _ => found = Some(value),
+                Some(old) if *old != reached => return None,
+                _ => found = Some(reached),
+            }
+        }
+        for (pred, _) in back {
+            let end = self.f.blocks[&pred].insts.len();
+            match self.symbolic_slot((pred, end), address, bytes, lane, Some(block), memo)? {
+                Reached::Same => {}
+                Reached::Value(v) if found == Some(Reached::Value(v.clone())) => {}
+                _ => return None,
             }
         }
         found
@@ -1745,7 +1793,7 @@ impl<'a> Addresses<'a> {
         if first.region.is_some() {
             return None;
         }
-        let starts = self.starts(&first.form)?;
+        let starts = self.starts(&first.form, SEQUENCE / (last as usize + 1))?;
         let mut values = Vec::with_capacity(starts.len() * (last as usize + 1));
         match affine {
             Some((scale, step)) => {
@@ -1758,19 +1806,27 @@ impl<'a> Addresses<'a> {
                 }
             }
             None => {
-                let &[edge] = back.as_slice() else {
-                    return None;
-                };
-                let arg = self.edge_arg(edge, index);
-                for &start in &starts {
-                    let mut x = start;
-                    for i in 0..=last {
-                        values.push(x);
-                        if i < last {
-                            x = self.concrete(arg, v, x, header, lane, 0)? as u32;
+                let mut args: Vec<ValueId> = back.iter().map(|&edge| self.edge_arg(edge, index)).collect();
+                args.sort_unstable();
+                args.dedup();
+                let mut seen: BTreeSet<u32> = starts.iter().copied().collect();
+                let mut frontier = starts.clone();
+                for _ in 0..last {
+                    let mut next = Vec::new();
+                    for &x in &frontier {
+                        for &arg in &args {
+                            let y = self.concrete(arg, v, x, header, lane, 0)? as u32;
+                            if seen.insert(y) {
+                                next.push(y);
+                            }
                         }
                     }
+                    if seen.len() > SEQUENCE {
+                        return None;
+                    }
+                    frontier = next;
                 }
+                values.extend(seen);
             }
         }
         values.sort_unstable();
@@ -1790,7 +1846,7 @@ impl<'a> Addresses<'a> {
         Some(Value::of(Form::unknown(u)))
     }
 
-    fn starts(&mut self, form: &Form) -> Option<Vec<u32>> {
+    fn starts(&mut self, form: &Form, most: usize) -> Option<Vec<u32>> {
         if let Some(k) = form.as_constant() {
             return Some(vec![k]);
         }
@@ -1800,7 +1856,7 @@ impl<'a> Addresses<'a> {
         let range = self.range(u);
         let choices: Vec<u32> = match (&self.unknowns[u as usize].values, range) {
             (Some(set), _) => set.to_vec(),
-            (None, Some((low, high))) if high - low < 64 => (low..=high).collect(),
+            (None, Some((low, high))) if ((high - low) as usize) < most => (low..=high).collect(),
             _ => return None,
         };
         Some(choices.into_iter().map(|x| form.constant.wrapping_add(c.wrapping_mul(x))).collect())
@@ -2755,8 +2811,8 @@ impl<'a> Addresses<'a> {
         let (f, facts) = (self.f, self.facts);
         if let Some(&root) = self.copies.get(&v) {
             if self.narrowable[v.0] {
-                if let Some(k) = self.narrowed_everywhere(v) {
-                    return unassumed(Value::constant(k));
+                if let Some(form) = self.narrowed_everywhere(v, lane) {
+                    return unassumed(Value::of(form));
                 }
             }
             return self.value(root, lane, assume);
@@ -2901,6 +2957,64 @@ impl<'a> Addresses<'a> {
         self.equal_on_edge(cond, taken, arg, 0)
     }
 
+    fn fixed_words(&self, cond: ValueId, taken: bool, depth: usize, out: &mut Vec<(ValueId, u32)>) {
+        if depth > 8 {
+            return;
+        }
+        let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
+        match self.facts.op(self.f, root(cond)) {
+            Some(Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), x, y)) if (p == IntPred::Eq) == taken && matches!(self.f.types[x.0], Ty::I32 | Ty::I64) => {
+                if let Some(k) = self.facts.constant(self.f, y) {
+                    out.push((root(x), k as u32));
+                } else if let Some(k) = self.facts.constant(self.f, x) {
+                    out.push((root(y), k as u32));
+                }
+            }
+            Some(Op::Int(IntOp::And, a, b)) if taken => {
+                self.fixed_words(a, true, depth + 1, out);
+                self.fixed_words(b, true, depth + 1, out);
+            }
+            Some(Op::Int(IntOp::Or, a, b)) if !taken => {
+                self.fixed_words(a, false, depth + 1, out);
+                self.fixed_words(b, false, depth + 1, out);
+            }
+            Some(Op::Int(IntOp::Xor, a, one)) if self.f.types[a.0] == Ty::I1 && self.facts.constant(self.f, one) == Some(1) => {
+                self.fixed_words(a, !taken, depth + 1, out)
+            }
+            _ => {}
+        }
+    }
+
+    fn narrowed_form(&mut self, (pred, slot): (BlockId, usize), arg: ValueId, at: BlockId, lane: usize) -> Option<Form> {
+        if !self.narrowing_edges.contains(&(pred, slot)) {
+            return None;
+        }
+        if let Some(k) = self.narrowing((pred, slot), arg) {
+            return Some(Form::constant(k));
+        }
+        let (cond, taken) = self.edge_condition(pred, slot)?;
+        let mut fixed = Vec::new();
+        self.fixed_words(cond, taken, 0, &mut fixed);
+        let mut form = self.operand(arg, at, lane, None).0.form;
+        let mut changed = false;
+        for (x, k) in fixed {
+            if self.f.types[x.0] != Ty::I32 {
+                continue;
+            }
+            let fx = self.operand(x, at, lane, None).0.form;
+            let &[(t, 1)] = fx.terms.as_slice() else {
+                continue;
+            };
+            let Some(&(_, c)) = form.terms.iter().find(|&&(u, _)| u == t) else {
+                continue;
+            };
+            let value = k.wrapping_sub(fx.constant);
+            form = form.sub(&Form::unknown(t).scale(c)).add(&Form::constant(value.wrapping_mul(c)));
+            changed = true;
+        }
+        changed.then_some(form)
+    }
+
     fn fixes_a_word(&self, cond: ValueId, taken: bool, depth: usize) -> bool {
         if depth > 8 {
             return false;
@@ -2921,7 +3035,7 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    fn narrowed_everywhere(&mut self, v: ValueId) -> Option<u32> {
+    fn narrowed_everywhere(&mut self, v: ValueId, lane: usize) -> Option<Form> {
         let Site::Param { block, index } = self.facts.site[v.0] else {
             return None;
         };
@@ -2930,18 +3044,27 @@ impl<'a> Addresses<'a> {
         }
         let facts = self.facts;
         let own = self.rank[&block];
-        let mut narrowed: Vec<(BlockId, usize, Option<u32>)> = Vec::new();
+        let root = |this: &Self, x: ValueId| this.copies.get(&x).copied().unwrap_or(x);
+        let mut narrowed: Vec<(BlockId, usize, Option<Form>)> = Vec::new();
         for &(pred, slot) in &facts.incoming[&block] {
+            let arg = self.edge_arg((pred, slot), index);
             if self.rank[&pred] >= own {
+                if arg == v || root(self, arg) == root(self, v) {
+                    continue;
+                }
                 return None;
             }
-            let arg = self.edge_arg((pred, slot), index);
-            narrowed.push((pred, slot, self.narrowing((pred, slot), arg)));
+            let form = if self.f.types[v.0] == Ty::I32 {
+                self.narrowed_form((pred, slot), arg, block, lane)
+            } else {
+                self.narrowing((pred, slot), arg).map(Form::constant)
+            };
+            narrowed.push((pred, slot, form));
         }
-        if narrowed.iter().all(|&(_, _, k)| k.is_none()) {
+        if narrowed.iter().all(|(_, _, k)| k.is_none()) {
             return None;
         }
-        let mut found = None;
+        let mut found: Option<Form> = None;
         for (pred, slot, k) in narrowed {
             if k.is_some() && k == found {
                 continue;
@@ -2978,8 +3101,15 @@ impl<'a> Addresses<'a> {
         let mut forms: Vec<Form> = Vec::new();
         let narrowable = self.narrowable[v.0] && !self.headers.contains(&block);
         for &(edge, a) in &arguments {
-            let value = match narrowable.then(|| self.narrowing(edge, a)).flatten() {
-                Some(k) => Value::constant(k),
+            let narrowed = if !narrowable {
+                None
+            } else if self.f.types[v.0] == Ty::I32 {
+                self.narrowed_form(edge, a, block, lane)
+            } else {
+                self.narrowing(edge, a).map(Form::constant)
+            };
+            let value = match narrowed {
+                Some(form) => Value::of(form),
                 None => self.operand(a, block, lane, None).0,
             };
             region = Some(match region {
@@ -3068,13 +3198,14 @@ impl<'a> Addresses<'a> {
                 match s.form.as_constant() {
                     Some(k) if k < 32 => Value::of(a.form.scale(1 << k)),
                     Some(k) if wide && k < 64 => Value::constant(0),
-                    None if !wide => {
+                    None if !wide || self.bounds(&s.form).is_some_and(|(_, high)| high < 32) => {
                         let power = self.power(v, &s.form, lane);
                         match a.form.as_constant() {
                             Some(k) => Value::of(power.scale(k)),
                             None => self.product(v, &a.form, &power, lane),
                         }
                     }
+                    None => Value::of(self.shifted_by(v, IntOp::Shl, &a.form, &s.form, lane)),
                     _ => self.opaque(v, lane, None),
                 }
             }
@@ -3083,7 +3214,7 @@ impl<'a> Addresses<'a> {
                 match s.form.as_constant().map(|k| k & 31) {
                     Some(0) => a,
                     Some(k) => self.shift(v, &a.form, k, lane),
-                    _ => self.opaque(v, lane, None),
+                    None => Value::of(self.shifted_by(v, IntOp::LShr, &a.form, &s.form, lane)),
                 }
             }
             Op::Int(IntOp::AShr, a, s) if !wide => {
@@ -3093,6 +3224,7 @@ impl<'a> Addresses<'a> {
                     (None, Some(k)) if self.bounds(&a.form).is_some_and(|(_, high)| high < 1 << 31) => {
                         self.shift(v, &a.form, k, lane)
                     }
+                    (_, None) => Value::of(self.shifted_by(v, IntOp::AShr, &a.form, &s.form, lane)),
                     _ => self.opaque(v, lane, None),
                 }
             }
@@ -3462,11 +3594,21 @@ impl<'a> Addresses<'a> {
         }
     }
 
+    fn summed_high(&self, x: ValueId, seen: &mut HashMap<ValueId, bool>) -> bool {
+        let x = self.copies.get(&x).copied().unwrap_or(x);
+        if let Some(&known) = seen.get(&x) {
+            return known;
+        }
+        seen.insert(x, false);
+        let known = self.plain_high(x)
+            || matches!(self.facts.op(self.f, x), Some(Op::Int(IntOp::Add | IntOp::Sub, a, b)) if self.summed_high(a, seen) && self.summed_high(b, seen));
+        seen.insert(x, known);
+        known
+    }
+
     fn known_high(&mut self, x: ValueId, at: BlockId, lane: usize) -> Option<Form> {
         let x = self.copies.get(&x).copied().unwrap_or(x);
-        let plain = self.plain_high(x)
-            || matches!(self.facts.op(self.f, x), Some(Op::Int(IntOp::Add | IntOp::Sub, a, b)) if self.plain_high(a) && self.plain_high(b));
-        if !plain {
+        if !self.summed_high(x, &mut HashMap::default()) {
             return None;
         }
         let high = self.high_operand(x, at, lane);
@@ -3803,6 +3945,28 @@ impl<'a> Addresses<'a> {
         let range = Some((0, top(self.bounds(a)).min(top(self.bounds(b)))));
         let u = self.intern(
             Key::Both(key, l, Box::new((a.clone(), b.clone()))),
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block,
+                range,
+                through,
+                values: None,
+            },
+        );
+        Form::unknown(u)
+    }
+
+    fn shifted_by(&mut self, v: ValueId, kind: IntOp, a: &Form, s: &Form, lane: usize) -> Form {
+        let (shared, l, through) = self.derivation(&[a, s], lane);
+        let (block, key) = self.variance(&[a, s], self.block_of(v));
+        let range = match (kind, self.bounds(a)) {
+            (IntOp::LShr, Some((_, high))) if high < 1 << 32 => Some((0, high as u32)),
+            (IntOp::AShr, Some((_, high))) if high < 1 << 31 => Some((0, high as u32)),
+            _ => None,
+        };
+        let u = self.intern(
+            Key::Shift(key, l, kind, Box::new((a.clone(), s.clone()))),
             UnknownInfo {
                 rank: 0,
                 shared,
@@ -4312,8 +4476,16 @@ impl<'a> Addresses<'a> {
                 };
                 (4..=1 << 32).contains(&scale).then_some(root(d))
             } else {
-                let lane = matches!(facts.op(f, root(inner)), Some(Op::Env(Env::LaneId)));
-                (lane && (4..=1 << 27).contains(&scale)).then_some(root(inner))
+                let x = root(inner);
+                let top = match (facts.op(f, x), facts.site[x.0]) {
+                    (Some(Op::Env(Env::LaneId)), _) => Some(LANES as u64 - 1),
+                    (_, Site::Param { block, index }) if block == f.entry && matches!(self.inputs[index].source, ParameterSource::Vgpr(0)) => {
+                        let [bx, by, bz] = self.env.block.map(|n| n.max(1) as u64 - 1);
+                        Some(bx | by << 10 | bz << 20)
+                    }
+                    _ => None,
+                };
+                top.filter(|&top| scale >= 4 && top * scale < 1 << 32).map(|_| x)
             }
         };
         let (base, x) = match facts.op(f, address) {
@@ -5117,47 +5289,54 @@ impl Addresses<'_> {
 
     fn last_trip(&mut self, header: BlockId, trips: Unknown) -> Option<u32> {
         let own = self.rank[&header];
-        let mut condition: Option<(ValueId, bool)> = None;
+        let mut guards: Vec<(ValueId, bool)> = Vec::new();
         for &(pred, slot) in &self.facts.incoming[&header].clone() {
             if self.rank[&pred] < own {
                 continue;
             }
             let edge = self.guard(pred, slot)?;
-            match condition {
-                None => condition = Some(edge),
-                Some(old) if old == edge => {}
-                Some(_) => return None,
+            if !guards.contains(&edge) {
+                guards.push(edge);
             }
         }
-        let (cond, taken) = condition?;
-        let cond = self.copies.get(&cond).copied().unwrap_or(cond);
-        let Some(Op::Cmp(pred, a, b)) = self.facts.op(self.f, cond) else {
-            return None;
-        };
-        if self.f.types[a.0] != Ty::I32 {
-            return None;
-        }
-        let mut lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-        if self.facts.uniform[a.0] && self.facts.uniform[b.0] {
-            lanes.truncate(1);
-        }
-        let mut operands: Option<(Form, Form)> = None;
-        for l in lanes {
-            let x = self.value(a, l, None).0.form;
-            let y = self.value(b, l, None).0.form;
-            match &operands {
-                None => operands = Some((x, y)),
-                Some((ox, oy)) if *ox == x && *oy == y => {}
-                Some(_) => return None,
-            }
-        }
-        let (x, y) = operands?;
         let linear = |f: &Form| match f.terms.as_slice() {
             [] => Some((f.constant, 0)),
             [(u, k)] if *u == trips => Some((f.constant, *k)),
             _ => None,
         };
-        first_failure(pred, taken, linear(&x)?, linear(&y)?)
+        let mut shape: Option<(IntPred, bool, (u32, u32), (u32, u32))> = None;
+        for (cond, taken) in guards {
+            let cond = self.copies.get(&cond).copied().unwrap_or(cond);
+            let Some(Op::Cmp(pred, a, b)) = self.facts.op(self.f, cond) else {
+                return None;
+            };
+            if self.f.types[a.0] != Ty::I32 {
+                return None;
+            }
+            let mut lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+            if self.facts.uniform[a.0] && self.facts.uniform[b.0] {
+                lanes.truncate(1);
+            }
+            let mut operands: Option<(Form, Form)> = None;
+            for l in lanes {
+                let x = self.value(a, l, None).0.form;
+                let y = self.value(b, l, None).0.form;
+                match &operands {
+                    None => operands = Some((x, y)),
+                    Some((ox, oy)) if *ox == x && *oy == y => {}
+                    Some(_) => return None,
+                }
+            }
+            let (x, y) = operands?;
+            let guard = (pred, taken, linear(&x)?, linear(&y)?);
+            match shape {
+                None => shape = Some(guard),
+                Some(old) if old == guard => {}
+                Some(_) => return None,
+            }
+        }
+        let (pred, taken, x, y) = shape?;
+        first_failure(pred, taken, x, y)
     }
 
     fn induction(&mut self, v: ValueId, block: BlockId, index: usize, lane: usize) -> Option<(u32, u32)> {
@@ -6276,6 +6455,35 @@ mod facts_tests {
         words.push(("(1 << (w & 31)) * u", v, Box::new(|u, w, _| (1u32 << (w & 31)).wrapping_mul(u))));
         let v = b.int(e, IntOp::Shl, w, u);
         words.push(("w << u", v, Box::new(|u, w, _| w << (u & 31))));
+        let v = b.int(e, IntOp::LShr, u, s);
+        words.push(("u >> (w & 31)", v, Box::new(|u, w, _| u >> (w & 31))));
+        let v = b.int(e, IntOp::AShr, u, s);
+        words.push(("u >>> (w & 31)", v, Box::new(|u, w, _| ((u as i32) >> (w & 31)) as u32)));
+        let low_half = c(&mut b, 0xffff);
+        let half = b.int(e, IntOp::And, u, low_half);
+        let v = b.int(e, IntOp::LShr, half, s);
+        words.push(("(u & 0xffff) >> (w & 31)", v, Box::new(|u, w, _| (u & 0xffff) >> (w & 31))));
+        let v = b.int(e, IntOp::AShr, half, s);
+        words.push(("(u & 0xffff) >>> (w & 31)", v, Box::new(|u, w, _| (u & 0xffff) >> (w & 31))));
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, u));
+        let wide_s = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, s));
+        let shifted = b.int(e, IntOp::Shl, wide, wide_s);
+        let v = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, shifted));
+        words.push(("low(zext(u) << (w & 31))", v, Box::new(|u, w, _| ((u as u64) << (w & 31)) as u32)));
+        let sixty_three = c(&mut b, 63);
+        let far = b.int(e, IntOp::And, w, sixty_three);
+        let wide_far = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, far));
+        let shifted = b.int(e, IntOp::Shl, wide, wide_far);
+        let v = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, shifted));
+        words.push(("low(zext(u) << (w & 63))", v, Box::new(|u, w, _| ((u as u64) << (w & 63)) as u32)));
+        let wide_w = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, w));
+        let sum = b.int(e, IntOp::Add, wide, wide_w);
+        let again = b.int(e, IntOp::Add, sum, wide);
+        let v = b.core(e, Ty::I32, Op::UnpackHi(again));
+        words.push(("hi((zext(u) + zext(w)) + zext(u))", v, Box::new(|u, w, _| ((u as u64 + w as u64 + u as u64) >> 32) as u32)));
+        let back = b.int(e, IntOp::Sub, again, wide_w);
+        let v = b.core(e, Ty::I32, Op::UnpackHi(back));
+        words.push(("hi((zext(u) + zext(w)) + zext(u) - zext(w))", v, Box::new(|u, _, _| ((2 * u as u64) >> 32) as u32)));
         for (name, op) in [("popcount(u)", 0u8), ("leading zeros of u", 1), ("trailing zeros of u", 2), ("popcount(w)", 3), ("trailing zeros of w", 4)] {
             let v = match op {
                 0 => b.core(e, Ty::I32, Op::PopulationCount(u)),
@@ -7774,5 +7982,581 @@ mod facts_tests {
         let (b, chosen) = chosen_after_branch(true);
         let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the block runs only when u is 0");
+    }
+
+    fn zero_cases(b: &Build, cases: &[(&'static str, ValueId)], exact: bool) -> Vec<String> {
+        addresses(b, &two_words(), |a| {
+            cases
+                .iter()
+                .filter_map(|&(name, v)| {
+                    let form = a.value(v, 3, None).0.form;
+                    let wrong = if exact { form.as_constant() != Some(0) } else { !representable(&a.unknowns, &form, 0) };
+                    wrong.then(|| format!("{}: {:?}", name, form))
+                })
+                .collect()
+        })
+    }
+
+    fn distributed_products() -> (Build, Vec<(&'static str, ValueId)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = loaded_word(&mut b, &k, e, 4, MemSize::B32);
+        let w = loaded_word(&mut b, &k, e, 8, MemSize::B32);
+        let one = b.constant(e, Ty::I32, 1);
+        let next = b.int(e, IntOp::Add, v, one);
+        let product = b.int(e, IntOp::Mul, u, next);
+        let uv = b.int(e, IntOp::Mul, u, v);
+        let sum = b.int(e, IntOp::Add, uv, u);
+        let distributed = b.int(e, IntOp::Sub, product, sum);
+        let vw = b.int(e, IntOp::Mul, v, w);
+        let left = b.int(e, IntOp::Mul, u, vw);
+        let uv = b.int(e, IntOp::Mul, u, v);
+        let right = b.int(e, IntOp::Mul, uv, w);
+        let associated = b.int(e, IntOp::Sub, left, right);
+        (b, vec![("u * (v + 1) - (u * v + u)", distributed), ("u * (v * w) - (u * v) * w", associated)])
+    }
+
+    #[test]
+    fn distributed_and_regrouped_products_hold_zero() {
+        let (b, cases) = distributed_products();
+        let missed = zero_cases(&b, &cases, false);
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn distributed_and_regrouped_products_give_zero() {
+        let (b, cases) = distributed_products();
+        let loose = zero_cases(&b, &cases, true);
+        assert!(loose.is_empty(), "each is 0 for every u, v and w: {:?}", loose);
+    }
+
+    fn repeated_shifts() -> (Build, Vec<(&'static str, ValueId)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = loaded_word(&mut b, &k, e, 4, MemSize::B32);
+        let byte = loaded_word(&mut b, &k, e, 8, MemSize::U8);
+        let thirty_one = b.constant(e, Ty::I32, 31);
+        let s = b.int(e, IntOp::And, byte, thirty_one);
+        let mut cases = Vec::new();
+        for (name, op) in [("(u >> s) - (u >> s)", IntOp::LShr), ("(u >>> s) - (u >>> s)", IntOp::AShr)] {
+            let first = b.int(e, op, u, s);
+            let second = b.int(e, op, u, s);
+            cases.push((name, b.int(e, IntOp::Sub, first, second)));
+        }
+        let wide_u = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, u));
+        let wide_v = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, v));
+        let wide_s = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, s));
+        let uv = b.int(e, IntOp::Mul, wide_u, wide_v);
+        let vu = b.int(e, IntOp::Mul, wide_v, wide_u);
+        let products = b.int(e, IntOp::Sub, uv, vu);
+        cases.push(("low(zext(u) * zext(v) - zext(v) * zext(u))", b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, products))));
+        let first = b.int(e, IntOp::Shl, wide_u, wide_s);
+        let second = b.int(e, IntOp::Shl, wide_u, wide_s);
+        let shifts = b.int(e, IntOp::Sub, first, second);
+        cases.push(("low((zext(u) << s) - (zext(u) << s))", b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, shifts))));
+        (b, cases)
+    }
+
+    #[test]
+    fn repeated_variable_and_wide_shifts_and_products_hold_zero_differences() {
+        let (b, cases) = repeated_shifts();
+        let missed = zero_cases(&b, &cases, false);
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn repeated_variable_and_wide_shifts_and_products_give_zero_differences() {
+        let (b, cases) = repeated_shifts();
+        let loose = zero_cases(&b, &cases, true);
+        assert!(loose.is_empty(), "each is the same value twice: {:?}", loose);
+    }
+
+    fn products_after_two_loops() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (first, f) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        let (middle, m) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+        let (second, g) = b.block(&[Ty::I1, Ty::I64, Ty::I32, Ty::I32]);
+        let (after, a) = b.block(&[Ty::I1, Ty::I64, Ty::I32, Ty::I32]);
+        let (last, l) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+        b.br(e, first, vec![k.exec, table, zero]);
+        let yes = b.constant(first, Ty::I1, 1);
+        let x = b.load(first, Space::Global, MemSize::B32, f[1], yes);
+        let one = b.constant(first, Ty::I32, 1);
+        let next = b.int(first, IntOp::Add, f[2], one);
+        let two = b.constant(first, Ty::I32, 2);
+        let again = b.cmp(first, IntPred::Ult, next, two);
+        b.cond_br(first, again, (first, vec![f[0], f[1], next]), (middle, vec![f[0], f[1], x]));
+        let zero = b.constant(middle, Ty::I32, 0);
+        b.br(middle, second, vec![m[0], m[1], m[2], zero]);
+        let four = b.constant(second, Ty::I64, 4);
+        let at = b.int(second, IntOp::Add, g[1], four);
+        let yes = b.constant(second, Ty::I1, 1);
+        let y = b.load(second, Space::Global, MemSize::B32, at, yes);
+        let one = b.constant(second, Ty::I32, 1);
+        let next = b.int(second, IntOp::Add, g[3], one);
+        let two = b.constant(second, Ty::I32, 2);
+        let again = b.cmp(second, IntPred::Ult, next, two);
+        b.cond_br(second, again, (second, vec![g[0], g[1], g[2], next]), (after, vec![g[0], g[1], g[2], y]));
+        let product = b.int(after, IntOp::Mul, a[2], a[3]);
+        b.br(after, last, vec![a[0], a[2], a[3], product]);
+        let again = b.int(last, IntOp::Mul, l[1], l[2]);
+        let difference = b.int(last, IntOp::Sub, l[3], again);
+        (b, difference)
+    }
+
+    #[test]
+    fn products_of_words_from_two_loops_in_two_blocks_hold_their_difference() {
+        let (b, difference) = products_after_two_loops();
+        let held = addresses(&b, &two_words(), |a| {
+            let form = a.value(difference, 0, None).0.form;
+            representable(&a.unknowns, &form, 0)
+        });
+        assert!(held);
+    }
+
+    #[test]
+    fn products_of_words_from_two_loops_in_two_blocks_are_equal() {
+        let (b, difference) = products_after_two_loops();
+        let form = addresses(&b, &two_words(), |a| a.value(difference, 0, None).0.form);
+        assert_eq!(form, Form::constant(0), "both are x * y of the same x from the first loop and y from the second");
+    }
+
+    fn chosen_after_bound(entered: bool) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let four = b.constant(e, Ty::I32, 4);
+        let below = b.cmp(e, IntPred::Ult, u, four);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32]);
+        b.cond_br(e, below, (then, vec![k.exec, u]), (other, vec![k.exec, u]));
+        let (block, p) = if entered { (then, t) } else { (other, o) };
+        let eight = b.constant(block, Ty::I32, 8);
+        let test = b.cmp(block, IntPred::Ult, p[1], eight);
+        let seven = b.constant(block, Ty::I32, 7);
+        let nine = b.constant(block, Ty::I32, 9);
+        let chosen = b.core(block, Ty::I32, Op::Select(test, seven, nine));
+        (b, chosen)
+    }
+
+    #[test]
+    fn selects_after_a_bound_hold_the_arms_the_bound_leaves() {
+        let missed: Vec<(bool, u32)> = [(true, 7u32), (false, 7), (false, 9)]
+            .iter()
+            .copied()
+            .filter(|&(entered, truth)| {
+                let (b, chosen) = chosen_after_bound(entered);
+                !addresses(&b, &two_words(), |a| {
+                    let form = a.value(chosen, 0, None).0.form;
+                    representable(&a.unknowns, &form, truth)
+                })
+            })
+            .collect();
+        assert!(missed.is_empty(), "u below 4 gives 7; u of 4 or more gives 7 below 8 and 9 above: {:?}", missed);
+    }
+
+    #[test]
+    fn selects_after_a_bound_take_the_arm_the_bound_decides() {
+        let (b, chosen) = chosen_after_bound(true);
+        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        assert_eq!(form, Form::constant(7), "the block runs only when u is below 4, so u is below 8");
+    }
+
+    fn chosen_after_branch_on_a_source(entered: bool) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let is_zero = b.cmp(e, IntPred::Eq, u, zero);
+        let one = b.constant(e, Ty::I32, 1);
+        let w = b.int(e, IntOp::Add, u, one);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32]);
+        b.cond_br(e, is_zero, (then, vec![k.exec, w]), (other, vec![k.exec, w]));
+        let (block, p) = if entered { (then, t) } else { (other, o) };
+        let one = b.constant(block, Ty::I32, 1);
+        let test = b.cmp(block, IntPred::Eq, p[1], one);
+        let seven = b.constant(block, Ty::I32, 7);
+        let nine = b.constant(block, Ty::I32, 9);
+        let chosen = b.core(block, Ty::I32, Op::Select(test, seven, nine));
+        (b, chosen)
+    }
+
+    #[test]
+    fn selects_on_a_word_derived_from_the_branch_word_hold_the_arm_the_branch_leaves() {
+        let missed: Vec<bool> = [true, false]
+            .iter()
+            .copied()
+            .filter(|&entered| {
+                let (b, chosen) = chosen_after_branch_on_a_source(entered);
+                let truth = if entered { 7 } else { 9 };
+                !addresses(&b, &two_words(), |a| {
+                    let form = a.value(chosen, 0, None).0.form;
+                    representable(&a.unknowns, &form, truth)
+                })
+            })
+            .collect();
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn selects_on_a_word_derived_from_the_branch_word_take_the_arm_the_branch_decides() {
+        let (b, chosen) = chosen_after_branch_on_a_source(true);
+        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        assert_eq!(form, Form::constant(7), "the block runs only when u is 0, so u + 1 is 1");
+    }
+
+    fn chosen_in_a_loop_entered_on_zero() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let is_zero = b.cmp(e, IntPred::Eq, u, zero);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, is_zero, (body, vec![k.exec, u, zero]), (exit, vec![k.exec]));
+        let zero = b.constant(body, Ty::I32, 0);
+        let test = b.cmp(body, IntPred::Eq, p[1], zero);
+        let seven = b.constant(body, Ty::I32, 7);
+        let nine = b.constant(body, Ty::I32, 9);
+        let chosen = b.core(body, Ty::I32, Op::Select(test, seven, nine));
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let three = b.constant(body, Ty::I32, 3);
+        let again = b.cmp(body, IntPred::Ult, next, three);
+        b.cond_br(body, again, (body, vec![p[0], p[1], next]), (exit, vec![p[0]]));
+        (b, chosen)
+    }
+
+    #[test]
+    fn selects_in_a_loop_entered_on_zero_hold_the_arm_zero_takes() {
+        let (b, chosen) = chosen_in_a_loop_entered_on_zero();
+        let held = addresses(&b, &two_words(), |a| {
+            let form = a.value(chosen, 0, None).0.form;
+            representable(&a.unknowns, &form, 7)
+        });
+        assert!(held);
+    }
+
+    #[test]
+    fn selects_in_a_loop_entered_on_zero_take_the_arm_zero_takes() {
+        let (b, chosen) = chosen_in_a_loop_entered_on_zero();
+        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        assert_eq!(form, Form::constant(7), "the loop runs only when u is 0 and carries u unchanged");
+    }
+
+    fn affine_values(start: u32, trips: usize) -> Vec<u32> {
+        std::iter::successors(Some(start), |x| Some(x.wrapping_mul(3).wrapping_add(1))).take(trips).collect()
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_an_affine_step_carries_over_five_thousand_iterations() {
+        let (b, v) = affine_loop(5000);
+        let truth = affine_values(1, 5000);
+        let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
+            let form = a.value(v, 0, None).0.form;
+            truth.iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "{} values missed", missed.len());
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_an_affine_step_carries_over_five_thousand_iterations() {
+        let (b, v) = affine_loop(5000);
+        let mut truth = affine_values(1, 5000);
+        truth.sort_unstable();
+        truth.dedup();
+        let carried = carried_values(&b, v).map(|mut s| {
+            s.sort_unstable();
+            s
+        });
+        assert!(carried.as_ref() == Some(&truth), "the parameter runs 1, 4, 13 and on for 5000 iterations; found {:?} values", carried.map(|s| s.len()));
+    }
+
+    fn affine_loop_from_a_byte() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let mask = b.constant(e, Ty::I32, 127);
+        let start = b.int(e, IntOp::And, u, mask);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, start, zero]);
+        let three = b.constant(body, Ty::I32, 3);
+        let tripled = b.int(body, IntOp::Mul, p[1], three);
+        let one = b.constant(body, Ty::I32, 1);
+        let next_value = b.int(body, IntOp::Add, tripled, one);
+        let next = b.int(body, IntOp::Add, p[2], one);
+        let limit = b.constant(body, Ty::I32, 3);
+        let again = b.cmp(body, IntPred::Ult, next, limit);
+        b.cond_br(body, again, (body, vec![p[0], next_value, next]), (exit, vec![p[0]]));
+        (b, p[1])
+    }
+
+    fn affine_values_from_a_byte() -> Vec<u32> {
+        let mut values: Vec<u32> = (0..128).flat_map(|s| affine_values(s, 3)).collect();
+        values.sort_unstable();
+        values.dedup();
+        values
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_an_affine_step_carries_from_a_hundred_and_twenty_eight_starts() {
+        let (b, v) = affine_loop_from_a_byte();
+        let truth = affine_values_from_a_byte();
+        let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
+            let form = a.value(v, 0, None).0.form;
+            truth.iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_an_affine_step_carries_from_a_hundred_and_twenty_eight_starts() {
+        let (b, v) = affine_loop_from_a_byte();
+        let carried = addresses(&b, &two_words(), |a| {
+            let form = a.value(v, 0, None).0.form;
+            match form.terms.as_slice() {
+                [(u, 1)] if form.constant == 0 => a.unknowns[*u as usize].values.as_ref().map(|s| {
+                    let mut s = s.to_vec();
+                    s.sort_unstable();
+                    s
+                }),
+                _ => None,
+            }
+        });
+        assert!(carried == Some(affine_values_from_a_byte()), "the start is below 128 and the loop runs three times; found {:?} values", carried.map(|s| s.len()));
+    }
+
+    fn squared_loop_with_two_back_edges() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (head, h) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (left, l) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (right, r) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, head, vec![k.exec, one, zero]);
+        let squared = b.int(head, IntOp::Mul, h[1], h[1]);
+        let one = b.constant(head, Ty::I32, 1);
+        let next_value = b.int(head, IntOp::Add, squared, one);
+        let next = b.int(head, IntOp::Add, h[2], one);
+        let low = b.int(head, IntOp::And, next, one);
+        let odd = b.cmp(head, IntPred::Eq, low, one);
+        b.cond_br(head, odd, (left, vec![h[0], next_value, next]), (right, vec![h[0], next_value, next]));
+        for (block, p) in [(left, &l), (right, &r)] {
+            let three = b.constant(block, Ty::I32, 3);
+            let again = b.cmp(block, IntPred::Ult, p[2], three);
+            b.cond_br(block, again, (head, vec![p[0], p[1], p[2]]), (exit, vec![p[0]]));
+        }
+        (b, h[1])
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_a_square_step_carries_along_two_back_edges() {
+        let (b, v) = squared_loop_with_two_back_edges();
+        let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
+            let form = a.value(v, 0, None).0.form;
+            [1u32, 2, 5].iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the parameter runs 1, 2, 5: {:?}", missed);
+    }
+
+    #[test]
+    fn loop_values_are_exactly_those_a_square_step_carries_along_two_back_edges() {
+        let (b, v) = squared_loop_with_two_back_edges();
+        assert_eq!(carried_values(&b, v), Some(vec![1, 2, 5]));
+    }
+
+    fn sums_of_sums() -> (Build, Vec<(&'static str, ValueId, u32)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let far = b.constant(e, Ty::I64, 0x1_0000_0000);
+        let above = b.int(e, IntOp::Add, buf, far);
+        let twice = b.int(e, IntOp::Add, above, far);
+        let high = b.core(e, Ty::I32, Op::UnpackHi(twice));
+        let back = b.int(e, IntOp::Sub, twice, far);
+        let back_high = b.core(e, Ty::I32, Op::UnpackHi(back));
+        (b, vec![("high((buf + 2^32) + 2^32)", high, 2), ("high(((buf + 2^32) + 2^32) - 2^32)", back_high, 1)])
+    }
+
+    #[test]
+    fn high_halves_of_sums_of_sums_hold_their_values() {
+        let (b, cases) = sums_of_sums();
+        let missed: Vec<&str> = addresses(&b, &two_words(), |a| {
+            cases
+                .iter()
+                .filter(|c| {
+                    let form = a.value(c.1, 0, None).0.form;
+                    !representable(&a.unknowns, &form, c.2)
+                })
+                .map(|c| c.0)
+                .collect()
+        });
+        assert!(missed.is_empty(), "{:?}", missed);
+    }
+
+    #[test]
+    fn high_halves_of_sums_of_sums_give_their_values() {
+        let (b, cases) = sums_of_sums();
+        let loose: Vec<String> = addresses(&b, &two_words(), |a| {
+            cases
+                .iter()
+                .filter_map(|c| {
+                    let form = a.value(c.1, 0, None).0.form;
+                    (form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, form))
+                })
+                .collect()
+        });
+        assert!(loose.is_empty(), "buf is 0x1000: {:?}", loose);
+    }
+
+    fn shared_word_by_item() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let four = b.constant(e, Ty::I32, 4);
+        let own = b.int(e, IntOp::Mul, k.item, four);
+        b.store(e, Space::Lds, MemSize::B32, own, k.item, k.exec);
+        let back = b.load(e, Space::Lds, MemSize::B32, own, k.exec);
+        (b, back)
+    }
+
+    #[test]
+    fn lds_words_read_back_by_work_item_hold_the_word_the_item_stored() {
+        let (b, back) = shared_word_by_item();
+        let held = addresses(&b, &two_words(), |a| {
+            let form = a.value(back, 3, None).0.form;
+            representable(&a.unknowns, &form, 3)
+        });
+        assert!(held, "item 3 reads back the 3 it stored");
+    }
+
+    #[test]
+    fn lds_words_read_back_by_work_item_give_the_word_the_item_stored() {
+        let (b, back) = shared_word_by_item();
+        let form = addresses(&b, &two_words(), |a| a.value(back, 3, None).0.form);
+        assert_eq!(form, Form::constant(3), "word 3 of the LDS only ever holds 3, which only item 3 writes");
+    }
+
+    fn squared_loop_with_two_bounds() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (head, h) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (even, l) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (odd, r) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, head, vec![k.exec, one, zero]);
+        let squared = b.int(head, IntOp::Mul, h[1], h[1]);
+        let one = b.constant(head, Ty::I32, 1);
+        let next_value = b.int(head, IntOp::Add, squared, one);
+        let next = b.int(head, IntOp::Add, h[2], one);
+        let low = b.int(head, IntOp::And, next, one);
+        let is_odd = b.cmp(head, IntPred::Eq, low, one);
+        b.cond_br(head, is_odd, (odd, vec![h[0], next_value, next]), (even, vec![h[0], next_value, next]));
+        for (block, p, bound) in [(even, &l, 3u64), (odd, &r, 5)] {
+            let limit = b.constant(block, Ty::I32, bound);
+            let again = b.cmp(block, IntPred::Ult, p[2], limit);
+            b.cond_br(block, again, (head, vec![p[0], p[1], p[2]]), (exit, vec![p[0]]));
+        }
+        (b, h[1])
+    }
+
+    #[test]
+    fn loop_values_hold_every_value_a_square_step_carries_along_two_back_edges_with_different_bounds() {
+        let (b, v) = squared_loop_with_two_bounds();
+        let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
+            let form = a.value(v, 0, None).0.form;
+            [1u32, 2, 5, 26].iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the odd back edge goes on below 5 and the even one below 3, so the loop runs four times and carries 1, 2, 5, 26: {:?}", missed);
+    }
+
+    fn chosen_after_offset_branch(entered: bool) -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let three = b.constant(e, Ty::I32, 3);
+        let x = b.int(e, IntOp::Add, u, three);
+        let five = b.constant(e, Ty::I32, 5);
+        let hit = b.cmp(e, IntPred::Eq, x, five);
+        let two = b.constant(e, Ty::I32, 2);
+        let doubled = b.int(e, IntOp::Mul, u, two);
+        let one = b.constant(e, Ty::I32, 1);
+        let w = b.int(e, IntOp::Add, doubled, one);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (other, o) = b.block(&[Ty::I1, Ty::I32]);
+        b.cond_br(e, hit, (then, vec![k.exec, w]), (other, vec![k.exec, w]));
+        let (block, p) = if entered { (then, t) } else { (other, o) };
+        let five = b.constant(block, Ty::I32, 5);
+        let test = b.cmp(block, IntPred::Eq, p[1], five);
+        let seven = b.constant(block, Ty::I32, 7);
+        let nine = b.constant(block, Ty::I32, 9);
+        let chosen = b.core(block, Ty::I32, Op::Select(test, seven, nine));
+        (b, chosen)
+    }
+
+    #[test]
+    fn selects_on_a_word_derived_from_an_offset_branch_word_hold_the_arms_the_branch_leaves() {
+        let missed: Vec<(bool, u32)> = [(true, 7u32), (false, 7), (false, 9)]
+            .iter()
+            .copied()
+            .filter(|&(entered, truth)| {
+                let (b, chosen) = chosen_after_offset_branch(entered);
+                !addresses(&b, &two_words(), |a| {
+                    let form = a.value(chosen, 0, None).0.form;
+                    representable(&a.unknowns, &form, truth)
+                })
+            })
+            .collect();
+        assert!(missed.is_empty(), "u + 3 = 5 gives u = 2 and 2u + 1 = 5; otherwise u = 2^31 + 2 still gives 5: {:?}", missed);
+    }
+
+    #[test]
+    fn selects_on_a_word_derived_from_an_offset_branch_word_take_the_arm_the_branch_decides() {
+        let (b, chosen) = chosen_after_offset_branch(true);
+        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        assert_eq!(form, Form::constant(7), "the block runs only when u + 3 is 5, so 2u + 1 is 5");
+    }
+
+    fn chosen_in_a_loop_entered_on_zero_that_counts_up() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let is_zero = b.cmp(e, IntPred::Eq, u, zero);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, is_zero, (body, vec![k.exec, u]), (exit, vec![k.exec]));
+        let zero = b.constant(body, Ty::I32, 0);
+        let test = b.cmp(body, IntPred::Eq, p[1], zero);
+        let seven = b.constant(body, Ty::I32, 7);
+        let nine = b.constant(body, Ty::I32, 9);
+        let chosen = b.core(body, Ty::I32, Op::Select(test, seven, nine));
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[1], one);
+        let three = b.constant(body, Ty::I32, 3);
+        let again = b.cmp(body, IntPred::Ult, next, three);
+        b.cond_br(body, again, (body, vec![p[0], next]), (exit, vec![p[0]]));
+        (b, chosen)
+    }
+
+    #[test]
+    fn selects_in_a_loop_entered_on_zero_that_counts_up_hold_both_arms() {
+        let (b, chosen) = chosen_in_a_loop_entered_on_zero_that_counts_up();
+        let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
+            let form = a.value(chosen, 0, None).0.form;
+            [7u32, 9].iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
+        });
+        assert!(missed.is_empty(), "the first iteration sees 0 and gives 7, the next ones 1 and 2 and give 9: {:?}", missed);
     }
 }

@@ -4392,4 +4392,328 @@ mod tests {
         let (h, key) = counted_loop(1, true);
         assert!(!h.conflicts().contains(&key));
     }
+
+    fn two_index_read_back(shared: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let u = uniform_word(&mut b, &k, e, 16, MemSize::U8);
+        let column = byte_offset(&mut b, e, table, lane, 4);
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, u));
+        let row_bytes = b.constant(e, Ty::I64, 128);
+        let row = b.int(e, IntOp::Mul, wide, row_bytes);
+        let own = b.int(e, IntOp::Add, column, row);
+        let thirty_two = b.constant(e, Ty::I32, 32);
+        let scaled = b.int(e, IntOp::Mul, u, thirty_two);
+        let value = if shared { scaled } else { b.int(e, IntOp::Add, lane, scaled) };
+        b.store(e, Space::Global, MemSize::B32, own, value, k.exec);
+        let back = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let address = byte_offset(&mut b, e, buf, back, 4);
+        let (s1, s2) = twice(&mut b, e, address, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_word_two_indices_address_that_every_lane_shares() {
+        assert!(two_index_read_back(true), "every lane stores 32 u and reads it back");
+    }
+
+    #[test]
+    fn find_follows_a_word_two_indices_address_stored_and_loaded_back() {
+        assert!(!two_index_read_back(false), "the word at 4 lane + 128 u only ever holds lane + 32 u, which differs between lanes");
+    }
+
+    fn joined_three_ways(apart: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let f1 = uniform_word(&mut b, &k, e, 4, MemSize::B32);
+        let f2 = uniform_word(&mut b, &k, e, 8, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c1 = b.cmp(e, IntPred::Ne, f1, zero);
+        let c2 = b.cmp(e, IntPred::Ne, f2, zero);
+        let (one, a) = b.block(&[Ty::I1, Ty::I32]);
+        let (rest, r) = b.block(&[Ty::I1, Ty::I32, Ty::I1]);
+        let (two, t) = b.block(&[Ty::I1, Ty::I32]);
+        let (three, h) = b.block(&[Ty::I1, Ty::I32]);
+        let (join, j) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        b.cond_br(e, c1, (one, vec![k.exec, u]), (rest, vec![k.exec, u, c2]));
+        b.cond_br(rest, r[2], (two, vec![r[0], r[1]]), (three, vec![r[0], r[1]]));
+        b.br(one, join, vec![a[0], a[1], a[1]]);
+        let step = b.constant(two, Ty::I32, 1);
+        let next = b.int(two, IntOp::Add, t[1], step);
+        b.br(two, join, vec![t[0], next, t[1]]);
+        let step = b.constant(three, Ty::I32, 5);
+        let next = b.int(three, IntOp::Add, h[1], step);
+        b.br(three, join, vec![h[0], next, h[1]]);
+        let first = byte_offset(&mut b, join, buf, j[1], 4);
+        let shift = b.constant(join, Ty::I32, apart);
+        let moved = b.int(join, IntOp::Add, j[2], shift);
+        let second = byte_offset(&mut b, join, buf, moved, 4);
+        let s1 = store_at(&mut b, join, first, j[0]);
+        let s2 = store_at(&mut b, join, second, j[0]);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_three_way_join_that_meets_the_other_word() {
+        assert!(joined_three_ways(5), "the third path brings u + 5");
+    }
+
+    #[test]
+    fn find_keeps_apart_a_three_way_join_from_a_word_it_never_takes() {
+        assert!(!joined_three_ways(3), "the join is u, u + 1 or u + 5, never u + 3");
+    }
+
+    fn selected_with_another_term(apart: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::U8);
+        let flag = uniform_word(&mut b, &k, e, 8, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c = b.cmp(e, IntPred::Ne, flag, zero);
+        let sum = b.int(e, IntOp::Add, u, v);
+        let chosen = b.core(e, Ty::I32, Op::Select(c, u, sum));
+        let offset = b.int(e, IntOp::Sub, chosen, u);
+        let first = byte_offset(&mut b, e, buf, offset, 4);
+        let shift = b.constant(e, Ty::I32, apart);
+        let moved = b.int(e, IntOp::Add, v, shift);
+        let second = byte_offset(&mut b, e, buf, moved, 4);
+        let s1 = store_at(&mut b, e, first, k.exec);
+        let s2 = store_at(&mut b, e, second, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_select_of_different_terms_that_meets_the_other_word() {
+        assert!(selected_with_another_term(0), "when the flag is clear the first word is v, the second word's index");
+    }
+
+    #[test]
+    fn find_keeps_apart_a_select_of_different_terms_from_a_word_it_never_takes() {
+        assert!(!selected_with_another_term(300), "the first index is 0 or v < 256, the second v + 300");
+    }
+
+    enum Reload {
+        Chain(usize),
+        ThreeWays,
+        Loop,
+    }
+
+    fn spilled_before(shape: Reload, overwritten: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let at = uniform_word(&mut b, &k, e, 16, MemSize::U8);
+        let f1 = uniform_word(&mut b, &k, e, 20, MemSize::B32);
+        let f2 = uniform_word(&mut b, &k, e, 24, MemSize::B32);
+        let zero = b.constant(e, Ty::I32, 0);
+        let c1 = b.cmp(e, IntPred::Ne, f1, zero);
+        let c2 = b.cmp(e, IntPred::Ne, f2, zero);
+        let four = b.constant(e, Ty::I32, 4);
+        let slot = b.int(e, IntOp::Mul, at, four);
+        let sixty_four = b.constant(e, Ty::I32, 64);
+        let elsewhere = b.int(e, IntOp::Add, slot, sixty_four);
+        let spill = |b: &mut Build, block: BlockId, exec: ValueId, pointer: ValueId, at: ValueId| {
+            let low = b.core(block, Ty::I32, Op::UnpackLo(pointer));
+            let high = b.core(block, Ty::I32, Op::UnpackHi(pointer));
+            let four = b.constant(block, Ty::I32, 4);
+            let above = b.int(block, IntOp::Add, at, four);
+            b.store(block, Space::Scratch, MemSize::B32, at, low, exec);
+            b.store(block, Space::Scratch, MemSize::B32, above, high, exec);
+        };
+        spill(&mut b, e, k.exec, first, slot);
+        let looping = matches!(shape, Reload::Loop);
+        spill(&mut b, e, k.exec, second, if overwritten && !looping { slot } else { elsewhere });
+        let carried = [Ty::I1, Ty::I32, Ty::I64];
+        let (last, p) = match shape {
+            Reload::Chain(n) => {
+                let mut from = e;
+                let mut args = vec![k.exec, slot, second];
+                let mut block = (e, Vec::new());
+                for _ in 0..n {
+                    block = b.block(&carried);
+                    b.br(from, block.0, args.clone());
+                    from = block.0;
+                    args = block.1.clone();
+                }
+                block
+            }
+            Reload::ThreeWays => {
+                let (rest, r) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I1]);
+                let (one, a) = b.block(&carried);
+                let (two, t) = b.block(&carried);
+                let (three, h) = b.block(&carried);
+                let join = b.block(&carried);
+                b.cond_br(e, c1, (one, vec![k.exec, slot, second]), (rest, vec![k.exec, slot, second, c2]));
+                b.cond_br(rest, r[3], (two, vec![r[0], r[1], r[2]]), (three, vec![r[0], r[1], r[2]]));
+                for (block, q) in [(one, a), (two, t), (three, h)] {
+                    b.br(block, join.0, vec![q[0], q[1], q[2]]);
+                }
+                join
+            }
+            Reload::Loop => b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I32]),
+        };
+        if looping {
+            let zero = b.constant(e, Ty::I32, 0);
+            b.br(e, last, vec![k.exec, slot, second, zero]);
+        }
+        let four = b.constant(last, Ty::I32, 4);
+        let above = b.int(last, IntOp::Add, p[1], four);
+        let low = b.load(last, Space::Scratch, MemSize::B32, p[1], p[0]);
+        let high = b.load(last, Space::Scratch, MemSize::B32, above, p[0]);
+        let pointer = b.core(last, Ty::I64, Op::Pack64(low, high));
+        let lane = b.core(last, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, last, pointer, lane, 4);
+        let s1 = store_at(&mut b, last, own, p[0]);
+        let zero = b.constant(last, Ty::I32, 0);
+        let word = byte_offset(&mut b, last, p[2], zero, 4);
+        let s2 = store_at(&mut b, last, word, p[0]);
+        if looping {
+            if overwritten {
+                spill(&mut b, last, p[0], p[2], p[1]);
+            }
+            let one = b.constant(last, Ty::I32, 1);
+            let next = b.int(last, IntOp::Add, p[3], one);
+            let three = b.constant(last, Ty::I32, 3);
+            let again = b.cmp(last, IntPred::Ult, next, three);
+            let (exit, _) = b.block(&[Ty::I1]);
+            b.cond_br(last, again, (last, vec![p[0], p[1], p[2], next]), (exit, vec![p[0]]));
+        }
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_a_pointer_reloaded_nine_blocks_later_from_a_slot_a_second_spill_overwrote() {
+        assert!(spilled_before(Reload::Chain(9), true), "the second spill overwrites the slot");
+    }
+
+    #[test]
+    fn find_keeps_a_pointer_reloaded_nine_blocks_later_off_a_buffer_spilled_elsewhere() {
+        assert!(!spilled_before(Reload::Chain(9), false), "the slot holds the first buffer nine blocks later");
+    }
+
+    #[test]
+    fn find_reports_a_pointer_reloaded_after_a_three_way_join_from_a_slot_a_second_spill_overwrote() {
+        assert!(spilled_before(Reload::ThreeWays, true), "the second spill overwrites the slot");
+    }
+
+    #[test]
+    fn find_keeps_a_pointer_reloaded_after_a_three_way_join_off_a_buffer_spilled_elsewhere() {
+        assert!(!spilled_before(Reload::ThreeWays, false), "no path into the join writes the slot, which holds the first buffer");
+    }
+
+    #[test]
+    fn find_reports_a_pointer_reloaded_in_a_loop_that_spills_the_second_buffer_into_the_slot() {
+        assert!(spilled_before(Reload::Loop, true), "the second iteration reloads the second buffer the first spilled");
+    }
+
+    #[test]
+    fn find_keeps_a_pointer_reloaded_in_a_loop_off_a_buffer_spilled_before_it() {
+        assert!(!spilled_before(Reload::Loop, false), "the loop never writes the slot, which holds the first buffer");
+    }
+
+    fn loaded_node_far_up(offset: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_bvh64_intersect_ray");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::U16);
+        let sixteen = b.constant(e, Ty::I32, 16);
+        let scaled = b.int(e, IntOp::Mul, u, sixteen);
+        let base = b.constant(e, Ty::I32, (1 << 29) + 5);
+        let node = b.int(e, IntOp::Add, scaled, base);
+        let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, node));
+        let mut args = [b.constant(e, Ty::I32, 0); 14];
+        args[0] = base_units(&mut b, e, buf);
+        args[2] = wide;
+        args[13] = k.exec;
+        let r = b.here(e);
+        b.target(e, op, Arguments::Fourteen(args), &[Ty::I32; 4]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_a_read_of_a_loaded_node_four_gigabytes_up_after_stores_into_one_it_may_name() {
+        assert!(loaded_node_far_up((1 << 32) + 128 * 3 + 4), "u = 3 names node 2^29 + 53, 2^32 + 128 * 3 bytes in");
+    }
+
+    #[test]
+    fn find_keeps_a_read_of_a_loaded_node_four_gigabytes_up_apart_from_stores_into_the_first_node() {
+        assert!(!loaded_node_far_up(64), "every node the read may name starts 2^32 bytes or more past the store");
+    }
+
+    fn texel_read_with(offset: u64, coordinates: impl Fn(&mut Build, BlockId, &Kernel) -> (ValueId, ValueId)) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_sample_lz");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let (x, y) = coordinates(&mut b, e, &k);
+        let zero = b.constant(e, Ty::I32, 0);
+        let mut args = [zero; 16];
+        args[0] = base_units(&mut b, e, buf);
+        args[1] = b.constant(e, Ty::I32, 3 << 30 | 5 << 17);
+        args[2] = b.constant(e, Ty::I32, 15 << 14 | 3);
+        args[3] = b.constant(e, Ty::I32, 4);
+        args[13] = b.constant(e, Ty::I1, 1);
+        args[14] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, x));
+        args[15] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, y));
+        let r = b.here(e);
+        b.target(e, op, Arguments::Sixteen(args), &[Ty::I32]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    fn texel_read_of_a_small_row(offset: u64) -> bool {
+        texel_read_with(offset, |b, e, k| {
+            let w = uniform_word(b, k, e, 0, MemSize::B32);
+            let three = b.constant(e, Ty::I32, 3);
+            (k.item, b.int(e, IntOp::And, w, three))
+        })
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_of_a_loaded_row_after_stores_into_row_two() {
+        assert!(texel_read_of_a_small_row(2 * 128 + 4), "lane 4 reads texel (4, 2) when w & 3 is 2");
+    }
+
+    #[test]
+    fn find_keeps_a_texel_read_of_a_loaded_row_below_four_apart_from_stores_into_row_ten() {
+        assert!(!texel_read_of_a_small_row(10 * 128 + 4), "the rows read are w & 3, below 4");
+    }
+
+    fn texel_read_of_two_rows(offset: u64) -> bool {
+        texel_read_with(offset, |b, e, k| {
+            let three = b.constant(e, Ty::I32, 3);
+            let two = b.constant(e, Ty::I32, 2);
+            (b.int(e, IntOp::And, k.item, three), b.int(e, IntOp::And, k.item, two))
+        })
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_of_rows_zero_and_two_after_stores_into_row_two() {
+        assert!(texel_read_of_two_rows(2 * 128 + 2), "lane 2 reads texel (2, 2)");
+    }
+
+    #[test]
+    fn find_keeps_a_texel_read_of_rows_zero_and_two_apart_from_stores_into_row_one() {
+        assert!(!texel_read_of_two_rows(128 + 10), "the lanes read columns 0 to 3 of rows 0 and 2 only");
+    }
 }

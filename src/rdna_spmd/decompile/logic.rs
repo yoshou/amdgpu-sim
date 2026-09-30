@@ -1,4 +1,5 @@
 use super::address::compare;
+use super::check::interval;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
@@ -472,6 +473,10 @@ impl Logic {
                     self.float_order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::Cmp(p, a, b) => {
+                    let uniform = !facts.uniform[v.0] && uniform_order(f, facts, p, a, b);
+                    if uniform {
+                        self.uniform_tests.insert(v);
+                    }
                     let leaf = match (threshold(f, facts, p, a, b), facts.site[v.0]) {
                         (Some(t), Site::Inst { block, index }) => {
                             let below = self.below(f, facts, block, index, v, t);
@@ -487,6 +492,9 @@ impl Logic {
                                 Site::Inst { block, .. } => self.first_order(f, block)[&(q, x, y)],
                                 _ => v,
                             };
+                            if uniform {
+                                self.uniform_tests.insert(first);
+                            }
                             let relation = self.relation(f, facts, first, (q, x, y));
                             if negated {
                                 self.m.not(relation)
@@ -1066,6 +1074,23 @@ impl Logic {
                         _ => vx ^ vy,
                     };
                     (mask, value & mask)
+                })
+            }
+            Some(Op::Int(k @ (IntOp::Add | IntOp::Sub), a, b)) => {
+                let (x, y) = (self.known_bits(f, facts, a, depth + 1), self.known_bits(f, facts, b, depth + 1));
+                std::array::from_fn(|l| {
+                    let ((mx, vx), (my, vy)) = (x[l], y[l]);
+                    let (zero_x, one_x) = (mx & !vx, vx);
+                    let (zero_y, one_y, carry) = match k {
+                        IntOp::Add => (my & !vy, vy, 0u32),
+                        _ => (vy, my & !vy, 1u32),
+                    };
+                    let sum_zero = (!zero_x).wrapping_add(!zero_y).wrapping_add(carry);
+                    let sum_one = one_x.wrapping_add(one_y).wrapping_add(carry);
+                    let carry_zero = !(sum_zero ^ zero_x ^ zero_y);
+                    let carry_one = sum_one ^ one_x ^ one_y;
+                    let known = (zero_x | one_x) & (zero_y | one_y) & (carry_zero | carry_one);
+                    (known, sum_one & known)
                 })
             }
             Some(Op::Int(IntOp::Shl, a, s)) if constant(s).is_some() => {
@@ -1742,6 +1767,17 @@ fn float_test(f: &Func, facts: &Facts, p: FloatPred, a: ValueId, b: ValueId) -> 
     Some((x, set))
 }
 
+fn uniform_order(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> bool {
+    if f.types[a.0] != Ty::I32 || a == b || facts.constant(f, a).is_some() || facts.constant(f, b).is_some() || !uniform_difference(f, facts, a, b) {
+        return false;
+    }
+    let signed = matches!(p, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
+    match (interval(f, facts, a, 0), interval(f, facts, b, 0)) {
+        (Some(x), Some(y)) => !signed || (x.1 < 1 << 31 && y.1 < 1 << 31),
+        _ => false,
+    }
+}
+
 fn uniform_difference(f: &Func, facts: &Facts, x: ValueId, y: ValueId) -> bool {
     let mut terms: HashMap<ValueId, u32> = HashMap::default();
     linear_terms(f, facts, x, 1, &mut terms, 0);
@@ -2059,6 +2095,78 @@ mod tests {
                 let first = (words[i].2)(u, w, 0) == (words[j].2)(u, w, 0);
                 if (1..32).any(|l| ((words[i].2)(u, w, l) == (words[j].2)(u, w, l)) != first) {
                     wrong.push(format!("{} == {}", words[i].0, words[j].0));
+                    break;
+                }
+            }
+        }
+        wrong.truncate(5);
+        assert!(decided > 0 && wrong.is_empty(), "{} uniform, wrong {:?}", decided, wrong);
+    }
+
+    #[test]
+    fn uniform_orders_are_equal_in_every_lane() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let table = k.buffer(&mut b, e, 8);
+        let byte = b.load(e, Space::Global, MemSize::U8, table, yes);
+        let at = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, at);
+        let half = b.load(e, Space::Global, MemSize::U16, second, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let mut words: Vec<(String, ValueId, Word)> = vec![
+            ("lane".into(), lane, std::rc::Rc::new(|_, _, l| l)),
+            ("b".into(), byte, std::rc::Rc::new(|u, _, _| u & 0xff)),
+            ("h".into(), half, std::rc::Rc::new(|_, v, _| v & 0xffff)),
+        ];
+        let mut r = Random::new(67);
+        for _ in 0..40 {
+            let (i, j) = (r.below(words.len() as u64) as usize, r.below(words.len() as u64) as usize);
+            let k = [1u32, 2, 3, 5, 31, 0x80][r.below(6) as usize];
+            let ((nx, x, fx), (ny, y, fy)) = (words[i].clone(), words[j].clone());
+            let kc = b.constant(e, Ty::I32, k as u64);
+            let (name, value, truth): (String, ValueId, Word) = match r.below(4) {
+                0 => (format!("({} + {})", nx, ny), b.int(e, IntOp::Add, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l).wrapping_add(fy(u, v, l)))),
+                1 => (format!("({} - {})", nx, ny), b.int(e, IntOp::Sub, x, y), std::rc::Rc::new(move |u, v, l| fx(u, v, l).wrapping_sub(fy(u, v, l)))),
+                2 => (format!("({} * {})", nx, k), b.int(e, IntOp::Mul, x, kc), std::rc::Rc::new(move |u, v, l| fx(u, v, l).wrapping_mul(k))),
+                _ => (format!("({} + {})", nx, k), b.int(e, IntOp::Add, x, kc), std::rc::Rc::new(move |u, v, l| fx(u, v, l).wrapping_add(k))),
+            };
+            words.push((name, value, truth));
+        }
+        let step = b.constant(e, Ty::I32, 0x400_0000);
+        let wide = b.int(e, IntOp::Mul, lane, step);
+        let small = b.constant(e, Ty::I32, 16);
+        let large = b.constant(e, Ty::I32, 0x500_0000);
+        let low = b.int(e, IntOp::Add, wide, small);
+        let high = b.int(e, IntOp::Add, wide, large);
+        words.push(("lane * 2^26 + 16".into(), low, std::rc::Rc::new(|_, _, l| l.wrapping_mul(0x400_0000).wrapping_add(16))));
+        words.push(("lane * 2^26 + 0x5000000".into(), high, std::rc::Rc::new(|_, _, l| l.wrapping_mul(0x400_0000).wrapping_add(0x500_0000))));
+        let predicates = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge];
+        let mut tests = Vec::new();
+        let n = words.len();
+        for p in predicates {
+            tests.push((n - 2, n - 1, p));
+        }
+        for _ in 0..3000 {
+            let i = r.below(words.len() as u64) as usize;
+            let j = r.below(words.len() as u64) as usize;
+            let p = predicates[r.below(predicates.len() as u64) as usize];
+            tests.push((i, j, p));
+        }
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut wrong = Vec::new();
+        let mut decided = 0;
+        for &(i, j, p) in &tests {
+            if !uniform_order(&b.f, &facts, p, words[i].1, words[j].1) {
+                continue;
+            }
+            decided += 1;
+            for _ in 0..40 {
+                let (u, v) = (r.next() as u32, r.next() as u32);
+                let holds = |l: u32| compare(p, (words[i].2)(u, v, l), (words[j].2)(u, v, l));
+                let first = holds(0);
+                if (1..32).any(|l| holds(l) != first) {
+                    wrong.push(format!("{} {:?} {}", words[i].0, p, words[j].0));
                     break;
                 }
             }
