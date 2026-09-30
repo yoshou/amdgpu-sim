@@ -1197,6 +1197,8 @@ impl<'a> Check<'a> {
                     }
                     let fx = self.bit(x);
                     let tag = self.logic.tag(Choice::Query(out));
+                    let wave = self.logic.wave_answer(f, facts, out);
+                    let tag = self.and(tag, wave);
                     let answered = self.query(fx, hx, tag);
                     if local == Bdd::TRUE {
                         return answered;
@@ -1254,7 +1256,10 @@ impl<'a> Check<'a> {
                             let target = self.logic.lanes(|l| l as u64 == k & 31);
                             self.logic.m.ite(target, written, old)
                         }
-                        None => self.or(old, written),
+                        None => match self.logic.lane_is(f, facts, b, inputs[1]) {
+                            Some(target) => self.logic.m.ite(target, written, old),
+                            None => self.or(old, written),
+                        },
                     }
                 }
                 EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)) => {
@@ -1606,13 +1611,6 @@ impl<'c, 'a> Explore<'c, 'a> {
             Form::Core(t, Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), x, y)) if x.0 > y.0 => Form::Core(t, Op::Cmp(p, y, x)),
             other => other,
         };
-        let ones = |ty: Ty| {
-            if ty == Ty::I64 {
-                u64::MAX
-            } else {
-                (1u64 << ty.bits()) - 1
-            }
-        };
         match &form {
             Form::Core(_, Op::Convert(Cvt::Bitcast, _, a)) => {
                 let a = a.0;
@@ -1674,14 +1672,7 @@ impl<'c, 'a> Explore<'c, 'a> {
                 }
             }
             Form::Core(_, Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), x, y)) => {
-                for (a, b) in [(x.0, y.0), (y.0, x.0)] {
-                    match (k, self.constant_of(a)) {
-                        (IntOp::And, Some(0)) => return a,
-                        (IntOp::And, Some(c)) if c == ones(ty) => return b,
-                        (IntOp::Or | IntOp::Xor, Some(0)) => return b,
-                        _ => {}
-                    }
-                }
+                return self.gathered(ty, *k, x.0, y.0);
             }
             Form::Core(_, Op::Pack64(lo, hi)) => {
                 if let (Form::Core(_, Op::UnpackLo(a)), Form::Core(_, Op::UnpackHi(b))) =
@@ -1698,9 +1689,113 @@ impl<'c, 'a> Explore<'c, 'a> {
                 if let Some((terms, constant)) = self.combine(ty, *k, x.0, y.0) {
                     return self.intern_linear(ty, terms, constant);
                 }
+                if *k == IntOp::Mul {
+                    if let Some(t) = self.multiplied(ty, x.0, y.0) {
+                        return t;
+                    }
+                }
             }
             _ => {}
         }
+        self.insert(ty, form)
+    }
+
+    fn multiplied(&mut self, ty: Ty, x: usize, y: usize) -> Option<usize> {
+        let (xs, xk) = self.linear_parts(x);
+        let (ys, yk) = self.linear_parts(y);
+        if xs.len() * ys.len() > 16 {
+            return None;
+        }
+        let mut terms: Vec<(usize, u64)> = Vec::new();
+        terms.extend(xs.iter().map(|&(t, c)| (t, c.wrapping_mul(yk))));
+        terms.extend(ys.iter().map(|&(t, c)| (t, c.wrapping_mul(xk))));
+        for &(a, c) in &xs {
+            for &(b, d) in &ys {
+                let mut factors = self.operands_of(IntOp::Mul, a);
+                factors.extend(self.operands_of(IntOp::Mul, b));
+                if factors.len() > 8 {
+                    return None;
+                }
+                factors.sort_unstable();
+                let m = self.chained(ty, IntOp::Mul, &factors);
+                terms.push((m, c.wrapping_mul(d)));
+            }
+        }
+        Some(self.intern_linear(ty, terms, xk.wrapping_mul(yk)))
+    }
+
+    fn operands_of(&self, k: IntOp, t: usize) -> Vec<usize> {
+        match self.terms[t] {
+            Form::Core(_, Op::Int(op, a, b)) if op == k => {
+                let mut out = self.operands_of(k, a.0);
+                out.extend(self.operands_of(k, b.0));
+                out
+            }
+            _ => vec![t],
+        }
+    }
+
+    fn chained(&mut self, ty: Ty, k: IntOp, parts: &[usize]) -> usize {
+        let mut t = parts[0];
+        for &p in &parts[1..] {
+            t = self.insert(ty, Form::Core(ty, Op::Int(k, ValueId(t), ValueId(p))));
+        }
+        t
+    }
+
+    fn gathered(&mut self, ty: Ty, k: IntOp, x: usize, y: usize) -> usize {
+        let ones = if ty == Ty::I64 { u64::MAX } else { (1u64 << ty.bits()) - 1 };
+        let mut parts = self.operands_of(k, x);
+        parts.extend(self.operands_of(k, y));
+        let mut constant: Option<u64> = None;
+        let mut rest: Vec<usize> = Vec::new();
+        for p in parts {
+            match self.constant_of(p) {
+                Some(c) => {
+                    constant = Some(match (k, constant) {
+                        (_, None) => c & ones,
+                        (IntOp::And, Some(a)) => a & c,
+                        (IntOp::Or, Some(a)) => a | c,
+                        (_, Some(a)) => (a ^ c) & ones,
+                    })
+                }
+                None => rest.push(p),
+            }
+        }
+        rest.sort_unstable();
+        if k == IntOp::Xor {
+            let mut kept: Vec<usize> = Vec::new();
+            for p in rest {
+                if kept.last() == Some(&p) {
+                    kept.pop();
+                } else {
+                    kept.push(p);
+                }
+            }
+            rest = kept;
+        } else {
+            rest.dedup();
+        }
+        let identity = if k == IntOp::And { ones } else { 0 };
+        let absorbing = match k {
+            IntOp::And => Some(0),
+            IntOp::Or => Some(ones),
+            _ => None,
+        };
+        if let Some(c) = constant.filter(|&c| Some(c) == absorbing) {
+            return self.intern(ty, Form::Core(ty, Op::Const(ty, c)));
+        }
+        if let Some(c) = constant.filter(|&c| c != identity) {
+            let t = self.intern(ty, Form::Core(ty, Op::Const(ty, c)));
+            rest.push(t);
+        }
+        match rest.as_slice() {
+            [] => self.intern(ty, Form::Core(ty, Op::Const(ty, identity))),
+            _ => self.chained(ty, k, &rest),
+        }
+    }
+
+    fn insert(&mut self, ty: Ty, form: Form) -> usize {
         if let Some(&t) = self.index.get(&form) {
             return t;
         }
@@ -2128,12 +2223,40 @@ impl<'c, 'a> Explore<'c, 'a> {
                             if osides[s] == incoming[s] {
                                 continue;
                             }
+                            let mut classes: Vec<((Bdd, Bdd), Bdd)> = Vec::new();
                             for (k, &(param, _)) in f.blocks[&blk].params.iter().enumerate() {
                                 let (o, n) = (osides[s][k], incoming[s][k]);
                                 if o == n {
                                     continue;
                                 }
-                                let m = self.merge(s, param, mcond, o, n);
+                                let shared = match (o.bits, n.bits) {
+                                    (Some(ob), Some(nb)) => {
+                                        let (no, nn) = (self.logic().m.not(ob), self.logic().m.not(nb));
+                                        classes.iter().find_map(|&(pair, bits)| {
+                                            if pair == (ob, nb) {
+                                                Some(bits)
+                                            } else if pair == (no, nn) {
+                                                Some(self.check.logic.m.not(bits))
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    }
+                                    _ => None,
+                                };
+                                let m = match shared {
+                                    Some(bits) => Desc {
+                                        same: if o.same == n.same { o.same } else { None },
+                                        bits: Some(bits),
+                                    },
+                                    None => {
+                                        let m = self.merge(s, param, mcond, o, n);
+                                        if let (Some(ob), Some(nb), Some(mb)) = (o.bits, n.bits, m.bits) {
+                                            classes.push(((ob, nb), mb));
+                                        }
+                                        m
+                                    }
+                                };
                                 if m != o {
                                     merged[s][k] = m;
                                     grew = true;
@@ -3712,6 +3835,34 @@ mod tests {
     }
 
     #[test]
+    fn prove_keeps_both_of_two_queries_over_different_words_either_of_which_answers_a_store() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let zero = b.constant(e, Ty::I32, 0);
+        let flags: Vec<ValueId> = [8, 12]
+            .iter()
+            .map(|&at| {
+                let flag = per_lane(&mut b, &k, e, at);
+                let set = b.cmp(e, IntPred::Ne, flag, zero);
+                let c = b.int(e, IntOp::And, set, k.exec);
+                b.wave(e, WaveOp::Any, vec![c])
+            })
+            .collect();
+        let either = b.int(e, IntOp::Or, flags[0], flags[1]);
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let data = b.core(e, Ty::I32, Op::Select(either, one, two));
+        store_own(&mut b, &k, e, data, k.exec);
+        let wrong: Vec<&str> = ["search", "direct"]
+            .iter()
+            .zip(both(&b))
+            .filter(|(_, kept)| !kept.queries.contains(&flags[0]) || !kept.queries.contains(&flags[1]))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(wrong.is_empty(), "{:?}: any(c) | any(d) is 1 in a lane with neither bit only when some other lane has one", wrong);
+    }
+
+    #[test]
     fn prove_keeps_only_one_of_two_queries_either_of_which_answers_a_store() {
         let (b, first, second) = either_answer();
         let wrong: Vec<&str> = ["search", "direct"]
@@ -4156,6 +4307,176 @@ mod tests {
         b
     }
 
+    fn ordered_and_bounded_words(tests: &[(IntPred, usize, Option<usize>, u32)]) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let words: Vec<ValueId> = [16, 24].iter().map(|&o| per_lane(&mut b, &k, e, o)).collect();
+        let mut mask = k.exec;
+        for &(p, i, j, bound) in tests {
+            let other = match j {
+                Some(j) => words[j],
+                None => b.constant(e, Ty::I32, bound as u64),
+            };
+            let c = b.cmp(e, p, words[i], other);
+            mask = b.int(e, IntOp::And, mask, c);
+        }
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    #[test]
+    fn prove_follows_orders_of_both_signs_among_words_bounded_by_constants() {
+        let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge, IntPred::Eq, IntPred::Ne];
+        let bounds = [0u32, 1, 5, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0xffff_ffff];
+        let holds = |p: IntPred, v: u32, k: u32| super::super::address::compare(p, v, k);
+        let points = [0u32, 1, 2, 4, 5, 6, 0x7fff_fffe, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0x8000_0002, 0xffff_fffe, 0xffff_ffff];
+        let mut r = Random::new(71);
+        let mut wrong = Vec::new();
+        for _ in 0..300 {
+            let count = 2 + r.below(3) as usize;
+            let tests: Vec<(IntPred, usize, Option<usize>, u32)> = (0..count)
+                .map(|_| {
+                    let i = r.below(2) as usize;
+                    let p = preds[r.below(10) as usize];
+                    if r.below(2) == 0 {
+                        (p, i, Some(1 - i), 0)
+                    } else {
+                        (p, i, None, bounds[r.below(bounds.len() as u64) as usize])
+                    }
+                })
+                .collect();
+            let possible = points.iter().any(|&x| {
+                points.iter().any(|&y| {
+                    tests.iter().all(|&(p, i, j, bound)| {
+                        let w = [x, y];
+                        holds(p, w[i], j.map_or(bound, |j| w[j]))
+                    })
+                })
+            });
+            let b = ordered_and_bounded_words(&tests);
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                if possible && kept.queries.is_empty() {
+                    wrong.push(format!("{}: {:?} can all hold, yet the query was converted", name, tests));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+
+    fn branch_then_store_offset(entry: (IntPred, u32), offset: u32, store: (IntPred, u32)) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let table = k.buffer(&mut b, e, 16);
+        let yes = b.constant(e, Ty::I1, 1);
+        let x = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let bound = b.constant(e, Ty::I32, entry.1 as u64);
+        let enters = b.cmp(e, entry.0, x, bound);
+        let shift = b.constant(e, Ty::I32, offset as u64);
+        let moved = b.int(e, IntOp::Add, x, shift);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (then, t) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, enters, (then, vec![k.exec, moved, data, own]), (exit, vec![k.exec]));
+        let limit = b.constant(then, Ty::I32, store.1 as u64);
+        let test = b.cmp(then, store.0, t[1], limit);
+        let mask = b.int(then, IntOp::And, test, t[0]);
+        b.store(then, Space::Global, MemSize::B32, t[3], t[2], mask);
+        b
+    }
+
+    #[test]
+    fn prove_follows_a_bound_carried_through_an_offset_into_the_next_block() {
+        let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge, IntPred::Eq, IntPred::Ne];
+        let bounds = [0u32, 1, 4, 5, 6, 10, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+        let offsets = [0u32, 1, 5, 0x8000_0000, 0xffff_ffff];
+        let holds = |p: IntPred, v: u32, k: u32| super::super::address::compare(p, v, k);
+        let mut r = Random::new(73);
+        let mut wrong = Vec::new();
+        for _ in 0..200 {
+            let (p1, k1) = (preds[r.below(10) as usize], bounds[r.below(9) as usize]);
+            let (p2, k2) = (preds[r.below(10) as usize], bounds[r.below(9) as usize]);
+            let c = offsets[r.below(offsets.len() as u64) as usize];
+            let mut candidates = vec![0u32, 1, 2, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
+            for k in [k1, k2.wrapping_sub(c)] {
+                candidates.extend([k.wrapping_sub(1), k, k.wrapping_add(1)]);
+            }
+            for x in candidates.clone() {
+                candidates.push(x.wrapping_sub(c));
+            }
+            let possible = candidates.iter().any(|&x| holds(p1, x, k1) && holds(p2, x.wrapping_add(c), k2));
+            let b = branch_then_store_offset((p1, k1), c, (p2, k2));
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                let converted = kept.queries.is_empty();
+                if possible && converted {
+                    wrong.push(format!("{}: x {:?} {} into the block and x + {} {:?} {} inside it can both hold, yet the query was converted", name, p1, k1, c, p2, k2));
+                }
+                if !possible && !converted {
+                    wrong.push(format!("{}: x {:?} {} into the block and x + {} {:?} {} inside it never both hold, yet the query stays", name, p1, k1, c, p2, k2));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+
+    fn orders_then_compare(first: &[(IntPred, bool)], second: (IntPred, bool)) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let v = per_lane(&mut b, &k, e, 16);
+        let w = per_lane(&mut b, &k, e, 24);
+        let mut known = b.constant(e, Ty::I1, 1);
+        for &(p, swap) in first {
+            let c = if swap { b.cmp(e, p, w, v) } else { b.cmp(e, p, v, w) };
+            known = b.int(e, IntOp::And, known, c);
+        }
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (next, p) = b.block(&[Ty::I1, Ty::I64, Ty::I32, Ty::I32, Ty::I32, Ty::I1]);
+        b.br(e, next, vec![k.exec, own, data, v, w, known]);
+        let later = if second.1 { b.cmp(next, second.0, p[4], p[3]) } else { b.cmp(next, second.0, p[3], p[4]) };
+        let both_hold = b.int(next, IntOp::And, p[5], later);
+        let mask = b.int(next, IntOp::And, both_hold, p[0]);
+        b.store(next, Space::Global, MemSize::B32, p[1], p[2], mask);
+        b
+    }
+
+    #[test]
+    fn prove_follows_orders_of_two_words_into_the_next_block() {
+        let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge, IntPred::Eq, IntPred::Ne];
+        let holds = |p: IntPred, v: u32, k: u32| super::super::address::compare(p, v, k);
+        let points = [0u32, 1, 2, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0xffff_fffe, 0xffff_ffff];
+        let family = |p: IntPred| match p {
+            IntPred::Eq | IntPred::Ne => 0,
+            IntPred::Ult | IntPred::Ule | IntPred::Ugt | IntPred::Uge => 1,
+            _ => 2,
+        };
+        let mut r = Random::new(79);
+        let mut wrong = Vec::new();
+        for _ in 0..300 {
+            let first: Vec<(IntPred, bool)> = (0..1 + r.below(2)).map(|_| (preds[r.below(10) as usize], r.below(2) == 0)).collect();
+            let second = (preds[r.below(10) as usize], r.below(2) == 0);
+            let test = |(p, swap): (IntPred, bool), v: u32, w: u32| if swap { holds(p, w, v) } else { holds(p, v, w) };
+            let possible = points.iter().any(|&v| points.iter().any(|&w| first.iter().all(|&t| test(t, v, w)) && test(second, v, w)));
+            let families: BTreeSet<i32> = first.iter().chain([&second]).map(|&(p, _)| family(p)).filter(|&f| f != 0).collect();
+            let b = orders_then_compare(&first, second);
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                let converted = kept.queries.is_empty();
+                if possible && converted {
+                    wrong.push(format!("{}: {:?} then {:?} can both hold, yet the query was converted", name, first, second));
+                }
+                if !possible && !converted && families.len() <= 1 {
+                    wrong.push(format!("{}: {:?} then {:?} never both hold, yet the query stays", name, first, second));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+
     #[test]
     fn prove_follows_orders_among_three_words() {
         let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge, IntPred::Eq, IntPred::Ne];
@@ -4209,6 +4530,52 @@ mod tests {
         }
         store_own(&mut b, &k, e, data, mask);
         b
+    }
+
+    fn float_orders_of_two_words(tests: &[(FloatPred, bool)]) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let v = per_lane(&mut b, &k, e, 16);
+        let w = per_lane(&mut b, &k, e, 24);
+        let x = b.core(e, Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, v));
+        let y = b.core(e, Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, w));
+        let mut mask = k.exec;
+        for &(p, swap) in tests {
+            let t = if swap { b.core(e, Ty::I1, Op::FCmp(p, y, x)) } else { b.core(e, Ty::I1, Op::FCmp(p, x, y)) };
+            mask = b.int(e, IntOp::And, mask, t);
+        }
+        store_own(&mut b, &k, e, data, mask);
+        b
+    }
+
+    #[test]
+    fn prove_follows_orders_of_two_float_words() {
+        use FloatPred::*;
+        let preds = [Oeq, Ogt, Oge, Olt, Ole, One, Ord, Uno, Ueq, Ugt, Uge, Ult, Ule, Une];
+        let points = [0.0f32, -0.0, 1.0, -1.0, 2.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        let mut r = Random::new(83);
+        let mut wrong = Vec::new();
+        for _ in 0..300 {
+            let tests: Vec<(FloatPred, bool)> = (0..2 + r.below(2)).map(|_| (preds[r.below(14) as usize], r.below(2) == 0)).collect();
+            let holds = |(p, swap): (FloatPred, bool), x: f32, y: f32| {
+                let (a, b) = if swap { (y, x) } else { (x, y) };
+                super::super::logic::float_compare(p, a as f64, b as f64)
+            };
+            let possible = points.iter().any(|&x| points.iter().any(|&y| tests.iter().all(|&t| holds(t, x, y))));
+            let ordered = tests.iter().all(|&(p, _)| matches!(p, Oeq | Ogt | Oge | Olt | Ole));
+            let b = float_orders_of_two_words(&tests);
+            for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+                let converted = kept.queries.is_empty();
+                if possible && converted {
+                    wrong.push(format!("{}: {:?} can all hold, yet the query was converted", name, tests));
+                }
+                if !possible && !converted && ordered {
+                    wrong.push(format!("{}: {:?} never all hold, yet the query stays", name, tests));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
     }
 
     #[test]
@@ -4871,6 +5238,144 @@ mod tests {
         (0..1u32 << vars.len())
             .map(|row| vars.iter().enumerate().map(|(i, &v)| (v, row >> i & 1 == 1)).collect())
             .collect()
+    }
+
+    fn computed(e: &Explore, t: usize, leaves: &[u64]) -> u64 {
+        let mask = u32::MAX as u64;
+        match &e.terms[t] {
+            Form::Opaque(i, _) => leaves[*i - 1000],
+            Form::Core(_, Op::Const(_, k)) => *k & mask,
+            Form::Core(_, Op::Int(op, a, b)) => {
+                let (x, y) = (computed(e, a.0, leaves), computed(e, b.0, leaves));
+                (match op {
+                    IntOp::Add => x.wrapping_add(y),
+                    IntOp::Sub => x.wrapping_sub(y),
+                    IntOp::Mul => x.wrapping_mul(y),
+                    IntOp::And => x & y,
+                    IntOp::Or => x | y,
+                    IntOp::Xor => x ^ y,
+                    _ => panic!("no {:?} in these terms", op),
+                }) & mask
+            }
+            Form::Linear(_, parts, k) => parts.iter().fold(*k, |acc, &(p, c)| acc.wrapping_add(c.wrapping_mul(computed(e, p, leaves)))) & mask,
+            other => panic!("no {:?} in these terms", std::mem::discriminant(other)),
+        }
+    }
+
+    fn random_term(e: &mut Explore, r: &mut Random, depth: usize, leaves: &[usize]) -> (usize, Box<dyn Fn(&[u64]) -> u64>) {
+        if depth == 0 || r.below(4) == 0 {
+            if r.below(3) == 0 {
+                let k = [0u64, 1, 2, 3, 5, 0xff, 0xffff_ffff, 0x8000_0000][r.below(8) as usize];
+                return (e.intern(Ty::I32, Form::Core(Ty::I32, Op::Const(Ty::I32, k))), Box::new(move |_| k));
+            }
+            let i = r.below(leaves.len() as u64) as usize;
+            return (leaves[i], Box::new(move |v| v[i]));
+        }
+        let ops = [IntOp::Add, IntOp::Sub, IntOp::Mul, IntOp::And, IntOp::Or, IntOp::Xor];
+        let op = ops[r.below(ops.len() as u64) as usize];
+        let (a, fa) = random_term(e, r, depth - 1, leaves);
+        let (b, fb) = random_term(e, r, depth - 1, leaves);
+        let t = e.intern(Ty::I32, Form::Core(Ty::I32, Op::Int(op, ValueId(a), ValueId(b))));
+        let mask = u32::MAX as u64;
+        (
+            t,
+            Box::new(move |v| {
+                let (x, y) = (fa(v), fb(v));
+                (match op {
+                    IntOp::Add => x.wrapping_add(y),
+                    IntOp::Sub => x.wrapping_sub(y),
+                    IntOp::Mul => x.wrapping_mul(y),
+                    IntOp::And => x & y,
+                    IntOp::Or => x | y,
+                    _ => x ^ y,
+                }) & mask
+            }),
+        )
+    }
+
+    #[test]
+    fn interned_words_compute_what_their_operations_compute() {
+        with_explore(|e| {
+            let leaves: Vec<usize> = (0..3).map(|i| e.intern(Ty::I32, Form::Opaque(1000 + i, ValueId(0)))).collect();
+            let mut r = Random::new(113);
+            let mut wrong = Vec::new();
+            for trial in 0..400 {
+                let (t, truth) = random_term(e, &mut r, 4, &leaves);
+                for _ in 0..8 {
+                    let values: Vec<u64> = (0..3)
+                        .map(|_| match r.below(3) {
+                            0 => r.below(8),
+                            1 => (r.next() as u32) as u64,
+                            _ => [0xffff_ffffu64, 0x8000_0000, 0x7fff_ffff][r.below(3) as usize],
+                        })
+                        .collect();
+                    if computed(e, t, &values) != truth(&values) {
+                        wrong.push(format!("trial {} at {:?}: {:#x} not {:#x}", trial, values, computed(e, t, &values), truth(&values)));
+                    }
+                }
+            }
+            assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+        });
+    }
+
+    #[test]
+    fn interned_words_are_one_term_for_regrouped_distributed_and_reordered_operations() {
+        with_explore(|e| {
+            let [x, y, z]: [usize; 3] = std::array::from_fn(|i| e.intern(Ty::I32, Form::Opaque(1000 + i, ValueId(0))));
+            let k = |e: &mut Explore, c: u64| e.intern(Ty::I32, Form::Core(Ty::I32, Op::Const(Ty::I32, c)));
+            let op = |e: &mut Explore, o: IntOp, a: usize, b: usize| e.intern(Ty::I32, Form::Core(Ty::I32, Op::Int(o, ValueId(a), ValueId(b))));
+            use IntOp::*;
+            let mut loose = Vec::new();
+            let mut same = |name: &str, a: usize, b: usize| {
+                if a != b {
+                    loose.push(name.to_string());
+                }
+            };
+            let (xy, yz, zx) = (op(e, Mul, x, y), op(e, Mul, y, z), op(e, Mul, z, x));
+            let (a, b, c) = (op(e, Mul, xy, z), op(e, Mul, x, yz), op(e, Mul, zx, y));
+            same("(x y) z and x (y z)", a, b);
+            same("(x y) z and (z x) y", a, c);
+            let sum = op(e, Add, x, y);
+            let (xz, yz2) = (op(e, Mul, x, z), op(e, Mul, y, z));
+            let (a, b) = (op(e, Mul, sum, z), op(e, Add, xz, yz2));
+            same("(x + y) z and x z + y z", a, b);
+            let one = k(e, 1);
+            let (up, down) = (op(e, Add, x, one), op(e, Sub, x, one));
+            let xx = op(e, Mul, x, x);
+            let (a, b) = (op(e, Mul, up, down), op(e, Sub, xx, one));
+            same("(x + 1)(x - 1) and x x - 1", a, b);
+            let (xy, yz) = (op(e, And, x, y), op(e, And, y, z));
+            let (a, b) = (op(e, And, xy, z), op(e, And, x, yz));
+            same("(x & y) & z and x & (y & z)", a, b);
+            let zx = op(e, And, z, x);
+            let c = op(e, And, zx, y);
+            same("(x & y) & z and (z & x) & y", a, c);
+            let (xo, xa) = (op(e, Or, x, x), op(e, And, x, x));
+            same("x | x and x", xo, x);
+            same("x & x and x", xa, x);
+            let zero = k(e, 0);
+            let xx = op(e, Xor, x, x);
+            same("x ^ x and 0", xx, zero);
+            let xy = op(e, Xor, x, y);
+            let xyx = op(e, Xor, xy, x);
+            same("(x ^ y) ^ x and y", xyx, y);
+            let ones = k(e, 0xffff_ffff);
+            let a = op(e, And, x, ones);
+            same("x & ~0 and x", a, x);
+            let (three, five) = (k(e, 3), k(e, 5));
+            let x3 = op(e, And, x, three);
+            let a = op(e, And, x3, five);
+            let b = op(e, And, x, one);
+            same("(x & 3) & 5 and x & 1", a, b);
+            let x3 = op(e, Or, x, three);
+            let a = op(e, Or, x3, five);
+            let seven = k(e, 7);
+            let b = op(e, Or, seven, x);
+            same("(x | 3) | 5 and 7 | x", a, b);
+            let a = op(e, Or, x, ones);
+            same("x | ~0 and ~0", a, ones);
+            assert!(loose.is_empty(), "each pair computes the same word: {:?}", loose);
+        });
     }
 
     #[test]
@@ -6583,6 +7088,58 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: every storing lane keeps its own lane id", converted(&b));
     }
 
+    enum Written {
+        OnlyTarget,
+        SkipNext,
+        SkipWide,
+    }
+
+    fn lane_written_under(shape: Written) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let one = b.constant(e, Ty::I32, 1);
+        let two = b.constant(e, Ty::I32, 2);
+        let x = b.core(e, Ty::I32, Op::Select(q, one, two));
+        let u = uniform_load(&mut b, &k, e, 16);
+        let thirty_one = b.constant(e, Ty::I32, 31);
+        let target = match shape {
+            Written::SkipWide => u,
+            _ => b.int(e, IntOp::And, u, thirty_one),
+        };
+        let y = b.wave(e, WaveOp::WriteLane, vec![x, target, lane]);
+        let test = match shape {
+            Written::OnlyTarget => b.cmp(e, IntPred::Eq, lane, target),
+            Written::SkipNext => {
+                let next = b.int(e, IntOp::Add, target, one);
+                b.cmp(e, IntPred::Ne, lane, next)
+            }
+            Written::SkipWide => b.cmp(e, IntPred::Ne, target, lane),
+        };
+        let mask = b.int(e, IntOp::And, test, k.exec);
+        store_own(&mut b, &k, e, y, mask);
+        b
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_a_lane_write_puts_into_the_only_lane_that_stores() {
+        let b = lane_written_under(Written::OnlyTarget);
+        assert!(keeps(&b).is_empty(), "{:?}: only lane u & 31 stores, and it stores the written word", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_lane_write_target_differs_from_the_lane_the_store_skips() {
+        let b = lane_written_under(Written::SkipNext);
+        assert!(keeps(&b).is_empty(), "{:?}: the store skips lane u & 31 + 1, so lane u & 31 stores the written word", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_lane_write_target_may_pass_the_last_lane() {
+        let b = lane_written_under(Written::SkipWide);
+        assert!(keeps(&b).is_empty(), "{:?}: u = 33 writes lane 1, while the store skips no lane", keeps(&b));
+    }
+
     fn offset_lanes_below(shared: bool) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -6616,33 +7173,54 @@ mod tests {
     }
 
     fn apart_loop_pair(opposite: bool) -> Build {
+        looped_pair(opposite, Flips::Both)
+    }
+
+    enum Flips {
+        Both,
+        OnlyFirst,
+        SecondOnALoadedBit,
+    }
+
+    fn looped_pair(opposite: bool, flips: Flips) -> Build {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let q = flag_query(&mut b, &k, e);
+        let table = k.buffer(&mut b, e, 16);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let everywhere = b.constant(e, Ty::I1, 1);
+        let word = b.load(e, Space::Global, MemSize::B32, own, everywhere);
+        let nothing = b.constant(e, Ty::I32, 0);
+        let d = b.cmp(e, IntPred::Ne, word, nothing);
         let buf = k.buffer(&mut b, e, 0);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
         let own = byte_offset(&mut b, e, buf, lane, 4);
         let flag = per_lane(&mut b, &k, e, 28);
         let zero = b.constant(e, Ty::I32, 0);
         let c = b.cmp(e, IntPred::Ne, flag, zero);
-        let (arm, a) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
-        let (body, p) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1, Ty::I32]);
+        let (arm, a) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (body, p) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1, Ty::I32, Ty::I1]);
         let (after, m) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
         let (join, _) = b.block(&[Ty::I1]);
-        b.cond_br(e, q, (arm, vec![k.exec, own, c]), (join, vec![k.exec]));
+        b.cond_br(e, q, (arm, vec![k.exec, own, c, d]), (join, vec![k.exec]));
         let yes = b.constant(arm, Ty::I1, 1);
         let not_c = b.int(arm, IntOp::Xor, a[2], yes);
         let zero = b.constant(arm, Ty::I32, 0);
         let second = if opposite { not_c } else { a[2] };
-        b.br(arm, body, vec![a[0], a[1], a[2], second, zero]);
+        b.br(arm, body, vec![a[0], a[1], a[2], second, zero, a[3]]);
         let yes = b.constant(body, Ty::I1, 1);
         let s = b.int(body, IntOp::Xor, p[2], yes);
-        let t = b.int(body, IntOp::Xor, p[3], yes);
+        let t = match flips {
+            Flips::Both => b.int(body, IntOp::Xor, p[3], yes),
+            Flips::OnlyFirst => p[3],
+            Flips::SecondOnALoadedBit => b.int(body, IntOp::Xor, p[3], p[5]),
+        };
         let one = b.constant(body, Ty::I32, 1);
         let next = b.int(body, IntOp::Add, p[4], one);
         let three = b.constant(body, Ty::I32, 3);
         let again = b.cmp(body, IntPred::Ult, next, three);
-        b.cond_br(body, again, (body, vec![p[0], p[1], s, t, next]), (after, vec![p[0], p[1], s, t]));
+        b.cond_br(body, again, (body, vec![p[0], p[1], s, t, next, p[5]]), (after, vec![p[0], p[1], s, t]));
         let yes = b.constant(after, Ty::I1, 1);
         let not_t = b.int(after, IntOp::Xor, m[3], yes);
         let only = b.int(after, IntOp::And, m[2], not_t);
@@ -6657,6 +7235,76 @@ mod tests {
     fn prove_keeps_a_query_whose_arm_loops_two_bits_that_stay_opposite() {
         let b = apart_loop_pair(true);
         assert!(keeps(&b).is_empty(), "{:?}: the loop carries (c, !c) flipped three times, so s & !t is !c and lanes without c store", keeps(&b));
+    }
+
+    fn while_pair(flips: Flips) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let q = flag_query(&mut b, &k, e);
+        let table = k.buffer(&mut b, e, 16);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let slot = byte_offset(&mut b, e, table, lane, 4);
+        let everywhere = b.constant(e, Ty::I1, 1);
+        let word = b.load(e, Space::Global, MemSize::B32, slot, everywhere);
+        let nothing = b.constant(e, Ty::I32, 0);
+        let d = b.cmp(e, IntPred::Ne, word, nothing);
+        let buf = k.buffer(&mut b, e, 0);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let flag = per_lane(&mut b, &k, e, 28);
+        let c = b.cmp(e, IntPred::Ne, flag, nothing);
+        let (arm, a) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (header, h) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1, Ty::I32, Ty::I1]);
+        let (body, p) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1, Ty::I32, Ty::I1]);
+        let (after, m) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1]);
+        let (join, _) = b.block(&[Ty::I1]);
+        b.cond_br(e, q, (arm, vec![k.exec, own, c, d]), (join, vec![k.exec]));
+        let zero = b.constant(arm, Ty::I32, 0);
+        b.br(arm, header, vec![a[0], a[1], a[2], a[2], zero, a[3]]);
+        let three = b.constant(header, Ty::I32, 3);
+        let again = b.cmp(header, IntPred::Ult, h[4], three);
+        b.cond_br(header, again, (body, h.clone()), (after, vec![h[0], h[1], h[2], h[3]]));
+        let yes = b.constant(body, Ty::I1, 1);
+        let s = b.int(body, IntOp::Xor, p[2], yes);
+        let t = match flips {
+            Flips::Both => b.int(body, IntOp::Xor, p[3], yes),
+            Flips::OnlyFirst => p[3],
+            Flips::SecondOnALoadedBit => b.int(body, IntOp::Xor, p[3], p[5]),
+        };
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, p[4], one);
+        b.br(body, header, vec![p[0], p[1], s, t, next, p[5]]);
+        let yes = b.constant(after, Ty::I1, 1);
+        let not_t = b.int(after, IntOp::Xor, m[3], yes);
+        let only = b.int(after, IntOp::And, m[2], not_t);
+        let mask = b.int(after, IntOp::And, only, m[0]);
+        let one = b.constant(after, Ty::I32, 1);
+        b.store(after, Space::Global, MemSize::B32, m[1], one, mask);
+        b.br(after, join, vec![m[0]]);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_while_loop_flips_two_bits_that_stay_equal() {
+        let b = while_pair(Flips::Both);
+        assert!(converted(&b).is_empty(), "{:?}: the header always holds s = t, so s & !t never holds", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_while_loop_flips_one_of_two_equal_bits_on_a_loaded_bit() {
+        let b = while_pair(Flips::SecondOnALoadedBit);
+        assert!(keeps(&b).is_empty(), "{:?}: after one pass s is !c and t is c ^ d, so s & !t is !c & !d", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_loops_two_equal_bits_and_flips_only_one() {
+        let b = looped_pair(false, Flips::OnlyFirst);
+        assert!(keeps(&b).is_empty(), "{:?}: after three flips s is !c while t stays c, so lanes without c store", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_arm_loops_two_equal_bits_and_flips_one_on_a_loaded_bit() {
+        let b = looped_pair(false, Flips::SecondOnALoadedBit);
+        assert!(keeps(&b).is_empty(), "{:?}: t flips only where the loaded bit d is set, so after three flips s & !t is !c & !d", keeps(&b));
     }
 
     #[test]
@@ -7157,7 +7805,8 @@ mod difference_tests {
         let exec = k.exec;
         let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
             let c = l.m.and(bit(set), bit(exec));
-            l.m.not(c)
+            let absent = l.m.not(c);
+            l.m.and(absent, bit(q))
         };
         cases.push(Case { name: "any(c)", value: q, truth: Box::new(differs) });
         let v = b.core(e, Ty::I32, Op::Select(q, one, two));
@@ -7195,18 +7844,32 @@ mod difference_tests {
         let v = b.load(e, Space::Global, MemSize::B32, address, yes);
         cases.push(Case { name: "load from select(q, a, b)", value: v, truth: Box::new(differs) });
         let v = b.load(e, Space::Global, MemSize::B32, table, q);
-        cases.push(Case { name: "load masked by q", value: v, truth: Box::new(differs) });
+        let unperformed = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
+            let c = l.m.and(bit(set), bit(exec));
+            l.m.not(c)
+        };
+        cases.push(Case { name: "load masked by q", value: v, truth: Box::new(unperformed) });
         let v = b.load(e, Space::Global, MemSize::B32, table, yes);
         cases.push(Case { name: "unmasked load of a fixed word", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
         let masked = b.int(e, IntOp::And, q, k.exec);
         let w = b.wave(e, WaveOp::Ballot, vec![masked]);
         let v = b.core(e, Ty::I32, Op::PopulationCount(w));
-        cases.push(Case { name: "popcount(ballot(q & exec))", value: v, truth: Box::new(|_, _| Bdd::TRUE) });
+        cases.push(Case { name: "popcount(ballot(q & exec))", value: v, truth: Box::new(move |_, bit| bit(q)) });
         let kept = b.wave(e, WaveOp::Any, vec![masked]);
-        cases.push(Case { name: "any(q & exec)", value: kept, truth: Box::new(differs) });
+        cases.push(Case {
+            name: "any(q & exec)",
+            value: kept,
+            truth: Box::new(move |l, bit| {
+                let c = l.m.and(bit(set), bit(exec));
+                let absent = l.m.not(c);
+                let active = l.m.and(bit(exec), bit(q));
+                let answered = l.m.or(bit(kept), active);
+                l.m.and(absent, answered)
+            }),
+        });
         let picked = b.core(e, Ty::I32, Op::Select(q, one, lane));
         let v = b.wave(e, WaveOp::ReadLane, vec![picked, zero, zero]);
-        cases.push(Case { name: "readlane(select(q, 1, lane), 0)", value: v, truth: Box::new(|_, _| Bdd::TRUE) });
+        cases.push(Case { name: "readlane(select(q, 1, lane), 0)", value: v, truth: Box::new(move |_, bit| bit(q)) });
         let v = b.int(e, IntOp::Add, flag, one);
         cases.push(Case { name: "flag + 1", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
         let v = b.core(e, Ty::I32, Op::Select(d, s, s));
@@ -7249,7 +7912,8 @@ mod difference_tests {
         let exec = k.exec;
         let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
             let c = l.m.and(bit(set), bit(exec));
-            l.m.not(c)
+            let absent = l.m.not(c);
+            l.m.and(absent, bit(q))
         };
         let k = |b: &mut Build, x: u64| b.constant(e, Ty::I32, x);
         let mut cases = Vec::new();
@@ -7284,7 +7948,8 @@ mod difference_tests {
         let exec = k.exec;
         let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
             let c = l.m.and(bit(set), bit(exec));
-            l.m.not(c)
+            let absent = l.m.not(c);
+            l.m.and(absent, bit(q))
         };
         let k = |b: &mut Build, x: u64| b.constant(e, Ty::I32, x);
         let mut cases = Vec::new();
@@ -7319,7 +7984,8 @@ mod difference_tests {
         let exec = k.exec;
         let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
             let c = l.m.and(bit(set), bit(exec));
-            l.m.not(c)
+            let absent = l.m.not(c);
+            l.m.and(absent, bit(q))
         };
         let k = |b: &mut Build, x: u64| b.constant(e, Ty::I32, x);
         let (one, two, three, four, eight, nine) = (k(&mut b, 1), k(&mut b, 2), k(&mut b, 3), k(&mut b, 4), k(&mut b, 8), k(&mut b, 9));

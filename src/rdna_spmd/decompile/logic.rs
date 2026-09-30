@@ -406,13 +406,13 @@ impl Logic {
             } => {
                 let local = self.local(Choice::Query(outputs[0].0));
                 if local == Bdd::FALSE {
-                    return self.atom(opaque);
+                    return self.wave_answer(f, facts, v);
                 }
                 let bit = self.bit(f, facts, inputs[0]);
                 if local == Bdd::TRUE {
                     return bit;
                 }
-                let wave = self.atom(opaque);
+                let wave = self.wave_answer(f, facts, v);
                 self.m.ite(local, bit, wave)
             }
             Inst::Core { op, .. } => match *op {
@@ -469,7 +469,8 @@ impl Logic {
                     self.compare(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::FCmp(p, a, b) => {
-                    let leaf = self.float_within(f, facts, v, p, a, b);
+                    let within = self.float_within(f, facts, v, p, a, b);
+                    let leaf = if within == self.atom(Atom::Bit(v)) { self.float_relation(f, facts, v, p, a, b) } else { within };
                     self.float_order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::Cmp(p, a, b) => {
@@ -578,6 +579,80 @@ impl Logic {
         self.cells(&sets, &target, atom, FLOAT_NAN)
     }
 
+    fn float_edges(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize) -> Vec<(ValueId, ValueId, bool, Bdd)> {
+        let mut edges = Vec::new();
+        for inst in &f.blocks[&block].insts[..index] {
+            let Inst::Core { value, op: Op::FCmp(q, c, d), .. } = inst else {
+                continue;
+            };
+            let (c, d) = (*c, *d);
+            if c == d || facts.constant(f, c).is_some() || facts.constant(f, d).is_some() {
+                continue;
+            }
+            let bit = self.bit(f, facts, *value);
+            let not = self.m.not(bit);
+            use FloatPred::*;
+            let (guard, from, to, strict, both) = match q {
+                Olt => (bit, c, d, true, false),
+                Ole => (bit, c, d, false, false),
+                Ogt => (bit, d, c, true, false),
+                Oge => (bit, d, c, false, false),
+                Oeq => (bit, c, d, false, true),
+                Uge => (not, c, d, true, false),
+                Ugt => (not, c, d, false, false),
+                Ule => (not, d, c, true, false),
+                Ult => (not, d, c, false, false),
+                Une => (not, c, d, false, true),
+                _ => continue,
+            };
+            edges.push((from, to, strict, guard));
+            if both {
+                edges.push((to, from, strict, guard));
+            }
+        }
+        edges
+    }
+
+    fn float_relation(&mut self, f: &Func, facts: &Facts, v: ValueId, p: FloatPred, a: ValueId, b: ValueId) -> Bdd {
+        let atom = self.atom(Atom::Bit(v));
+        let Site::Inst { block, index } = facts.site[v.0] else {
+            return atom;
+        };
+        if a == b || facts.constant(f, a).is_some() || facts.constant(f, b).is_some() {
+            return atom;
+        }
+        use FloatPred::*;
+        let (x, y, strict) = match p {
+            Olt | Ult => (a, b, true),
+            Ogt | Ugt => (b, a, true),
+            Ole | Ule => (a, b, false),
+            Oge | Uge => (b, a, false),
+            Oeq | Une => (a, b, false),
+            _ => return atom,
+        };
+        let edges = self.float_edges(f, facts, block, index);
+        if edges.is_empty() {
+            return atom;
+        }
+        if matches!(p, Oeq | Une) {
+            let (up, above) = self.paths(&edges, a, b);
+            let (down, below) = self.paths(&edges, b, a);
+            let must = self.m.and(up, down);
+            let apart = self.m.or(above, below);
+            let holds = if p == Une { self.m.not(atom) } else { atom };
+            let open = self.m.not(apart);
+            let allowed = self.m.and(holds, open);
+            let equal = self.m.or(allowed, must);
+            return if p == Une { self.m.not(equal) } else { equal };
+        }
+        let (reach, sharp) = self.paths(&edges, x, y);
+        let (back_reach, back_sharp) = self.paths(&edges, y, x);
+        let (forward, back) = if strict { (sharp, back_reach) } else { (reach, back_sharp) };
+        let open = self.m.not(back);
+        let allowed = self.m.and(atom, open);
+        self.m.or(allowed, forward)
+    }
+
     fn cells(&mut self, sets: &[(Bdd, Vec<(u64, u64)>)], target: &[(u64, u64)], free: Bdd, top: u64) -> Bdd {
         let mut points: Vec<u64> = vec![0, top + 1];
         for (_, set) in sets {
@@ -679,6 +754,13 @@ impl Logic {
         let Site::Inst { block, index } = facts.site[v.0] else {
             return holds;
         };
+        let (must, apart) = self.equal_in(f, facts, block, index, x, y);
+        let open = self.m.not(apart);
+        let allowed = self.m.and(holds, open);
+        self.m.or(allowed, must)
+    }
+
+    fn equal_in(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, x: ValueId, y: ValueId) -> (Bdd, Bdd) {
         let mut must = Bdd::FALSE;
         let mut apart = Bdd::FALSE;
         for q in [IntPred::Ult, IntPred::Slt] {
@@ -710,9 +792,7 @@ impl Logic {
                 apart = self.m.or(apart, split);
             }
         }
-        let open = self.m.not(apart);
-        let allowed = self.m.and(holds, open);
-        self.m.or(allowed, must)
+        (must, apart)
     }
 
     fn block_comparisons(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<Vec<(usize, ValueId, IntPred, ValueId, ValueId)>> {
@@ -755,17 +835,47 @@ impl Logic {
                 }
                 _ => {
                     let (q, u, w, negated) = ordered(p, a, b);
-                    if family.is_some_and(|family| family != q) || family.is_none() {
+                    let Some(family) = family else {
                         continue;
-                    }
+                    };
                     let less = if negated { self.m.not(bit) } else { bit };
                     let not_less = self.m.not(less);
-                    edges.push((u, w, true, less));
-                    edges.push((w, u, false, not_less));
+                    if family == q {
+                        edges.push((u, w, true, less));
+                        edges.push((w, u, false, not_less));
+                    } else {
+                        let small_u = self.below_half(f, facts, block, u);
+                        let small_w = self.below_half(f, facts, block, w);
+                        let small = self.m.and(small_u, small_w);
+                        if small != Bdd::FALSE {
+                            let less = self.m.and(less, small);
+                            let not_less = self.m.and(not_less, small);
+                            edges.push((u, w, true, less));
+                            edges.push((w, u, false, not_less));
+                        }
+                    }
                 }
             }
         }
         edges
+    }
+
+    fn below_half(&mut self, f: &Func, facts: &Facts, block: BlockId, v: ValueId) -> Bdd {
+        if interval(f, facts, v, 0).is_some_and(|(_, high)| high < 1 << 31) {
+            return Bdd::TRUE;
+        }
+        let list = self.block_thresholds(f, facts, block);
+        let relevant: Vec<Threshold> = list.iter().filter(|t| t.value == v).copied().collect();
+        if relevant.is_empty() {
+            return Bdd::FALSE;
+        }
+        let mut sets = Vec::new();
+        for t in &relevant {
+            let bit = self.bit(f, facts, t.of);
+            let holds = if t.flip { self.m.not(bit) } else { bit };
+            sets.push((holds, t.truth()));
+        }
+        self.cells(&sets, &[(0, (1 << 31) - 1)], Bdd::FALSE, u32::MAX as u64)
     }
 
     fn paths(&mut self, edges: &[(ValueId, ValueId, bool, Bdd)], from: ValueId, to: ValueId) -> (Bdd, Bdd) {
@@ -1188,6 +1298,53 @@ impl Logic {
         f
     }
 
+    pub fn wave_answer(&mut self, f: &Func, facts: &Facts, out: ValueId) -> Bdd {
+        let mut canonical = out;
+        if let (Site::Inst { block, .. }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) {
+            let input = inputs[0];
+            let first = f.blocks[&block].insts.iter().find_map(|inst| match inst {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any),
+                    inputs,
+                    outputs,
+                    ..
+                } if inputs[0] == input => Some(outputs[0].0),
+                _ => None,
+            });
+            canonical = first.unwrap_or(out);
+        }
+        self.atom(Atom::Bit(canonical))
+    }
+
+    pub fn lane_is(&mut self, f: &Func, facts: &Facts, block: BlockId, target: ValueId) -> Option<Bdd> {
+        if !interval(f, facts, target, 0).is_some_and(|(_, high)| high < 32) {
+            return None;
+        }
+        for inst in &f.blocks[&block].insts {
+            let Inst::Core {
+                value,
+                op: Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b),
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let other = if facts.is_lane_id(f, *a) {
+                *b
+            } else if facts.is_lane_id(f, *b) {
+                *a
+            } else {
+                continue;
+            };
+            if other != target {
+                continue;
+            }
+            let bit = self.bit(f, facts, *value);
+            return Some(if *p == IntPred::Ne { self.m.not(bit) } else { bit });
+        }
+        None
+    }
+
     pub fn lanes(&mut self, holds: impl Fn(u32) -> bool) -> Bdd {
         let bits: Vec<Bdd> = (0..5).map(|i| self.atom(Atom::Lane(i))).collect();
         let mut any = Bdd::FALSE;
@@ -1511,15 +1668,27 @@ impl Logic {
                 }
                 seen.push(test);
                 let arg = f.blocks[&src].term.edges().nth(slot).unwrap().args[index];
-                let relevant: Vec<Threshold> = sources.iter().filter(|e| e.value == arg).copied().collect();
+                let (base, offset) = offset_of(f, facts, arg);
+                let relevant: Vec<(Threshold, u32)> = sources
+                    .iter()
+                    .filter_map(|e| {
+                        if e.value == arg {
+                            Some((*e, 0))
+                        } else if e.value == base {
+                            Some((*e, offset))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 if relevant.is_empty() {
                     continue;
                 }
                 let mut sets = Vec::new();
-                for e in &relevant {
+                for (e, offset) in &relevant {
                     let bit = self.bit(f, facts, e.of);
                     let holds = if e.flip { self.m.not(bit) } else { bit };
-                    sets.push((holds, e.truth()));
+                    sets.push((holds, shifted(&e.truth(), *offset)));
                 }
                 let atom = arriving(src, dst, Atom::Bit(t.of));
                 let own = self.atom(atom);
@@ -1546,20 +1715,67 @@ impl Logic {
                 if !self.carried(x) || !self.carried(y) {
                     continue;
                 }
-                let Some(&e) = sources.get(&(q, args[i], args[j])) else {
-                    continue;
-                };
-                let Some(Op::Cmp(pe, ae, be)) = facts.op(f, e) else {
-                    continue;
-                };
                 let Some(Op::Cmp(pt, at_, bt)) = facts.op(f, t) else {
                     continue;
                 };
-                let bit = self.bit(f, facts, e);
-                let canonical = if ordered(pe, ae, be).3 { self.m.not(bit) } else { bit };
-                let bound = if ordered(pt, at_, bt).3 { self.m.not(canonical) } else { canonical };
+                let negated = ordered(pt, at_, bt).3;
+                let canonical = match sources.get(&(q, args[i], args[j])) {
+                    Some(&e) => {
+                        let Some(Op::Cmp(pe, ae, be)) = facts.op(f, e) else {
+                            continue;
+                        };
+                        let bit = self.bit(f, facts, e);
+                        if ordered(pe, ae, be).3 { self.m.not(bit) } else { bit }
+                    }
+                    None => {
+                        let end = f.blocks[&src].insts.len();
+                        let edges = self.order_edges(f, facts, src, end, Some(q));
+                        if edges.is_empty() {
+                            continue;
+                        }
+                        let (back, _) = self.paths(&edges, args[j], args[i]);
+                        let (_, forward) = self.paths(&edges, args[i], args[j]);
+                        if back == Bdd::FALSE && forward == Bdd::FALSE {
+                            continue;
+                        }
+                        let own = self.atom(arriving(src, dst, Atom::Bit(t)));
+                        let free = if negated { self.m.not(own) } else { own };
+                        let open = self.m.not(back);
+                        let allowed = self.m.and(free, open);
+                        self.m.or(allowed, forward)
+                    }
+                };
+                let bound = if negated { self.m.not(canonical) } else { canonical };
                 out.push((arriving(src, dst, Atom::Bit(t)), bound));
             }
+        }
+        let at = |p: ValueId| match facts.site[p.0] {
+            Site::Param { block, index } if block == dst => Some(index),
+            _ => None,
+        };
+        let comparisons = self.block_comparisons(f, facts, dst);
+        let end = f.blocks[&src].insts.len();
+        for &(_, t, p, x, y) in comparisons.iter() {
+            if !matches!(p, IntPred::Eq | IntPred::Ne) {
+                continue;
+            }
+            let (Some(i), Some(j)) = (at(x), at(y)) else {
+                continue;
+            };
+            if !self.carried(x) || !self.carried(y) {
+                continue;
+            }
+            let (must, apart) = self.equal_in(f, facts, src, end, args[i], args[j]);
+            if must == Bdd::FALSE && apart == Bdd::FALSE {
+                continue;
+            }
+            let own = self.atom(arriving(src, dst, Atom::Bit(t)));
+            let free = if p == IntPred::Ne { self.m.not(own) } else { own };
+            let open = self.m.not(apart);
+            let allowed = self.m.and(free, open);
+            let equal = self.m.or(allowed, must);
+            let bound = if p == IntPred::Ne { self.m.not(equal) } else { equal };
+            out.push((arriving(src, dst, Atom::Bit(t)), bound));
         }
         out
     }
@@ -1857,6 +2073,50 @@ fn threshold(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Opt
         of: value,
         equal: false,
     })
+}
+
+fn offset_of(f: &Func, facts: &Facts, v: ValueId) -> (ValueId, u32) {
+    let mut x = v;
+    let mut offset = 0u32;
+    for _ in 0..16 {
+        match facts.op(f, x) {
+            Some(Op::Int(IntOp::Add, a, b)) if facts.constant(f, b).is_some() => {
+                offset = offset.wrapping_add(facts.constant(f, b).unwrap() as u32);
+                x = a;
+            }
+            Some(Op::Int(IntOp::Add, a, b)) if facts.constant(f, a).is_some() => {
+                offset = offset.wrapping_add(facts.constant(f, a).unwrap() as u32);
+                x = b;
+            }
+            Some(Op::Int(IntOp::Sub, a, b)) if facts.constant(f, b).is_some() => {
+                offset = offset.wrapping_sub(facts.constant(f, b).unwrap() as u32);
+                x = a;
+            }
+            _ => break,
+        }
+    }
+    if f.types[x.0] != Ty::I32 {
+        return (v, 0);
+    }
+    (x, offset)
+}
+
+fn shifted(set: &[(u64, u64)], offset: u32) -> Vec<(u64, u64)> {
+    let top = u32::MAX as u64;
+    let mut out = Vec::new();
+    for &(low, high) in set {
+        let (a, b) = (low + offset as u64, high + offset as u64);
+        if b <= top {
+            out.push((a, b));
+        } else if a > top {
+            out.push((a - top - 1, b - top - 1));
+        } else {
+            out.push((a, top));
+            out.push((0, b - top - 1));
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 fn ordered(p: IntPred, a: ValueId, b: ValueId) -> (IntPred, ValueId, ValueId, bool) {

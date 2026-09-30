@@ -9,7 +9,7 @@ use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const LANES: usize = 32;
-const SEQUENCE: usize = 4096;
+const SEQUENCE: usize = 1 << 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Region {
@@ -31,6 +31,37 @@ pub struct UnknownInfo {
     pub range: Option<(u32, u32)>,
     pub through: Vec<BlockId>,
     pub values: Option<std::rc::Rc<[u32]>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wide {
+    pub constant: i128,
+    pub terms: Vec<(Unknown, i128)>,
+}
+
+impl Wide {
+    fn plus(&self, other: &Wide, sign: i128) -> Wide {
+        let mut terms = self.terms.clone();
+        for &(u, c) in &other.terms {
+            match terms.iter_mut().find(|(v, _)| *v == u) {
+                Some((_, old)) => *old += sign * c,
+                None => terms.push((u, sign * c)),
+            }
+        }
+        terms.retain(|&(_, c)| c != 0);
+        terms.sort_unstable();
+        Wide {
+            constant: self.constant + sign * other.constant,
+            terms,
+        }
+    }
+
+    fn times(&self, k: i128) -> Wide {
+        Wide {
+            constant: self.constant * k,
+            terms: self.terms.iter().filter(|_| k != 0).map(|&(u, c)| (u, c * k)).collect(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -150,10 +181,12 @@ enum Key {
     Masked(Option<BlockId>, Vec<(Unknown, u32)>, u32),
     MaskCarry(Option<BlockId>, Vec<(Unknown, u32)>, u32, u32),
     Product(Option<BlockId>, u8, Box<(Form, Form)>),
+    Monomial(Option<BlockId>, Vec<Unknown>),
     Both(Option<BlockId>, u8, Box<(Form, Form)>),
     Power(Option<BlockId>, u8, Box<Form>),
     Shift(Option<BlockId>, u8, IntOp, Box<(Form, Form)>),
     Selector(BlockId, u64),
+    Pattern(BlockId, u64, Vec<u32>),
     Chosen(ValueId, u8),
     Low(ValueId, Form, u32),
     Spread(ValueId, u8, Vec<Form>),
@@ -184,6 +217,7 @@ enum Entry {
     Step(StepKey),
     Summarized(BlockId),
     Decision(BlockId),
+    Limits(BlockId),
     Reach(BlockId),
     Region(ValueKey, bool),
     WordBit((ValueId, u8)),
@@ -389,6 +423,8 @@ pub struct Addresses<'a> {
     wave: usize,
     entered: Option<usize>,
     decisions: Cached<BlockId, Option<bool>>,
+    limited: Cached<BlockId, std::rc::Rc<Limits>>,
+    limiting: HashMap<BlockId, usize>,
     reach: Cached<BlockId, bool>,
     deciding: HashMap<BlockId, usize>,
     reaching: HashMap<BlockId, usize>,
@@ -415,6 +451,7 @@ pub struct Addresses<'a> {
     assumable: HashSet<ValueId>,
     equated: HashSet<ValueId>,
     derived: HashMap<Unknown, Vec<ValueId>>,
+    monomials: HashMap<Unknown, Vec<Unknown>>,
     loops: HashMap<BlockId, Vec<BlockId>>,
     active: HashMap<(ValueId, u8, Option<ValueId>, bool), usize>,
     guessed: HashMap<(ValueId, u8), (Value, Depth)>,
@@ -496,6 +533,8 @@ impl<'a> Addresses<'a> {
             wave: 0,
             entered: None,
             decisions: HashMap::default(),
+            limited: HashMap::default(),
+            limiting: HashMap::default(),
             reach: HashMap::default(),
             deciding: HashMap::default(),
             reaching: HashMap::default(),
@@ -522,6 +561,7 @@ impl<'a> Addresses<'a> {
             assumable: HashSet::default(),
             equated: HashSet::default(),
             derived: HashMap::default(),
+            monomials: HashMap::default(),
             loops,
             active: HashMap::default(),
             guessed: HashMap::default(),
@@ -636,6 +676,7 @@ impl<'a> Addresses<'a> {
         self.unknowns.clear();
         self.keys.clear();
         self.derived.clear();
+        self.monomials.clear();
         self.values.clear();
         self.bits.clear();
         self.fixed_values.clear();
@@ -658,6 +699,7 @@ impl<'a> Addresses<'a> {
         self.fixed_highs.clear();
         self.opaque_highs.clear();
         self.decisions.clear();
+        self.limited.clear();
         self.reach.clear();
         self.looped.clear();
         self.checked.clear();
@@ -973,6 +1015,11 @@ impl<'a> Addresses<'a> {
                 Entry::Decision(key) => {
                     if self.decisions.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.decisions.remove(&key);
+                    }
+                }
+                Entry::Limits(key) => {
+                    if self.limited.get(&key).is_some_and(|e| e.1 .1 >= depth) {
+                        self.limited.remove(&key);
                     }
                 }
                 Entry::Reach(key) => {
@@ -1979,7 +2026,7 @@ impl<'a> Addresses<'a> {
         })
     }
 
-    fn bounds(&self, form: &Form) -> Option<(u64, u64)> {
+    pub(super) fn bounds(&self, form: &Form) -> Option<(u64, u64)> {
         let (mut low, mut high) = (form.constant as u64, form.constant as u64);
         for &(u, c) in &form.terms {
             let (l, h) = self.range(u)?;
@@ -2949,6 +2996,184 @@ impl<'a> Addresses<'a> {
         }
     }
 
+    fn limits(&mut self, b: BlockId) -> std::rc::Rc<Limits> {
+        if let Some((found, depth)) = self.limited.get(&b) {
+            let found = found.clone();
+            self.depend(*depth);
+            return found;
+        }
+        let outside = match self.limiting.insert(b, self.guessing) {
+            Some(level) if level == self.guessing => return std::rc::Rc::default(),
+            outside => outside,
+        };
+        let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
+        let (limits, depth) = self.frame(|this| {
+            if outside.is_some() {
+                this.depend(level(this.checking));
+            }
+            this.compute_limits(b)
+        });
+        (self.fixed, self.affected_now) = (fixed, affected);
+        match outside {
+            Some(level) => self.limiting.insert(b, level),
+            None => self.limiting.remove(&b),
+        };
+        let limits = std::rc::Rc::new(limits);
+        if depth != FREE {
+            self.journal.push((Entry::Limits(b), depth));
+        }
+        self.limited.insert(b, (limits.clone(), depth));
+        limits
+    }
+
+    fn compute_limits(&mut self, b: BlockId) -> Limits {
+        if b == self.f.entry {
+            return Vec::new();
+        }
+        if self.headers.contains(&b) {
+            let d = self.facts.order[self.idom[self.rank[&b]]];
+            return (*self.limits(d)).clone();
+        }
+        let mut out: Option<Limits> = None;
+        for (pred, slot) in self.facts.incoming[&b].clone() {
+            let mut here = (*self.limits(pred)).clone();
+            if let Some((cond, taken)) = self.edge_condition(pred, slot) {
+                let limits = self.condition_limits(cond, taken, None, 0);
+                here = conjoined(here, limits);
+            }
+            let joined = match out {
+                None => here,
+                Some(old) => disjoined(old, here),
+            };
+            if joined.is_empty() {
+                return joined;
+            }
+            out = Some(joined);
+        }
+        out.unwrap_or_default()
+    }
+
+    fn condition_limits(&mut self, cond: ValueId, taken: bool, lane: Option<(BlockId, usize)>, depth: usize) -> Limits {
+        if depth > 8 {
+            return Vec::new();
+        }
+        let cond = self.copies.get(&cond).copied().unwrap_or(cond);
+        match self.facts.op(self.f, cond) {
+            Some(Op::Cmp(p, x, y)) if self.f.types[x.0] == Ty::I32 && (lane.is_some() || self.facts.uniform[x.0] && self.facts.uniform[y.0]) => {
+                let pred = if taken { p } else { negated(p) };
+                let (fx, fy) = match lane {
+                    Some((at, l)) => (self.operand(x, at, l, None).0.form, self.operand(y, at, l, None).0.form),
+                    None => (self.value(x, 0, None).0.form, self.value(y, 0, None).0.form),
+                };
+                match (fx.as_constant(), fy.as_constant()) {
+                    (None, Some(k)) => vec![class_limit(&fx, &satisfying(pred, k))],
+                    (Some(k), None) => vec![class_limit(&fy, &satisfying(swapped(pred), k))],
+                    _ => Vec::new(),
+                }
+            }
+            Some(Op::Int(k @ (IntOp::And | IntOp::Or), a, b)) if self.f.types[cond.0] == Ty::I1 => {
+                let left = self.condition_limits(a, taken, lane, depth + 1);
+                let right = self.condition_limits(b, taken, lane, depth + 1);
+                if (k == IntOp::And) == taken {
+                    conjoined(left, right)
+                } else {
+                    disjoined(left, right)
+                }
+            }
+            Some(Op::Int(IntOp::Xor, a, one)) if self.f.types[a.0] == Ty::I1 && self.facts.constant(self.f, one) == Some(1) => {
+                self.condition_limits(a, !taken, lane, depth + 1)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn access_pieces(&mut self, block: BlockId, predicate: Option<ValueId>, lane: usize) -> Vec<(Unknown, Vec<(u32, u32)>)> {
+        let mut limits = (*self.limits(block)).clone();
+        if let Some(p) = predicate {
+            let own = self.condition_limits(p, true, Some((block, lane)), 0);
+            limits = conjoined(limits, own);
+        }
+        limits
+            .into_iter()
+            .filter_map(|(class, pieces)| match class.terms.as_slice() {
+                &[(u, 1)] => Some((u, pieces.iter().map(|&(low, high)| (low as u32, high as u32)).collect())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn wide_value(&mut self, v: ValueId, at: BlockId, lane: usize) -> Option<Wide> {
+        self.wide_at(v, at, lane, 0)
+    }
+
+    fn wide_at(&mut self, v: ValueId, at: BlockId, lane: usize, depth: usize) -> Option<Wide> {
+        if depth > 12 {
+            return None;
+        }
+        let v = self.copies.get(&v).copied().unwrap_or(v);
+        if self.f.types[v.0] != Ty::I64 {
+            return None;
+        }
+        if let Some(low) = self.operand(v, at, lane, None).0.form.as_constant() {
+            if let Some(high) = self.high(v, lane).as_constant() {
+                return Some(Wide {
+                    constant: (high as i128) << 32 | low as i128,
+                    terms: Vec::new(),
+                });
+            }
+        }
+        let wide = match self.facts.op(self.f, v)? {
+            Op::Convert(Cvt::ZExt, Ty::I64, x) if self.f.types[x.0] == Ty::I32 => {
+                let form = self.operand(x, at, lane, None).0.form;
+                if !(form.constant == 0 && matches!(form.terms.as_slice(), [(_, 1)])) {
+                    self.bounds(&form)?;
+                }
+                Wide {
+                    constant: form.constant as i128,
+                    terms: form.terms.iter().map(|&(u, c)| (u, c as i128)).collect(),
+                }
+            }
+            Op::Int(k @ (IntOp::Add | IntOp::Sub), a, b) => {
+                let x = self.wide_at(a, at, lane, depth + 1)?;
+                let y = self.wide_at(b, at, lane, depth + 1)?;
+                x.plus(&y, if k == IntOp::Add { 1 } else { -1 })
+            }
+            Op::Int(IntOp::Mul, a, b) => match (self.facts.constant(self.f, a), self.facts.constant(self.f, b)) {
+                (_, Some(k)) => self.wide_at(a, at, lane, depth + 1)?.times(k as i128),
+                (Some(k), _) => self.wide_at(b, at, lane, depth + 1)?.times(k as i128),
+                _ => return None,
+            },
+            Op::Int(IntOp::Shl, a, s) => {
+                let k = self.facts.constant(self.f, s)?;
+                if k >= 64 {
+                    return None;
+                }
+                self.wide_at(a, at, lane, depth + 1)?.times(1i128 << k)
+            }
+            _ => return None,
+        };
+        let (mut low, mut high) = (wide.constant, wide.constant);
+        for &(u, c) in &wide.terms {
+            let (l, h) = self.range(u).unwrap_or((0, u32::MAX));
+            let (a, b) = (c * l as i128, c * h as i128);
+            low += a.min(b);
+            high += a.max(b);
+        }
+        (low >= 0 && high < 1 << 64).then_some(wide)
+    }
+
+    fn pieces(&self, x: &Form, limits: &Limits) -> Vec<(u64, u64)> {
+        let whole = vec![self.bounds(x).unwrap_or((0, u32::MAX as u64))];
+        let class = Form {
+            constant: 0,
+            terms: x.terms.clone(),
+        };
+        match limits.iter().find(|(c, _)| *c == class) {
+            Some((_, set)) => intersected(&whole, &shifted_pieces(set, x.constant)),
+            None => whole,
+        }
+    }
+
     fn narrowing(&self, (pred, slot): (BlockId, usize), arg: ValueId) -> Option<u32> {
         if !self.narrowing_edges.contains(&(pred, slot)) {
             return None;
@@ -3468,11 +3693,21 @@ impl<'a> Addresses<'a> {
                     }
                     None => bytes,
                 };
+                let narrow = offset.iter().all(|&(index, mask)| {
+                    let arg = args[index];
+                    self.f.types[arg.0] != Ty::I64 || mask >> 32 == 0 || self.high(arg, lane).as_constant().is_some_and(|h| (h as u64) & (mask >> 32) == 0)
+                });
                 let high = match (word(self, 0)?.as_constant(), word(self, 1)?.as_constant(), exact) {
                     (Some(r0), Some(r1), Some(offset)) => {
                         let start = ((((r1 & 0xff) as u64) << 40) | ((r0 as u64) << 8)).wrapping_add(offset << shift);
                         Some(Form::constant((start >> 32) as u32))
                     }
+                    (Some(r0), Some(r1), None) if narrow => self.bounds(&sum).and_then(|(low, high)| {
+                        let origin = (((r1 & 0xff) as u64) << 40) | ((r0 as u64) << 8);
+                        let first = origin.wrapping_add(low << shift) >> 32;
+                        let last = origin.wrapping_add(high << shift) >> 32;
+                        (high < 1 << 32 && high << shift >> shift == high && first == last).then(|| Form::constant(first as u32))
+                    }),
                     _ => None,
                 };
                 Some((Value::of(base.add(&sum.scale(1u32 << shift))), bytes, high))
@@ -3486,23 +3721,34 @@ impl<'a> Addresses<'a> {
                 let constant = |this: &Self, index: usize| args.get(index).and_then(|&x| this.facts.constant(this.f, x));
                 let sampler: Option<Vec<u32>> = (8..12).map(|i| constant(self, i).map(|k| k as u32)).collect();
                 let point = sampler.as_ref().is_some_and(|s| crate::buffer::get_bits_u32(s, 84, 2) == 0);
+                let coordinates = [self.coordinate(args.get(14).copied(), at.0, lane), self.coordinate(args.get(15).copied(), at.0, lane)];
                 let axis = |coord: usize, size: u64, index: usize| -> Option<Option<(u64, u64)>> {
                     let full = Some(Some((0, size - 1)));
-                    let (Some(sampler), Some(unrm), Some(c)) = (sampler.as_ref(), constant(self, 13), constant(self, coord)) else {
+                    let (Some(sampler), Some(unrm), Some((low, high))) = (sampler.as_ref(), constant(self, 13), coordinates[coord - 14]) else {
                         return full;
                     };
                     if !point {
                         return full;
                     }
                     let unnormalized = unrm != 0 || crate::buffer::get_bits_u32(sampler, 15, 1) != 0;
-                    let c = f32::from_bits(c as u32);
-                    let t = if unnormalized { c } else { c * size as f32 }.floor() as i32;
+                    let texel = |c: f32| if unnormalized { c } else { c * size as f32 }.floor();
+                    let (first, last) = (texel(low), texel(high));
+                    if !(first >= i32::MIN as f32 && last <= i32::MAX as f32 && last - first <= 4.0 * size as f32) {
+                        return full;
+                    }
                     let mode = match crate::buffer::get_bits_u32(sampler, index * 3, 3) {
                         0 if unnormalized => 2,
                         1 if unnormalized => 3,
                         mode => mode,
                     };
-                    Some(crate::rdna_translator::bvh::clamp_texel(t, size as i32, mode).map(|x| (x as u64, x as u64)))
+                    let mut span: Option<(u64, u64)> = None;
+                    for t in first as i32..=last as i32 {
+                        if let Some(x) = crate::rdna_translator::bvh::clamp_texel(t, size as i32, mode) {
+                            let x = x as u64;
+                            span = Some(span.map_or((x, x), |(a, b)| (a.min(x), b.max(x))));
+                        }
+                    }
+                    Some(span)
                 };
                 let (Some(x), Some(y)) = (axis(14, width, 0)?, axis(15, height, 1)?) else {
                     return Some((Value::of(base), 0, None));
@@ -3511,6 +3757,29 @@ impl<'a> Addresses<'a> {
                 (end < 1 << 31).then(|| (Value::of(base.add(&Form::constant(start as u32))), (end - start) as u32, None))
             }
         }
+    }
+
+    fn coordinate(&mut self, x: Option<ValueId>, at: BlockId, lane: usize) -> Option<(f32, f32)> {
+        let x = x?;
+        if let Some(k) = self.facts.constant(self.f, x) {
+            let c = f32::from_bits(k as u32);
+            return (!c.is_nan()).then_some((c, c));
+        }
+        let Some(Op::Convert(cvt @ (Cvt::UnsignedToFloatRte | Cvt::SignedToFloatRte), Ty::F32, i)) = self.facts.op(self.f, x) else {
+            return None;
+        };
+        if self.f.types[i.0] != Ty::I32 {
+            return None;
+        }
+        let form = self.operand(i, at, lane, None).0.form;
+        let (low, high) = match form.as_constant() {
+            Some(k) => (k as u64, k as u64),
+            None => self.bounds(&form)?,
+        };
+        if high >= 1 << 32 || (cvt == Cvt::SignedToFloatRte && high >= 1 << 31) {
+            return None;
+        }
+        Some((low as f32, high as f32))
     }
 
     fn masked_part(&mut self, v: ValueId, form: &Form, m: u32, lane: usize) -> Option<Form> {
@@ -3804,7 +4073,15 @@ impl<'a> Addresses<'a> {
                     None => Some((b, around)),
                     Some((_, current)) if current.iter().all(|h| around.contains(h)) => Some((b, around)),
                     Some(kept) if around.iter().all(|h| kept.1.contains(h)) => Some(kept),
-                    Some(_) => return (at, Some(at)),
+                    Some(_) => {
+                        let varying = self.loops.get(&at).map_or(none, |l| l.as_slice()).iter().copied().filter(|h| {
+                            forms.iter().any(|f| {
+                                f.terms.iter().any(|&(u, _)| self.loops.get(&self.unknowns[u as usize].block).is_some_and(|l| l.contains(h)))
+                            })
+                        });
+                        let inner = varying.max_by_key(|h| self.rank[h]).unwrap_or(self.f.entry);
+                        return (inner, Some(inner));
+                    }
                 };
             }
         }
@@ -3840,7 +4117,8 @@ impl<'a> Addresses<'a> {
                 .enumerate()
                 .all(|(e, x)| x.as_constant() == Some(d.wrapping_mul(e as u32)))
         });
-        if step.is_none() && (n != 2 || self.bounds(&differences[1]).or_else(|| self.bounds(&differences[1].scale(u32::MAX))).is_none()) {
+        let pattern: Option<Vec<u32>> = differences.iter().map(|d| d.as_constant()).collect();
+        if step.is_none() && pattern.is_none() && (n != 2 || self.bounds(&differences[1]).or_else(|| self.bounds(&differences[1].scale(u32::MAX))).is_none()) {
             return None;
         }
         let incoming = &self.facts.incoming[&block];
@@ -3853,6 +4131,23 @@ impl<'a> Addresses<'a> {
             .filter(|(_, e)| edges.contains(e))
             .fold(0u64, |m, (i, _)| m | 1 << i);
         let through = self.loops.get(&block).cloned().unwrap_or_default();
+        if let (None, Some(pattern)) = (step, pattern) {
+            let mut values = pattern.clone();
+            values.sort_unstable();
+            values.dedup();
+            let d = self.intern(
+                Key::Pattern(block, reached, pattern),
+                UnknownInfo {
+                    rank: 0,
+                    shared: true,
+                    block,
+                    range: Some((values[0], values[values.len() - 1])),
+                    through,
+                    values: Some(values.into()),
+                },
+            );
+            return Some(first.add(&Form::unknown(d)));
+        }
         let s = self.intern(
             Key::Selector(block, reached),
             UnknownInfo {
@@ -3885,8 +4180,10 @@ impl<'a> Addresses<'a> {
     }
 
     fn chosen(&mut self, v: ValueId, c: ValueId, x: &Form, y: &Form, lane: usize) -> Option<Form> {
-        let d = x.sub(y).as_constant()?;
-        let _ = (v, lane);
+        let difference = x.sub(y);
+        if difference.as_constant().is_none() && self.bounds(&difference).or_else(|| self.bounds(&difference.scale(u32::MAX))).is_none() {
+            return None;
+        }
         let c = self.copies.get(&c).copied().unwrap_or(c);
         let shared = self.facts.uniform[c.0];
         let block = self.block_of(c);
@@ -3902,10 +4199,26 @@ impl<'a> Addresses<'a> {
                 values: None,
             },
         );
-        Some(y.add(&Form::unknown(bit).scale(d)))
+        Some(y.add(&self.times_selector(v, &difference, &Form::unknown(bit), lane)))
     }
 
     fn product(&mut self, v: ValueId, a: &Form, b: &Form, lane: usize) -> Value {
+        let degree = |this: &Self, f: &Form| f.terms.iter().map(|&(u, _)| this.factors(u).len()).max().unwrap_or(0);
+        if a.terms.len() * b.terms.len() <= 16 && degree(self, a) + degree(self, b) <= 8 {
+            let mut out = Form::constant(a.constant.wrapping_mul(b.constant));
+            for (x, k) in [(a, b.constant), (b, a.constant)] {
+                for &(u, c) in &x.terms {
+                    out = out.add(&Form::unknown(u).scale(c.wrapping_mul(k)));
+                }
+            }
+            for &(x, cx) in &a.terms {
+                for &(y, cy) in &b.terms {
+                    let m = self.monomial(v, x, y, lane);
+                    out = out.add(&Form::unknown(m).scale(cx.wrapping_mul(cy)));
+                }
+            }
+            return Value::of(out);
+        }
         let (a, b) = if (a.terms.as_slice(), a.constant) <= (b.terms.as_slice(), b.constant) { (a, b) } else { (b, a) };
         let shared = [a, b].iter().all(|f| f.terms.iter().all(|&(u, _)| self.unknowns[u as usize].shared));
         let (block, key) = self.variance(&[a, b], self.block_of(v));
@@ -3935,6 +4248,49 @@ impl<'a> Addresses<'a> {
         );
         self.derived.entry(u).or_default().push(v);
         Value::of(Form::unknown(u))
+    }
+
+    fn factors(&self, u: Unknown) -> Vec<Unknown> {
+        self.monomials.get(&u).cloned().unwrap_or_else(|| vec![u])
+    }
+
+    fn monomial(&mut self, v: ValueId, x: Unknown, y: Unknown, lane: usize) -> Unknown {
+        let mut factors = self.factors(x);
+        factors.extend(self.factors(y));
+        factors.sort_unstable();
+        let forms: Vec<Form> = factors.iter().map(|&u| Form::unknown(u)).collect();
+        let refs: Vec<&Form> = forms.iter().collect();
+        let (block, key) = self.variance(&refs, self.block_of(v));
+        let monomial = Key::Monomial(key, factors.clone());
+        if let Some(u) = self.known_key(&monomial) {
+            let list = self.derived.entry(u).or_default();
+            if !list.contains(&v) {
+                list.push(v);
+            }
+            return u;
+        }
+        let (shared, _, through) = self.derivation(&refs, lane);
+        let mut range = Some((1u64, 1u64));
+        for &u in &factors {
+            range = match (range, self.range(u)) {
+                (Some((low, high)), Some((l, h))) if high * h as u64 >> 32 == 0 => Some((low * l as u64, high * h as u64)),
+                _ => None,
+            };
+        }
+        let u = self.intern(
+            monomial,
+            UnknownInfo {
+                rank: 0,
+                shared,
+                block,
+                range: range.map(|(low, high)| (low as u32, high as u32)),
+                through,
+                values: None,
+            },
+        );
+        self.monomials.insert(u, factors);
+        self.derived.entry(u).or_default().push(v);
+        u
     }
 
     fn both(&mut self, v: ValueId, a: &Form, b: &Form, lane: usize) -> Form {
@@ -4460,7 +4816,28 @@ impl<'a> Addresses<'a> {
     fn determined(&self, address: ValueId, data: ValueId, wide: bool) -> Option<Option<ValueId>> {
         let (f, facts) = (self.f, self.facts);
         let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
-        let scaled = |offset: ValueId| -> Option<ValueId> {
+        let top = |x: ValueId| -> Option<u64> {
+            match (facts.op(f, x), facts.site[x.0]) {
+                (Some(Op::Env(Env::LaneId)), _) => Some(LANES as u64 - 1),
+                (_, Site::Param { block, index }) if block == f.entry && matches!(self.inputs[index].source, ParameterSource::Vgpr(0)) => {
+                    let [bx, by, bz] = self.env.block.map(|n| n.max(1) as u64 - 1);
+                    Some(bx | by << 10 | bz << 20)
+                }
+                (Some(Op::Int(IntOp::And, a, b)), _) => facts.constant(f, a).or(facts.constant(f, b)).map(|k| k & 0xffff_ffff),
+                _ => match facts.inst(f, x) {
+                    Some(Inst::Effect {
+                        op: EffectOp::Memory { op: MemoryOp::Load(MemSize::U8), .. },
+                        ..
+                    }) => Some(0xff),
+                    Some(Inst::Effect {
+                        op: EffectOp::Memory { op: MemoryOp::Load(MemSize::U16), .. },
+                        ..
+                    }) => Some(0xffff),
+                    _ => None,
+                },
+            }
+        };
+        let scaled = |offset: ValueId| -> Option<(ValueId, u64)> {
             let (inner, scale) = match facts.op(f, root(offset))? {
                 Op::Int(IntOp::Mul, a, b) => match (facts.constant(f, a), facts.constant(f, b)) {
                     (_, Some(k)) => (a, k),
@@ -4474,31 +4851,63 @@ impl<'a> Addresses<'a> {
                 let Some(Op::Convert(Cvt::ZExt, Ty::I64, d)) = facts.op(f, root(inner)) else {
                     return None;
                 };
-                (4..=1 << 32).contains(&scale).then_some(root(d))
+                (scale <= 1 << 32).then_some((root(d), scale))
             } else {
-                let x = root(inner);
-                let top = match (facts.op(f, x), facts.site[x.0]) {
-                    (Some(Op::Env(Env::LaneId)), _) => Some(LANES as u64 - 1),
-                    (_, Site::Param { block, index }) if block == f.entry && matches!(self.inputs[index].source, ParameterSource::Vgpr(0)) => {
-                        let [bx, by, bz] = self.env.block.map(|n| n.max(1) as u64 - 1);
-                        Some(bx | by << 10 | bz << 20)
-                    }
-                    _ => None,
-                };
-                top.filter(|&top| scale >= 4 && top * scale < 1 << 32).map(|_| x)
+                Some((root(inner), scale))
             }
         };
-        let (base, x) = match facts.op(f, address) {
-            Some(Op::Int(IntOp::Add, a, b)) => [(a, b), (b, a)].iter().find_map(|&(base, offset)| Some((Some(base), scaled(offset)?)))?,
-            _ if !wide => (None, scaled(address)?),
-            _ => return None,
+        let mut rest = root(address);
+        let mut indices: Vec<(ValueId, u64)> = Vec::new();
+        let base = loop {
+            if indices.len() > 4 {
+                return None;
+            }
+            match facts.op(f, rest) {
+                Some(Op::Int(IntOp::Add, a, b)) => match (scaled(b), scaled(a)) {
+                    (Some(index), _) => {
+                        indices.push(index);
+                        rest = root(a);
+                    }
+                    (None, Some(index)) => {
+                        indices.push(index);
+                        rest = root(b);
+                    }
+                    (None, None) if indices.is_empty() => return None,
+                    (None, None) => break Some(rest),
+                },
+                _ => match scaled(rest) {
+                    Some(index) if !wide => {
+                        indices.push(index);
+                        break None;
+                    }
+                    _ if indices.is_empty() => return None,
+                    _ => break Some(rest),
+                },
+            }
         };
-        self.only_of(data, x, 0).then_some(base)
+        indices.sort_by_key(|&(_, scale)| scale);
+        let mut reach: u128 = 0;
+        let last = indices.len() - 1;
+        for (i, &(x, scale)) in indices.iter().enumerate() {
+            if (scale as u128) < reach + 4 {
+                return None;
+            }
+            match top(x) {
+                Some(t) => reach += scale as u128 * t as u128,
+                None if wide && i == last => {}
+                None => return None,
+            }
+        }
+        if !wide && reach >= 1 << 32 {
+            return None;
+        }
+        let allowed: Vec<ValueId> = indices.iter().map(|&(x, _)| x).collect();
+        self.only_of(data, &allowed, 0).then_some(base)
     }
 
-    fn only_of(&self, v: ValueId, x: ValueId, depth: usize) -> bool {
+    fn only_of(&self, v: ValueId, allowed: &[ValueId], depth: usize) -> bool {
         let v = self.copies.get(&v).copied().unwrap_or(v);
-        if v == x {
+        if allowed.contains(&v) {
             return true;
         }
         if depth > 16 {
@@ -4509,7 +4918,7 @@ impl<'a> Addresses<'a> {
             Some(op @ (Op::Int(..) | Op::Cmp(..) | Op::Select(..) | Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc, _, _))) => {
                 let mut only = true;
                 op.map(|a| {
-                    only &= self.only_of(a, x, depth + 1);
+                    only &= self.only_of(a, allowed, depth + 1);
                     a
                 });
                 only
@@ -4661,7 +5070,7 @@ impl<'a> Addresses<'a> {
                 unassumed(joined.flatten())
             }
             Site::Inst { block, index } => match f.blocks[&block].insts[index] {
-                Inst::Core { op, .. } => self.core_bit(op, lane, assume),
+                Inst::Core { op, .. } => self.core_bit(op, block, lane, assume),
                 Inst::Effect {
                     op: EffectOp::Wave(WaveOp::Any),
                     ref inputs,
@@ -4687,7 +5096,7 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    fn core_bit(&mut self, op: Op, lane: usize, assume: Option<ValueId>) -> Assumed<Option<bool>> {
+    fn core_bit(&mut self, op: Op, block: BlockId, lane: usize, assume: Option<ValueId>) -> Assumed<Option<bool>> {
         let mut used = Reliance::default();
         macro_rules! bit {
             ($this:expr, $x:expr) => {{
@@ -4775,7 +5184,7 @@ impl<'a> Addresses<'a> {
                 used |= u;
                 let wide = self.f.types[a.0] == Ty::I64;
                 let difference = x.form.sub(&y.form);
-                match (pred, difference.as_constant()) {
+                let plain = match (pred, difference.as_constant()) {
                     (IntPred::Ne, Some(d)) if d != 0 => Some(true),
                     (IntPred::Eq, Some(d)) if d != 0 => Some(false),
                     _ if wide => None,
@@ -4790,6 +5199,24 @@ impl<'a> Addresses<'a> {
                         (Some(bx), Some(by)) => decide(pred, bx, by),
                         _ => None,
                     },
+                };
+                if plain.is_some() || wide {
+                    plain
+                } else {
+                    let limits = self.limits(block);
+                    let (xs, ys) = (self.pieces(&x.form, &limits), self.pieces(&y.form, &limits));
+                    decide_pieces(pred, &xs, &ys).or_else(|| {
+                        let d = difference.as_constant()?;
+                        let mut answer = None;
+                        for &by in &ys {
+                            let r = offset(pred, d, by)?;
+                            if answer.is_some_and(|a| a != r) {
+                                return None;
+                            }
+                            answer = Some(r);
+                        }
+                        answer
+                    })
                 }
             }
             _ => None,
@@ -5765,6 +6192,161 @@ fn first_failure(pred: IntPred, taken: bool, x: (u32, u32), y: (u32, u32)) -> Op
     (low..=high).contains(&last).then_some(first as u32)
 }
 
+fn negated(pred: IntPred) -> IntPred {
+    match pred {
+        IntPred::Eq => IntPred::Ne,
+        IntPred::Ne => IntPred::Eq,
+        IntPred::Ult => IntPred::Uge,
+        IntPred::Uge => IntPred::Ult,
+        IntPred::Ule => IntPred::Ugt,
+        IntPred::Ugt => IntPred::Ule,
+        IntPred::Slt => IntPred::Sge,
+        IntPred::Sge => IntPred::Slt,
+        IntPred::Sle => IntPred::Sgt,
+        IntPred::Sgt => IntPred::Sle,
+    }
+}
+
+fn satisfying(pred: IntPred, k: u32) -> Vec<(u64, u64)> {
+    let max = u32::MAX as i64;
+    let unsigned = |low: i64, high: i64| if low > high { Vec::new() } else { vec![(low as u64, high as u64)] };
+    let signed = |low: i64, high: i64| {
+        if low > high {
+            Vec::new()
+        } else if low >= 0 || high < 0 {
+            vec![(low as i32 as u32 as u64, high as i32 as u32 as u64)]
+        } else {
+            vec![(0, high as u64), (low as i32 as u32 as u64, u32::MAX as u64)]
+        }
+    };
+    let (u, s) = (k as i64, k as i32 as i64);
+    let (least, most) = (i32::MIN as i64, i32::MAX as i64);
+    match pred {
+        IntPred::Eq => vec![(k as u64, k as u64)],
+        IntPred::Ne => [unsigned(0, u - 1), unsigned(u + 1, max)].concat(),
+        IntPred::Ult => unsigned(0, u - 1),
+        IntPred::Ule => unsigned(0, u),
+        IntPred::Ugt => unsigned(u + 1, max),
+        IntPred::Uge => unsigned(u, max),
+        IntPred::Slt => signed(least, s - 1),
+        IntPred::Sle => signed(least, s),
+        IntPred::Sgt => signed(s + 1, most),
+        IntPred::Sge => signed(s, most),
+    }
+}
+
+fn shifted_pieces(set: &[(u64, u64)], k: u32) -> Vec<(u64, u64)> {
+    let whole = 1u64 << 32;
+    let mut out = Vec::new();
+    for &(low, high) in set {
+        let (low, high) = (low + k as u64, high + k as u64);
+        if high < whole {
+            out.push((low, high));
+        } else if low >= whole {
+            out.push((low - whole, high - whole));
+        } else {
+            out.push((low, whole - 1));
+            out.push((0, high - whole));
+        }
+    }
+    normalized(out)
+}
+
+fn intersected(a: &[(u64, u64)], b: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(la, ha) in a {
+        for &(lb, hb) in b {
+            let (low, high) = (la.max(lb), ha.min(hb));
+            if low <= high {
+                out.push((low, high));
+            }
+        }
+    }
+    normalized(out)
+}
+
+fn normalized(mut set: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    set.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for (low, high) in set {
+        match out.last_mut() {
+            Some(last) if low <= last.1 + 1 => last.1 = last.1.max(high),
+            _ => out.push((low, high)),
+        }
+    }
+    out
+}
+
+type Limits = Vec<(Form, Vec<(u64, u64)>)>;
+
+fn class_limit(form: &Form, values: &[(u64, u64)]) -> (Form, Vec<(u64, u64)>) {
+    let class = Form {
+        constant: 0,
+        terms: form.terms.clone(),
+    };
+    (class, normalized(shifted_pieces(values, form.constant.wrapping_neg())))
+}
+
+fn conjoined(mut a: Limits, b: Limits) -> Limits {
+    for (class, set) in b {
+        match a.iter_mut().find(|(c, _)| *c == class) {
+            Some((_, old)) => *old = intersected(old, &set),
+            None => a.push((class, set)),
+        }
+    }
+    a
+}
+
+fn disjoined(a: Limits, b: Limits) -> Limits {
+    a.into_iter()
+        .filter_map(|(class, set)| {
+            let (_, other) = b.iter().find(|(c, _)| *c == class)?;
+            Some((class, normalized([set, other.clone()].concat())))
+        })
+        .collect()
+}
+
+fn decide_pieces(pred: IntPred, xs: &[(u64, u64)], ys: &[(u64, u64)]) -> Option<bool> {
+    let signed = matches!(pred, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
+    let half = 1u64 << 31;
+    let flip = |set: &[(u64, u64)]| -> Vec<(u64, u64)> {
+        if !signed {
+            return set.to_vec();
+        }
+        let mut out = Vec::new();
+        for &(low, high) in set {
+            if high < half {
+                out.push((low + half, high + half));
+            } else if low >= half {
+                out.push((low - half, high - half));
+            } else {
+                out.push((low + half, 2 * half - 1));
+                out.push((0, high - half));
+            }
+        }
+        out
+    };
+    let unsigned = match pred {
+        IntPred::Slt => IntPred::Ult,
+        IntPred::Sle => IntPred::Ule,
+        IntPred::Sgt => IntPred::Ugt,
+        IntPred::Sge => IntPred::Uge,
+        other => other,
+    };
+    let (xs, ys) = (flip(xs), flip(ys));
+    let mut answer = None;
+    for &x in &xs {
+        for &y in &ys {
+            let r = decide(unsigned, x, y)?;
+            if answer.is_some_and(|a| a != r) {
+                return None;
+            }
+            answer = Some(r);
+        }
+    }
+    answer
+}
+
 fn swapped(pred: IntPred) -> IntPred {
     match pred {
         IntPred::Ult => IntPred::Ugt,
@@ -6417,6 +6999,15 @@ mod facts_tests {
         let below = b.cmp(e, IntPred::Ult, u, thousand);
         let v = b.core(e, Ty::I32, Op::Select(below, u, hundred));
         words.push(("select(u < 1000, u, 100)", v, Box::new(|u, _, _| if u < 1000 { u } else { 100 })));
+        let low_byte = b.int(e, IntOp::And, w, ff);
+        let more = b.int(e, IntOp::Add, u, low_byte);
+        let v = b.core(e, Ty::I32, Op::Select(small, more, u));
+        words.push(("select(u < 100, u + (w & 0xff), u)", v, Box::new(|u, w, _| if u < 100 { u + (w & 0xff) } else { u })));
+        let v = b.core(e, Ty::I32, Op::Select(small, u, more));
+        words.push(("select(u < 100, u, u + (w & 0xff))", v, Box::new(|u, w, _| if u < 100 { u } else { u + (w & 0xff) })));
+        let twice = b.int(e, IntOp::Add, u, u);
+        let v = b.core(e, Ty::I32, Op::Select(small, u, twice));
+        words.push(("select(u < 100, u, 2u)", v, Box::new(|u, _, _| if u < 100 { u } else { 2 * u })));
         let v = b.int(e, IntOp::Mul, u, u);
         words.push(("u * u", v, Box::new(|u, _, _| u.wrapping_mul(u))));
         let sixteen = c(&mut b, 16);
@@ -6538,18 +7129,23 @@ mod facts_tests {
     }
 
     fn exactly_representable(unknowns: &[UnknownInfo], form: &Form, truth: u32) -> Option<bool> {
-        let ranges: Vec<(u32, u32)> = form
+        let choices: Vec<Vec<u32>> = form
             .terms
             .iter()
-            .map(|&(u, _)| unknowns[u as usize].range.filter(|(lo, hi)| hi - lo < 4096))
+            .map(|&(u, _)| match (&unknowns[u as usize].values, unknowns[u as usize].range) {
+                (Some(set), _) => Some(set.to_vec()),
+                (None, Some((lo, hi))) if hi - lo < 4096 => Some((lo..=hi).collect()),
+                _ => None,
+            })
             .collect::<Option<_>>()?;
-        let mut index: Vec<u32> = ranges.iter().map(|r| r.0).collect();
+        let mut index: Vec<usize> = vec![0; choices.len()];
         loop {
             let value = form
                 .terms
                 .iter()
                 .zip(&index)
-                .fold(form.constant, |acc, (&(_, c), &t)| acc.wrapping_add(c.wrapping_mul(t)));
+                .zip(&choices)
+                .fold(form.constant, |acc, ((&(_, c), &i), set)| acc.wrapping_add(c.wrapping_mul(set[i])));
             if value == truth {
                 return Some(true);
             }
@@ -6558,11 +7154,11 @@ mod facts_tests {
                 if k == index.len() {
                     return Some(false);
                 }
-                if index[k] < ranges[k].1 {
+                if index[k] + 1 < choices[k].len() {
                     index[k] += 1;
                     break;
                 }
-                index[k] = ranges[k].0;
+                index[k] = 0;
                 k += 1;
             }
         }
@@ -6628,15 +7224,22 @@ mod facts_tests {
         let eight = b.constant(e, Ty::I32, 8);
         let past = b.int(e, IntOp::Add, lane, eight);
         let (five, nine, thirteen) = (b.constant(e, Ty::I32, 5), b.constant(e, Ty::I32, 9), b.constant(e, Ty::I32, 13));
+        let (below, hundred) = (b.constant(e, Ty::I32, 0xffff_fff0), b.constant(e, Ty::I32, 100));
         let (middle, _) = b.block(&[Ty::I1]);
-        let (join, j) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
-        b.cond_br(e, first, (middle, vec![k.exec]), (join, vec![k.exec, lane, five, lane]));
+        let (join, j) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32, Ty::I32]);
+        b.cond_br(e, first, (middle, vec![k.exec]), (join, vec![k.exec, lane, five, lane, five]));
         let exec = b.f.blocks[&middle].params[0].0;
-        b.cond_br(middle, second, (join, vec![exec, mirrored, nine, past]), (join, vec![exec, mirrored, thirteen, lane]));
+        b.cond_br(
+            middle,
+            second,
+            (join, vec![exec, mirrored, nine, past, below]),
+            (join, vec![exec, mirrored, thirteen, lane, hundred]),
+        );
         let values: Vec<(ValueId, Vec<Box<dyn Fn(u32) -> u32>>)> = vec![
             (j[1], vec![Box::new(|l| l), Box::new(|l| 31 - l)]),
             (j[2], vec![Box::new(|_| 5), Box::new(|_| 9), Box::new(|_| 13)]),
             (j[3], vec![Box::new(|l| l), Box::new(|l| l + 8)]),
+            (j[4], vec![Box::new(|_| 5), Box::new(|_| 0xffff_fff0), Box::new(|_| 100)]),
         ];
         (b, values)
     }
@@ -6671,6 +7274,12 @@ mod facts_tests {
             for (value, holds) in [(5u32, true), (7, false), (9, true), (11, false), (13, true), (17, false)] {
                 if exactly_representable(&a.unknowns, &f, value) != Some(holds) {
                     loose.push(format!("{:?} at {}: not {}", f, value, holds));
+                }
+            }
+            let f = a.value(values[3].0, 3, None).0.form;
+            for (value, holds) in [(5u32, true), (0xffff_fff0, true), (100, true), (0, false), (52, false), (0xffff_fff1, false), (6, false)] {
+                if exactly_representable(&a.unknowns, &f, value) != Some(holds) {
+                    loose.push(format!("{:?} at {:#x}: not {}", f, value, holds));
                 }
             }
         });
@@ -8024,6 +8633,168 @@ mod facts_tests {
         assert!(missed.is_empty(), "{:?}", missed);
     }
 
+    fn polynomials() -> (Build, [ValueId; 3], Vec<(&'static str, ValueId, Box<dyn Fn(u32, u32, u32) -> u32>)>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = loaded_word(&mut b, &k, e, 4, MemSize::U16);
+        let w = loaded_word(&mut b, &k, e, 8, MemSize::U8);
+        let c = |b: &mut Build, k: u32| b.constant(e, Ty::I32, k as u64);
+        let mut out: Vec<(&'static str, ValueId, Box<dyn Fn(u32, u32, u32) -> u32>)> = Vec::new();
+        let (three, five, seven) = (c(&mut b, 3), c(&mut b, 5), c(&mut b, 7));
+        let u3 = b.int(e, IntOp::Add, u, three);
+        let v5 = b.int(e, IntOp::Add, v, five);
+        let x = b.int(e, IntOp::Mul, u3, v5);
+        out.push(("(u + 3)(v + 5)", x, Box::new(|u, v, _| u.wrapping_add(3).wrapping_mul(v + 5))));
+        let difference = b.int(e, IntOp::Sub, u, v);
+        let sum = b.int(e, IntOp::Add, u, v);
+        let x = b.int(e, IntOp::Mul, difference, sum);
+        out.push(("(u - v)(u + v)", x, Box::new(|u, v, _| u.wrapping_sub(v).wrapping_mul(u.wrapping_add(v)))));
+        let vw = b.int(e, IntOp::Mul, v, w);
+        let x = b.int(e, IntOp::Mul, u, vw);
+        out.push(("u (v w)", x, Box::new(|u, v, w| u.wrapping_mul(v * w))));
+        let uv = b.int(e, IntOp::Mul, u, v);
+        let uv7 = b.int(e, IntOp::Add, uv, seven);
+        let two = c(&mut b, 2);
+        let w2 = b.int(e, IntOp::Sub, w, two);
+        let x = b.int(e, IntOp::Mul, uv7, w2);
+        out.push(("(u v + 7)(w - 2)", x, Box::new(|u, v, w| u.wrapping_mul(v).wrapping_add(7).wrapping_mul(w.wrapping_sub(2)))));
+        let (four, one) = (c(&mut b, 4), c(&mut b, 1));
+        let u2 = b.int(e, IntOp::Mul, u, two);
+        let v3 = b.int(e, IntOp::Mul, v, three);
+        let left = b.int(e, IntOp::Add, u2, v3);
+        let w4 = b.int(e, IntOp::Mul, w, four);
+        let right = b.int(e, IntOp::Add, w4, one);
+        let lr = b.int(e, IntOp::Mul, left, right);
+        let x = b.int(e, IntOp::Mul, lr, u);
+        out.push(("(2u + 3v)(4w + 1) u", x, Box::new(|u, v, w| u.wrapping_mul(2).wrapping_add(3 * v).wrapping_mul(4 * w + 1).wrapping_mul(u))));
+        let u1 = b.int(e, IntOp::Add, u, one);
+        let square = b.int(e, IntOp::Mul, u1, u1);
+        let x = b.int(e, IntOp::Mul, square, u1);
+        out.push(("(u + 1)^3", x, Box::new(|u, _, _| u.wrapping_add(1).wrapping_mul(u.wrapping_add(1)).wrapping_mul(u.wrapping_add(1)))));
+        let vv = b.int(e, IntOp::Mul, v, v);
+        let x = b.int(e, IntOp::Mul, vv, vv);
+        out.push(("v^4", x, Box::new(|_, v, _| v.wrapping_mul(v).wrapping_mul(v).wrapping_mul(v))));
+        let sixteen = c(&mut b, 16);
+        let shifted = b.int(e, IntOp::Shl, v, sixteen);
+        let x = b.int(e, IntOp::Mul, shifted, w);
+        out.push(("(v << 16) w", x, Box::new(|_, v, w| (v << 16).wrapping_mul(w))));
+        (b, [u, v, w], out)
+    }
+
+    #[test]
+    fn products_expand_into_monomials_whose_factors_multiply_to_the_true_value() {
+        let (b, words, cases) = polynomials();
+        let mut wrong = Vec::new();
+        addresses(&b, &two_words(), |a| {
+            let bases: Vec<Form> = words.iter().map(|&x| a.value(x, 0, None).0.form).collect();
+            let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.value(x, 0, None).0.form).collect();
+            let mut r = Random::new(109);
+            let mut samples: Vec<[u32; 3]> = vec![[0, 0, 0], [1, 1, 1], [u32::MAX, 65535, 255], [0x8000_0000, 0x8000, 0x80], [12345, 678, 9]];
+            samples.extend((0..40).map(|_| [r.next() as u32, r.below(65536) as u32, r.below(256) as u32]));
+            for sample in samples {
+                let value = |u: Unknown| -> Option<u32> {
+                    let base = |u: Unknown| bases.iter().position(|f| *f == Form::unknown(u)).map(|i| sample[i]);
+                    match a.monomials.get(&u) {
+                        Some(factors) => factors.iter().try_fold(1u32, |p, &f| Some(p.wrapping_mul(base(f)?))),
+                        None => base(u),
+                    }
+                };
+                for (i, (name, _, truth)) in cases.iter().enumerate() {
+                    let evaluated = forms[i].terms.iter().try_fold(forms[i].constant, |acc, &(u, c)| Some(acc.wrapping_add(c.wrapping_mul(value(u)?))));
+                    let t = truth(sample[0], sample[1], sample[2]);
+                    if evaluated != Some(t) {
+                        wrong.push(format!("{} at {:?}: {:?} gives {:?}, not {:#x}", name, sample, forms[i], evaluated, t));
+                    }
+                }
+                for (u, factors) in &a.monomials {
+                    let Some(p) = value(*u) else {
+                        continue;
+                    };
+                    if let Some((low, high)) = a.unknowns[*u as usize].range {
+                        if p < low || p > high {
+                            wrong.push(format!("monomial {:?} at {:?} is {:#x}, outside {:?}", factors, sample, p, (low, high)));
+                        }
+                    }
+                }
+            }
+        });
+        wrong.sort();
+        wrong.dedup();
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
+    }
+
+    #[test]
+    fn wide_values_are_the_addresses_as_integers_whenever_they_are_given() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let s = loaded_word(&mut b, &k, e, 4, MemSize::U8);
+        let t = loaded_word(&mut b, &k, e, 8, MemSize::U16);
+        let zext = |b: &mut Build, x: ValueId| b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, x));
+        let wide = |b: &mut Build, k: u64| b.constant(e, Ty::I64, k);
+        let (zu, zs, zt) = (zext(&mut b, u), zext(&mut b, s), zext(&mut b, t));
+        let mut cases: Vec<(&'static str, ValueId, bool, Box<dyn Fn(u64, u64, u64) -> u64>)> = Vec::new();
+        let four = wide(&mut b, 4);
+        let scaled = b.int(e, IntOp::Mul, zu, four);
+        let x = b.int(e, IntOp::Add, buf, scaled);
+        cases.push(("buf + 4u", x, true, Box::new(|u, _, _| 0x1000 + 4 * u)));
+        let eight = wide(&mut b, 8);
+        let y = b.int(e, IntOp::Sub, x, eight);
+        cases.push(("buf + 4u - 8", y, true, Box::new(|u, _, _| 0x1000 + 4 * u - 8)));
+        let three = wide(&mut b, 3);
+        let shifted = b.int(e, IntOp::Shl, zu, three);
+        let two = wide(&mut b, 2);
+        let doubled = b.int(e, IntOp::Mul, two, zs);
+        let x = b.int(e, IntOp::Add, shifted, doubled);
+        cases.push(("(u << 3) + 2s", x, true, Box::new(|u, s, _| (u << 3) + 2 * s)));
+        let row = wide(&mut b, 256);
+        let rows = b.int(e, IntOp::Mul, zt, row);
+        let x = b.int(e, IntOp::Add, zs, rows);
+        cases.push(("s + 256t", x, true, Box::new(|_, s, t| s + 256 * t)));
+        let big = wide(&mut b, 1 << 33);
+        let far = b.int(e, IntOp::Mul, zu, big);
+        let x = b.int(e, IntOp::Add, buf, far);
+        cases.push(("buf + 2^33 u", x, false, Box::new(|u, _, _| 0x1000u64.wrapping_add(u.wrapping_mul(1 << 33)))));
+        let five = b.constant(e, Ty::I32, 5);
+        let bumped = b.int(e, IntOp::Add, u, five);
+        let x = zext(&mut b, bumped);
+        cases.push(("zext(u + 5)", x, false, Box::new(|u, _, _| (u as u32).wrapping_add(5) as u64)));
+        let bumped = b.int(e, IntOp::Add, t, five);
+        let x = zext(&mut b, bumped);
+        cases.push(("zext(t + 5)", x, true, Box::new(|_, _, t| t + 5)));
+        let x = b.int(e, IntOp::Sub, zs, zt);
+        cases.push(("s - t", x, false, Box::new(|_, s, t| s.wrapping_sub(t))));
+        let mut wrong = Vec::new();
+        addresses(&b, &two_words(), |a| {
+            let bases: Vec<Form> = [u, s, t].iter().map(|&x| a.value(x, 0, None).0.form).collect();
+            let forms: Vec<Option<super::Wide>> = cases.iter().map(|&(_, x, _, _)| a.wide_value(x, e, 0)).collect();
+            let mut r = Random::new(127);
+            let mut samples: Vec<[u64; 3]> = vec![[0, 0, 0], [u32::MAX as u64, 255, 65535], [0x8000_0000, 128, 32768], [1, 1, 1]];
+            samples.extend((0..40).map(|_| [r.next() as u32 as u64, r.below(256), r.below(65536)]));
+            for (i, (name, _, given, truth)) in cases.iter().enumerate() {
+                match &forms[i] {
+                    None if *given => wrong.push(format!("{}: no wide form", name)),
+                    None => {}
+                    Some(w) => {
+                        for sample in &samples {
+                            let value = w.terms.iter().try_fold(w.constant, |acc, &(x, c)| {
+                                let i = bases.iter().position(|f| *f == Form::unknown(x))?;
+                                Some(acc + c * sample[i] as i128)
+                            });
+                            let t = truth(sample[0], sample[1], sample[2]) as i128;
+                            if value != Some(t) {
+                                wrong.push(format!("{} at {:?}: {:?} gives {:?}, not {:#x}", name, sample, w, value, t));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+
     #[test]
     fn distributed_and_regrouped_products_give_zero() {
         let (b, cases) = distributed_products();
@@ -8165,6 +8936,389 @@ mod facts_tests {
         let (b, chosen) = chosen_after_bound(true);
         let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the block runs only when u is below 4, so u is below 8");
+    }
+
+    const PREDICATES: [IntPred; 10] = [
+        IntPred::Eq,
+        IntPred::Ne,
+        IntPred::Ult,
+        IntPred::Ule,
+        IntPred::Ugt,
+        IntPred::Uge,
+        IntPred::Slt,
+        IntPred::Sle,
+        IntPred::Sgt,
+        IntPred::Sge,
+    ];
+
+    fn within(set: &[(u64, u64)], x: u32) -> bool {
+        set.iter().any(|&(low, high)| low <= x as u64 && x as u64 <= high)
+    }
+
+    fn ends_of(set: &[(u64, u64)]) -> Vec<u32> {
+        set.iter()
+            .flat_map(|&(low, high)| [low as u32, (low as u32).wrapping_sub(1), high as u32, (high as u32).wrapping_add(1)])
+            .collect()
+    }
+
+    fn well_formed(set: &[(u64, u64)]) -> bool {
+        set.iter().all(|&(low, high)| low <= high && high <= u32::MAX as u64) && set.windows(2).all(|w| w[0].1 + 1 < w[1].0)
+    }
+
+    fn random_pieces(r: &mut Random) -> Vec<(u64, u64)> {
+        let points = [0u32, 1, 5, 100, 0x7fff_fff0, 0x7fff_ffff, 0x8000_0000, 0x8000_0010, u32::MAX - 3, u32::MAX];
+        let mut set = Vec::new();
+        for _ in 0..r.below(3) {
+            let mut pick = || if r.below(2) == 0 { points[r.below(points.len() as u64) as usize] } else { r.next() as u32 };
+            let (x, y) = (pick(), pick());
+            set.push((x.min(y) as u64, x.max(y) as u64));
+        }
+        set
+    }
+
+    #[test]
+    fn satisfying_holds_exactly_the_words_each_predicate_accepts() {
+        let mut r = Random::new(97);
+        let mut constants = vec![0u32, 1, 2, 7, 0x7fff_fffe, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, u32::MAX - 1, u32::MAX];
+        constants.extend((0..20).map(|_| r.next() as u32));
+        let mut wrong = Vec::new();
+        for pred in PREDICATES {
+            for &k in &constants {
+                let set = satisfying(pred, k);
+                if !set.iter().all(|&(low, high)| low <= high && high <= u32::MAX as u64) || !set.windows(2).all(|w| w[0].1 < w[1].0) {
+                    wrong.push(format!("{:?} {:#x}: {:?}", pred, k, set));
+                }
+                let mut words = constants.clone();
+                words.extend([k.wrapping_sub(1), k, k.wrapping_add(1)]);
+                words.extend(ends_of(&set));
+                for x in words {
+                    if within(&set, x) != compare(pred, x, k) {
+                        wrong.push(format!("{:?} {:#x} at {:#x}: {:?}", pred, k, x, set));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn piece_operations_hold_exactly_the_words_their_pieces_hold() {
+        let mut r = Random::new(101);
+        let mut wrong = Vec::new();
+        for _ in 0..600 {
+            let (a, b) = (random_pieces(&mut r), random_pieces(&mut r));
+            let k = match r.below(3) {
+                0 => r.below(8) as u32,
+                1 => (r.below(8) as u32).wrapping_neg(),
+                _ => r.next() as u32,
+            };
+            let shifted = shifted_pieces(&a, k);
+            let common = intersected(&a, &b);
+            let merged = normalized([a.clone(), b.clone()].concat());
+            for set in [&shifted, &common, &merged] {
+                if !well_formed(set) {
+                    wrong.push(format!("{:?} and {:?}: not normal {:?}", a, b, set));
+                }
+            }
+            let mut words: Vec<u32> = [ends_of(&a), ends_of(&b), ends_of(&common), ends_of(&merged)].concat();
+            words.extend(ends_of(&shifted).iter().map(|y| y.wrapping_sub(k)));
+            words.extend([0, 0x8000_0000, u32::MAX]);
+            for x in words {
+                if within(&shifted, x.wrapping_add(k)) != within(&a, x) {
+                    wrong.push(format!("{:?} + {:#x} at {:#x}: {:?}", a, k, x, shifted));
+                }
+                if within(&common, x) != (within(&a, x) && within(&b, x)) {
+                    wrong.push(format!("{:?} and {:?} at {:#x}: {:?}", a, b, x, common));
+                }
+                if within(&merged, x) != (within(&a, x) || within(&b, x)) {
+                    wrong.push(format!("{:?} or {:?} at {:#x}: {:?}", a, b, x, merged));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn limits_of_word_classes_conjoin_exactly_and_disjoin_exactly_within_one_class() {
+        let (u, v) = (Form::unknown(0), Form::unknown(1));
+        let holds = |limits: &[(Form, Vec<(u64, u64)>)], x: u32, y: u32| {
+            limits.iter().all(|(c, set)| within(set, if *c == u { x } else { y }))
+        };
+        let mut r = Random::new(103);
+        let mut wrong = Vec::new();
+        for _ in 0..400 {
+            let mut build = |r: &mut Random| {
+                let mut limits = Vec::new();
+                for class in [&u, &v] {
+                    if r.below(3) != 0 {
+                        let c = if r.below(2) == 0 { r.below(8) as u32 } else { r.next() as u32 };
+                        let values = random_pieces(r);
+                        let limit = class_limit(&class.add(&Form::constant(c)), &values);
+                        if limit.0 != *class || !well_formed(&limit.1) {
+                            wrong.push(format!("{:?} + {:#x} in {:?}: {:?}", class, c, values, limit));
+                        }
+                        for x in [ends_of(&values).iter().map(|y| y.wrapping_sub(c)).collect(), ends_of(&limit.1)].concat() {
+                            if within(&limit.1, x) != within(&values, x.wrapping_add(c)) {
+                                wrong.push(format!("{:?} + {:#x} in {:?} at {:#x}: {:?}", class, c, values, x, limit));
+                            }
+                        }
+                        limits.push(limit);
+                    }
+                }
+                limits
+            };
+            let (a, b) = (build(&mut r), build(&mut r));
+            let both = conjoined(a.clone(), b.clone());
+            let either = disjoined(a.clone(), b.clone());
+            let one_class = a.len() == 1 && b.len() == 1 && a[0].0 == b[0].0;
+            let words = |class: &Form| -> Vec<u32> {
+                let mut out = vec![0, 0x8000_0000, u32::MAX];
+                for limits in [&a, &b, &both, &either] {
+                    for (c, set) in limits.iter() {
+                        if c == class {
+                            out.extend(ends_of(set));
+                        }
+                    }
+                }
+                out
+            };
+            let (xs, ys) = (words(&u), words(&v));
+            for &x in &xs {
+                for &y in &ys {
+                    let (ha, hb) = (holds(&a, x, y), holds(&b, x, y));
+                    if holds(&both, x, y) != (ha && hb) {
+                        wrong.push(format!("{:?} and {:?} at ({:#x}, {:#x}): {:?}", a, b, x, y, both));
+                    }
+                    if (ha || hb) && !holds(&either, x, y) {
+                        wrong.push(format!("{:?} or {:?} at ({:#x}, {:#x}) misses: {:?}", a, b, x, y, either));
+                    }
+                    if one_class && holds(&either, x, y) != (ha || hb) {
+                        wrong.push(format!("{:?} or {:?} at ({:#x}, {:#x}) loose: {:?}", a, b, x, y, either));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(10)]);
+    }
+
+    #[test]
+    fn decide_pieces_decides_exactly_when_every_pair_of_words_agrees() {
+        let mut r = Random::new(107);
+        let centers = [0u32, 3, 0x7fff_fffc, 0x8000_0000, u32::MAX - 3];
+        let mut small = |r: &mut Random| {
+            let mut set = Vec::new();
+            for _ in 0..1 + r.below(2) {
+                let low = centers[r.below(centers.len() as u64) as usize].wrapping_add(r.below(9) as u32).wrapping_sub(4);
+                let high = low.saturating_add(r.below(4) as u32);
+                set.push((low as u64, high as u64));
+            }
+            set
+        };
+        let mut wrong = Vec::new();
+        for _ in 0..4000 {
+            let pred = PREDICATES[r.below(10) as usize];
+            let (xs, ys) = (small(&mut r), small(&mut r));
+            let mut seen = [false; 2];
+            for &(lx, hx) in &xs {
+                for x in lx..=hx {
+                    for &(ly, hy) in &ys {
+                        for y in ly..=hy {
+                            seen[compare(pred, x as u32, y as u32) as usize] = true;
+                        }
+                    }
+                }
+            }
+            let truth = match seen {
+                [true, false] => Some(false),
+                [false, true] => Some(true),
+                _ => None,
+            };
+            let got = decide_pieces(pred, &xs, &ys);
+            if got != truth {
+                wrong.push(format!("{:?} {:?} {:?}: {:?}, not {:?}", pred, xs, ys, got, truth));
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(10)]);
+    }
+
+    struct BranchesOnOneWord {
+        b: Build,
+        conditions: Vec<(IntPred, u32, u32)>,
+        blocks: Vec<(&'static str, Box<dyn Fn(u32) -> bool>, Vec<(IntPred, bool, u32, u32, ValueId)>)>,
+    }
+
+    fn branches_on_one_word() -> BranchesOnOneWord {
+        use IntPred::*;
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let against = |b: &mut Build, at: BlockId, pred: IntPred, x: ValueId, c: u32| {
+            let c = b.constant(at, Ty::I32, c as u64);
+            b.cmp(at, pred, x, c)
+        };
+        let fork = |b: &mut Build, at: BlockId, cond: ValueId, exec: ValueId| {
+            let (yes, y) = b.block(&[Ty::I1]);
+            let (no, n) = b.block(&[Ty::I1]);
+            b.cond_br(at, cond, (yes, vec![exec]), (no, vec![exec]));
+            ((yes, y[0]), (no, n[0]))
+        };
+        let c1 = against(&mut b, e, Ult, u, 1000);
+        let ((b1, e1), (x1, f1)) = fork(&mut b, e, c1, k.exec);
+        let five = b.constant(b1, Ty::I32, 5);
+        let u5 = b.int(b1, IntOp::Add, u, five);
+        let above = against(&mut b, b1, Ugt, u5, 20);
+        let big = against(&mut b, b1, Uge, u, 500);
+        let one = b.constant(b1, Ty::I1, 1);
+        let small = b.int(b1, IntOp::Xor, big, one);
+        let c2 = b.int(b1, IntOp::And, above, small);
+        let ((b2, e2), (x2, _)) = fork(&mut b, b1, c2, e1);
+        let three_hundred = b.constant(b2, Ty::I32, 300);
+        let m = b.int(b2, IntOp::Sub, u, three_hundred);
+        let c3 = against(&mut b, b2, Sge, m, 0);
+        let ((b3, e3), (x3, _)) = fork(&mut b, b2, c3, e2);
+        let c4 = against(&mut b, b3, Ne, u, 400);
+        let ((b4, e4), (x4, _)) = fork(&mut b, b3, c4, e3);
+        let low = against(&mut b, b4, Ult, u, 320);
+        let high = against(&mut b, b4, Ugt, u, 450);
+        let c5 = b.int(b4, IntOp::Or, low, high);
+        let ((b5, e5), (x5, f5)) = fork(&mut b, b4, c5, e4);
+        let (j5, _) = b.block(&[Ty::I1]);
+        let (z5, _) = b.block(&[Ty::I1]);
+        let (y5, _) = b.block(&[Ty::I1]);
+        let c8 = against(&mut b, b5, Ult, u, 310);
+        b.cond_br(b5, c8, (j5, vec![e5]), (z5, vec![e5]));
+        let c7 = against(&mut b, x5, Uge, u, 440);
+        b.cond_br(x5, c7, (j5, vec![f5]), (y5, vec![f5]));
+        let bound = b.constant(x1, Ty::I32, 0x9000_0000);
+        let c6 = b.cmp(x1, Ugt, bound, u);
+        let ((b6, _), (x6, _)) = fork(&mut b, x1, c6, f1);
+        let conditions = vec![
+            (Ult, 0, 1000),
+            (Ugt, 5, 20),
+            (Uge, 0, 500),
+            (Sge, 300u32.wrapping_neg(), 0),
+            (Ne, 0, 400),
+            (Ult, 0, 320),
+            (Ugt, 0, 450),
+            (Ult, 0, 0x9000_0000),
+            (Ult, 0, 310),
+            (Uge, 0, 440),
+        ];
+        let c1 = |u: u32| u < 1000;
+        let c2 = |u: u32| u.wrapping_add(5) > 20 && u < 500;
+        let c3 = |u: u32| u.wrapping_sub(300) as i32 >= 0;
+        let c4 = |u: u32| u != 400;
+        let c5 = |u: u32| !(320..=450).contains(&u);
+        let c6 = |u: u32| u < 0x9000_0000;
+        let c7 = |u: u32| u >= 440;
+        let c8 = |u: u32| u < 310;
+        let reach: Vec<(&'static str, BlockId, Box<dyn Fn(u32) -> bool>)> = vec![
+            ("b1", b1, Box::new(move |u| c1(u))),
+            ("x1", x1, Box::new(move |u| !c1(u))),
+            ("b2", b2, Box::new(move |u| c1(u) && c2(u))),
+            ("x2", x2, Box::new(move |u| c1(u) && !c2(u))),
+            ("b3", b3, Box::new(move |u| c1(u) && c2(u) && c3(u))),
+            ("x3", x3, Box::new(move |u| c1(u) && c2(u) && !c3(u))),
+            ("b4", b4, Box::new(move |u| c1(u) && c2(u) && c3(u) && c4(u))),
+            ("x4", x4, Box::new(move |u| c1(u) && c2(u) && c3(u) && !c4(u))),
+            ("b5", b5, Box::new(move |u| c1(u) && c2(u) && c3(u) && c4(u) && c5(u))),
+            ("x5", x5, Box::new(move |u| c1(u) && c2(u) && c3(u) && c4(u) && !c5(u))),
+            ("j5", j5, Box::new(move |u| c1(u) && c2(u) && c3(u) && c4(u) && if c5(u) { c8(u) } else { c7(u) })),
+            ("z5", z5, Box::new(move |u| c1(u) && c2(u) && c3(u) && c4(u) && c5(u) && !c8(u))),
+            ("y5", y5, Box::new(move |u| c1(u) && c2(u) && c3(u) && c4(u) && !c5(u) && !c7(u))),
+            ("b6", b6, Box::new(move |u| !c1(u) && c6(u))),
+            ("x6", x6, Box::new(move |u| !c1(u) && !c6(u))),
+        ];
+        let offsets = [0u32, 1, u32::MAX, 0x8000_0000, 700];
+        let constants = [0u32, 15, 16, 300, 319, 400, 401, 451, 499, 500, 999, 1000, 0x7fff_ffff, 0x8000_0000, 0x9000_0000, u32::MAX];
+        let mut blocks = Vec::new();
+        for (name, block, reaches) in reach {
+            let mut queries = Vec::new();
+            for &offset in &offsets {
+                let x = if offset == 0 {
+                    u
+                } else {
+                    let c = b.constant(block, Ty::I32, offset as u64);
+                    b.int(block, IntOp::Add, u, c)
+                };
+                for &c in &constants {
+                    let kc = b.constant(block, Ty::I32, c as u64);
+                    for pred in PREDICATES {
+                        queries.push((pred, false, offset, c, b.cmp(block, pred, x, kc)));
+                        queries.push((pred, true, offset, c, b.cmp(block, pred, kc, x)));
+                    }
+                }
+            }
+            blocks.push((name, reaches, queries));
+        }
+        BranchesOnOneWord { b, conditions, blocks }
+    }
+
+    fn settled_by_branches(branches: &BranchesOnOneWord, pred: IntPred, flipped: bool, offset: u32, c: u32, reaches: &dyn Fn(u32) -> bool) -> Option<Option<bool>> {
+        let holds = |u: u32| {
+            let x = u.wrapping_add(offset);
+            if flipped {
+                compare(pred, c, x)
+            } else {
+                compare(pred, x, c)
+            }
+        };
+        let mut starts = vec![0u32];
+        for &(_, shift, k) in branches.conditions.iter().chain([(pred, offset, c)].iter()) {
+            starts.extend([k.wrapping_sub(shift), k.wrapping_sub(shift).wrapping_add(1), shift.wrapping_neg(), 0x8000_0000u32.wrapping_sub(shift)]);
+        }
+        let mut seen = [false; 2];
+        for u in starts {
+            if reaches(u) {
+                seen[holds(u) as usize] = true;
+            }
+        }
+        match seen {
+            [false, false] => None,
+            [true, false] => Some(Some(false)),
+            [false, true] => Some(Some(true)),
+            _ => Some(None),
+        }
+    }
+
+    #[test]
+    fn comparisons_under_branches_decide_only_what_every_reaching_word_gives() {
+        let branches = branches_on_one_word();
+        let mut wrong = Vec::new();
+        addresses(&branches.b, &two_words(), |a| {
+            for (name, reaches, queries) in &branches.blocks {
+                for &(pred, flipped, offset, c, q) in queries {
+                    let Some(truth) = settled_by_branches(&branches, pred, flipped, offset, c, reaches.as_ref()) else {
+                        continue;
+                    };
+                    let got = a.bit(q, 0, None).0;
+                    if got.is_some() && got != truth {
+                        wrong.push(format!("{}: {:?} flipped {} (u + {:#x}) against {:#x}: {:?}, truth {:?}", name, pred, flipped, offset, c, got, truth));
+                    }
+                }
+            }
+        });
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+    }
+
+    #[test]
+    fn comparisons_under_branches_decide_what_the_conditions_on_one_word_settle() {
+        let branches = branches_on_one_word();
+        let mut loose = Vec::new();
+        addresses(&branches.b, &two_words(), |a| {
+            for (name, reaches, queries) in &branches.blocks {
+                for &(pred, flipped, offset, c, q) in queries {
+                    let Some(truth) = settled_by_branches(&branches, pred, flipped, offset, c, reaches.as_ref()) else {
+                        continue;
+                    };
+                    let got = a.bit(q, 0, None).0;
+                    if truth.is_some() && got != truth {
+                        loose.push(format!("{}: {:?} flipped {} (u + {:#x}) against {:#x}: {:?}, truth {:?}", name, pred, flipped, offset, c, got, truth));
+                    }
+                }
+            }
+        });
+        assert!(loose.is_empty(), "{} loose: {:?}", loose.len(), &loose[..loose.len().min(10)]);
     }
 
     fn chosen_after_branch_on_a_source(entered: bool) -> (Build, ValueId) {

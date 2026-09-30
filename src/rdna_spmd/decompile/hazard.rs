@@ -4,6 +4,7 @@ use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::environment::Environment;
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::Program;
+use crate::rdna_spmd::hash::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -845,7 +846,14 @@ fn meet(
                 if d >= y.bytes && d.wrapping_neg() >= x.bytes {
                     continue;
                 }
-            } else if !may_overlap(unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ) {
+            }
+            let pieces = [addresses.access_pieces(pa.block, pa.predicate, a), addresses.access_pieces(qa.block, qa.predicate, b)];
+            let cases = cases_of(&pieces);
+            let apart = cases.iter().all(|ranges| {
+                !may_overlap_within(&addresses.unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, [&ranges[0], &ranges[1]])
+                    || wide_apart(addresses, (pa, a, x.bytes), (qa, b, y.bytes), variant, [&ranges[0], &ranges[1]])
+            });
+            if apart {
                 continue;
             }
             if above(addresses, (pa, a, xa, x.high.as_ref(), x.bytes), (qa, b, ya, y.high.as_ref(), y.bytes), variant, differ) {
@@ -947,6 +955,19 @@ fn above(
                 || !may_overlap(unknowns, &hx.add(&Form::constant(k as u32)), &hy, 1, 1, variant, differ)
         });
     }
+    if let (Some(kx), Some(ky)) = (hx.as_constant(), hy.as_constant()) {
+        if let (Some((x_low, x_high)), Some((y_low, y_high))) = (addresses.bounds(&x.form), addresses.bounds(&y.form)) {
+            if x_high < 1 << 32 && y_high < 1 << 32 {
+                let above = (ky as i64 - kx as i64) << 32;
+                let least = above + y_low as i64 - x_high as i64;
+                let most = above + y_high as i64 - x_low as i64;
+                if most <= -(y_bytes as i64) || least >= x_bytes as i64 {
+                    return true;
+                }
+            }
+        }
+    }
+    let unknowns = &addresses.unknowns;
     let same = x.form == y.form && x.form.terms.iter().all(|&(u, _)| !variant(&unknowns[u as usize]));
     let window = if same { 1 } else { 2 };
     !may_overlap(unknowns, &hx, &hy, window, window, variant, differ)
@@ -960,6 +981,107 @@ fn may_overlap(
     y_bytes: u32,
     variant: &dyn Fn(&UnknownInfo) -> bool,
     differ: Option<Unknown>,
+) -> bool {
+    let none = HashMap::default();
+    may_overlap_within(unknowns, x, y, x_bytes, y_bytes, variant, differ, [&none, &none])
+}
+
+fn cases_of(pieces: &[Vec<(Unknown, Vec<(u32, u32)>)>; 2]) -> Vec<[HashMap<Unknown, (u32, u32)>; 2]> {
+    let count: usize = pieces.iter().flatten().map(|(_, p)| p.len().max(1)).product();
+    let mut cases = vec![[HashMap::default(), HashMap::default()]];
+    for (side, list) in pieces.iter().enumerate() {
+        for (u, set) in list {
+            let choices: Vec<(u32, u32)> = match set.as_slice() {
+                [] => vec![(1, 0)],
+                _ if count > 16 => vec![(set[0].0, set[set.len() - 1].1)],
+                _ => set.clone(),
+            };
+            cases = cases
+                .into_iter()
+                .flat_map(|case| {
+                    choices.iter().map(move |&range| {
+                        let mut case = case.clone();
+                        case[side].insert(*u, range);
+                        case
+                    })
+                })
+                .collect();
+        }
+    }
+    cases
+}
+
+fn narrowed(info: &UnknownInfo, u: Unknown, given: Option<&(u32, u32)>) -> Option<Option<(u32, u32)>> {
+    if info.values.is_some() {
+        return Some(info.range);
+    }
+    let range = match (info.range, given) {
+        (range, None) => range,
+        (None, Some(&given)) => Some(given),
+        (Some((l, h)), Some(&(gl, gh))) => Some((l.max(gl), h.min(gh))),
+    };
+    let _ = u;
+    match range {
+        Some((l, h)) if l > h => None,
+        range => Some(range),
+    }
+}
+
+fn wide_apart(
+    addresses: &mut Addresses,
+    (pa, a, x_bytes): (&Access, usize, u32),
+    (qa, b, y_bytes): (&Access, usize, u32),
+    variant: &dyn Fn(&UnknownInfo) -> bool,
+    ranges: [&HashMap<Unknown, (u32, u32)>; 2],
+) -> bool {
+    let (Some(xv), Some(yv)) = (pa.address, qa.address) else {
+        return false;
+    };
+    let (Some(wx), Some(wy)) = (addresses.wide_value(xv, pa.block, a), addresses.wide_value(yv, qa.block, b)) else {
+        return false;
+    };
+    let unknowns = &addresses.unknowns;
+    let (mut low, mut high) = (wx.constant - wy.constant, wx.constant - wy.constant);
+    let mut add = |c: i128, range: Option<(u32, u32)>| {
+        let (l, h) = range.unwrap_or((0, u32::MAX));
+        let (p, q) = (c * l as i128, c * h as i128);
+        low += p.min(q);
+        high += p.max(q);
+    };
+    let mut seen: Vec<Unknown> = wx.terms.iter().chain(&wy.terms).map(|&(u, _)| u).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    for u in seen {
+        let cx = wx.terms.iter().find(|t| t.0 == u).map_or(0, |t| t.1);
+        let cy = wy.terms.iter().find(|t| t.0 == u).map_or(0, |t| t.1);
+        let info = &unknowns[u as usize];
+        let (Some(rx), Some(ry)) = (narrowed(info, u, ranges[0].get(&u)), narrowed(info, u, ranges[1].get(&u))) else {
+            return true;
+        };
+        if variant(info) {
+            add(cx, rx);
+            add(-cy, ry);
+        } else {
+            let both = match (rx, ry) {
+                (Some((a, b)), Some((c, d))) if a.max(c) > b.min(d) => return true,
+                (Some((a, b)), Some((c, d))) => Some((a.max(c), b.min(d))),
+                (r, None) | (None, r) => r,
+            };
+            add(cx - cy, both);
+        }
+    }
+    high <= -(x_bytes as i128) || low >= y_bytes as i128
+}
+
+fn may_overlap_within(
+    unknowns: &[UnknownInfo],
+    x: &Form,
+    y: &Form,
+    x_bytes: u32,
+    y_bytes: u32,
+    variant: &dyn Fn(&UnknownInfo) -> bool,
+    differ: Option<Unknown>,
+    ranges: [&HashMap<Unknown, (u32, u32)>; 2],
 ) -> bool {
     let mut sum = Sum::default();
     let mut apart = None;
@@ -987,15 +1109,23 @@ fn may_overlap(
         };
         let info = &unknowns[u as usize];
         let set = if info.values.is_some() { u } else { NO_SET };
+        let (Some(rx), Some(ry)) = (narrowed(info, u, ranges[0].get(&u)), narrowed(info, u, ranges[1].get(&u))) else {
+            return false;
+        };
         if variant(info) {
             if let (true, true, Some((lo, hi)), NO_SET) = (Some(u) == differ, cx == cy, info.range, set) {
                 apart = Some((cx, hi - lo));
                 continue;
             }
-            sum.add(cx, info.range, set);
-            sum.add(cy.wrapping_neg(), info.range, set);
+            sum.add(cx, rx, set);
+            sum.add(cy.wrapping_neg(), ry, set);
         } else {
-            sum.add(cx.wrapping_sub(cy), info.range, set);
+            let both = match (rx, ry) {
+                (Some((a, b)), Some((c, d))) if a.max(c) > b.min(d) => return false,
+                (Some((a, b)), Some((c, d))) => Some((a.max(c), b.min(d))),
+                (r, None) | (None, r) => r,
+            };
+            sum.add(cx.wrapping_sub(cy), both, set);
         }
     }
     let constant = x.constant.wrapping_sub(y.constant) as i64;
@@ -1012,6 +1142,7 @@ fn may_overlap(
 
 const BOUNDED: usize = 8;
 const PARTIAL_SUMS: usize = 4096;
+const ONE_TERM: u32 = 1 << 16;
 const NO_SET: Unknown = Unknown::MAX;
 
 #[derive(Clone, Copy)]
@@ -1115,6 +1246,13 @@ impl Sum {
                 }
             })
         };
+        let rest: Vec<usize> = (0..terms.len()).filter(|&k| Some(k) != first && Some(k) != second).collect();
+        if let &[k] = rest.as_slice() {
+            let (c, lo, hi, set) = terms[k];
+            if set == NO_SET && hi - lo < ONE_TERM {
+                return (lo..=hi).any(|u| hits((c as u64).wrapping_mul(u as u64) & mask));
+            }
+        }
         let mut sums: Vec<u64> = vec![0];
         for (k, &(c, lo, hi, set)) in terms.iter().enumerate() {
             if Some(k) == first || Some(k) == second {
@@ -1535,6 +1673,60 @@ mod tests {
         assert!(three_wide_terms(14), "u = w = 1, v = 0 gives 14");
     }
 
+    fn sumset(set: &[bool], c: usize, width: usize) -> Vec<bool> {
+        let mut out = vec![false; set.len() + c * width];
+        for r in 0..c {
+            let mut live = 0usize;
+            let mut x = r;
+            let mut k = 0usize;
+            while x < out.len() {
+                if x < set.len() && set[x] {
+                    live += 1;
+                }
+                if k > width {
+                    let gone = x - c * (width + 1);
+                    if gone < set.len() && set[gone] {
+                        live -= 1;
+                    }
+                }
+                out[x] = live > 0;
+                x += c;
+                k += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn may_overlap_decides_three_wide_terms_as_their_sums_do() {
+        let mut r = Random::new(131);
+        let mut wrong = Vec::new();
+        for trial in 0..60 {
+            let coefficients: Vec<usize> = (0..3).map(|_| 1 + r.below(20) as usize).collect();
+            let widths: Vec<usize> = (0..3).map(|_| 4097 + r.below(8000) as usize).collect();
+            let unknowns: Vec<UnknownInfo> = widths.iter().enumerate().map(|(i, &w)| info(i, Some((0, w as u32)))).collect();
+            let x = Form {
+                constant: 0,
+                terms: coefficients.iter().enumerate().map(|(i, &c)| (i as Unknown, c as u32)).collect(),
+            };
+            let mut reachable = vec![true];
+            for (&c, &w) in coefficients.iter().zip(&widths) {
+                reachable = sumset(&reachable, c, w);
+            }
+            let top = reachable.len();
+            let mut targets: Vec<usize> = (0..12).chain(top - 12..top + 3).collect();
+            targets.extend((0..20).map(|_| r.below(top as u64) as usize));
+            for t in targets {
+                let truth = t < top && reachable[t];
+                let found = may_overlap(&unknowns, &x, &Form::constant(t as u32), 1, 1, &|_: &UnknownInfo| false, None);
+                if found != truth {
+                    wrong.push(format!("trial {}: {:?} over {:?} at {}: {} not {}", trial, coefficients, widths, t, found, truth));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(6)]);
+    }
+
     #[test]
     fn may_overlap_sees_that_four_u_plus_six_v_plus_ten_w_never_hits_two_over_wide_ranges() {
         assert!(!three_wide_terms(2), "2u + 3v + 5w = 1 has no solution with u, v, w >= 0");
@@ -1949,6 +2141,46 @@ mod tests {
         let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
         let key = pair(&h, s, s);
         (h, key)
+    }
+
+    #[test]
+    fn find_reports_products_of_words_from_two_loops_that_meet_across_iterations_of_the_second() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let table = k.buffer(&mut b, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (first, f) = b.block(&[Ty::I1, Ty::I32]);
+        let (second, g) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, first, vec![k.exec, zero]);
+        let yes = b.constant(first, Ty::I1, 1);
+        let x = b.load(first, Space::Global, MemSize::U8, table, yes);
+        let one = b.constant(first, Ty::I32, 1);
+        let next = b.int(first, IntOp::Add, f[1], one);
+        let two = b.constant(first, Ty::I32, 2);
+        let again = b.cmp(first, IntPred::Ult, next, two);
+        let start = b.constant(first, Ty::I32, 0);
+        b.cond_br(first, again, (first, vec![f[0], next]), (second, vec![f[0], x, start]));
+        let at = byte_offset(&mut b, second, table, g[2], 4);
+        let yes = b.constant(second, Ty::I1, 1);
+        let y = b.load(second, Space::Global, MemSize::U8, at, yes);
+        let product = b.int(second, IntOp::Mul, g[1], y);
+        let address = byte_offset(&mut b, second, buf, product, 4);
+        let s = store_at(&mut b, second, address, g[0]);
+        let four = b.constant(second, Ty::I64, 4);
+        let ahead = b.int(second, IntOp::Add, address, four);
+        let l = b.here(second);
+        b.load(second, Space::Global, MemSize::B32, ahead, g[0]);
+        let one = b.constant(second, Ty::I32, 1);
+        let next = b.int(second, IntOp::Add, g[2], one);
+        let limit = b.constant(second, Ty::I32, 4);
+        let again = b.cmp(second, IntPred::Ult, next, limit);
+        b.cond_br(second, again, (second, vec![g[0], g[1], next]), (exit, vec![g[0]]));
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
+        let key = pair(&h, s, l);
+        assert!(h.apart.contains(&key), "x y in iteration i is x y + 1 in iteration j when x = 1 and y rises by one");
+        assert!(!h.together.contains(&key), "within one iteration the load reads the word after the store");
     }
 
     #[test]
@@ -3486,6 +3718,65 @@ mod tests {
         assert!(!bounded_pair(false), "the first index is below 3 and the second above 10");
     }
 
+    fn predicated_pair(space: Space, first: (IntPred, u64), second: Option<(IntPred, u64)>) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::B32);
+        let mut mask = |b: &mut Build, x: ValueId, (pred, bound): (IntPred, u64)| {
+            let bound = b.constant(e, Ty::I32, bound);
+            let holds = b.cmp(e, pred, x, bound);
+            b.int(e, IntOp::And, holds, k.exec)
+        };
+        let m1 = mask(&mut b, u, first);
+        let m2 = match second {
+            Some(guard) => mask(&mut b, v, guard),
+            None => k.exec,
+        };
+        let zero = b.constant(e, Ty::I32, 0);
+        let (s1, s2) = if space == Space::Lds {
+            let four = b.constant(e, Ty::I32, 4);
+            let (a1, a2) = (b.int(e, IntOp::Mul, u, four), b.int(e, IntOp::Mul, v, four));
+            let s1 = b.here(e);
+            b.store(e, Space::Lds, MemSize::B32, a1, zero, m1);
+            let s2 = b.here(e);
+            b.store(e, Space::Lds, MemSize::B32, a2, zero, m2);
+            (s1, s2)
+        } else {
+            let (a1, a2) = (byte_offset(&mut b, e, buf, u, 4), byte_offset(&mut b, e, buf, v, 4));
+            (store_at(&mut b, e, a1, m1), store_at(&mut b, e, a2, m2))
+        };
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_lds_stores_whose_predicated_indices_meet_after_the_word_wraps() {
+        assert!(predicated_pair(Space::Lds, (IntPred::Ult, 3), Some((IntPred::Ugt, 10))), "v = 2^30 + 1 stores to LDS byte 4, where u = 1 stores");
+    }
+
+    #[test]
+    fn find_reports_a_predicated_store_and_an_unpredicated_one_at_a_shared_index() {
+        assert!(predicated_pair(Space::Global, (IntPred::Ult, 3), None), "v = 1 meets u = 1");
+    }
+
+    #[test]
+    fn find_reports_stores_whose_predicated_index_ranges_overlap() {
+        assert!(predicated_pair(Space::Global, (IntPred::Ult, 21), Some((IntPred::Ugt, 10))), "u = v = 15 passes both predicates");
+    }
+
+    #[test]
+    fn find_reports_stores_whose_signed_predicates_let_their_indices_meet() {
+        assert!(predicated_pair(Space::Global, (IntPred::Slt, 3), Some((IntPred::Sgt, (-10i32) as u32 as u64))), "u = v = 0 is below 3 and above -10");
+    }
+
+    #[test]
+    fn find_keeps_apart_stores_whose_signed_predicates_keep_their_indices_apart() {
+        assert!(!predicated_pair(Space::Global, (IntPred::Slt, 3), Some((IntPred::Sgt, 10))), "u is below 3 or at least 2^31, v between 11 and 2^31 - 1");
+    }
+
+
     fn workgroup_branch(entered: u64) -> bool {
         let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(WORKGROUP_ID_X), Ty::I32)]);
         b.entry.workgroup_id_x = true;
@@ -4394,15 +4685,25 @@ mod tests {
     }
 
     fn two_index_read_back(shared: bool) -> bool {
+        two_index_read_back_at(shared, 128, false)
+    }
+
+    fn two_index_read_back_at(shared: bool, row: u64, per_lane: bool) -> bool {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let table = k.buffer(&mut b, e, 8);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
-        let u = uniform_word(&mut b, &k, e, 16, MemSize::U8);
+        let u = if per_lane {
+            let own = byte_offset(&mut b, e, table, lane, 1);
+            let yes = b.constant(e, Ty::I1, 1);
+            b.load(e, Space::Global, MemSize::U8, own, yes)
+        } else {
+            uniform_word(&mut b, &k, e, 16, MemSize::U8)
+        };
         let column = byte_offset(&mut b, e, table, lane, 4);
         let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, u));
-        let row_bytes = b.constant(e, Ty::I64, 128);
+        let row_bytes = b.constant(e, Ty::I64, row);
         let row = b.int(e, IntOp::Mul, wide, row_bytes);
         let own = b.int(e, IntOp::Add, column, row);
         let thirty_two = b.constant(e, Ty::I32, 32);
@@ -4424,6 +4725,16 @@ mod tests {
     #[test]
     fn find_follows_a_word_two_indices_address_stored_and_loaded_back() {
         assert!(!two_index_read_back(false), "the word at 4 lane + 128 u only ever holds lane + 32 u, which differs between lanes");
+    }
+
+    #[test]
+    fn find_follows_a_word_two_indices_of_its_own_lane_address_stored_and_loaded_back() {
+        assert!(!two_index_read_back_at(false, 128, true), "4 lane + 128 u names one lane and one u, so the word holds lane + 32 u");
+    }
+
+    #[test]
+    fn find_reports_a_word_two_overlapping_indices_address_stored_and_loaded_back() {
+        assert!(two_index_read_back_at(false, 64, true), "lane 16 with u = 0 and lane 0 with u = 1 both store to byte 64, the first 16 and the second 32");
     }
 
     fn joined_three_ways(apart: u64) -> bool {
@@ -4624,6 +4935,14 @@ mod tests {
     }
 
     fn loaded_node_far_up(offset: u64) -> bool {
+        loaded_node_from((1 << 29) + 5, offset)
+    }
+
+    fn loaded_node_from(first: u64, offset: u64) -> bool {
+        loaded_node_scaled(first, 16, offset)
+    }
+
+    fn loaded_node_scaled(first: u64, scale: u64, offset: u64) -> bool {
         let (mut b, k) = Build::kernel();
         let op = rdna4(&mut b, "image_bvh64_intersect_ray");
         let e = BlockId(0);
@@ -4632,9 +4951,9 @@ mod tests {
         let address = b.int(e, IntOp::Add, buf, at);
         let s = store_at(&mut b, e, address, k.exec);
         let u = uniform_word(&mut b, &k, e, 0, MemSize::U16);
-        let sixteen = b.constant(e, Ty::I32, 16);
-        let scaled = b.int(e, IntOp::Mul, u, sixteen);
-        let base = b.constant(e, Ty::I32, (1 << 29) + 5);
+        let step = b.constant(e, Ty::I32, scale);
+        let scaled = b.int(e, IntOp::Mul, u, step);
+        let base = b.constant(e, Ty::I32, first);
         let node = b.int(e, IntOp::Add, scaled, base);
         let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, node));
         let mut args = [b.constant(e, Ty::I32, 0); 14];
@@ -4657,7 +4976,21 @@ mod tests {
         assert!(!loaded_node_far_up(64), "every node the read may name starts 2^32 bytes or more past the store");
     }
 
+    #[test]
+    fn find_orders_a_read_of_loaded_nodes_across_several_four_gigabyte_lines_after_stores_two_lines_up() {
+        assert!(loaded_node_scaled(5, 1 << 16, (1 << 33) + 64), "u = 2^14 names the node 2^33 bytes in, while u = 0 names one below 2^32");
+    }
+
+    #[test]
+    fn find_orders_a_read_of_loaded_nodes_across_four_gigabytes_after_stores_above_the_line() {
+        assert!(loaded_node_from((1 << 29) - 1600 + 5, (1 << 32) + 12804), "u = 200 names the node 2^32 + 12800 bytes in, u = 0 one below 2^32");
+    }
+
     fn texel_read_with(offset: u64, coordinates: impl Fn(&mut Build, BlockId, &Kernel) -> (ValueId, ValueId)) -> bool {
+        texel_read_converted(offset, Cvt::UnsignedToFloatRte, coordinates)
+    }
+
+    fn texel_read_converted(offset: u64, cvt: Cvt, coordinates: impl Fn(&mut Build, BlockId, &Kernel) -> (ValueId, ValueId)) -> bool {
         let (mut b, k) = Build::kernel();
         let op = rdna4(&mut b, "image_sample_lz");
         let e = BlockId(0);
@@ -4673,8 +5006,8 @@ mod tests {
         args[2] = b.constant(e, Ty::I32, 15 << 14 | 3);
         args[3] = b.constant(e, Ty::I32, 4);
         args[13] = b.constant(e, Ty::I1, 1);
-        args[14] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, x));
-        args[15] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, y));
+        args[14] = b.core(e, Ty::F32, Op::Convert(cvt, Ty::F32, x));
+        args[15] = b.core(e, Ty::F32, Op::Convert(cvt, Ty::F32, y));
         let r = b.here(e);
         b.target(e, op, Arguments::Sixteen(args), &[Ty::I32]);
         let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
@@ -4715,5 +5048,16 @@ mod tests {
     #[test]
     fn find_keeps_a_texel_read_of_rows_zero_and_two_apart_from_stores_into_row_one() {
         assert!(!texel_read_of_two_rows(128 + 10), "the lanes read columns 0 to 3 of rows 0 and 2 only");
+    }
+
+    #[test]
+    fn find_orders_a_texel_read_of_a_negative_column_after_stores_into_column_zero() {
+        let read = texel_read_converted(2 * 128, Cvt::SignedToFloatRte, |b, e, k| {
+            let three = b.constant(e, Ty::I32, 3);
+            let low = b.int(e, IntOp::And, k.item, three);
+            let top = b.constant(e, Ty::I32, 0x8000_0000);
+            (b.int(e, IntOp::Add, low, top), b.constant(e, Ty::I32, 2))
+        });
+        assert!(read, "columns below 0 clamp to column 0 of row 2");
     }
 }
