@@ -12,6 +12,7 @@ use std::rc::Rc;
 pub enum Atom {
     Bit(ValueId),
     View(ValueId),
+    WordBit(ValueId, u8),
     Lane(u8),
     Fresh(usize, ValueId, u32),
     Term(usize, bool),
@@ -330,6 +331,10 @@ impl Logic {
                 }
             }
             Atom::Lane(i) => (2 << 30) | i as u32,
+            Atom::WordBit(v, i) => {
+                assert!(v.0 < 1 << 26, "function too large");
+                (2 << 30) + 8 + ((v.0 as u32) << 3) + i as u32
+            }
             Atom::Fresh(PATH, _, i) => {
                 assert!(i < 1 << 16, "too many paths");
                 return (1 << 16) + i;
@@ -360,6 +365,7 @@ impl Logic {
         match self.atoms[&var] {
             Atom::Bit(v) => facts.uniform[v.0] || self.uniform_tests.contains(&v),
             Atom::View(v) => facts.saturated[v.0],
+            Atom::WordBit(v, _) => facts.uniform[v.0],
             Atom::Marker(_) => true,
             Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
         }
@@ -367,7 +373,7 @@ impl Logic {
 
     pub fn scope(&self, facts: &Facts, var: u32) -> Option<BlockId> {
         match self.atoms[&var] {
-            Atom::Bit(v) | Atom::View(v) => match facts.site[v.0] {
+            Atom::Bit(v) | Atom::View(v) | Atom::WordBit(v, _) => match facts.site[v.0] {
                 Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),
                 Site::Unreached => None,
             },
@@ -441,6 +447,7 @@ impl Logic {
                     let values = self.lane_values(f, facts, v, 0).unwrap();
                     self.lanes(|l| values[l as usize] & 1 == 1)
                 }
+                Op::Cmp(p, a, b) if self.small_comparison(f, facts, p, a, b).is_some() => self.small_comparison(f, facts, p, a, b).unwrap(),
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
                     let leaf = match (equality(f, facts, p, a, b), facts.site[v.0]) {
                         (Some(e), Site::Inst { block, index }) => {
@@ -1299,24 +1306,115 @@ impl Logic {
     }
 
     pub fn wave_answer(&mut self, f: &Func, facts: &Facts, out: ValueId) -> Bdd {
-        let mut canonical = out;
-        if let (Site::Inst { block, .. }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) {
-            let input = inputs[0];
-            let first = f.blocks[&block].insts.iter().find_map(|inst| match inst {
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Any),
-                    inputs,
-                    outputs,
-                    ..
-                } if inputs[0] == input => Some(outputs[0].0),
-                _ => None,
-            });
-            canonical = first.unwrap_or(out);
+        let (Site::Inst { block, index }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) else {
+            return self.atom(Atom::Bit(out));
+        };
+        let input = inputs[0];
+        let mut answers: Vec<(Bdd, ValueId)> = Vec::new();
+        for inst in &f.blocks[&block].insts[..index] {
+            if let Inst::Effect {
+                op: EffectOp::Wave(WaveOp::Any),
+                inputs,
+                outputs,
+                ..
+            } = inst
+            {
+                let bits = self.bit(f, facts, inputs[0]);
+                if !answers.iter().any(|&(x, _)| x == bits) {
+                    answers.push((bits, outputs[0].0));
+                }
+            }
         }
-        self.atom(Atom::Bit(canonical))
+        let bits = self.bit(f, facts, input);
+        if !answers.iter().any(|&(x, _)| x == bits) {
+            answers.push((bits, out));
+        }
+        match self.expanded_answer(facts, bits, &answers, 0) {
+            Some(answer) => answer,
+            None => {
+                let canonical = answers.iter().find(|&&(x, _)| x == bits).map_or(out, |&(_, v)| v);
+                self.atom(Atom::Bit(canonical))
+            }
+        }
+    }
+
+    fn expanded_answer(&mut self, facts: &Facts, g: Bdd, answers: &[(Bdd, ValueId)], depth: usize) -> Option<Bdd> {
+        if g == Bdd::FALSE || g == Bdd::TRUE {
+            return Some(g);
+        }
+        let support = self.support(g);
+        match support.iter().copied().find(|&v| self.uniform_atom(facts, v)) {
+            Some(_) if depth > 8 => None,
+            Some(var) => {
+                let (low, high) = (self.m.cofactor(g, var, false), self.m.cofactor(g, var, true));
+                let no = self.expanded_answer(facts, low, answers, depth + 1)?;
+                let yes = self.expanded_answer(facts, high, answers, depth + 1)?;
+                let x = self.m.var(var);
+                Some(self.m.ite(x, yes, no))
+            }
+            None => {
+                let &(_, v) = answers.iter().find(|&&(x, _)| x == g)?;
+                Some(self.atom(Atom::Bit(v)))
+            }
+        }
+    }
+
+    fn small_word(&self, f: &Func, facts: &Facts, w: ValueId) -> Option<(u32, u32)> {
+        if f.types[w.0] != Ty::I32 || !facts.uniform[w.0] || !matches!(facts.site[w.0], Site::Inst { .. }) || facts.constant(f, w).is_some() {
+            return None;
+        }
+        interval(f, facts, w, 0).filter(|&(_, high)| high < 32)
+    }
+
+    fn word_is(&mut self, w: ValueId, value: u32) -> Bdd {
+        let mut g = Bdd::TRUE;
+        for i in 0..5u8 {
+            let bit = self.atom(Atom::WordBit(w, i));
+            let literal = if value >> i & 1 == 1 { bit } else { self.m.not(bit) };
+            g = self.m.and(g, literal);
+        }
+        g
+    }
+
+    fn small_comparison(&mut self, f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Bdd> {
+        let (w, other, flipped) = match (self.small_word(f, facts, a), self.small_word(f, facts, b)) {
+            (Some(_), None) => (a, b, false),
+            (None, Some(_)) => (b, a, true),
+            _ => return None,
+        };
+        if facts.constant(f, other).is_some() || f.types[other.0] != Ty::I32 {
+            return None;
+        }
+        let (low, high) = self.small_word(f, facts, w)?;
+        let values = self.lane_values(f, facts, other, 0)?;
+        let mut g = Bdd::FALSE;
+        for x in low..=high {
+            let is = self.word_is(w, x);
+            let lanes = self.lanes(|l| {
+                let o = values[l as usize];
+                if flipped {
+                    compare(p, o, x)
+                } else {
+                    compare(p, x, o)
+                }
+            });
+            let both = self.m.and(is, lanes);
+            g = self.m.or(g, both);
+        }
+        Some(g)
     }
 
     pub fn lane_is(&mut self, f: &Func, facts: &Facts, block: BlockId, target: ValueId) -> Option<Bdd> {
+        if let Some((low, high)) = self.small_word(f, facts, target) {
+            let mut g = Bdd::FALSE;
+            for x in low..=high {
+                let is = self.word_is(target, x);
+                let lanes = self.lanes(|l| l == x);
+                let both = self.m.and(is, lanes);
+                g = self.m.or(g, both);
+            }
+            return Some(g);
+        }
         if !interval(f, facts, target, 0).is_some_and(|(_, high)| high < 32) {
             return None;
         }
@@ -2291,6 +2389,88 @@ mod tests {
             words.push((name, value, truth));
         }
         (b, words)
+    }
+
+    #[test]
+    fn small_word_comparisons_hold_exactly_in_every_lane_and_word() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let table = k.buffer(&mut b, e, 8);
+        let u = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let c = |b: &mut Build, k: u64| b.constant(e, Ty::I32, k);
+        let (k31, k7, k15, k16, k63) = (c(&mut b, 31), c(&mut b, 7), c(&mut b, 15), c(&mut b, 16), c(&mut b, 63));
+        let low = b.int(e, IntOp::And, u, k15);
+        let high = b.int(e, IntOp::Or, low, k16);
+        let smalls: Vec<(ValueId, Box<dyn Fn(u32) -> bool>)> = vec![
+            (b.int(e, IntOp::And, u, k31), Box::new(|x| x < 32)),
+            (b.int(e, IntOp::And, u, k7), Box::new(|x| x < 8)),
+            (high, Box::new(|x| (16..32).contains(&x))),
+            (b.int(e, IntOp::And, u, k63), Box::new(|x| x < 64)),
+        ];
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let (two, one, three) = (c(&mut b, 2), c(&mut b, 1), c(&mut b, 3));
+        let doubled = b.int(e, IntOp::Mul, lane, two);
+        let odd = b.int(e, IntOp::Add, doubled, one);
+        let quarter = b.int(e, IntOp::And, lane, three);
+        let mirrored = b.int(e, IntOp::Sub, k31, lane);
+        let lanes: Vec<(ValueId, Box<dyn Fn(u32) -> u32>)> = vec![
+            (lane, Box::new(|l| l)),
+            (odd, Box::new(|l| 2 * l + 1)),
+            (quarter, Box::new(|l| l & 3)),
+            (mirrored, Box::new(|l| 31 - l)),
+        ];
+        let mut cases = Vec::new();
+        for (i, _) in smalls.iter().enumerate() {
+            for (j, _) in lanes.iter().enumerate() {
+                for (pi, &p) in [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sge].iter().enumerate() {
+                    let _ = pi;
+                    cases.push((i, j, p, false, b.cmp(e, p, smalls[i].0, lanes[j].0)));
+                    cases.push((i, j, p, true, b.cmp(e, p, lanes[j].0, smalls[i].0)));
+                }
+            }
+        }
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
+        let evaluate = |logic: &Logic, g: Bdd, w: ValueId, x: u32, l: u32| {
+            let mut g = g;
+            while let Some((var, low, high)) = logic.m.decompose(g) {
+                let bit = match logic.atom_of(var) {
+                    Atom::WordBit(v, i) if v == w => x >> i & 1 == 1,
+                    Atom::Lane(i) => l >> i & 1 == 1,
+                    _ => return None,
+                };
+                g = if bit { high } else { low };
+            }
+            Some(g == Bdd::TRUE)
+        };
+        let mut wrong = Vec::new();
+        for &(i, j, p, flipped, cmp) in &cases {
+            let g = logic.bit(&b.f, &facts, cmp);
+            let w = smalls[i].0;
+            for x in (0..64).filter(|&x| smalls[i].1(x)) {
+                for l in 0..32u32 {
+                    let o = lanes[j].1(l);
+                    let truth = if flipped { compare(p, o, x) } else { compare(p, x, o) };
+                    if evaluate(&logic, g, w, x, l).is_some_and(|got| got != truth) {
+                        wrong.push(format!("small {} lane word {} {:?} flipped {} at w = {} lane {}", i, j, p, flipped, x, l));
+                    }
+                }
+            }
+        }
+        for (i, (w, possible)) in smalls.iter().enumerate() {
+            let Some(g) = logic.lane_is(&b.f, &facts, e, *w) else {
+                continue;
+            };
+            for x in (0..64).filter(|&x| possible(x)) {
+                for l in 0..32u32 {
+                    if evaluate(&logic, g, *w, x, l).is_some_and(|got| got != (l == x & 31)) {
+                        wrong.push(format!("lane_is of small {} at w = {} lane {}", i, x, l));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(8)]);
     }
 
     #[test]

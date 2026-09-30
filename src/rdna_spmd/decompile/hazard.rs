@@ -1,4 +1,4 @@
-use super::address::{Addresses, Form, Region, Regions, Unknown, UnknownInfo, Value, LANES};
+use super::address::{word_range, Addresses, Classes, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide, LANES};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::environment::Environment;
@@ -824,6 +824,8 @@ fn meet(
     differ: Option<Unknown>,
 ) -> Option<[bool; 2]> {
     let mut idle: Option<[bool; 2]> = None;
+    let mut lanes_p: Vec<Option<LaneFacts>> = vec![None; p.len()];
+    let mut lanes_q: Vec<Option<LaneFacts>> = vec![None; q.len()];
     for (a, x) in p.iter().enumerate() {
         let Some(x) = x else { continue };
         for (b, y) in q.iter().enumerate() {
@@ -847,11 +849,20 @@ fn meet(
                     continue;
                 }
             }
-            let pieces = [addresses.access_pieces(pa.block, pa.predicate, a), addresses.access_pieces(qa.block, qa.predicate, b)];
-            let cases = cases_of(&pieces);
+            if lanes_p[a].is_none() {
+                lanes_p[a] = Some(lane_facts(addresses, pa, a));
+            }
+            if lanes_q[b].is_none() {
+                lanes_q[b] = Some(lane_facts(addresses, qa, b));
+            }
+            let (lp, lq) = (lanes_p[a].as_ref().unwrap(), lanes_q[b].as_ref().unwrap());
+            let cases = cases_of([&lp.pieces, &lq.pieces]);
             let apart = cases.iter().all(|ranges| {
                 !may_overlap_within(&addresses.unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, [&ranges[0], &ranges[1]])
-                    || wide_apart(addresses, (pa, a, x.bytes), (qa, b, y.bytes), variant, [&ranges[0], &ranges[1]])
+                    || match (&lp.wide, &lq.wide) {
+                        (Some(wx), Some(wy)) => wide_apart(&addresses.unknowns, (wx, x.bytes), (wy, y.bytes), variant, [&ranges[0], &ranges[1]], [&lp.classes, &lq.classes]),
+                        _ => false,
+                    }
             });
             if apart {
                 continue;
@@ -986,11 +997,21 @@ fn may_overlap(
     may_overlap_within(unknowns, x, y, x_bytes, y_bytes, variant, differ, [&none, &none])
 }
 
-fn cases_of(pieces: &[Vec<(Unknown, Vec<(u32, u32)>)>; 2]) -> Vec<[HashMap<Unknown, (u32, u32)>; 2]> {
-    let count: usize = pieces.iter().flatten().map(|(_, p)| p.len().max(1)).product();
+fn single_pieces(classes: &Classes) -> Vec<(Unknown, Vec<(u32, u32)>)> {
+    classes
+        .iter()
+        .filter_map(|(class, pieces)| match class.terms.as_slice() {
+            &[(u, 1)] => Some((u, pieces.iter().map(|&(low, high)| (low as u32, high as u32)).collect())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn cases_of(pieces: [&[(Unknown, Vec<(u32, u32)>)]; 2]) -> Vec<[HashMap<Unknown, (u32, u32)>; 2]> {
+    let count: usize = pieces.iter().flat_map(|list| list.iter()).map(|(_, p)| p.len().max(1)).product();
     let mut cases = vec![[HashMap::default(), HashMap::default()]];
     for (side, list) in pieces.iter().enumerate() {
-        for (u, set) in list {
+        for (u, set) in list.iter() {
             let choices: Vec<(u32, u32)> = match set.as_slice() {
                 [] => vec![(1, 0)],
                 _ if count > 16 => vec![(set[0].0, set[set.len() - 1].1)],
@@ -1027,27 +1048,29 @@ fn narrowed(info: &UnknownInfo, u: Unknown, given: Option<&(u32, u32)>) -> Optio
     }
 }
 
+#[derive(Clone)]
+struct LaneFacts {
+    classes: Classes,
+    pieces: Vec<(Unknown, Vec<(u32, u32)>)>,
+    wide: Option<Wide>,
+}
+
+fn lane_facts(addresses: &mut Addresses, access: &Access, lane: usize) -> LaneFacts {
+    let classes = addresses.access_classes(access.block, access.predicate, lane);
+    let pieces = single_pieces(&classes);
+    let wide = access.address.and_then(|v| addresses.wide_value(v, access.block, lane));
+    LaneFacts { classes, pieces, wide }
+}
+
 fn wide_apart(
-    addresses: &mut Addresses,
-    (pa, a, x_bytes): (&Access, usize, u32),
-    (qa, b, y_bytes): (&Access, usize, u32),
+    unknowns: &[UnknownInfo],
+    (wx, x_bytes): (&Wide, u32),
+    (wy, y_bytes): (&Wide, u32),
     variant: &dyn Fn(&UnknownInfo) -> bool,
     ranges: [&HashMap<Unknown, (u32, u32)>; 2],
+    classes: [&Classes; 2],
 ) -> bool {
-    let (Some(xv), Some(yv)) = (pa.address, qa.address) else {
-        return false;
-    };
-    let (Some(wx), Some(wy)) = (addresses.wide_value(xv, pa.block, a), addresses.wide_value(yv, qa.block, b)) else {
-        return false;
-    };
-    let unknowns = &addresses.unknowns;
-    let (mut low, mut high) = (wx.constant - wy.constant, wx.constant - wy.constant);
-    let mut add = |c: i128, range: Option<(u32, u32)>| {
-        let (l, h) = range.unwrap_or((0, u32::MAX));
-        let (p, q) = (c * l as i128, c * h as i128);
-        low += p.min(q);
-        high += p.max(q);
-    };
+    let mut terms: Vec<(i128, (u32, u32))> = Vec::new();
     let mut seen: Vec<Unknown> = wx.terms.iter().chain(&wy.terms).map(|&(u, _)| u).collect();
     seen.sort_unstable();
     seen.dedup();
@@ -1058,19 +1081,168 @@ fn wide_apart(
         let (Some(rx), Some(ry)) = (narrowed(info, u, ranges[0].get(&u)), narrowed(info, u, ranges[1].get(&u))) else {
             return true;
         };
+        let full = (0, u32::MAX);
         if variant(info) {
-            add(cx, rx);
-            add(-cy, ry);
+            terms.push((cx, rx.unwrap_or(full)));
+            terms.push((-cy, ry.unwrap_or(full)));
         } else {
             let both = match (rx, ry) {
                 (Some((a, b)), Some((c, d))) if a.max(c) > b.min(d) => return true,
-                (Some((a, b)), Some((c, d))) => Some((a.max(c), b.min(d))),
-                (r, None) | (None, r) => r,
+                (Some((a, b)), Some((c, d))) => (a.max(c), b.min(d)),
+                (Some(r), None) | (None, Some(r)) => r,
+                (None, None) => full,
             };
-            add(cx - cy, both);
+            terms.push((cx - cy, both));
         }
     }
-    high <= -(x_bytes as i128) || low >= y_bytes as i128
+    let varies = |f: &Form| f.terms.iter().any(|&(u, _)| variant(&unknowns[u as usize]));
+    let range_of = |side: usize, f: &Form| word_range(classes[side], f).unwrap_or((0, u32::MAX));
+    let mut words: Vec<(Form, i128, i128)> = Vec::new();
+    for (f, c) in &wx.words {
+        words.push((f.clone(), *c, 0));
+    }
+    for (f, c) in &wy.words {
+        match words.iter_mut().find(|(g, _, _)| g == f && !varies(f)) {
+            Some((_, _, old)) => *old += *c,
+            None => words.push((f.clone(), 0, *c)),
+        }
+    }
+    for (f, cx, cy) in words {
+        let (rx, ry) = (range_of(0, &f), range_of(1, &f));
+        if (cx != 0 && rx.0 > rx.1) || (cy != 0 && ry.0 > ry.1) {
+            return true;
+        }
+        if varies(&f) || cx == 0 || cy == 0 {
+            terms.push((cx, rx));
+            terms.push((-cy, ry));
+        } else {
+            let both = (rx.0.max(ry.0), rx.1.min(ry.1));
+            if both.0 > both.1 {
+                return true;
+            }
+            terms.push((cx - cy, both));
+        }
+    }
+    let window = (-(x_bytes as i128) + 1, y_bytes as i128 - 1);
+    integer_hits(wx.constant - wy.constant, &terms, window) == Some(false)
+}
+
+fn integer_hits(constant: i128, terms: &[(i128, (u32, u32))], window: (i128, i128)) -> Option<bool> {
+    let mut constant = constant;
+    let mut rest: Vec<(i128, i128)> = Vec::new();
+    for &(c, (low, high)) in terms {
+        constant = constant.checked_add(c.checked_mul(low as i128)?)?;
+        let width = high as i128 - low as i128;
+        if c != 0 && width > 0 {
+            rest.push((c, width));
+        }
+    }
+    let (mut least, mut most) = (constant, constant);
+    for &(c, w) in &rest {
+        let span = c.checked_mul(w)?;
+        least = least.checked_add(span.min(0))?;
+        most = most.checked_add(span.max(0))?;
+    }
+    if most < window.0 || least > window.1 {
+        return Some(false);
+    }
+    let g = rest.iter().fold(0i128, |g, &(c, _)| gcd128(g, c.abs()));
+    let targets: Vec<i128> = (window.0..=window.1)
+        .map(|t| t - constant)
+        .filter(|&t| if g == 0 { t == 0 } else { t % g == 0 })
+        .collect();
+    if targets.is_empty() {
+        return Some(false);
+    }
+    match rest.len() {
+        0 => Some(true),
+        1 => {
+            let (c, w) = rest[0];
+            Some(targets.iter().any(|&t| t % c == 0 && (0..=w).contains(&(t / c))))
+        }
+        _ => {
+            let mut order: Vec<usize> = (0..rest.len()).collect();
+            order.sort_by_key(|&k| std::cmp::Reverse(rest[k].1));
+            let ((a, wa), (b, wb)) = (rest[order[0]], rest[order[1]]);
+            let mut sums: Vec<i128> = vec![0];
+            for &k in &order[2..] {
+                let (c, w) = rest[k];
+                if (w + 1) * sums.len() as i128 > 4096 {
+                    return None;
+                }
+                sums = sums.iter().flat_map(|&s| (0..=w).map(move |x| s + c * x)).collect();
+                sums.sort_unstable();
+                sums.dedup();
+            }
+            let mut found = false;
+            for &t in &targets {
+                for &s in &sums {
+                    match pair_solvable(a, wa, b, wb, t - s) {
+                        Some(true) => found = true,
+                        Some(false) => {}
+                        None => return None,
+                    }
+                    if found {
+                        return Some(true);
+                    }
+                }
+            }
+            Some(false)
+        }
+    }
+}
+
+fn gcd128(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
+fn pair_solvable(a: i128, wa: i128, b: i128, wb: i128, t: i128) -> Option<bool> {
+    let g = gcd128(a, b);
+    if t % g != 0 {
+        return Some(false);
+    }
+    let (a, b, t) = (a / g, b / g, t / g);
+    let m = b.abs();
+    if m >= 1 << 62 || a.abs() >= 1 << 62 {
+        return None;
+    }
+    let x0 = if m == 1 {
+        0
+    } else {
+        let inverse = inverse_mod(a.rem_euclid(m), m)?;
+        (t.rem_euclid(m) * inverse).rem_euclid(m)
+    };
+    let y0 = t.checked_sub(a.checked_mul(x0)?)? / b;
+    let (mut low, mut high) = (floor_div(-x0 + m - 1, m), floor_div(wa - x0, m));
+    let s = a * b.signum();
+    if s > 0 {
+        low = low.max(floor_div(y0 - wb + s - 1, s));
+        high = high.min(floor_div(y0, s));
+    } else {
+        let s = -s;
+        low = low.max(floor_div(-y0 + s - 1, s));
+        high = high.min(floor_div(wb - y0, s));
+    }
+    Some(low <= high)
+}
+
+fn floor_div(a: i128, b: i128) -> i128 {
+    a.div_euclid(b)
+}
+
+fn inverse_mod(a: i128, m: i128) -> Option<i128> {
+    let (mut old_r, mut r) = (a, m);
+    let (mut old_s, mut s) = (1i128, 0i128);
+    while r != 0 {
+        let q = old_r / r;
+        (old_r, r) = (r, old_r - q * r);
+        (old_s, s) = (s, old_s - q * s);
+    }
+    (old_r == 1).then(|| old_s.rem_euclid(m))
 }
 
 fn may_overlap_within(
@@ -3749,6 +3921,118 @@ mod tests {
         };
         let h = Hazards::find(&b.program(), &env2());
         h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn integer_hits_answers_as_every_assignment_does() {
+        let mut r = Random::new(149);
+        let mut wrong = Vec::new();
+        for trial in 0..3000 {
+            let n = r.below(4) as usize;
+            let terms: Vec<(i128, (u32, u32))> = (0..n)
+                .map(|_| {
+                    let c = r.below(41) as i128 - 20;
+                    let low = r.below(10) as u32;
+                    (c, (low, low + r.below(12) as u32))
+                })
+                .collect();
+            let constant = r.below(200) as i128 - 100;
+            let window = (-(r.below(4) as i128), r.below(4) as i128);
+            let mut hit = false;
+            let mut index: Vec<u32> = terms.iter().map(|t| t.1 .0).collect();
+            loop {
+                let value = terms.iter().zip(&index).fold(constant, |acc, (&(c, _), &x)| acc + c * x as i128);
+                hit |= value >= window.0 && value <= window.1;
+                let mut k = 0;
+                while k < n && index[k] == terms[k].1 .1 {
+                    index[k] = terms[k].1 .0;
+                    k += 1;
+                }
+                if k == n {
+                    break;
+                }
+                index[k] += 1;
+            }
+            let got = integer_hits(constant, &terms, window);
+            if got != Some(hit) {
+                wrong.push(format!("trial {}: {} + {:?} in {:?}: {:?}, not {}", trial, constant, terms, window, got, hit));
+            }
+        }
+        for trial in 0..400 {
+            let pick = |r: &mut Random| {
+                let c = r.below(100) as i128 - 50;
+                if c == 0 { 7 } else { c }
+            };
+            let (a, b) = (pick(&mut r), pick(&mut r));
+            let (wa, wb) = (r.below(2000) as i128, r.below(2000) as i128);
+            let t = r.below(200_000) as i128 - 100_000;
+            let truth = (0..=wa).any(|x| {
+                let rest = t - a * x;
+                rest % b == 0 && (0..=wb).contains(&(rest / b))
+            });
+            if pair_solvable(a, wa, b, wb, t) != Some(truth) {
+                wrong.push(format!("pair {}: {} x + {} y = {} over {} and {}: {:?}, not {}", trial, a, b, t, wa, wb, pair_solvable(a, wa, b, wb, t), truth));
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(6)]);
+    }
+
+    fn records(second: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::B32);
+        let first = byte_offset(&mut b, e, buf, u, 12);
+        let other = byte_offset(&mut b, e, buf, v, 12);
+        let at = b.constant(e, Ty::I64, second);
+        let next = b.int(e, IntOp::Add, other, at);
+        let s1 = store_at(&mut b, e, first, k.exec);
+        let s2 = store_at(&mut b, e, next, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_apart_the_first_and_second_words_of_twelve_byte_records() {
+        assert!(!records(4), "12 u - 12 v - 4 is 4 more than a multiple of 12, so the words never meet");
+    }
+
+    #[test]
+    fn find_reports_the_first_word_of_one_twelve_byte_record_and_of_the_next() {
+        assert!(records(12), "u = v + 1 stores where the second store does");
+    }
+
+    fn predicated_sum(second: (IntPred, u64)) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = uniform_word(&mut b, &k, e, 4, MemSize::B32);
+        let w = uniform_word(&mut b, &k, e, 8, MemSize::B32);
+        let sum = b.int(e, IntOp::Add, u, v);
+        let three = b.constant(e, Ty::I32, 3);
+        let small = b.cmp(e, IntPred::Ult, sum, three);
+        let m1 = b.int(e, IntOp::And, small, k.exec);
+        let bound = b.constant(e, Ty::I32, second.1);
+        let other = b.cmp(e, second.0, w, bound);
+        let m2 = b.int(e, IntOp::And, other, k.exec);
+        let a1 = byte_offset(&mut b, e, buf, sum, 4);
+        let a2 = byte_offset(&mut b, e, buf, w, 4);
+        let s1 = store_at(&mut b, e, a1, m1);
+        let s2 = store_at(&mut b, e, a2, m2);
+        let h = Hazards::find(&b.program(), &env2());
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_apart_stores_whose_predicates_bound_a_sum_and_a_word_apart() {
+        assert!(!predicated_sum((IntPred::Ugt, 10)), "the first index u + v is below 3 and the second above 10");
+    }
+
+    #[test]
+    fn find_reports_stores_whose_predicates_let_a_sum_and_a_word_meet() {
+        assert!(predicated_sum((IntPred::Ult, 5)), "u + v = w = 1 passes both predicates");
     }
 
     #[test]
