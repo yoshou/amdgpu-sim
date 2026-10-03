@@ -235,19 +235,6 @@ enum Entry {
     High((ValueId, u8)),
 }
 
-#[derive(Default)]
-struct Fixed {
-    values: Cached<ValueKey, Assumed<Value>>,
-    bits: Cached<ValueKey, Assumed<Option<bool>>>,
-    slots: Cached<Slot, Option<Value>>,
-    keys: Cached<Key, Unknown>,
-    loop_bits: Cached<BlockId, Bits>,
-    steps: Cached<StepKey, Step>,
-    summarized: Cached<BlockId, ()>,
-    word_bits: Cached<(ValueId, u8), Option<bool>>,
-    highs: Cached<(ValueId, u8), Form>,
-}
-
 #[derive(Clone, Debug, Default)]
 struct Guesses {
     depth: Depth,
@@ -441,22 +428,12 @@ pub struct Addresses<'a> {
     reaching: HashMap<BlockId, usize>,
     values: Cached<ValueKey, Assumed<Value>>,
     bits: Cached<ValueKey, Assumed<Option<bool>>>,
-    fixed: Option<(ValueId, u32)>,
-    fixed_values: Cached<ValueKey, Assumed<Value>>,
-    fixed_bits: Cached<ValueKey, Assumed<Option<bool>>>,
-    fixed_keys: Cached<Key, Unknown>,
-    fixed_loop_bits: Cached<BlockId, Bits>,
-    fixed_steps: Cached<StepKey, Step>,
-    fixed_summarized: Cached<BlockId, ()>,
     steps: Cached<StepKey, Step>,
     summarized: Cached<BlockId, ()>,
     summarizing: HashMap<BlockId, usize>,
     loop_bits: Cached<BlockId, Bits>,
     guessing_about: HashMap<BlockId, Guesses>,
-    fixed_store: HashMap<(ValueId, u32), Fixed>,
     users: HashMap<ValueId, Vec<ValueId>>,
-    affected: HashMap<ValueId, std::rc::Rc<HashSet<ValueId>>>,
-    affected_now: Option<std::rc::Rc<HashSet<ValueId>>>,
     implied: HashMap<ValueId, Vec<ValueId>>,
     implications: std::cell::RefCell<HashMap<ImplicationKey, bool>>,
     assumable: HashSet<ValueId>,
@@ -473,15 +450,13 @@ pub struct Addresses<'a> {
     checking: usize,
     guessing: usize,
     slots: Cached<Slot, Option<Value>>,
-    fixed_slots: Cached<Slot, Option<Value>>,
     guessed_slots: Cached<Slot, Option<Value>>,
     active_slots: HashMap<Slot, usize>,
     regions: Cached<ValueKey, Assumed<Regions>>,
     refined: Cached<ValueKey, Assumed<Regions>>,
     active_regions: HashSet<(ValueId, u8, Option<ValueId>, bool)>,
     word_bits: Cached<(ValueId, u8), Option<bool>>,
-    fixed_word_bits: Cached<(ValueId, u8), Option<bool>>,
-    active_words: HashMap<(ValueId, u8, bool), usize>,
+    active_words: HashMap<(ValueId, u8), usize>,
     known: Vec<Option<Option<Region>>>,
     plain: Vec<bool>,
     bounds: HashMap<ValueId, Vec<Regions>>,
@@ -494,7 +469,6 @@ pub struct Addresses<'a> {
     sources: HashMap<ValueId, Vec<usize>>,
     exposing: Vec<Exposure>,
     highs: Cached<(ValueId, u8), Form>,
-    fixed_highs: Cached<(ValueId, u8), Form>,
     active_highs: HashSet<(ValueId, u8)>,
     opaque_highs: HashSet<Unknown>,
     readbacks: HashMap<(BlockId, usize), Option<(ValueId, Option<ValueId>, Option<u64>)>>,
@@ -551,22 +525,12 @@ impl<'a> Addresses<'a> {
             reaching: HashMap::default(),
             values: HashMap::default(),
             bits: HashMap::default(),
-            fixed: None,
-            fixed_values: HashMap::default(),
-            fixed_bits: HashMap::default(),
-            fixed_keys: HashMap::default(),
-            fixed_loop_bits: HashMap::default(),
-            fixed_steps: HashMap::default(),
-            fixed_summarized: HashMap::default(),
             steps: HashMap::default(),
             summarized: HashMap::default(),
             summarizing: HashMap::default(),
             loop_bits: HashMap::default(),
             guessing_about: HashMap::default(),
-            fixed_store: HashMap::default(),
             users: users(f, facts),
-            affected: HashMap::default(),
-            affected_now: None,
             implied: HashMap::default(),
             implications: std::cell::RefCell::new(HashMap::default()),
             assumable: HashSet::default(),
@@ -583,14 +547,12 @@ impl<'a> Addresses<'a> {
             checking: 0,
             guessing: 0,
             slots: HashMap::default(),
-            fixed_slots: HashMap::default(),
             guessed_slots: HashMap::default(),
             active_slots: HashMap::default(),
             regions: HashMap::default(),
             refined: HashMap::default(),
             active_regions: HashSet::default(),
             word_bits: HashMap::default(),
-            fixed_word_bits: HashMap::default(),
             active_words: HashMap::default(),
             known: Vec::new(),
             plain: Vec::new(),
@@ -604,7 +566,6 @@ impl<'a> Addresses<'a> {
             sources: HashMap::default(),
             exposing: Vec::new(),
             highs: HashMap::default(),
-            fixed_highs: HashMap::default(),
             active_highs: HashSet::default(),
             opaque_highs: HashSet::default(),
             readbacks: HashMap::default(),
@@ -690,24 +651,14 @@ impl<'a> Addresses<'a> {
         self.monomials.clear();
         self.values.clear();
         self.bits.clear();
-        self.fixed_values.clear();
-        self.fixed_bits.clear();
-        self.fixed_keys.clear();
-        self.fixed_loop_bits.clear();
         self.loop_bits.clear();
-        self.fixed_steps.clear();
         self.steps.clear();
-        self.fixed_summarized.clear();
         self.summarized.clear();
-        self.fixed_store.clear();
         self.slots.clear();
-        self.fixed_slots.clear();
         self.regions.clear();
         self.refined.clear();
         self.word_bits.clear();
-        self.fixed_word_bits.clear();
         self.highs.clear();
-        self.fixed_highs.clear();
         self.opaque_highs.clear();
         self.decisions.clear();
         self.limited.clear();
@@ -739,14 +690,12 @@ impl<'a> Addresses<'a> {
             Some(level) if level == self.guessing => return None,
             outside => outside,
         };
-        let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
         let (decided, depth) = self.frame(|this| {
             if outside.is_some() {
                 this.depend(level(this.checking));
             }
             this.decide(cond)
         });
-        (self.fixed, self.affected_now) = (fixed, affected);
         match outside {
             Some(level) => self.deciding.insert(b, level),
             None => self.deciding.remove(&b),
@@ -815,43 +764,6 @@ impl<'a> Addresses<'a> {
         self.reached(b)
     }
 
-    pub fn reaches_block_with_value(&mut self, b: BlockId) -> bool {
-        if self.fixed.is_none() {
-            return self.reached(b);
-        }
-        self.reached_with_value(b, &mut HashMap::default())
-    }
-
-    fn reached_with_value(&mut self, b: BlockId, memo: &mut HashMap<BlockId, bool>) -> bool {
-        if b == self.f.entry {
-            return true;
-        }
-        if let Some(&r) = memo.get(&b) {
-            return r;
-        }
-        if !self.reached(b) {
-            return false;
-        }
-        memo.insert(b, true);
-        let own = self.rank[&b];
-        let incoming = self.facts.incoming[&b].clone();
-        let r = incoming.into_iter().any(|(pred, slot)| {
-            self.rank[&pred] < own && self.reached_with_value(pred, memo) && self.takes_with_value(pred, slot)
-        });
-        memo.insert(b, r);
-        r
-    }
-
-    fn takes_with_value(&mut self, pred: BlockId, slot: usize) -> bool {
-        if let Some(yes) = self.decision(pred) {
-            return (slot == 0) == yes;
-        }
-        let Term::CondBr { cond, .. } = self.f.blocks[&pred].term else {
-            return true;
-        };
-        self.decide(cond).is_none_or(|yes| (slot == 0) == yes)
-    }
-
     fn can_take(&mut self, pred: BlockId, slot: usize, block: BlockId) -> bool {
         if self.rank[&pred] >= self.rank[&block] {
             return true;
@@ -870,10 +782,7 @@ impl<'a> Addresses<'a> {
     }
 
     fn known_key(&self, key: &Key) -> Option<Unknown> {
-        let found = match self.fixed {
-            Some(_) => self.fixed_keys.get(key).or_else(|| self.keys.get(key)),
-            None => self.keys.get(key),
-        };
+        let found = self.keys.get(key);
         found.map(|&(u, depth)| {
             self.depend(depth);
             u
@@ -881,10 +790,7 @@ impl<'a> Addresses<'a> {
     }
 
     fn intern(&mut self, key: Key, mut info: UnknownInfo) -> Unknown {
-        let found = match self.fixed {
-            Some(_) => self.fixed_keys.get(&key).or_else(|| self.keys.get(&key)),
-            None => self.keys.get(&key),
-        };
+        let found = self.keys.get(&key);
         if let Some(&(u, depth)) = found {
             self.depend(depth);
             return u;
@@ -896,11 +802,7 @@ impl<'a> Addresses<'a> {
         if depth != FREE {
             self.journal.push((Entry::Key(key.clone()), depth));
         }
-        if self.fixed.is_some() {
-            self.fixed_keys.insert(key, (u, depth));
-        } else {
-            self.keys.insert(key, (u, depth));
-        }
+        self.keys.insert(key, (u, depth));
         u
     }
 
@@ -957,48 +859,30 @@ impl<'a> Addresses<'a> {
                     if self.values.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.values.remove(&key);
                     }
-                    if self.fixed_values.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_values.remove(&key);
-                    }
                 }
                 Entry::Bit(key) => {
                     if self.bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.bits.remove(&key);
-                    }
-                    if self.fixed_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_bits.remove(&key);
                     }
                 }
                 Entry::Key(key) => {
                     if self.keys.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.keys.remove(&key);
                     }
-                    if self.fixed_keys.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_keys.remove(&key);
-                    }
                 }
                 Entry::Slot(key) => {
                     if self.slots.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.slots.remove(&key);
-                    }
-                    if self.fixed_slots.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_slots.remove(&key);
                     }
                 }
                 Entry::LoopBits(key) => {
                     if self.loop_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.loop_bits.remove(&key);
                     }
-                    if self.fixed_loop_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_loop_bits.remove(&key);
-                    }
                 }
                 Entry::Step(key) => {
                     if self.steps.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.steps.remove(&key);
-                    }
-                    if self.fixed_steps.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_steps.remove(&key);
                     }
                 }
                 Entry::Region(key, refine) => {
@@ -1011,16 +895,10 @@ impl<'a> Addresses<'a> {
                     if self.word_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.word_bits.remove(&key);
                     }
-                    if self.fixed_word_bits.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_word_bits.remove(&key);
-                    }
                 }
                 Entry::High(key) => {
                     if self.highs.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.highs.remove(&key);
-                    }
-                    if self.fixed_highs.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_highs.remove(&key);
                     }
                 }
                 Entry::Decision(key) => {
@@ -1041,9 +919,6 @@ impl<'a> Addresses<'a> {
                 Entry::Summarized(key) => {
                     if self.summarized.get(&key).is_some_and(|e| e.1 .1 >= depth) {
                         self.summarized.remove(&key);
-                    }
-                    if self.fixed_summarized.get(&key).is_some_and(|e| e.1 .1 >= depth) {
-                        self.fixed_summarized.remove(&key);
                     }
                 }
             }
@@ -1071,22 +946,14 @@ impl<'a> Addresses<'a> {
         if depth != FREE {
             self.journal.push((Entry::Value(key), depth));
         }
-        if self.fixed.is_some() {
-            self.fixed_values.insert(key, (r, depth));
-        } else {
-            self.values.insert(key, (r, depth));
-        }
+        self.values.insert(key, (r, depth));
     }
 
     fn cache_bit(&mut self, key: (ValueId, u8, Option<ValueId>), r: Assumed<Option<bool>>, depth: Depth) {
         if depth != FREE {
             self.journal.push((Entry::Bit(key), depth));
         }
-        if self.fixed.is_some() {
-            self.fixed_bits.insert(key, (r, depth));
-        } else {
-            self.bits.insert(key, (r, depth));
-        }
+        self.bits.insert(key, (r, depth));
     }
 
     fn block_of(&self, v: ValueId) -> BlockId {
@@ -1306,11 +1173,7 @@ impl<'a> Addresses<'a> {
             }
             return Some(guess);
         }
-        let cached = if self.fixed.is_some() {
-            self.fixed_slots.get(&key).cloned()
-        } else {
-            self.slots.get(&key).cloned()
-        };
+        let cached = self.slots.get(&key).cloned();
         if let Some((r, depth)) = cached {
             self.depend(depth);
             return r;
@@ -1329,11 +1192,7 @@ impl<'a> Addresses<'a> {
         if depth != FREE {
             self.journal.push((Entry::Slot(key), depth));
         }
-        if self.fixed.is_some() {
-            self.fixed_slots.insert(key, (result.clone(), depth));
-        } else {
-            self.slots.insert(key, (result.clone(), depth));
-        }
+        self.slots.insert(key, (result.clone(), depth));
         result
     }
 
@@ -1491,11 +1350,7 @@ impl<'a> Addresses<'a> {
     }
 
     fn loop_bits(&mut self, header: BlockId) -> Bits {
-        let cached = if self.fixed.is_some() {
-            self.fixed_loop_bits.get(&header).cloned()
-        } else {
-            self.loop_bits.get(&header).cloned()
-        };
+        let cached = self.loop_bits.get(&header).cloned();
         if let Some((bits, depth)) = cached {
             self.depend(depth);
             return bits;
@@ -1504,11 +1359,7 @@ impl<'a> Addresses<'a> {
             return Bits::default();
         }
         self.summarize(header, None);
-        let cached = if self.fixed.is_some() {
-            self.fixed_loop_bits.get(&header).cloned()
-        } else {
-            self.loop_bits.get(&header).cloned()
-        };
+        let cached = self.loop_bits.get(&header).cloned();
         match cached {
             Some((bits, depth)) => {
                 self.depend(depth);
@@ -1542,11 +1393,7 @@ impl<'a> Addresses<'a> {
     }
 
     fn summarize(&mut self, header: BlockId, seed: Option<Target>) {
-        let done = if self.fixed.is_some() {
-            self.fixed_summarized.get(&header).copied()
-        } else {
-            self.summarized.get(&header).copied()
-        };
+        let done = self.summarized.get(&header).copied();
         if seed.is_none() {
             if let Some((_, depth)) = done {
                 self.depend(depth);
@@ -1570,27 +1417,17 @@ impl<'a> Addresses<'a> {
             Some(level) => self.summarizing.insert(header, level),
             None => self.summarizing.remove(&header),
         };
-        let fixed = self.fixed.is_some();
         if depth != FREE {
             self.journal.push((Entry::LoopBits(header), depth));
             self.journal.push((Entry::Summarized(header), depth));
         }
-        if fixed {
-            self.fixed_loop_bits.insert(header, (bits, depth));
-            self.fixed_summarized.insert(header, ((), depth));
-        } else {
-            self.loop_bits.insert(header, (bits, depth));
-            self.summarized.insert(header, ((), depth));
-        }
+        self.loop_bits.insert(header, (bits, depth));
+        self.summarized.insert(header, ((), depth));
         for (key, step) in steps {
             if depth != FREE {
                 self.journal.push((Entry::Step(key), depth));
             }
-            if fixed {
-                self.fixed_steps.insert(key, (step, depth));
-            } else {
-                self.steps.insert(key, (step, depth));
-            }
+            self.steps.insert(key, (step, depth));
         }
     }
 
@@ -1598,11 +1435,7 @@ impl<'a> Addresses<'a> {
         let params: Vec<(ValueId, Ty)> = self.f.blocks[&header].params.clone();
         let (entering, back) = self.edges_into(header);
         let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-        let known = if self.fixed.is_some() {
-            self.fixed_loop_bits.get(&header).cloned()
-        } else {
-            self.loop_bits.get(&header).cloned()
-        };
+        let known = self.loop_bits.get(&header).cloned();
         let mut bits: Vec<((usize, u8), bool)> = match known {
             Some((bits, depth)) => {
                 self.depend(depth);
@@ -1782,11 +1615,7 @@ impl<'a> Addresses<'a> {
         let region = first.region;
         let step_key = (header, l, target, region);
         let lookup = |this: &mut Self| {
-            let cached = if this.fixed.is_some() {
-                this.fixed_steps.get(&step_key).cloned()
-            } else {
-                this.steps.get(&step_key).cloned()
-            };
+            let cached = this.steps.get(&step_key).cloned();
             cached.map(|(step, depth)| {
                 this.depend(depth);
                 step
@@ -1807,11 +1636,7 @@ impl<'a> Addresses<'a> {
                 if depth != FREE {
                     self.journal.push((Entry::Step(step_key), depth));
                 }
-                if self.fixed.is_some() {
-                    self.fixed_steps.insert(step_key, (step, depth));
-                } else {
-                    self.steps.insert(step_key, (step, depth));
-                }
+                self.steps.insert(step_key, (step, depth));
                 step
             }
         };
@@ -1839,11 +1664,7 @@ impl<'a> Addresses<'a> {
         }
         let l = lane as u8;
         let key = (header, l, Target::Param(index), None);
-        let cached = if self.fixed.is_some() {
-            self.fixed_steps.get(&key).cloned()
-        } else {
-            self.steps.get(&key).cloned()
-        };
+        let cached = self.steps.get(&key).cloned();
         let ((_, _, affine), depth) = cached?;
         self.depend(depth);
         let (entering, back) = self.edges_into(header);
@@ -2099,91 +1920,6 @@ impl<'a> Addresses<'a> {
         list
     }
 
-    pub fn with_value<T>(&mut self, v: ValueId, k: u32, f: impl FnOnce(&mut Self) -> T) -> T {
-        let affected = self.affected_by(v);
-        let stored = self.fixed_store.remove(&(v, k)).unwrap_or_default();
-        self.fixed_values = stored.values;
-        self.fixed_bits = stored.bits;
-        self.fixed_slots = stored.slots;
-        self.fixed_keys = stored.keys;
-        self.fixed_loop_bits = stored.loop_bits;
-        self.fixed_steps = stored.steps;
-        self.fixed_summarized = stored.summarized;
-        self.fixed_word_bits = stored.word_bits;
-        self.fixed_highs = stored.highs;
-        self.fixed = Some((v, k));
-        self.affected_now = Some(affected);
-        let r = f(self);
-        self.fixed = None;
-        self.affected_now = None;
-        let stored = Fixed {
-            values: std::mem::take(&mut self.fixed_values),
-            bits: std::mem::take(&mut self.fixed_bits),
-            slots: std::mem::take(&mut self.fixed_slots),
-            keys: std::mem::take(&mut self.fixed_keys),
-            loop_bits: std::mem::take(&mut self.fixed_loop_bits),
-            steps: std::mem::take(&mut self.fixed_steps),
-            summarized: std::mem::take(&mut self.fixed_summarized),
-            word_bits: std::mem::take(&mut self.fixed_word_bits),
-            highs: std::mem::take(&mut self.fixed_highs),
-        };
-        self.fixed_store.insert((v, k), stored);
-        r
-    }
-
-    fn affected_by(&mut self, v: ValueId) -> std::rc::Rc<HashSet<ValueId>> {
-        if let Some(set) = self.affected.get(&v) {
-            return set.clone();
-        }
-        let mut set: HashSet<ValueId> = HashSet::default();
-        let mut pending = vec![v];
-        let mut memory = false;
-        while let Some(x) = pending.pop() {
-            if !set.insert(x) {
-                continue;
-            }
-            for &y in self.users.get(&x).map(|u| u.as_slice()).unwrap_or(&[]) {
-                if y == PRIVATE_MEMORY {
-                    if !memory {
-                        memory = true;
-                        pending.extend(self.users.get(&PRIVATE_MEMORY).into_iter().flatten().copied());
-                    }
-                } else {
-                    pending.push(y);
-                }
-            }
-        }
-        let set = std::rc::Rc::new(set);
-        self.affected.insert(v, set.clone());
-        set
-    }
-
-    fn unaffected(&self, v: ValueId) -> bool {
-        self.affected_now.as_ref().is_some_and(|set| !set.contains(&v))
-    }
-
-    pub fn program_value(&mut self, u: Unknown) -> Option<ValueId> {
-        let candidates: Vec<ValueId> = match self.derived.get(&u) {
-            Some(list) => list.clone(),
-            None => {
-                let found = self.keys.iter().find_map(|(key, &(x, _))| match key {
-                    Key::Value(v, None) if x == u => Some(Some(*v)),
-                    Key::Workgroup(_) if x == u => Some(None),
-                    _ => None,
-                })?;
-                match found {
-                    Some(v) => vec![v],
-                    None => self.f.blocks[&self.f.entry].params.iter().map(|&(p, _)| p).collect(),
-                }
-            }
-        };
-        let unknown = Form::unknown(u);
-        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
-        candidates
-            .into_iter()
-            .find(|&v| lanes.iter().all(|&l| self.value(v, l, None).0.form == unknown))
-    }
-
     fn canonical(&self, v: ValueId, lane: usize) -> usize {
         if self.facts.uniform[v.0] && self.valid(lane) {
             0
@@ -2229,22 +1965,9 @@ impl<'a> Addresses<'a> {
                 return unassumed(guess);
             }
         }
-        if self.unaffected(v) {
-            let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
-            let r = self.value(v, lane, assume);
-            (self.fixed, self.affected_now) = (fixed, affected);
-            return r;
-        }
-        let hit = if let Some((fixed, k)) = self.fixed {
-            if fixed == v {
-                return unassumed(Value::constant(k));
-            }
-            self.fixed_values.get(&(v, l, assume)).cloned()
-        } else {
-            match self.values.get(&(v, l, None)) {
-                Some(e) if assume.is_none() || !e.0 .1.open => Some(e.clone()),
-                _ => assume.and_then(|_| self.values.get(&(v, l, assume)).cloned()),
-            }
+        let hit = match self.values.get(&(v, l, None)) {
+            Some(e) if assume.is_none() || !e.0 .1.open => Some(e.clone()),
+            _ => assume.and_then(|_| self.values.get(&(v, l, assume)).cloned()),
         };
         if let Some((r, depth)) = hit {
             self.depend(depth);
@@ -2274,10 +1997,6 @@ impl<'a> Addresses<'a> {
             this.compute(v, lane, assume)
         });
         self.end(key, outside);
-        if self.fixed.is_some() {
-            self.cache_value((v, l, assume), r.clone(), depth);
-            return r;
-        }
         if assume.is_some() {
             self.cache_value((v, l, assume), r.clone(), depth);
         }
@@ -2321,19 +2040,9 @@ impl<'a> Addresses<'a> {
             self.depend(depth);
             return unassumed(Some(guess));
         }
-        if self.unaffected(v) {
-            let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
-            let r = self.bit_unless_assumed(v, lane, assume);
-            (self.fixed, self.affected_now) = (fixed, affected);
-            return r;
-        }
-        let hit = if self.fixed.is_some() {
-            self.fixed_bits.get(&(v, l, assume)).copied()
-        } else {
-            match self.bits.get(&(v, l, None)) {
-                Some(&e) if assume.is_none() || !e.0 .1.open => Some(e),
-                _ => assume.and_then(|_| self.bits.get(&(v, l, assume)).copied()),
-            }
+        let hit = match self.bits.get(&(v, l, None)) {
+            Some(&e) if assume.is_none() || !e.0 .1.open => Some(e),
+            _ => assume.and_then(|_| self.bits.get(&(v, l, assume)).copied()),
         };
         if let Some((r, depth)) = hit {
             self.depend(depth);
@@ -2350,10 +2059,6 @@ impl<'a> Addresses<'a> {
             this.compute_bit(v, lane, assume)
         });
         self.end(key, outside);
-        if self.fixed.is_some() {
-            self.cache_bit((v, l, assume), r, depth);
-            return r;
-        }
         if assume.is_some() {
             self.cache_bit((v, l, assume), r, depth);
         }
@@ -2797,10 +2502,7 @@ impl<'a> Addresses<'a> {
 
     fn unresolved(&self, v: ValueId, lane: usize, value: &Value) -> bool {
         let key = Key::Value(v, (!self.facts.uniform[v.0]).then_some(lane as u8));
-        let found = match self.fixed {
-            Some(_) => self.fixed_keys.get(&key).or_else(|| self.keys.get(&key)),
-            None => self.keys.get(&key),
-        };
+        let found = self.keys.get(&key);
         value.region.is_none() && value.form.constant == 0 && found.is_some_and(|&(u, _)| value.form.terms == [(u, 1)])
     }
 
@@ -3017,14 +2719,12 @@ impl<'a> Addresses<'a> {
             Some(level) if level == self.guessing => return std::rc::Rc::default(),
             outside => outside,
         };
-        let (fixed, affected) = (self.fixed.take(), self.affected_now.take());
         let (limits, depth) = self.frame(|this| {
             if outside.is_some() {
                 this.depend(level(this.checking));
             }
             this.compute_limits(b)
         });
-        (self.fixed, self.affected_now) = (fixed, affected);
         match outside {
             Some(level) => self.limiting.insert(b, level),
             None => self.limiting.remove(&b),
@@ -3852,8 +3552,7 @@ impl<'a> Addresses<'a> {
         let v = self.copies.get(&v).copied().unwrap_or(v);
         let lane = self.canonical(v, lane);
         let key = (v, lane as u8);
-        let fixed = self.fixed.is_some();
-        let cached = if fixed { self.fixed_highs.get(&key).cloned() } else { self.highs.get(&key).cloned() };
+        let cached = self.highs.get(&key).cloned();
         if let Some((form, depth)) = cached {
             self.depend(depth);
             return form;
@@ -3869,11 +3568,7 @@ impl<'a> Addresses<'a> {
         if depth != FREE {
             self.journal.push((Entry::High(key), depth));
         }
-        if fixed {
-            self.fixed_highs.insert(key, (found.clone(), depth));
-        } else {
-            self.highs.insert(key, (found.clone(), depth));
-        }
+        self.highs.insert(key, (found.clone(), depth));
         found
     }
 
@@ -5864,17 +5559,12 @@ impl Addresses<'_> {
     fn word_bit(&mut self, w: ValueId, bit: usize) -> Option<bool> {
         let w = self.copies.get(&w).copied().unwrap_or(w);
         let key = (w, bit as u8);
-        let fixed = self.fixed.is_some();
-        let cached = if fixed {
-            self.fixed_word_bits.get(&key).copied()
-        } else {
-            self.word_bits.get(&key).copied()
-        };
+        let cached = self.word_bits.get(&key).copied();
         if let Some((r, depth)) = cached {
             self.depend(depth);
             return r;
         }
-        let active = (w, bit as u8, fixed);
+        let active = (w, bit as u8);
         let outside = match self.active_words.insert(active, self.guessing) {
             Some(level) if level == self.guessing => return None,
             outside => outside,
@@ -5892,11 +5582,7 @@ impl Addresses<'_> {
         if depth != FREE {
             self.journal.push((Entry::WordBit(key), depth));
         }
-        if fixed {
-            self.fixed_word_bits.insert(key, (r, depth));
-        } else {
-            self.word_bits.insert(key, (r, depth));
-        }
+        self.word_bits.insert(key, (r, depth));
         r
     }
 

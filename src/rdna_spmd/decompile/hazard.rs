@@ -873,9 +873,6 @@ fn meet(
             if !runs(addresses, pa, a) || !runs(addresses, qa, b) {
                 continue;
             }
-            if excluded(addresses, (pa, a, &xa.form, x.bytes), (qa, b, &ya.form, y.bytes), variant) {
-                continue;
-            }
             let both = [idles(addresses, pa, a), idles(addresses, qa, b)];
             let old = idle.unwrap_or([true; 2]);
             idle = Some([old[0] && both[0], old[1] && both[1]]);
@@ -885,61 +882,6 @@ fn meet(
         }
     }
     idle
-}
-
-fn excluded(
-    addresses: &mut Addresses,
-    (pa, a, x, x_bytes): (&Access, usize, &Form, u32),
-    (qa, b, y, y_bytes): (&Access, usize, &Form, u32),
-    variant: &dyn Fn(&UnknownInfo) -> bool,
-) -> bool {
-    let difference = x.sub(y);
-    if difference.terms.len() != 1 {
-        return false;
-    }
-    let (u, c) = difference.terms[0];
-    let info = addresses.unknowns[u as usize].clone();
-    if !info.shared || variant(&info) {
-        return false;
-    }
-    let Some(v) = addresses.program_value(u) else {
-        return false;
-    };
-    let shift = c.trailing_zeros();
-    let odd = c >> shift;
-    let inverse = (0..5).fold(odd, |inv, _| inv.wrapping_mul(2u32.wrapping_sub(odd.wrapping_mul(inv))));
-    let low_mask = if shift == 0 { u32::MAX } else { (1u32 << (32 - shift)) - 1 };
-    let mut candidates = Vec::new();
-    for t in -(x_bytes as i64) + 1..y_bytes as i64 {
-        let target = (t as u32).wrapping_sub(difference.constant);
-        if target & ((1u64 << shift) - 1) as u32 != 0 {
-            continue;
-        }
-        let base = (target >> shift).wrapping_mul(inverse) & low_mask;
-        let step = low_mask as u64 + 1;
-        let (low, high) = info.range.map_or((0u64, u32::MAX as u64), |(l, h)| (l as u64, h as u64));
-        let first = if low > base as u64 { (low - base as u64).div_ceil(step) } else { 0 };
-        let last = if high >= base as u64 { (high - base as u64) / step } else { continue };
-        if last < first {
-            continue;
-        }
-        for j in first..=last {
-            candidates.push((base as u64 + j * step) as u32);
-        }
-    }
-    candidates.sort_unstable();
-    candidates.dedup();
-    candidates.into_iter().all(|value| {
-        addresses.with_value(v, value, |this| {
-            let runs = |this: &mut Addresses, access: &Access, lane: usize| {
-                this.reaches_block_with_value(access.block)
-                    && access
-                        .predicate
-                        .is_none_or(|p| this.bit(p, lane, None).0 != Some(false))
-            };
-            !(runs(this, pa, a) && runs(this, qa, b))
-        })
-    })
 }
 
 fn above(
@@ -5342,5 +5284,37 @@ mod tests {
     #[test]
     fn may_overlap_sees_that_differently_scaled_iterations_meet_only_in_the_same_iteration() {
         assert!(!differently_scaled_iterations((0, 1)), "2i = 3j with i, j in {0, 1} only at i = j = 0");
+    }
+
+    fn guarded_by_a_sum(sum: u64, word: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let u = uniform_word(&mut b, &k, e, 0, MemSize::U8);
+        let w = uniform_word(&mut b, &k, e, 4, MemSize::U8);
+        let v = uniform_word(&mut b, &k, e, 8, MemSize::U8);
+        let total = b.int(e, IntOp::Add, u, w);
+        let sum = b.constant(e, Ty::I32, sum);
+        let word = b.constant(e, Ty::I32, word);
+        let at_sum = b.cmp(e, IntPred::Eq, total, sum);
+        let at_word = b.cmp(e, IntPred::Eq, v, word);
+        let m1 = b.int(e, IntOp::And, at_sum, k.exec);
+        let m2 = b.int(e, IntOp::And, at_word, k.exec);
+        let a1 = byte_offset(&mut b, e, buf, total, 4);
+        let a2 = byte_offset(&mut b, e, buf, v, 4);
+        let s1 = store_at(&mut b, e, a1, m1);
+        let s2 = store_at(&mut b, e, a2, m2);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_excludes_stores_guarded_by_a_sum_and_a_word_that_name_different_words() {
+        assert!(!guarded_by_a_sum(7, 8), "the first store runs only at word u + w = 7, the second only at word 8");
+    }
+
+    #[test]
+    fn find_reports_stores_guarded_by_a_sum_and_a_word_that_name_one_word() {
+        assert!(guarded_by_a_sum(7, 7), "both stores run at word 7 when u + w = 7 and v = 7");
     }
 }
