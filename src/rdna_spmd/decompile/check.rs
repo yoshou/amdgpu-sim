@@ -480,6 +480,7 @@ impl<'a> Check<'a> {
 
     fn require(&mut self, block: BlockId, index: usize, reason: &'static str, difference: Bdd) {
         let difference = self.and(difference, self.safe);
+        let difference = self.consistent(difference);
         if difference == Bdd::FALSE {
             return;
         }
@@ -940,6 +941,7 @@ impl<'a> Check<'a> {
     }
 
     fn some_lane(&mut self, x: Bdd) -> Bdd {
+        let x = self.consistent(x);
         let varying: Vec<u32> = self
             .logic
             .support(x)
@@ -950,6 +952,15 @@ impl<'a> Check<'a> {
         self.logic.exists(&varying, x)
     }
 
+    fn consistent(&mut self, x: Bdd) -> Bdd {
+        self.logic.consistent(x)
+    }
+
+    fn at_lane(&mut self, x: Bdd, lane: u32) -> Bdd {
+        let x = self.consistent(x);
+        self.logic.at_lane(x, lane)
+    }
+
     fn read_from(&mut self, h: Bdd, source: impl Fn(usize) -> u32) -> Bdd {
         let mut seen: HashMap<u32, Bdd> = HashMap::default();
         let mut any = Bdd::FALSE;
@@ -958,7 +969,7 @@ impl<'a> Check<'a> {
             let there = match seen.get(&s) {
                 Some(&there) => there,
                 None => {
-                    let at = self.logic.at_lane(h, s);
+                    let at = self.at_lane(h, s);
                     let there = self.some_lane(at);
                     seen.insert(s, there);
                     there
@@ -982,7 +993,7 @@ impl<'a> Check<'a> {
                     let mut there = Bdd::FALSE;
                     for s in 0..32u32 {
                         if set >> s & 1 == 1 {
-                            let at = self.logic.at_lane(h, s);
+                            let at = self.at_lane(h, s);
                             let read = self.some_lane(at);
                             there = self.or(there, read);
                         }
@@ -1016,7 +1027,7 @@ impl<'a> Check<'a> {
         }
         let mut any = Bdd::FALSE;
         for l in 0..32u32 {
-            let at = self.logic.at_lane(x, l);
+            let at = self.at_lane(x, l);
             let there = self.some_lane(at);
             if there == Bdd::FALSE {
                 continue;
@@ -1197,13 +1208,15 @@ impl<'a> Check<'a> {
                     }
                     let fx = self.bit(x);
                     let tag = self.logic.tag(Choice::Query(out));
-                    let tag = if hx == Bdd::FALSE {
-                        let wave = self.logic.wave_answer(f, facts, out);
-                        self.and(tag, wave)
-                    } else {
-                        tag
-                    };
-                    let answered = self.query(fx, hx, tag);
+                    let unchanged = self.not(hx);
+                    let certain = self.and(fx, unchanged);
+                    let possible = self.or(fx, hx);
+                    let low = self.logic.answer(f, facts, out, certain);
+                    let high = self.logic.answer(f, facts, out, possible);
+                    let differs_low = self.logic.m.xor(fx, low);
+                    let differs_high = self.logic.m.xor(fx, high);
+                    let differs = self.or(differs_low, differs_high);
+                    let answered = self.and(tag, differs);
                     if local == Bdd::TRUE {
                         return answered;
                     }
@@ -1240,7 +1253,7 @@ impl<'a> Check<'a> {
                         (None, Some(lanes)) => {
                             let mut any = Bdd::FALSE;
                             for lane in lanes {
-                                let there = self.logic.at_lane(hx, lane as u32 & 31);
+                                let there = self.at_lane(hx, lane as u32 & 31);
                                 let there = self.some_lane(there);
                                 any = self.or(any, there);
                             }
@@ -1252,7 +1265,7 @@ impl<'a> Check<'a> {
                 }
                 EffectOp::Wave(WaveOp::WriteLane) => {
                     let written = self.any_of(&inputs[..2]);
-                    let written = self.logic.at_lane(written, 0);
+                    let written = self.at_lane(written, 0);
                     let written = self.some_lane(written);
                     let old = self.any_of(&inputs[2..]);
                     match facts.constant(f, inputs[1]) {
@@ -1884,6 +1897,13 @@ impl<'c, 'a> Explore<'c, 'a> {
             Atom::Cell(block, group, _) => {
                 let leaves: Vec<ValueId> = self.check.logic.cell_leaves(block, group).to_vec();
                 leaves.iter().any(|&v| {
+                    let h = self.check.h[v.0];
+                    h != Bdd::FALSE && self.check.and(self.assume, h) != Bdd::FALSE
+                })
+            }
+            Atom::Some(block, _) => {
+                let sources = self.check.logic.answer_sources(block);
+                sources.iter().any(|&v| {
                     let h = self.check.h[v.0];
                     h != Bdd::FALSE && self.check.and(self.assume, h) != Bdd::FALSE
                 })
@@ -6087,6 +6107,41 @@ mod tests {
         assert!(keeps(&b).is_empty(), "{:?}: x = 5 and y = 0 pass both tests and the next block stores the answer", keeps(&b));
     }
 
+    fn word_test_into_a_query(uniform: bool) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flag = per_lane(&mut b, &k, e, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let w = if uniform { uniform_load(&mut b, &k, e, 16) } else { b.wave(e, WaveOp::Ballot, vec![c]) };
+        let t = b.cmp(e, IntPred::Ne, w, zero);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (next, p) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+        b.br(e, next, vec![k.exec, own, t]);
+        let q = b.wave(next, WaveOp::Any, vec![p[2]]);
+        let one = b.constant(next, Ty::I32, 1);
+        let zero = b.constant(next, Ty::I32, 0);
+        let v = b.core(next, Ty::I32, Op::Select(q, one, zero));
+        b.store(next, Space::Global, MemSize::B32, p[1], v, p[0]);
+        b
+    }
+
+    #[test]
+    fn prove_keeps_the_word_or_the_query_when_a_test_of_a_ballot_feeds_a_query_in_the_next_block() {
+        let b = word_test_into_a_query(false);
+        let kept = converted(&b);
+        assert_eq!(kept, ["search", "direct"], "converting both the word test and the query stores each lane's own bit instead of whether any lane is set");
+    }
+
+    #[test]
+    fn prove_converts_a_query_over_a_test_of_a_uniform_word_in_the_next_block() {
+        let b = word_test_into_a_query(true);
+        assert!(converted(&b).is_empty(), "{:?}: the test of a uniform word is the same in every lane", converted(&b));
+    }
+
     fn arms_store_two(order: bool, second: u64) -> Build {
         arms_store(move |b, block, side, p| {
             let past = b.constant(block, Ty::I64, 128);
@@ -7951,8 +8006,9 @@ mod difference_tests {
                 let mut atoms: HashMap<ValueId, Bdd> = HashMap::default();
                 for v in 0..f.types.len() {
                     if f.types[v] == Ty::I1 {
-                        let bit = match facts.op(f, ValueId(v)) {
-                            Some(Op::Cmp(..)) => logic.bit(f, &facts, ValueId(v)),
+                        let bit = match (facts.op(f, ValueId(v)), facts.inst(f, ValueId(v))) {
+                            (Some(Op::Cmp(..)), _) => logic.bit(f, &facts, ValueId(v)),
+                            (_, Some(Inst::Effect { op: EffectOp::Wave(WaveOp::Any), .. })) => logic.wave_answer(f, &facts, ValueId(v)),
                             _ => logic.atom(Atom::Bit(ValueId(v))),
                         };
                         atoms.insert(ValueId(v), bit);
@@ -7960,6 +8016,7 @@ mod difference_tests {
                 }
                 (case.truth)(logic, &|v| atoms[&v])
             };
+            let (h, truth) = (logic.consistent(h), logic.consistent(truth));
             let ok = if exact { logic.m.implies(h, truth) } else { logic.m.implies(truth, h) };
             if !ok {
                 wrong.push(case.name.to_string());

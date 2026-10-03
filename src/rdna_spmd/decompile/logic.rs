@@ -19,6 +19,7 @@ pub enum Atom {
     Next(ValueId, bool),
     Marker(Choice),
     Cell(BlockId, u16, u8),
+    Some(BlockId, u16),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,6 +82,7 @@ pub struct Logic {
     detour: HashMap<Atom, u32>,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
+    answers: HashMap<BlockId, BlockAnswers>,
     lane_values: HashMap<ValueId, Option<[u32; 32]>>,
     supports: HashMap<Bdd, Rc<Vec<u32>>>,
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
@@ -230,6 +232,14 @@ const CELLS: usize = 64;
 const GROUP: usize = 12;
 const JOINT: usize = 1 << 10;
 
+#[derive(Default)]
+struct BlockAnswers {
+    residuals: Vec<(Bdd, ValueId)>,
+    relation: Option<(usize, Bdd)>,
+}
+
+const ANSWERS: usize = 1 << 10;
+
 impl Logic {
     fn with(
         f: &Func,
@@ -262,6 +272,7 @@ impl Logic {
             detour: HashMap::default(),
             bits: HashMap::default(),
             views: HashMap::default(),
+            answers: HashMap::default(),
             lane_values: HashMap::default(),
             supports: HashMap::default(),
             edges: BTreeMap::new(),
@@ -474,6 +485,10 @@ impl Logic {
                 assert!(block.0 < 1 << 19 && group < 64 && bit < 16, "too many cells");
                 (1 << 30) | (1 << 29) | ((block.0 as u32) << 10) | ((group as u32) << 4) | bit as u32
             }
+            Atom::Some(block, k) => {
+                assert!(block.0 < 1 << 19 && k < 1 << 10, "too many answers");
+                (1 << 30) | (1 << 29) | (1 << 28) | ((block.0 as u32) << 10) | k as u32
+            }
             Atom::WordBit(v, i) => {
                 assert!(v.0 < 1 << 26, "function too large");
                 (2 << 30) + 8 + ((v.0 as u32) << 3) + i as u32
@@ -511,6 +526,7 @@ impl Logic {
             Atom::WordBit(v, _) => facts.uniform[v.0],
             Atom::Marker(_) => true,
             Atom::Cell(block, group, bit) => bit < self.cell_groups[&(block, group)].0,
+            Atom::Some(..) => true,
             Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
         }
     }
@@ -521,7 +537,7 @@ impl Logic {
                 Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),
                 Site::Unreached => None,
             },
-            Atom::Cell(block, ..) => Some(block),
+            Atom::Cell(block, ..) | Atom::Some(block, _) => Some(block),
             Atom::Lane(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
         }
     }
@@ -529,6 +545,90 @@ impl Logic {
     pub fn cell_leaves(&self, block: BlockId, group: u16) -> &[ValueId] {
         &self.cell_groups[&(block, group)].1
     }
+
+    pub fn answer_sources(&self, block: BlockId) -> Vec<ValueId> {
+        self.answers.get(&block).map_or_else(Vec::new, |a| a.residuals.iter().map(|&(_, v)| v).collect())
+    }
+
+    pub fn mentions_answers(&mut self, f: Bdd) -> bool {
+        let support = self.support(f);
+        support.iter().any(|v| matches!(self.atoms.get(v), Some(Atom::Some(..))))
+    }
+
+    pub fn consistent(&mut self, x: Bdd) -> Bdd {
+        if !self.mentions_answers(x) {
+            return x;
+        }
+        let blocks: BTreeSet<BlockId> = self
+            .support(x)
+            .iter()
+            .filter_map(|v| match self.atoms[v] {
+                Atom::Some(block, _) => Some(block),
+                _ => None,
+            })
+            .collect();
+        let mut result = x;
+        for block in blocks {
+            let relation = self.answer_relation(block);
+            result = self.m.and(result, relation);
+        }
+        result
+    }
+
+    fn answer_relation(&mut self, block: BlockId) -> Bdd {
+        let residuals: Vec<Bdd> = self.answers[&block].residuals.iter().map(|&(g, _)| g).collect();
+        if let Some((count, relation)) = self.answers[&block].relation {
+            if count == residuals.len() {
+                return relation;
+            }
+        }
+        let mut relation = Bdd::TRUE;
+        if let Some(worlds) = self.answer_worlds(&residuals) {
+            let mut any = Bdd::FALSE;
+            for world in &worlds {
+                let mut minterm = Bdd::TRUE;
+                for (k, &held) in world.iter().enumerate() {
+                    let var = self.atom(Atom::Some(block, k as u16));
+                    let literal = if held { var } else { self.m.not(var) };
+                    minterm = self.m.and(minterm, literal);
+                }
+                any = self.m.or(any, minterm);
+            }
+            relation = any;
+        }
+        for (k, &g) in residuals.iter().enumerate() {
+            let some = self.atom(Atom::Some(block, k as u16));
+            let not_g = self.m.not(g);
+            let implied = self.m.or(not_g, some);
+            relation = self.m.and(relation, implied);
+            if let Some(lane) = self.only_lane(g) {
+                let here = self.lanes(|l| l == lane);
+                let not_some = self.m.not(some);
+                let back = self.m.or(not_some, g);
+                let tie = self.m.ite(here, back, Bdd::TRUE);
+                relation = self.m.and(relation, tie);
+            }
+        }
+        self.answers.get_mut(&block).unwrap().relation = Some((residuals.len(), relation));
+        relation
+    }
+
+    fn only_lane(&mut self, g: Bdd) -> Option<u32> {
+        if !self.lane_dependent(g) {
+            return None;
+        }
+        let mut found = None;
+        for lane in 0..32u32 {
+            if self.at_lane(g, lane) != Bdd::FALSE {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(lane);
+            }
+        }
+        found
+    }
+
 
     fn block_cells(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<BlockCells> {
         if let Some(cells) = self.cells.get(&block) {
@@ -657,6 +757,10 @@ impl Logic {
     }
 
     fn part_minterm(&mut self, block: BlockId, group: u16, offset: u8, part: usize, count: usize) -> Bdd {
+        self.index_minterm(&|i| Atom::Cell(block, group, offset + i), part, count)
+    }
+
+    fn index_minterm(&mut self, atom: &dyn Fn(u8) -> Atom, part: usize, count: usize) -> Bdd {
         let bits = CellGroup::bits(count);
         let mut result = Bdd::FALSE;
         for index in 0..(1usize << bits) {
@@ -665,7 +769,7 @@ impl Logic {
             }
             let mut minterm = Bdd::TRUE;
             for i in 0..bits {
-                let var = self.atom(Atom::Cell(block, group, offset + i));
+                let var = self.atom(atom(i));
                 let literal = if index >> i & 1 == 1 { var } else { self.m.not(var) };
                 minterm = self.m.and(minterm, literal);
             }
@@ -1411,57 +1515,106 @@ impl Logic {
     }
 
     pub fn wave_answer(&mut self, f: &Func, facts: &Facts, out: ValueId) -> Bdd {
-        let (Site::Inst { block, index }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) else {
+        let Some(Inst::Effect { inputs, .. }) = facts.inst(f, out) else {
             return self.atom(Atom::Bit(out));
         };
-        let input = inputs[0];
-        let mut answers: Vec<(Bdd, ValueId)> = Vec::new();
-        for inst in &f.blocks[&block].insts[..index] {
-            if let Inst::Effect {
-                op: EffectOp::Wave(WaveOp::Any),
-                inputs,
-                outputs,
-                ..
-            } = inst
-            {
-                let bits = self.bit(f, facts, inputs[0]);
-                if !answers.iter().any(|&(x, _)| x == bits) {
-                    answers.push((bits, outputs[0].0));
-                }
-            }
-        }
-        let bits = self.bit(f, facts, input);
-        if !answers.iter().any(|&(x, _)| x == bits) {
-            answers.push((bits, out));
-        }
-        match self.expanded_answer(facts, bits, &answers, 0) {
-            Some(answer) => answer,
-            None => {
-                let canonical = answers.iter().find(|&&(x, _)| x == bits).map_or(out, |&(_, v)| v);
-                self.atom(Atom::Bit(canonical))
-            }
-        }
+        let bits = self.bit(f, facts, inputs[0]);
+        self.answer(f, facts, out, bits)
     }
 
-    fn expanded_answer(&mut self, facts: &Facts, g: Bdd, answers: &[(Bdd, ValueId)], depth: usize) -> Option<Bdd> {
+    pub fn answer(&mut self, f: &Func, facts: &Facts, out: ValueId, g: Bdd) -> Bdd {
+        let (Site::Inst { block, .. }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) else {
+            return self.atom(Atom::Bit(out));
+        };
+        let some = self.some_lane_holds(facts, block, g, inputs[0], &mut HashMap::default());
+        self.m.or(g, some)
+    }
+
+    fn answer_worlds(&mut self, residuals: &[Bdd]) -> Option<Vec<Vec<bool>>> {
+        let mut out = Vec::new();
+        let mut chosen = Vec::with_capacity(residuals.len());
+        self.enumerate_answers(residuals, &mut chosen, Bdd::FALSE, &mut out)?;
+        Some(out)
+    }
+
+    fn enumerate_answers(&mut self, residuals: &[Bdd], chosen: &mut Vec<bool>, denied: Bdd, out: &mut Vec<Vec<bool>>) -> Option<()> {
+        let k = chosen.len();
+        if k == residuals.len() {
+            if out.len() >= ANSWERS {
+                return None;
+            }
+            out.push(chosen.clone());
+            return Some(());
+        }
+        for value in [true, false] {
+            let denied = if value { denied } else { self.m.or(denied, residuals[k]) };
+            chosen.push(value);
+            if self.answers_possible(residuals, chosen, denied) {
+                let r = self.enumerate_answers(residuals, chosen, denied, out);
+                if r.is_none() {
+                    chosen.pop();
+                    return None;
+                }
+            }
+            chosen.pop();
+        }
+        Some(())
+    }
+
+    fn answers_possible(&mut self, residuals: &[Bdd], chosen: &[bool], denied: Bdd) -> bool {
+        let open = self.m.not(denied);
+        let mut at_lane: HashMap<u32, Bdd> = HashMap::default();
+        for (i, &held) in chosen.iter().enumerate() {
+            if !held {
+                continue;
+            }
+            let witness = self.m.and(residuals[i], open);
+            if witness == Bdd::FALSE {
+                return false;
+            }
+            if let Some(lane) = self.only_lane(residuals[i]) {
+                let joint = at_lane.get(&lane).copied().unwrap_or(open);
+                let joint = self.m.and(joint, residuals[i]);
+                let joint = self.at_lane(joint, lane);
+                if joint == Bdd::FALSE {
+                    return false;
+                }
+                at_lane.insert(lane, joint);
+            }
+        }
+        true
+    }
+
+    fn some_lane_holds(&mut self, facts: &Facts, block: BlockId, g: Bdd, source: ValueId, done: &mut HashMap<Bdd, Bdd>) -> Bdd {
         if g == Bdd::FALSE || g == Bdd::TRUE {
-            return Some(g);
+            return g;
+        }
+        if let Some(&b) = done.get(&g) {
+            return b;
         }
         let support = self.support(g);
-        match support.iter().copied().find(|&v| self.uniform_atom(facts, v)) {
-            Some(_) if depth > 8 => None,
+        let result = match support.iter().copied().find(|&v| self.uniform_atom(facts, v)) {
             Some(var) => {
                 let (low, high) = (self.m.cofactor(g, var, false), self.m.cofactor(g, var, true));
-                let no = self.expanded_answer(facts, low, answers, depth + 1)?;
-                let yes = self.expanded_answer(facts, high, answers, depth + 1)?;
+                let no = self.some_lane_holds(facts, block, low, source, done);
+                let yes = self.some_lane_holds(facts, block, high, source, done);
                 let x = self.m.var(var);
-                Some(self.m.ite(x, yes, no))
+                self.m.ite(x, yes, no)
             }
             None => {
-                let &(_, v) = answers.iter().find(|&&(x, _)| x == g)?;
-                Some(self.atom(Atom::Bit(v)))
+                let answers = self.answers.entry(block).or_default();
+                let k = match answers.residuals.iter().position(|&(x, _)| x == g) {
+                    Some(k) => k,
+                    None => {
+                        answers.residuals.push((g, source));
+                        answers.residuals.len() - 1
+                    }
+                };
+                self.atom(Atom::Some(block, k as u16))
             }
-        }
+        };
+        done.insert(g, result);
+        result
     }
 
     fn small_word(&self, f: &Func, facts: &Facts, w: ValueId) -> Option<(u32, u32)> {
