@@ -1,6 +1,7 @@
 mod address;
 mod check;
 mod direct;
+mod encoding;
 mod fold;
 mod hazard;
 mod linear;

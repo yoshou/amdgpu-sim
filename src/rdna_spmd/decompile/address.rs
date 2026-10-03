@@ -3,6 +3,7 @@ use crate::rdna_spmd::engine::{EntryLayout, WORKGROUP_ID_X, WORKGROUP_ID_YZ};
 use crate::rdna_spmd::environment::Environment;
 use crate::rdna_spmd::hash::HashMap;
 type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::rdna_spmd::hash::Mix>>;
+use super::encoding::{mirrored, outcomes, Encoding};
 use super::hazard::Reach;
 use super::provenance::{bounds, Exposure, Spill};
 use crate::rdna_spmd::ir::*;
@@ -4955,33 +4956,8 @@ impl<'a> Addresses<'a> {
                     plain
                 } else {
                     let limits = self.limits(block);
-                    let (xs, ys) = (self.pieces(&x.form, &limits), self.pieces(&y.form, &limits));
-                    decide_pieces(pred, &xs, &ys)
-                        .or_else(|| {
-                            let d = difference.as_constant()?;
-                            let mut answer = None;
-                            for &by in &ys {
-                                let r = offset(pred, d, by)?;
-                                if answer.is_some_and(|a| a != r) {
-                                    return None;
-                                }
-                                answer = Some(r);
-                            }
-                            answer
-                        })
-                        .or_else(|| {
-                            let known = known_order(&limits.orders, &x.form, &y.form)?;
-                            let want = outcomes(pred);
-                            if known == 0 {
-                                None
-                            } else if known & !want == 0 {
-                                Some(true)
-                            } else if known & want == 0 {
-                                Some(false)
-                            } else {
-                                None
-                            }
-                        })
+                    let mut encoding = Encoding::new(&self.unknowns, &|_: &UnknownInfo| false);
+                    encoding.decide(pred, &x.form, &y.form, &limits.classes, &limits.orders)
                 }
             }
             _ => None,
@@ -6061,26 +6037,6 @@ fn either_limits(a: Limits, b: Limits) -> Limits {
     }
 }
 
-fn outcomes(pred: IntPred) -> u8 {
-    let (equal, ll, lg, gl, gg) = (1u8, 2u8, 4u8, 8u8, 16u8);
-    match pred {
-        IntPred::Eq => equal,
-        IntPred::Ne => ll | lg | gl | gg,
-        IntPred::Ult => ll | lg,
-        IntPred::Ule => ll | lg | equal,
-        IntPred::Ugt => gl | gg,
-        IntPred::Uge => gl | gg | equal,
-        IntPred::Slt => ll | gl,
-        IntPred::Sle => ll | gl | equal,
-        IntPred::Sgt => lg | gg,
-        IntPred::Sge => lg | gg | equal,
-    }
-}
-
-fn mirrored(mask: u8) -> u8 {
-    (mask & 1) | (mask & 2) << 3 | (mask & 16) >> 3 | (mask & 4) << 1 | (mask & 8) >> 1
-}
-
 fn order_limit(x: &Form, y: &Form, pred: IntPred) -> Vec<(Form, Form, u8)> {
     if x == y {
         return Vec::new();
@@ -6091,18 +6047,6 @@ fn order_limit(x: &Form, y: &Form, pred: IntPred) -> Vec<(Form, Form, u8)> {
     } else {
         vec![(y.clone(), x.clone(), mirrored(mask))]
     }
-}
-
-fn known_order(orders: &[(Form, Form, u8)], x: &Form, y: &Form) -> Option<u8> {
-    orders.iter().find_map(|(a, b, mask)| {
-        if a == x && b == y {
-            Some(*mask)
-        } else if a == y && b == x {
-            Some(mirrored(*mask))
-        } else {
-            None
-        }
-    })
 }
 
 fn orders_conjoined(mut a: Vec<(Form, Form, u8)>, b: Vec<(Form, Form, u8)>) -> Vec<(Form, Form, u8)> {
@@ -6149,47 +6093,6 @@ fn disjoined(a: Classes, b: Classes) -> Classes {
             Some((class, normalized([set, other.clone()].concat())))
         })
         .collect()
-}
-
-fn decide_pieces(pred: IntPred, xs: &[(u64, u64)], ys: &[(u64, u64)]) -> Option<bool> {
-    let signed = matches!(pred, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
-    let half = 1u64 << 31;
-    let flip = |set: &[(u64, u64)]| -> Vec<(u64, u64)> {
-        if !signed {
-            return set.to_vec();
-        }
-        let mut out = Vec::new();
-        for &(low, high) in set {
-            if high < half {
-                out.push((low + half, high + half));
-            } else if low >= half {
-                out.push((low - half, high - half));
-            } else {
-                out.push((low + half, 2 * half - 1));
-                out.push((0, high - half));
-            }
-        }
-        out
-    };
-    let unsigned = match pred {
-        IntPred::Slt => IntPred::Ult,
-        IntPred::Sle => IntPred::Ule,
-        IntPred::Sgt => IntPred::Ugt,
-        IntPred::Sge => IntPred::Uge,
-        other => other,
-    };
-    let (xs, ys) = (flip(xs), flip(ys));
-    let mut answer = None;
-    for &x in &xs {
-        for &y in &ys {
-            let r = decide(unsigned, x, y)?;
-            if answer.is_some_and(|a| a != r) {
-                return None;
-            }
-            answer = Some(r);
-        }
-    }
-    answer
 }
 
 fn swapped(pred: IntPred) -> IntPred {
@@ -9261,46 +9164,6 @@ mod facts_tests {
         assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(10)]);
     }
 
-    #[test]
-    fn decide_pieces_decides_exactly_when_every_pair_of_words_agrees() {
-        let mut r = Random::new(107);
-        let centers = [0u32, 3, 0x7fff_fffc, 0x8000_0000, u32::MAX - 3];
-        let mut small = |r: &mut Random| {
-            let mut set = Vec::new();
-            for _ in 0..1 + r.below(2) {
-                let low = centers[r.below(centers.len() as u64) as usize].wrapping_add(r.below(9) as u32).wrapping_sub(4);
-                let high = low.saturating_add(r.below(4) as u32);
-                set.push((low as u64, high as u64));
-            }
-            set
-        };
-        let mut wrong = Vec::new();
-        for _ in 0..4000 {
-            let pred = PREDICATES[r.below(10) as usize];
-            let (xs, ys) = (small(&mut r), small(&mut r));
-            let mut seen = [false; 2];
-            for &(lx, hx) in &xs {
-                for x in lx..=hx {
-                    for &(ly, hy) in &ys {
-                        for y in ly..=hy {
-                            seen[compare(pred, x as u32, y as u32) as usize] = true;
-                        }
-                    }
-                }
-            }
-            let truth = match seen {
-                [true, false] => Some(false),
-                [false, true] => Some(true),
-                _ => None,
-            };
-            let got = decide_pieces(pred, &xs, &ys);
-            if got != truth {
-                wrong.push(format!("{:?} {:?} {:?}: {:?}, not {:?}", pred, xs, ys, got, truth));
-            }
-        }
-        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(10)]);
-    }
-
     struct BranchesOnOneWord {
         b: Build,
         conditions: Vec<(IntPred, u32, u32)>,
@@ -9872,5 +9735,148 @@ mod facts_tests {
             [7u32, 9].iter().copied().filter(|&t| !representable(&a.unknowns, &form, t)).collect()
         });
         assert!(missed.is_empty(), "the first iteration sees 0 and gives 7, the next ones 1 and 2 and give 9: {:?}", missed);
+    }
+
+    fn branches_on_chained_orders() -> (Build, Vec<(&'static str, Box<dyn Fn(u32, u32, u32) -> bool>, Vec<(IntPred, ValueId)>)>) {
+        use IntPred::*;
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::B32);
+        let v = loaded_word(&mut b, &k, e, 4, MemSize::B32);
+        let w = loaded_word(&mut b, &k, e, 8, MemSize::B32);
+        let fork = |b: &mut Build, at: BlockId, cond: ValueId, exec: ValueId| {
+            let (yes, y) = b.block(&[Ty::I1]);
+            let (no, n) = b.block(&[Ty::I1]);
+            b.cond_br(at, cond, (yes, vec![exec]), (no, vec![exec]));
+            ((yes, y[0]), (no, n[0]))
+        };
+        let c1 = b.cmp(e, Ult, u, v);
+        let ((b1, e1), (x1, _)) = fork(&mut b, e, c1, k.exec);
+        let c2 = b.cmp(b1, Ult, v, w);
+        let ((b2, _), (x2, _)) = fork(&mut b, b1, c2, e1);
+        let c1 = |u: u32, v: u32, _: u32| u < v;
+        let c2 = |_: u32, v: u32, w: u32| v < w;
+        let reach: Vec<(&'static str, BlockId, Box<dyn Fn(u32, u32, u32) -> bool>)> = vec![
+            ("b1", b1, Box::new(move |u, v, w| c1(u, v, w))),
+            ("x1", x1, Box::new(move |u, v, w| !c1(u, v, w))),
+            ("b2", b2, Box::new(move |u, v, w| c1(u, v, w) && c2(u, v, w))),
+            ("x2", x2, Box::new(move |u, v, w| c1(u, v, w) && !c2(u, v, w))),
+        ];
+        let mut blocks = Vec::new();
+        for (name, block, reaches) in reach {
+            let queries = PREDICATES.iter().map(|&pred| (pred, b.cmp(block, pred, u, w))).collect();
+            blocks.push((name, reaches, queries));
+        }
+        (b, blocks)
+    }
+
+    fn chained_order_answers(exact: bool) -> Vec<String> {
+        let (b, blocks) = branches_on_chained_orders();
+        let points = [0u32, 1, 2, 3, 0x7fff_fffe, 0x7fff_ffff, 0x8000_0000, u32::MAX - 1, u32::MAX];
+        let mut wrong = Vec::new();
+        addresses(&b, &two_words(), |a| {
+            for (name, reaches, queries) in &blocks {
+                for &(pred, q) in queries {
+                    let mut seen = [false; 2];
+                    for &u in &points {
+                        for &v in &points {
+                            for &w in &points {
+                                if reaches(u, v, w) {
+                                    seen[compare(pred, u, w) as usize] = true;
+                                }
+                            }
+                        }
+                    }
+                    let truth = match seen {
+                        [false, false] => continue,
+                        [true, false] => Some(false),
+                        [false, true] => Some(true),
+                        _ => None,
+                    };
+                    let got = a.bit(q, 0, None).0;
+                    let ok = if exact { got == truth } else { got.is_none() || got == truth };
+                    if !ok {
+                        wrong.push(format!("{}: u {:?} w: {:?}, truth {:?}", name, pred, got, truth));
+                    }
+                }
+            }
+        });
+        wrong
+    }
+
+    #[test]
+    fn comparisons_under_chained_orders_decide_exactly_what_the_orders_settle_together() {
+        let wrong = chained_order_answers(true);
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+    }
+
+    #[test]
+    fn comparisons_under_chained_orders_hold_every_value_the_orders_leave() {
+        let wrong = chained_order_answers(false);
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+    }
+
+    fn branches_on_an_order_over_bytes() -> (Build, BlockId, Vec<(IntPred, u32, ValueId)>) {
+        use IntPred::*;
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let u = loaded_word(&mut b, &k, e, 0, MemSize::U8);
+        let v = loaded_word(&mut b, &k, e, 4, MemSize::U8);
+        let ten = b.constant(e, Ty::I32, 10);
+        let shifted = b.int(e, IntOp::Add, u, ten);
+        let c = b.cmp(e, Ugt, v, shifted);
+        let (yes, y) = b.block(&[Ty::I1]);
+        let (no, n) = b.block(&[Ty::I1]);
+        b.cond_br(e, c, (yes, vec![k.exec]), (no, vec![k.exec]));
+        let _ = (y, n);
+        let mut queries = Vec::new();
+        for &bound in &[9u32, 10, 11, 12, 254, 255] {
+            let k = b.constant(yes, Ty::I32, bound as u64);
+            for pred in PREDICATES {
+                queries.push((pred, bound, b.cmp(yes, pred, v, k)));
+            }
+        }
+        (b, yes, queries)
+    }
+
+    fn byte_order_answers(exact: bool) -> Vec<String> {
+        let (b, _, queries) = branches_on_an_order_over_bytes();
+        let mut wrong = Vec::new();
+        addresses(&b, &two_words(), |a| {
+            for &(pred, bound, q) in &queries {
+                let mut seen = [false; 2];
+                for u in 0u32..256 {
+                    for v in 0u32..256 {
+                        if v > u + 10 {
+                            seen[compare(pred, v, bound) as usize] = true;
+                        }
+                    }
+                }
+                let truth = match seen {
+                    [false, false] => continue,
+                    [true, false] => Some(false),
+                    [false, true] => Some(true),
+                    _ => None,
+                };
+                let got = a.bit(q, 0, None).0;
+                let ok = if exact { got == truth } else { got.is_none() || got == truth };
+                if !ok {
+                    wrong.push(format!("v {:?} {}: {:?}, truth {:?}", pred, bound, got, truth));
+                }
+            }
+        });
+        wrong
+    }
+
+    #[test]
+    fn comparisons_with_constants_under_an_order_over_bounded_words_decide_exactly_what_the_order_settles() {
+        let wrong = byte_order_answers(true);
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+    }
+
+    #[test]
+    fn comparisons_with_constants_under_an_order_over_bounded_words_hold_every_value_the_order_leaves() {
+        let wrong = byte_order_answers(false);
+        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(10)]);
     }
 }

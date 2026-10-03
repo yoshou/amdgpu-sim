@@ -98,10 +98,18 @@ impl Domain {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct Clause {
+    pub equal: Vec<Linear>,
+    pub at_least: Vec<Linear>,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Problem {
     pub domains: Vec<Domain>,
     pub equal: Vec<Linear>,
     pub at_least: Vec<Linear>,
+
+    pub either: Vec<Vec<Clause>>,
 }
 
 const STEPS: usize = 1 << 16;
@@ -169,8 +177,27 @@ impl Problem {
     }
 
     pub fn feasible(&self) -> Option<bool> {
-        let mut solver = Solver { steps: 0 };
-        solver.split(self, self.domains.clone())
+        let Some((first, rest)) = self.either.split_first() else {
+            let mut solver = Solver { steps: 0 };
+            return solver.split(self, self.domains.clone());
+        };
+        let mut unknown = false;
+        for option in first {
+            let mut chosen = self.clone();
+            chosen.either = rest.to_vec();
+            chosen.equal.extend(option.equal.iter().cloned());
+            chosen.at_least.extend(option.at_least.iter().cloned());
+            match chosen.feasible() {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            None
+        } else {
+            Some(false)
+        }
     }
 }
 
