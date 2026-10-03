@@ -3016,10 +3016,8 @@ fn settled(f: &Func, facts: &Facts, op: Op) -> bool {
         return false;
     }
     if let Op::Cmp(p, ..) = op {
-        if let (Some(a), Some(b)) = (interval(f, facts, x, 0), interval(f, facts, y, 0)) {
-            if decided(p, a, b).is_some() {
-                return true;
-            }
+        if super::terms::Terms::new(f, facts).decided(p, x, y).is_some() {
+            return true;
         }
     }
     let (Some(xs), Some(ys)) = (constant_choices(f, facts, x), constant_choices(f, facts, y)) else {
@@ -3123,38 +3121,6 @@ pub(super) fn interval(f: &Func, facts: &Facts, v: ValueId, depth: usize) -> Opt
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn decided(p: IntPred, x: (u32, u32), y: (u32, u32)) -> Option<bool> {
-    let signed = matches!(p, IntPred::Slt | IntPred::Sgt | IntPred::Sle | IntPred::Sge);
-    if signed && (x.1 >= 1 << 31 || y.1 >= 1 << 31) {
-        return None;
-    }
-    let below = |a: (u32, u32), b: (u32, u32)| {
-        if a.1 < b.0 {
-            Some(true)
-        } else if a.0 >= b.1 {
-            Some(false)
-        } else {
-            None
-        }
-    };
-    match p {
-        IntPred::Eq | IntPred::Ne => {
-            let equal = if x.1 < y.0 || y.1 < x.0 {
-                Some(false)
-            } else if x.0 == x.1 && y.0 == y.1 && x.0 == y.0 {
-                Some(true)
-            } else {
-                None
-            };
-            equal.map(|e| e == (p == IntPred::Eq))
-        }
-        IntPred::Ult | IntPred::Slt => below(x, y),
-        IntPred::Ugt | IntPred::Sgt => below(y, x),
-        IntPred::Ule | IntPred::Sle => below(y, x).map(|b| !b),
-        IntPred::Uge | IntPred::Sge => below(x, y).map(|b| !b),
     }
 }
 
@@ -7811,50 +7777,6 @@ mod difference_tests {
     }
 
     #[test]
-    fn decided_answers_only_what_every_pair_of_values_gives() {
-        let mut r = Random::new(29);
-        let mut wrong = Vec::new();
-        let bases = [0u32, 5, 30, 0x7fff_fff0, 0x8000_0000, 0xffff_fff0];
-        for _ in 0..3000 {
-            let mut pick = |r: &mut Random| {
-                let low = bases[r.below(bases.len() as u64) as usize].wrapping_add(r.below(12) as u32);
-                (low, low.saturating_add(r.below(12) as u32))
-            };
-            let (x, y) = (pick(&mut r), pick(&mut r));
-            for p in PREDICATES {
-                if let Some(answer) = decided(p, x, y) {
-                    let found = (x.0..=x.1).any(|a| (y.0..=y.1).any(|b| compare(p, a, b) != answer));
-                    if found {
-                        wrong.push(format!("{:?} {:?} {:?} decided {}", p, x, y, answer));
-                    }
-                }
-            }
-        }
-        assert!(wrong.is_empty(), "{} wrong, first {:?}", wrong.len(), &wrong[..wrong.len().min(5)]);
-    }
-
-    #[test]
-    fn decided_answers_every_pair_of_ranges_one_answer_covers() {
-        let mut r = Random::new(31);
-        let mut missed = Vec::new();
-        for _ in 0..3000 {
-            let mut pick = |r: &mut Random| {
-                let low = r.below(40) as u32;
-                (low, low + r.below(6) as u32)
-            };
-            let (x, y) = (pick(&mut r), pick(&mut r));
-            for p in PREDICATES {
-                let all = |answer: bool| (x.0..=x.1).all(|a| (y.0..=y.1).all(|b| compare(p, a, b) == answer));
-                let truth = if all(true) { Some(true) } else if all(false) { Some(false) } else { None };
-                if truth.is_some() && decided(p, x, y) != truth {
-                    missed.push(format!("{:?} {:?} {:?} is always {:?}", p, x, y, truth));
-                }
-            }
-        }
-        assert!(missed.is_empty(), "{} missed, first {:?}", missed.len(), &missed[..missed.len().min(5)]);
-    }
-
-    #[test]
     fn interval_holds_every_value_the_operations_give() {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -8344,5 +8266,53 @@ mod difference_tests {
             sound,
             exact
         );
+    }
+
+    fn relations_program() -> (Build, Vec<Case>) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let yes = b.constant(e, Ty::I1, 1);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, yes);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![c]);
+        let exec = k.exec;
+        let differs = move |l: &mut Logic, bit: &dyn Fn(ValueId) -> Bdd| {
+            let c = l.m.and(bit(set), bit(exec));
+            let absent = l.m.not(c);
+            l.m.and(absent, bit(q))
+        };
+        let k = |b: &mut Build, x: u64| b.constant(e, Ty::I32, x);
+        let (one, two, three, four) = (k(&mut b, 1), k(&mut b, 2), k(&mut b, 3), k(&mut b, 4));
+        let low = b.int(e, IntOp::And, flag, three);
+        let s = b.core(e, Ty::I32, Op::Select(q, low, four));
+        let next = b.int(e, IntOp::Add, s, one);
+        let mut cases = Vec::new();
+        let v = b.cmp(e, IntPred::Ult, s, next);
+        cases.push(Case { name: "s < s + 1 for s = select(q, flag & 3, 4)", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        let doubled = b.int(e, IntOp::Mul, s, two);
+        let v = b.cmp(e, IntPred::Ult, next, doubled);
+        cases.push(Case { name: "s + 1 < s * 2 for s = select(q, flag & 3, 4)", value: v, truth: Box::new(differs) });
+        let v = b.cmp(e, IntPred::Uge, doubled, s);
+        cases.push(Case { name: "s * 2 >= s for s = select(q, flag & 3, 4)", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
+        (b, cases)
+    }
+
+    #[test]
+    fn differences_vanish_for_operations_the_relations_of_their_operands_decide() {
+        let (b, cases) = relations_program();
+        let loose = check_differences(&b, &[], &cases, true);
+        assert!(loose.is_empty(), "differences that claim a disagreement that cannot happen: {:?}", loose);
+    }
+
+    #[test]
+    fn differences_hold_for_operations_the_relations_of_their_operands_leave_open() {
+        let (b, cases) = relations_program();
+        let missed = check_differences(&b, &[], &cases, false);
+        assert!(missed.is_empty(), "differences that miss a possible disagreement: {:?}", missed);
     }
 }

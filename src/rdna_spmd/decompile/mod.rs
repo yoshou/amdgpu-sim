@@ -9,6 +9,7 @@ mod logic;
 mod provenance;
 mod rewrite;
 mod search;
+mod terms;
 #[cfg(test)]
 mod testing;
 
