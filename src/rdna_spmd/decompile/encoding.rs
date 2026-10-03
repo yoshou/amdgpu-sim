@@ -63,7 +63,6 @@ pub(super) struct Encoding<'a> {
     difference: Linear,
     window: (i128, i128),
     modular: bool,
-    signs: HashMap<Var, Var>,
 }
 
 impl<'a> Encoding<'a> {
@@ -77,7 +76,6 @@ impl<'a> Encoding<'a> {
             difference: Linear::default(),
             window: (0, 0),
             modular: false,
-            signs: HashMap::default(),
         }
     }
 
@@ -529,79 +527,42 @@ pub(super) fn negated(pred: IntPred) -> IntPred {
 
 const HALF: i128 = 1 << 31;
 
-pub(super) fn signed_view(problem: &mut Problem, signs: &mut HashMap<Var, Var>, w: Var) -> Var {
-    if let Some(&s) = signs.get(&w) {
-        return s;
-    }
-    let s = problem.between(-HALF, HALF - 1);
-    let h = problem.between(0, 1);
-    problem.equal(Linear::constant(0).term(w, 1).term(h, -WORD).term(s, -1));
-    signs.insert(w, s);
-    s
-}
-
-fn outcome_clause(problem: &mut Problem, signs: &mut HashMap<Var, Var>, bit: u8, (wa, wb): (Var, Var)) -> Clause {
+fn outcome_clauses(bit: u8, (wa, wb): (Var, Var)) -> Vec<Clause> {
     let unsigned = Linear::constant(0).term(wa, 1).term(wb, -1);
-    let mut clause = Clause::default();
-    if bit == 1 {
-        clause.equal.push(unsigned);
-        return clause;
-    }
-    let (sa, sb) = (signed_view(problem, signs, wa), signed_view(problem, signs, wb));
-    let signed = Linear::constant(0).term(sa, 1).term(sb, -1);
     let below = |e: &Linear| Linear::constant(-1).plus(e, -1);
     let above = |e: &Linear| e.clone().offset(-1);
-    let (ub, ua) = (below(&unsigned), above(&unsigned));
-    let (sb_, sa_) = (below(&signed), above(&signed));
+    let low = |w: Var| Linear::constant(HALF - 1).term(w, -1);
+    let high = |w: Var| Linear::constant(-HALF).term(w, 1);
+    let clause = |at_least: Vec<Linear>| Clause { equal: Vec::new(), at_least };
     match bit {
-        2 => clause.at_least.extend([ub, sb_]),
-        4 => clause.at_least.extend([ub, sa_]),
-        8 => clause.at_least.extend([ua, sb_]),
-        _ => clause.at_least.extend([ua, sa_]),
+        1 => vec![Clause { equal: vec![unsigned], at_least: Vec::new() }],
+        2 => vec![clause(vec![below(&unsigned), low(wa), low(wb)]), clause(vec![below(&unsigned), high(wa), high(wb)])],
+        4 => vec![clause(vec![low(wa), high(wb)])],
+        8 => vec![clause(vec![high(wa), low(wb)])],
+        _ => vec![clause(vec![above(&unsigned), low(wa), low(wb)]), clause(vec![above(&unsigned), high(wa), high(wb)])],
     }
-    clause
 }
 
-pub(super) fn relation_options(problem: &mut Problem, signs: &mut HashMap<Var, Var>, mask: u8, (wa, wb): (Var, Var)) -> Vec<Clause> {
+pub(super) fn relation_options(mask: u8, (wa, wb): (Var, Var)) -> Vec<Clause> {
     let unsigned = Linear::constant(0).term(wa, 1).term(wb, -1);
-    let one = |at_least: Vec<Linear>, equal: Vec<Linear>| vec![Clause { equal, at_least }];
+    let one = |at_least: Vec<Linear>| vec![Clause { equal: Vec::new(), at_least }];
     let below = |e: &Linear| Linear::constant(-1).plus(e, -1);
     let above = |e: &Linear| e.clone().offset(-1);
     let at_most = |e: &Linear| Linear::constant(0).plus(e, -1);
-    let plain = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge];
-    for pred in plain {
-        if outcomes(pred) != mask {
-            continue;
-        }
-        let e = if matches!(pred, IntPred::Ult | IntPred::Ule | IntPred::Ugt | IntPred::Uge) {
-            unsigned
-        } else {
-            let (sa, sb) = (signed_view(problem, signs, wa), signed_view(problem, signs, wb));
-            Linear::constant(0).term(sa, 1).term(sb, -1)
-        };
-        let bound = match pred {
-            IntPred::Ult | IntPred::Slt => below(&e),
-            IntPred::Ule | IntPred::Sle => at_most(&e),
-            IntPred::Ugt | IntPred::Sgt => above(&e),
-            _ => e.clone(),
-        };
-        return one(vec![bound], Vec::new());
+    match mask {
+        m if m == outcomes(IntPred::Ult) => one(vec![below(&unsigned)]),
+        m if m == outcomes(IntPred::Ule) => one(vec![at_most(&unsigned)]),
+        m if m == outcomes(IntPred::Ugt) => one(vec![above(&unsigned)]),
+        m if m == outcomes(IntPred::Uge) => one(vec![unsigned]),
+        m if m == outcomes(IntPred::Eq) => outcome_clauses(1, (wa, wb)),
+        m if m == outcomes(IntPred::Ne) => vec![Clause { equal: Vec::new(), at_least: vec![below(&unsigned)] }, Clause { equal: Vec::new(), at_least: vec![above(&unsigned)] }],
+        _ => (0..5).filter(|k| mask & (1 << k) != 0).flat_map(|k| outcome_clauses(1 << k, (wa, wb))).collect(),
     }
-    if mask == outcomes(IntPred::Eq) {
-        return one(Vec::new(), vec![unsigned]);
-    }
-    if mask == outcomes(IntPred::Ne) {
-        return vec![
-            Clause { equal: Vec::new(), at_least: vec![below(&unsigned)] },
-            Clause { equal: Vec::new(), at_least: vec![above(&unsigned)] },
-        ];
-    }
-    (0..5).filter(|k| mask & (1 << k) != 0).map(|k| outcome_clause(problem, signs, 1 << k, (wa, wb))).collect()
 }
 
 impl<'a> Encoding<'a> {
     fn options(&mut self, mask: u8, (wa, wb): (Var, Var)) -> Vec<Clause> {
-        relation_options(&mut self.problem, &mut self.signs, mask, (wa, wb))
+        relation_options(mask, (wa, wb))
     }
 
     pub(super) fn orders(&mut self, side: usize, orders: &[(Form, Form, u8)]) -> usize {

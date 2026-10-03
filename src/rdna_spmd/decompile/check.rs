@@ -1881,6 +1881,13 @@ impl<'c, 'a> Explore<'c, 'a> {
                 let h = self.check.h[v.0];
                 h != Bdd::FALSE && self.check.and(self.assume, h) != Bdd::FALSE
             }
+            Atom::Cell(block, group, _) => {
+                let leaves: Vec<ValueId> = self.check.logic.cell_leaves(block, group).to_vec();
+                leaves.iter().any(|&v| {
+                    let h = self.check.h[v.0];
+                    h != Bdd::FALSE && self.check.and(self.assume, h) != Bdd::FALSE
+                })
+            }
             _ => false,
         };
         self.unreliable.insert(var, u);
@@ -6019,6 +6026,67 @@ mod tests {
         assert!(converted(&b).is_empty(), "{:?}: lanes with x >= 5 store 3, which the query never reaches", converted(&b));
     }
 
+    fn sum_bound_into_a_difference(bytes: bool, bound: u64, next_block: bool) -> Build {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let data = query_data(&mut b, &k, e);
+        let size = if bytes { MemSize::U8 } else { MemSize::B32 };
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let (first, second) = (k.buffer(&mut b, e, 16), k.buffer(&mut b, e, 24));
+        let (own_x, own_y) = (byte_offset(&mut b, e, first, lane, 4), byte_offset(&mut b, e, second, lane, 4));
+        let x = b.load(e, Space::Global, size, own_x, k.exec);
+        let y = b.load(e, Space::Global, size, own_y, k.exec);
+        let sum = b.int(e, IntOp::Add, x, y);
+        let ten = b.constant(e, Ty::I32, 10);
+        let small = b.cmp(e, IntPred::Ult, sum, ten);
+        let three = b.constant(e, Ty::I32, 3);
+        let v = b.core(e, Ty::I32, Op::Select(small, data, three));
+        let buf = k.buffer(&mut b, e, 0);
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let (block, exec, own, x, v) = if next_block {
+            let (next, p) = b.block(&[Ty::I1, Ty::I64, Ty::I32, Ty::I32]);
+            b.br(e, next, vec![k.exec, own, x, v]);
+            (next, p[0], p[1], p[2], p[3])
+        } else {
+            (e, k.exec, own, x, v)
+        };
+        let bound = b.constant(block, Ty::I32, bound);
+        let test = b.cmp(block, IntPred::Uge, x, bound);
+        let mask = b.int(block, IntOp::And, test, exec);
+        b.store(block, Space::Global, MemSize::B32, own, v, mask);
+        b
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_a_bound_on_a_summand_rules_out_a_bound_on_the_sum() {
+        let b = sum_bound_into_a_difference(true, 10, false);
+        assert!(converted(&b).is_empty(), "{:?}: bytes with x >= 10 have x + y >= 10, so they store 3", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_a_looser_bound_on_a_summand_lets_the_sum_through() {
+        let b = sum_bound_into_a_difference(true, 5, false);
+        assert!(keeps(&b).is_empty(), "{:?}: x = 5 and y = 0 pass both tests and store the answer", keeps(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_a_bound_on_a_summand_lets_a_wrapping_sum_through() {
+        let b = sum_bound_into_a_difference(false, 10, false);
+        assert!(keeps(&b).is_empty(), "{:?}: x = 0xffffffff and y = 1 sum to 0 and store the answer", keeps(&b));
+    }
+
+    #[test]
+    fn prove_converts_a_query_whose_word_a_bound_on_a_summand_carried_into_the_next_block_rules_out_a_bound_on_the_sum() {
+        let b = sum_bound_into_a_difference(true, 10, true);
+        assert!(converted(&b).is_empty(), "{:?}: bytes with x >= 10 have x + y >= 10, so the next block stores 3", converted(&b));
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_word_a_looser_bound_on_a_summand_carried_into_the_next_block_lets_the_sum_through() {
+        let b = sum_bound_into_a_difference(true, 5, true);
+        assert!(keeps(&b).is_empty(), "{:?}: x = 5 and y = 0 pass both tests and the next block stores the answer", keeps(&b));
+    }
+
     fn arms_store_two(order: bool, second: u64) -> Build {
         arms_store(move |b, block, side, p| {
             let past = b.constant(block, Ty::I64, 128);
@@ -7904,7 +7972,11 @@ mod difference_tests {
                 let mut atoms: HashMap<ValueId, Bdd> = HashMap::default();
                 for v in 0..f.types.len() {
                     if f.types[v] == Ty::I1 {
-                        atoms.insert(ValueId(v), logic.atom(Atom::Bit(ValueId(v))));
+                        let bit = match facts.op(f, ValueId(v)) {
+                            Some(Op::Cmp(..)) => logic.bit(f, &facts, ValueId(v)),
+                            _ => logic.atom(Atom::Bit(ValueId(v))),
+                        };
+                        atoms.insert(ValueId(v), bit);
                     }
                 }
                 (case.truth)(logic, &|v| atoms[&v])

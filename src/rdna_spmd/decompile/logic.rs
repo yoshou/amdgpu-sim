@@ -18,6 +18,7 @@ pub enum Atom {
     Term(usize, bool),
     Next(ValueId, bool),
     Marker(Choice),
+    Cell(BlockId, u16, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -81,15 +82,153 @@ pub struct Logic {
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
     lane_values: HashMap<ValueId, Option<[u32; 32]>>,
-    orders: HashMap<BlockId, Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>>>,
-    thresholds: HashMap<BlockId, Rc<Vec<Threshold>>>,
     supports: HashMap<Bdd, Rc<Vec<u32>>>,
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
     relations: BTreeMap<(BlockId, usize), Rc<Vec<Binding>>>,
     images: HashMap<(usize, usize, Bdd), Bdd>,
     uniform_tests: HashSet<ValueId>,
-    comparisons: HashMap<BlockId, Rc<Vec<(usize, ValueId, IntPred, ValueId, ValueId)>>>,
+    cells: HashMap<BlockId, Rc<BlockCells>>,
+    cell_groups: HashMap<(BlockId, u16), (u8, Vec<ValueId>)>,
+    bridges: HashMap<(BlockId, usize), Rc<Vec<Binding>>>,
 }
+
+#[derive(Default)]
+struct BlockCells {
+    of: HashMap<ValueId, (Option<u16>, Rc<Tree>)>,
+    placed: HashMap<usize, (u16, usize)>,
+    groups: Vec<CellGroup>,
+}
+
+#[derive(Debug)]
+enum Tree {
+    Const(bool),
+    Leaf(usize),
+    Pick(ValueId, Rc<Tree>, Rc<Tree>),
+}
+
+impl Tree {
+    fn leaves(&self, out: &mut BTreeSet<usize>) {
+        match self {
+            Tree::Const(_) => {}
+            Tree::Leaf(i) => {
+                out.insert(*i);
+            }
+            Tree::Pick(_, a, b) => {
+                a.leaves(out);
+                b.leaves(out);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct Distributor {
+    preds: Vec<(IntPred, ValueId, ValueId)>,
+    trees: HashMap<(IntPred, ValueId, ValueId), Rc<Tree>>,
+}
+
+impl Distributor {
+    fn distribute(&mut self, f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Rc<Tree> {
+        if let Some(tree) = self.trees.get(&(p, a, b)) {
+            return tree.clone();
+        }
+        let select = |x: ValueId| match facts.op(f, x) {
+            Some(Op::Select(c, u, v)) => Some((c, u, v)),
+            _ => None,
+        };
+        let tree = if let Some((c, u, v)) = select(a) {
+            let yes = self.distribute(f, facts, p, u, b);
+            let no = self.distribute(f, facts, p, v, b);
+            Tree::Pick(c, yes, no)
+        } else if let Some((c, u, v)) = select(b) {
+            let yes = self.distribute(f, facts, p, a, u);
+            let no = self.distribute(f, facts, p, a, v);
+            Tree::Pick(c, yes, no)
+        } else if let Some(value) = super::terms::Terms::new(f, facts).decided(p, a, b) {
+            Tree::Const(value)
+        } else {
+            let index = match self.preds.iter().position(|&q| q == (p, a, b)) {
+                Some(i) => i,
+                None => {
+                    self.preds.push((p, a, b));
+                    self.preds.len() - 1
+                }
+            };
+            Tree::Leaf(index)
+        };
+        let tree = Rc::new(tree);
+        self.trees.insert((p, a, b), tree.clone());
+        tree
+    }
+}
+
+fn grouped(leaves: &[Option<BTreeSet<ValueId>>]) -> Vec<Vec<usize>> {
+    let mut parent: Vec<usize> = (0..leaves.len()).collect();
+    fn root(parent: &mut Vec<usize>, i: usize) -> usize {
+        let mut i = i;
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut owner: HashMap<ValueId, usize> = HashMap::default();
+    for (i, set) in leaves.iter().enumerate() {
+        for &leaf in set.iter().flatten() {
+            match owner.get(&leaf) {
+                Some(&j) => {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                    parent[a] = b;
+                }
+                None => {
+                    owner.insert(leaf, i);
+                }
+            }
+        }
+    }
+    let mut members: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..leaves.len() {
+        if leaves[i].is_some() {
+            let r = root(&mut parent, i);
+            members.entry(r).or_default().push(i);
+        }
+    }
+    members.into_values().collect()
+}
+
+struct CellGroup {
+    worlds: Vec<Vec<bool>>,
+    preds: Vec<(IntPred, ValueId, ValueId)>,
+    leaves: BTreeSet<ValueId>,
+    uniform: Vec<bool>,
+    parts: Vec<(usize, usize)>,
+    counts: (usize, usize),
+}
+
+impl CellGroup {
+    fn new(worlds: Vec<Vec<bool>>, preds: Vec<(IntPred, ValueId, ValueId)>, leaves: BTreeSet<ValueId>, uniform: Vec<bool>) -> Self {
+        let project = |world: &Vec<bool>, keep: bool| -> Vec<bool> { world.iter().zip(&uniform).filter(|&(_, &u)| u == keep).map(|(&w, _)| w).collect() };
+        let index = |list: &mut Vec<Vec<bool>>, part: Vec<bool>| match list.iter().position(|p| *p == part) {
+            Some(i) => i,
+            None => {
+                list.push(part);
+                list.len() - 1
+            }
+        };
+        let (mut firsts, mut seconds): (Vec<Vec<bool>>, Vec<Vec<bool>>) = (Vec::new(), Vec::new());
+        let parts: Vec<(usize, usize)> = worlds.iter().map(|world| (index(&mut firsts, project(world, true)), index(&mut seconds, project(world, false)))).collect();
+        let counts = (firsts.len(), seconds.len());
+        CellGroup { worlds, preds, leaves, uniform, parts, counts }
+    }
+
+    fn bits(count: usize) -> u8 {
+        (usize::BITS - count.saturating_sub(1).leading_zeros()) as u8
+    }
+}
+
+const CELLS: usize = 64;
+const GROUP: usize = 12;
+const JOINT: usize = 1 << 10;
 
 impl Logic {
     fn with(
@@ -124,14 +263,14 @@ impl Logic {
             bits: HashMap::default(),
             views: HashMap::default(),
             lane_values: HashMap::default(),
-            orders: HashMap::default(),
-            thresholds: HashMap::default(),
             supports: HashMap::default(),
             edges: BTreeMap::new(),
             relations: BTreeMap::new(),
             images: HashMap::default(),
             uniform_tests: HashSet::default(),
-            comparisons: HashMap::default(),
+            cells: HashMap::default(),
+            cell_groups: HashMap::default(),
+            bridges: HashMap::default(),
         }
     }
 
@@ -331,6 +470,10 @@ impl Logic {
                 }
             }
             Atom::Lane(i) => (2 << 30) | i as u32,
+            Atom::Cell(block, group, bit) => {
+                assert!(block.0 < 1 << 19 && group < 64 && bit < 16, "too many cells");
+                (1 << 30) | (1 << 29) | ((block.0 as u32) << 10) | ((group as u32) << 4) | bit as u32
+            }
             Atom::WordBit(v, i) => {
                 assert!(v.0 < 1 << 26, "function too large");
                 (2 << 30) + 8 + ((v.0 as u32) << 3) + i as u32
@@ -367,6 +510,7 @@ impl Logic {
             Atom::View(v) => facts.saturated[v.0],
             Atom::WordBit(v, _) => facts.uniform[v.0],
             Atom::Marker(_) => true,
+            Atom::Cell(block, group, bit) => bit < self.cell_groups[&(block, group)].0,
             Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
         }
     }
@@ -377,8 +521,230 @@ impl Logic {
                 Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),
                 Site::Unreached => None,
             },
+            Atom::Cell(block, ..) => Some(block),
             Atom::Lane(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
         }
+    }
+
+    pub fn cell_leaves(&self, block: BlockId, group: u16) -> &[ValueId] {
+        &self.cell_groups[&(block, group)].1
+    }
+
+    fn block_cells(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<BlockCells> {
+        if let Some(cells) = self.cells.get(&block) {
+            return cells.clone();
+        }
+        let mut distributor = Distributor::default();
+        let mut trees: Vec<(ValueId, Rc<Tree>)> = Vec::new();
+        for inst in &f.blocks[&block].insts {
+            if let Inst::Core { value, op: Op::Cmp(p, a, b), .. } = inst {
+                if f.types[a.0] == Ty::I32 {
+                    trees.push((*value, distributor.distribute(f, facts, *p, *a, *b)));
+                }
+            }
+        }
+        let preds = distributor.preds;
+        let terms = super::terms::Terms::new(f, facts);
+        let leaves: Vec<Option<BTreeSet<ValueId>>> = preds
+            .iter()
+            .map(|&(_, a, b)| {
+                let (mut set, mut lane) = (BTreeSet::new(), false);
+                terms.leaves(a, 0, &mut set, &mut lane);
+                terms.leaves(b, 0, &mut set, &mut lane);
+                (!set.is_empty() && set.iter().all(|l| !facts.lane_word[l.0])).then_some(set)
+            })
+            .collect();
+        let mut cells = BlockCells::default();
+        for list in grouped(&leaves) {
+            if list.len() > GROUP {
+                continue;
+            }
+            let preds: Vec<(IntPred, ValueId, ValueId)> = list.iter().map(|&i| preds[i]).collect();
+            let Some(worlds) = super::terms::Terms::new(f, facts).worlds(&preds, CELLS) else {
+                continue;
+            };
+            if worlds.is_empty() {
+                continue;
+            }
+            let uniform: Vec<bool> = preds.iter().map(|&p| super::terms::Terms::new(f, facts).uniform(p)).collect();
+            let leaves: BTreeSet<ValueId> = list.iter().flat_map(|&i| leaves[i].iter().flatten().copied()).collect();
+            let group = CellGroup::new(worlds, preds, leaves, uniform);
+            let number = cells.groups.len() as u16;
+            self.cell_groups.insert((block, number), (CellGroup::bits(group.counts.0), group.leaves.iter().copied().collect()));
+            for (k, &i) in list.iter().enumerate() {
+                cells.placed.insert(i, (number, k));
+            }
+            cells.groups.push(group);
+        }
+        for (value, tree) in trees {
+            let mut indices = BTreeSet::new();
+            tree.leaves(&mut indices);
+            let group = match indices.first() {
+                None => None,
+                Some(first) => match cells.placed.get(first) {
+                    Some(&(group, _)) if indices.iter().all(|i| cells.placed.get(i).is_some_and(|&(g, _)| g == group)) => Some(group),
+                    _ => continue,
+                },
+            };
+            cells.of.insert(value, (group, tree));
+        }
+        let cells = Rc::new(cells);
+        self.cells.insert(block, cells.clone());
+        cells
+    }
+
+    fn cell_bit(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<Bdd> {
+        let Site::Inst { block, .. } = facts.site[v.0] else {
+            return None;
+        };
+        let cells = self.block_cells(f, facts, block);
+        let (group, tree) = cells.of.get(&v)?;
+        let (group, tree) = (*group, tree.clone());
+        let mut done = HashMap::default();
+        Some(self.tree_bit(f, facts, block, group.unwrap_or(0), &tree, &cells, &mut done))
+    }
+
+    fn tree_bit(&mut self, f: &Func, facts: &Facts, block: BlockId, group: u16, tree: &Rc<Tree>, cells: &BlockCells, done: &mut HashMap<*const Tree, Bdd>) -> Bdd {
+        if let Some(&b) = done.get(&Rc::as_ptr(tree)) {
+            return b;
+        }
+        let result = match &**tree {
+            Tree::Const(value) => {
+                if *value {
+                    Bdd::TRUE
+                } else {
+                    Bdd::FALSE
+                }
+            }
+            Tree::Leaf(index) => {
+                let k = &cells.placed[index].1;
+                let g = &cells.groups[group as usize];
+                let mut result = Bdd::FALSE;
+                if g.uniform[*k] {
+                    let mut seen = BTreeSet::new();
+                    for (cell, world) in g.worlds.iter().enumerate() {
+                        if world[*k] && seen.insert(g.parts[cell].0) {
+                            let minterm = self.part_minterm(block, group, 0, g.parts[cell].0, g.counts.0);
+                            result = self.m.or(result, minterm);
+                        }
+                    }
+                } else {
+                    for (cell, world) in g.worlds.iter().enumerate() {
+                        if world[*k] {
+                            let minterm = self.cell_minterm(block, group, cell, g);
+                            result = self.m.or(result, minterm);
+                        }
+                    }
+                }
+                result
+            }
+            Tree::Pick(c, yes, no) => {
+                let c = self.bit(f, facts, *c);
+                let yes = self.tree_bit(f, facts, block, group, yes, cells, done);
+                let no = self.tree_bit(f, facts, block, group, no, cells, done);
+                self.m.ite(c, yes, no)
+            }
+        };
+        done.insert(Rc::as_ptr(tree), result);
+        result
+    }
+
+    fn cell_minterm(&mut self, block: BlockId, group: u16, cell: usize, g: &CellGroup) -> Bdd {
+        let (u, v) = g.parts[cell];
+        let first = self.part_minterm(block, group, 0, u, g.counts.0);
+        let second = self.part_minterm(block, group, CellGroup::bits(g.counts.0), v, g.counts.1);
+        self.m.and(first, second)
+    }
+
+    fn part_minterm(&mut self, block: BlockId, group: u16, offset: u8, part: usize, count: usize) -> Bdd {
+        let bits = CellGroup::bits(count);
+        let mut result = Bdd::FALSE;
+        for index in 0..(1usize << bits) {
+            if index.min(count - 1) != part {
+                continue;
+            }
+            let mut minterm = Bdd::TRUE;
+            for i in 0..bits {
+                let var = self.atom(Atom::Cell(block, group, offset + i));
+                let literal = if index >> i & 1 == 1 { var } else { self.m.not(var) };
+                minterm = self.m.and(minterm, literal);
+            }
+            result = self.m.or(result, minterm);
+        }
+        result
+    }
+
+    fn bridges(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Rc<Vec<Binding>> {
+        if let Some(b) = self.bridges.get(&(src, slot)) {
+            return b.clone();
+        }
+        let links = Rc::new(self.cell_bridges(f, facts, src, slot));
+        self.bridges.insert((src, slot), links.clone());
+        links
+    }
+
+    fn cell_bridges(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<Binding> {
+        let edge = f.blocks[&src].term.edges().nth(slot).unwrap();
+        let dst = edge.dst;
+        if dst == src {
+            return Vec::new();
+        }
+        let substitution: HashMap<ValueId, ValueId> = f.blocks[&dst]
+            .params
+            .iter()
+            .zip(&edge.args)
+            .map(|(&(param, _), &arg)| (param, arg))
+            .collect();
+        let (from, to) = (self.block_cells(f, facts, src), self.block_cells(f, facts, dst));
+        let mut out = Vec::new();
+        for (g_to, target) in to.groups.iter().enumerate() {
+            let params: Vec<ValueId> = target.leaves.iter().copied().filter(|l| substitution.contains_key(l)).collect();
+            if params.is_empty() || params.iter().any(|p| !self.carried(*p)) {
+                continue;
+            }
+            let mut mapped: BTreeSet<ValueId> = BTreeSet::new();
+            let terms = super::terms::Terms::substituting(f, facts, substitution.clone());
+            for &(_, a, b) in &target.preds {
+                let mut lane = false;
+                terms.leaves(a, 0, &mut mapped, &mut lane);
+                terms.leaves(b, 0, &mut mapped, &mut lane);
+                if lane {
+                    mapped.clear();
+                    break;
+                }
+            }
+            if mapped.is_empty() {
+                continue;
+            }
+            for (g_from, source) in from.groups.iter().enumerate() {
+                if source.leaves.is_disjoint(&mapped) {
+                    continue;
+                }
+                let preds: Vec<(IntPred, ValueId, ValueId)> = source.preds.iter().chain(&target.preds).copied().collect();
+                let mut terms = super::terms::Terms::substituting(f, facts, substitution.clone());
+                let Some(worlds) = terms.worlds(&preds, JOINT) else {
+                    continue;
+                };
+                let mut relation = Bdd::FALSE;
+                for world in &worlds {
+                    let (a, b) = world.split_at(source.preds.len());
+                    let (Some(i), Some(j)) = (source.worlds.iter().position(|w| w == a), target.worlds.iter().position(|w| w == b)) else {
+                        continue;
+                    };
+                    let left = self.cell_minterm(src, g_from as u16, i, source);
+                    let right = self.cell_minterm(dst, g_to as u16, j, target);
+                    let both = self.m.and(left, right);
+                    relation = self.m.or(relation, both);
+                }
+                let support = self.scoped(facts, relation, src);
+                out.push(Binding {
+                    atom: Bdd::TRUE,
+                    bound: relation,
+                    support,
+                });
+            }
+        }
+        out
     }
 
     fn scoped(&mut self, facts: &Facts, f: Bdd, block: BlockId) -> Vec<u32> {
@@ -448,31 +814,9 @@ impl Logic {
                     self.lanes(|l| values[l as usize] & 1 == 1)
                 }
                 Op::Cmp(p, a, b) if self.small_comparison(f, facts, p, a, b).is_some() => self.small_comparison(f, facts, p, a, b).unwrap(),
+                Op::Cmp(..) if self.cell_bit(f, facts, v).is_some() => self.cell_bit(f, facts, v).unwrap(),
                 Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
-                    let leaf = match (equality(f, facts, p, a, b), facts.site[v.0]) {
-                        (Some(e), Site::Inst { block, index }) => {
-                            let equal = self.equal(f, facts, block, index, v, e);
-                            if e.flip {
-                                self.m.not(equal)
-                            } else {
-                                equal
-                            }
-                        }
-                        (None, Site::Inst { .. })
-                            if f.types[a.0] == Ty::I32 && a != b && facts.constant(f, a).is_none() && facts.constant(f, b).is_none() =>
-                        {
-                            if !facts.uniform[v.0] && uniform_difference(f, facts, a, b) {
-                                self.uniform_tests.insert(v);
-                            }
-                            let equal = self.value_equality(f, facts, v, a, b, p == IntPred::Ne);
-                            if p == IntPred::Ne {
-                                self.m.not(equal)
-                            } else {
-                                equal
-                            }
-                        }
-                        _ => self.atom(opaque),
-                    };
+                    let leaf = self.open_comparison(f, facts, v, p, a, b);
                     self.compare(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::FCmp(p, a, b) => {
@@ -481,36 +825,7 @@ impl Logic {
                     self.float_order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 Op::Cmp(p, a, b) => {
-                    let uniform = !facts.uniform[v.0] && uniform_order(f, facts, p, a, b);
-                    if uniform {
-                        self.uniform_tests.insert(v);
-                    }
-                    let leaf = match (threshold(f, facts, p, a, b), facts.site[v.0]) {
-                        (Some(t), Site::Inst { block, index }) => {
-                            let below = self.below(f, facts, block, index, v, t);
-                            if t.flip {
-                                self.m.not(below)
-                            } else {
-                                below
-                            }
-                        }
-                        _ => {
-                            let (q, x, y, negated) = ordered(p, a, b);
-                            let first = match facts.site[v.0] {
-                                Site::Inst { block, .. } => self.first_order(f, block)[&(q, x, y)],
-                                _ => v,
-                            };
-                            if uniform {
-                                self.uniform_tests.insert(first);
-                            }
-                            let relation = self.relation(f, facts, first, (q, x, y));
-                            if negated {
-                                self.m.not(relation)
-                            } else {
-                                relation
-                            }
-                        }
-                    };
+                    let leaf = self.open_comparison(f, facts, v, p, a, b);
                     self.order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
                 _ => self.atom(opaque),
@@ -519,37 +834,22 @@ impl Logic {
         }
     }
 
-    fn below(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, t: Threshold) -> Bdd {
-        self.within(f, facts, block, index, v, t)
-    }
-
-    fn equal(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, e: Threshold) -> Bdd {
-        self.within(f, facts, block, index, v, e)
-    }
-
-    fn within(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, v: ValueId, t: Threshold) -> Bdd {
-        let target = t.truth();
-        if target.is_empty() {
-            return Bdd::FALSE;
-        }
-        if target == [(0, u32::MAX as u64)] {
-            return Bdd::TRUE;
-        }
-        let list = self.block_thresholds(f, facts, block);
-        let earlier: Vec<Threshold> = list.iter().filter(|e| e.index < index && e.value == t.value).copied().collect();
-        let mut sets: Vec<(Bdd, Vec<(u64, u64)>)> = Vec::new();
-        for e in &earlier {
-            let bit = self.bit(f, facts, e.of);
-            let holds = if e.flip { self.m.not(bit) } else { bit };
-            let set = e.truth();
-            if set == target {
-                return holds;
+    fn open_comparison(&mut self, f: &Func, facts: &Facts, v: ValueId, p: IntPred, a: ValueId, b: ValueId) -> Bdd {
+        if !facts.uniform[v.0] && f.types[a.0] == Ty::I32 && a != b {
+            let mut terms = super::terms::Terms::new(f, facts);
+            let (mut leaves, mut lane) = (BTreeSet::new(), false);
+            terms.leaves(a, 0, &mut leaves, &mut lane);
+            terms.leaves(b, 0, &mut leaves, &mut lane);
+            let open = !leaves.is_empty() && leaves.iter().all(|l| !facts.lane_word[l.0]);
+            if open && !leaves.iter().all(|l| facts.uniform[l.0]) || lane {
+                if open && terms.uniform((p, a, b)) {
+                    self.uniform_tests.insert(v);
+                }
+            } else if open {
+                self.uniform_tests.insert(v);
             }
-            sets.push((holds, set));
         }
-        let atom = self.atom(Atom::Bit(v));
-        let free = if t.flip { self.m.not(atom) } else { atom };
-        self.cells(&sets, &target, free, u32::MAX as u64)
+        self.atom(Atom::Bit(v))
     }
 
     fn float_within(&mut self, f: &Func, facts: &Facts, v: ValueId, p: FloatPred, a: ValueId, b: ValueId) -> Bdd {
@@ -713,178 +1013,6 @@ impl Logic {
         result
     }
 
-    fn block_thresholds(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<Vec<Threshold>> {
-        if let Some(list) = self.thresholds.get(&block) {
-            return list.clone();
-        }
-        let mut list = Vec::new();
-        for (index, inst) in f.blocks[&block].insts.iter().enumerate() {
-            if let Inst::Core {
-                value,
-                op: Op::Cmp(p, a, b),
-                ..
-            } = inst
-            {
-                if let Some(t) = threshold(f, facts, *p, *a, *b).or_else(|| equality(f, facts, *p, *a, *b)) {
-                    list.push(Threshold { index, of: *value, ..t });
-                }
-            }
-        }
-        let list = Rc::new(list);
-        self.thresholds.insert(block, list.clone());
-        list
-    }
-
-    fn relation(&mut self, f: &Func, facts: &Facts, first: ValueId, (q, x, y): (IntPred, ValueId, ValueId)) -> Bdd {
-        let atom = self.atom(Atom::Bit(first));
-        let Some(Op::Cmp(p, a, b)) = facts.op(f, first) else {
-            unreachable!("the first order of a block is a comparison")
-        };
-        let holds = if ordered(p, a, b).3 { self.m.not(atom) } else { atom };
-        let Site::Inst { block, index } = facts.site[first.0] else {
-            return holds;
-        };
-        let edges = self.order_edges(f, facts, block, index, Some(q));
-        if edges.is_empty() {
-            return holds;
-        }
-        let (back, _) = self.paths(&edges, y, x);
-        let (_, forward) = self.paths(&edges, x, y);
-        let open = self.m.not(back);
-        let allowed = self.m.and(holds, open);
-        self.m.or(allowed, forward)
-    }
-
-    fn value_equality(&mut self, f: &Func, facts: &Facts, v: ValueId, x: ValueId, y: ValueId, flip: bool) -> Bdd {
-        let atom = self.atom(Atom::Bit(v));
-        let holds = if flip { self.m.not(atom) } else { atom };
-        let Site::Inst { block, index } = facts.site[v.0] else {
-            return holds;
-        };
-        let (must, apart) = self.equal_in(f, facts, block, index, x, y);
-        let open = self.m.not(apart);
-        let allowed = self.m.and(holds, open);
-        self.m.or(allowed, must)
-    }
-
-    fn equal_in(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, x: ValueId, y: ValueId) -> (Bdd, Bdd) {
-        let mut must = Bdd::FALSE;
-        let mut apart = Bdd::FALSE;
-        for q in [IntPred::Ult, IntPred::Slt] {
-            let edges = self.order_edges(f, facts, block, index, Some(q));
-            if edges.is_empty() {
-                continue;
-            }
-            let (up, above) = self.paths(&edges, x, y);
-            let (down, below) = self.paths(&edges, y, x);
-            let both = self.m.and(up, down);
-            must = self.m.or(must, both);
-            let strict = self.m.or(above, below);
-            apart = self.m.or(apart, strict);
-        }
-        let edges = self.order_edges(f, facts, block, index, None);
-        if !edges.is_empty() {
-            let (joined, _) = self.paths(&edges, x, y);
-            must = self.m.or(must, joined);
-            let unequal: Vec<(ValueId, ValueId, Bdd)> = edges.iter().step_by(2).map(|&(a, b, _, equal)| (a, b, self.m.not(equal))).collect();
-            for (a, b, differ) in unequal {
-                let (xa, _) = self.paths(&edges, x, a);
-                let (by, _) = self.paths(&edges, b, y);
-                let (xb, _) = self.paths(&edges, x, b);
-                let (ay, _) = self.paths(&edges, a, y);
-                let direct = self.m.and(xa, by);
-                let crossed = self.m.and(xb, ay);
-                let linked = self.m.or(direct, crossed);
-                let split = self.m.and(differ, linked);
-                apart = self.m.or(apart, split);
-            }
-        }
-        (must, apart)
-    }
-
-    fn block_comparisons(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Rc<Vec<(usize, ValueId, IntPred, ValueId, ValueId)>> {
-        if let Some(list) = self.comparisons.get(&block) {
-            return list.clone();
-        }
-        let list: Vec<(usize, ValueId, IntPred, ValueId, ValueId)> = f.blocks[&block]
-            .insts
-            .iter()
-            .enumerate()
-            .filter_map(|(i, inst)| match inst {
-                Inst::Core {
-                    value,
-                    op: Op::Cmp(p, a, b),
-                    ..
-                } if f.types[a.0] == Ty::I32 && facts.constant(f, *a).is_none() && facts.constant(f, *b).is_none() && a != b => {
-                    Some((i, *value, *p, *a, *b))
-                }
-                _ => None,
-            })
-            .collect();
-        let list = Rc::new(list);
-        self.comparisons.insert(block, list.clone());
-        list
-    }
-
-    fn order_edges(&mut self, f: &Func, facts: &Facts, block: BlockId, index: usize, family: Option<IntPred>) -> Vec<(ValueId, ValueId, bool, Bdd)> {
-        let list = self.block_comparisons(f, facts, block);
-        let mut edges = Vec::new();
-        for &(i, c, p, a, b) in list.iter() {
-            if i >= index {
-                break;
-            }
-            let bit = self.bit(f, facts, c);
-            match p {
-                IntPred::Eq | IntPred::Ne => {
-                    let equal = if p == IntPred::Ne { self.m.not(bit) } else { bit };
-                    edges.push((a, b, false, equal));
-                    edges.push((b, a, false, equal));
-                }
-                _ => {
-                    let (q, u, w, negated) = ordered(p, a, b);
-                    let Some(family) = family else {
-                        continue;
-                    };
-                    let less = if negated { self.m.not(bit) } else { bit };
-                    let not_less = self.m.not(less);
-                    if family == q {
-                        edges.push((u, w, true, less));
-                        edges.push((w, u, false, not_less));
-                    } else {
-                        let small_u = self.below_half(f, facts, block, u);
-                        let small_w = self.below_half(f, facts, block, w);
-                        let small = self.m.and(small_u, small_w);
-                        if small != Bdd::FALSE {
-                            let less = self.m.and(less, small);
-                            let not_less = self.m.and(not_less, small);
-                            edges.push((u, w, true, less));
-                            edges.push((w, u, false, not_less));
-                        }
-                    }
-                }
-            }
-        }
-        edges
-    }
-
-    fn below_half(&mut self, f: &Func, facts: &Facts, block: BlockId, v: ValueId) -> Bdd {
-        if interval(f, facts, v, 0).is_some_and(|(_, high)| high < 1 << 31) {
-            return Bdd::TRUE;
-        }
-        let list = self.block_thresholds(f, facts, block);
-        let relevant: Vec<Threshold> = list.iter().filter(|t| t.value == v).copied().collect();
-        if relevant.is_empty() {
-            return Bdd::FALSE;
-        }
-        let mut sets = Vec::new();
-        for t in &relevant {
-            let bit = self.bit(f, facts, t.of);
-            let holds = if t.flip { self.m.not(bit) } else { bit };
-            sets.push((holds, t.truth()));
-        }
-        self.cells(&sets, &[(0, (1 << 31) - 1)], Bdd::FALSE, u32::MAX as u64)
-    }
-
     fn paths(&mut self, edges: &[(ValueId, ValueId, bool, Bdd)], from: ValueId, to: ValueId) -> (Bdd, Bdd) {
         let mut any: HashMap<ValueId, Bdd> = HashMap::default();
         let mut strict: HashMap<ValueId, Bdd> = HashMap::default();
@@ -992,29 +1120,6 @@ impl Logic {
         };
         memo.insert((a, b), g);
         g
-    }
-
-    fn first_order(&mut self, f: &Func, block: BlockId) -> Rc<HashMap<(IntPred, ValueId, ValueId), ValueId>> {
-        if let Some(index) = self.orders.get(&block) {
-            return index.clone();
-        }
-        let mut index = HashMap::default();
-        for inst in &f.blocks[&block].insts {
-            if let Inst::Core {
-                value,
-                op: Op::Cmp(p, a, b),
-                ..
-            } = inst
-            {
-                if !matches!(p, IntPred::Eq | IntPred::Ne) {
-                    let (q, x, y, _) = ordered(*p, *a, *b);
-                    index.entry((q, x, y)).or_insert(*value);
-                }
-            }
-        }
-        let index = Rc::new(index);
-        self.orders.insert(block, index.clone());
-        index
     }
 
     fn compare(
@@ -1547,10 +1652,9 @@ impl Logic {
                 links.push(link);
             }
         }
-        for (atom, bound) in self.passed_tests(f, facts, src, slot) {
-            let link = self.binding(facts, src, atom, bound);
+        for link in self.bridges(f, facts, src, slot).iter() {
             if link.support.iter().any(|v| seen.contains(v)) {
-                links.push(link);
+                links.push(link.clone());
             }
         }
         let r = self.project(facts, src, formula, &links);
@@ -1740,142 +1844,10 @@ impl Logic {
             };
             links.push(self.binding(facts, src, arriving(src, edge.dst, atom), bound));
         }
-        for (atom, bound) in self.passed_tests(f, facts, src, slot) {
-            links.push(self.binding(facts, src, atom, bound));
-        }
+        links.extend(self.bridges(f, facts, src, slot).iter().cloned());
         let links = Rc::new(links);
         self.relations.insert((src, slot), links.clone());
         links
-    }
-
-    fn passed_tests(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<(Atom, Bdd)> {
-        let edge = f.blocks[&src].term.edges().nth(slot).unwrap();
-        let dst = edge.dst;
-        let mut out = Vec::new();
-        let targets = self.block_thresholds(f, facts, dst);
-        if !targets.is_empty() {
-            let sources = self.block_thresholds(f, facts, src);
-            let mut seen: Vec<(ValueId, bool, bool, i64)> = Vec::new();
-            for t in targets.iter() {
-                let Site::Param { block, index } = facts.site[t.value.0] else {
-                    continue;
-                };
-                let test = (t.value, t.equal, t.signed, t.at);
-                if block != dst || !self.carried(t.value) || seen.contains(&test) {
-                    continue;
-                }
-                seen.push(test);
-                let arg = f.blocks[&src].term.edges().nth(slot).unwrap().args[index];
-                let (base, offset) = offset_of(f, facts, arg);
-                let relevant: Vec<(Threshold, u32)> = sources
-                    .iter()
-                    .filter_map(|e| {
-                        if e.value == arg {
-                            Some((*e, 0))
-                        } else if e.value == base {
-                            Some((*e, offset))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if relevant.is_empty() {
-                    continue;
-                }
-                let mut sets = Vec::new();
-                for (e, offset) in &relevant {
-                    let bit = self.bit(f, facts, e.of);
-                    let holds = if e.flip { self.m.not(bit) } else { bit };
-                    sets.push((holds, shifted(&e.truth(), *offset)));
-                }
-                let atom = arriving(src, dst, Atom::Bit(t.of));
-                let own = self.atom(atom);
-                let free = if t.flip { self.m.not(own) } else { own };
-                let truth = self.cells(&sets, &t.truth(), free, u32::MAX as u64);
-                let bound = if t.flip { self.m.not(truth) } else { truth };
-                out.push((atom, bound));
-            }
-        }
-        let args: Vec<ValueId> = f.blocks[&src].term.edges().nth(slot).unwrap().args.clone();
-        let orders = self.first_order(f, dst);
-        if !orders.is_empty() {
-            let at = |p: ValueId| match facts.site[p.0] {
-                Site::Param { block, index } if block == dst => Some(index),
-                _ => None,
-            };
-            let sources = self.first_order(f, src);
-            let mut pairs: Vec<((IntPred, ValueId, ValueId), ValueId)> = orders.iter().map(|(&k, &v)| (k, v)).collect();
-            pairs.sort_by_key(|&(_, v)| v.0);
-            for ((q, x, y), t) in pairs {
-                let (Some(i), Some(j)) = (at(x), at(y)) else {
-                    continue;
-                };
-                if !self.carried(x) || !self.carried(y) {
-                    continue;
-                }
-                let Some(Op::Cmp(pt, at_, bt)) = facts.op(f, t) else {
-                    continue;
-                };
-                let negated = ordered(pt, at_, bt).3;
-                let canonical = match sources.get(&(q, args[i], args[j])) {
-                    Some(&e) => {
-                        let Some(Op::Cmp(pe, ae, be)) = facts.op(f, e) else {
-                            continue;
-                        };
-                        let bit = self.bit(f, facts, e);
-                        if ordered(pe, ae, be).3 { self.m.not(bit) } else { bit }
-                    }
-                    None => {
-                        let end = f.blocks[&src].insts.len();
-                        let edges = self.order_edges(f, facts, src, end, Some(q));
-                        if edges.is_empty() {
-                            continue;
-                        }
-                        let (back, _) = self.paths(&edges, args[j], args[i]);
-                        let (_, forward) = self.paths(&edges, args[i], args[j]);
-                        if back == Bdd::FALSE && forward == Bdd::FALSE {
-                            continue;
-                        }
-                        let own = self.atom(arriving(src, dst, Atom::Bit(t)));
-                        let free = if negated { self.m.not(own) } else { own };
-                        let open = self.m.not(back);
-                        let allowed = self.m.and(free, open);
-                        self.m.or(allowed, forward)
-                    }
-                };
-                let bound = if negated { self.m.not(canonical) } else { canonical };
-                out.push((arriving(src, dst, Atom::Bit(t)), bound));
-            }
-        }
-        let at = |p: ValueId| match facts.site[p.0] {
-            Site::Param { block, index } if block == dst => Some(index),
-            _ => None,
-        };
-        let comparisons = self.block_comparisons(f, facts, dst);
-        let end = f.blocks[&src].insts.len();
-        for &(_, t, p, x, y) in comparisons.iter() {
-            if !matches!(p, IntPred::Eq | IntPred::Ne) {
-                continue;
-            }
-            let (Some(i), Some(j)) = (at(x), at(y)) else {
-                continue;
-            };
-            if !self.carried(x) || !self.carried(y) {
-                continue;
-            }
-            let (must, apart) = self.equal_in(f, facts, src, end, args[i], args[j]);
-            if must == Bdd::FALSE && apart == Bdd::FALSE {
-                continue;
-            }
-            let own = self.atom(arriving(src, dst, Atom::Bit(t)));
-            let free = if p == IntPred::Ne { self.m.not(own) } else { own };
-            let open = self.m.not(apart);
-            let allowed = self.m.and(free, open);
-            let equal = self.m.or(allowed, must);
-            let bound = if p == IntPred::Ne { self.m.not(equal) } else { equal };
-            out.push((arriving(src, dst, Atom::Bit(t)), bound));
-        }
-        out
     }
 
     fn post(&mut self, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
@@ -1941,6 +1913,7 @@ impl Logic {
     }
 }
 
+#[derive(Clone)]
 struct Binding {
     atom: Bdd,
     bound: Bdd,
@@ -1979,47 +1952,6 @@ pub(super) fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
         FloatPred::Ule => unordered || x <= y,
         FloatPred::Une => unordered || x != y,
     }
-}
-
-#[derive(Clone, Copy)]
-struct Threshold {
-    value: ValueId,
-    signed: bool,
-    at: i64,
-    flip: bool,
-    index: usize,
-    of: ValueId,
-    equal: bool,
-}
-
-impl Threshold {
-    fn truth(&self) -> Vec<(u64, u64)> {
-        let top = u32::MAX as u64;
-        if self.equal {
-            let k = self.at as u32 as u64;
-            return vec![(k, k)];
-        }
-        if !self.signed {
-            return if self.at <= 0 {
-                Vec::new()
-            } else if self.at > top as i64 {
-                vec![(0, top)]
-            } else {
-                vec![(0, self.at as u64 - 1)]
-            };
-        }
-        let half = 1u64 << 31;
-        if self.at <= i32::MIN as i64 {
-            Vec::new()
-        } else if self.at > i32::MAX as i64 {
-            vec![(0, top)]
-        } else if self.at <= 0 {
-            vec![(half, (self.at - 1) as i32 as u32 as u64)]
-        } else {
-            vec![(0, self.at as u64 - 1), (half, top)]
-        }
-    }
-
 }
 
 const FLOAT_OFFSET: u64 = 0x7f80_0000;
@@ -2079,154 +2011,6 @@ fn float_test(f: &Func, facts: &Facts, p: FloatPred, a: ValueId, b: ValueId) -> 
         set.push((FLOAT_NAN, FLOAT_NAN));
     }
     Some((x, set))
-}
-
-fn uniform_order(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> bool {
-    if f.types[a.0] != Ty::I32 || a == b || facts.constant(f, a).is_some() || facts.constant(f, b).is_some() || !uniform_difference(f, facts, a, b) {
-        return false;
-    }
-    let signed = matches!(p, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
-    match (interval(f, facts, a, 0), interval(f, facts, b, 0)) {
-        (Some(x), Some(y)) => !signed || (x.1 < 1 << 31 && y.1 < 1 << 31),
-        _ => false,
-    }
-}
-
-fn uniform_difference(f: &Func, facts: &Facts, x: ValueId, y: ValueId) -> bool {
-    let mut terms: HashMap<ValueId, u32> = HashMap::default();
-    linear_terms(f, facts, x, 1, &mut terms, 0);
-    linear_terms(f, facts, y, u32::MAX, &mut terms, 0);
-    terms.iter().all(|(&leaf, &c)| c == 0 || facts.uniform[leaf.0])
-}
-
-fn linear_terms(f: &Func, facts: &Facts, v: ValueId, scale: u32, terms: &mut HashMap<ValueId, u32>, depth: u32) {
-    let constant = |x: ValueId| facts.constant(f, x).map(|k| k as u32);
-    if constant(v).is_some() {
-        return;
-    }
-    let op = if depth > 16 { None } else { facts.op(f, v) };
-    match op {
-        Some(Op::Int(IntOp::Add, a, b)) => {
-            linear_terms(f, facts, a, scale, terms, depth + 1);
-            linear_terms(f, facts, b, scale, terms, depth + 1);
-        }
-        Some(Op::Int(IntOp::Sub, a, b)) => {
-            linear_terms(f, facts, a, scale, terms, depth + 1);
-            linear_terms(f, facts, b, scale.wrapping_neg(), terms, depth + 1);
-        }
-        Some(Op::Int(IntOp::Mul, a, b)) if constant(b).is_some() => {
-            linear_terms(f, facts, a, scale.wrapping_mul(constant(b).unwrap()), terms, depth + 1);
-        }
-        Some(Op::Int(IntOp::Mul, a, b)) if constant(a).is_some() => {
-            linear_terms(f, facts, b, scale.wrapping_mul(constant(a).unwrap()), terms, depth + 1);
-        }
-        Some(Op::Int(IntOp::Shl, a, b)) if constant(b).is_some() => {
-            linear_terms(f, facts, a, scale.wrapping_mul(1u32 << (constant(b).unwrap() & 31)), terms, depth + 1);
-        }
-        _ => {
-            let c = terms.entry(v).or_insert(0);
-            *c = c.wrapping_add(scale);
-        }
-    }
-}
-
-fn equality(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Threshold> {
-    if !matches!(p, IntPred::Eq | IntPred::Ne) || f.types[a.0] != Ty::I32 {
-        return None;
-    }
-    let (value, k) = match (facts.constant(f, a), facts.constant(f, b)) {
-        (None, Some(k)) => (a, k),
-        (Some(k), None) => (b, k),
-        _ => return None,
-    };
-    Some(Threshold {
-        value,
-        signed: false,
-        at: k as u32 as i64,
-        flip: p == IntPred::Ne,
-        index: 0,
-        of: value,
-        equal: true,
-    })
-}
-
-fn threshold(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Threshold> {
-    if matches!(p, IntPred::Eq | IntPred::Ne) || f.types[a.0] != Ty::I32 {
-        return None;
-    }
-    let (q, x, y, negated) = ordered(p, a, b);
-    let signed = q == IntPred::Slt;
-    let at = |k: u64| if signed { k as u32 as i32 as i64 } else { k as u32 as i64 };
-    let (value, at, flip) = match (facts.constant(f, x), facts.constant(f, y)) {
-        (None, Some(k)) => (x, at(k), negated),
-        (Some(k), None) => (y, at(k) + 1, !negated),
-        _ => return None,
-    };
-    Some(Threshold {
-        value,
-        signed,
-        at,
-        flip,
-        index: 0,
-        of: value,
-        equal: false,
-    })
-}
-
-fn offset_of(f: &Func, facts: &Facts, v: ValueId) -> (ValueId, u32) {
-    let mut x = v;
-    let mut offset = 0u32;
-    for _ in 0..16 {
-        match facts.op(f, x) {
-            Some(Op::Int(IntOp::Add, a, b)) if facts.constant(f, b).is_some() => {
-                offset = offset.wrapping_add(facts.constant(f, b).unwrap() as u32);
-                x = a;
-            }
-            Some(Op::Int(IntOp::Add, a, b)) if facts.constant(f, a).is_some() => {
-                offset = offset.wrapping_add(facts.constant(f, a).unwrap() as u32);
-                x = b;
-            }
-            Some(Op::Int(IntOp::Sub, a, b)) if facts.constant(f, b).is_some() => {
-                offset = offset.wrapping_sub(facts.constant(f, b).unwrap() as u32);
-                x = a;
-            }
-            _ => break,
-        }
-    }
-    if f.types[x.0] != Ty::I32 {
-        return (v, 0);
-    }
-    (x, offset)
-}
-
-fn shifted(set: &[(u64, u64)], offset: u32) -> Vec<(u64, u64)> {
-    let top = u32::MAX as u64;
-    let mut out = Vec::new();
-    for &(low, high) in set {
-        let (a, b) = (low + offset as u64, high + offset as u64);
-        if b <= top {
-            out.push((a, b));
-        } else if a > top {
-            out.push((a - top - 1, b - top - 1));
-        } else {
-            out.push((a, top));
-            out.push((0, b - top - 1));
-        }
-    }
-    out.sort_unstable();
-    out
-}
-
-fn ordered(p: IntPred, a: ValueId, b: ValueId) -> (IntPred, ValueId, ValueId, bool) {
-    match p {
-        IntPred::Uge => (IntPred::Ult, a, b, true),
-        IntPred::Ugt => (IntPred::Ult, b, a, false),
-        IntPred::Ule => (IntPred::Ult, b, a, true),
-        IntPred::Sge => (IntPred::Slt, a, b, true),
-        IntPred::Sgt => (IntPred::Slt, b, a, false),
-        IntPred::Sle => (IntPred::Slt, b, a, true),
-        _ => (p, a, b, false),
-    }
 }
 
 pub fn constant_choices(f: &Func, facts: &Facts, v: ValueId) -> Option<Vec<u64>> {
@@ -2522,10 +2306,13 @@ mod tests {
             tests.push((i, j, t));
         }
         let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
         let mut wrong = Vec::new();
         let mut decided = 0;
         for &(i, j, t) in &tests {
-            if facts.uniform[t.0] || !uniform_difference(&b.f, &facts, words[i].1, words[j].1) {
+            let bit = logic.bit(&b.f, &facts, t);
+            let uniform = logic.support(bit).iter().all(|&var| logic.uniform_atom(&facts, var));
+            if facts.uniform[t.0] || !uniform {
                 continue;
             }
             decided += 1;
@@ -2593,11 +2380,15 @@ mod tests {
             let p = predicates[r.below(predicates.len() as u64) as usize];
             tests.push((i, j, p));
         }
+        let tests: Vec<(usize, usize, IntPred, ValueId)> = tests.iter().map(|&(i, j, p)| (i, j, p, b.cmp(e, p, words[i].1, words[j].1))).collect();
         let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
         let mut wrong = Vec::new();
         let mut decided = 0;
-        for &(i, j, p) in &tests {
-            if !uniform_order(&b.f, &facts, p, words[i].1, words[j].1) {
+        for &(i, j, p, t) in &tests {
+            let bit = logic.bit(&b.f, &facts, t);
+            let uniform = logic.support(bit).iter().all(|&var| logic.uniform_atom(&facts, var));
+            if facts.uniform[t.0] || !uniform {
                 continue;
             }
             decided += 1;
@@ -2668,6 +2459,51 @@ mod tests {
             Bdd::FALSE,
             "the second iteration starts with the carried bit false, which the first iteration sends when its fresh bit is false"
         );
+    }
+
+    fn nested_selects(loaded_arm: bool) -> (Build, ValueId, ValueId, ValueId) {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32), (ParameterSource::Vgpr(2), Ty::I32)]);
+        let e = BlockId(0);
+        let item = p[1];
+        let two = b.constant(e, Ty::I32, 2);
+        let mut value = if loaded_arm { p[2] } else { item };
+        for k in 0..8 {
+            let bound = b.constant(e, Ty::I32, 10 + k);
+            let c = b.cmp(e, IntPred::Ult, item, bound);
+            value = b.core(e, Ty::I32, Op::Select(c, two, value));
+        }
+        let three = b.constant(e, Ty::I32, 3);
+        let small = b.cmp(e, IntPred::Ult, value, three);
+        let large = b.cmp(e, IntPred::Ugt, value, three);
+        let seventeen = b.constant(e, Ty::I32, 17);
+        let any = b.cmp(e, IntPred::Ult, item, seventeen);
+        (b, small, large, any)
+    }
+
+    #[test]
+    fn bit_follows_selects_of_any_depth() {
+        let (b, small, large, any) = nested_selects(false);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let any = logic.bit(f, &facts, any);
+        assert_eq!(logic.bit(f, &facts, small), any, "eight nested selects give 2 below 17 and the item itself from 17 on");
+        assert_eq!(logic.bit(f, &facts, large), logic.m.not(any), "the value is above 3 exactly from 17 on");
+    }
+
+    #[test]
+    fn bit_keeps_the_loaded_arm_eight_selects_deep() {
+        let (b, small, large, any) = nested_selects(true);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let any = logic.bit(f, &facts, any);
+        let (small, large) = (logic.bit(f, &facts, small), logic.bit(f, &facts, large));
+        assert_eq!(logic.m.and(small, any), any, "below 17 the value is 2");
+        let beyond = logic.m.not(any);
+        assert_ne!(logic.m.and(small, beyond), Bdd::FALSE, "from 17 on the loaded word may be below 3");
+        assert_eq!(logic.m.and(small, large), Bdd::FALSE, "no value is both below and above 3");
+        assert_ne!(logic.m.or(small, large), Bdd::TRUE, "the loaded word may be 3");
     }
 
     #[test]
@@ -2742,15 +2578,15 @@ mod tests {
         let f = &b.f;
         let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
         let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
-        let bc = logic.atom(Atom::Bit(c));
-        let own_d = logic.atom(Atom::Bit(d));
-        let bd = logic.m.or(own_d, bc);
+        let bc = logic.bit(f, &facts, c);
+        let bd = logic.bit(f, &facts, d);
+        assert!(bc != Bdd::FALSE && bc != Bdd::TRUE && bd != bc, "item < 3 and item < 7 are open and distinct");
+        assert_eq!(logic.m.and(bc, bd), bc, "item < 3 implies item < 7");
         let _ = exec;
         let mut expect = Vec::new();
         let xor = logic.m.xor(bc, bd);
         let ndd = logic.m.not(bd);
         let crossed_formula = logic.m.ite(bc, ndd, bd);
-        expect.push(("item < 7 after item < 3", logic.bit(f, &facts, d), bd));
         expect.push(("select(c, 1, 2) == select(d, 2, 1)", logic.bit(f, &facts, crossed), crossed_formula));
         expect.push(("select(c, 1, 2) == 1", logic.bit(f, &facts, picked), bc));
         expect.push(("lane != lane", logic.bit(f, &facts, same), Bdd::FALSE));
@@ -2777,11 +2613,10 @@ mod tests {
         expect.push(("item >= 3", logic.bit(f, &facts, not_c), nbc));
         expect.push(("3 > item", logic.bit(f, &facts, swapped_c), bc));
         expect.push(("7 <= item", logic.bit(f, &facts, not_d), nbd));
-        let bs = logic.atom(Atom::Bit(signed));
-        let negative = logic.m.and(bs, nbd);
-        let signed_formula = logic.m.or(bc, negative);
-        let not_signed_formula = logic.m.not(signed_formula);
-        expect.push(("item s< 3", logic.bit(f, &facts, signed), signed_formula));
+        let bs = logic.bit(f, &facts, signed);
+        expect.push(("item s< 3 within item < 7", logic.m.and(bs, bd), bc));
+        assert_ne!(logic.m.and(bs, nbd), Bdd::FALSE, "a negative item is s< 3 and not < 7");
+        let not_signed_formula = logic.m.not(bs);
         expect.push(("item s>= 3", logic.bit(f, &facts, not_signed), not_signed_formula));
         let low = logic.lanes(|l| l < 3);
         expect.push(("lane < 3", logic.bit(f, &facts, low_lanes), low));
@@ -2790,10 +2625,8 @@ mod tests {
         expect.push(("lane == 99", logic.bit(f, &facts, no_lane), Bdd::FALSE));
         expect.push(("99 != lane", logic.bit(f, &facts, every_lane), Bdd::TRUE));
         expect.push(("lane s> -2", logic.bit(f, &facts, signed_lanes), Bdd::TRUE));
-        let small_leaf = logic.atom(Atom::Bit(small));
-        let small_formula = logic.m.and(bc, small_leaf);
-        expect.push(("select(c, item, 100) < 5", logic.bit(f, &facts, small), small_formula));
-        expect.push(("5 > select(c, item, 100)", logic.bit(f, &facts, large), small_formula));
+        expect.push(("select(c, item, 100) < 5", logic.bit(f, &facts, small), bc));
+        expect.push(("5 > select(c, item, 100)", logic.bit(f, &facts, large), bc));
         expect.push(("select(c, 1, 2) < 2", logic.bit(f, &facts, chosen_small), bc));
         expect.push(("select(c, 1, 2) <= 2", logic.bit(f, &facts, chosen_any), Bdd::TRUE));
         let odd_lanes = logic.lanes(|l| l & 1 == 1);
@@ -2801,10 +2634,10 @@ mod tests {
         let lanes_16_to_23 = logic.lanes(|l| (16..24).contains(&l));
         expect.push(("lane >> 3 == 2", logic.bit(f, &facts, third_group), lanes_16_to_23));
         expect.push(("the lane bit of 1 << lane", logic.view(f, &facts, own_bit), Bdd::TRUE));
-        let undefined_atom = logic.atom(Atom::Bit(undefined));
-        expect.push(("(lane << 32) == 0", logic.bit(f, &facts, undefined), undefined_atom));
-        let with_item_atom = logic.atom(Atom::Bit(with_item));
-        expect.push(("lane + item < 3", logic.bit(f, &facts, with_item), with_item_atom));
+        let undefined_bit = logic.bit(f, &facts, undefined);
+        assert!(undefined_bit != Bdd::TRUE && undefined_bit != Bdd::FALSE, "(lane << 32) == 0 stays open");
+        let with_item_bit = logic.bit(f, &facts, with_item);
+        assert!(with_item_bit != Bdd::TRUE && with_item_bit != Bdd::FALSE, "lane + item < 3 stays open");
         let lane_one = logic.lanes(|l| l == 1);
         let bits_of_two = logic.word(2);
         expect.push(("the lanes of 2", bits_of_two, lane_one));
