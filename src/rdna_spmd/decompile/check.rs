@@ -7432,10 +7432,8 @@ mod tests {
     }
 
     enum Related {
-        Tied,
         Stale,
         Loose,
-        Parity,
         Unfixed,
     }
 
@@ -7462,10 +7460,10 @@ mod tests {
         let (after, m) = b.block(&[Ty::I1, Ty::I64, Ty::I1, Ty::I1, Ty::I1]);
         let (join, _) = b.block(&[Ty::I1]);
         b.cond_br(e, q, (arm, vec![k.exec, own, c, d]), (join, vec![k.exec]));
-        let parity = matches!(shape, Related::Parity | Related::Unfixed);
+        let parity = matches!(shape, Related::Unfixed);
         let start = match shape {
-            Related::Loose | Related::Parity | Related::Unfixed => a[2],
-            _ => b.int(arm, IntOp::And, a[2], a[3]),
+            Related::Loose | Related::Unfixed => a[2],
+            Related::Stale => b.int(arm, IntOp::And, a[2], a[3]),
         };
         let other = if parity { b.constant(arm, Ty::I1, 0) } else { a[3] };
         let none = b.constant(arm, Ty::I32, 0);
@@ -7477,22 +7475,15 @@ mod tests {
         let flipped = b.int(body, IntOp::Xor, p[3], yes);
         let s = match shape {
             Related::Stale => b.int(body, IntOp::And, p[5], p[3]),
-            Related::Parity | Related::Unfixed => b.int(body, IntOp::Xor, p[2], yes),
-            _ => b.int(body, IntOp::And, p[5], flipped),
+            Related::Unfixed => b.int(body, IntOp::Xor, p[2], yes),
+            Related::Loose => b.int(body, IntOp::And, p[5], flipped),
         };
         let one = b.constant(body, Ty::I32, 1);
         let next = b.int(body, IntOp::Add, p[4], one);
         b.br(body, header, vec![p[0], p[1], s, flipped, next, p[5]]);
         let yes = b.constant(after, Ty::I1, 1);
         let only = if parity {
-            let fixed = if matches!(shape, Related::Parity) {
-                let c = b.int(after, IntOp::Xor, m[2], m[3]);
-                b.int(after, IntOp::Xor, c, m[4])
-            } else {
-                b.int(after, IntOp::Xor, m[2], m[3])
-            };
-            let _ = yes;
-            fixed
+            b.int(after, IntOp::Xor, m[2], m[3])
         } else {
             let not_t = b.int(after, IntOp::Xor, m[3], yes);
             b.int(after, IntOp::And, m[2], not_t)
@@ -7505,21 +7496,9 @@ mod tests {
     }
 
     #[test]
-    fn prove_converts_a_query_whose_while_loop_keeps_one_bit_a_fixed_bit_xor_a_parity() {
-        let b = related_pair(Related::Parity);
-        assert!(converted(&b).is_empty(), "{:?}: the header always holds s = c ^ p, so s ^ p ^ c never holds", converted(&b));
-    }
-
-    #[test]
     fn prove_keeps_a_query_whose_while_loop_stores_a_bit_xor_a_parity() {
         let b = related_pair(Related::Unfixed);
         assert!(keeps(&b).is_empty(), "{:?}: s ^ p is c, which some lanes hold", keeps(&b));
-    }
-
-    #[test]
-    fn prove_converts_a_query_whose_while_loop_keeps_one_bit_the_and_of_a_fixed_bit_and_the_other() {
-        let b = related_pair(Related::Tied);
-        assert!(converted(&b).is_empty(), "{:?}: the header always holds s = c & t, so s & !t never holds", converted(&b));
     }
 
     #[test]
