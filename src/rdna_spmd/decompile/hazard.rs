@@ -5234,4 +5234,113 @@ mod tests {
         });
         assert!(read, "columns below 0 clamp to column 0 of row 2");
     }
+
+    fn sixty_five_thousand_wide_terms(target: u32) -> bool {
+        let unknowns = [info(0, Some((0, 70000))), info(1, Some((0, 70000))), info(2, Some((0, 70000)))];
+        let x = Form {
+            constant: 0,
+            terms: vec![(0, 4), (1, 6), (2, 4)],
+        };
+        may_overlap(&unknowns, &x, &Form::constant(target), 1, 1, &|_: &UnknownInfo| false, None)
+    }
+
+    #[test]
+    fn may_overlap_finds_four_u_plus_six_v_plus_four_w_hitting_ten_over_sixty_five_thousand_wide_ranges() {
+        assert!(sixty_five_thousand_wide_terms(10), "u = v = 1, w = 0 gives 10");
+    }
+
+    #[test]
+    fn may_overlap_sees_that_four_u_plus_six_v_plus_four_w_never_hits_two_over_sixty_five_thousand_wide_ranges() {
+        assert!(!sixty_five_thousand_wide_terms(2), "4u + 6v + 4w = 2 has no solution with u, v, w >= 0");
+    }
+
+    fn five_thousand_even_values(target: u32) -> bool {
+        let values: Vec<u32> = (0..5000).map(|k| 2 * k).collect();
+        let unknowns = [UnknownInfo {
+            range: Some((0, 9998)),
+            values: Some(values.into()),
+            ..info(0, None)
+        }];
+        let x = Form {
+            constant: 0,
+            terms: vec![(0, 1)],
+        };
+        may_overlap(&unknowns, &x, &Form::constant(target), 1, 1, &|_: &UnknownInfo| false, None)
+    }
+
+    #[test]
+    fn may_overlap_finds_a_value_set_of_five_thousand_even_words_hitting_an_even_word() {
+        assert!(five_thousand_even_values(4096), "4096 is in the set");
+    }
+
+    #[test]
+    fn may_overlap_sees_that_a_value_set_of_five_thousand_even_words_never_hits_an_odd_word() {
+        assert!(!five_thousand_even_values(4097), "no even word is 4097");
+    }
+
+    fn nine_bits(target: u32) -> bool {
+        let unknowns: Vec<UnknownInfo> = (0..9).map(|u| info(u, Some((0, 1)))).collect();
+        let x = Form {
+            constant: 0,
+            terms: (0..8).map(|u| (u as Unknown, 3)).chain([(8, 5)]).collect(),
+        };
+        may_overlap(&unknowns, &x, &Form::constant(target), 1, 1, &|_: &UnknownInfo| false, None)
+    }
+
+    #[test]
+    fn may_overlap_finds_nine_bits_scaled_by_three_and_five_hitting_eight() {
+        assert!(nine_bits(8), "one bit of three and the bit of five give 8");
+    }
+
+    #[test]
+    fn may_overlap_sees_that_nine_bits_scaled_by_three_and_five_never_hit_one() {
+        assert!(!nine_bits(1), "3a + 5b = 1 has no solution with a, b >= 0");
+    }
+
+    fn five_words_limited_to_two_pieces_each(target: u32) -> bool {
+        let unknowns: Vec<UnknownInfo> = (0..5).map(|u| info(u, Some((0, 3)))).collect();
+        let x = Form {
+            constant: 0,
+            terms: (0..5).map(|u| (u as Unknown, 1)).collect(),
+        };
+        let classes: Classes = (0..5)
+            .map(|u| (Form { constant: 0, terms: vec![(u as Unknown, 1)] }, vec![(0, 0), (3, 3)]))
+            .collect();
+        let none = Classes::new();
+        let variant = |_: &UnknownInfo| false;
+        may_overlap_within(&unknowns, &x, &Form::constant(target), 1, 1, &variant, None, [&classes, &none], &mut Shapes::default())
+    }
+
+    #[test]
+    fn may_overlap_finds_five_words_limited_to_two_pieces_each_hitting_a_multiple_of_three() {
+        assert!(five_words_limited_to_two_pieces_each(6), "two words of 3 give 6");
+    }
+
+    #[test]
+    fn may_overlap_sees_that_five_words_limited_to_two_pieces_each_never_hit_one() {
+        assert!(!five_words_limited_to_two_pieces_each(1), "sums of words in {0, 3} are multiples of 3");
+    }
+
+    fn differently_scaled_iterations(range: (u32, u32)) -> bool {
+        let unknowns = [info(0, Some(range))];
+        let x = Form {
+            constant: 0,
+            terms: vec![(0, 2)],
+        };
+        let y = Form {
+            constant: 0,
+            terms: vec![(0, 3)],
+        };
+        may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| true, Some(0))
+    }
+
+    #[test]
+    fn may_overlap_finds_differently_scaled_iterations_that_meet_apart() {
+        assert!(differently_scaled_iterations((0, 3)), "iterations 3 and 2 give 2 * 3 = 3 * 2");
+    }
+
+    #[test]
+    fn may_overlap_sees_that_differently_scaled_iterations_meet_only_in_the_same_iteration() {
+        assert!(!differently_scaled_iterations((0, 1)), "2i = 3j with i, j in {0, 1} only at i = j = 0");
+    }
 }
