@@ -6349,19 +6349,6 @@ fn normalized(mut set: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 
 pub(super) type Classes = Vec<(Form, Vec<(u64, u64)>)>;
 
-pub(super) fn word_range(classes: &Classes, form: &Form) -> Option<(u32, u32)> {
-    let class = Form {
-        constant: 0,
-        terms: form.terms.clone(),
-    };
-    let (_, set) = classes.iter().find(|(c, _)| *c == class)?;
-    let values = shifted_pieces(set, form.constant);
-    Some(match (values.first(), values.last()) {
-        (Some(&(low, _)), Some(&(_, high))) => (low as u32, high as u32),
-        _ => (1, 0),
-    })
-}
-
 #[derive(Clone, Debug, Default)]
 struct Limits {
     classes: Classes,

@@ -3,6 +3,7 @@ mod check;
 mod direct;
 mod fold;
 mod hazard;
+mod linear;
 mod logic;
 mod provenance;
 mod rewrite;

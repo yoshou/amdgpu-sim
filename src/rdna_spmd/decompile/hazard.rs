@@ -1,4 +1,5 @@
-use super::address::{word_range, Addresses, Classes, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide, LANES};
+use super::address::{Addresses, Classes, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide, LANES};
+use super::linear::{Domain, Linear, Problem, Var};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::environment::Environment;
@@ -826,6 +827,7 @@ fn meet(
     let mut idle: Option<[bool; 2]> = None;
     let mut lanes_p: Vec<Option<LaneFacts>> = vec![None; p.len()];
     let mut lanes_q: Vec<Option<LaneFacts>> = vec![None; q.len()];
+    let mut judgments = Shapes::default();
     for (a, x) in p.iter().enumerate() {
         let Some(x) = x else { continue };
         for (b, y) in q.iter().enumerate() {
@@ -856,14 +858,12 @@ fn meet(
                 lanes_q[b] = Some(lane_facts(addresses, qa, b));
             }
             let (lp, lq) = (lanes_p[a].as_ref().unwrap(), lanes_q[b].as_ref().unwrap());
-            let cases = cases_of([&lp.pieces, &lq.pieces]);
-            let apart = cases.iter().all(|ranges| {
-                !may_overlap_within(&addresses.unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, [&ranges[0], &ranges[1]])
-                    || match (&lp.wide, &lq.wide) {
-                        (Some(wx), Some(wy)) => wide_apart(&addresses.unknowns, (wx, x.bytes), (wy, y.bytes), variant, [&ranges[0], &ranges[1]], [&lp.classes, &lq.classes]),
-                        _ => false,
-                    }
-            });
+            let limits = [&lp.classes, &lq.classes];
+            let apart = !may_overlap_within(&addresses.unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, &mut judgments)
+                || match (&lp.wide, &lq.wide) {
+                    (Some(wx), Some(wy)) => wide_apart(&addresses.unknowns, (wx, x.bytes), (wy, y.bytes), variant, differ, limits, &mut judgments),
+                    _ => false,
+                };
             if apart {
                 continue;
             }
@@ -993,206 +993,26 @@ fn may_overlap(
     variant: &dyn Fn(&UnknownInfo) -> bool,
     differ: Option<Unknown>,
 ) -> bool {
-    let none = HashMap::default();
-    may_overlap_within(unknowns, x, y, x_bytes, y_bytes, variant, differ, [&none, &none])
-}
-
-fn single_pieces(classes: &Classes) -> Vec<(Unknown, Vec<(u32, u32)>)> {
-    classes
-        .iter()
-        .filter_map(|(class, pieces)| match class.terms.as_slice() {
-            &[(u, 1)] => Some((u, pieces.iter().map(|&(low, high)| (low as u32, high as u32)).collect())),
-            _ => None,
-        })
-        .collect()
-}
-
-fn cases_of(pieces: [&[(Unknown, Vec<(u32, u32)>)]; 2]) -> Vec<[HashMap<Unknown, (u32, u32)>; 2]> {
-    let count: usize = pieces.iter().flat_map(|list| list.iter()).map(|(_, p)| p.len().max(1)).product();
-    let mut cases = vec![[HashMap::default(), HashMap::default()]];
-    for (side, list) in pieces.iter().enumerate() {
-        for (u, set) in list.iter() {
-            let choices: Vec<(u32, u32)> = match set.as_slice() {
-                [] => vec![(1, 0)],
-                _ if count > 16 => vec![(set[0].0, set[set.len() - 1].1)],
-                _ => set.clone(),
-            };
-            cases = cases
-                .into_iter()
-                .flat_map(|case| {
-                    choices.iter().map(move |&range| {
-                        let mut case = case.clone();
-                        case[side].insert(*u, range);
-                        case
-                    })
-                })
-                .collect();
-        }
-    }
-    cases
-}
-
-fn narrowed(info: &UnknownInfo, u: Unknown, given: Option<&(u32, u32)>) -> Option<Option<(u32, u32)>> {
-    if info.values.is_some() {
-        return Some(info.range);
-    }
-    let range = match (info.range, given) {
-        (range, None) => range,
-        (None, Some(&given)) => Some(given),
-        (Some((l, h)), Some(&(gl, gh))) => Some((l.max(gl), h.min(gh))),
-    };
-    let _ = u;
-    match range {
-        Some((l, h)) if l > h => None,
-        range => Some(range),
-    }
+    let none = Classes::new();
+    may_overlap_within(unknowns, x, y, x_bytes, y_bytes, variant, differ, [&none, &none], &mut Shapes::default())
 }
 
 #[derive(Clone)]
 struct LaneFacts {
     classes: Classes,
-    pieces: Vec<(Unknown, Vec<(u32, u32)>)>,
     wide: Option<Wide>,
 }
 
 fn lane_facts(addresses: &mut Addresses, access: &Access, lane: usize) -> LaneFacts {
     let classes = addresses.access_classes(access.block, access.predicate, lane);
-    let pieces = single_pieces(&classes);
     let wide = access.address.and_then(|v| addresses.wide_value(v, access.block, lane));
-    LaneFacts { classes, pieces, wide }
+    LaneFacts { classes, wide }
 }
 
-fn wide_apart(
-    unknowns: &[UnknownInfo],
-    (wx, x_bytes): (&Wide, u32),
-    (wy, y_bytes): (&Wide, u32),
-    variant: &dyn Fn(&UnknownInfo) -> bool,
-    ranges: [&HashMap<Unknown, (u32, u32)>; 2],
-    classes: [&Classes; 2],
-) -> bool {
-    let mut terms: Vec<(i128, (u32, u32))> = Vec::new();
-    let mut seen: Vec<Unknown> = wx.terms.iter().chain(&wy.terms).map(|&(u, _)| u).collect();
-    seen.sort_unstable();
-    seen.dedup();
-    for u in seen {
-        let cx = wx.terms.iter().find(|t| t.0 == u).map_or(0, |t| t.1);
-        let cy = wy.terms.iter().find(|t| t.0 == u).map_or(0, |t| t.1);
-        let info = &unknowns[u as usize];
-        let (Some(rx), Some(ry)) = (narrowed(info, u, ranges[0].get(&u)), narrowed(info, u, ranges[1].get(&u))) else {
-            return true;
-        };
-        let full = (0, u32::MAX);
-        if variant(info) {
-            terms.push((cx, rx.unwrap_or(full)));
-            terms.push((-cy, ry.unwrap_or(full)));
-        } else {
-            let both = match (rx, ry) {
-                (Some((a, b)), Some((c, d))) if a.max(c) > b.min(d) => return true,
-                (Some((a, b)), Some((c, d))) => (a.max(c), b.min(d)),
-                (Some(r), None) | (None, Some(r)) => r,
-                (None, None) => full,
-            };
-            terms.push((cx - cy, both));
-        }
-    }
-    let varies = |f: &Form| f.terms.iter().any(|&(u, _)| variant(&unknowns[u as usize]));
-    let range_of = |side: usize, f: &Form| word_range(classes[side], f).unwrap_or((0, u32::MAX));
-    let mut words: Vec<(Form, i128, i128)> = Vec::new();
-    for (f, c) in &wx.words {
-        words.push((f.clone(), *c, 0));
-    }
-    for (f, c) in &wy.words {
-        match words.iter_mut().find(|(g, _, _)| g == f && !varies(f)) {
-            Some((_, _, old)) => *old += *c,
-            None => words.push((f.clone(), 0, *c)),
-        }
-    }
-    for (f, cx, cy) in words {
-        let (rx, ry) = (range_of(0, &f), range_of(1, &f));
-        if (cx != 0 && rx.0 > rx.1) || (cy != 0 && ry.0 > ry.1) {
-            return true;
-        }
-        if varies(&f) || cx == 0 || cy == 0 {
-            terms.push((cx, rx));
-            terms.push((-cy, ry));
-        } else {
-            let both = (rx.0.max(ry.0), rx.1.min(ry.1));
-            if both.0 > both.1 {
-                return true;
-            }
-            terms.push((cx - cy, both));
-        }
-    }
-    let window = (-(x_bytes as i128) + 1, y_bytes as i128 - 1);
-    integer_hits(wx.constant - wy.constant, &terms, window) == Some(false)
-}
+const WORD: i128 = 1 << 32;
+const SHARED: usize = 2;
 
-fn integer_hits(constant: i128, terms: &[(i128, (u32, u32))], window: (i128, i128)) -> Option<bool> {
-    let mut constant = constant;
-    let mut rest: Vec<(i128, i128)> = Vec::new();
-    for &(c, (low, high)) in terms {
-        constant = constant.checked_add(c.checked_mul(low as i128)?)?;
-        let width = high as i128 - low as i128;
-        if c != 0 && width > 0 {
-            rest.push((c, width));
-        }
-    }
-    let (mut least, mut most) = (constant, constant);
-    for &(c, w) in &rest {
-        let span = c.checked_mul(w)?;
-        least = least.checked_add(span.min(0))?;
-        most = most.checked_add(span.max(0))?;
-    }
-    if most < window.0 || least > window.1 {
-        return Some(false);
-    }
-    let g = rest.iter().fold(0i128, |g, &(c, _)| gcd128(g, c.abs()));
-    let targets: Vec<i128> = (window.0..=window.1)
-        .map(|t| t - constant)
-        .filter(|&t| if g == 0 { t == 0 } else { t % g == 0 })
-        .collect();
-    if targets.is_empty() {
-        return Some(false);
-    }
-    match rest.len() {
-        0 => Some(true),
-        1 => {
-            let (c, w) = rest[0];
-            Some(targets.iter().any(|&t| t % c == 0 && (0..=w).contains(&(t / c))))
-        }
-        _ => {
-            let mut order: Vec<usize> = (0..rest.len()).collect();
-            order.sort_by_key(|&k| std::cmp::Reverse(rest[k].1));
-            let ((a, wa), (b, wb)) = (rest[order[0]], rest[order[1]]);
-            let mut sums: Vec<i128> = vec![0];
-            for &k in &order[2..] {
-                let (c, w) = rest[k];
-                if (w + 1) * sums.len() as i128 > 4096 {
-                    return None;
-                }
-                sums = sums.iter().flat_map(|&s| (0..=w).map(move |x| s + c * x)).collect();
-                sums.sort_unstable();
-                sums.dedup();
-            }
-            let mut found = false;
-            for &t in &targets {
-                for &s in &sums {
-                    match pair_solvable(a, wa, b, wb, t - s) {
-                        Some(true) => found = true,
-                        Some(false) => {}
-                        None => return None,
-                    }
-                    if found {
-                        return Some(true);
-                    }
-                }
-            }
-            Some(false)
-        }
-    }
-}
-
-fn gcd128(a: i128, b: i128) -> i128 {
+fn gcd(a: i128, b: i128) -> i128 {
     let (mut a, mut b) = (a.abs(), b.abs());
     while b != 0 {
         (a, b) = (b, a % b);
@@ -1200,49 +1020,477 @@ fn gcd128(a: i128, b: i128) -> i128 {
     a
 }
 
-fn pair_solvable(a: i128, wa: i128, b: i128, wb: i128, t: i128) -> Option<bool> {
-    let g = gcd128(a, b);
-    if t % g != 0 {
-        return Some(false);
+type Shape = (i128, Vec<(i128, Domain)>, Option<(usize, usize)>);
+
+#[derive(Default)]
+pub(super) struct Shapes {
+    sets: HashMap<Shape, Option<std::rc::Rc<Values>>>,
+}
+
+const ENUMERATED: i128 = 1 << 16;
+const SPAN: i128 = 1 << 20;
+
+enum Values {
+    Sorted(Vec<i128>),
+    Line { offset: i128, bits: Vec<bool> },
+    Cycle { modulus: i128, bits: Vec<bool> },
+}
+
+impl Values {
+    fn contains(&self, v: i128, modulus: i128) -> bool {
+        match self {
+            Values::Sorted(values) => values.binary_search(&(if modulus > 0 { v.rem_euclid(modulus) } else { v })).is_ok(),
+            Values::Line { offset, bits } => {
+                let end = offset + bits.len() as i128;
+                if modulus == 0 {
+                    return v >= *offset && v < end && bits[(v - offset) as usize];
+                }
+                let mut x = offset + (v - offset).rem_euclid(modulus);
+                while x < end {
+                    if bits[(x - offset) as usize] {
+                        return true;
+                    }
+                    x += modulus;
+                }
+                false
+            }
+            Values::Cycle { modulus, bits } => bits[v.rem_euclid(*modulus) as usize],
+        }
     }
-    let (a, b, t) = (a / g, b / g, t / g);
-    let m = b.abs();
-    if m >= 1 << 62 || a.abs() >= 1 << 62 {
-        return None;
+}
+
+struct Encoding<'a> {
+    unknowns: &'a [UnknownInfo],
+    variant: &'a dyn Fn(&UnknownInfo) -> bool,
+    problem: Problem,
+    vars: HashMap<(usize, Unknown), Var>,
+    words: Vec<((usize, Form), Var)>,
+    difference: Linear,
+    window: (i128, i128),
+    modular: bool,
+}
+
+impl<'a> Encoding<'a> {
+    fn new(unknowns: &'a [UnknownInfo], variant: &'a dyn Fn(&UnknownInfo) -> bool) -> Self {
+        Encoding {
+            unknowns,
+            variant,
+            problem: Problem::default(),
+            vars: HashMap::default(),
+            words: Vec::new(),
+            difference: Linear::default(),
+            window: (0, 0),
+            modular: false,
+        }
     }
-    let x0 = if m == 1 {
-        0
-    } else {
-        let inverse = inverse_mod(a.rem_euclid(m), m)?;
-        (t.rem_euclid(m) * inverse).rem_euclid(m)
+
+    fn side_of(&self, side: usize, u: Unknown) -> usize {
+        if (self.variant)(&self.unknowns[u as usize]) {
+            side
+        } else {
+            SHARED
+        }
+    }
+
+    fn unknown(&mut self, side: usize, u: Unknown) -> Var {
+        let key = (self.side_of(side, u), u);
+        if let Some(&v) = self.vars.get(&key) {
+            return v;
+        }
+        let info = &self.unknowns[u as usize];
+        let (lo, hi) = info.range.unwrap_or((0, u32::MAX));
+        let mut domain = Domain::between(lo as i128, hi as i128);
+        if let Some(values) = &info.values {
+            domain = domain.meet(&Domain::of_values(values.iter().map(|&k| k as i128)));
+        }
+        let v = self.problem.var(domain);
+        self.vars.insert(key, v);
+        v
+    }
+
+    fn form(&mut self, side: usize, f: &Form) -> Linear {
+        let mut e = Linear::constant(f.constant as i32 as i128);
+        for &(u, c) in &f.terms {
+            let v = self.unknown(side, u);
+            e.add(v, c as i32 as i128);
+        }
+        e
+    }
+
+    fn wrapped(&mut self, e: Linear) -> Linear {
+        let m = self.problem.free();
+        e.term(m, -WORD)
+    }
+
+    fn word(&mut self, side: usize, f: &Form) -> Var {
+        let key = (
+            if f.terms.iter().any(|&(u, _)| self.side_of(side, u) == side) { side } else { SHARED },
+            f.clone(),
+        );
+        if let Some((_, v)) = self.words.iter().find(|(k, _)| *k == key) {
+            return *v;
+        }
+        let e = self.form(side, f);
+        let w = self.problem.between(0, WORD - 1);
+        let e = self.wrapped(e);
+        self.problem.equal(e.term(w, -1));
+        self.words.push((key, w));
+        w
+    }
+
+    fn wide(&mut self, side: usize, w: &Wide) -> Linear {
+        let mut e = Linear::constant(w.constant);
+        for &(u, c) in &w.terms {
+            let v = self.unknown(side, u);
+            e.add(v, c);
+        }
+        for (f, c) in &w.words {
+            let v = self.word(side, f);
+            e.add(v, *c);
+        }
+        e
+    }
+
+    fn limits(&mut self, classes: [&Classes; 2]) {
+        let mut done = [BTreeSet::new(), BTreeSet::new()];
+        loop {
+            let present: BTreeSet<Unknown> = self.vars.keys().map(|&(_, u)| u).collect();
+            let mut added = false;
+            for side in 0..2 {
+                for (i, (form, pieces)) in classes[side].iter().enumerate() {
+                    if done[side].contains(&i) || !form.terms.iter().any(|&(u, _)| present.contains(&u)) {
+                        continue;
+                    }
+                    done[side].insert(i);
+                    added = true;
+                    let domain = Domain::Within(pieces.iter().map(|&(lo, hi)| (lo as i128, hi as i128)).collect());
+                    let v = match form.terms.as_slice() {
+                        &[(u, 1)] if form.constant == 0 => self.unknown(side, u),
+                        _ => self.word(side, form),
+                    };
+                    self.problem.domains[v] = self.problem.domains[v].meet(&domain);
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+    }
+
+    fn window(&mut self, difference: Linear, modular: bool, x_bytes: u32, y_bytes: u32) {
+        self.window = (-(x_bytes as i128) + 1, y_bytes as i128 - 1);
+        self.difference = difference.clone();
+        self.modular = modular;
+        let difference = if modular { self.wrapped(difference) } else { difference };
+        self.problem.at_least(difference.clone().offset(-self.window.0));
+        self.problem.at_most(difference, self.window.1);
+    }
+
+    fn surely_apart(&self) -> bool {
+        let (lo, hi) = self.window;
+        let g = self.difference.terms.iter().fold(0i128, |g, &(_, c)| gcd(g, c));
+        let g = if self.modular { gcd(g, WORD) } else { g };
+        if g > 1 && !(lo..=hi).any(|t| (t - self.difference.constant).rem_euclid(g) == 0) {
+            return true;
+        }
+        let (low, high) = self.problem.bounds(&self.difference);
+        let (Some(low), Some(high)) = (low, high) else {
+            return false;
+        };
+        if low > high {
+            return true;
+        }
+        if !self.modular {
+            return high < lo || low > hi;
+        }
+        let span = high - low;
+        span + 1 < WORD && !(lo..=hi).any(|t| (t - low).rem_euclid(WORD) <= span)
+    }
+
+    fn shape(&self, copies: Option<(Var, Var)>) -> Option<Shape> {
+        if !self.problem.equal.is_empty() {
+            return None;
+        }
+        let mut modulus = if self.modular { WORD } else { 0 };
+        let mut terms: Vec<(i128, Domain, Var)> = Vec::with_capacity(self.difference.terms.len());
+        for &(v, c) in &self.difference.terms {
+            if c == 0 {
+                continue;
+            }
+            let Domain::Within(pieces) = &self.problem.domains[v] else {
+                return None;
+            };
+            if pieces.is_empty() {
+                return None;
+            }
+            let whole = self.modular && pieces.len() == 1 && pieces[0].0 <= 0 && pieces[0].1 >= WORD - 1;
+            if whole && copies.is_none_or(|(p, q)| v != p && v != q) {
+                modulus = gcd(modulus, c);
+                continue;
+            }
+            terms.push((c, self.problem.domains[v].clone(), v));
+        }
+        terms.sort_by(|a, b| (a.0, &a.1, a.2).cmp(&(b.0, &b.1, b.2)));
+        let differ = copies.and_then(|(p, q)| {
+            let i = terms.iter().position(|t| t.2 == p)?;
+            let j = terms.iter().position(|t| t.2 == q)?;
+            Some((i, j))
+        });
+        if copies.is_some() && differ.is_none() {
+            return None;
+        }
+        Some((modulus, terms.into_iter().map(|(c, d, _)| (c, d)).collect(), differ))
+    }
+
+    fn values(shape: &Shape) -> Option<Values> {
+        let (modulus, terms, differ) = shape;
+        if differ.is_some() {
+            return Self::enumerate(shape).map(Values::Sorted);
+        }
+        let mut span: i128 = 0;
+        let mut offset: i128 = 0;
+        for (c, d) in terms {
+            let (Some(lo), Some(hi)) = d.hull()? else {
+                return None;
+            };
+            if *c >= 0 {
+                offset += c * lo;
+                span += c * (hi - lo);
+            } else {
+                offset += c * hi;
+                span += -c * (hi - lo);
+            }
+        }
+        if *modulus > 0 && *modulus <= SPAN {
+            return Some(Self::cycle(*modulus, terms));
+        }
+        if span < SPAN {
+            return Some(Self::line(offset, span, terms));
+        }
+        Self::enumerate(shape).map(Values::Sorted)
+    }
+
+    fn line(offset: i128, span: i128, terms: &[(i128, Domain)]) -> Values {
+        let n = span as usize + 1;
+        let mut bits = vec![false; n];
+        bits[0] = true;
+        for (c, d) in terms {
+            let Domain::Within(pieces) = d else { unreachable!() };
+            let (lo, hi) = (pieces[0].0, pieces[pieces.len() - 1].1);
+            let s = c.unsigned_abs() as usize;
+            if s == 0 {
+                continue;
+            }
+            let steps: Vec<(usize, usize)> = pieces
+                .iter()
+                .map(|&(a, b)| if *c >= 0 { ((a - lo) as usize, (b - lo) as usize) } else { ((hi - b) as usize, (hi - a) as usize) })
+                .collect();
+            let mut count = vec![0u32; n];
+            for v in 0..n {
+                count[v] = bits[v] as u32 + if v >= s { count[v - s] } else { 0 };
+            }
+            let at = |v: isize| if v < 0 { 0 } else { count[v as usize] };
+            let mut next = vec![false; n];
+            for v in 0..n {
+                next[v] = steps.iter().any(|&(a, b)| {
+                    let high = v as isize - (s * a) as isize;
+                    high >= 0 && at(high) - at(v as isize - (s * (b + 1)) as isize) > 0
+                });
+            }
+            bits = next;
+        }
+        Values::Line { offset, bits }
+    }
+
+    fn cycle(modulus: i128, terms: &[(i128, Domain)]) -> Values {
+        let m = modulus as usize;
+        let mut bits = vec![false; m];
+        bits[0] = true;
+        for (c, d) in terms {
+            let Domain::Within(pieces) = d else { unreachable!() };
+            let s = c.rem_euclid(modulus) as usize;
+            if s == 0 {
+                continue;
+            }
+            let g = gcd(s as i128, modulus) as usize;
+            let cycle = m / g;
+            let mut next = vec![false; m];
+            let mut seq = vec![0u32; cycle];
+            let mut prefix = vec![0u32; 2 * cycle + 1];
+            for r in 0..g {
+                let mut p = r;
+                for i in 0..cycle {
+                    seq[i] = bits[p] as u32;
+                    p = (p + s) % m;
+                }
+                for i in 0..2 * cycle {
+                    prefix[i + 1] = prefix[i] + seq[i % cycle];
+                }
+                let total = prefix[cycle];
+                let mut p = r;
+                for i in 0..cycle {
+                    let reachable = pieces.iter().any(|&(a, b)| {
+                        let width = (b - a + 1) as usize;
+                        if width >= cycle {
+                            return total > 0;
+                        }
+                        let start = (i as i128 - b).rem_euclid(cycle as i128) as usize;
+                        prefix[start + width] - prefix[start] > 0
+                    });
+                    next[p] = reachable;
+                    p = (p + s) % m;
+                }
+            }
+            bits = next;
+        }
+        Values::Cycle { modulus, bits }
+    }
+
+    fn enumerate(shape: &Shape) -> Option<Vec<i128>> {
+        let (modulus, terms, differ) = shape;
+        let mut count: i128 = 1;
+        for (_, d) in terms {
+            let Domain::Within(pieces) = d else {
+                return None;
+            };
+            let width: i128 = pieces.iter().map(|&(lo, hi)| hi - lo + 1).sum();
+            count = count.checked_mul(width)?;
+            if count > ENUMERATED {
+                return None;
+            }
+        }
+        let choices: Vec<Vec<i128>> = terms
+            .iter()
+            .map(|(_, d)| match d {
+                Domain::Within(pieces) => pieces.iter().flat_map(|&(lo, hi)| lo..=hi).collect(),
+                Domain::Free => Vec::new(),
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut index = vec![0usize; terms.len()];
+        if choices.iter().any(|c| c.is_empty()) {
+            return Some(out);
+        }
+        loop {
+            let allowed = differ.is_none_or(|(i, j)| choices[i][index[i]] != choices[j][index[j]]);
+            if allowed {
+                let sum = terms.iter().zip(&index).zip(&choices).fold(0i128, |acc, (((c, _), &k), values)| acc + c * values[k]);
+                out.push(if *modulus > 0 { sum.rem_euclid(*modulus) } else { sum });
+            }
+            let mut k = 0;
+            loop {
+                if k == terms.len() {
+                    out.sort_unstable();
+                    out.dedup();
+                    return Some(out);
+                }
+                index[k] += 1;
+                if index[k] < choices[k].len() {
+                    break;
+                }
+                index[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
+    fn hits(&self, modulus: i128, values: &Values) -> bool {
+        let (lo, hi) = self.window;
+        (lo..=hi).any(|t| values.contains(t - self.difference.constant, modulus))
+    }
+
+    fn feasible(&self, differ: Option<Unknown>, cache: &mut Shapes) -> Option<bool> {
+        if self.surely_apart() {
+            return Some(false);
+        }
+        let copies = differ.and_then(|u| Some((*self.vars.get(&(0, u))?, *self.vars.get(&(1, u))?)));
+        if let Some(shape) = self.shape(copies) {
+            let modulus = shape.0;
+            let values = cache
+                .sets
+                .entry(shape)
+                .or_insert_with_key(|shape| Self::values(shape).map(std::rc::Rc::new))
+                .clone();
+            if let Some(values) = values {
+                return Some(self.hits(modulus, &values));
+            }
+        }
+        let Some((p, q)) = copies else {
+            return self.problem.feasible();
+        };
+        let mut unknown = false;
+        for (a, b) in [(p, q), (q, p)] {
+            let mut problem = self.problem.clone();
+            problem.at_least(Linear::constant(-1).term(a, 1).term(b, -1));
+            match problem.feasible() {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            None
+        } else {
+            Some(false)
+        }
+    }
+}
+
+fn quickly_apart(
+    unknowns: &[UnknownInfo],
+    x: &Form,
+    y: &Form,
+    x_bytes: u32,
+    y_bytes: u32,
+    variant: &dyn Fn(&UnknownInfo) -> bool,
+) -> bool {
+    let (lo, hi) = (-(x_bytes as i128) + 1, y_bytes as i128 - 1);
+    let constant = (x.constant as i32 as i128) - (y.constant as i32 as i128);
+    let (mut g, mut low, mut high) = (WORD, constant, constant);
+    let mut add = |u: Unknown, c: i128| {
+        if c == 0 {
+            return;
+        }
+        g = gcd(g, c);
+        let (a, b) = unknowns[u as usize].range.unwrap_or((0, u32::MAX));
+        let (a, b) = if c > 0 { (a as i128 * c, b as i128 * c) } else { (b as i128 * c, a as i128 * c) };
+        low += a;
+        high += b;
     };
-    let y0 = t.checked_sub(a.checked_mul(x0)?)? / b;
-    let (mut low, mut high) = (floor_div(-x0 + m - 1, m), floor_div(wa - x0, m));
-    let s = a * b.signum();
-    if s > 0 {
-        low = low.max(floor_div(y0 - wb + s - 1, s));
-        high = high.min(floor_div(y0, s));
-    } else {
-        let s = -s;
-        low = low.max(floor_div(-y0 + s - 1, s));
-        high = high.min(floor_div(wb - y0, s));
+    let (mut i, mut j) = (0, 0);
+    while i < x.terms.len() || j < y.terms.len() {
+        match (x.terms.get(i), y.terms.get(j)) {
+            (Some(&(u, cx)), Some(&(v, cy))) if u == v => {
+                i += 1;
+                j += 1;
+                let (cx, cy) = (cx as i32 as i128, cy as i32 as i128);
+                if variant(&unknowns[u as usize]) {
+                    add(u, cx);
+                    add(u, -cy);
+                } else {
+                    add(u, cx - cy);
+                }
+            }
+            (Some(&(u, cx)), Some(&(v, _))) if u < v => {
+                i += 1;
+                add(u, cx as i32 as i128);
+            }
+            (Some(&(u, cx)), None) => {
+                i += 1;
+                add(u, cx as i32 as i128);
+            }
+            (_, Some(&(v, cy))) => {
+                j += 1;
+                add(v, -(cy as i32 as i128));
+            }
+            (None, None) => break,
+        }
     }
-    Some(low <= high)
-}
-
-fn floor_div(a: i128, b: i128) -> i128 {
-    a.div_euclid(b)
-}
-
-fn inverse_mod(a: i128, m: i128) -> Option<i128> {
-    let (mut old_r, mut r) = (a, m);
-    let (mut old_s, mut s) = (1i128, 0i128);
-    while r != 0 {
-        let q = old_r / r;
-        (old_r, r) = (r, old_r - q * r);
-        (old_s, s) = (s, old_s - q * s);
+    if g > 1 && !(lo..=hi).any(|t| (t - constant).rem_euclid(g) == 0) {
+        return true;
     }
-    (old_r == 1).then(|| old_s.rem_euclid(m))
+    let span = high - low;
+    span + 1 < WORD && !(lo..=hi).any(|t| (t - low).rem_euclid(WORD) <= span)
 }
 
 fn may_overlap_within(
@@ -1253,300 +1501,41 @@ fn may_overlap_within(
     y_bytes: u32,
     variant: &dyn Fn(&UnknownInfo) -> bool,
     differ: Option<Unknown>,
-    ranges: [&HashMap<Unknown, (u32, u32)>; 2],
+    classes: [&Classes; 2],
+    cache: &mut Shapes,
 ) -> bool {
-    let mut sum = Sum::default();
-    let mut apart = None;
-    let (mut i, mut j) = (0, 0);
-    while i < x.terms.len() || j < y.terms.len() {
-        let u = match (x.terms.get(i), y.terms.get(j)) {
-            (Some(&(a, _)), Some(&(b, _))) => a.min(b),
-            (Some(&(a, _)), None) => a,
-            (None, Some(&(b, _))) => b,
-            (None, None) => break,
-        };
-        let cx = match x.terms.get(i) {
-            Some(&(a, c)) if a == u => {
-                i += 1;
-                c
-            }
-            _ => 0,
-        };
-        let cy = match y.terms.get(j) {
-            Some(&(b, c)) if b == u => {
-                j += 1;
-                c
-            }
-            _ => 0,
-        };
-        let info = &unknowns[u as usize];
-        let set = if info.values.is_some() { u } else { NO_SET };
-        let (Some(rx), Some(ry)) = (narrowed(info, u, ranges[0].get(&u)), narrowed(info, u, ranges[1].get(&u))) else {
-            return false;
-        };
-        if variant(info) {
-            if let (true, true, Some((lo, hi)), NO_SET) = (Some(u) == differ, cx == cy, info.range, set) {
-                apart = Some((cx, hi - lo));
-                continue;
-            }
-            sum.add(cx, rx, set);
-            sum.add(cy.wrapping_neg(), ry, set);
-        } else {
-            let both = match (rx, ry) {
-                (Some((a, b)), Some((c, d))) if a.max(c) > b.min(d) => return false,
-                (Some((a, b)), Some((c, d))) => Some((a.max(c), b.min(d))),
-                (r, None) | (None, r) => r,
-            };
-            sum.add(cx.wrapping_sub(cy), both, set);
-        }
-    }
-    let constant = x.constant.wrapping_sub(y.constant) as i64;
-    match apart {
-        None => sum.within(unknowns, constant, x_bytes, y_bytes),
-        Some((_, 0)) => false,
-        Some((c, span)) => [c, c.wrapping_neg()].iter().any(|&c| {
-            let mut sum = sum;
-            sum.add(c, Some((1, span)), NO_SET);
-            sum.within(unknowns, constant, x_bytes, y_bytes)
-        }),
-    }
-}
-
-const BOUNDED: usize = 8;
-const PARTIAL_SUMS: usize = 4096;
-const ONE_TERM: u32 = 1 << 16;
-const NO_SET: Unknown = Unknown::MAX;
-
-#[derive(Clone, Copy)]
-struct Sum {
-    low: i64,
-    high: i64,
-    modulus: u64,
-    divisor: u64,
-    free: u64,
-    terms: [(u32, u32, u32, Unknown); BOUNDED],
-    count: usize,
-}
-
-impl Default for Sum {
-    fn default() -> Self {
-        Sum {
-            low: 0,
-            high: 0,
-            modulus: 1 << 32,
-            divisor: 0,
-            free: 1 << 32,
-            terms: [(0, 0, 0, NO_SET); BOUNDED],
-            count: 0,
-        }
-    }
-}
-
-impl Sum {
-    fn add(&mut self, c: u32, range: Option<(u32, u32)>, set: Unknown) {
-        if c == 0 {
-            return;
-        }
-        let signed = c as i32 as i64;
-        match range {
-            Some((lo, hi)) if (hi as i64 - lo as i64) * signed.abs() < 1 << 32 => {
-                let (a, b) = (signed * lo as i64, signed * hi as i64);
-                self.low = self.low.wrapping_add(a.min(b));
-                self.high = self.high.wrapping_add(a.max(b));
-                self.divisor = gcd(self.divisor, signed.unsigned_abs());
-            }
-            _ => self.modulus = self.modulus.min(1u64 << c.trailing_zeros()),
-        }
-        match range {
-            Some((lo, hi)) if self.count < BOUNDED => {
-                self.terms[self.count] = (c, lo, hi, set);
-                self.count += 1;
-            }
-            Some(_) => self.count = BOUNDED + 1,
-            None => self.free = self.free.min(1u64 << c.trailing_zeros()),
-        }
-    }
-
-    fn within(&self, unknowns: &[UnknownInfo], constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
-        self.roughly_within(constant, x_bytes, y_bytes) && self.exactly_within(unknowns, constant, x_bytes, y_bytes)
-    }
-
-    fn roughly_within(&self, constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
-        let step = gcd(self.divisor, self.modulus) as i64;
-        let window = -(x_bytes as i64) + 1..y_bytes as i64;
-        if !window.clone().any(|t| (t - constant).rem_euclid(step) == 0) {
-            return false;
-        }
-        let span = self.high.wrapping_sub(self.low);
-        if span + 1 >= self.modulus as i64 {
-            return true;
-        }
-        let m = self.modulus as i64;
-        window.into_iter().any(|t| {
-            let target = (t - constant).rem_euclid(m);
-            let start = self.low.rem_euclid(m);
-            let offset = (target - start).rem_euclid(m);
-            offset <= span
-        })
-    }
-
-    fn exactly_within(&self, unknowns: &[UnknownInfo], constant: i64, x_bytes: u32, y_bytes: u32) -> bool {
-        if self.count == 0 || self.count > BOUNDED {
-            return true;
-        }
-        let m = self.free;
-        let mask = m - 1;
-        let terms = &self.terms[..self.count];
-        let mut widest: Vec<usize> = (0..terms.len()).filter(|&k| terms[k].3 == NO_SET).collect();
-        widest.sort_by_key(|&k| std::cmp::Reverse(terms[k].2 - terms[k].1));
-        let (first, second) = (widest.first().copied(), widest.get(1).copied());
-        let hits = |s: u64| {
-            (-(x_bytes as i64) + 1..y_bytes as i64).any(|t| {
-                let target = ((t - constant).rem_euclid(m as i64) as u64).wrapping_sub(s) & mask;
-                let Some(first) = first else {
-                    return target == 0;
-                };
-                let (c1, lo1, hi1, _) = terms[first];
-                match second {
-                    None => solvable(c1, lo1, hi1, target, m),
-                    Some(k) => {
-                        let (c2, lo2, hi2, _) = terms[k];
-                        let start = (c1 as u64).wrapping_mul(lo1 as u64).wrapping_add((c2 as u64).wrapping_mul(lo2 as u64));
-                        let target = target.wrapping_sub(start) & mask;
-                        two_solvable(c1 as u64, (hi1 - lo1) as u64, c2 as u64, (hi2 - lo2) as u64, target, m)
-                    }
-                }
-            })
-        };
-        let rest: Vec<usize> = (0..terms.len()).filter(|&k| Some(k) != first && Some(k) != second).collect();
-        if let &[k] = rest.as_slice() {
-            let (c, lo, hi, set) = terms[k];
-            if set == NO_SET && hi - lo < ONE_TERM {
-                return (lo..=hi).any(|u| hits((c as u64).wrapping_mul(u as u64) & mask));
-            }
-        }
-        let mut sums: Vec<u64> = vec![0];
-        for (k, &(c, lo, hi, set)) in terms.iter().enumerate() {
-            if Some(k) == first || Some(k) == second {
-                continue;
-            }
-            let values = (set != NO_SET).then(|| unknowns[set as usize].values.clone()).flatten();
-            let width = values.as_ref().map_or((hi - lo) as usize + 1, |v| v.len());
-            if width > PARTIAL_SUMS || sums.len() * width > PARTIAL_SUMS * 4 {
-                return true;
-            }
-            let mut next: Vec<u64> = Vec::with_capacity(sums.len() * width);
-            for &s in &sums {
-                match &values {
-                    Some(values) => {
-                        for &u in values.iter() {
-                            next.push(s.wrapping_add((c as u64).wrapping_mul(u as u64)) & mask);
-                        }
-                    }
-                    None => {
-                        for u in lo..=hi {
-                            next.push(s.wrapping_add((c as u64).wrapping_mul(u as u64)) & mask);
-                        }
-                    }
-                }
-            }
-            next.sort_unstable();
-            next.dedup();
-            if next.len() > PARTIAL_SUMS {
-                return true;
-            }
-            sums = next;
-        }
-        sums.into_iter().any(hits)
-    }
-}
-
-fn odd_inverse(odd: u64) -> u64 {
-    (0..6).fold(odd, |inv: u64, _| inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv))))
-}
-
-fn floor_sum(mut n: u128, mut m: u128, mut a: u128, mut b: u128) -> u128 {
-    let mut sum = 0u128;
-    loop {
-        if a >= m {
-            sum += n * n.saturating_sub(1) / 2 * (a / m);
-            a %= m;
-        }
-        if b >= m {
-            sum += n * (b / m);
-            b %= m;
-        }
-        let top = a * n + b;
-        if top < m {
-            return sum;
-        }
-        n = top / m;
-        b = top % m;
-        std::mem::swap(&mut m, &mut a);
-    }
-}
-
-fn some_low_residue(n: u64, modulus: u64, a: u64, b: u64, bound: u64) -> bool {
-    if n == 0 {
+    if quickly_apart(unknowns, x, y, x_bytes, y_bytes, variant) {
         return false;
     }
-    if bound >= modulus - 1 {
+    let mut e = Encoding::new(unknowns, variant);
+    let fx = e.form(0, x);
+    let fy = e.form(1, y);
+    e.window(fx.plus(&fy, -1), true, x_bytes, y_bytes);
+    if e.surely_apart() {
+        return false;
+    }
+    e.limits(classes);
+    e.feasible(differ, cache) != Some(false)
+}
+
+fn wide_apart(
+    unknowns: &[UnknownInfo],
+    (wx, x_bytes): (&Wide, u32),
+    (wy, y_bytes): (&Wide, u32),
+    variant: &dyn Fn(&UnknownInfo) -> bool,
+    differ: Option<Unknown>,
+    classes: [&Classes; 2],
+    cache: &mut Shapes,
+) -> bool {
+    let mut e = Encoding::new(unknowns, variant);
+    let fx = e.wide(0, wx);
+    let fy = e.wide(1, wy);
+    e.window(fx.plus(&fy, -1), false, x_bytes, y_bytes);
+    if e.surely_apart() {
         return true;
     }
-    let (n, m, a, b, bound) = (n as u128, modulus as u128, a as u128, b as u128, bound as u128);
-    floor_sum(n, m, b, a) + n > floor_sum(n, m, b, a + m - 1 - bound)
-}
-
-fn two_solvable(c1: u64, w1: u64, c2: u64, w2: u64, target: u64, m: u64) -> bool {
-    let mask = m - 1;
-    let (c1, c2, target) = (c1 & mask, c2 & mask, target & mask);
-    if c1 == 0 {
-        return solvable(c2 as u32, 0, w2 as u32, target, m);
-    }
-    if c2 == 0 {
-        return solvable(c1 as u32, 0, w1 as u32, target, m);
-    }
-    let g = 1u64 << c1.trailing_zeros();
-    let g2 = (1u64 << c2.trailing_zeros()).min(g);
-    if target % g2 != 0 {
-        return false;
-    }
-    let step = g / g2;
-    let first = if step == 1 {
-        0
-    } else {
-        ((target / g2) % step).wrapping_mul(odd_inverse(c2 / g2)) & (step - 1)
-    };
-    if first > w2 {
-        return false;
-    }
-    let count = (w2 - first) / step + 1;
-    let big = m / g;
-    let low = big - 1;
-    let inverse = odd_inverse(c1 / g) & low;
-    let base = target.wrapping_sub(c2.wrapping_mul(first)) & mask;
-    let a = (base / g).wrapping_mul(inverse) & low;
-    let delta = (c2.wrapping_mul(step) & mask) / g;
-    let b = (big - (delta & low)).wrapping_mul(inverse) & low;
-    some_low_residue(count, big, a, b, w1)
-}
-
-fn solvable(c: u32, lo: u32, hi: u32, target: u64, m: u64) -> bool {
-    let c = c as u64 % m;
-    if c == 0 {
-        return target % m == 0;
-    }
-    let g = 1u64 << c.trailing_zeros();
-    if target % g != 0 {
-        return false;
-    }
-    let reduced = m / g;
-    let mask = reduced - 1;
-    let odd = c / g;
-    let inverse = (0..6).fold(odd, |inv: u64, _| inv.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inv))));
-    let r = ((target / g).wrapping_mul(inverse)) & mask;
-    let first = lo as u64 + (r.wrapping_sub(lo as u64) & mask);
-    first <= hi as u64
+    e.limits(classes);
+    e.feasible(differ, cache) == Some(false)
 }
 
 #[cfg(test)]
@@ -1554,13 +1543,6 @@ pub(super) fn may_overlap_for_tests(unknowns: &[UnknownInfo], x: &Form, y: &Form
     may_overlap(unknowns, x, y, 1, 1, &|_: &UnknownInfo| false, None)
 }
 
-fn gcd(a: u64, b: u64) -> u64 {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -1769,44 +1751,6 @@ mod tests {
         let y = Form::constant(0);
         assert!(exact_overlap(&unknowns, &[false, false], &x, &y, 1, 1));
         assert!(may_overlap(&unknowns, &x, &y, 1, 1, &|_: &UnknownInfo| false, None));
-    }
-
-    #[test]
-    fn two_solvable_matches_enumeration() {
-        let mut r = Random::new(53);
-        let mut wrong = Vec::new();
-        for _ in 0..3000 {
-            let m = 1u64 << (1 + r.below(32));
-            let pick = |r: &mut Random| match r.below(4) {
-                0 => r.below(8),
-                1 => (r.next() as u32 as u64) << r.below(8),
-                2 => r.next() as u32 as u64,
-                _ => 1u64 << r.below(32),
-            };
-            let (c1, c2, target) = (pick(&mut r) & (m - 1), pick(&mut r) & (m - 1), r.next() as u32 as u64 & (m - 1));
-            let (w1, w2) = (r.below(70), r.below(70));
-            let brute = (0..=w1).any(|u| (0..=w2).any(|v| (c1.wrapping_mul(u).wrapping_add(c2.wrapping_mul(v)).wrapping_sub(target)) & (m - 1) == 0));
-            if two_solvable(c1, w1, c2, w2, target, m) != brute {
-                wrong.push(format!("{} u + {} v = {} mod {:#x}, u <= {}, v <= {}: expected {}", c1, c2, target, m, w1, w2, brute));
-            }
-        }
-        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
-    }
-
-    #[test]
-    fn some_low_residue_matches_enumeration() {
-        let mut r = Random::new(59);
-        let mut wrong = Vec::new();
-        for _ in 0..3000 {
-            let bits = r.below(20);
-            let m = 1 + r.below(1 << bits);
-            let (a, b, bound, n) = (r.below(m), r.below(m), r.below(m), r.below(200));
-            let brute = (0..n).any(|j| (a + b * j) % m <= bound);
-            if some_low_residue(n, m, a, b, bound) != brute {
-                wrong.push(format!("({} + {} j) mod {} <= {} for j < {}: expected {}", a, b, m, bound, n, brute));
-            }
-        }
-        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(5)]);
     }
 
     #[test]
@@ -3921,60 +3865,6 @@ mod tests {
         };
         let h = Hazards::find(&b.program(), &env2());
         h.together.contains(&pair(&h, s1, s2))
-    }
-
-    #[test]
-    fn integer_hits_answers_as_every_assignment_does() {
-        let mut r = Random::new(149);
-        let mut wrong = Vec::new();
-        for trial in 0..3000 {
-            let n = r.below(4) as usize;
-            let terms: Vec<(i128, (u32, u32))> = (0..n)
-                .map(|_| {
-                    let c = r.below(41) as i128 - 20;
-                    let low = r.below(10) as u32;
-                    (c, (low, low + r.below(12) as u32))
-                })
-                .collect();
-            let constant = r.below(200) as i128 - 100;
-            let window = (-(r.below(4) as i128), r.below(4) as i128);
-            let mut hit = false;
-            let mut index: Vec<u32> = terms.iter().map(|t| t.1 .0).collect();
-            loop {
-                let value = terms.iter().zip(&index).fold(constant, |acc, (&(c, _), &x)| acc + c * x as i128);
-                hit |= value >= window.0 && value <= window.1;
-                let mut k = 0;
-                while k < n && index[k] == terms[k].1 .1 {
-                    index[k] = terms[k].1 .0;
-                    k += 1;
-                }
-                if k == n {
-                    break;
-                }
-                index[k] += 1;
-            }
-            let got = integer_hits(constant, &terms, window);
-            if got != Some(hit) {
-                wrong.push(format!("trial {}: {} + {:?} in {:?}: {:?}, not {}", trial, constant, terms, window, got, hit));
-            }
-        }
-        for trial in 0..400 {
-            let pick = |r: &mut Random| {
-                let c = r.below(100) as i128 - 50;
-                if c == 0 { 7 } else { c }
-            };
-            let (a, b) = (pick(&mut r), pick(&mut r));
-            let (wa, wb) = (r.below(2000) as i128, r.below(2000) as i128);
-            let t = r.below(200_000) as i128 - 100_000;
-            let truth = (0..=wa).any(|x| {
-                let rest = t - a * x;
-                rest % b == 0 && (0..=wb).contains(&(rest / b))
-            });
-            if pair_solvable(a, wa, b, wb, t) != Some(truth) {
-                wrong.push(format!("pair {}: {} x + {} y = {} over {} and {}: {:?}, not {}", trial, a, b, t, wa, wb, pair_solvable(a, wa, b, wb, t), truth));
-            }
-        }
-        assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(6)]);
     }
 
     fn records(second: u64) -> bool {
