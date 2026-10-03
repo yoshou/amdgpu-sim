@@ -5317,4 +5317,69 @@ mod tests {
     fn find_reports_stores_guarded_by_a_sum_and_a_word_that_name_one_word() {
         assert!(guarded_by_a_sum(7, 7), "both stores run at word 7 when u + w = 7 and v = 7");
     }
+
+    fn select_picked_by_the_predicate(guarded: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let v = uniform_word(&mut b, &k, e, 0, MemSize::U8);
+        let w = uniform_word(&mut b, &k, e, 4, MemSize::U8);
+        let three = b.constant(e, Ty::I32, 3);
+        let c = b.cmp(e, IntPred::Eq, v, three);
+        let far = b.constant(e, Ty::I32, 1000);
+        let index = b.core(e, Ty::I32, Op::Select(c, far, w));
+        let a1 = byte_offset(&mut b, e, buf, index, 4);
+        let m1 = if guarded { b.int(e, IntOp::And, c, k.exec) } else { k.exec };
+        let s1 = store_at(&mut b, e, a1, m1);
+        let scaled = byte_offset(&mut b, e, buf, w, 4);
+        let one = b.constant(e, Ty::I64, 1);
+        let a2 = b.int(e, IntOp::Add, scaled, one);
+        let zero = b.constant(e, Ty::I32, 0);
+        let s2 = b.here(e);
+        b.store(e, Space::Global, MemSize::U8, a2, zero, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_apart_a_store_whose_predicate_picks_its_far_select_arm() {
+        assert!(!select_picked_by_the_predicate(true), "under its predicate the store goes to word 1000, far from the byte stores below word 256");
+    }
+
+    #[test]
+    fn find_reports_a_store_whose_select_arm_the_predicate_leaves_open() {
+        assert!(select_picked_by_the_predicate(false), "without the guard the store may go to word w, where the byte store lands");
+    }
+
+    fn product_fixed_by_the_predicate(guarded: bool) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let x = uniform_word(&mut b, &k, e, 0, MemSize::U8);
+        let y = uniform_word(&mut b, &k, e, 4, MemSize::U8);
+        let seven = b.constant(e, Ty::I32, 7);
+        let c = b.cmp(e, IntPred::Eq, x, seven);
+        let product = b.int(e, IntOp::Mul, x, y);
+        let a1 = byte_offset(&mut b, e, buf, product, 4);
+        let m1 = if guarded { b.int(e, IntOp::And, c, k.exec) } else { k.exec };
+        let s1 = store_at(&mut b, e, a1, m1);
+        let scaled = byte_offset(&mut b, e, buf, y, 28);
+        let four = b.constant(e, Ty::I64, 4);
+        let a2 = b.int(e, IntOp::Add, scaled, four);
+        let zero = b.constant(e, Ty::I32, 0);
+        let s2 = b.here(e);
+        b.store(e, Space::Global, MemSize::U8, a2, zero, k.exec);
+        let h = Hazards::find(&b.program(), &env2());
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_keeps_apart_a_store_whose_predicate_fixes_a_factor_of_its_product() {
+        assert!(!product_fixed_by_the_predicate(true), "under x == 7 the store covers words 28y..28y+4, and the byte store is at 28y + 4");
+    }
+
+    #[test]
+    fn find_reports_a_store_whose_product_the_predicate_leaves_open() {
+        assert!(product_fixed_by_the_predicate(false), "x * y may equal 7y + 1 for some x and y");
+    }
 }
