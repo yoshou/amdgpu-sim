@@ -10,6 +10,10 @@ fn ints(n: usize, m: i32) -> Vec<i32> {
     (0..n).map(|k| (k as i32 * 37) % m - m / 2).collect()
 }
 
+fn words(n: usize) -> Vec<u32> {
+    (0..n as u32).map(|i| i.wrapping_mul(2654435761) >> 7).collect()
+}
+
 #[test]
 fn saxpy_scales_and_adds() {
     let k = Kernels::load();
@@ -1259,3 +1263,176 @@ fn max_float_cas_retries_until_it_wins() {
     }
 }
 
+#[test]
+fn shared_memory_with_a_wave_operation_and_no_barrier() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input: Vec<u32> = (0..n as u32).map(|i| i * 7 + 5).collect();
+    let values: Vec<u32> = input.iter().map(|&x| x * 3 + 1).collect();
+    let want: Vec<u32> = (0..n).map(|g| values[g] + values[g / 32 * 32]).collect();
+    for width in WIDTHS {
+        let mut out = vec![0u32; n];
+        k.run(
+            &Run {
+                kernel: "lds_first_lane",
+                wg: [64, 1, 1],
+                grid: [2, 1, 1],
+                args: &[Arg::output(&mut out), Arg::input(&input), Arg::U32(0)],
+            },
+            width,
+        );
+        same("lds_first_lane", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn shared_memory_exchange_between_neighbours() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input = words(n);
+    let values: Vec<u32> = input.iter().map(|&x| x * 3 + 1).collect();
+    let want: Vec<u32> = (0..n)
+        .map(|g| values[g ^ 1].wrapping_add(values[(g / 32 * 32) ^ 1]))
+        .collect();
+    for width in WIDTHS {
+        let mut out = vec![0u32; n];
+        k.run(
+            &Run {
+                kernel: "lds_first_lane",
+                wg: [64, 1, 1],
+                grid: [2, 1, 1],
+                args: &[Arg::output(&mut out), Arg::input(&input), Arg::U32(1)],
+            },
+            width,
+        );
+        same("lds_first_lane", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn shared_memory_after_a_barrier_the_compiler_drops() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input = words(n);
+    let want: Vec<u32> = (0..n)
+        .map(|g| input[g / 32 * 32 + 31 - g % 32] * 5 + 2)
+        .collect();
+    for width in WIDTHS {
+        let mut out = vec![0u32; n];
+        k.run(
+            &Run {
+                kernel: "lds_reverse",
+                wg: [32, 1, 1],
+                grid: [4, 1, 1],
+                args: &[Arg::output(&mut out), Arg::input(&input)],
+            },
+            width,
+        );
+        same("lds_reverse", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn global_memory_exchange_within_a_wave() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input = words(n);
+    let want: Vec<u32> = (0..n).map(|g| input[g ^ 1] * 2 + 1).collect();
+    for width in WIDTHS {
+        let mut out = vec![0u32; n];
+        let mut tmp = vec![0u32; n];
+        k.run(
+            &Run {
+                kernel: "global_swap",
+                wg: [32, 1, 1],
+                grid: [4, 1, 1],
+                args: &[
+                    Arg::output(&mut out),
+                    Arg::output(&mut tmp),
+                    Arg::input(&input),
+                ],
+            },
+            width,
+        );
+        same("global_swap", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn wave_synchronous_scan_in_shared_memory() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input = words(n);
+    let mut want = vec![0u32; n];
+    for g in 0..n {
+        want[g] = if g % 32 == 0 {
+            input[g]
+        } else {
+            want[g - 1].wrapping_add(input[g])
+        };
+    }
+    for width in WIDTHS {
+        let mut out = vec![0u32; n];
+        k.run(
+            &Run {
+                kernel: "wave_scan",
+                wg: [32, 1, 1],
+                grid: [4, 1, 1],
+                args: &[Arg::output(&mut out), Arg::input(&input)],
+            },
+            width,
+        );
+        same("wave_scan", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn atomic_total_read_by_another_lane() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input = words(n);
+    let want: Vec<u32> = input
+        .chunks(32)
+        .map(|block| block.iter().fold(0u32, |a, &x| a.wrapping_add(x)))
+        .collect();
+    for width in WIDTHS {
+        let mut out = vec![0u32; n / 32];
+        k.run(
+            &Run {
+                kernel: "block_sum",
+                wg: [32, 1, 1],
+                grid: [4, 1, 1],
+                args: &[Arg::output(&mut out), Arg::input(&input)],
+            },
+            width,
+        );
+        same("block_sum", width, "the reference", &out, &want);
+    }
+}
+
+#[test]
+fn exchange_after_divergent_stores() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let input = words(n);
+    let stored: Vec<u32> = input
+        .iter()
+        .map(|&v| if v & 1 == 1 { v + 7 } else { v * 3 })
+        .collect();
+    let want: Vec<u32> = (0..n)
+        .map(|g| stored[g / 32 * 32 + ((g % 32) ^ 2)])
+        .collect();
+    for width in WIDTHS {
+        let mut out = vec![0u32; n];
+        k.run(
+            &Run {
+                kernel: "divergent_swap",
+                wg: [32, 1, 1],
+                grid: [4, 1, 1],
+                args: &[Arg::output(&mut out), Arg::input(&input)],
+            },
+            width,
+        );
+        same("divergent_swap", width, "the reference", &out, &want);
+    }
+}
