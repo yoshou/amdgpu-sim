@@ -96,7 +96,8 @@ pub struct Logic {
 
 #[derive(Default)]
 struct BlockCells {
-    of: HashMap<ValueId, (Option<u16>, Rc<Tree>)>,
+    of: HashMap<ValueId, Rc<Tree>>,
+    opaque: HashMap<ValueId, (IntPred, ValueId, ValueId)>,
     placed: HashMap<usize, (u16, usize)>,
     groups: Vec<CellGroup>,
 }
@@ -106,6 +107,7 @@ enum Tree {
     Const(bool),
     Leaf(usize),
     Pick(ValueId, Rc<Tree>, Rc<Tree>),
+    Test(ValueId, bool, Rc<Tree>),
 }
 
 impl Tree {
@@ -119,6 +121,7 @@ impl Tree {
                 a.leaves(out);
                 b.leaves(out);
             }
+            Tree::Test(_, _, inner) => inner.leaves(out),
         }
     }
 }
@@ -146,7 +149,7 @@ impl Distributor {
             let yes = self.distribute(f, facts, p, a, u);
             let no = self.distribute(f, facts, p, a, v);
             Tree::Pick(c, yes, no)
-        } else if let Some(value) = super::terms::Terms::new(f, facts).decided(p, a, b) {
+        } else if let Some(value) = decided(f, facts, p, a, b) {
             Tree::Const(value)
         } else {
             let index = match self.preds.iter().position(|&q| q == (p, a, b)) {
@@ -158,9 +161,27 @@ impl Distributor {
             };
             Tree::Leaf(index)
         };
+        let tree = match (p, lane_test(f, facts, a, b)) {
+            (IntPred::Eq | IntPred::Ne, Some(w)) => Tree::Test(w, p == IntPred::Eq, Rc::new(tree)),
+            _ => tree,
+        };
         let tree = Rc::new(tree);
         self.trees.insert((p, a, b), tree.clone());
         tree
+    }
+}
+
+fn decided(f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<bool> {
+    if a == b {
+        return Some(compare(p, 0, 0));
+    }
+    if f.types[a.0] == Ty::I32 {
+        return super::terms::Terms::new(f, facts).decided(p, a, b);
+    }
+    match (p, facts.constant(f, a), facts.constant(f, b)) {
+        (IntPred::Eq, Some(x), Some(y)) => Some(x == y),
+        (IntPred::Ne, Some(x), Some(y)) => Some(x != y),
+        _ => None,
     }
 }
 
@@ -635,25 +656,24 @@ impl Logic {
             return cells.clone();
         }
         let mut distributor = Distributor::default();
-        let mut trees: Vec<(ValueId, Rc<Tree>)> = Vec::new();
+        let mut trees: Vec<(ValueId, IntPred, ValueId, ValueId, Rc<Tree>)> = Vec::new();
         for inst in &f.blocks[&block].insts {
             if let Inst::Core { value, op: Op::Cmp(p, a, b), .. } = inst {
-                if f.types[a.0] == Ty::I32 {
-                    trees.push((*value, distributor.distribute(f, facts, *p, *a, *b)));
-                }
+                trees.push((*value, *p, *a, *b, distributor.distribute(f, facts, *p, *a, *b)));
             }
         }
         let preds = distributor.preds;
         let terms = super::terms::Terms::new(f, facts);
-        let leaves: Vec<Option<BTreeSet<ValueId>>> = preds
-            .iter()
-            .map(|&(_, a, b)| {
-                let (mut set, mut lane) = (BTreeSet::new(), false);
-                terms.leaves(a, 0, &mut set, &mut lane);
-                terms.leaves(b, 0, &mut set, &mut lane);
-                (!set.is_empty() && set.iter().all(|l| !facts.lane_word[l.0])).then_some(set)
-            })
-            .collect();
+        let leaves_of = |a: ValueId, b: ValueId| {
+            if f.types[a.0] != Ty::I32 {
+                return None;
+            }
+            let (mut set, mut lane) = (BTreeSet::new(), false);
+            terms.leaves(a, 0, &mut set, &mut lane);
+            terms.leaves(b, 0, &mut set, &mut lane);
+            (!set.is_empty() && set.iter().all(|l| !facts.lane_word[l.0])).then_some(set)
+        };
+        let leaves: Vec<Option<BTreeSet<ValueId>>> = preds.iter().map(|&(_, a, b)| leaves_of(a, b)).collect();
         let mut cells = BlockCells::default();
         for list in grouped(&leaves) {
             if list.len() > GROUP {
@@ -676,17 +696,13 @@ impl Logic {
             }
             cells.groups.push(group);
         }
-        for (value, tree) in trees {
+        for (value, p, a, b, tree) in trees {
             let mut indices = BTreeSet::new();
             tree.leaves(&mut indices);
-            let group = match indices.first() {
-                None => None,
-                Some(first) => match cells.placed.get(first) {
-                    Some(&(group, _)) if indices.iter().all(|i| cells.placed.get(i).is_some_and(|&(g, _)| g == group)) => Some(group),
-                    _ => continue,
-                },
-            };
-            cells.of.insert(value, (group, tree));
+            if indices.iter().any(|i| !cells.placed.contains_key(i)) && !facts.uniform[value.0] && a != b && leaves_of(a, b).is_some() {
+                cells.opaque.insert(value, (p, a, b));
+            }
+            cells.of.insert(value, tree);
         }
         let cells = Rc::new(cells);
         self.cells.insert(block, cells.clone());
@@ -698,50 +714,78 @@ impl Logic {
             return None;
         };
         let cells = self.block_cells(f, facts, block);
-        let (group, tree) = cells.of.get(&v)?;
-        let (group, tree) = (*group, tree.clone());
+        let tree = cells.of.get(&v)?.clone();
+        if let Some(&(p, a, b)) = cells.opaque.get(&v) {
+            let mut terms = super::terms::Terms::new(f, facts);
+            let (mut leaves, mut lane) = (BTreeSet::new(), false);
+            terms.leaves(a, 0, &mut leaves, &mut lane);
+            terms.leaves(b, 0, &mut leaves, &mut lane);
+            if !lane && leaves.iter().all(|l| facts.uniform[l.0]) || terms.uniform((p, a, b)) {
+                self.uniform_tests.insert(v);
+            }
+        }
         let mut done = HashMap::default();
-        Some(self.tree_bit(f, facts, block, group.unwrap_or(0), &tree, &cells, &mut done))
+        Some(self.tree_bit(f, facts, block, v, &tree, &cells, &mut done))
     }
 
-    fn tree_bit(&mut self, f: &Func, facts: &Facts, block: BlockId, group: u16, tree: &Rc<Tree>, cells: &BlockCells, done: &mut HashMap<*const Tree, Bdd>) -> Bdd {
+    fn leaf_bit(&mut self, block: BlockId, v: ValueId, index: usize, cells: &BlockCells) -> Bdd {
+        let Some(&(group, k)) = cells.placed.get(&index) else {
+            return self.atom(Atom::Bit(v));
+        };
+        let g = &cells.groups[group as usize];
+        let mut result = Bdd::FALSE;
+        if g.uniform[k] {
+            let mut seen = BTreeSet::new();
+            for (cell, world) in g.worlds.iter().enumerate() {
+                if world[k] && seen.insert(g.parts[cell].0) {
+                    let minterm = self.part_minterm(block, group, 0, g.parts[cell].0, g.counts.0);
+                    result = self.m.or(result, minterm);
+                }
+            }
+        } else {
+            for (cell, world) in g.worlds.iter().enumerate() {
+                if world[k] {
+                    let minterm = self.cell_minterm(block, group, cell, g);
+                    result = self.m.or(result, minterm);
+                }
+            }
+        }
+        result
+    }
+
+    fn tree_bit(&mut self, f: &Func, facts: &Facts, block: BlockId, v: ValueId, tree: &Rc<Tree>, cells: &BlockCells, done: &mut HashMap<*const Tree, Bdd>) -> Bdd {
         if let Some(&b) = done.get(&Rc::as_ptr(tree)) {
             return b;
         }
         let result = match &**tree {
-            Tree::Const(value) => {
-                if *value {
-                    Bdd::TRUE
-                } else {
-                    Bdd::FALSE
-                }
-            }
-            Tree::Leaf(index) => {
-                let k = &cells.placed[index].1;
-                let g = &cells.groups[group as usize];
-                let mut result = Bdd::FALSE;
-                if g.uniform[*k] {
-                    let mut seen = BTreeSet::new();
-                    for (cell, world) in g.worlds.iter().enumerate() {
-                        if world[*k] && seen.insert(g.parts[cell].0) {
-                            let minterm = self.part_minterm(block, group, 0, g.parts[cell].0, g.counts.0);
-                            result = self.m.or(result, minterm);
-                        }
+            Tree::Const(value) => Manager::constant(*value),
+            Tree::Leaf(index) => self.leaf_bit(block, v, *index, cells),
+            Tree::Test(w, zero, inner) => {
+                let mode = self.materialized(facts, *w);
+                let lane = |this: &mut Self| {
+                    let bit = this.view(f, facts, *w);
+                    if *zero {
+                        this.m.not(bit)
+                    } else {
+                        bit
                     }
+                };
+                if mode == Bdd::FALSE {
+                    lane(self)
                 } else {
-                    for (cell, world) in g.worlds.iter().enumerate() {
-                        if world[*k] {
-                            let minterm = self.cell_minterm(block, group, cell, g);
-                            result = self.m.or(result, minterm);
-                        }
+                    let general = self.tree_bit(f, facts, block, v, inner, cells, done);
+                    if mode == Bdd::TRUE {
+                        general
+                    } else {
+                        let lane = lane(self);
+                        self.m.ite(mode, general, lane)
                     }
                 }
-                result
             }
             Tree::Pick(c, yes, no) => {
                 let c = self.bit(f, facts, *c);
-                let yes = self.tree_bit(f, facts, block, group, yes, cells, done);
-                let no = self.tree_bit(f, facts, block, group, no, cells, done);
+                let yes = self.tree_bit(f, facts, block, v, yes, cells, done);
+                let no = self.tree_bit(f, facts, block, v, no, cells, done);
                 self.m.ite(c, yes, no)
             }
         };
@@ -918,42 +962,27 @@ impl Logic {
                     self.lanes(|l| values[l as usize] & 1 == 1)
                 }
                 Op::Cmp(p, a, b) if self.small_comparison(f, facts, p, a, b).is_some() => self.small_comparison(f, facts, p, a, b).unwrap(),
-                Op::Cmp(..) if self.cell_bit(f, facts, v).is_some() => self.cell_bit(f, facts, v).unwrap(),
-                Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) => {
-                    let leaf = self.open_comparison(f, facts, v, p, a, b);
-                    self.compare(f, facts, p, a, b, leaf, &mut HashMap::default())
+                Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), a, b) if f.types[a.0] == Ty::I1 => {
+                    let (x, y) = (self.bit(f, facts, a), self.bit(f, facts, b));
+                    if p == IntPred::Ne {
+                        self.m.xor(x, y)
+                    } else {
+                        self.m.iff(x, y)
+                    }
                 }
+                Op::Cmp(..) => match self.cell_bit(f, facts, v) {
+                    Some(bit) => bit,
+                    None => self.atom(opaque),
+                },
                 Op::FCmp(p, a, b) => {
                     let within = self.float_within(f, facts, v, p, a, b);
                     let leaf = if within == self.atom(Atom::Bit(v)) { self.float_relation(f, facts, v, p, a, b) } else { within };
                     self.float_order(f, facts, p, a, b, leaf, &mut HashMap::default())
                 }
-                Op::Cmp(p, a, b) => {
-                    let leaf = self.open_comparison(f, facts, v, p, a, b);
-                    self.order(f, facts, p, a, b, leaf, &mut HashMap::default())
-                }
                 _ => self.atom(opaque),
             },
             _ => self.atom(opaque),
         }
-    }
-
-    fn open_comparison(&mut self, f: &Func, facts: &Facts, v: ValueId, p: IntPred, a: ValueId, b: ValueId) -> Bdd {
-        if !facts.uniform[v.0] && f.types[a.0] == Ty::I32 && a != b {
-            let mut terms = super::terms::Terms::new(f, facts);
-            let (mut leaves, mut lane) = (BTreeSet::new(), false);
-            terms.leaves(a, 0, &mut leaves, &mut lane);
-            terms.leaves(b, 0, &mut leaves, &mut lane);
-            let open = !leaves.is_empty() && leaves.iter().all(|l| !facts.lane_word[l.0]);
-            if open && !leaves.iter().all(|l| facts.uniform[l.0]) || lane {
-                if open && terms.uniform((p, a, b)) {
-                    self.uniform_tests.insert(v);
-                }
-            } else if open {
-                self.uniform_tests.insert(v);
-            }
-        }
-        self.atom(Atom::Bit(v))
     }
 
     fn float_within(&mut self, f: &Func, facts: &Facts, v: ValueId, p: FloatPred, a: ValueId, b: ValueId) -> Bdd {
@@ -1187,109 +1216,6 @@ impl Logic {
             self.m.ite(c, yes, no)
         } else {
             leaf
-        };
-        memo.insert((a, b), g);
-        g
-    }
-
-    fn order(
-        &mut self,
-        f: &Func,
-        facts: &Facts,
-        pred: IntPred,
-        a: ValueId,
-        b: ValueId,
-        leaf: Bdd,
-        memo: &mut HashMap<(ValueId, ValueId), Bdd>,
-    ) -> Bdd {
-        if let Some(&g) = memo.get(&(a, b)) {
-            return g;
-        }
-        let g = if a == b {
-            Manager::constant(compare(pred, 0, 0))
-        } else if let (Some(x), Some(y), Ty::I32) = (facts.constant(f, a), facts.constant(f, b), f.types[a.0]) {
-            Manager::constant(compare(pred, x as u32, y as u32))
-        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
-            let c = self.bit(f, facts, c);
-            let yes = self.order(f, facts, pred, yes, b, leaf, memo);
-            let no = self.order(f, facts, pred, no, b, leaf, memo);
-            self.m.ite(c, yes, no)
-        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, b) {
-            let c = self.bit(f, facts, c);
-            let yes = self.order(f, facts, pred, a, yes, leaf, memo);
-            let no = self.order(f, facts, pred, a, no, leaf, memo);
-            self.m.ite(c, yes, no)
-        } else {
-            leaf
-        };
-        memo.insert((a, b), g);
-        g
-    }
-
-    fn compare(
-        &mut self,
-        f: &Func,
-        facts: &Facts,
-        pred: IntPred,
-        a: ValueId,
-        b: ValueId,
-        leaf: Bdd,
-        memo: &mut HashMap<(ValueId, ValueId), Bdd>,
-    ) -> Bdd {
-        let test = lane_test(f, facts, a, b);
-        if let Some(w) = test {
-            if self.materialized(facts, w) == Bdd::FALSE {
-                let bit = self.view(f, facts, w);
-                return if pred == IntPred::Ne {
-                    bit
-                } else {
-                    self.m.not(bit)
-                };
-            }
-        }
-        if let Some(&g) = memo.get(&(a, b)) {
-            return g;
-        }
-        let g = if a == b {
-            Manager::constant(pred == IntPred::Eq)
-        } else if let (Some(x), Some(y)) = (facts.constant(f, a), facts.constant(f, b)) {
-            Manager::constant((x == y) == (pred == IntPred::Eq))
-        } else if f.types[a.0] == Ty::I1 {
-            let (x, y) = (self.bit(f, facts, a), self.bit(f, facts, b));
-            if pred == IntPred::Ne {
-                self.m.xor(x, y)
-            } else {
-                self.m.iff(x, y)
-            }
-        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, a) {
-            let c = self.bit(f, facts, c);
-            let yes = self.compare(f, facts, pred, yes, b, leaf, memo);
-            let no = self.compare(f, facts, pred, no, b, leaf, memo);
-            self.m.ite(c, yes, no)
-        } else if let Some(Op::Select(c, yes, no)) = facts.op(f, b) {
-            let c = self.bit(f, facts, c);
-            let yes = self.compare(f, facts, pred, a, yes, leaf, memo);
-            let no = self.compare(f, facts, pred, a, no, leaf, memo);
-            self.m.ite(c, yes, no)
-        } else {
-            leaf
-        };
-        let g = match test {
-            Some(w) => {
-                let mode = self.materialized(facts, w);
-                if mode == Bdd::TRUE {
-                    g
-                } else {
-                    let bit = self.view(f, facts, w);
-                    let lane = if pred == IntPred::Ne {
-                        bit
-                    } else {
-                        self.m.not(bit)
-                    };
-                    self.m.ite(mode, g, lane)
-                }
-            }
-            None => g,
         };
         memo.insert((a, b), g);
         g
