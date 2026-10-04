@@ -4117,6 +4117,77 @@ mod tests {
         assert!(!h.together.contains(&pair(&h, s, s)), "(i + lane) & 31 differs between the lanes of one iteration");
     }
 
+    fn counting_lanes(split: bool, masked: bool, after: Option<bool>) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (head, p) = b.block(&[Ty::I1, Ty::I32, Ty::I1]);
+        let (exit, x) = b.block(&[Ty::I1, Ty::I32]);
+        b.br(e, head, vec![k.exec, zero, k.exec]);
+        let (body, q) = if split {
+            let (body, q) = b.block(&[Ty::I1, Ty::I32, Ty::I1]);
+            b.br(head, body, vec![p[0], p[1], p[2]]);
+            (body, q)
+        } else {
+            (head, p.clone())
+        };
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let base = b.constant(body, Ty::I32, 32);
+        let mut inside = None;
+        if after.is_none() {
+            let up = b.int(body, IntOp::Add, q[1], base);
+            let index = b.int(body, IntOp::Sub, up, lane);
+            let address = byte_offset(&mut b, body, buf, index, 4);
+            let mask = if masked { q[0] } else { q[2] };
+            inside = Some((store_at(&mut b, body, address, mask), store_at(&mut b, body, address, mask)));
+        }
+        let one = b.constant(body, Ty::I32, 1);
+        let next = b.int(body, IntOp::Add, q[1], one);
+        let stay = b.cmp(body, IntPred::Ult, next, lane);
+        let running = b.int(body, IntOp::And, q[0], stay);
+        let kept = b.core(body, Ty::I32, Op::Select(running, next, q[1]));
+        let any = b.wave(body, WaveOp::Any, vec![running]);
+        let last = if after == Some(true) { q[1] } else { kept };
+        b.cond_br(body, any, (head, vec![running, kept, q[2]]), (exit, vec![q[2], last]));
+        let (first, second) = match inside {
+            Some(pair) => pair,
+            None => {
+                let lane = b.core(exit, Ty::I32, Op::Env(Env::LaneId));
+                let base = b.constant(exit, Ty::I32, 32);
+                let up = b.int(exit, IntOp::Add, x[1], base);
+                let index = b.int(exit, IntOp::Sub, up, lane);
+                let address = byte_offset(&mut b, exit, buf, index, 4);
+                (store_at(&mut b, exit, address, x[0]), store_at(&mut b, exit, address, x[0]))
+            }
+        };
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        let key = pair(&h, first, second);
+        if after.is_some() {
+            h.conflicts().contains(&key)
+        } else {
+            h.together.contains(&key)
+        }
+    }
+
+    #[test]
+    fn find_reports_a_word_the_lanes_that_stopped_counting_share_inside_the_loop() {
+        assert!(counting_lanes(false, false, None), "lanes 1 and 2 both store word 31 in the second iteration");
+        assert!(counting_lanes(true, false, None), "lanes 1 and 2 both store word 31 in the second iteration");
+    }
+
+    #[test]
+    fn find_reports_a_word_the_lanes_that_stopped_counting_share_after_the_loop() {
+        assert!(counting_lanes(false, false, Some(false)), "every lane but the first ends at its lane id less one and stores word 31");
+        assert!(counting_lanes(false, false, Some(true)), "every lane but the first began the last iteration at its lane id less one");
+    }
+
+    #[test]
+    fn find_keeps_apart_in_one_iteration_the_lanes_still_counting() {
+        assert!(!counting_lanes(false, true, None), "the lanes still counting share the count i and store word i + 32 - lane");
+        assert!(!counting_lanes(true, true, None), "the lanes still counting share the count i and store word i + 32 - lane");
+    }
+
     #[test]
     fn find_keeps_apart_the_lanes_after_a_loop_when_each_adds_its_lane() {
         let Looped {

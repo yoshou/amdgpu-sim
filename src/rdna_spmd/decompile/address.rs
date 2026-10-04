@@ -416,6 +416,8 @@ pub struct Addresses<'a> {
     copies: Copies,
     narrowing_edges: HashSet<(BlockId, usize)>,
     narrowable: Vec<bool>,
+    guards: Vec<((BlockId, usize), Option<ValueId>)>,
+    safe_steps: HashMap<ValueId, bool>,
     conditions: std::cell::RefCell<Vec<Option<(std::rc::Rc<Cond>, bool)>>>,
     stores: HashMap<BlockId, Vec<Store>>,
     pub unknowns: Vec<UnknownInfo>,
@@ -514,6 +516,8 @@ impl<'a> Addresses<'a> {
             copies: copies(f, facts),
             narrowing_edges: HashSet::default(),
             narrowable: Vec::new(),
+            guards: Vec::new(),
+            safe_steps: HashMap::default(),
             conditions: std::cell::RefCell::new(vec![None; 2 * f.types.len()]),
             stores: private_stores(f, facts),
             unknowns: Vec::new(),
@@ -595,6 +599,23 @@ impl<'a> Addresses<'a> {
             }
         }
         this.narrowing_edges = narrowing;
+        for &b in &facts.order {
+            for (index, inst) in f.blocks[&b].insts.iter().enumerate() {
+                let guard = match inst {
+                    Inst::Effect { op: EffectOp::Memory { op: MemoryOp::Fence, .. }, .. } => continue,
+                    Inst::Effect { op: EffectOp::Memory { op, .. }, inputs, .. } => inputs.get(op.mask_input()).copied(),
+                    Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot), inputs, .. } => Some(inputs[0]),
+                    Inst::Effect { .. } => None,
+                    Inst::Target { op, args, .. } => match registry.operation(*op).map(|spec| spec.effect) {
+                        Ok(Effect::Pure) | Err(_) => continue,
+                        Ok(Effect::ReadGlobal { every_lane: false }) => args.values().iter().copied().find(|a| f.types[a.0] == Ty::I1),
+                        Ok(_) => None,
+                    },
+                    _ => continue,
+                };
+                this.guards.push(((b, index), guard));
+            }
+        }
         this.narrowable = narrowable;
         (this.known, this.plain, this.bounds, this.loaded) = (found.known, found.plain, found.carried, found.loaded);
         (this.spills, this.exposing, this.written) = (found.spills, found.exposing, found.written);
@@ -3008,8 +3029,10 @@ impl<'a> Addresses<'a> {
 
     fn join(&mut self, v: ValueId, block: BlockId, index: usize, lane: usize) -> Assumed<Value> {
         let Some(arguments) = self.incoming_edges(v, block, index) else {
-            if let Some(value) = self.stepped(v, block, index, lane) {
-                return unassumed(value);
+            if let Some((value, masked)) = self.stepped(v, block, index, lane) {
+                if !masked || self.step_safe(v, block) {
+                    return unassumed(value);
+                }
             }
             if let Some(value) = self.recur(block, lane, Target::Param(index)) {
                 return unassumed(value);
@@ -5250,11 +5273,12 @@ impl Addresses<'_> {
 }
 
 impl Addresses<'_> {
-    fn stepped(&mut self, v: ValueId, block: BlockId, index: usize, lane: usize) -> Option<Value> {
+    fn stepped(&mut self, v: ValueId, block: BlockId, index: usize, lane: usize) -> Option<(Value, bool)> {
         let exec_index = self.exec_index?;
         let own = self.rank[&block];
         let resolve = |this: &Self, x: ValueId| this.copies.get(&x).copied().unwrap_or(x);
         let mut step: Option<u32> = None;
+        let mut masked = false;
         let mut entering: Option<Value> = None;
         for &(pred, slot) in &self.facts.incoming[&block].clone() {
             if !self.can_take(pred, slot, block) {
@@ -5274,7 +5298,10 @@ impl Addresses<'_> {
             let arg = resolve(self, arg);
             let edge = self.edge_condition(pred, slot);
             let added = match self.facts.op(self.f, arg) {
-                Some(Op::Select(c, x, y)) if self.source(y, lane) == (v, lane) && self.implies(mask, c, edge) => x,
+                Some(Op::Select(c, x, y)) if self.source(y, lane) == (v, lane) && self.implies(mask, c, edge) => {
+                    masked = true;
+                    x
+                }
                 _ => arg,
             };
             let k = match self.source(added, lane) {
@@ -5293,13 +5320,105 @@ impl Addresses<'_> {
         }
         let (step, entering) = (step?, entering?);
         if step == 0 {
-            return Some(entering);
+            return Some((entering, false));
         }
         let trips = self.trips(block);
-        Some(Value {
+        let value = Value {
             form: entering.form.add(&Form::unknown(trips).scale(step)),
             region: entering.region,
+        };
+        Some((value, masked))
+    }
+
+    fn step_safe(&mut self, v: ValueId, header: BlockId) -> bool {
+        if let Some(&safe) = self.safe_steps.get(&v) {
+            return safe;
+        }
+        let safe = self.compute_step_safe(v, header);
+        self.safe_steps.insert(v, safe);
+        safe
+    }
+
+    fn compute_step_safe(&mut self, v: ValueId, header: BlockId) -> bool {
+        let Some(i) = self.exec_index else {
+            return false;
+        };
+        let (f, facts) = (self.f, self.facts);
+        let exec = f.blocks[&header].params[i].0;
+        let own = self.rank[&header];
+        let masks: Vec<ValueId> = facts.incoming[&header]
+            .iter()
+            .filter(|&&(pred, _)| self.rank[&pred] >= own)
+            .map(|&e| self.edge_arg(e, i))
+            .collect();
+        if !masks.iter().all(|&m| self.within(m, exec, &mut Vec::new())) {
+            return false;
+        }
+        let mut depends = vec![false; f.types.len()];
+        depends[v.0] = true;
+        loop {
+            let mut grew = false;
+            for &b in &facts.order {
+                if b != f.entry {
+                    for (index, &(p, _)) in f.blocks[&b].params.iter().enumerate() {
+                        if !depends[p.0] && facts.incoming[&b].iter().any(|&e| depends[self.edge_arg(e, index).0]) {
+                            depends[p.0] = true;
+                            grew = true;
+                        }
+                    }
+                }
+                for inst in &f.blocks[&b].insts {
+                    let mut any = false;
+                    inst.for_each_operand(|x| any |= depends[x.0]);
+                    if any {
+                        for out in inst.outputs() {
+                            if !depends[out.0] {
+                                depends[out.0] = true;
+                                grew = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+        let guards = self.guards.clone();
+        guards.iter().all(|&((b, index), guard)| {
+            let mut any = false;
+            f.blocks[&b].insts[index].for_each_operand(|x| any |= depends[x.0]);
+            !any || guard.is_some_and(|g| self.within(g, exec, &mut Vec::new()))
         })
+    }
+
+    fn within(&mut self, a: ValueId, mask: ValueId, visiting: &mut Vec<ValueId>) -> bool {
+        let mask = self.copies.get(&mask).copied().unwrap_or(mask);
+        for c in self.assumptions(a) {
+            if c == mask {
+                return true;
+            }
+            let Site::Param { block, index } = self.facts.site[c.0] else {
+                continue;
+            };
+            if block == self.f.entry {
+                continue;
+            }
+            if visiting.contains(&c) {
+                return true;
+            }
+            visiting.push(c);
+            let edges = self.facts.incoming[&block].clone();
+            let carried = edges.iter().all(|&e| {
+                let arg = self.edge_arg(e, index);
+                self.within(arg, mask, visiting)
+            });
+            visiting.pop();
+            if carried {
+                return true;
+            }
+        }
+        false
     }
 
     fn source(&self, x: ValueId, lane: usize) -> (ValueId, usize) {
