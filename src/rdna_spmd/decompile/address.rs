@@ -416,6 +416,7 @@ pub struct Addresses<'a> {
     copies: Copies,
     narrowing_edges: HashSet<(BlockId, usize)>,
     narrowable: Vec<bool>,
+    conditions: std::cell::RefCell<Vec<Option<(std::rc::Rc<Cond>, bool)>>>,
     stores: HashMap<BlockId, Vec<Store>>,
     pub unknowns: Vec<UnknownInfo>,
     keys: Cached<Key, Unknown>,
@@ -513,6 +514,7 @@ impl<'a> Addresses<'a> {
             copies: copies(f, facts),
             narrowing_edges: HashSet::default(),
             narrowable: Vec::new(),
+            conditions: std::cell::RefCell::new(vec![None; 2 * f.types.len()]),
             stores: private_stores(f, facts),
             unknowns: Vec::new(),
             keys: HashMap::default(),
@@ -578,7 +580,7 @@ impl<'a> Addresses<'a> {
         for &b in &facts.order {
             if let Term::CondBr { cond, .. } = f.blocks[&b].term {
                 for slot in 0..2 {
-                    if this.fixes_a_word(cond, slot == 0, 0) {
+                    if !this.fixed_words(cond, slot == 0).is_empty() {
                         narrowing.insert((b, slot));
                     }
                 }
@@ -619,8 +621,8 @@ impl<'a> Addresses<'a> {
                 {
                     if let Some(&p) = inputs.get(op.mask_input()) {
                         let implied = this.assumptions(p);
-                        for &c in &implied {
-                            if let Some((x, _)) = this.equated_in(c) {
+                        for (x, _) in this.fixed_words(p, true) {
+                            if f.types[x.0] == Ty::I32 {
                                 this.equated.insert(x);
                             }
                         }
@@ -1869,16 +1871,40 @@ impl<'a> Addresses<'a> {
         (high < 1 << 32).then_some((low, high))
     }
 
-    fn equated_in(&self, c: ValueId) -> Option<(ValueId, u32)> {
-        let Some(Op::Cmp(IntPred::Eq, x, y)) = self.facts.op(self.f, c) else {
+    fn condition(&self, cond: ValueId, taken: bool) -> (std::rc::Rc<Cond>, bool) {
+        let slot = 2 * cond.0 + taken as usize;
+        if let Some(found) = &self.conditions.borrow()[slot] {
+            return found.clone();
+        }
+        let tree = condition(self.f, self.facts, &self.copies, cond, taken);
+        let found = (tree.clone(), shares(&tree));
+        self.conditions.borrow_mut()[slot] = Some(found.clone());
+        found
+    }
+
+    fn literals(&self, cond: ValueId, taken: bool) -> Vec<(ValueId, bool)> {
+        let mut out = Vec::new();
+        literals(&self.condition(cond, taken).0, &mut out);
+        out
+    }
+
+    fn fixed_by(&self, (c, holds): (ValueId, bool)) -> Option<(ValueId, u32)> {
+        let Some(Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), x, y)) = self.facts.op(self.f, c) else {
             return None;
         };
+        if (p == IntPred::Eq) != holds || !matches!(self.f.types[x.0], Ty::I32 | Ty::I64) {
+            return None;
+        }
         let root = |v: ValueId| self.copies.get(&v).copied().unwrap_or(v);
         match (self.facts.constant(self.f, x), self.facts.constant(self.f, y)) {
-            (None, Some(k)) if self.f.types[x.0] == Ty::I32 => Some((root(x), k as u32)),
-            (Some(k), None) if self.f.types[y.0] == Ty::I32 => Some((root(y), k as u32)),
+            (_, Some(k)) => Some((root(x), k as u32)),
+            (Some(k), None) => Some((root(y), k as u32)),
             _ => None,
         }
+    }
+
+    fn fixed_words(&self, cond: ValueId, taken: bool) -> Vec<(ValueId, u32)> {
+        self.literals(cond, taken).into_iter().filter_map(|l| self.fixed_by(l)).collect()
     }
 
     fn assumed_constant(&mut self, a: ValueId, v: ValueId) -> Option<u32> {
@@ -1886,37 +1912,22 @@ impl<'a> Addresses<'a> {
         if !self.equated.contains(&root) {
             return None;
         }
-        self.assumptions(a)
-            .into_iter()
-            .find_map(|c| self.equated_in(c).filter(|&(x, _)| x == root).map(|(_, k)| k))
+        self.fixed_words(a, true).into_iter().find(|&(x, _)| x == root).map(|(_, k)| k)
     }
 
     fn assumes(&mut self, a: ValueId, v: ValueId) -> bool {
-        if !self.implied.contains_key(&a) {
-            self.assumptions(a);
-        }
-        self.implied[&a].contains(&v) || self.implies(a, v, None)
+        let known = match self.implied.get(&a) {
+            Some(list) => list.contains(&v),
+            None => self.assumptions(a).contains(&v),
+        };
+        known || self.implies(a, v, None)
     }
 
     fn assumptions(&mut self, predicate: ValueId) -> Vec<ValueId> {
         if let Some(list) = self.implied.get(&predicate) {
             return list.clone();
         }
-        let mut list = Vec::new();
-        let mut pending = vec![predicate];
-        while let Some(p) = pending.pop() {
-            let p = self.copies.get(&p).copied().unwrap_or(p);
-            if list.contains(&p) {
-                continue;
-            }
-            list.push(p);
-            if let Some(Op::Int(IntOp::And, a, b)) = self.facts.op(self.f, p) {
-                if self.f.types[p.0] == Ty::I1 {
-                    pending.push(a);
-                    pending.push(b);
-                }
-            }
-        }
+        let list: Vec<ValueId> = self.literals(predicate, true).into_iter().filter(|l| l.1).map(|l| l.0).collect();
         self.implied.insert(predicate, list.clone());
         list
     }
@@ -2680,34 +2691,9 @@ impl<'a> Addresses<'a> {
         Some(out)
     }
 
-    fn equal_on_edge(&self, cond: ValueId, taken: bool, arg: ValueId, depth: usize) -> Option<u32> {
-        if depth > 8 {
-            return None;
-        }
-        let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
-        match self.facts.op(self.f, root(cond))? {
-            Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), x, y)
-                if (p == IntPred::Eq) == taken && matches!(self.f.types[x.0], Ty::I32 | Ty::I64) =>
-            {
-                if root(x) == root(arg) {
-                    self.facts.constant(self.f, y).map(|k| k as u32)
-                } else if root(y) == root(arg) {
-                    self.facts.constant(self.f, x).map(|k| k as u32)
-                } else {
-                    None
-                }
-            }
-            Op::Int(IntOp::And, a, b) if taken => self
-                .equal_on_edge(a, true, arg, depth + 1)
-                .or_else(|| self.equal_on_edge(b, true, arg, depth + 1)),
-            Op::Int(IntOp::Or, a, b) if !taken => self
-                .equal_on_edge(a, false, arg, depth + 1)
-                .or_else(|| self.equal_on_edge(b, false, arg, depth + 1)),
-            Op::Int(IntOp::Xor, a, one) if self.f.types[a.0] == Ty::I1 && self.facts.constant(self.f, one) == Some(1) => {
-                self.equal_on_edge(a, !taken, arg, depth + 1)
-            }
-            _ => None,
-        }
+    fn equal_on_edge(&self, cond: ValueId, taken: bool, arg: ValueId) -> Option<u32> {
+        let arg = self.copies.get(&arg).copied().unwrap_or(arg);
+        self.fixed_words(cond, taken).into_iter().find(|&(x, _)| x == arg).map(|(_, k)| k)
     }
 
     fn limits(&mut self, b: BlockId) -> std::rc::Rc<Limits> {
@@ -2750,7 +2736,7 @@ impl<'a> Addresses<'a> {
         for (pred, slot) in self.facts.incoming[&b].clone() {
             let mut here = (*self.limits(pred)).clone();
             if let Some((cond, taken)) = self.edge_condition(pred, slot) {
-                let limits = self.condition_limits(cond, taken, None, 0);
+                let limits = self.condition_limits(cond, taken, None);
                 here = both_limits(here, limits);
             }
             let joined = match out {
@@ -2765,11 +2751,38 @@ impl<'a> Addresses<'a> {
         out.unwrap_or_default()
     }
 
-    fn condition_limits(&mut self, cond: ValueId, taken: bool, lane: Option<(BlockId, usize)>, depth: usize) -> Limits {
-        if depth > 8 {
-            return Limits::default();
+    fn condition_limits(&mut self, cond: ValueId, taken: bool, lane: Option<(BlockId, usize)>) -> Limits {
+        let (tree, shared) = self.condition(cond, taken);
+        let mut memo = shared.then(HashMap::default);
+        self.limits_of(&tree, lane, &mut memo)
+    }
+
+    fn limits_of(&mut self, cond: &Cond, lane: Option<(BlockId, usize)>, memo: &mut Option<HashMap<(ValueId, bool), Limits>>) -> Limits {
+        let (key, parts, all) = match cond {
+            Cond::Leaf(c, holds) => return self.comparison_limits(*c, *holds, lane),
+            Cond::All(v, holds, parts) => ((*v, *holds), parts, true),
+            Cond::Any(v, holds, parts) => ((*v, *holds), parts, false),
+        };
+        if let Some(found) = memo.as_ref().and_then(|m| m.get(&key)) {
+            return found.clone();
         }
-        let cond = self.copies.get(&cond).copied().unwrap_or(cond);
+        let mut joined: Option<Limits> = None;
+        for part in parts {
+            let own = self.limits_of(part, lane, memo);
+            joined = Some(match joined {
+                None => own,
+                Some(old) if all => both_limits(old, own),
+                Some(old) => either_limits(old, own),
+            });
+        }
+        let limits = joined.unwrap_or_default();
+        if let Some(memo) = memo {
+            memo.insert(key, limits.clone());
+        }
+        limits
+    }
+
+    fn comparison_limits(&mut self, cond: ValueId, taken: bool, lane: Option<(BlockId, usize)>) -> Limits {
         match self.facts.op(self.f, cond) {
             Some(Op::Cmp(p, x, y)) if self.f.types[x.0] == Ty::I32 && (lane.is_some() || self.facts.uniform[x.0] && self.facts.uniform[y.0]) => {
                 let pred = if taken { p } else { negated(p) };
@@ -2792,18 +2805,6 @@ impl<'a> Addresses<'a> {
                     },
                     _ => Limits::default(),
                 }
-            }
-            Some(Op::Int(k @ (IntOp::And | IntOp::Or), a, b)) if self.f.types[cond.0] == Ty::I1 => {
-                let left = self.condition_limits(a, taken, lane, depth + 1);
-                let right = self.condition_limits(b, taken, lane, depth + 1);
-                if (k == IntOp::And) == taken {
-                    both_limits(left, right)
-                } else {
-                    either_limits(left, right)
-                }
-            }
-            Some(Op::Int(IntOp::Xor, a, one)) if self.f.types[a.0] == Ty::I1 && self.facts.constant(self.f, one) == Some(1) => {
-                self.condition_limits(a, !taken, lane, depth + 1)
             }
             _ => Limits::default(),
         }
@@ -2832,7 +2833,7 @@ impl<'a> Addresses<'a> {
     pub fn access_classes(&mut self, block: BlockId, predicate: Option<ValueId>, lane: usize) -> Classes {
         let mut limits = (*self.limits(block)).clone();
         if let Some(p) = predicate {
-            let own = self.condition_limits(p, true, Some((block, lane)), 0);
+            let own = self.condition_limits(p, true, Some((block, lane)));
             limits = both_limits(limits, own);
         }
         limits.classes
@@ -2927,35 +2928,7 @@ impl<'a> Addresses<'a> {
             return None;
         }
         let (cond, taken) = self.edge_condition(pred, slot)?;
-        self.equal_on_edge(cond, taken, arg, 0)
-    }
-
-    fn fixed_words(&self, cond: ValueId, taken: bool, depth: usize, out: &mut Vec<(ValueId, u32)>) {
-        if depth > 8 {
-            return;
-        }
-        let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
-        match self.facts.op(self.f, root(cond)) {
-            Some(Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), x, y)) if (p == IntPred::Eq) == taken && matches!(self.f.types[x.0], Ty::I32 | Ty::I64) => {
-                if let Some(k) = self.facts.constant(self.f, y) {
-                    out.push((root(x), k as u32));
-                } else if let Some(k) = self.facts.constant(self.f, x) {
-                    out.push((root(y), k as u32));
-                }
-            }
-            Some(Op::Int(IntOp::And, a, b)) if taken => {
-                self.fixed_words(a, true, depth + 1, out);
-                self.fixed_words(b, true, depth + 1, out);
-            }
-            Some(Op::Int(IntOp::Or, a, b)) if !taken => {
-                self.fixed_words(a, false, depth + 1, out);
-                self.fixed_words(b, false, depth + 1, out);
-            }
-            Some(Op::Int(IntOp::Xor, a, one)) if self.f.types[a.0] == Ty::I1 && self.facts.constant(self.f, one) == Some(1) => {
-                self.fixed_words(a, !taken, depth + 1, out)
-            }
-            _ => {}
-        }
+        self.equal_on_edge(cond, taken, arg)
     }
 
     fn narrowed_form(&mut self, (pred, slot): (BlockId, usize), arg: ValueId, at: BlockId, lane: usize) -> Option<Form> {
@@ -2966,8 +2939,7 @@ impl<'a> Addresses<'a> {
             return Some(Form::constant(k));
         }
         let (cond, taken) = self.edge_condition(pred, slot)?;
-        let mut fixed = Vec::new();
-        self.fixed_words(cond, taken, 0, &mut fixed);
+        let fixed = self.fixed_words(cond, taken);
         let mut form = self.operand(arg, at, lane, None).0.form;
         let mut changed = false;
         for (x, k) in fixed {
@@ -2986,26 +2958,6 @@ impl<'a> Addresses<'a> {
             changed = true;
         }
         changed.then_some(form)
-    }
-
-    fn fixes_a_word(&self, cond: ValueId, taken: bool, depth: usize) -> bool {
-        if depth > 8 {
-            return false;
-        }
-        let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
-        match self.facts.op(self.f, root(cond)) {
-            Some(Op::Cmp(p @ (IntPred::Eq | IntPred::Ne), x, y)) => {
-                (p == IntPred::Eq) == taken
-                    && matches!(self.f.types[x.0], Ty::I32 | Ty::I64)
-                    && (self.facts.constant(self.f, x).is_some() || self.facts.constant(self.f, y).is_some())
-            }
-            Some(Op::Int(IntOp::And, a, b)) if taken => self.fixes_a_word(a, true, depth + 1) || self.fixes_a_word(b, true, depth + 1),
-            Some(Op::Int(IntOp::Or, a, b)) if !taken => self.fixes_a_word(a, false, depth + 1) || self.fixes_a_word(b, false, depth + 1),
-            Some(Op::Int(IntOp::Xor, a, one)) if self.f.types[a.0] == Ty::I1 && self.facts.constant(self.f, one) == Some(1) => {
-                self.fixes_a_word(a, !taken, depth + 1)
-            }
-            _ => false,
-        }
     }
 
     fn narrowed_everywhere(&mut self, v: ValueId, lane: usize) -> Option<Form> {
@@ -5936,6 +5888,59 @@ fn negated(pred: IntPred) -> IntPred {
         IntPred::Sge => IntPred::Slt,
         IntPred::Sle => IntPred::Sgt,
         IntPred::Sgt => IntPred::Sle,
+    }
+}
+
+pub(super) enum Cond {
+    Leaf(ValueId, bool),
+    All(ValueId, bool, Vec<std::rc::Rc<Cond>>),
+    Any(ValueId, bool, Vec<std::rc::Rc<Cond>>),
+}
+
+pub(super) fn condition(f: &Func, facts: &Facts, copies: &Copies, cond: ValueId, taken: bool) -> std::rc::Rc<Cond> {
+    fn build(f: &Func, facts: &Facts, copies: &Copies, cond: ValueId, taken: bool, memo: &mut HashMap<(ValueId, bool), std::rc::Rc<Cond>>) -> std::rc::Rc<Cond> {
+        let cond = copies.get(&cond).copied().unwrap_or(cond);
+        if let Some(found) = memo.get(&(cond, taken)) {
+            return found.clone();
+        }
+        let node = match facts.op(f, cond) {
+            Some(Op::Int(k @ (IntOp::And | IntOp::Or), a, b)) if f.types[cond.0] == Ty::I1 => {
+                let parts = vec![build(f, facts, copies, a, taken, memo), build(f, facts, copies, b, taken, memo)];
+                if (k == IntOp::And) == taken {
+                    Cond::All(cond, taken, parts)
+                } else {
+                    Cond::Any(cond, taken, parts)
+                }
+            }
+            Some(Op::Int(IntOp::Xor, a, one)) if f.types[a.0] == Ty::I1 && facts.constant(f, one) == Some(1) => {
+                Cond::All(cond, taken, vec![build(f, facts, copies, a, !taken, memo)])
+            }
+            _ => Cond::Leaf(cond, taken),
+        };
+        let node = std::rc::Rc::new(node);
+        memo.insert((cond, taken), node.clone());
+        node
+    }
+    build(f, facts, copies, cond, taken, &mut HashMap::default())
+}
+
+pub(super) fn literals(cond: &Cond, out: &mut Vec<(ValueId, bool)>) {
+    let (Cond::Leaf(v, holds) | Cond::All(v, holds, _) | Cond::Any(v, holds, _)) = cond;
+    if out.contains(&(*v, *holds)) {
+        return;
+    }
+    out.push((*v, *holds));
+    if let Cond::All(_, _, parts) = cond {
+        for part in parts {
+            literals(part, out);
+        }
+    }
+}
+
+fn shares(cond: &Cond) -> bool {
+    match cond {
+        Cond::Leaf(..) => false,
+        Cond::All(_, _, parts) | Cond::Any(_, _, parts) => parts.iter().any(|p| std::rc::Rc::strong_count(p) > 1 || shares(p)),
     }
 }
 

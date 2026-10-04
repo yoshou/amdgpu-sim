@@ -1,4 +1,4 @@
-use super::address::{aligns, Copies, Region, Regions, LANES, PRIVATE_MEMORY};
+use super::address::{aligns, condition, literals, Copies, Region, Regions, LANES, PRIVATE_MEMORY};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::engine::EntryLayout;
 use crate::rdna_spmd::environment::Environment;
@@ -549,21 +549,8 @@ impl<'a> Sets<'a> {
 
     fn conjuncts(&self, c: ValueId) -> Vec<ValueId> {
         let mut list = Vec::new();
-        let mut pending = vec![c];
-        while let Some(p) = pending.pop() {
-            let p = self.copies.get(&p).copied().unwrap_or(p);
-            if list.contains(&p) {
-                continue;
-            }
-            list.push(p);
-            if let Some(Op::Int(IntOp::And, a, b)) = self.facts.op(self.f, p) {
-                if self.f.types[p.0] == Ty::I1 {
-                    pending.push(a);
-                    pending.push(b);
-                }
-            }
-        }
-        list
+        literals(&condition(self.f, self.facts, self.copies, c, true), &mut list);
+        list.into_iter().filter(|l| l.1).map(|l| l.0).collect()
     }
 
     fn under(&self, x: ValueId, held: &[ValueId], memo: &mut HashMap<ValueId, Vec<u64>>) -> Vec<u64> {
