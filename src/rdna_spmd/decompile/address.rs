@@ -220,20 +220,6 @@ enum Reached {
     Same,
 }
 
-enum Entry {
-    Value((ValueId, u8, Option<ValueId>)),
-    Bit((ValueId, u8, Option<ValueId>)),
-    Slot(Slot),
-    LoopBits(BlockId),
-    Step(StepKey),
-    Summarized(BlockId),
-    Decision(BlockId),
-    Limits(BlockId),
-    Reach(BlockId),
-    WordBit((ValueId, u8)),
-    High((ValueId, u8)),
-}
-
 #[derive(Clone, Debug, Default)]
 struct Guesses {
     depth: Depth,
@@ -413,7 +399,6 @@ struct Values<'a> {
     entered: Option<usize>,
     memo: Memo,
     journal: Journal<Entry>,
-    active: Active,
     guessing: Guessing,
 }
 
@@ -463,19 +448,75 @@ struct Conditions {
 
 type WrittenBack = (ValueId, Option<ValueId>, Option<u64>);
 
-#[derive(Default)]
-struct Memo {
-    values: Cached<ValueKey, Assumed<Value>>,
-    bits: Cached<ValueKey, Assumed<Option<bool>>>,
-    loop_bits: Cached<BlockId, Bits>,
-    steps: Cached<StepKey, Step>,
-    summarized: Cached<BlockId, ()>,
-    slots: Cached<Slot, Option<Value>>,
-    word_bits: Cached<(ValueId, u8), Option<bool>>,
-    highs: Cached<(ValueId, u8), Form>,
-    decisions: Cached<BlockId, Option<bool>>,
-    limited: Cached<BlockId, std::rc::Rc<Limits>>,
-    reach: Cached<BlockId, bool>,
+struct Table<K, V> {
+    done: Cached<K, V>,
+    active: Guard<K>,
+}
+
+trait Query {
+    type Key: Copy + std::hash::Hash + Eq;
+    type Answer: Clone;
+    fn table(memo: &mut Memo) -> &mut Table<Self::Key, Self::Answer>;
+    fn entry(key: Self::Key) -> Entry;
+}
+
+macro_rules! tables {
+    ($($table:ident: $query:ident($key:ty) => $answer:ty,)*) => {
+        #[derive(Default)]
+        struct Memo {
+            $($table: Table<$key, $answer>,)*
+        }
+
+        enum Entry {
+            $($query($key),)*
+        }
+
+        impl Memo {
+            fn clear(&mut self) {
+                $(self.$table.done.clear();)*
+            }
+
+            #[inline]
+            fn evict(&mut self, entry: Entry, depth: usize) {
+                match entry {
+                    $(Entry::$query(key) => evict(&mut self.$table.done, &key, depth),)*
+                }
+            }
+        }
+
+        $(
+            struct $query;
+
+            impl Query for $query {
+                type Key = $key;
+                type Answer = $answer;
+
+                #[inline]
+                fn table(memo: &mut Memo) -> &mut Table<$key, $answer> {
+                    &mut memo.$table
+                }
+
+                #[inline]
+                fn entry(key: $key) -> Entry {
+                    Entry::$query(key)
+                }
+            }
+        )*
+    };
+}
+
+tables! {
+    values: ValueOf(ValueKey) => Assumed<Value>,
+    bits: BitOf(ValueKey) => Assumed<Option<bool>>,
+    loop_bits: LoopBits(BlockId) => Bits,
+    steps: StepOf(StepKey) => Step,
+    summarized: Summarized(BlockId) => (),
+    slots: SlotAt(Slot) => Option<Value>,
+    word_bits: WordBit((ValueId, u8)) => Option<bool>,
+    highs: HighOf((ValueId, u8)) => Form,
+    decisions: Decision(BlockId) => Option<bool>,
+    limited: LimitsAt(BlockId) => std::rc::Rc<Limits>,
+    reach: Reaching(BlockId) => bool,
 }
 
 #[derive(Default)]
@@ -485,18 +526,6 @@ struct Trail {
 }
 
 struct Journal<E>(Vec<(E, Depth)>);
-
-#[derive(Default)]
-struct Active {
-    values: Guard<(ValueId, u8, Option<ValueId>, bool)>,
-    slots: Guard<Slot>,
-    words: Guard<(ValueId, u8)>,
-    highs: HashSet<(ValueId, u8)>,
-    decisions: Guard<BlockId>,
-    reach: Guard<BlockId>,
-    limits: Guard<BlockId>,
-    summaries: Guard<BlockId>,
-}
 
 struct Guard<K>(HashMap<K, usize>);
 
@@ -524,48 +553,11 @@ struct Widening {
     split: HashSet<(ValueId, bool)>,
 }
 
-impl Memo {
-    fn clear(&mut self) {
-        let Memo {
-            values,
-            bits,
-            loop_bits,
-            steps,
-            summarized,
-            slots,
-            word_bits,
-            highs,
-            decisions,
-            limited,
-            reach,
-        } = self;
-        values.clear();
-        bits.clear();
-        loop_bits.clear();
-        steps.clear();
-        summarized.clear();
-        slots.clear();
-        word_bits.clear();
-        highs.clear();
-        decisions.clear();
-        limited.clear();
-        reach.clear();
-    }
-
-    #[inline]
-    fn evict(&mut self, entry: Entry, depth: usize) {
-        match entry {
-            Entry::Value(key) => evict(&mut self.values, &key, depth),
-            Entry::Bit(key) => evict(&mut self.bits, &key, depth),
-            Entry::Slot(key) => evict(&mut self.slots, &key, depth),
-            Entry::LoopBits(key) => evict(&mut self.loop_bits, &key, depth),
-            Entry::Step(key) => evict(&mut self.steps, &key, depth),
-            Entry::WordBit(key) => evict(&mut self.word_bits, &key, depth),
-            Entry::High(key) => evict(&mut self.highs, &key, depth),
-            Entry::Decision(key) => evict(&mut self.decisions, &key, depth),
-            Entry::Limits(key) => evict(&mut self.limited, &key, depth),
-            Entry::Reach(key) => evict(&mut self.reach, &key, depth),
-            Entry::Summarized(key) => evict(&mut self.summarized, &key, depth),
+impl<K, V> Default for Table<K, V> {
+    fn default() -> Self {
+        Self {
+            done: Cached::default(),
+            active: Guard::default(),
         }
     }
 }
@@ -2186,7 +2178,6 @@ impl<'a> Addresses<'a> {
                 entered: None,
                 memo: Memo::default(),
                 journal: Journal::default(),
-                active: Active::default(),
                 guessing: Guessing::default(),
             },
             found: Found::default(),
@@ -2765,25 +2756,14 @@ impl<'a> Values<'a> {
     }
 
     fn decision(&mut self, b: BlockId) -> Option<bool> {
-        if let Some(&(decided, depth)) = self.memo.decisions.get(&b) {
-            self.symbols.trail.depend(depth);
+        if let Some(decided) = self.known::<Decision>(&b) {
             return decided;
         }
         let Term::CondBr { cond, .. } = self.symbols.program.f.blocks[&b].term else {
             return None;
         };
-        let Some(outside) = self.active.decisions.enter(b, self.guessing.level) else {
-            return None;
-        };
-        let (decided, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.decide(cond)
-        });
-        self.active.decisions.leave(b, outside);
-        self.journal.note(Entry::Decision(b), depth);
-        self.memo.decisions.insert(b, (decided, depth));
+        let (decided, depth) = self.guarded::<Decision, _>(b, |this| this.decide(cond))?;
+        self.store::<Decision>(b, decided, depth);
         decided
     }
 
@@ -2807,26 +2787,20 @@ impl<'a> Values<'a> {
         if b == self.symbols.program.f.entry {
             return true;
         }
-        if let Some(&(reached, depth)) = self.memo.reach.get(&b) {
-            self.symbols.trail.depend(depth);
+        if let Some(reached) = self.known::<Reaching>(&b) {
             return reached;
         }
-        let Some(outside) = self.active.reach.enter(b, self.guessing.level) else {
-            return true;
-        };
-        let (reached, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
+        let found = self.guarded::<Reaching, _>(b, |this| {
             let facts = this.symbols.program.facts;
             let own = this.symbols.program.rank[&b];
             facts.incoming[&b]
                 .iter()
                 .any(|&(pred, slot)| this.symbols.program.rank[&pred] < own && this.reached(pred) && this.takes(pred, slot))
         });
-        self.active.reach.leave(b, outside);
-        self.journal.note(Entry::Reach(b), depth);
-        self.memo.reach.insert(b, (reached, depth));
+        let Some((reached, depth)) = found else {
+            return true;
+        };
+        self.store::<Reaching>(b, reached, depth);
         reached
     }
 
@@ -2851,20 +2825,59 @@ impl<'a> Values<'a> {
         (result, outer)
     }
 
+    #[inline]
     fn frame<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> (T, Depth) {
         self.symbols.trail.push();
         let result = f(self);
         (result, self.symbols.trail.pop())
     }
 
-    fn cache_value(&mut self, key: (ValueId, u8, Option<ValueId>), r: Assumed<Value>, depth: Depth) {
-        self.journal.note(Entry::Value(key), depth);
-        self.memo.values.insert(key, (r, depth));
+    #[inline]
+    fn known<Q: Query>(&mut self, key: &Q::Key) -> Option<Q::Answer> {
+        let (answer, depth) = Q::table(&mut self.memo).done.get(key)?.clone();
+        self.symbols.trail.depend(depth);
+        Some(answer)
     }
 
-    fn cache_bit(&mut self, key: (ValueId, u8, Option<ValueId>), r: Assumed<Option<bool>>, depth: Depth) {
-        self.journal.note(Entry::Bit(key), depth);
-        self.memo.bits.insert(key, (r, depth));
+    #[inline]
+    fn guarded<Q: Query, T>(&mut self, key: Q::Key, f: impl FnOnce(&mut Self) -> T) -> Option<(T, Depth)> {
+        let outside = Q::table(&mut self.memo).active.enter(key, self.guessing.level)?;
+        let found = self.frame(|this| {
+            if outside.is_some() {
+                this.symbols.trail.depend(level(this.symbols.trail.checking));
+            }
+            f(this)
+        });
+        Q::table(&mut self.memo).active.leave(key, outside);
+        Some(found)
+    }
+
+    #[inline]
+    fn store<Q: Query>(&mut self, key: Q::Key, answer: Q::Answer, depth: Depth) {
+        self.journal.note(Q::entry(key), depth);
+        Q::table(&mut self.memo).done.insert(key, (answer, depth));
+    }
+
+    #[inline]
+    fn known_assuming<Q: Query<Key = ValueKey, Answer = Assumed<T>>, T: Clone>(&mut self, (v, l, assume): ValueKey) -> Option<Assumed<T>> {
+        let done = &Q::table(&mut self.memo).done;
+        let hit = match done.get(&(v, l, None)) {
+            Some(e) if assume.is_none() || !e.0 .1.open => Some(e.clone()),
+            _ => assume.and_then(|_| done.get(&(v, l, assume)).cloned()),
+        };
+        let (r, depth) = hit?;
+        self.symbols.trail.depend(depth);
+        Some(r)
+    }
+
+    #[inline]
+    fn store_assuming<Q: Query<Key = ValueKey, Answer = Assumed<T>>, T: Clone>(&mut self, (v, l, assume): ValueKey, r: &Assumed<T>, depth: Depth) {
+        if assume.is_some() {
+            self.store::<Q>((v, l, assume), r.clone(), depth);
+        }
+        if !r.1.used {
+            self.store::<Q>((v, l, None), r.clone(), depth);
+        }
     }
 
     fn operand(&mut self, x: ValueId, at: BlockId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
@@ -3017,21 +3030,11 @@ impl<'a> Values<'a> {
             }
             return Some(guess);
         }
-        let cached = self.memo.slots.get(&key).cloned();
-        if let Some((r, depth)) = cached {
-            self.symbols.trail.depend(depth);
+        if let Some(r) = self.known::<SlotAt>(&key) {
             return r;
         }
-        let outside = self.active.slots.enter(key, self.guessing.level)?;
-        let (result, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.join_slot(block, address, bytes, lane)
-        });
-        self.active.slots.leave(key, outside);
-        self.journal.note(Entry::Slot(key), depth);
-        self.memo.slots.insert(key, (result.clone(), depth));
+        let (result, depth) = self.guarded::<SlotAt, _>(key, |this| this.join_slot(block, address, bytes, lane))?;
+        self.store::<SlotAt>(key, result.clone(), depth);
         result
     }
 
@@ -3122,23 +3125,14 @@ impl<'a> Values<'a> {
     }
 
     fn loop_bits(&mut self, header: BlockId) -> Bits {
-        let cached = self.memo.loop_bits.get(&header).cloned();
-        if let Some((bits, depth)) = cached {
-            self.symbols.trail.depend(depth);
+        if let Some(bits) = self.known::<LoopBits>(&header) {
             return bits;
         }
         if !self.may_guess(header) {
             return Bits::default();
         }
         self.summarize(header, None);
-        let cached = self.memo.loop_bits.get(&header).cloned();
-        match cached {
-            Some((bits, depth)) => {
-                self.symbols.trail.depend(depth);
-                bits
-            }
-            None => Bits::default(),
-        }
+        self.known::<LoopBits>(&header).unwrap_or_default()
     }
 
     fn loop_bit(&mut self, header: BlockId, index: usize, lane: usize) -> Option<bool> {
@@ -3165,33 +3159,19 @@ impl<'a> Values<'a> {
     }
 
     fn summarize(&mut self, header: BlockId, seed: Option<Target>) {
-        let done = self.memo.summarized.get(&header).copied();
-        if seed.is_none() {
-            if let Some((_, depth)) = done {
-                self.symbols.trail.depend(depth);
-                return;
-            }
+        if seed.is_none() && self.known::<Summarized>(&header).is_some() {
+            return;
         }
         if !self.may_guess(header) {
             return;
         }
-        let Some(outside) = self.active.summaries.enter(header, self.guessing.level) else {
+        let Some(((bits, steps), depth)) = self.guarded::<Summarized, _>(header, |this| this.summary(header, seed)) else {
             return;
         };
-        let ((bits, steps), depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.summary(header, seed)
-        });
-        self.active.summaries.leave(header, outside);
-        self.journal.note(Entry::LoopBits(header), depth);
-        self.journal.note(Entry::Summarized(header), depth);
-        self.memo.loop_bits.insert(header, (bits, depth));
-        self.memo.summarized.insert(header, ((), depth));
+        self.store::<LoopBits>(header, bits, depth);
+        self.store::<Summarized>(header, (), depth);
         for (key, step) in steps {
-            self.journal.note(Entry::Step(key), depth);
-            self.memo.steps.insert(key, (step, depth));
+            self.store::<StepOf>(key, step, depth);
         }
     }
 
@@ -3199,12 +3179,8 @@ impl<'a> Values<'a> {
         let params: Vec<(ValueId, Ty)> = self.symbols.program.f.blocks[&header].params.clone();
         let (entering, back) = self.edges_into(header);
         let lanes: Vec<usize> = (0..LANES).filter(|&l| self.symbols.valid(l)).collect();
-        let known = self.memo.loop_bits.get(&header).cloned();
-        let mut bits: Vec<((usize, u8), bool)> = match known {
-            Some((bits, depth)) => {
-                self.symbols.trail.depend(depth);
-                (*bits).clone()
-            }
+        let mut bits: Vec<((usize, u8), bool)> = match self.known::<LoopBits>(&header) {
+            Some(bits) => (*bits).clone(),
             None => {
                 let mut bits = Vec::new();
                 for (index, &(_, ty)) in params.iter().enumerate() {
@@ -3378,18 +3354,11 @@ impl<'a> Values<'a> {
         let l = lane as u8;
         let region = first.region;
         let step_key = (header, l, target, region);
-        let lookup = |this: &mut Self| {
-            let cached = this.memo.steps.get(&step_key).cloned();
-            cached.map(|(step, depth)| {
-                this.symbols.trail.depend(depth);
-                step
-            })
-        };
-        let found = match lookup(self) {
+        let found = match self.known::<StepOf>(&step_key) {
             Some(step) => Some(step),
             None => {
                 self.summarize(header, Some(target));
-                lookup(self)
+                self.known::<StepOf>(&step_key)
             }
         };
         let (step, keeps, _) = match found {
@@ -3397,8 +3366,7 @@ impl<'a> Values<'a> {
             None => {
                 let bits = self.loop_bits(header);
                 let (step, depth) = self.frame(|this| this.find_step(header, lane, target, region, &bits, &back));
-                self.journal.note(Entry::Step(step_key), depth);
-                self.memo.steps.insert(step_key, (step, depth));
+                self.store::<StepOf>(step_key, step, depth);
                 step
             }
         };
@@ -3426,9 +3394,7 @@ impl<'a> Values<'a> {
         }
         let l = lane as u8;
         let key = (header, l, Target::Param(index), None);
-        let cached = self.memo.steps.get(&key).cloned();
-        let ((_, _, affine), depth) = cached?;
-        self.symbols.trail.depend(depth);
+        let (_, _, affine) = self.known::<StepOf>(&key)?;
         let (entering, back) = self.edges_into(header);
         let first = self.entering_value(&entering, header, index, lane)?;
         if first.region.is_some() {
@@ -3641,16 +3607,11 @@ impl<'a> Values<'a> {
                 return unassumed(guess);
             }
         }
-        let hit = match self.memo.values.get(&(v, l, None)) {
-            Some(e) if assume.is_none() || !e.0 .1.open => Some(e.clone()),
-            _ => assume.and_then(|_| self.memo.values.get(&(v, l, assume)).cloned()),
-        };
-        if let Some((r, depth)) = hit {
-            self.symbols.trail.depend(depth);
+        let key = (v, l, assume);
+        if let Some(r) = self.known_assuming::<ValueOf, _>(key) {
             return r;
         }
-        let key = (v, l, assume, false);
-        let Some(outside) = self.active.values.enter(key, self.guessing.level) else {
+        let Some((r, depth)) = self.guarded::<ValueOf, _>(key, |this| this.compute(v, lane, assume)) else {
             let shared = self.symbols.program.facts.uniform[v.0];
             let block = self.symbols.program.block_of(v);
             let u = self.symbols.intern(
@@ -3666,25 +3627,13 @@ impl<'a> Values<'a> {
             );
             return unassumed(Value::of(Form::unknown(u)));
         };
-        let (r, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.compute(v, lane, assume)
-        });
-        self.active.values.leave(key, outside);
-        if assume.is_some() {
-            self.cache_value((v, l, assume), r.clone(), depth);
-        }
         let root = self.symbols.program.copies.get(&v).copied().unwrap_or(v);
         let r = if assume.is_none() && self.symbols.program.equated.contains(&root) {
             (r.0, Reliance { open: true, ..r.1 })
         } else {
             r
         };
-        if !r.1.used {
-            self.cache_value((v, l, None), r.clone(), depth);
-        }
+        self.store_assuming::<ValueOf, _>(key, &r, depth);
         r
     }
 
@@ -3716,31 +3665,14 @@ impl<'a> Values<'a> {
             self.symbols.trail.depend(depth);
             return unassumed(Some(guess));
         }
-        let hit = match self.memo.bits.get(&(v, l, None)) {
-            Some(&e) if assume.is_none() || !e.0 .1.open => Some(e),
-            _ => assume.and_then(|_| self.memo.bits.get(&(v, l, assume)).copied()),
-        };
-        if let Some((r, depth)) = hit {
-            self.symbols.trail.depend(depth);
+        let key = (v, l, assume);
+        if let Some(r) = self.known_assuming::<BitOf, _>(key) {
             return r;
         }
-        let key = (v, l, assume, true);
-        let Some(outside) = self.active.values.enter(key, self.guessing.level) else {
+        let Some((r, depth)) = self.guarded::<BitOf, _>(key, |this| this.compute_bit(v, lane, assume)) else {
             return unassumed(None);
         };
-        let (r, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.compute_bit(v, lane, assume)
-        });
-        self.active.values.leave(key, outside);
-        if assume.is_some() {
-            self.cache_bit((v, l, assume), r, depth);
-        }
-        if !r.1.used {
-            self.cache_bit((v, l, None), r, depth);
-        }
+        self.store_assuming::<BitOf, _>(key, &r, depth);
         r
     }
 
@@ -3794,24 +3726,14 @@ impl<'a> Values<'a> {
     }
 
     fn limits(&mut self, b: BlockId) -> std::rc::Rc<Limits> {
-        if let Some((found, depth)) = self.memo.limited.get(&b) {
-            let found = found.clone();
-            self.symbols.trail.depend(*depth);
+        if let Some(found) = self.known::<LimitsAt>(&b) {
             return found;
         }
-        let Some(outside) = self.active.limits.enter(b, self.guessing.level) else {
+        let Some((limits, depth)) = self.guarded::<LimitsAt, _>(b, |this| this.compute_limits(b)) else {
             return std::rc::Rc::default();
         };
-        let (limits, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.compute_limits(b)
-        });
-        self.active.limits.leave(b, outside);
         let limits = std::rc::Rc::new(limits);
-        self.journal.note(Entry::Limits(b), depth);
-        self.memo.limited.insert(b, (limits.clone(), depth));
+        self.store::<LimitsAt>(b, limits.clone(), depth);
         limits
     }
 
@@ -4551,21 +4473,17 @@ impl<'a> Values<'a> {
         let v = self.symbols.program.copies.get(&v).copied().unwrap_or(v);
         let lane = self.symbols.canonical(v, lane);
         let key = (v, lane as u8);
-        let cached = self.memo.highs.get(&key).cloned();
-        if let Some((form, depth)) = cached {
-            self.symbols.trail.depend(depth);
+        if let Some(form) = self.known::<HighOf>(&key) {
             return form;
         }
-        if !self.active.highs.insert(key) {
-            return self.symbols.opaque_high(v, lane);
-        }
-        let (found, depth) = self.frame(|this| {
+        let found = self.guarded::<HighOf, _>(key, |this| {
             let found = this.compute_high(v, lane);
             found.unwrap_or_else(|| this.symbols.opaque_high(v, lane))
         });
-        self.active.highs.remove(&key);
-        self.journal.note(Entry::High(key), depth);
-        self.memo.highs.insert(key, (found.clone(), depth));
+        let Some((found, depth)) = found else {
+            return self.symbols.opaque_high(v, lane);
+        };
+        self.store::<HighOf>(key, found.clone(), depth);
         found
     }
 
@@ -5847,24 +5765,11 @@ impl Values<'_> {
     fn word_bit(&mut self, w: ValueId, bit: usize) -> Option<bool> {
         let w = self.symbols.program.copies.get(&w).copied().unwrap_or(w);
         let key = (w, bit as u8);
-        let cached = self.memo.word_bits.get(&key).copied();
-        if let Some((r, depth)) = cached {
-            self.symbols.trail.depend(depth);
+        if let Some(r) = self.known::<WordBit>(&key) {
             return r;
         }
-        let active = (w, bit as u8);
-        let Some(outside) = self.active.words.enter(active, self.guessing.level) else {
-            return None;
-        };
-        let (r, depth) = self.frame(|this| {
-            if outside.is_some() {
-                this.symbols.trail.depend(level(this.symbols.trail.checking));
-            }
-            this.compute_word_bit(w, bit)
-        });
-        self.active.words.leave(active, outside);
-        self.journal.note(Entry::WordBit(key), depth);
-        self.memo.word_bits.insert(key, (r, depth));
+        let (r, depth) = self.guarded::<WordBit, _>(key, |this| this.compute_word_bit(w, bit))?;
+        self.store::<WordBit>(key, r, depth);
         r
     }
 
