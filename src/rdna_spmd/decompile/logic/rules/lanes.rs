@@ -1,7 +1,20 @@
-use super::super::address::compare;
+use super::super::super::address::compare;
+use super::super::kernel::Queries;
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
+
+pub(super) trait HasLanes {
+    fn lanes_mut(&mut self) -> &mut LaneValues;
+}
+
+#[inline]
+pub(super) fn lane_values<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]>
+where
+    Q::State: HasLanes,
+{
+    q.state_mut().lanes_mut().of(f, facts, v, 0)
+}
 
 #[derive(Default)]
 pub(super) struct LaneValues(HashMap<ValueId, Option<[u32; 32]>>);

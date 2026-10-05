@@ -1,7 +1,11 @@
 use super::super::address::compare;
 use super::super::testing::*;
 use super::*;
+use crate::rdna_spmd::analysis::bdd::Bdd;
+use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::hash::HashMap;
+use crate::rdna_spmd::ir::*;
+use std::collections::BTreeSet;
 
 type Word = std::rc::Rc<dyn Fn(u32, u32, u32) -> u32>;
 

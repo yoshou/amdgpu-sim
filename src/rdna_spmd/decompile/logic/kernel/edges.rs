@@ -1,7 +1,5 @@
-use super::super::terms::Terms;
 use super::atoms::Atom;
-use super::cells::{block_cells, cell_minterm};
-use super::queries::Queries;
+use super::queries::{Queries, Rules};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::hash::HashMap;
@@ -9,13 +7,11 @@ use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-const JOINT: usize = 1 << 10;
-
 #[derive(Clone)]
-struct Binding {
-    atom: Bdd,
-    bound: Bdd,
-    support: Vec<u32>,
+pub(in super::super) struct Binding {
+    pub(in super::super) atom: Bdd,
+    pub(in super::super) bound: Bdd,
+    pub(in super::super) support: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -25,7 +21,7 @@ struct EdgeIndex {
 }
 
 #[derive(Default)]
-pub(super) struct Edges {
+pub(in super::super) struct Edges {
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
     relations: BTreeMap<(BlockId, usize), Rc<Vec<Binding>>>,
     images: HashMap<(usize, usize, Bdd), Bdd>,
@@ -37,7 +33,7 @@ impl Edges {
         if let Some(b) = self.bridges.get(&(src, slot)) {
             return b.clone();
         }
-        let links = Rc::new(cell_bridges(q, f, facts, src, slot));
+        let links = Rc::new(Q::State::bridges(q, f, facts, src, slot));
         self.bridges.insert((src, slot), links.clone());
         links
     }
@@ -73,7 +69,7 @@ impl Edges {
         index
     }
 
-    pub(super) fn image<Q: Queries>(
+    pub(in super::super) fn image<Q: Queries>(
         &mut self,
         q: &mut Q,
         f: &Func,
@@ -169,7 +165,7 @@ impl Edges {
         links
     }
 
-    pub(super) fn post<Q: Queries>(&mut self, q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
+    pub(in super::super) fn post<Q: Queries>(&mut self, q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
         if formula == Bdd::FALSE {
             return formula;
         }
@@ -179,7 +175,7 @@ impl Edges {
         arrived(q, src, dst, r)
     }
 
-    pub(super) fn reach<Q: Queries>(
+    pub(in super::super) fn reach<Q: Queries>(
         &mut self,
         q: &mut Q,
         f: &Func,
@@ -231,70 +227,6 @@ impl Edges {
         }
         reach
     }
-}
-
-fn cell_bridges<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<Binding> {
-    let edge = f.blocks[&src].term.edges().nth(slot).unwrap();
-    let dst = edge.dst;
-    if dst == src {
-        return Vec::new();
-    }
-    let substitution: HashMap<ValueId, ValueId> = f.blocks[&dst]
-        .params
-        .iter()
-        .zip(&edge.args)
-        .map(|(&(param, _), &arg)| (param, arg))
-        .collect();
-    let (from, to) = (block_cells(q, f, facts, src), block_cells(q, f, facts, dst));
-    let mut out = Vec::new();
-    for (g_to, target) in to.groups.iter().enumerate() {
-        let params: Vec<ValueId> = target.leaves.iter().copied().filter(|l| substitution.contains_key(l)).collect();
-        if params.is_empty() || params.iter().any(|p| !q.carried(*p)) {
-            continue;
-        }
-        let mut mapped: BTreeSet<ValueId> = BTreeSet::new();
-        let terms = Terms::substituting(f, facts, substitution.clone());
-        for &(_, a, b) in &target.preds {
-            let mut lane = false;
-            terms.leaves(a, 0, &mut mapped, &mut lane);
-            terms.leaves(b, 0, &mut mapped, &mut lane);
-            if lane {
-                mapped.clear();
-                break;
-            }
-        }
-        if mapped.is_empty() {
-            continue;
-        }
-        for (g_from, source) in from.groups.iter().enumerate() {
-            if source.leaves.is_disjoint(&mapped) {
-                continue;
-            }
-            let preds: Vec<(IntPred, ValueId, ValueId)> = source.preds.iter().chain(&target.preds).copied().collect();
-            let mut terms = Terms::substituting(f, facts, substitution.clone());
-            let Some(worlds) = terms.worlds(&preds, JOINT) else {
-                continue;
-            };
-            let mut relation = Bdd::FALSE;
-            for world in &worlds {
-                let (a, b) = world.split_at(source.preds.len());
-                let (Some(i), Some(j)) = (source.worlds.iter().position(|w| w == a), target.worlds.iter().position(|w| w == b)) else {
-                    continue;
-                };
-                let left = cell_minterm(q, src, g_from as u16, i, source);
-                let right = cell_minterm(q, dst, g_to as u16, j, target);
-                let both = q.m().and(left, right);
-                relation = q.m().or(relation, both);
-            }
-            let support = q.scoped(facts, relation, src);
-            out.push(Binding {
-                atom: Bdd::TRUE,
-                bound: relation,
-                support,
-            });
-        }
-    }
-    out
 }
 
 fn arrived<Q: Queries>(q: &mut Q, src: BlockId, dst: BlockId, r: Bdd) -> Bdd {

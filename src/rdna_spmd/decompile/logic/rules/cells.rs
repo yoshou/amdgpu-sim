@@ -1,9 +1,7 @@
-use super::super::address::compare;
-use super::super::terms::Terms;
-use super::atoms::{Atom, Atoms};
-use super::patterns::lane_test;
-use super::queries::Queries;
-use super::HashSet;
+use super::super::super::address::compare;
+use super::super::super::terms::Terms;
+use super::super::kernel::{lane_test, Atom, Binding, Queries};
+use super::super::HashSet;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
@@ -12,11 +10,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 #[derive(Default)]
-pub(super) struct BlockCells {
+struct BlockCells {
     of: HashMap<ValueId, Rc<Tree>>,
     opaque: HashMap<ValueId, (IntPred, ValueId, ValueId)>,
     placed: HashMap<usize, (u16, usize)>,
-    pub(super) groups: Vec<CellGroup>,
+    groups: Vec<CellGroup>,
 }
 
 #[derive(Debug)]
@@ -136,10 +134,10 @@ fn grouped(leaves: &[Option<BTreeSet<ValueId>>]) -> Vec<Vec<usize>> {
     members.into_values().collect()
 }
 
-pub(super) struct CellGroup {
-    pub(super) worlds: Vec<Vec<bool>>,
-    pub(super) preds: Vec<(IntPred, ValueId, ValueId)>,
-    pub(super) leaves: BTreeSet<ValueId>,
+struct CellGroup {
+    worlds: Vec<Vec<bool>>,
+    preds: Vec<(IntPred, ValueId, ValueId)>,
+    leaves: BTreeSet<ValueId>,
     uniform: Vec<bool>,
     parts: Vec<(usize, usize)>,
     counts: (usize, usize),
@@ -168,6 +166,7 @@ impl CellGroup {
 
 const CELLS: usize = 64;
 const GROUP: usize = 12;
+const JOINT: usize = 1 << 10;
 
 #[derive(Default)]
 pub(super) struct Cells {
@@ -181,22 +180,28 @@ impl Cells {
     pub(super) fn leaves(&self, block: BlockId, group: u16) -> &[ValueId] {
         &self.groups[&(block, group)].1
     }
-}
 
-pub(super) fn uniform_atom(atoms: &Atoms, cells: &Cells, facts: &Facts, var: u32) -> bool {
-    match atoms.of(var) {
-        Atom::Bit(v) => facts.uniform[v.0] || cells.uniform_tests.contains(&v),
-        Atom::View(v) => facts.saturated[v.0],
-        Atom::WordBit(v, _) => facts.uniform[v.0],
-        Atom::Marker(_) => true,
-        Atom::Cell(block, group, bit) => bit < cells.groups[&(block, group)].0,
-        Atom::Some(..) => true,
-        Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,
+    #[inline]
+    pub(super) fn uniform_test(&self, v: ValueId) -> bool {
+        self.uniform_tests.contains(&v)
+    }
+
+    #[inline]
+    pub(super) fn uniform_cell(&self, block: BlockId, group: u16, bit: u8) -> bool {
+        bit < self.groups[&(block, group)].0
     }
 }
 
-pub(super) fn block_cells<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId) -> Rc<BlockCells> {
-    if let Some(cells) = q.cells().blocks.get(&block) {
+pub(super) trait HasCells {
+    fn cells(&self) -> &Cells;
+    fn cells_mut(&mut self) -> &mut Cells;
+}
+
+fn block_cells<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId) -> Rc<BlockCells>
+where
+    Q::State: HasCells,
+{
+    if let Some(cells) = q.state().cells().blocks.get(&block) {
         return cells.clone();
     }
     let mut distributor = Distributor::default();
@@ -234,7 +239,7 @@ pub(super) fn block_cells<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block:
         let leaves: BTreeSet<ValueId> = list.iter().flat_map(|&i| leaves[i].iter().flatten().copied()).collect();
         let group = CellGroup::new(worlds, preds, leaves, uniform);
         let number = cells.groups.len() as u16;
-        q.cells_mut().groups.insert((block, number), (CellGroup::bits(group.counts.0), group.leaves.iter().copied().collect()));
+        q.state_mut().cells_mut().groups.insert((block, number), (CellGroup::bits(group.counts.0), group.leaves.iter().copied().collect()));
         for (k, &i) in list.iter().enumerate() {
             cells.placed.insert(i, (number, k));
         }
@@ -249,11 +254,14 @@ pub(super) fn block_cells<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block:
         cells.of.insert(value, tree);
     }
     let cells = Rc::new(cells);
-    q.cells_mut().blocks.insert(block, cells.clone());
+    q.state_mut().cells_mut().blocks.insert(block, cells.clone());
     cells
 }
 
-pub(super) fn cell_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<Bdd> {
+pub(super) fn cell_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<Bdd>
+where
+    Q::State: HasCells,
+{
     let Site::Inst { block, .. } = facts.site[v.0] else {
         return None;
     };
@@ -265,7 +273,7 @@ pub(super) fn cell_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueI
         terms.leaves(a, 0, &mut leaves, &mut lane);
         terms.leaves(b, 0, &mut leaves, &mut lane);
         if !lane && leaves.iter().all(|l| facts.uniform[l.0]) || terms.uniform((p, a, b)) {
-            q.cells_mut().uniform_tests.insert(v);
+            q.state_mut().cells_mut().uniform_tests.insert(v);
         }
     }
     let mut done = HashMap::default();
@@ -337,7 +345,7 @@ fn tree_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId, v: V
     result
 }
 
-pub(super) fn cell_minterm<Q: Queries>(q: &mut Q, block: BlockId, group: u16, cell: usize, g: &CellGroup) -> Bdd {
+fn cell_minterm<Q: Queries>(q: &mut Q, block: BlockId, group: u16, cell: usize, g: &CellGroup) -> Bdd {
     let (u, v) = g.parts[cell];
     let first = part_minterm(q, block, group, 0, u, g.counts.0);
     let second = part_minterm(q, block, group, CellGroup::bits(g.counts.0), v, g.counts.1);
@@ -364,4 +372,71 @@ fn index_minterm<Q: Queries>(q: &mut Q, atom: &dyn Fn(u8) -> Atom, part: usize, 
         result = q.m().or(result, minterm);
     }
     result
+}
+
+pub(super) fn bridges<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<Binding>
+where
+    Q::State: HasCells,
+{
+    let edge = f.blocks[&src].term.edges().nth(slot).unwrap();
+    let dst = edge.dst;
+    if dst == src {
+        return Vec::new();
+    }
+    let substitution: HashMap<ValueId, ValueId> = f.blocks[&dst]
+        .params
+        .iter()
+        .zip(&edge.args)
+        .map(|(&(param, _), &arg)| (param, arg))
+        .collect();
+    let (from, to) = (block_cells(q, f, facts, src), block_cells(q, f, facts, dst));
+    let mut out = Vec::new();
+    for (g_to, target) in to.groups.iter().enumerate() {
+        let params: Vec<ValueId> = target.leaves.iter().copied().filter(|l| substitution.contains_key(l)).collect();
+        if params.is_empty() || params.iter().any(|p| !q.carried(*p)) {
+            continue;
+        }
+        let mut mapped: BTreeSet<ValueId> = BTreeSet::new();
+        let terms = Terms::substituting(f, facts, substitution.clone());
+        for &(_, a, b) in &target.preds {
+            let mut lane = false;
+            terms.leaves(a, 0, &mut mapped, &mut lane);
+            terms.leaves(b, 0, &mut mapped, &mut lane);
+            if lane {
+                mapped.clear();
+                break;
+            }
+        }
+        if mapped.is_empty() {
+            continue;
+        }
+        for (g_from, source) in from.groups.iter().enumerate() {
+            if source.leaves.is_disjoint(&mapped) {
+                continue;
+            }
+            let preds: Vec<(IntPred, ValueId, ValueId)> = source.preds.iter().chain(&target.preds).copied().collect();
+            let mut terms = Terms::substituting(f, facts, substitution.clone());
+            let Some(worlds) = terms.worlds(&preds, JOINT) else {
+                continue;
+            };
+            let mut relation = Bdd::FALSE;
+            for world in &worlds {
+                let (a, b) = world.split_at(source.preds.len());
+                let (Some(i), Some(j)) = (source.worlds.iter().position(|w| w == a), target.worlds.iter().position(|w| w == b)) else {
+                    continue;
+                };
+                let left = cell_minterm(q, src, g_from as u16, i, source);
+                let right = cell_minterm(q, dst, g_to as u16, j, target);
+                let both = q.m().and(left, right);
+                relation = q.m().or(relation, both);
+            }
+            let support = q.scoped(facts, relation, src);
+            out.push(Binding {
+                atom: Bdd::TRUE,
+                bound: relation,
+                support,
+            });
+        }
+    }
+    out
 }

@@ -1,5 +1,4 @@
-use super::atoms::Atom;
-use super::queries::Queries;
+use super::super::kernel::{Atom, Queries};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
@@ -242,7 +241,7 @@ pub(super) fn float_order<Q: Queries>(
     g
 }
 
-pub(in super::super) fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
+pub(in super::super::super) fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
     let unordered = x.is_nan() || y.is_nan();
     match pred {
         FloatPred::Oeq => !unordered && x == y,

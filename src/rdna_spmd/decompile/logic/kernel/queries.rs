@@ -1,12 +1,20 @@
-use super::answers::Answers;
 use super::atoms::{self, Atom, Atoms, Choice};
-use super::cells::{self, Cells};
+use super::edges::Binding;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::ir::*;
 use std::rc::Rc;
 
-pub(super) trait Queries {
+pub(in super::super) trait Rules: Sized {
+    fn bit<Q: Queries<State = Self>>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Bdd;
+    fn view<Q: Queries<State = Self>>(q: &mut Q, f: &Func, facts: &Facts, w: ValueId) -> Bdd;
+    fn uniform(&self, atoms: &Atoms, facts: &Facts, var: u32) -> bool;
+    fn bridges<Q: Queries<State = Self>>(q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<Binding>;
+}
+
+pub(in super::super) trait Queries {
+    type State: Rules;
+
     fn m(&mut self) -> &mut Manager;
     fn atoms(&self) -> &Atoms;
     fn atom(&mut self, atom: Atom) -> Bdd;
@@ -14,11 +22,8 @@ pub(super) trait Queries {
     fn local(&mut self, c: Choice) -> Bdd;
     fn materialized(&self, facts: &Facts, v: ValueId) -> Bdd;
     fn carried(&self, param: ValueId) -> bool;
-    fn lane_values(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]>;
-    fn cells(&self) -> &Cells;
-    fn cells_mut(&mut self) -> &mut Cells;
-    fn answers(&self) -> &Answers;
-    fn answers_mut(&mut self) -> &mut Answers;
+    fn state(&self) -> &Self::State;
+    fn state_mut(&mut self) -> &mut Self::State;
     fn bit(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Bdd;
     fn view(&mut self, f: &Func, facts: &Facts, w: ValueId) -> Bdd;
 
@@ -29,7 +34,7 @@ pub(super) trait Queries {
 
     #[inline]
     fn uniform_atom(&self, facts: &Facts, var: u32) -> bool {
-        cells::uniform_atom(self.atoms(), self.cells(), facts, var)
+        self.state().uniform(self.atoms(), facts, var)
     }
 
     #[inline]
@@ -77,15 +82,5 @@ pub(super) trait Queries {
             }
         }
         f
-    }
-
-    fn word_is(&mut self, w: ValueId, value: u32) -> Bdd {
-        let mut g = Bdd::TRUE;
-        for i in 0..5u8 {
-            let bit = self.atom(Atom::WordBit(w, i));
-            let literal = if value >> i & 1 == 1 { bit } else { self.m().not(bit) };
-            g = self.m().and(g, literal);
-        }
-        g
     }
 }

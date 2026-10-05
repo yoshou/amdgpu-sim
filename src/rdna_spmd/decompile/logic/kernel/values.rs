@@ -1,46 +1,40 @@
-use super::answers::Answers;
 use super::atoms::{Atom, Atoms, Choice};
-use super::bits::{compute_bit, compute_view};
-use super::cells::Cells;
-use super::lanes::LaneValues;
 use super::policy::Policy;
-use super::queries::Queries;
+use super::queries::{Queries, Rules};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::rc::Rc;
 
-pub(super) struct Values {
-    pub(super) atoms: Atoms,
-    pub(super) policy: Policy,
-    pub(super) lanes: LaneValues,
-    pub(super) cells: Cells,
-    pub(super) answers: Answers,
+pub(in super::super) struct Values<S> {
+    pub(in super::super) atoms: Atoms,
+    pub(in super::super) policy: Policy,
+    pub(in super::super) state: S,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
 }
 
-impl Values {
-    pub(super) fn new(atoms: Atoms, policy: Policy) -> Self {
+impl<S> Values<S> {
+    pub(in super::super) fn new(atoms: Atoms, policy: Policy, state: S) -> Self {
         Self {
             atoms,
             policy,
-            lanes: LaneValues::default(),
-            cells: Cells::default(),
-            answers: Answers::default(),
+            state,
             bits: HashMap::default(),
             views: HashMap::default(),
         }
     }
 }
 
-pub(super) struct Eval<'x> {
-    pub(super) m: &'x mut Manager,
-    pub(super) values: &'x mut Values,
+pub(in super::super) struct Eval<'x, S> {
+    pub(in super::super) m: &'x mut Manager,
+    pub(in super::super) values: &'x mut Values<S>,
 }
 
-impl Queries for Eval<'_> {
+impl<S: Rules> Queries for Eval<'_, S> {
+    type State = S;
+
     #[inline]
     fn m(&mut self) -> &mut Manager {
         self.m
@@ -77,35 +71,20 @@ impl Queries for Eval<'_> {
     }
 
     #[inline]
-    fn lane_values(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
-        self.values.lanes.of(f, facts, v, 0)
+    fn state(&self) -> &S {
+        &self.values.state
     }
 
     #[inline]
-    fn cells(&self) -> &Cells {
-        &self.values.cells
-    }
-
-    #[inline]
-    fn cells_mut(&mut self) -> &mut Cells {
-        &mut self.values.cells
-    }
-
-    #[inline]
-    fn answers(&self) -> &Answers {
-        &self.values.answers
-    }
-
-    #[inline]
-    fn answers_mut(&mut self) -> &mut Answers {
-        &mut self.values.answers
+    fn state_mut(&mut self) -> &mut S {
+        &mut self.values.state
     }
 
     fn bit(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Bdd {
         if let Some(&b) = self.values.bits.get(&v) {
             return b;
         }
-        let b = compute_bit(self, f, facts, v);
+        let b = S::bit(self, f, facts, v);
         self.values.bits.insert(v, b);
         b
     }
@@ -114,7 +93,7 @@ impl Queries for Eval<'_> {
         if let Some(&b) = self.values.views.get(&w) {
             return b;
         }
-        let b = compute_view(self, f, facts, w);
+        let b = S::view(self, f, facts, w);
         self.values.views.insert(w, b);
         b
     }

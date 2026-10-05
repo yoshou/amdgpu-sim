@@ -1,5 +1,4 @@
-use super::atoms::Atom;
-use super::queries::Queries;
+use super::super::kernel::{Atom, Queries};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
@@ -23,12 +22,20 @@ impl Answers {
     }
 }
 
-pub(super) fn mentions_answers<Q: Queries>(q: &mut Q, f: Bdd) -> bool {
+pub(super) trait HasAnswers {
+    fn answers(&self) -> &Answers;
+    fn answers_mut(&mut self) -> &mut Answers;
+}
+
+fn mentions_answers<Q: Queries>(q: &mut Q, f: Bdd) -> bool {
     let support = q.support(f);
     support.iter().any(|&v| matches!(q.atoms().get(v), Some(Atom::Some(..))))
 }
 
-pub(super) fn consistent<Q: Queries>(q: &mut Q, x: Bdd) -> Bdd {
+pub(super) fn consistent<Q: Queries>(q: &mut Q, x: Bdd) -> Bdd
+where
+    Q::State: HasAnswers,
+{
     if !mentions_answers(q, x) {
         return x;
     }
@@ -48,9 +55,12 @@ pub(super) fn consistent<Q: Queries>(q: &mut Q, x: Bdd) -> Bdd {
     result
 }
 
-fn answer_relation<Q: Queries>(q: &mut Q, block: BlockId) -> Bdd {
-    let residuals: Vec<Bdd> = q.answers().0[&block].residuals.iter().map(|&(g, _)| g).collect();
-    if let Some((count, relation)) = q.answers().0[&block].relation {
+fn answer_relation<Q: Queries>(q: &mut Q, block: BlockId) -> Bdd
+where
+    Q::State: HasAnswers,
+{
+    let residuals: Vec<Bdd> = q.state().answers().0[&block].residuals.iter().map(|&(g, _)| g).collect();
+    if let Some((count, relation)) = q.state().answers().0[&block].relation {
         if count == residuals.len() {
             return relation;
         }
@@ -82,7 +92,7 @@ fn answer_relation<Q: Queries>(q: &mut Q, block: BlockId) -> Bdd {
             relation = q.m().and(relation, tie);
         }
     }
-    q.answers_mut().0.get_mut(&block).unwrap().relation = Some((residuals.len(), relation));
+    q.state_mut().answers_mut().0.get_mut(&block).unwrap().relation = Some((residuals.len(), relation));
     relation
 }
 
@@ -102,7 +112,10 @@ fn only_lane<Q: Queries>(q: &mut Q, g: Bdd) -> Option<u32> {
     found
 }
 
-pub(super) fn wave_answer<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, out: ValueId) -> Bdd {
+pub(super) fn wave_answer<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, out: ValueId) -> Bdd
+where
+    Q::State: HasAnswers,
+{
     let Some(Inst::Effect { inputs, .. }) = facts.inst(f, out) else {
         return q.atom(Atom::Bit(out));
     };
@@ -110,7 +123,10 @@ pub(super) fn wave_answer<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, out: V
     answer(q, f, facts, out, bits)
 }
 
-pub(super) fn answer<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, out: ValueId, g: Bdd) -> Bdd {
+pub(super) fn answer<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, out: ValueId, g: Bdd) -> Bdd
+where
+    Q::State: HasAnswers,
+{
     let (Site::Inst { block, .. }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) else {
         return q.atom(Atom::Bit(out));
     };
@@ -173,7 +189,10 @@ fn answers_possible<Q: Queries>(q: &mut Q, residuals: &[Bdd], chosen: &[bool], d
     true
 }
 
-fn some_lane_holds<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, g: Bdd, source: ValueId, done: &mut HashMap<Bdd, Bdd>) -> Bdd {
+fn some_lane_holds<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, g: Bdd, source: ValueId, done: &mut HashMap<Bdd, Bdd>) -> Bdd
+where
+    Q::State: HasAnswers,
+{
     if g == Bdd::FALSE || g == Bdd::TRUE {
         return g;
     }
@@ -190,7 +209,7 @@ fn some_lane_holds<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, g: Bdd,
             q.m().ite(x, yes, no)
         }
         None => {
-            let answers = q.answers_mut().0.entry(block).or_default();
+            let answers = q.state_mut().answers_mut().0.entry(block).or_default();
             let k = match answers.residuals.iter().position(|&(x, _)| x == g) {
                 Some(k) => k,
                 None => {

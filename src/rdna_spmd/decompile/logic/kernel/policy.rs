@@ -44,20 +44,20 @@ enum Choices {
     },
 }
 
-pub(super) struct Policy {
+pub(in super::super) struct Policy {
     choices: Choices,
     listed: Vec<Choice>,
 }
 
 impl Policy {
-    pub(super) fn fixed(kept: &BTreeSet<Choice>, listed: &[Choice]) -> Self {
+    pub(in super::super) fn fixed(kept: &BTreeSet<Choice>, listed: &[Choice]) -> Self {
         Self {
             choices: Choices::Fixed { kept: kept.clone() },
             listed: listed.to_vec(),
         }
     }
 
-    pub(super) fn open(f: &Func, facts: &Facts, listed: &[Choice], atoms: &mut Atoms, m: &mut Manager) -> Self {
+    pub(in super::super) fn open(f: &Func, facts: &Facts, listed: &[Choice], atoms: &mut Atoms, m: &mut Manager) -> Self {
         let mut whole: Vec<Bdd> = facts
             .materialized
             .iter()
@@ -96,17 +96,17 @@ impl Policy {
         }
     }
 
-    pub(super) fn keep(&mut self, kept: &BTreeSet<Choice>) {
+    pub(in super::super) fn keep(&mut self, kept: &BTreeSet<Choice>) {
         if let Choices::Fixed { kept: fixed } = &mut self.choices {
             *fixed = kept.clone();
         }
     }
 
-    pub(super) fn is_open(&self) -> bool {
+    pub(in super::super) fn is_open(&self) -> bool {
         matches!(self.choices, Choices::Open { .. })
     }
 
-    pub(super) fn local(&self, atoms: &mut Atoms, m: &mut Manager, c: Choice) -> Bdd {
+    pub(in super::super) fn local(&self, atoms: &mut Atoms, m: &mut Manager, c: Choice) -> Bdd {
         if let Choices::Fixed { kept } = &self.choices {
             return Manager::constant(!kept.contains(&c));
         }
@@ -117,14 +117,14 @@ impl Policy {
         }
     }
 
-    pub(super) fn materialized(&self, facts: &Facts, v: ValueId) -> Bdd {
+    pub(in super::super) fn materialized(&self, facts: &Facts, v: ValueId) -> Bdd {
         match &self.choices {
             Choices::Fixed { .. } => Manager::constant(facts.materialized[v.0]),
             Choices::Open { whole, .. } => whole[v.0],
         }
     }
 
-    pub(super) fn tag(&self, atoms: &mut Atoms, m: &mut Manager, c: Choice) -> Bdd {
+    pub(in super::super) fn tag(&self, atoms: &mut Atoms, m: &mut Manager, c: Choice) -> Bdd {
         if matches!(self.choices, Choices::Fixed { .. }) && atoms.marks(c) {
             atoms.atom(m, Atom::Marker(c))
         } else {
@@ -132,21 +132,21 @@ impl Policy {
         }
     }
 
-    pub(super) fn carried(&self, param: ValueId) -> bool {
+    pub(in super::super) fn carried(&self, param: ValueId) -> bool {
         match &self.choices {
             Choices::Fixed { .. } => true,
             Choices::Open { live, .. } => live[param.0],
         }
     }
 
-    pub(super) fn all_local(&self) -> Bdd {
+    pub(in super::super) fn all_local(&self) -> Bdd {
         match self.choices {
             Choices::Fixed { .. } => Bdd::TRUE,
             Choices::Open { all_local, .. } => all_local,
         }
     }
 
-    pub(super) fn choose(&self, atoms: &Atoms, m: &mut Manager, mut safe: Bdd) -> Kept {
+    pub(in super::super) fn choose(&self, atoms: &Atoms, m: &mut Manager, mut safe: Bdd) -> Kept {
         assert_ne!(safe, Bdd::FALSE);
         let mut kept = Kept::default();
         for &c in &self.listed {
@@ -164,7 +164,7 @@ impl Policy {
     }
 }
 
-pub(super) fn possible_policies(atoms: &mut Atoms, m: &mut Manager, condition: Bdd) -> Bdd {
+pub(in super::super) fn possible_policies(atoms: &mut Atoms, m: &mut Manager, condition: Bdd) -> Bdd {
     let varying: Vec<u32> = atoms
         .support(m, condition)
         .iter()
@@ -174,7 +174,7 @@ pub(super) fn possible_policies(atoms: &mut Atoms, m: &mut Manager, condition: B
     exists(m, &varying, condition)
 }
 
-pub(super) fn settled(atoms: &mut Atoms, m: &mut Manager, f: Bdd, kept: &BTreeSet<Choice>) -> Bdd {
+pub(in super::super) fn settled(atoms: &mut Atoms, m: &mut Manager, f: Bdd, kept: &BTreeSet<Choice>) -> Bdd {
     let markers: HashMap<u32, Bdd> = atoms
         .support(m, f)
         .iter()
