@@ -230,7 +230,6 @@ enum Entry {
     Decision(BlockId),
     Limits(BlockId),
     Reach(BlockId),
-    Region(ValueKey, bool),
     WordBit((ValueId, u8)),
     High((ValueId, u8)),
 }
@@ -403,6 +402,12 @@ fn unassumed<T>(x: T) -> Assumed<T> {
 }
 
 pub struct Addresses<'a> {
+    values: Values<'a>,
+    found: Found,
+    widening: Widening,
+}
+
+struct Values<'a> {
     symbols: Symbols<'a>,
     conditions: Conditions,
     entered: Option<usize>,
@@ -410,7 +415,6 @@ pub struct Addresses<'a> {
     journal: Journal<Entry>,
     active: Active,
     guessing: Guessing,
-    widening: Widening,
 }
 
 struct Symbols<'a> {
@@ -467,8 +471,6 @@ struct Memo {
     steps: Cached<StepKey, Step>,
     summarized: Cached<BlockId, ()>,
     slots: Cached<Slot, Option<Value>>,
-    regions: Cached<ValueKey, Assumed<Regions>>,
-    refined: Cached<ValueKey, Assumed<Regions>>,
     word_bits: Cached<(ValueId, u8), Option<bool>>,
     highs: Cached<(ValueId, u8), Form>,
     decisions: Cached<BlockId, Option<bool>>,
@@ -488,7 +490,6 @@ struct Journal<E>(Vec<(E, Depth)>);
 struct Active {
     values: Guard<(ValueId, u8, Option<ValueId>, bool)>,
     slots: Guard<Slot>,
-    regions: HashSet<(ValueId, u8, Option<ValueId>, bool)>,
     words: Guard<(ValueId, u8)>,
     highs: HashSet<(ValueId, u8)>,
     decisions: Guard<BlockId>,
@@ -509,9 +510,16 @@ struct Guessing {
 }
 
 #[derive(Default)]
-struct Widening {
+struct Found {
+    coarse: HashMap<ValueKey, Assumed<Regions>>,
+    refined: HashMap<ValueKey, Assumed<Regions>>,
+    active: HashSet<(ValueId, u8, Option<ValueId>, bool)>,
     looped: BTreeMap<(ValueId, u8, bool), usize>,
     checked: BTreeSet<(ValueId, u8, bool)>,
+}
+
+#[derive(Default)]
+struct Widening {
     grown: HashMap<(ValueId, u8, bool), Regions>,
     split: HashSet<(ValueId, bool)>,
 }
@@ -525,8 +533,6 @@ impl Memo {
             steps,
             summarized,
             slots,
-            regions,
-            refined,
             word_bits,
             highs,
             decisions,
@@ -539,8 +545,6 @@ impl Memo {
         steps.clear();
         summarized.clear();
         slots.clear();
-        regions.clear();
-        refined.clear();
         word_bits.clear();
         highs.clear();
         decisions.clear();
@@ -556,7 +560,6 @@ impl Memo {
             Entry::Slot(key) => evict(&mut self.slots, &key, depth),
             Entry::LoopBits(key) => evict(&mut self.loop_bits, &key, depth),
             Entry::Step(key) => evict(&mut self.steps, &key, depth),
-            Entry::Region(key, refine) => evict(if refine { &mut self.refined } else { &mut self.regions }, &key, depth),
             Entry::WordBit(key) => evict(&mut self.word_bits, &key, depth),
             Entry::High(key) => evict(&mut self.highs, &key, depth),
             Entry::Decision(key) => evict(&mut self.decisions, &key, depth),
@@ -2166,57 +2169,587 @@ impl<'a> Addresses<'a> {
     ) -> Self {
         let mut conditions = Conditions::new(f);
         Self {
-            symbols: Symbols {
-                program: Program::new(f, facts, inputs, exec, entry, env, headers, registry, &mut conditions),
-                trail: Trail::default(),
+            values: Values {
+                symbols: Symbols {
+                    program: Program::new(f, facts, inputs, exec, entry, env, headers, registry, &mut conditions),
+                    trail: Trail::default(),
+                    journal: Journal::default(),
+                    wave: 0,
+                    unknowns: Vec::new(),
+                    keys: Cached::default(),
+                    derived: HashMap::default(),
+                    monomials: HashMap::default(),
+                    opaque_highs: HashSet::default(),
+                    pending: HashMap::default(),
+                },
+                conditions,
+                entered: None,
+                memo: Memo::default(),
                 journal: Journal::default(),
-                wave: 0,
-                unknowns: Vec::new(),
-                keys: Cached::default(),
-                derived: HashMap::default(),
-                monomials: HashMap::default(),
-                opaque_highs: HashSet::default(),
-                pending: HashMap::default(),
+                active: Active::default(),
+                guessing: Guessing::default(),
             },
-            conditions,
-            entered: None,
-            memo: Memo::default(),
-            journal: Journal::default(),
-            active: Active::default(),
-            guessing: Guessing::default(),
+            found: Found::default(),
             widening: Widening::default(),
         }
     }
 
+    pub fn enter(&mut self, wave: usize) {
+        if self.values.enter(wave) {
+            self.found.coarse.clear();
+            self.found.refined.clear();
+            self.found.looped.clear();
+            self.found.checked.clear();
+        }
+    }
+
     pub fn unknowns(&self) -> &[UnknownInfo] {
-        &self.symbols.unknowns
+        &self.values.symbols.unknowns
     }
 
     pub fn trip(&self, header: BlockId) -> Option<Unknown> {
-        self.symbols.trip(header)
+        self.values.symbols.trip(header)
     }
 
     pub fn waves(&self) -> usize {
-        self.symbols.waves()
+        self.values.symbols.waves()
     }
 
     pub fn valid(&self, lane: usize) -> bool {
-        self.symbols.valid(lane)
+        self.values.symbols.valid(lane)
     }
 
     pub(super) fn bounds(&self, form: &Form) -> Option<(u64, u64)> {
-        self.symbols.bounds(form)
+        self.values.symbols.bounds(form)
     }
 
-    pub fn enter(&mut self, wave: usize) {
+    pub fn operand(&mut self, x: ValueId, at: BlockId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
+        self.values.operand(x, at, lane, assume)
+    }
+
+    pub fn bit(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Option<bool>> {
+        self.values.bit(v, lane, assume)
+    }
+
+    pub fn high(&mut self, v: ValueId, lane: usize) -> Form {
+        self.values.high(v, lane)
+    }
+
+    pub fn wide_value(&mut self, v: ValueId, at: BlockId, lane: usize) -> Option<Wide> {
+        self.values.wide_at(v, at, lane, 0)
+    }
+
+    pub fn resource_span(&mut self, at: (BlockId, usize), reach: Reach, lane: usize) -> Option<(Value, u32, Option<Form>)> {
+        self.values.resource_span(at, reach, lane)
+    }
+
+    pub fn access_classes(&mut self, block: BlockId, predicate: Option<ValueId>, lane: usize) -> Classes {
+        self.values.access_classes(block, predicate, lane)
+    }
+
+    pub fn reaches_block(&mut self, b: BlockId) -> bool {
+        self.values.reached(b)
+    }
+
+    pub fn wide(&self, v: ValueId) -> bool {
+        self.values.symbols.program.f.types[v.0] == Ty::I64
+    }
+
+    pub fn regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Regions {
+        self.assumed_regions(v, lane, assume, refine).0
+    }
+
+    pub fn read_regions(&mut self, at: (BlockId, usize), lane: usize, exec: Option<ValueId>, refine: bool) -> Regions {
+        let mut set = Regions::one(None);
+        if let Inst::Target { args, .. } = &self.values.symbols.program.f.blocks[&at.0].insts[at.1] {
+            for &x in args.values() {
+                match self.values.symbols.program.provenance.known[x.0] {
+                    Some(r) => set.add(r),
+                    None => set.union(&self.regions(x, lane, exec, refine)),
+                }
+            }
+        }
+        set
+    }
+
+    fn assumed_regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Assumed<Regions> {
+        if let Some(r) = self.values.symbols.program.provenance.known[v.0] {
+            return unassumed(Regions::one(r));
+        }
+        let lane = self.values.symbols.canonical(v, lane);
+        let l = lane as u8;
+        let cache = if refine { &self.found.refined } else { &self.found.coarse };
+        let open = |e: &Assumed<Regions>| assume.is_some() && e.1.open;
+        let hit = match (cache.get(&(v, ALL, None)), cache.get(&(v, l, None))) {
+            (Some(e), _) if !open(e) => Some(e.clone()),
+            (_, Some(e)) if !open(e) => Some(e.clone()),
+            _ => assume.and_then(|_| cache.get(&(v, ALL, assume)).or_else(|| cache.get(&(v, l, assume))).cloned()),
+        };
+        if let Some(r) = hit {
+            return r;
+        }
+        let key = (v, l, assume, refine);
+        if !self.found.active.insert(key) {
+            return in_lane(Regions::any());
+        }
+        let mut reliance = Reliance::default();
+        let set = self.compute_regions(v, lane, assume, refine, &mut reliance);
+        self.found.active.remove(&key);
+        let r = (set, reliance);
+        let cache = if refine { &mut self.found.refined } else { &mut self.found.coarse };
+        let lanes = if reliance.lane { l } else { ALL };
+        if assume.is_some() {
+            cache.insert((v, lanes, assume), r.clone());
+        }
+        if !reliance.used {
+            cache.insert((v, lanes, None), r.clone());
+        }
+        r
+    }
+
+    fn compute_regions(
+        &mut self,
+        v: ValueId,
+        lane: usize,
+        assume: Option<ValueId>,
+        refine: bool,
+        reliance: &mut Reliance,
+    ) -> Regions {
+        macro_rules! regions {
+            ($x:expr) => {{
+                let (r, u) = self.assumed_regions($x, lane, assume, refine);
+                *reliance |= u;
+                r
+            }};
+        }
+        let none = || Regions::one(None);
+        if let Some(&root) = self.values.symbols.program.copies.get(&v) {
+            return regions!(root);
+        }
+        let (f, facts) = (self.values.symbols.program.f, self.values.symbols.program.facts);
+        match facts.site[v.0] {
+            Site::Param { block, index } if block == f.entry => match self.values.symbols.program.inputs[index].source {
+                ParameterSource::Vgpr(n) if n != 0 => Regions::default(),
+                ParameterSource::Sgpr(n) if Some(n) == self.values.symbols.program.entry.kernarg_ptr => Regions::one(Some(Region::Kernarg)),
+                ParameterSource::Sgpr(n) if Some(n) == self.values.symbols.program.entry.dispatch_ptr => Regions::one(Some(Region::Dispatch)),
+                _ => none(),
+            },
+            Site::Param { block, index } => {
+                let header = self.values.symbols.program.headers.contains(&block);
+                let own = self.values.symbols.program.rank[&block];
+                let mut set = Regions::default();
+                for &e in &facts.incoming[&block] {
+                    if header && self.values.symbols.program.rank[&e.0] >= own {
+                        continue;
+                    }
+                    let (r, u) = self.assumed_regions(self.values.symbols.program.edge_arg(e, index), lane, None, refine);
+                    reliance.lane |= u.lane;
+                    set.union(&r);
+                }
+                if self.values.symbols.program.provenance.plain[v.0] {
+                    set.add(None);
+                }
+                if self.values.symbols.program.provenance.carried.contains_key(&v) {
+                    self.carry(v, lane, refine, &mut set, reliance);
+                }
+                set
+            }
+            Site::Inst { block, index } => match &f.blocks[&block].insts[index] {
+                Inst::Core { op, .. } => match *op {
+                    Op::Int(IntOp::Add, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
+                        (Some(r), None) | (None, Some(r)) => Some(r),
+                        _ => None,
+                    }),
+                    Op::Int(IntOp::Sub, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
+                        (Some(r), None) => Some(r),
+                        _ => None,
+                    }),
+                    Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, to, a)
+                        if to.bits() >= 32 && f.types[a.0].bits() >= 32 =>
+                    {
+                        regions!(a)
+                    }
+                    Op::Pack64(lo, _) | Op::UnpackLo(lo) => regions!(lo),
+                    Op::UnpackHi(x) => match facts.op(f, x) {
+                        Some(Op::Pack64(_, hi)) => regions!(hi),
+                        _ => none(),
+                    },
+                    Op::Select(c, a, b) => {
+                        let root = self.values.symbols.program.copies.get(&c).copied().unwrap_or(c);
+                        if assume.is_some_and(|p| self.values.conditions.assumes(&self.values.symbols.program, p, root)) {
+                            reliance.used = true;
+                            return regions!(a);
+                        }
+                        let (x, y) = (regions!(a), regions!(b));
+                        if x.single().is_some() && x == y {
+                            return x;
+                        }
+                        if refine {
+                            let (bit, u) = self.values.bit(c, lane, assume);
+                            *reliance |= u;
+                            reliance.lane |= !facts.uniform[c.0];
+                            match bit {
+                                Some(true) => return x,
+                                Some(false) => return y,
+                                None => {}
+                            }
+                        }
+                        reliance.open = true;
+                        x.joined(&y)
+                    }
+                    Op::Int(IntOp::And, a, b) => {
+                        let mask = |x: ValueId| match facts.op(f, x) {
+                            Some(Op::Const(_, k)) => Some(k as u32),
+                            _ => None,
+                        };
+                        match (mask(a), mask(b)) {
+                            (None, Some(m)) if aligns(m) => regions!(a),
+                            (Some(m), None) if aligns(m) => regions!(b),
+                            (None, None) => {
+                                let mut set = regions!(a).combine(&regions!(b), |x, y| match (x, y) {
+                                    (Some(r), None) | (None, Some(r)) => Some(r),
+                                    _ => None,
+                                });
+                                set.add(None);
+                                set
+                            }
+                            _ => none(),
+                        }
+                    }
+                    Op::Int(IntOp::Or | IntOp::Xor, a, b) => {
+                        let (x, y) = (regions!(a), regions!(b));
+                        if x.any || y.any {
+                            return Regions::any();
+                        }
+                        let mut set = Regions::default();
+                        for &r in x.list.iter().chain(&y.list) {
+                            if r.is_some() {
+                                set.add(r);
+                            }
+                        }
+                        if x.list.contains(&None) && y.list.contains(&None) {
+                            set.add(None);
+                        }
+                        set
+                    }
+                    Op::Int(IntOp::LShr, a, _) if f.types[v.0] != Ty::I64 => {
+                        let mut set = regions!(a);
+                        set.add(None);
+                        set
+                    }
+                    Op::Env(Env::ScratchBase) => Regions::one(Some(Region::Private)),
+                    _ => none(),
+                },
+                Inst::Effect {
+                    op: EffectOp::Memory {
+                        op: MemoryOp::Load(_),
+                        space,
+                        ..
+                    },
+                    inputs,
+                    ..
+                } => {
+                    let address = regions!(inputs[0]);
+                    let kernarg = address.any || address.list.contains(&Some(Region::Kernarg));
+                    if *space == Space::Scratch || kernarg {
+                        let (value, u) = self.values.value(v, lane, assume);
+                        *reliance |= u;
+                        reliance.lane |= !facts.uniform[v.0];
+                        let mut set = Regions::one(value.region);
+                        if (self.values.symbols.program.provenance.carried.contains_key(&v) || self.values.symbols.program.provenance.loaded.contains_key(&v)) && self.values.symbols.unresolved(v, lane, &value) {
+                            match self.values.symbols.program.provenance.loaded.get(&v) {
+                                Some(loaded) => set.union(loaded),
+                                None => self.carry(v, lane, refine, &mut set, reliance),
+                            }
+                        }
+                        set
+                    } else {
+                        none()
+                    }
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::ReadFirstLane),
+                    inputs,
+                    ..
+                } => self.lanes_regions(inputs[0], false),
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::ReadLane),
+                    inputs,
+                    ..
+                } => {
+                    reliance.lane = true;
+                    match self.values.value(inputs[1], lane, None).0.form.as_constant() {
+                        Some(k) if !self.valid((k & 31) as usize) => none(),
+                        Some(k) => self.assumed_regions(inputs[0], (k & 31) as usize, None, refine).0,
+                        None => {
+                            let partial = !(0..LANES).all(|l| self.valid(l));
+                            self.lanes_regions(inputs[0], partial)
+                        }
+                    }
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::WriteLane),
+                    inputs,
+                    ..
+                } => {
+                    reliance.lane = true;
+                    match self.values.value(inputs[1], lane, None).0.form.as_constant() {
+                        Some(k) if (k & 31) as usize == lane => self.assumed_regions(inputs[0], lane, None, refine).0,
+                        Some(_) => self.assumed_regions(inputs[2], lane, None, refine).0,
+                        None => {
+                            let mut set = self.assumed_regions(inputs[0], lane, None, refine).0;
+                            set.union(&self.assumed_regions(inputs[2], lane, None, refine).0);
+                            set
+                        }
+                    }
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)),
+                    inputs,
+                    ..
+                } => {
+                    reliance.lane = true;
+                    let silent = *op == WaveOp::Bpermute || !(0..LANES).all(|l| self.valid(l));
+                    self.lanes_regions(inputs[1], silent)
+                }
+                _ => none(),
+            },
+            Site::Unreached => none(),
+        }
+    }
+
+    fn carry(&mut self, v: ValueId, lane: usize, refine: bool, set: &mut Regions, reliance: &mut Reliance) {
+        for tier in [false, true] {
+            if tier && !refine {
+                continue;
+            }
+            if let Some(grown) = self.widening.grown.get(&(v, ALL, tier)) {
+                set.union(grown);
+            }
+            if self.widening.split.contains(&(v, tier)) {
+                reliance.lane = true;
+                if let Some(grown) = self.widening.grown.get(&(v, lane as u8, tier)) {
+                    set.union(grown);
+                }
+            }
+        }
+        let bound = &self.values.symbols.program.provenance.carried[&v];
+        if !bound[if bound.len() == 1 { 0 } else { lane }].within(set) {
+            let key = (v, if reliance.lane { lane as u8 } else { ALL }, refine);
+            self.found.looped.entry(key).or_insert(lane);
+        }
+    }
+
+    fn stored_regions(&mut self, v: ValueId, lane: usize, refine: bool, held: &Regions) -> Assumed<Regions> {
+        let mut set = Regions::default();
+        let Site::Inst { block, index } = self.values.symbols.program.facts.site[v.0] else {
+            return (set, Reliance::default());
+        };
+        let Inst::Effect {
+            op: EffectOp::Memory {
+                op: MemoryOp::Load(size), ..
+            },
+            inputs,
+            ..
+        } = &self.values.symbols.program.f.blocks[&block].insts[index]
+        else {
+            return (set, Reliance::default());
+        };
+        let (address, mut reliance) = self.values.value(inputs[0], lane, Some(inputs[1]));
+        reliance.lane |= !self.values.symbols.program.facts.uniform[inputs[0].0];
+        let words = self
+            .bounds(&address.form)
+            .map(|(low, high)| ((low / 4) as u32, (high + size.bytes() as u64).div_ceil(4) as u32));
+        let sources = self.values.symbols.program.sources.get(&v).cloned().unwrap_or_default();
+        for i in sources {
+            if let (Some((a, b)), Some((c, d))) = (words, self.values.symbols.program.provenance.spills[i].words) {
+                if b <= c || d <= a {
+                    continue;
+                }
+            }
+            if self.values.symbols.program.provenance.spills[i].part(lane).within(held) {
+                continue;
+            }
+            let mask = self.values.symbols.program.provenance.spills[i].mask;
+            for k in 0..self.values.symbols.program.provenance.spills[i].data.len() {
+                let (r, u) = self.assumed_regions(self.values.symbols.program.provenance.spills[i].data[k], lane, Some(mask), refine);
+                reliance |= u;
+                set.union(&r);
+            }
+        }
+        (set, reliance)
+    }
+
+    fn feeding(&mut self, v: ValueId, lane: usize, refine: bool, held: &Regions) -> Assumed<Regions> {
+        match self.values.symbols.program.facts.site[v.0] {
+            Site::Param { .. } => self.back_regions(v, lane, refine),
+            _ => self.stored_regions(v, lane, refine, held),
+        }
+    }
+
+    fn back_regions(&mut self, v: ValueId, lane: usize, refine: bool) -> Assumed<Regions> {
+        let mut set = Regions::default();
+        let mut reliance = Reliance::default();
+        let Site::Param { block, index } = self.values.symbols.program.facts.site[v.0] else {
+            return (set, reliance);
+        };
+        let own = self.values.symbols.program.rank[&block];
+        let back: Vec<(BlockId, usize)> = self.values.symbols.program.facts.incoming[&block]
+            .iter()
+            .copied()
+            .filter(|&(pred, _)| self.values.symbols.program.rank[&pred] >= own)
+            .collect();
+        for e in back {
+            let (r, u) = self.assumed_regions(self.values.symbols.program.edge_arg(e, index), lane, None, refine);
+            reliance |= u;
+            set.union(&r);
+        }
+        (set, reliance)
+    }
+
+    pub fn settle_loops(&mut self) -> bool {
+        let mut grew = false;
+        loop {
+            let pending: Vec<((ValueId, u8, bool), usize)> = self
+                .found.looped
+                .iter()
+                .filter(|(key, _)| !self.found.checked.contains(key))
+                .map(|(&key, &lane)| (key, lane))
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for ((v, l, refine), first) in pending {
+                self.found.checked.insert((v, l, refine));
+                let held = self.regions(v, first, None, refine);
+                let bound = self.values.symbols.program.provenance.carried[&v].clone();
+                let all: Vec<usize> = (0..LANES).filter(|&k| self.valid(k)).collect();
+                let (lanes, mut known) = match (l == ALL, bound.len() > 1) {
+                    (true, true) => (all, None),
+                    (true, false) => {
+                        let (found, u) = self.feeding(v, first, false, &held);
+                        (if u.lane { all } else { vec![first] }, Some((found, u)))
+                    }
+                    _ => (vec![first], None),
+                };
+                for lane in lanes {
+                    let own = &bound[if bound.len() == 1 { 0 } else { lane }];
+                    if own.within(&held) {
+                        continue;
+                    }
+                    let (found, u) = if !own.any && own.list.iter().all(Option::is_none) {
+                        (own.clone(), in_lane(()).1)
+                    } else {
+                        let cached = if lane == first { known.take() } else { None };
+                        let coarse = match cached {
+                            Some(coarse) => coarse,
+                            None => self.feeding(v, lane, false, &held),
+                        };
+                        if coarse.0.within(&held) {
+                            continue;
+                        }
+                        if refine {
+                            self.feeding(v, lane, true, &held)
+                        } else {
+                            coarse
+                        }
+                    };
+                    if found.within(&held) {
+                        continue;
+                    }
+                    let key = if l == ALL && !u.lane {
+                        (v, ALL, refine)
+                    } else {
+                        self.widening.split.insert((v, refine));
+                        (v, lane as u8, refine)
+                    };
+                    let grown = self.widening.grown.entry(key).or_default();
+                    if !found.within(grown) {
+                        grown.union(&found);
+                        grew = true;
+                    }
+                }
+            }
+        }
+        if grew {
+            self.found.coarse.clear();
+            self.found.refined.clear();
+            self.found.looped.clear();
+            self.found.checked.clear();
+        }
+        grew
+    }
+
+    pub fn pending(&self) -> BTreeSet<(ValueId, u8, bool)> {
+        self.found.looped.keys().copied().collect()
+    }
+
+    pub fn forget(&mut self, kept: &BTreeSet<(ValueId, u8, bool)>) {
+        self.found.looped.retain(|key, _| kept.contains(key));
+        self.found.coarse.clear();
+        self.found.refined.clear();
+    }
+
+    pub fn exposable(&self) -> BTreeSet<u64> {
+        self.values.symbols.program.exposable()
+    }
+
+    pub fn expose(&mut self, open: &[u64], stake: &[u64]) -> Vec<u64> {
+        let mut found: Vec<u64> = Vec::new();
+        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.valid(l)).collect();
+        for e in self.values.symbols.program.provenance.exposing.clone() {
+            let mut fresh: Vec<u64> = e
+                .candidates
+                .iter()
+                .copied()
+                .filter(|id| stake.contains(id) && !open.contains(id) && !found.contains(id))
+                .collect();
+            for &lane in &lanes {
+                for &x in &e.operands {
+                    if fresh.is_empty() {
+                        break;
+                    }
+                    let meets = |set: &Regions, id: u64| set.any || set.list.contains(&Some(Region::Allocation(id)));
+                    let coarse = self.regions(x, lane, e.assume, false);
+                    if !fresh.iter().any(|&id| meets(&coarse, id)) {
+                        continue;
+                    }
+                    let refined = self.regions(x, lane, e.assume, true);
+                    fresh.retain(|&id| {
+                        let hit = meets(&refined, id);
+                        if hit {
+                            found.push(id);
+                        }
+                        !hit
+                    });
+                }
+            }
+        }
+        found
+    }
+
+    fn lanes_regions(&mut self, x: ValueId, silent: bool) -> Regions {
+        let mut set = Regions::default();
+        if silent {
+            set.add(None);
+        }
+        for l in 0..LANES {
+            if self.valid(l) {
+                set.union(&self.regions(x, l, None, false));
+            }
+        }
+        set
+    }
+}
+
+impl<'a> Values<'a> {
+    fn enter(&mut self, wave: usize) -> bool {
         if self.entered == Some(wave) {
-            return;
+            return false;
         }
         self.entered = Some(wave);
         self.symbols.enter(wave);
         self.memo.clear();
-        self.widening.looped.clear();
-        self.widening.checked.clear();
         let mut headers: Vec<BlockId> = self.symbols.program.headers.iter().copied().collect();
         headers.sort_by_key(|h| self.symbols.program.rank[h]);
         let trips: Vec<Unknown> = headers.iter().map(|&h| self.symbols.trips(h)).collect();
@@ -2228,6 +2761,7 @@ impl<'a> Addresses<'a> {
             }
             self.symbols.pending.remove(&u);
         }
+        true
     }
 
     fn decision(&mut self, b: BlockId) -> Option<bool> {
@@ -2300,10 +2834,6 @@ impl<'a> Addresses<'a> {
         self.decision(pred).is_none_or(|yes| (slot == 0) == yes)
     }
 
-    pub fn reaches_block(&mut self, b: BlockId) -> bool {
-        self.reached(b)
-    }
-
     fn can_take(&mut self, pred: BlockId, slot: usize, block: BlockId) -> bool {
         if self.symbols.program.rank[&pred] >= self.symbols.program.rank[&block] {
             return true;
@@ -2337,7 +2867,7 @@ impl<'a> Addresses<'a> {
         self.memo.bits.insert(key, (r, depth));
     }
 
-    pub fn operand(&mut self, x: ValueId, at: BlockId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
+    fn operand(&mut self, x: ValueId, at: BlockId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
         let (value, reliance) = self.value(x, lane, assume);
         (self.symbols.leave(value, at, lane), reliance)
     }
@@ -3074,7 +3604,7 @@ impl<'a> Addresses<'a> {
         })
     }
 
-    pub fn value(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
+    fn value(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
         if let Some(k) = assume.and_then(|a| self.conditions.assumed_constant(&self.symbols.program, a, v)) {
             return (
                 Value::constant(k),
@@ -3158,7 +3688,7 @@ impl<'a> Addresses<'a> {
         r
     }
 
-    pub fn bit(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Option<bool>> {
+    fn bit(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Option<bool>> {
         if let Some(a) = assume {
             let root = self.symbols.program.copies.get(&v).copied().unwrap_or(v);
             if self.conditions.assumes(&self.symbols.program, a, root) {
@@ -3212,497 +3742,6 @@ impl<'a> Addresses<'a> {
             self.cache_bit((v, l, None), r, depth);
         }
         r
-    }
-
-    pub fn regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Regions {
-        self.assumed_regions(v, lane, assume, refine).0
-    }
-
-    pub fn read_regions(&mut self, at: (BlockId, usize), lane: usize, exec: Option<ValueId>, refine: bool) -> Regions {
-        let mut set = Regions::one(None);
-        if let Inst::Target { args, .. } = &self.symbols.program.f.blocks[&at.0].insts[at.1] {
-            for &x in args.values() {
-                match self.symbols.program.provenance.known[x.0] {
-                    Some(r) => set.add(r),
-                    None => set.union(&self.regions(x, lane, exec, refine)),
-                }
-            }
-        }
-        set
-    }
-
-    fn assumed_regions(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Assumed<Regions> {
-        if let Some(r) = self.symbols.program.provenance.known[v.0] {
-            return unassumed(Regions::one(r));
-        }
-        let lane = self.symbols.canonical(v, lane);
-        let l = lane as u8;
-        let cache = if refine { &self.memo.refined } else { &self.memo.regions };
-        let open = |e: &(Assumed<Regions>, Depth)| assume.is_some() && e.0 .1.open;
-        let hit = match (cache.get(&(v, ALL, None)), cache.get(&(v, l, None))) {
-            (Some(e), _) if !open(e) => Some(e.clone()),
-            (_, Some(e)) if !open(e) => Some(e.clone()),
-            _ => assume.and_then(|_| cache.get(&(v, ALL, assume)).or_else(|| cache.get(&(v, l, assume))).cloned()),
-        };
-        if let Some((r, depth)) = hit {
-            self.symbols.trail.depend(depth);
-            return r;
-        }
-        let key = (v, l, assume, refine);
-        if !self.active.regions.insert(key) {
-            return in_lane(Regions::any());
-        }
-        let mut reliance = Reliance::default();
-        let (set, depth) = self.frame(|this| this.compute_regions(v, lane, assume, refine, &mut reliance));
-        self.active.regions.remove(&key);
-        let r = (set, reliance);
-        let cache = |this: &mut Self, key: ValueKey| {
-            this.journal.note(Entry::Region(key, refine), depth);
-            let cache = if refine { &mut this.memo.refined } else { &mut this.memo.regions };
-            cache.insert(key, (r.clone(), depth));
-        };
-        let lanes = if reliance.lane { l } else { ALL };
-        if assume.is_some() {
-            cache(self, (v, lanes, assume));
-        }
-        if !reliance.used {
-            cache(self, (v, lanes, None));
-        }
-        r
-    }
-
-    fn compute_regions(
-        &mut self,
-        v: ValueId,
-        lane: usize,
-        assume: Option<ValueId>,
-        refine: bool,
-        reliance: &mut Reliance,
-    ) -> Regions {
-        macro_rules! regions {
-            ($x:expr) => {{
-                let (r, u) = self.assumed_regions($x, lane, assume, refine);
-                *reliance |= u;
-                r
-            }};
-        }
-        let none = || Regions::one(None);
-        if let Some(&root) = self.symbols.program.copies.get(&v) {
-            return regions!(root);
-        }
-        let (f, facts) = (self.symbols.program.f, self.symbols.program.facts);
-        match facts.site[v.0] {
-            Site::Param { block, index } if block == f.entry => match self.symbols.program.inputs[index].source {
-                ParameterSource::Vgpr(n) if n != 0 => Regions::default(),
-                ParameterSource::Sgpr(n) if Some(n) == self.symbols.program.entry.kernarg_ptr => Regions::one(Some(Region::Kernarg)),
-                ParameterSource::Sgpr(n) if Some(n) == self.symbols.program.entry.dispatch_ptr => Regions::one(Some(Region::Dispatch)),
-                _ => none(),
-            },
-            Site::Param { block, index } => {
-                let header = self.symbols.program.headers.contains(&block);
-                let own = self.symbols.program.rank[&block];
-                let mut set = Regions::default();
-                for &e in &facts.incoming[&block] {
-                    if header && self.symbols.program.rank[&e.0] >= own {
-                        continue;
-                    }
-                    let (r, u) = self.assumed_regions(self.symbols.program.edge_arg(e, index), lane, None, refine);
-                    reliance.lane |= u.lane;
-                    set.union(&r);
-                }
-                if self.symbols.program.provenance.plain[v.0] {
-                    set.add(None);
-                }
-                if self.symbols.program.provenance.carried.contains_key(&v) {
-                    self.carry(v, lane, refine, &mut set, reliance);
-                }
-                set
-            }
-            Site::Inst { block, index } => match &f.blocks[&block].insts[index] {
-                Inst::Core { op, .. } => match *op {
-                    Op::Int(IntOp::Add, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
-                        (Some(r), None) | (None, Some(r)) => Some(r),
-                        _ => None,
-                    }),
-                    Op::Int(IntOp::Sub, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
-                        (Some(r), None) => Some(r),
-                        _ => None,
-                    }),
-                    Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, to, a)
-                        if to.bits() >= 32 && f.types[a.0].bits() >= 32 =>
-                    {
-                        regions!(a)
-                    }
-                    Op::Pack64(lo, _) | Op::UnpackLo(lo) => regions!(lo),
-                    Op::UnpackHi(x) => match facts.op(f, x) {
-                        Some(Op::Pack64(_, hi)) => regions!(hi),
-                        _ => none(),
-                    },
-                    Op::Select(c, a, b) => {
-                        let root = self.symbols.program.copies.get(&c).copied().unwrap_or(c);
-                        if assume.is_some_and(|p| self.conditions.assumes(&self.symbols.program, p, root)) {
-                            reliance.used = true;
-                            return regions!(a);
-                        }
-                        let (x, y) = (regions!(a), regions!(b));
-                        if x.single().is_some() && x == y {
-                            return x;
-                        }
-                        if refine {
-                            let (bit, u) = self.bit(c, lane, assume);
-                            *reliance |= u;
-                            reliance.lane |= !facts.uniform[c.0];
-                            match bit {
-                                Some(true) => return x,
-                                Some(false) => return y,
-                                None => {}
-                            }
-                        }
-                        reliance.open = true;
-                        x.joined(&y)
-                    }
-                    Op::Int(IntOp::And, a, b) => {
-                        let mask = |x: ValueId| match facts.op(f, x) {
-                            Some(Op::Const(_, k)) => Some(k as u32),
-                            _ => None,
-                        };
-                        match (mask(a), mask(b)) {
-                            (None, Some(m)) if aligns(m) => regions!(a),
-                            (Some(m), None) if aligns(m) => regions!(b),
-                            (None, None) => {
-                                let mut set = regions!(a).combine(&regions!(b), |x, y| match (x, y) {
-                                    (Some(r), None) | (None, Some(r)) => Some(r),
-                                    _ => None,
-                                });
-                                set.add(None);
-                                set
-                            }
-                            _ => none(),
-                        }
-                    }
-                    Op::Int(IntOp::Or | IntOp::Xor, a, b) => {
-                        let (x, y) = (regions!(a), regions!(b));
-                        if x.any || y.any {
-                            return Regions::any();
-                        }
-                        let mut set = Regions::default();
-                        for &r in x.list.iter().chain(&y.list) {
-                            if r.is_some() {
-                                set.add(r);
-                            }
-                        }
-                        if x.list.contains(&None) && y.list.contains(&None) {
-                            set.add(None);
-                        }
-                        set
-                    }
-                    Op::Int(IntOp::LShr, a, _) if f.types[v.0] != Ty::I64 => {
-                        let mut set = regions!(a);
-                        set.add(None);
-                        set
-                    }
-                    Op::Env(Env::ScratchBase) => Regions::one(Some(Region::Private)),
-                    _ => none(),
-                },
-                Inst::Effect {
-                    op: EffectOp::Memory {
-                        op: MemoryOp::Load(_),
-                        space,
-                        ..
-                    },
-                    inputs,
-                    ..
-                } => {
-                    let address = regions!(inputs[0]);
-                    let kernarg = address.any || address.list.contains(&Some(Region::Kernarg));
-                    if *space == Space::Scratch || kernarg {
-                        let (value, u) = self.value(v, lane, assume);
-                        *reliance |= u;
-                        reliance.lane |= !facts.uniform[v.0];
-                        let mut set = Regions::one(value.region);
-                        if (self.symbols.program.provenance.carried.contains_key(&v) || self.symbols.program.provenance.loaded.contains_key(&v)) && self.symbols.unresolved(v, lane, &value) {
-                            match self.symbols.program.provenance.loaded.get(&v) {
-                                Some(loaded) => set.union(loaded),
-                                None => self.carry(v, lane, refine, &mut set, reliance),
-                            }
-                        }
-                        set
-                    } else {
-                        none()
-                    }
-                }
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::ReadFirstLane),
-                    inputs,
-                    ..
-                } => self.lanes_regions(inputs[0], false),
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::ReadLane),
-                    inputs,
-                    ..
-                } => {
-                    reliance.lane = true;
-                    match self.value(inputs[1], lane, None).0.form.as_constant() {
-                        Some(k) if !self.symbols.valid((k & 31) as usize) => none(),
-                        Some(k) => self.assumed_regions(inputs[0], (k & 31) as usize, None, refine).0,
-                        None => {
-                            let partial = !(0..LANES).all(|l| self.symbols.valid(l));
-                            self.lanes_regions(inputs[0], partial)
-                        }
-                    }
-                }
-                Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::WriteLane),
-                    inputs,
-                    ..
-                } => {
-                    reliance.lane = true;
-                    match self.value(inputs[1], lane, None).0.form.as_constant() {
-                        Some(k) if (k & 31) as usize == lane => self.assumed_regions(inputs[0], lane, None, refine).0,
-                        Some(_) => self.assumed_regions(inputs[2], lane, None, refine).0,
-                        None => {
-                            let mut set = self.assumed_regions(inputs[0], lane, None, refine).0;
-                            set.union(&self.assumed_regions(inputs[2], lane, None, refine).0);
-                            set
-                        }
-                    }
-                }
-                Inst::Effect {
-                    op: EffectOp::Wave(op @ (WaveOp::Bpermute | WaveOp::BpermuteFi)),
-                    inputs,
-                    ..
-                } => {
-                    reliance.lane = true;
-                    let silent = *op == WaveOp::Bpermute || !(0..LANES).all(|l| self.symbols.valid(l));
-                    self.lanes_regions(inputs[1], silent)
-                }
-                _ => none(),
-            },
-            Site::Unreached => none(),
-        }
-    }
-
-    fn carry(&mut self, v: ValueId, lane: usize, refine: bool, set: &mut Regions, reliance: &mut Reliance) {
-        for tier in [false, true] {
-            if tier && !refine {
-                continue;
-            }
-            if let Some(grown) = self.widening.grown.get(&(v, ALL, tier)) {
-                set.union(grown);
-            }
-            if self.widening.split.contains(&(v, tier)) {
-                reliance.lane = true;
-                if let Some(grown) = self.widening.grown.get(&(v, lane as u8, tier)) {
-                    set.union(grown);
-                }
-            }
-        }
-        let bound = &self.symbols.program.provenance.carried[&v];
-        if !bound[if bound.len() == 1 { 0 } else { lane }].within(set) {
-            let key = (v, if reliance.lane { lane as u8 } else { ALL }, refine);
-            self.widening.looped.entry(key).or_insert(lane);
-        }
-    }
-
-    fn stored_regions(&mut self, v: ValueId, lane: usize, refine: bool, held: &Regions) -> Assumed<Regions> {
-        let mut set = Regions::default();
-        let Site::Inst { block, index } = self.symbols.program.facts.site[v.0] else {
-            return (set, Reliance::default());
-        };
-        let Inst::Effect {
-            op: EffectOp::Memory {
-                op: MemoryOp::Load(size), ..
-            },
-            inputs,
-            ..
-        } = &self.symbols.program.f.blocks[&block].insts[index]
-        else {
-            return (set, Reliance::default());
-        };
-        let (address, mut reliance) = self.value(inputs[0], lane, Some(inputs[1]));
-        reliance.lane |= !self.symbols.program.facts.uniform[inputs[0].0];
-        let words = self
-            .bounds(&address.form)
-            .map(|(low, high)| ((low / 4) as u32, (high + size.bytes() as u64).div_ceil(4) as u32));
-        let sources = self.symbols.program.sources.get(&v).cloned().unwrap_or_default();
-        for i in sources {
-            if let (Some((a, b)), Some((c, d))) = (words, self.symbols.program.provenance.spills[i].words) {
-                if b <= c || d <= a {
-                    continue;
-                }
-            }
-            if self.symbols.program.provenance.spills[i].part(lane).within(held) {
-                continue;
-            }
-            let mask = self.symbols.program.provenance.spills[i].mask;
-            for k in 0..self.symbols.program.provenance.spills[i].data.len() {
-                let (r, u) = self.assumed_regions(self.symbols.program.provenance.spills[i].data[k], lane, Some(mask), refine);
-                reliance |= u;
-                set.union(&r);
-            }
-        }
-        (set, reliance)
-    }
-
-    fn feeding(&mut self, v: ValueId, lane: usize, refine: bool, held: &Regions) -> Assumed<Regions> {
-        match self.symbols.program.facts.site[v.0] {
-            Site::Param { .. } => self.back_regions(v, lane, refine),
-            _ => self.stored_regions(v, lane, refine, held),
-        }
-    }
-
-    fn back_regions(&mut self, v: ValueId, lane: usize, refine: bool) -> Assumed<Regions> {
-        let mut set = Regions::default();
-        let mut reliance = Reliance::default();
-        let Site::Param { block, index } = self.symbols.program.facts.site[v.0] else {
-            return (set, reliance);
-        };
-        let own = self.symbols.program.rank[&block];
-        let back: Vec<(BlockId, usize)> = self.symbols.program.facts.incoming[&block]
-            .iter()
-            .copied()
-            .filter(|&(pred, _)| self.symbols.program.rank[&pred] >= own)
-            .collect();
-        for e in back {
-            let (r, u) = self.assumed_regions(self.symbols.program.edge_arg(e, index), lane, None, refine);
-            reliance |= u;
-            set.union(&r);
-        }
-        (set, reliance)
-    }
-
-    pub fn settle_loops(&mut self) -> bool {
-        let mut grew = false;
-        loop {
-            let pending: Vec<((ValueId, u8, bool), usize)> = self
-                .widening.looped
-                .iter()
-                .filter(|(key, _)| !self.widening.checked.contains(key))
-                .map(|(&key, &lane)| (key, lane))
-                .collect();
-            if pending.is_empty() {
-                break;
-            }
-            for ((v, l, refine), first) in pending {
-                self.widening.checked.insert((v, l, refine));
-                let held = self.regions(v, first, None, refine);
-                let bound = self.symbols.program.provenance.carried[&v].clone();
-                let all: Vec<usize> = (0..LANES).filter(|&k| self.symbols.valid(k)).collect();
-                let (lanes, mut known) = match (l == ALL, bound.len() > 1) {
-                    (true, true) => (all, None),
-                    (true, false) => {
-                        let (found, u) = self.feeding(v, first, false, &held);
-                        (if u.lane { all } else { vec![first] }, Some((found, u)))
-                    }
-                    _ => (vec![first], None),
-                };
-                for lane in lanes {
-                    let own = &bound[if bound.len() == 1 { 0 } else { lane }];
-                    if own.within(&held) {
-                        continue;
-                    }
-                    let (found, u) = if !own.any && own.list.iter().all(Option::is_none) {
-                        (own.clone(), in_lane(()).1)
-                    } else {
-                        let cached = if lane == first { known.take() } else { None };
-                        let coarse = match cached {
-                            Some(coarse) => coarse,
-                            None => self.feeding(v, lane, false, &held),
-                        };
-                        if coarse.0.within(&held) {
-                            continue;
-                        }
-                        if refine {
-                            self.feeding(v, lane, true, &held)
-                        } else {
-                            coarse
-                        }
-                    };
-                    if found.within(&held) {
-                        continue;
-                    }
-                    let key = if l == ALL && !u.lane {
-                        (v, ALL, refine)
-                    } else {
-                        self.widening.split.insert((v, refine));
-                        (v, lane as u8, refine)
-                    };
-                    let grown = self.widening.grown.entry(key).or_default();
-                    if !found.within(grown) {
-                        grown.union(&found);
-                        grew = true;
-                    }
-                }
-            }
-        }
-        if grew {
-            self.memo.regions.clear();
-            self.memo.refined.clear();
-            self.widening.looped.clear();
-            self.widening.checked.clear();
-        }
-        grew
-    }
-
-    pub fn pending(&self) -> BTreeSet<(ValueId, u8, bool)> {
-        self.widening.looped.keys().copied().collect()
-    }
-
-    pub fn forget(&mut self, kept: &BTreeSet<(ValueId, u8, bool)>) {
-        self.widening.looped.retain(|key, _| kept.contains(key));
-        self.memo.regions.clear();
-        self.memo.refined.clear();
-    }
-
-    pub fn exposable(&self) -> BTreeSet<u64> {
-        self.symbols.program.exposable()
-    }
-
-    pub fn expose(&mut self, open: &[u64], stake: &[u64]) -> Vec<u64> {
-        let mut found: Vec<u64> = Vec::new();
-        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.symbols.valid(l)).collect();
-        for e in self.symbols.program.provenance.exposing.clone() {
-            let mut fresh: Vec<u64> = e
-                .candidates
-                .iter()
-                .copied()
-                .filter(|id| stake.contains(id) && !open.contains(id) && !found.contains(id))
-                .collect();
-            for &lane in &lanes {
-                for &x in &e.operands {
-                    if fresh.is_empty() {
-                        break;
-                    }
-                    let meets = |set: &Regions, id: u64| set.any || set.list.contains(&Some(Region::Allocation(id)));
-                    let coarse = self.regions(x, lane, e.assume, false);
-                    if !fresh.iter().any(|&id| meets(&coarse, id)) {
-                        continue;
-                    }
-                    let refined = self.regions(x, lane, e.assume, true);
-                    fresh.retain(|&id| {
-                        let hit = meets(&refined, id);
-                        if hit {
-                            found.push(id);
-                        }
-                        !hit
-                    });
-                }
-            }
-        }
-        found
-    }
-
-    fn lanes_regions(&mut self, x: ValueId, silent: bool) -> Regions {
-        let mut set = Regions::default();
-        if silent {
-            set.add(None);
-        }
-        for l in 0..LANES {
-            if self.symbols.valid(l) {
-                set.union(&self.regions(x, l, None, false));
-            }
-        }
-        set
     }
 
     fn compute(&mut self, v: ValueId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
@@ -3882,17 +3921,13 @@ impl<'a> Addresses<'a> {
         }
     }
 
-    pub fn access_classes(&mut self, block: BlockId, predicate: Option<ValueId>, lane: usize) -> Classes {
+    fn access_classes(&mut self, block: BlockId, predicate: Option<ValueId>, lane: usize) -> Classes {
         let mut limits = (*self.limits(block)).clone();
         if let Some(p) = predicate {
             let own = self.condition_limits(p, true, Some((block, lane)));
             limits = both_limits(limits, own);
         }
         limits.classes
-    }
-
-    pub fn wide_value(&mut self, v: ValueId, at: BlockId, lane: usize) -> Option<Wide> {
-        self.wide_at(v, at, lane, 0)
     }
 
     fn wide_at(&mut self, v: ValueId, at: BlockId, lane: usize, depth: usize) -> Option<Wide> {
@@ -4370,7 +4405,7 @@ impl<'a> Addresses<'a> {
         self.symbols.leave(Value::of(high), at, lane).form
     }
 
-    pub fn resource_span(&mut self, at: (BlockId, usize), reach: Reach, lane: usize) -> Option<(Value, u32, Option<Form>)> {
+    fn resource_span(&mut self, at: (BlockId, usize), reach: Reach, lane: usize) -> Option<(Value, u32, Option<Form>)> {
         let Inst::Target { args, outputs, .. } = &self.symbols.program.f.blocks[&at.0].insts[at.1] else {
             return None;
         };
@@ -4512,11 +4547,7 @@ impl<'a> Addresses<'a> {
         (aligning && shared).then(|| self.mask(v, form, m, lane).form)
     }
 
-    pub fn wide(&self, v: ValueId) -> bool {
-        self.symbols.program.f.types[v.0] == Ty::I64
-    }
-
-    pub fn high(&mut self, v: ValueId, lane: usize) -> Form {
+    fn high(&mut self, v: ValueId, lane: usize) -> Form {
         let v = self.symbols.program.copies.get(&v).copied().unwrap_or(v);
         let lane = self.symbols.canonical(v, lane);
         let key = (v, lane as u8);
@@ -5641,7 +5672,7 @@ fn copies(f: &Func, facts: &Facts) -> Copies {
     Copies(root)
 }
 
-impl Addresses<'_> {
+impl Values<'_> {
     fn aperture(&mut self, a: ValueId, b: ValueId, lane: usize) -> Option<bool> {
         let (f, facts) = (self.symbols.program.f, self.symbols.program.facts);
         let (Some(Op::Cmp(IntPred::Uge, base, low)), Some(Op::Cmp(IntPred::Ult, again, high))) = (facts.op(f, a), facts.op(f, b))
@@ -5667,7 +5698,7 @@ impl Addresses<'_> {
     }
 }
 
-impl Addresses<'_> {
+impl Values<'_> {
     fn stepped(&mut self, v: ValueId, block: BlockId, index: usize, lane: usize) -> Option<(Value, bool)> {
         let exec_index = self.symbols.program.exec_index?;
         let own = self.symbols.program.rank[&block];
@@ -6826,7 +6857,7 @@ mod facts_tests {
             addresses(&b, &env, |a| {
                 for lane in 0..32 {
                     match &truth {
-                        Truth::Word(t) => match a.value(v, lane, None).0.form.as_constant() {
+                        Truth::Word(t) => match a.values.value(v, lane, None).0.form.as_constant() {
                             Some(k) if k != t[lane] => wrong.push(format!("{} lane {}: {:#x}, not {:#x}", name, lane, k, t[lane])),
                             Some(_) => {}
                             None => undecided.push(format!("{} lane {}", name, lane)),
@@ -7124,11 +7155,11 @@ mod facts_tests {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let mut loose = Vec::new();
         addresses(&b, &env, |a| {
-            let f = a.value(halved, 0, None).0.form;
+            let f = a.values.value(halved, 0, None).0.form;
             if a.bounds(&f) != Some((0, 32767)) {
                 loose.push(format!("u ashr 1: {:?} over {:?}, not within [0, 32767]", f, a.bounds(&f)));
             }
-            let f = a.value(masked, 0, None).0.form;
+            let f = a.values.value(masked, 0, None).0.form;
             for (value, holds) in [(0u32, true), (0x10, true), (0x0ff0, true), (0x0ff1, false), (0x18, false)] {
                 if exactly_representable(a.unknowns(), &f, value) != Some(holds) {
                     loose.push(format!("u & 0xff0: {:?} at {:#x}: not {}", f, value, holds));
@@ -7182,7 +7213,7 @@ mod facts_tests {
         addresses(&b, &env, |a| {
             for (v, truths) in &values {
                 for l in 0..32 {
-                    let f = a.value(*v, l, None).0.form;
+                    let f = a.values.value(*v, l, None).0.form;
                     for truth in truths {
                         if !representable(a.unknowns(), &f, truth(l as u32)) {
                             wrong.push(format!("{:?} lane {}: {:?} cannot be {}", v, l, f, truth(l as u32)));
@@ -7200,13 +7231,13 @@ mod facts_tests {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let mut loose = Vec::new();
         addresses(&b, &env, |a| {
-            let f = a.value(values[1].0, 3, None).0.form;
+            let f = a.values.value(values[1].0, 3, None).0.form;
             for (value, holds) in [(5u32, true), (7, false), (9, true), (11, false), (13, true), (17, false)] {
                 if exactly_representable(a.unknowns(), &f, value) != Some(holds) {
                     loose.push(format!("{:?} at {}: not {}", f, value, holds));
                 }
             }
-            let f = a.value(values[3].0, 3, None).0.form;
+            let f = a.values.value(values[3].0, 3, None).0.form;
             for (value, holds) in [(5u32, true), (0xffff_fff0, true), (100, true), (0, false), (52, false), (0xffff_fff1, false), (6, false)] {
                 if exactly_representable(a.unknowns(), &f, value) != Some(holds) {
                     loose.push(format!("{:?} at {:#x}: not {}", f, value, holds));
@@ -7257,7 +7288,7 @@ mod facts_tests {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let mut wrong = Vec::new();
         addresses(&b, &env, |a| {
-            let forms: Vec<Form> = words.iter().map(|&(_, v, _)| a.value(v, 0, None).0.form).collect();
+            let forms: Vec<Form> = words.iter().map(|&(_, v, _)| a.values.value(v, 0, None).0.form).collect();
             let mut r = Random::new(71);
             let mut values = vec![0u32, 1, 2, 6, 7, 8, 0x7fff_ffff, 0x8000_0000, u32::MAX - 2, u32::MAX];
             values.extend((0..40).map(|_| r.next() as u32));
@@ -7279,13 +7310,13 @@ mod facts_tests {
         let mut loose = Vec::new();
         addresses(&b, &env, |a| {
             let &(_, odd, _) = words.iter().find(|w| w.0 == "(z + 3) | 1").unwrap();
-            let f = a.value(odd, 0, None).0.form;
+            let f = a.values.value(odd, 0, None).0.form;
             if f.terms.is_empty() || f.terms.iter().any(|&(_, c)| c % 2 != 0) || f.constant % 2 != 1 {
                 loose.push(format!("(z + 3) | 1: {:?} can be even", f));
             }
             for (name, scale, constant) in [("z | 1", 2u32, 1u32), ("7 | z", 8, 7), ("z & ~7", 8, 0)] {
                 let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
-                let f = a.value(v, 0, None).0.form;
+                let f = a.values.value(v, 0, None).0.form;
                 let shaped = f.constant == constant && f.terms.len() == 1 && f.terms[0].1 == scale;
                 if !shaped {
                     loose.push(format!("{}: {:?}, not {} times one unknown plus {}", name, f, scale, constant));
@@ -7293,7 +7324,7 @@ mod facts_tests {
             }
             for (name, scale, low) in [("z | 2", 4u32, (2u32, 3u32)), ("z | 5", 8, (5, 7)), ("z ^ 3", 4, (0, 3))] {
                 let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
-                let f = a.value(v, 0, None).0.form;
+                let f = a.values.value(v, 0, None).0.form;
                 let ranges: Vec<Option<(u32, u32)>> = f.terms.iter().map(|&(u, _)| a.unknowns()[u as usize].range).collect();
                 let shaped = f.constant == 0
                     && f.terms.len() == 2
@@ -7313,7 +7344,7 @@ mod facts_tests {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let mut wrong = Vec::new();
         addresses(&b, &env, |a| {
-            let forms: Vec<Vec<Form>> = words.iter().map(|&(_, v, _)| (0..32).map(|l| a.value(v, l, None).0.form).collect()).collect();
+            let forms: Vec<Vec<Form>> = words.iter().map(|&(_, v, _)| (0..32).map(|l| a.values.value(v, l, None).0.form).collect()).collect();
             let decided: Vec<Vec<Option<bool>>> = bits.iter().map(|&(_, v, _)| (0..32).map(|l| a.bit(v, l, None).0).collect()).collect();
             for (u, w) in samples() {
                 for (i, (name, _, truth)) in words.iter().enumerate() {
@@ -7363,7 +7394,7 @@ mod facts_tests {
         addresses(&b, &env, |a| {
             let form = |a: &mut Addresses, name: &str| {
                 let &(_, v, _) = words.iter().find(|w| w.0 == name).unwrap();
-                a.value(v, 3, None).0.form
+                a.values.value(v, 3, None).0.form
             };
             let base = form(a, "u + 4 lane");
             let bounds = |a: &Addresses, f: &Form| a.bounds(f);
@@ -7492,7 +7523,7 @@ mod facts_tests {
                             }
                         }
                     }
-                    let value = a.value(*v, l, None).0;
+                    let value = a.values.value(*v, l, None).0;
                     if let Some(r) = value.region {
                         if !truths.contains(&Some(r)) {
                             wrong.push(format!("{} lane {}: value says {:?}, truth {:?}", name, l, r, truths));
@@ -7678,7 +7709,7 @@ mod facts_tests {
         let mut wrong = Vec::new();
         for (name, c) in loops() {
             addresses(&c.b, &env, |a| {
-                let form = a.value(c.index, 0, None).0.form;
+                let form = a.values.value(c.index, 0, None).0.form;
                 for &t in &c.truth {
                     if !representable(a.unknowns(), &form, t) {
                         wrong.push(format!("{}: {:?} cannot be {}", name, form, t));
@@ -7695,7 +7726,7 @@ mod facts_tests {
         let mut loose = Vec::new();
         for (name, c) in loops() {
             addresses(&c.b, &env, |a| {
-                let form = a.value(c.index, 0, None).0.form;
+                let form = a.values.value(c.index, 0, None).0.form;
                 let extra: Vec<u32> = vec![c.truth[0].wrapping_sub(1), c.truth.last().unwrap().wrapping_add(1), 0x7fff_ffff]
                     .into_iter()
                     .filter(|x| !c.truth.contains(x))
@@ -7731,7 +7762,7 @@ mod facts_tests {
     fn a_parameter_the_loop_passes_back_unchanged_keeps_its_entering_value() {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let (b, p, _) = carried_param(false);
-        let form = addresses(&b, &env, |a| a.value(p, 0, None).0.form);
+        let form = addresses(&b, &env, |a| a.values.value(p, 0, None).0.form);
         assert_eq!(form, Form::constant(0x1000));
     }
 
@@ -7740,7 +7771,7 @@ mod facts_tests {
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
         let (b, p, truth) = carried_param(true);
         let missed: Vec<u32> = addresses(&b, &env, |a| {
-            let form = a.value(p, 0, None).0.form;
+            let form = a.values.value(p, 0, None).0.form;
             truth.iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the parameter is the first pointer in even iterations and the second in odd ones: {:?}", missed);
@@ -7858,7 +7889,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter_map(|c| {
-                    let value = a.value(c.1, 0, None).0;
+                    let value = a.values.value(c.1, 0, None).0;
                     (value.region.is_none() && value.form.as_constant().is_some())
                         .then(|| format!("{} = {:#x}", c.0, value.form.constant))
                 })
@@ -7890,7 +7921,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter_map(|c| {
-                    let value = a.value(c.1, 0, None).0;
+                    let value = a.values.value(c.1, 0, None).0;
                     (value.form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, value.form))
                 })
                 .collect()
@@ -7915,14 +7946,14 @@ mod facts_tests {
     #[test]
     fn lane_reads_of_lanes_the_wave_lacks_fix_no_value_but_zero() {
         let (b, read) = lane_read(|b, _, e, _| b.constant(e, Ty::I32, 20));
-        let form = addresses(&b, &environment(16, &[]), |a| a.value(read, 3, None).0.form);
+        let form = addresses(&b, &environment(16, &[]), |a| a.values.value(read, 3, None).0.form);
         assert!(form.as_constant().is_none_or(|k| k == 0), "lane 20 is not in a wave of 16 lanes, so the read gives 0, not {:?}", form);
     }
 
     #[test]
     fn lane_reads_of_lanes_the_wave_lacks_give_zero() {
         let (b, read) = lane_read(|b, _, e, _| b.constant(e, Ty::I32, 20));
-        let form = addresses(&b, &environment(16, &[]), |a| a.value(read, 3, None).0.form);
+        let form = addresses(&b, &environment(16, &[]), |a| a.values.value(read, 3, None).0.form);
         assert_eq!(form, Form::constant(0));
     }
 
@@ -7936,7 +7967,7 @@ mod facts_tests {
         let selector = b.load(e, Space::Global, MemSize::B32, table, yes);
         let register = b.constant(e, Ty::I32, 0);
         let read = b.wave(e, WaveOp::ReadLane, vec![seven, selector, register]);
-        let form = addresses(&b, &environment(16, &[(0, 1, 0x1000)]), |a| a.value(read, 3, None).0.form);
+        let form = addresses(&b, &environment(16, &[(0, 1, 0x1000)]), |a| a.values.value(read, 3, None).0.form);
         assert!(form.as_constant().is_none_or(|k| k == 0), "the selector may name a lane the wave of 16 lacks: {:?}", form);
     }
 
@@ -7948,14 +7979,14 @@ mod facts_tests {
             b.load(e, Space::Global, MemSize::B32, table, yes)
         });
         let env = environment(32, &[(0, 1, 0x1000)]);
-        let (third, fifth) = addresses(&b, &env, |a| (a.value(read, 3, None).0.form, a.value(read, 5, None).0.form));
+        let (third, fifth) = addresses(&b, &env, |a| (a.values.value(read, 3, None).0.form, a.values.value(read, 5, None).0.form));
         assert_eq!(third, fifth, "every lane reads the lane the one selector names");
     }
 
     #[test]
     fn lane_reads_with_a_varying_selector_read_each_lane_own_source() {
         let (b, read) = lane_read(|_, _, _, lane| lane);
-        let form = addresses(&b, &environment(32, &[]), |a| a.value(read, 3, None).0.form);
+        let form = addresses(&b, &environment(32, &[]), |a| a.values.value(read, 3, None).0.form);
         assert!(form.as_constant().is_none_or(|k| k == 20), "lane 3 reads its own 3 * 4 + 8, not {:?}", form);
     }
 
@@ -7969,7 +8000,7 @@ mod facts_tests {
             b.load(e, Space::Global, MemSize::U8, address, yes)
         });
         let env = environment(32, &[(0, 1, 0x1000)]);
-        let (third, fifth) = addresses(&b, &env, |a| (a.value(read, 3, None).0.form, a.value(read, 5, None).0.form));
+        let (third, fifth) = addresses(&b, &env, |a| (a.values.value(read, 3, None).0.form, a.values.value(read, 5, None).0.form));
         assert!(third != fifth || third.as_constant().is_some(), "lanes 3 and 5 may read different lanes: {:?}", third);
     }
 
@@ -8072,7 +8103,7 @@ mod facts_tests {
         let missed: Vec<String> = addresses(&b, &environment(32, &[(8, 1, 0x1000)]), |a| {
             let mut missed = Vec::new();
             for (name, v, truths) in &cases {
-                let (low, high) = (a.value(*v, 0, None).0.form, a.high(*v, 0));
+                let (low, high) = (a.values.value(*v, 0, None).0.form, a.high(*v, 0));
                 for &t in truths {
                     if !representable(a.unknowns(), &low, t as u32) || !representable(a.unknowns(), &high, (t >> 32) as u32) {
                         missed.push(format!("{}: {:#x} with {:?} and {:?}", name, t, low, high));
@@ -8093,7 +8124,7 @@ mod facts_tests {
                 .iter()
                 .filter(|(_, _, truths)| truths.len() == 1)
                 .filter_map(|(name, v, truths)| {
-                    let (low, high) = (a.value(*v, 0, None).0.form, a.high(*v, 0));
+                    let (low, high) = (a.values.value(*v, 0, None).0.form, a.high(*v, 0));
                     let t = truths[0];
                     (low.as_constant() != Some(t as u32) || high.as_constant() != Some((t >> 32) as u32))
                         .then(|| format!("{}: {:?} and {:?}", name, low, high))
@@ -8124,7 +8155,7 @@ mod facts_tests {
 
     fn carried_values(b: &Build, v: ValueId) -> Option<Vec<u32>> {
         addresses(b, &environment(32, &[]), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             match form.terms.as_slice() {
                 [(u, 1)] if form.constant == 0 => a.unknowns()[*u as usize].values.as_ref().map(|s| s.to_vec()),
                 _ => None,
@@ -8137,7 +8168,7 @@ mod facts_tests {
         let (b, v) = affine_loop(5);
         let truth = [1u32, 4, 13, 40, 121];
         let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             truth.iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the parameter runs 1, 4, 13, 40, 121: {:?}", missed);
@@ -8177,7 +8208,7 @@ mod facts_tests {
         let (b, v) = affine_loop_from_either();
         let truth = [1u32, 2, 4, 7, 13, 22, 40, 67, 121, 202];
         let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             truth.iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the parameter runs 1, 4, 13, 40, 121 or 2, 7, 22, 67, 202: {:?}", missed);
@@ -8200,7 +8231,7 @@ mod facts_tests {
         let (b, v) = affine_loop(100);
         let truth = hundred_affine_values();
         let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             truth.iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the parameter runs 1, 4, 13 and on for 100 iterations: {:?}", missed);
@@ -8248,7 +8279,7 @@ mod facts_tests {
                     let found = if to == Ty::I1 {
                         a.bit(v, 0, None).0.map(|x| x as u32)
                     } else {
-                        a.value(v, 0, None).0.form.as_constant()
+                        a.values.value(v, 0, None).0.form.as_constant()
                     };
                     (found != Some(truth)).then(|| format!("{}: {:?}", name, found))
                 })
@@ -8300,7 +8331,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter(|c| {
-                    let form = a.value(c.1, 3, None).0.form;
+                    let form = a.values.value(c.1, 3, None).0.form;
                     !representable(a.unknowns(), &form, 0)
                 })
                 .map(|c| c.0)
@@ -8313,7 +8344,7 @@ mod facts_tests {
     fn identities_of_nonlinear_operations_give_zero() {
         let (b, cases) = identities();
         let loose: Vec<&str> = addresses(&b, &two_words(), |a| {
-            cases.iter().filter(|c| a.value(c.1, 3, None).0.form.as_constant() != Some(0)).map(|c| c.0).collect()
+            cases.iter().filter(|c| a.values.value(c.1, 3, None).0.form.as_constant() != Some(0)).map(|c| c.0).collect()
         });
         assert!(loose.is_empty(), "each is 0 for every u, v and s: {:?}", loose);
     }
@@ -8364,7 +8395,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter(|c| {
-                    let form = a.value(c.1, 0, None).0.form;
+                    let form = a.values.value(c.1, 0, None).0.form;
                     !representable(a.unknowns(), &form, c.2)
                 })
                 .map(|c| c.0)
@@ -8380,7 +8411,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter_map(|c| {
-                    let form = a.value(c.1, 0, None).0.form;
+                    let form = a.values.value(c.1, 0, None).0.form;
                     (form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, form))
                 })
                 .collect()
@@ -8403,7 +8434,7 @@ mod facts_tests {
     fn lds_words_read_back_hold_the_word_the_lane_stored() {
         let (b, back) = shared_word();
         let held = addresses(&b, &two_words(), |a| {
-            let form = a.value(back, 3, None).0.form;
+            let form = a.values.value(back, 3, None).0.form;
             representable(a.unknowns(), &form, 3)
         });
         assert!(held, "lane 3 reads back the 3 it stored");
@@ -8412,7 +8443,7 @@ mod facts_tests {
     #[test]
     fn lds_words_read_back_give_the_word_the_lane_stored() {
         let (b, back) = shared_word();
-        let form = addresses(&b, &two_words(), |a| a.value(back, 3, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(back, 3, None).0.form);
         assert_eq!(form, Form::constant(3), "word 3 of the LDS only ever holds 3");
     }
 
@@ -8438,7 +8469,7 @@ mod facts_tests {
     fn loop_values_hold_every_value_a_square_step_carries() {
         let (b, v) = squared_loop();
         let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             [1u32, 2, 5].iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the parameter runs 1, 2, 5: {:?}", missed);
@@ -8468,7 +8499,7 @@ mod facts_tests {
     fn halves_of_one_word_in_two_blocks_hold_their_difference() {
         let (b, difference) = halves_in_two_blocks();
         let held = addresses(&b, &two_words(), |a| {
-            let form = a.value(difference, 0, None).0.form;
+            let form = a.values.value(difference, 0, None).0.form;
             representable(a.unknowns(), &form, 0)
         });
         assert!(held);
@@ -8477,7 +8508,7 @@ mod facts_tests {
     #[test]
     fn halves_of_one_word_in_two_blocks_are_equal() {
         let (b, difference) = halves_in_two_blocks();
-        let form = addresses(&b, &two_words(), |a| a.value(difference, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(difference, 0, None).0.form);
         assert_eq!(form, Form::constant(0), "both are u >> 1 of the same u");
     }
 
@@ -8508,7 +8539,7 @@ mod facts_tests {
                 let (b, chosen) = chosen_after_branch(entered);
                 let truth = if entered { 7 } else { 9 };
                 !addresses(&b, &two_words(), |a| {
-                    let form = a.value(chosen, 0, None).0.form;
+                    let form = a.values.value(chosen, 0, None).0.form;
                     representable(a.unknowns(), &form, truth)
                 })
             })
@@ -8519,7 +8550,7 @@ mod facts_tests {
     #[test]
     fn selects_after_a_branch_take_the_arm_the_branch_decides() {
         let (b, chosen) = chosen_after_branch(true);
-        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the block runs only when u is 0");
     }
 
@@ -8528,7 +8559,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter_map(|&(name, v)| {
-                    let form = a.value(v, 3, None).0.form;
+                    let form = a.values.value(v, 3, None).0.form;
                     let wrong = if exact { form.as_constant() != Some(0) } else { !representable(a.unknowns(), &form, 0) };
                     wrong.then(|| format!("{}: {:?}", name, form))
                 })
@@ -8617,15 +8648,15 @@ mod facts_tests {
         let (b, words, cases) = polynomials();
         let mut wrong = Vec::new();
         addresses(&b, &two_words(), |a| {
-            let bases: Vec<Form> = words.iter().map(|&x| a.value(x, 0, None).0.form).collect();
-            let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.value(x, 0, None).0.form).collect();
+            let bases: Vec<Form> = words.iter().map(|&x| a.values.value(x, 0, None).0.form).collect();
+            let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.values.value(x, 0, None).0.form).collect();
             let mut r = Random::new(109);
             let mut samples: Vec<[u32; 3]> = vec![[0, 0, 0], [1, 1, 1], [u32::MAX, 65535, 255], [0x8000_0000, 0x8000, 0x80], [12345, 678, 9]];
             samples.extend((0..40).map(|_| [r.next() as u32, r.below(65536) as u32, r.below(256) as u32]));
             for sample in samples {
                 let value = |u: Unknown| -> Option<u32> {
                     let base = |u: Unknown| bases.iter().position(|f| *f == Form::unknown(u)).map(|i| sample[i]);
-                    match a.symbols.monomials.get(&u) {
+                    match a.values.symbols.monomials.get(&u) {
                         Some(factors) => factors.iter().try_fold(1u32, |p, &f| Some(p.wrapping_mul(base(f)?))),
                         None => base(u),
                     }
@@ -8637,7 +8668,7 @@ mod facts_tests {
                         wrong.push(format!("{} at {:?}: {:?} gives {:?}, not {:#x}", name, sample, forms[i], evaluated, t));
                     }
                 }
-                for (u, factors) in &a.symbols.monomials {
+                for (u, factors) in &a.values.symbols.monomials {
                     let Some(p) = value(*u) else {
                         continue;
                     };
@@ -8698,7 +8729,7 @@ mod facts_tests {
         cases.push(("s - t", x, false, Box::new(|_, s, t| s.wrapping_sub(t))));
         let mut wrong = Vec::new();
         addresses(&b, &two_words(), |a| {
-            let bases: Vec<Form> = [u, s, t].iter().map(|&x| a.value(x, 0, None).0.form).collect();
+            let bases: Vec<Form> = [u, s, t].iter().map(|&x| a.values.value(x, 0, None).0.form).collect();
             let forms: Vec<Option<super::Wide>> = cases.iter().map(|&(_, x, _, _)| a.wide_value(x, e, 0)).collect();
             let mut r = Random::new(127);
             let mut samples: Vec<[u64; 3]> = vec![[0, 0, 0], [u32::MAX as u64, 255, 65535], [0x8000_0000, 128, 32768], [1, 1, 1]];
@@ -8816,7 +8847,7 @@ mod facts_tests {
     fn products_of_words_from_two_loops_in_two_blocks_hold_their_difference() {
         let (b, difference) = products_after_two_loops();
         let held = addresses(&b, &two_words(), |a| {
-            let form = a.value(difference, 0, None).0.form;
+            let form = a.values.value(difference, 0, None).0.form;
             representable(a.unknowns(), &form, 0)
         });
         assert!(held);
@@ -8825,7 +8856,7 @@ mod facts_tests {
     #[test]
     fn products_of_words_from_two_loops_in_two_blocks_are_equal() {
         let (b, difference) = products_after_two_loops();
-        let form = addresses(&b, &two_words(), |a| a.value(difference, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(difference, 0, None).0.form);
         assert_eq!(form, Form::constant(0), "both are x * y of the same x from the first loop and y from the second");
     }
 
@@ -8855,7 +8886,7 @@ mod facts_tests {
             .filter(|&(entered, truth)| {
                 let (b, chosen) = chosen_after_bound(entered);
                 !addresses(&b, &two_words(), |a| {
-                    let form = a.value(chosen, 0, None).0.form;
+                    let form = a.values.value(chosen, 0, None).0.form;
                     representable(a.unknowns(), &form, truth)
                 })
             })
@@ -8866,7 +8897,7 @@ mod facts_tests {
     #[test]
     fn selects_after_a_bound_take_the_arm_the_bound_decides() {
         let (b, chosen) = chosen_after_bound(true);
-        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the block runs only when u is below 4, so u is below 8");
     }
 
@@ -8903,7 +8934,7 @@ mod facts_tests {
         for entered in [true, false] {
             let (b, cases, _) = operations_after_a_bound(entered);
             addresses(&b, &two_words(), |a| {
-                let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.value(x, 0, None).0.form).collect();
+                let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.values.value(x, 0, None).0.form).collect();
                 for u in [0u32, 1, 15, 16, 17, 255, 256, 0x1234, u32::MAX - 16, u32::MAX] {
                     if (u < 16) != entered {
                         continue;
@@ -8923,13 +8954,13 @@ mod facts_tests {
     fn operations_after_a_bound_settle_what_the_bound_decides() {
         let (b, cases, u) = operations_after_a_bound(true);
         let loose = addresses(&b, &two_words(), |a| {
-            let word = a.value(u, 0, None).0.form;
+            let word = a.values.value(u, 0, None).0.form;
             let expected = [word, Form::constant(0), Form::constant(0)];
             cases
                 .iter()
                 .zip(expected)
                 .filter_map(|(&(name, x, _), want)| {
-                    let form = a.value(x, 0, None).0.form;
+                    let form = a.values.value(x, 0, None).0.form;
                     (form != want).then(|| format!("{}: {:?}, not {:?}", name, form, want))
                 })
                 .collect::<Vec<_>>()
@@ -8979,7 +9010,7 @@ mod facts_tests {
         for entered in [true, false] {
             let (b, cases) = selects_after_an_order(entered);
             addresses(&b, &two_words(), |a| {
-                let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.value(x, 0, None).0.form).collect();
+                let forms: Vec<Form> = cases.iter().map(|&(_, x, _)| a.values.value(x, 0, None).0.form).collect();
                 let samples = [(0u32, 1u32), (1, 0), (5, 5), (0, 0x8000_0000), (0x8000_0000, 0), (u32::MAX, 3), (3, u32::MAX), (7, 9)];
                 for (u, v) in samples {
                     if (u < v) != entered {
@@ -9174,7 +9205,7 @@ mod facts_tests {
                 .iter()
                 .filter(|&&(name, _, _)| name != "u < v signed")
                 .filter_map(|&(name, x, ref truth)| {
-                    let form = a.value(x, 0, None).0.form;
+                    let form = a.values.value(x, 0, None).0.form;
                     let want = Form::constant(truth(0, 1));
                     (form != want).then(|| format!("{}: {:?}, not {:?}", name, form, want))
                 })
@@ -9555,7 +9586,7 @@ mod facts_tests {
                 let (b, chosen) = chosen_after_branch_on_a_source(entered);
                 let truth = if entered { 7 } else { 9 };
                 !addresses(&b, &two_words(), |a| {
-                    let form = a.value(chosen, 0, None).0.form;
+                    let form = a.values.value(chosen, 0, None).0.form;
                     representable(a.unknowns(), &form, truth)
                 })
             })
@@ -9566,7 +9597,7 @@ mod facts_tests {
     #[test]
     fn selects_on_a_word_derived_from_the_branch_word_take_the_arm_the_branch_decides() {
         let (b, chosen) = chosen_after_branch_on_a_source(true);
-        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the block runs only when u is 0, so u + 1 is 1");
     }
 
@@ -9596,7 +9627,7 @@ mod facts_tests {
     fn selects_in_a_loop_entered_on_zero_hold_the_arm_zero_takes() {
         let (b, chosen) = chosen_in_a_loop_entered_on_zero();
         let held = addresses(&b, &two_words(), |a| {
-            let form = a.value(chosen, 0, None).0.form;
+            let form = a.values.value(chosen, 0, None).0.form;
             representable(a.unknowns(), &form, 7)
         });
         assert!(held);
@@ -9605,7 +9636,7 @@ mod facts_tests {
     #[test]
     fn selects_in_a_loop_entered_on_zero_take_the_arm_zero_takes() {
         let (b, chosen) = chosen_in_a_loop_entered_on_zero();
-        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the loop runs only when u is 0 and carries u unchanged");
     }
 
@@ -9618,7 +9649,7 @@ mod facts_tests {
         let (b, v) = affine_loop(5000);
         let truth = affine_values(1, 5000);
         let missed: Vec<u32> = addresses(&b, &environment(32, &[]), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             truth.iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "{} values missed", missed.len());
@@ -9670,7 +9701,7 @@ mod facts_tests {
         let (b, v) = affine_loop_from_a_byte();
         let truth = affine_values_from_a_byte();
         let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             truth.iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "{:?}", missed);
@@ -9680,7 +9711,7 @@ mod facts_tests {
     fn loop_values_are_exactly_those_an_affine_step_carries_from_a_hundred_and_twenty_eight_starts() {
         let (b, v) = affine_loop_from_a_byte();
         let carried = addresses(&b, &two_words(), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             match form.terms.as_slice() {
                 [(u, 1)] if form.constant == 0 => a.unknowns()[*u as usize].values.as_ref().map(|s| {
                     let mut s = s.to_vec();
@@ -9722,7 +9753,7 @@ mod facts_tests {
     fn loop_values_hold_every_value_a_square_step_carries_along_two_back_edges() {
         let (b, v) = squared_loop_with_two_back_edges();
         let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             [1u32, 2, 5].iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the parameter runs 1, 2, 5: {:?}", missed);
@@ -9754,7 +9785,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter(|c| {
-                    let form = a.value(c.1, 0, None).0.form;
+                    let form = a.values.value(c.1, 0, None).0.form;
                     !representable(a.unknowns(), &form, c.2)
                 })
                 .map(|c| c.0)
@@ -9770,7 +9801,7 @@ mod facts_tests {
             cases
                 .iter()
                 .filter_map(|c| {
-                    let form = a.value(c.1, 0, None).0.form;
+                    let form = a.values.value(c.1, 0, None).0.form;
                     (form.as_constant() != Some(c.2)).then(|| format!("{}: {:?}", c.0, form))
                 })
                 .collect()
@@ -9792,7 +9823,7 @@ mod facts_tests {
     fn lds_words_read_back_by_work_item_hold_the_word_the_item_stored() {
         let (b, back) = shared_word_by_item();
         let held = addresses(&b, &two_words(), |a| {
-            let form = a.value(back, 3, None).0.form;
+            let form = a.values.value(back, 3, None).0.form;
             representable(a.unknowns(), &form, 3)
         });
         assert!(held, "item 3 reads back the 3 it stored");
@@ -9801,7 +9832,7 @@ mod facts_tests {
     #[test]
     fn lds_words_read_back_by_work_item_give_the_word_the_item_stored() {
         let (b, back) = shared_word_by_item();
-        let form = addresses(&b, &two_words(), |a| a.value(back, 3, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(back, 3, None).0.form);
         assert_eq!(form, Form::constant(3), "word 3 of the LDS only ever holds 3, which only item 3 writes");
     }
 
@@ -9834,7 +9865,7 @@ mod facts_tests {
     fn loop_values_hold_every_value_a_square_step_carries_along_two_back_edges_with_different_bounds() {
         let (b, v) = squared_loop_with_two_bounds();
         let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
-            let form = a.value(v, 0, None).0.form;
+            let form = a.values.value(v, 0, None).0.form;
             [1u32, 2, 5, 26].iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the odd back edge goes on below 5 and the even one below 3, so the loop runs four times and carries 1, 2, 5, 26: {:?}", missed);
@@ -9872,7 +9903,7 @@ mod facts_tests {
             .filter(|&(entered, truth)| {
                 let (b, chosen) = chosen_after_offset_branch(entered);
                 !addresses(&b, &two_words(), |a| {
-                    let form = a.value(chosen, 0, None).0.form;
+                    let form = a.values.value(chosen, 0, None).0.form;
                     representable(a.unknowns(), &form, truth)
                 })
             })
@@ -9883,7 +9914,7 @@ mod facts_tests {
     #[test]
     fn selects_on_a_word_derived_from_an_offset_branch_word_take_the_arm_the_branch_decides() {
         let (b, chosen) = chosen_after_offset_branch(true);
-        let form = addresses(&b, &two_words(), |a| a.value(chosen, 0, None).0.form);
+        let form = addresses(&b, &two_words(), |a| a.values.value(chosen, 0, None).0.form);
         assert_eq!(form, Form::constant(7), "the block runs only when u + 3 is 5, so 2u + 1 is 5");
     }
 
@@ -9913,7 +9944,7 @@ mod facts_tests {
     fn selects_in_a_loop_entered_on_zero_that_counts_up_hold_both_arms() {
         let (b, chosen) = chosen_in_a_loop_entered_on_zero_that_counts_up();
         let missed: Vec<u32> = addresses(&b, &two_words(), |a| {
-            let form = a.value(chosen, 0, None).0.form;
+            let form = a.values.value(chosen, 0, None).0.form;
             [7u32, 9].iter().copied().filter(|&t| !representable(a.unknowns(), &form, t)).collect()
         });
         assert!(missed.is_empty(), "the first iteration sees 0 and gives 7, the next ones 1 and 2 and give 9: {:?}", missed);
