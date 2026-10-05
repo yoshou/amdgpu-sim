@@ -1,3 +1,5 @@
+use super::logic::{Atom, Logic};
+use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::engine::EntryLayout;
 use crate::rdna_spmd::environment::{Binding, Environment};
 use crate::rdna_spmd::ir::*;
@@ -285,4 +287,40 @@ pub(super) fn interesting(r: &mut Random) -> u32 {
         3 => [1, 2, 3, 4, 0xffff_ffff, 0xffff_fffe, 0x8000_0000, 0x7fff_ffff][r.below(8) as usize],
         _ => r.next() as u32,
     }
+}
+
+pub(super) fn evaluate(m: &Manager, mut g: Bdd, value: &dyn Fn(u32) -> bool) -> bool {
+    while let Some((var, low, high)) = m.decompose(g) {
+        g = if value(var) { high } else { low };
+    }
+    g == Bdd::TRUE
+}
+
+pub(super) fn variable(logic: &mut Logic, atom: Atom) -> u32 {
+    let g = logic.atom(atom);
+    logic.m.decompose(g).unwrap().0
+}
+
+pub(super) fn random_function(logic: &mut Logic, r: &mut Random, pool: &[Atom], most: usize) -> Bdd {
+    let mut atoms: Vec<Atom> = Vec::new();
+    for _ in 0..1 + r.below(most as u64) {
+        let a = pool[r.below(pool.len() as u64) as usize];
+        if !atoms.contains(&a) {
+            atoms.push(a);
+        }
+    }
+    let vars: Vec<Bdd> = atoms.iter().map(|&a| logic.atom(a)).collect();
+    let mut g = Bdd::FALSE;
+    for row in 0..1u32 << vars.len() {
+        if r.below(2) == 0 {
+            continue;
+        }
+        let mut minterm = Bdd::TRUE;
+        for (i, &v) in vars.iter().enumerate() {
+            let literal = if row >> i & 1 == 1 { v } else { logic.m.not(v) };
+            minterm = logic.m.and(minterm, literal);
+        }
+        g = logic.m.or(g, minterm);
+    }
+    g
 }

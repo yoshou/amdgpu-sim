@@ -38,11 +38,11 @@ pub fn prove(
             return (kept, everyone);
         }
         let mut blamed = BTreeSet::new();
-        for i in 0..check.violations.len() {
-            let condition = check.violations[i].condition;
-            if let Some(v) = named(&mut check.logic, condition, &order) {
+        for i in 0..check.violations().len() {
+            let condition = check.violations()[i].condition;
+            if let Some(v) = named(check.logic(), condition, &order) {
                 if std::env::var_os("AMDGPU_SIM_PRINT_MEETINGS").is_some() {
-                    let violation = &check.violations[i];
+                    let violation = &check.violations()[i];
                     eprintln!(
                         "; keeps {:?} for b{}:{}: {}",
                         v, violation.block.0, violation.index, violation.reason
@@ -52,7 +52,7 @@ pub fn prove(
             }
         }
         if blamed.is_empty() {
-            let v = &check.violations[0];
+            let v = &check.violations()[0];
             panic!(
                 "b{}:{}: {} under every conversion policy",
                 v.block.0, v.index, v.reason
@@ -73,11 +73,11 @@ fn without_covered_meetings(check: &mut Check, mut kept: Kept) -> Kept {
     for m in meets {
         let mut trial = kept.clone();
         trial.meets.remove(&m);
-        check.logic.keep(&trial.choices());
+        check.logic().keep(&trial.choices());
         if check.orderings() == base {
             kept = trial;
         } else {
-            check.logic.keep(&kept.choices());
+            check.logic().keep(&kept.choices());
         }
     }
     kept

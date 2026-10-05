@@ -24,13 +24,14 @@ pub fn prove(
     let logic = Logic::open(f, &facts, &listed);
     let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
     if !check.run() {
-        let (block, index, reason) = check.exhausted.unwrap();
+        let (block, index, reason) = check.exhausted().unwrap();
         panic!(
             "b{}:{}: {} under every conversion policy",
             block.0, index, reason
         );
     }
-    let kept = check.logic.choose(check.safe);
+    let safe = check.safe();
+    let kept = check.logic().choose(safe);
     let everyone = check.everyone(&kept.choices());
     (kept, everyone)
 }

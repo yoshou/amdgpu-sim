@@ -1,5 +1,5 @@
 use super::address::compare;
-use super::check::interval;
+use super::terms::interval;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
