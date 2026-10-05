@@ -843,7 +843,7 @@ fn meet(
                 idle = Some([old[0] && both[0], old[1] && both[1]]);
                 continue;
             };
-            let unknowns = &addresses.unknowns;
+            let unknowns = addresses.unknowns();
             if xa.form.terms == ya.form.terms && xa.form.terms.iter().all(|&(u, _)| !variant(&unknowns[u as usize])) {
                 let d = xa.form.constant.wrapping_sub(ya.form.constant);
                 if d >= y.bytes && d.wrapping_neg() >= x.bytes {
@@ -858,9 +858,9 @@ fn meet(
             }
             let (lp, lq) = (lanes_p[a].as_ref().unwrap(), lanes_q[b].as_ref().unwrap());
             let limits = [&lp.classes, &lq.classes];
-            let apart = !may_overlap_within(&addresses.unknowns, &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, &mut judgments)
+            let apart = !may_overlap_within(addresses.unknowns(), &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, &mut judgments)
                 || match (&lp.wide, &lq.wide) {
-                    (Some(wx), Some(wy)) => wide_apart(&addresses.unknowns, (wx, x.bytes), (wy, y.bytes), variant, differ, limits, &mut judgments),
+                    (Some(wx), Some(wy)) => wide_apart(addresses.unknowns(), (wx, x.bytes), (wy, y.bytes), variant, differ, limits, &mut judgments),
                     _ => false,
                 };
             if apart {
@@ -898,7 +898,7 @@ fn above(
     let (Some(hx), Some(hy)) = (high(pa, a, xh), high(qa, b, yh)) else {
         return false;
     };
-    let unknowns = &addresses.unknowns;
+    let unknowns = addresses.unknowns();
     if let (Some(lx), Some(ly)) = (x.form.as_constant(), y.form.as_constant()) {
         let low = ly as i64 - lx as i64;
         return [-1i64, 0, 1].iter().all(|&k| {
@@ -919,7 +919,7 @@ fn above(
             }
         }
     }
-    let unknowns = &addresses.unknowns;
+    let unknowns = addresses.unknowns();
     let same = x.form == y.form && x.form.terms.iter().all(|&(u, _)| !variant(&unknowns[u as usize]));
     let window = if same { 1 } else { 2 };
     !may_overlap(unknowns, &hx, &hy, window, window, variant, differ)
