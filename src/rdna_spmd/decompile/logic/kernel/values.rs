@@ -7,16 +7,16 @@ use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::rc::Rc;
 
-pub(in super::super) struct Values<S> {
-    pub(in super::super) atoms: Atoms,
-    pub(in super::super) policy: Policy,
-    pub(in super::super) state: S,
+pub(super) struct Values<S> {
+    pub(super) atoms: Atoms,
+    pub(super) policy: Policy,
+    pub(super) state: S,
     bits: HashMap<ValueId, Bdd>,
     views: HashMap<ValueId, Bdd>,
 }
 
 impl<S> Values<S> {
-    pub(in super::super) fn new(atoms: Atoms, policy: Policy, state: S) -> Self {
+    pub(super) fn new(atoms: Atoms, policy: Policy, state: S) -> Self {
         Self {
             atoms,
             policy,
@@ -27,9 +27,9 @@ impl<S> Values<S> {
     }
 }
 
-pub(in super::super) struct Eval<'x, S> {
-    pub(in super::super) m: &'x mut Manager,
-    pub(in super::super) values: &'x mut Values<S>,
+pub struct Eval<'x, S> {
+    pub(super) m: &'x mut Manager,
+    pub(super) values: &'x mut Values<S>,
 }
 
 impl<S: Rules> Queries for Eval<'_, S> {

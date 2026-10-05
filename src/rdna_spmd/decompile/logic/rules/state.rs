@@ -1,36 +1,36 @@
 use super::super::kernel::{Atom, Atoms, Binding, Queries, Rules};
-use super::bits::{compute_bit, compute_view};
 use super::answers::{Answers, HasAnswers};
+use super::bits::{compute_bit, compute_view};
 use super::cells::{self, Cells, HasCells};
+use super::lanes::{HasLanes, LaneValues};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::ir::*;
-use super::lanes::{HasLanes, LaneValues};
 
 #[derive(Default)]
-pub(super) struct State {
+pub struct State {
     lanes: LaneValues,
     cells: Cells,
     answers: Answers,
 }
 
 impl State {
-    pub(super) fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
+    pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
         self.lanes.of(f, facts, v, 0)
     }
 
-    pub(super) fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); 32]> {
+    pub fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); 32]> {
         if f.types[v.0] != Ty::I32 {
             return None;
         }
         Some(self.lanes.known_bits(f, facts, v, 0))
     }
 
-    pub(super) fn cell_leaves(&self, block: BlockId, group: u16) -> &[ValueId] {
+    pub fn cell_leaves(&self, block: BlockId, group: u16) -> &[ValueId] {
         self.cells.leaves(block, group)
     }
 
-    pub(super) fn answer_sources(&self, block: BlockId) -> Vec<ValueId> {
+    pub fn answer_sources(&self, block: BlockId) -> Vec<ValueId> {
         self.answers.sources(block)
     }
 }

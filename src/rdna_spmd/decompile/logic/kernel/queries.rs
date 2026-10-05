@@ -5,14 +5,14 @@ use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::ir::*;
 use std::rc::Rc;
 
-pub(in super::super) trait Rules: Sized {
+pub trait Rules: Sized {
     fn bit<Q: Queries<State = Self>>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Bdd;
     fn view<Q: Queries<State = Self>>(q: &mut Q, f: &Func, facts: &Facts, w: ValueId) -> Bdd;
     fn uniform(&self, atoms: &Atoms, facts: &Facts, var: u32) -> bool;
     fn bridges<Q: Queries<State = Self>>(q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize) -> Vec<Binding>;
 }
 
-pub(in super::super) trait Queries {
+pub trait Queries {
     type State: Rules;
 
     fn m(&mut self) -> &mut Manager;

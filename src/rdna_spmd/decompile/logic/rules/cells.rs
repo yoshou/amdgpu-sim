@@ -1,13 +1,14 @@
 use super::super::super::address::compare;
 use super::super::super::terms::Terms;
 use super::super::kernel::{lane_test, Atom, Binding, Queries};
-use super::super::HashSet;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+
+type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::rdna_spmd::hash::Mix>>;
 
 #[derive(Default)]
 struct BlockCells {

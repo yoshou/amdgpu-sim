@@ -8,10 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 #[derive(Clone)]
-pub(in super::super) struct Binding {
-    pub(in super::super) atom: Bdd,
-    pub(in super::super) bound: Bdd,
-    pub(in super::super) support: Vec<u32>,
+pub struct Binding {
+    pub atom: Bdd,
+    pub bound: Bdd,
+    pub support: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -21,7 +21,7 @@ struct EdgeIndex {
 }
 
 #[derive(Default)]
-pub(in super::super) struct Edges {
+pub(super) struct Edges {
     edges: BTreeMap<(BlockId, usize), Rc<EdgeIndex>>,
     relations: BTreeMap<(BlockId, usize), Rc<Vec<Binding>>>,
     images: HashMap<(usize, usize, Bdd), Bdd>,
@@ -69,7 +69,7 @@ impl Edges {
         index
     }
 
-    pub(in super::super) fn image<Q: Queries>(
+    pub(super) fn image<Q: Queries>(
         &mut self,
         q: &mut Q,
         f: &Func,
@@ -165,7 +165,7 @@ impl Edges {
         links
     }
 
-    pub(in super::super) fn post<Q: Queries>(&mut self, q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
+    pub(super) fn post<Q: Queries>(&mut self, q: &mut Q, f: &Func, facts: &Facts, src: BlockId, slot: usize, formula: Bdd) -> Bdd {
         if formula == Bdd::FALSE {
             return formula;
         }
@@ -175,7 +175,7 @@ impl Edges {
         arrived(q, src, dst, r)
     }
 
-    pub(in super::super) fn reach<Q: Queries>(
+    pub(super) fn reach<Q: Queries>(
         &mut self,
         q: &mut Q,
         f: &Func,

@@ -28,7 +28,7 @@ pub enum Choice {
 const MARKERS_LAST: u32 = 0xfffe_0000;
 pub const PATH: usize = 3;
 
-pub(in super::super) struct Atoms {
+pub struct Atoms {
     markers_first: bool,
     vars: HashMap<Atom, u32>,
     atoms: HashMap<u32, Atom>,
@@ -39,7 +39,7 @@ pub(in super::super) struct Atoms {
 }
 
 impl Atoms {
-    pub(in super::super) fn new(f: &Func, facts: &Facts, markers_first: bool, listed: &[Choice]) -> Self {
+    pub(super) fn new(f: &Func, facts: &Facts, markers_first: bool, listed: &[Choice]) -> Self {
         let mut params = HashMap::default();
         for (rank, id) in facts.order.iter().enumerate() {
             for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
@@ -63,7 +63,7 @@ impl Atoms {
         }
     }
 
-    pub(in super::super) fn atom(&mut self, m: &mut Manager, atom: Atom) -> Bdd {
+    pub(super) fn atom(&mut self, m: &mut Manager, atom: Atom) -> Bdd {
         let var = match self.vars.get(&atom) {
             Some(&var) => var,
             None => {
@@ -129,26 +129,26 @@ impl Atoms {
     }
 
     #[inline]
-    pub(in super::super) fn of(&self, var: u32) -> Atom {
+    pub fn of(&self, var: u32) -> Atom {
         self.atoms[&var]
     }
 
     #[inline]
-    pub(in super::super) fn get(&self, var: u32) -> Option<Atom> {
+    pub fn get(&self, var: u32) -> Option<Atom> {
         self.atoms.get(&var).copied()
     }
 
     #[inline]
-    pub(in super::super) fn var(&self, atom: Atom) -> Option<u32> {
+    pub(super) fn var(&self, atom: Atom) -> Option<u32> {
         self.vars.get(&atom).copied()
     }
 
     #[inline]
-    pub(in super::super) fn marks(&self, c: Choice) -> bool {
+    pub(super) fn marks(&self, c: Choice) -> bool {
         self.markers.contains_key(&c)
     }
 
-    pub(in super::super) fn support(&mut self, m: &mut Manager, f: Bdd) -> Rc<Vec<u32>> {
+    pub(super) fn support(&mut self, m: &mut Manager, f: Bdd) -> Rc<Vec<u32>> {
         if let Some(s) = self.supports.get(&f) {
             return s.clone();
         }
@@ -158,7 +158,7 @@ impl Atoms {
     }
 }
 
-pub(in super::super) fn exists(m: &mut Manager, vars: &[u32], f: Bdd) -> Bdd {
+pub fn exists(m: &mut Manager, vars: &[u32], f: Bdd) -> Bdd {
     if vars.is_empty() {
         return f;
     }
@@ -167,7 +167,7 @@ pub(in super::super) fn exists(m: &mut Manager, vars: &[u32], f: Bdd) -> Bdd {
     m.exists(f, &|v| vars.binary_search(&v).is_ok())
 }
 
-pub(in super::super) fn forall(m: &mut Manager, vars: &[u32], f: Bdd) -> Bdd {
+pub fn forall(m: &mut Manager, vars: &[u32], f: Bdd) -> Bdd {
     if vars.is_empty() {
         return f;
     }
@@ -176,7 +176,7 @@ pub(in super::super) fn forall(m: &mut Manager, vars: &[u32], f: Bdd) -> Bdd {
     m.forall(f, &|v| vars.binary_search(&v).is_ok())
 }
 
-pub(in super::super) fn scope(atom: Atom, facts: &Facts) -> Option<BlockId> {
+pub(super) fn scope(atom: Atom, facts: &Facts) -> Option<BlockId> {
     match atom {
         Atom::Bit(v) | Atom::View(v) | Atom::WordBit(v, _) => match facts.site[v.0] {
             Site::Param { block, .. } | Site::Inst { block, .. } => Some(block),

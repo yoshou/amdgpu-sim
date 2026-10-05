@@ -241,7 +241,7 @@ pub(super) fn float_order<Q: Queries>(
     g
 }
 
-pub(in super::super::super) fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
+pub fn float_compare(pred: FloatPred, x: f64, y: f64) -> bool {
     let unordered = x.is_nan() || y.is_nan();
     match pred {
         FloatPred::Oeq => !unordered && x == y,
