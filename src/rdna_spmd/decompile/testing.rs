@@ -276,3 +276,13 @@ pub(super) fn environment(lanes: u32, buffers: &[(u32, u64, u64)]) -> Environmen
         exposed: Vec::new(),
     }
 }
+
+pub(super) fn interesting(r: &mut Random) -> u32 {
+    match r.below(5) {
+        0 => r.below(16) as u32,
+        1 => (r.below(16) as u32).wrapping_neg(),
+        2 => 0x8000_0000u32.wrapping_add(r.below(16) as u32).wrapping_sub(8),
+        3 => [1, 2, 3, 4, 0xffff_ffff, 0xffff_fffe, 0x8000_0000, 0x7fff_ffff][r.below(8) as usize],
+        _ => r.next() as u32,
+    }
+}
