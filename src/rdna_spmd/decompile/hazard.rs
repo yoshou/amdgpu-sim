@@ -3297,7 +3297,7 @@ mod tests {
         let buf = k.buffer(&mut b, e, 0);
         let u = uniform_word(&mut b, &k, e, 0, MemSize::B32);
         let v = uniform_word(&mut b, &k, e, 4, MemSize::B32);
-        let mut mask = |b: &mut Build, x: ValueId, (pred, bound): (IntPred, u64)| {
+        let mask = |b: &mut Build, x: ValueId, (pred, bound): (IntPred, u64)| {
             let bound = b.constant(e, Ty::I32, bound);
             let holds = b.cmp(e, pred, x, bound);
             b.int(e, IntOp::And, holds, k.exec)
@@ -4846,7 +4846,7 @@ mod tests {
 
     #[test]
     fn may_overlap_sees_that_five_words_limited_to_two_pieces_each_never_hit_one() {
-        assert!(!five_words_limited_to_two_pieces_each(1), "sums of words in {0, 3} are multiples of 3");
+        assert!(!five_words_limited_to_two_pieces_each(1), "{}", "sums of words in {0, 3} are multiples of 3");
     }
 
     fn differently_scaled_iterations(range: (u32, u32)) -> bool {
@@ -4869,7 +4869,7 @@ mod tests {
 
     #[test]
     fn may_overlap_sees_that_differently_scaled_iterations_meet_only_in_the_same_iteration() {
-        assert!(!differently_scaled_iterations((0, 1)), "2i = 3j with i, j in {0, 1} only at i = j = 0");
+        assert!(!differently_scaled_iterations((0, 1)), "{}", "2i = 3j with i, j in {0, 1} only at i = j = 0");
     }
 
     fn guarded_by_a_sum(sum: u64, word: u64) -> bool {

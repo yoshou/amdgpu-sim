@@ -2497,7 +2497,7 @@ fn orders_conjoin_exactly_and_disjoin_exactly_on_one_pair() {
     let mut r = Random::new(139);
     let mut wrong = Vec::new();
     for _ in 0..400 {
-        let mut build = |r: &mut Random| {
+        let build = |r: &mut Random| {
             let mut orders = Vec::new();
             for _ in 0..r.below(3) {
                 let (i, j) = (r.below(3) as usize, r.below(3) as usize);

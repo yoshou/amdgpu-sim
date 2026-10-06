@@ -1131,8 +1131,6 @@ fn prove_follows_pairs_of_bounds_on_one_word() {
     let preds = [IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge, IntPred::Eq, IntPred::Ne];
     let bounds = [0u32, 1, 4, 5, 6, 10, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff];
     let holds = |p: IntPred, v: u32, k: u32| super::super::address::compare(p, v, k);
-    let signed = |p: IntPred| matches!(p, IntPred::Slt | IntPred::Sle | IntPred::Sgt | IntPred::Sge);
-    let equality = |p: IntPred| matches!(p, IntPred::Eq | IntPred::Ne);
     let mut r = Random::new(29);
     let mut wrong = Vec::new();
     for _ in 0..400 {
@@ -3969,7 +3967,7 @@ fn related_pair(shape: Related) -> Build {
     let everywhere = b.constant(e, Ty::I1, 1);
     let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
     let zero = b.constant(e, Ty::I32, 0);
-    let mut bit_at = |b: &mut Build, offset: u64| {
+    let bit_at = |b: &mut Build, offset: u64| {
         let table = k.buffer(b, e, offset);
         let slot = byte_offset(b, e, table, lane, 4);
         let word = b.load(e, Space::Global, MemSize::B32, slot, everywhere);
@@ -4274,19 +4272,6 @@ fn prove_converts_a_query_whose_arms_store_the_same_value_into_two_words_that_ma
     let b = arms_store_two_that_may_meet(5);
     assert!(converted(&b).is_empty(), "{:?}: both arms leave 5 in the lane's word and in the word u & 1 rows further, whether or not they are one word", converted(&b));
 }
-
-const PREDICATES: [IntPred; 10] = [
-    IntPred::Eq,
-    IntPred::Ne,
-    IntPred::Ult,
-    IntPred::Ugt,
-    IntPred::Ule,
-    IntPred::Uge,
-    IntPred::Slt,
-    IntPred::Sgt,
-    IntPred::Sle,
-    IntPred::Sge,
-];
 
 #[test]
 fn masked_tests_of_words_hold_only_where_inactive_lanes_see_zero() {

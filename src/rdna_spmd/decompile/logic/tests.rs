@@ -188,7 +188,7 @@ fn uniform_tests_are_equal_in_every_lane() {
         }
         decided += 1;
         for _ in 0..40 {
-            let mut pick = |r: &mut Random| if r.below(2) == 0 { r.below(64) as u32 } else { r.next() as u32 };
+            let pick = |r: &mut Random| if r.below(2) == 0 { r.below(64) as u32 } else { r.next() as u32 };
             let (u, w) = (pick(&mut r), pick(&mut r));
             let first = (words[i].2)(u, w, 0) == (words[j].2)(u, w, 0);
             if (1..32).any(|l| ((words[i].2)(u, w, l) == (words[j].2)(u, w, l)) != first) {
