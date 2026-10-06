@@ -18,7 +18,7 @@ pub(super) struct Program<'a> {
     pub(super) rank: HashMap<BlockId, usize>,
     pub(super) incoming: Vec<Vec<(&'a [ValueId], bool)>>,
     pub(super) carried: Vec<(usize, usize, ValueId)>,
-    pub(super) partial: bool,
+    workgroup: usize,
 }
 
 impl<'a> Program<'a> {
@@ -79,8 +79,20 @@ impl<'a> Program<'a> {
             rank,
             incoming,
             carried,
-            partial: env.workgroup_size() as usize % LANES != 0,
+            workgroup: env.workgroup_size() as usize,
         }
+    }
+
+    pub(super) fn partial(&self) -> bool {
+        self.workgroup % LANES != 0
+    }
+
+    pub(super) fn lacks(&self, lane: usize) -> bool {
+        self.partial() && lane >= self.workgroup % LANES
+    }
+
+    pub(super) fn words(&self, address: ValueId, bytes: u32) -> Option<(u32, u32)> {
+        self.folded[address.0].map(|t| (t / 4, (t as u64 + bytes as u64).div_ceil(4) as u32))
     }
 
     pub(super) fn constant(&self, x: ValueId) -> Option<u32> {

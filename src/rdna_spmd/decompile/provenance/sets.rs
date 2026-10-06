@@ -359,11 +359,15 @@ impl<'p, 'a> Sets<'p, 'a> {
                 ..
             } => match self.program.constant(inputs[1]) {
                 Some(k) => {
-                    merge(acc, self.part(inputs[0], (k & 31) as usize));
+                    let k = (k & 31) as usize;
+                    merge(acc, self.part(inputs[0], k));
+                    if self.program.lacks(k) {
+                        acc[0] |= 1;
+                    }
                 }
                 None => {
                     merge(acc, self.of(inputs[0]));
-                    if self.program.partial {
+                    if self.program.partial() {
                         acc[0] |= 1;
                     }
                 }
@@ -384,7 +388,7 @@ impl<'p, 'a> Sets<'p, 'a> {
                 ..
             } => {
                 merge(acc, self.of(inputs[1]));
-                if *op == WaveOp::Bpermute || self.program.partial {
+                if *op == WaveOp::Bpermute || self.program.partial() {
                     acc[0] |= 1;
                 }
             }
@@ -421,8 +425,8 @@ impl<'p, 'a> Sets<'p, 'a> {
             _ => 4,
         };
         let w = self.words;
-        match self.program.folded[inputs[0].0] {
-            Some(t) => {
+        match self.program.words(inputs[0], bytes) {
+            Some((first, end)) => {
                 let mut lanes = vec![0; LANES * w];
                 for lane in 0..LANES {
                     for &d in &inputs[1..op.mask_input()] {
@@ -431,7 +435,7 @@ impl<'p, 'a> Sets<'p, 'a> {
                     lanes[lane * w] &= !1;
                 }
                 let mut changed = false;
-                for word in t / 4..(t + bytes).div_ceil(4) {
+                for word in first..end {
                     changed |= merge(self.slots.entry(word).or_insert_with(|| vec![0; LANES * w]), &lanes);
                 }
                 changed
@@ -443,9 +447,9 @@ impl<'p, 'a> Sets<'p, 'a> {
     fn slot(&self, address: ValueId, bytes: u32, lane: usize, acc: &mut [u64]) {
         let w = self.words;
         merge(acc, &self.anywhere);
-        match self.program.folded[address.0] {
-            Some(t) => {
-                for word in t / 4..(t + bytes).div_ceil(4) {
+        match self.program.words(address, bytes) {
+            Some((first, end)) => {
+                for word in first..end {
                     if let Some(slot) = self.slots.get(&word) {
                         merge(acc, &slot[lane * w..(lane + 1) * w]);
                     }

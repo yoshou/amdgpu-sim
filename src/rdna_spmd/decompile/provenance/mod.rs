@@ -152,7 +152,7 @@ fn loaded(sets: &Sets, spills: &[Spill], bounds: &mut HashMap<ValueId, Vec<Regio
                 }
                 continue;
             }
-            let words = program.folded[inputs[0].0].map(|t| (t / 4, (t + size.bytes()).div_ceil(4)));
+            let words = program.words(inputs[0], size.bytes());
             let from: Vec<&Spill> = spills
                 .iter()
                 .filter(|sp| match (words, sp.words) {

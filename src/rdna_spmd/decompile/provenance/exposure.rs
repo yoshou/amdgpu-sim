@@ -93,7 +93,7 @@ pub(super) fn exposures(sets: &Sets, env: &Environment) -> (Vec<Exposure>, Vec<S
                 if !points(&acc) {
                     continue;
                 }
-                let words = program.folded[address.0].map(|t| (t / 4, (t + bytes).div_ceil(4)));
+                let words = program.words(address, bytes);
                 let parts = if operands.iter().any(|&x| sets.has_parts(x)) {
                     (0..LANES)
                         .map(|lane| {

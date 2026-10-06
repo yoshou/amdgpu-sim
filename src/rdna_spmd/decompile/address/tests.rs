@@ -1335,6 +1335,32 @@ fn lane_reads_of_lanes_the_wave_lacks_give_zero() {
 }
 
 #[test]
+fn lane_reads_of_lanes_the_last_wave_lacks_point_into_no_region() {
+    let (mut b, _) = Build::kernel();
+    let e = BlockId(0);
+    let (_, p) = scratch(&mut b, e, 16);
+    let low = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, p));
+    let high = b.core(e, Ty::I32, Op::UnpackHi(p));
+    let last = b.constant(e, Ty::I32, 31);
+    let register = b.constant(e, Ty::I32, 0);
+    let read = b.wave(e, WaveOp::ReadLane, vec![low, last, register]);
+    let pointer = b.core(e, Ty::I64, Op::Pack64(read, high));
+    let regions: Vec<Regions> = addresses(&b, &environment(48, &[]), |a| {
+        (0..2)
+            .map(|wave| {
+                a.enter(wave);
+                a.regions(pointer, 0, None, true)
+            })
+            .collect()
+    });
+    assert_eq!(
+        regions,
+        vec![Regions::one(Some(Region::Private)), Regions::one(None)],
+        "the second wave of 48 lanes lacks lane 31, so its read gives 0 and points into no region"
+    );
+}
+
+#[test]
 fn lane_reads_of_one_word_in_a_partial_wave_fix_no_value_but_zero() {
     let (mut b, k) = Build::kernel();
     let e = BlockId(0);
@@ -1393,6 +1419,20 @@ fn scratch_pointers_read_from_another_lane_equal_the_lane_own() {
     let same = b.cmp(e, IntPred::Eq, read, low);
     let found = addresses(&b, &environment(32, &[]), |a| a.bit(same, 3, None).0);
     assert_eq!(found, Some(true), "every lane has the same scratch base");
+}
+
+#[test]
+fn spills_at_the_top_of_the_scratch_offsets_reload_the_pointer_they_hold() {
+    for slot in [0xFFFF_FFF8u64, 0xFFFF_FFFE] {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I32, slot);
+        b.store(e, Space::Scratch, MemSize::B64, at, first, k.exec);
+        let spilled = b.load(e, Space::Scratch, MemSize::B64, at, k.exec);
+        let set = addresses(&b, &environment(32, &[(0, 1, 0x1000)]), |a| a.regions(spilled, 0, None, true));
+        assert_eq!(set, Regions::one(Some(Region::Allocation(1))), "the spill at {:#x} holds the buffer pointer", slot);
+    }
 }
 
 #[test]
