@@ -861,6 +861,27 @@ fn facts_keep_the_high_word_of_a_wide_word_in_a_wave_of_32_lanes_whole() {
     assert!(facts.materialized[pair.0], "the high word needs the whole pair");
 }
 
+#[test]
+fn facts_saturate_a_pair_only_when_both_halves_are_one_saturated_word() {
+    let (mut b, p) = Build::with_lanes(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Sgpr(0), Ty::I32)], 64);
+    let e = BlockId(0);
+    let three = b.constant(e, Ty::I32, 3);
+    let c = b.cmp(e, IntPred::Ult, p[1], three);
+    let ones = b.constant(e, Ty::I32, 0xffff_ffff);
+    let zero = b.constant(e, Ty::I32, 0);
+    let s = b.core(e, Ty::I32, Op::Select(c, ones, zero));
+    let t = b.core(e, Ty::I32, Op::Select(c, ones, zero));
+    let same = b.core(e, Ty::I64, Op::Pack64(s, s));
+    let twins = b.core(e, Ty::I64, Op::Pack64(s, t));
+    let skew = b.core(e, Ty::I64, Op::Pack64(s, zero));
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    assert!(facts.saturated[s.0] && facts.saturated[t.0], "a uniform choice between all ones and zero is saturated");
+    assert!(facts.saturated[same.0], "a pair of one saturated word repeats its bit in every lane");
+    assert!(!facts.saturated[twins.0], "two words are not known to agree unless they are one value");
+    assert!(!facts.saturated[skew.0], "a pair whose halves may differ is not saturated");
+}
+
 fn halves_of_two_conditions() -> (Build, [ValueId; 7]) {
     let (mut b, p) = Build::with_lanes(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)], 64);
     let e = BlockId(0);

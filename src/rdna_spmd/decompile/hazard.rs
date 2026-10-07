@@ -1356,6 +1356,76 @@ mod tests {
         }
     }
 
+    fn read_after_a_restore(outer: bool) -> (Hazards, (BlockId, usize), (BlockId, usize)) {
+        let (mut b, k, _) = Build::kernel_in(&[], 64);
+        let e = BlockId(0);
+        let near = k.buffer(&mut b, e, 0);
+        let far = k.buffer(&mut b, e, 8);
+        let flags = k.buffer(&mut b, e, 16);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, near, lane, 4);
+        let at = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, at, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let hit = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, hit, k.exec);
+        let pointer = b.core(e, Ty::I64, Op::Select(c, own, far));
+        let (region, r) = b.block(&[Ty::I1, Ty::I64, Ty::I64, Ty::I1]);
+        b.br(e, region, vec![c, pointer, far, k.exec]);
+        let low = b.wave(region, WaveOp::Ballot { high: false }, vec![r[0]]);
+        let high = b.wave(region, WaveOp::Ballot { high: true }, vec![r[0]]);
+        let lane = b.core(region, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(region, Ty::I32, 5);
+        let few = b.cmp(region, IntPred::Ult, lane, five);
+        let inner = b.int(region, IntOp::And, few, r[0]);
+        let yes = b.constant(region, Ty::I1, 1);
+        let rest = b.int(region, IntOp::Xor, few, yes);
+        let other = b.int(region, IntOp::And, rest, r[0]);
+        let any = b.wave(region, WaveOp::Any, vec![inner]);
+        let shape = [Ty::I1, Ty::I64, Ty::I32, Ty::I32, Ty::I64, Ty::I1];
+        let (then, t) = b.block(&shape);
+        let (otherwise, o) = b.block(&shape);
+        b.cond_br(region, any, (then, vec![inner, r[1], low, high, r[2], r[3]]), (otherwise, vec![other, r[1], low, high, r[2], r[3]]));
+        let (join, j) = b.block(&shape);
+        b.br(then, join, t.clone());
+        b.br(otherwise, join, o.clone());
+        let lo = b.wave(join, WaveOp::Ballot { high: false }, vec![j[0]]);
+        let hi = b.wave(join, WaveOp::Ballot { high: true }, vec![j[0]]);
+        let now = b.core(join, Ty::I64, Op::Pack64(lo, hi));
+        let saved = b.core(join, Ty::I64, Op::Pack64(j[2], j[3]));
+        let word = b.int(join, IntOp::Or, now, saved);
+        let lane = b.core(join, Ty::I32, Op::Env(Env::LaneId));
+        let wide = b.core(join, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+        let shifted = b.int(join, IntOp::LShr, word, wide);
+        let bit = b.core(join, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let valid = b.core(join, Ty::I1, Op::Env(Env::ValidLane));
+        let restored = b.int(join, IntOp::And, bit, valid);
+        let (read, x) = b.block(&[Ty::I1, Ty::I64, Ty::I64, Ty::I1]);
+        b.br(join, read, vec![restored, j[1], j[4], j[5]]);
+        let mask = if outer { x[0] } else { x[3] };
+        let load = b.here(read);
+        b.load(read, Space::Global, MemSize::B32, x[1], mask);
+        let lane = b.core(read, Ty::I32, Op::Env(Env::LaneId));
+        let mine = byte_offset(&mut b, read, x[2], lane, 4);
+        let zero = b.constant(read, Ty::I32, 0);
+        let store = b.here(read);
+        b.store(read, Space::Global, MemSize::B32, mine, zero, x[3]);
+        let h = Hazards::find(&b.program(), &environment(64, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]));
+        (h, load, store)
+    }
+
+    #[test]
+    fn find_reads_through_a_pointer_set_where_every_lane_that_reads_was_active() {
+        let (h, load, store) = read_after_a_restore(true);
+        assert!(!h.conflicts().contains(&pair(&h, load, store)), "a lane that reads after the join set its pointer into the first buffer");
+    }
+
+    #[test]
+    fn find_reports_a_read_by_lanes_whose_pointer_kept_the_other_buffer() {
+        let (h, load, store) = read_after_a_restore(false);
+        assert!(h.conflicts().contains(&pair(&h, load, store)), "a lane outside the region reads the second buffer another lane writes");
+    }
+
     fn uniform_stores(lanes: u32) -> bool {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);

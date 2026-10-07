@@ -51,10 +51,10 @@ cargo run --release --example smallpt_spmd -- --arch gfx1200
 cargo run --release --example smallpt_spmd -- --arch gfx803
 ```
 
-`smallpt_spmd` defaults to gfx803, whose kernel takes about two minutes to
-compile. On gfx803, `texture_spmd` builds a GCN3 image resource; the backend
-samples single-channel 8-bit images with point filtering at the base level of a
-linear two-dimensional image, and stops with a trap on any other resource.
+`smallpt_spmd` defaults to gfx803. On gfx803, `texture_spmd` builds a GCN3
+image resource; the backend samples single-channel 8-bit images with point
+filtering at the base level of a linear two-dimensional image, and stops with a
+trap on any other resource.
 
 Use `--num_threads N` to select the CPU thread count. Examples that support
 packed work-item execution also accept `--vec_width W`; `0` selects the
