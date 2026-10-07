@@ -8,13 +8,151 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub(super) struct Origins {
-    coarse: HashMap<ValueKey, Assumed<Regions>>,
-    refined: HashMap<ValueKey, Assumed<Regions>>,
-    active: HashSet<(ValueId, u8, Option<ValueId>, bool)>,
+    coarse: HashMap<RegionKey, Assumed<Regions>>,
+    refined: HashMap<RegionKey, Assumed<Regions>>,
+    active: HashSet<(ValueId, u8, Option<Lit>, bool)>,
     looped: BTreeMap<(ValueId, u8, bool), usize>,
     checked: BTreeSet<(ValueId, u8, bool)>,
     grown: HashMap<(ValueId, u8, bool), Regions>,
     split: HashSet<(ValueId, bool)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Lit {
+    Bit(ValueId),
+    Word(ValueId),
+    Halves(ValueId, ValueId),
+}
+
+impl Lit {
+    fn bit(self) -> Option<ValueId> {
+        match self {
+            Self::Bit(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+type RegionKey = (ValueId, u8, Option<Lit>);
+
+fn either(a: Option<Vec<Lit>>, b: Option<Vec<Lit>>) -> Option<Vec<Lit>> {
+    let mut a = a?;
+    for l in b? {
+        if !a.contains(&l) {
+            a.push(l);
+        }
+    }
+    Some(a)
+}
+
+fn split<'a, Q: Queries<'a>>(q: &mut Q, block: BlockId, lit: Lit) -> Option<Vec<Lit>> {
+    let (f, facts) = (q.program().f, q.program().facts);
+    let local = |v: ValueId| matches!(facts.site[v.0], Site::Param { block: b, .. } if b == block);
+    let inst = |v: ValueId| facts.inst(f, v);
+    match lit {
+        Lit::Bit(v) => {
+            if local(v) {
+                return Some(vec![lit]);
+            }
+            match facts.op(f, v)? {
+                Op::Const(_, k) => (k & 1 == 0).then(Vec::new),
+                Op::Int(IntOp::And, a, b) => split(q, block, Lit::Bit(a)).or_else(|| split(q, block, Lit::Bit(b))),
+                Op::Int(IntOp::Or, a, b) => either(split(q, block, Lit::Bit(a)), split(q, block, Lit::Bit(b))),
+                Op::Select(_, a, b) => either(split(q, block, Lit::Bit(a)), split(q, block, Lit::Bit(b))),
+                Op::Convert(Cvt::Trunc, Ty::I1, shifted) => match facts.op(f, shifted) {
+                    Some(Op::Int(IntOp::LShr, w, k)) if facts.is_lane_shift(f, w, k) => split(q, block, Lit::Word(w)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Lit::Word(w) => {
+            if f.types[w.0].bits() < f.lanes {
+                return None;
+            }
+            if local(w) {
+                return Some(vec![lit]);
+            }
+            match inst(w)? {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Ballot { high: false }),
+                    inputs,
+                    ..
+                } if f.lanes == 32 => split(q, block, Lit::Bit(inputs[0])),
+                Inst::Core { op, .. } => match *op {
+                    Op::Const(_, k) => (k == 0).then(Vec::new),
+                    Op::Pack64(lo, hi) if f.lanes == 64 => split(q, block, Lit::Halves(lo, hi)),
+                    Op::Int(IntOp::And, x, y) => split(q, block, Lit::Word(x)).or_else(|| split(q, block, Lit::Word(y))),
+                    Op::Int(IntOp::Or, x, y) => either(split(q, block, Lit::Word(x)), split(q, block, Lit::Word(y))),
+                    Op::Select(_, x, y) => either(split(q, block, Lit::Word(x)), split(q, block, Lit::Word(y))),
+                    Op::Convert(Cvt::Bitcast, _, x) => split(q, block, Lit::Word(x)),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        Lit::Halves(lo, hi) => {
+            if f.lanes != 64 {
+                return None;
+            }
+            if local(lo) && local(hi) {
+                return Some(vec![lit]);
+            }
+            match (inst(lo)?, inst(hi)?) {
+                (
+                    Inst::Effect {
+                        op: EffectOp::Wave(WaveOp::Ballot { high: false }),
+                        inputs: x,
+                        ..
+                    },
+                    Inst::Effect {
+                        op: EffectOp::Wave(WaveOp::Ballot { high: true }),
+                        inputs: y,
+                        ..
+                    },
+                ) if x[0] == y[0] => split(q, block, Lit::Bit(x[0])),
+                (Inst::Core { op: x, .. }, Inst::Core { op: y, .. }) => match (*x, *y) {
+                    (Op::UnpackLo(a), Op::UnpackHi(b)) if a == b => split(q, block, Lit::Word(a)),
+                    (Op::Const(_, 0), Op::Const(_, 0)) => Some(Vec::new()),
+                    (Op::Int(IntOp::And, a, b), Op::Int(IntOp::And, c, d)) => {
+                        split(q, block, Lit::Halves(a, c)).or_else(|| split(q, block, Lit::Halves(b, d)))
+                    }
+                    (Op::Int(IntOp::Or, a, b), Op::Int(IntOp::Or, c, d)) => {
+                        either(split(q, block, Lit::Halves(a, c)), split(q, block, Lit::Halves(b, d)))
+                    }
+                    (Op::Select(s, a, b), Op::Select(t, c, d)) if s == t => {
+                        either(split(q, block, Lit::Halves(a, c)), split(q, block, Lit::Halves(b, d)))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+    }
+}
+
+fn implied<'a, Q: Queries<'a>>(q: &mut Q, lit: Lit, c: ValueId) -> bool {
+    match lit {
+        Lit::Bit(v) => q.reason(|conditions, program| conditions.assumes(program, v, c)),
+        Lit::Word(w) => q.reason(|conditions, program| conditions.holds(program, w, c, None)),
+        Lit::Halves(lo, hi) => q.reason(|conditions, program| conditions.halves_hold(program, lo, hi, c)),
+    }
+}
+
+fn carried<'a, Q: Queries<'a>>(q: &mut Q, parts: &[Lit], e: (BlockId, usize)) -> Vec<Lit> {
+    let facts = q.program().facts;
+    let arg = |v: ValueId| match facts.site[v.0] {
+        Site::Param { index, .. } => q.program().edge_arg(e, index),
+        _ => unreachable!("a split literal names the parameters of its block"),
+    };
+    parts
+        .iter()
+        .map(|&l| match l {
+            Lit::Bit(v) => Lit::Bit(arg(v)),
+            Lit::Word(w) => Lit::Word(arg(w)),
+            Lit::Halves(lo, hi) => Lit::Halves(arg(lo), arg(hi)),
+        })
+        .collect()
 }
 
 impl Origins {
@@ -26,7 +164,7 @@ impl Origins {
     }
 
     pub(super) fn regions<'a, Q: Queries<'a>>(&mut self, q: &mut Q, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Regions {
-        self.assumed_regions(q, v, lane, assume, refine).0
+        self.assumed_regions(q, v, lane, assume.map(Lit::Bit), refine).0
     }
 
     pub(super) fn read_regions<'a, Q: Queries<'a>>(&mut self, q: &mut Q, at: (BlockId, usize), lane: usize, exec: Option<ValueId>, refine: bool) -> Regions {
@@ -42,7 +180,7 @@ impl Origins {
         set
     }
 
-    fn assumed_regions<'a, Q: Queries<'a>>(&mut self, q: &mut Q, v: ValueId, lane: usize, assume: Option<ValueId>, refine: bool) -> Assumed<Regions> {
+    fn assumed_regions<'a, Q: Queries<'a>>(&mut self, q: &mut Q, v: ValueId, lane: usize, assume: Option<Lit>, refine: bool) -> Assumed<Regions> {
         if let Some(r) = q.program().provenance.known[v.0] {
             return unassumed(Regions::one(r));
         }
@@ -82,7 +220,7 @@ impl Origins {
         q: &mut Q,
         v: ValueId,
         lane: usize,
-        assume: Option<ValueId>,
+        assume: Option<Lit>,
         refine: bool,
         reliance: &mut Reliance,
     ) -> Regions {
@@ -95,7 +233,9 @@ impl Origins {
         }
         let none = || Regions::one(None);
         if let Some(&root) = q.program().copies.get(&v) {
-            return regions!(root);
+            if assume.is_none() {
+                return regions!(root);
+            }
         }
         let (f, facts) = (q.program().f, q.program().facts);
         match facts.site[v.0] {
@@ -109,13 +249,26 @@ impl Origins {
                 let header = q.program().headers.contains(&block);
                 let own = q.program().rank[&block];
                 let mut set = Regions::default();
+                let parts = assume.and_then(|lit| split(q, block, lit));
                 for &e in &facts.incoming[&block] {
                     if header && q.program().rank[&e.0] >= own {
                         continue;
                     }
-                    let (r, u) = self.assumed_regions(q, q.program().edge_arg(e, index), lane, None, refine);
-                    reliance.lane |= u.lane;
-                    set.union(&r);
+                    let arg = q.program().edge_arg(e, index);
+                    let Some(parts) = &parts else {
+                        let (r, u) = self.assumed_regions(q, arg, lane, None, refine);
+                        reliance.lane |= u.lane;
+                        reliance.open |= u.open;
+                        set.union(&r);
+                        continue;
+                    };
+                    reliance.used = true;
+                    for given in carried(q, parts, e) {
+                        let (r, u) = self.assumed_regions(q, arg, lane, Some(given), refine);
+                        reliance.lane |= u.lane;
+                        reliance.open |= u.open;
+                        set.union(&r);
+                    }
                 }
                 if q.program().provenance.plain[v.0] {
                     set.add(None);
@@ -147,7 +300,7 @@ impl Origins {
                     },
                     Op::Select(c, a, b) => {
                         let root = q.program().copies.get(&c).copied().unwrap_or(c);
-                        if assume.is_some_and(|p| q.reason(|conditions, program| conditions.assumes(program, p, root))) {
+                        if assume.is_some_and(|lit| implied(q, lit, root)) {
                             reliance.used = true;
                             return regions!(a);
                         }
@@ -156,7 +309,7 @@ impl Origins {
                             return x;
                         }
                         if refine {
-                            let (bit, u) = q.bit(c, lane, assume);
+                            let (bit, u) = q.bit(c, lane, assume.and_then(Lit::bit));
                             *reliance |= u;
                             reliance.lane |= !facts.uniform[c.0];
                             match bit {
@@ -223,7 +376,7 @@ impl Origins {
                     let address = regions!(inputs[0]);
                     let kernarg = address.any || address.list.contains(&Some(Region::Kernarg));
                     if *space == Space::Scratch || kernarg {
-                        let (value, u) = q.value(v, lane, assume);
+                        let (value, u) = q.value(v, lane, assume.and_then(Lit::bit));
                         *reliance |= u;
                         reliance.lane |= !facts.uniform[v.0];
                         let mut set = Regions::one(value.region);
@@ -344,7 +497,7 @@ impl Origins {
             }
             let mask = q.program().provenance.spills[i].mask;
             for k in 0..q.program().provenance.spills[i].data.len() {
-                let (r, u) = self.assumed_regions(q, q.program().provenance.spills[i].data[k], lane, Some(mask), refine);
+                let (r, u) = self.assumed_regions(q, q.program().provenance.spills[i].data[k], lane, Some(Lit::Bit(mask)), refine);
                 reliance |= u;
                 set.union(&r);
             }
@@ -507,5 +660,169 @@ impl Origins {
             }
         }
         set
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::testing::*;
+    use super::super::tests::addresses;
+    use super::*;
+
+    struct Masks {
+        b: Build,
+        block: BlockId,
+        params: [ValueId; 4],
+        tests: Vec<(&'static str, ValueId)>,
+    }
+
+    fn masks() -> Masks {
+        let (mut b, k, _) = Build::kernel_in(&[], 64);
+        let (block, p) = b.block(&[Ty::I1, Ty::I1, Ty::I32, Ty::I32]);
+        let zero = b.constant(BlockId(0), Ty::I32, 0);
+        b.br(BlockId(0), block, vec![k.exec, k.exec, zero, zero]);
+        let lo = b.wave(block, WaveOp::Ballot { high: false }, vec![p[0]]);
+        let hi = b.wave(block, WaveOp::Ballot { high: true }, vec![p[0]]);
+        let now = b.core(block, Ty::I64, Op::Pack64(lo, hi));
+        let saved = b.core(block, Ty::I64, Op::Pack64(p[2], p[3]));
+        let lane = b.core(block, Ty::I32, Op::Env(Env::LaneId));
+        let wide = b.core(block, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+        let valid = b.core(block, Ty::I1, Op::Env(Env::ValidLane));
+        let own = |b: &mut Build, word: ValueId| {
+            let shifted = b.int(block, IntOp::LShr, word, wide);
+            let bit = b.core(block, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+            b.int(block, IntOp::And, bit, valid)
+        };
+        let either = b.int(block, IntOp::Or, now, saved);
+        let restored = own(&mut b, either);
+        let both = b.int(block, IntOp::And, now, saved);
+        let narrowed = own(&mut b, both);
+        let flipped = b.int(block, IntOp::Xor, now, saved);
+        let toggled = own(&mut b, flipped);
+        let and = b.int(block, IntOp::And, p[0], p[1]);
+        let or = b.int(block, IntOp::Or, p[0], p[1]);
+        let picked = b.core(block, Ty::I1, Op::Select(p[1], p[0], restored));
+        let halves_lo = b.core(block, Ty::I32, Op::UnpackLo(either));
+        let halves_hi = b.core(block, Ty::I32, Op::UnpackHi(either));
+        let repacked = b.core(block, Ty::I64, Op::Pack64(halves_lo, halves_hi));
+        let unpacked = own(&mut b, repacked);
+        let tests = vec![
+            ("restored", restored),
+            ("narrowed", narrowed),
+            ("toggled", toggled),
+            ("and", and),
+            ("or", or),
+            ("picked", picked),
+            ("unpacked", unpacked),
+        ];
+        Masks {
+            b,
+            block,
+            params: [p[0], p[1], p[2], p[3]],
+            tests,
+        }
+    }
+
+    fn evaluate(f: &Func, block: BlockId, state: &BTreeMap<ValueId, Vec<u64>>) -> BTreeMap<ValueId, Vec<u64>> {
+        let lanes = f.lanes as usize;
+        let mut values = state.clone();
+        for inst in &f.blocks[&block].insts {
+            match inst {
+                Inst::Core { value, ty, op } => {
+                    let g = |v: ValueId, l: usize| values[&v][l];
+                    let out: Vec<u64> = (0..lanes)
+                        .map(|l| {
+                            let x = match *op {
+                                Op::Const(_, k) => k,
+                                Op::Env(Env::LaneId) => l as u64,
+                                Op::Env(Env::ValidLane) => 1,
+                                Op::Int(IntOp::And, a, b) => g(a, l) & g(b, l),
+                                Op::Int(IntOp::Or, a, b) => g(a, l) | g(b, l),
+                                Op::Int(IntOp::Xor, a, b) => g(a, l) ^ g(b, l),
+                                Op::Int(IntOp::LShr, a, b) => g(a, l).checked_shr(g(b, l) as u32).unwrap_or(0),
+                                Op::Convert(_, _, a) => g(a, l),
+                                Op::Pack64(lo, hi) => (g(lo, l) & 0xffff_ffff) | (g(hi, l) << 32),
+                                Op::UnpackLo(a) => g(a, l) & 0xffff_ffff,
+                                Op::UnpackHi(a) => g(a, l) >> 32,
+                                Op::Select(c, a, b) => {
+                                    if g(c, l) & 1 != 0 {
+                                        g(a, l)
+                                    } else {
+                                        g(b, l)
+                                    }
+                                }
+                                other => panic!("{:?}", other),
+                            };
+                            match ty {
+                                Ty::I1 => x & 1,
+                                Ty::I32 => x & 0xffff_ffff,
+                                _ => x,
+                            }
+                        })
+                        .collect();
+                    values.insert(*value, out);
+                }
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Ballot { high }),
+                    inputs,
+                    outputs,
+                    ..
+                } => {
+                    let first = if *high { 32 } else { 0 };
+                    let word = (0..32).filter(|k| values[&inputs[0]][first + k] & 1 != 0).fold(0u64, |w, k| w | 1 << k);
+                    values.insert(outputs[0].0, vec![word; lanes]);
+                }
+                _ => {}
+            }
+        }
+        values
+    }
+
+    fn holds(lit: Lit, values: &BTreeMap<ValueId, Vec<u64>>, lane: usize) -> bool {
+        match lit {
+            Lit::Bit(v) => values[&v][lane] & 1 != 0,
+            Lit::Word(w) => values[&w][lane] >> lane & 1 != 0,
+            Lit::Halves(lo, hi) => {
+                let word = (values[&lo][lane] & 0xffff_ffff) | (values[&hi][lane] << 32);
+                word >> lane & 1 != 0
+            }
+        }
+    }
+
+    #[test]
+    fn a_split_mask_holds_one_of_its_parts_in_every_lane_where_it_holds() {
+        let Masks { b, block, params, tests } = masks();
+        let env = environment(64, &[]);
+        let splits: Vec<(&str, Option<Vec<Lit>>)> = addresses(&b, &env, |a| {
+            tests.iter().map(|&(name, v)| (name, split(&mut a.values, block, Lit::Bit(v)))).collect()
+        });
+        let named = |name: &str| splits.iter().find(|(n, _)| *n == name).unwrap().1.clone();
+        assert_eq!(named("restored"), Some(vec![Lit::Bit(params[0]), Lit::Halves(params[2], params[3])]), "a restore is the mask or the saved mask");
+        assert_eq!(named("unpacked"), named("restored"), "halves of a word split as the word does");
+        assert!(named("toggled").is_none(), "a toggled bit names no part that must hold");
+        let mut r = Random::new(17);
+        for _ in 0..300 {
+            let mut state = BTreeMap::new();
+            for (k, &p) in params.iter().enumerate() {
+                let value: Vec<u64> = if k < 2 {
+                    (0..64).map(|_| r.below(2)).collect()
+                } else {
+                    vec![r.next() & 0xffff_ffff; 64]
+                };
+                state.insert(p, value);
+            }
+            let values = evaluate(&b.f, block, &state);
+            for (name, parts) in &splits {
+                let Some(parts) = parts else {
+                    continue;
+                };
+                let v = tests.iter().find(|(n, _)| n == name).unwrap().1;
+                for lane in 0..64 {
+                    if values[&v][lane] & 1 != 0 {
+                        assert!(parts.iter().any(|&l| holds(l, &values, lane)), "{}: lane {} holds the mask but no part", name, lane);
+                    }
+                }
+            }
+        }
     }
 }

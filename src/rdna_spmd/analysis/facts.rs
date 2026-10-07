@@ -448,6 +448,7 @@ impl Facts {
                         Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a)
                         | Op::UnpackLo(a)
                         | Op::UnpackHi(a) => self.saturated[a.0],
+                        Op::Pack64(a, b) => a == b && self.saturated[a.0],
                         _ => false,
                     };
                     if !s && self.saturated[value.0] {

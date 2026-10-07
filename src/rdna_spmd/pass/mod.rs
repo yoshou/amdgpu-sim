@@ -2,19 +2,25 @@ mod adjacency;
 mod branch_selects;
 mod dce;
 mod entry;
+mod halves;
 mod idioms;
 mod pairs;
 mod predication;
+mod private_slots;
 mod simplify;
+#[cfg(test)]
+mod testing;
 mod uniform_queries;
 
 pub use adjacency::Adjacency;
 pub use branch_selects::BranchSelects;
 pub use dce::{Dce, DeadParams};
 pub use entry::PacketState;
+pub use halves::Halves;
 pub use idioms::{Idiom, Idioms};
 pub use pairs::{Pairs, WideMemory};
 pub use predication::Predication;
+pub use private_slots::PrivateSlots;
 pub use simplify::Simplify;
 pub use uniform_queries::UniformQueries;
 

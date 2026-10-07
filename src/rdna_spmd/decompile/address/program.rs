@@ -808,6 +808,10 @@ impl Conditions {
         }
     }
 
+    pub(super) fn halves_hold(&self, program: &Program, lo: ValueId, hi: ValueId, v: ValueId) -> bool {
+        self.half_holds(program, lo, false, v, None) && self.half_holds(program, hi, true, v, None)
+    }
+
     fn half_holds(&self, program: &Program, w: ValueId, high: bool, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         let w = program.copies.get(&w).copied().unwrap_or(w);
         let v = program.copies.get(&v).copied().unwrap_or(v);

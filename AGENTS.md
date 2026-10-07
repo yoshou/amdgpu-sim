@@ -38,7 +38,7 @@
 - Architecture defaults vary by example, so be explicit when running commands:
   - `smallpt`, `bitonic_sort`, `histogram`, and `texture` default to `gfx803`
   - `raytracing` defaults to `gfx1200`
-  - among the `*_spmd` examples, `smallpt_spmd` defaults to `gfx803` (about two minutes of compilation) and the others default to `gfx1200`; `bitonic_sort_spmd`, `histogram_spmd`, `smallpt_spmd`, and `texture_spmd` accept both architectures
+  - among the `*_spmd` examples, `smallpt_spmd` defaults to `gfx803` and the others default to `gfx1200`; `bitonic_sort_spmd`, `histogram_spmd`, `smallpt_spmd`, and `texture_spmd` accept both architectures
   - `simple_hgemm` should be run with `--arch gfx1200`; its source still has a `gfx942` default even though this repository ships `examples/simple_hgemm/kernel_gfx1200.o` and the dispatcher supports `gfx1200`
 - `smallpt` has repository-specific CLI details already captured in `.agents/skills/run-smallpt/SKILL.md`: it accepts `--arch` and `--nb_samples`, and it writes `image.png` at the repository root.
 - Register files are stored as flattened `(elem, register)` arrays in both processor implementations. The RDNA path uses `aligned_vec::AVec` for aligned storage, which is part of the performance-sensitive design rather than an incidental implementation detail.

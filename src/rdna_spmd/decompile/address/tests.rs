@@ -3509,3 +3509,71 @@ fn comparisons_with_constants_under_an_order_over_bounded_words_hold_every_value
     let wrong = byte_order_answers(false);
     assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(10)]);
 }
+
+fn read_after_a_restore() -> (Build, ValueId, ValueId, ValueId) {
+    let (mut b, k, _) = Build::kernel_in(&[], 64);
+    let e = BlockId(0);
+    let near = k.buffer(&mut b, e, 0);
+    let far = k.buffer(&mut b, e, 8);
+    let flags = k.buffer(&mut b, e, 16);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, near, lane, 4);
+    let at = byte_offset(&mut b, e, flags, lane, 4);
+    let flag = b.load(e, Space::Global, MemSize::B32, at, k.exec);
+    let zero = b.constant(e, Ty::I32, 0);
+    let hit = b.cmp(e, IntPred::Ne, flag, zero);
+    let c = b.int(e, IntOp::And, hit, k.exec);
+    let pointer = b.core(e, Ty::I64, Op::Select(c, own, far));
+    let (region, r) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+    b.br(e, region, vec![c, pointer, k.exec]);
+    let low = b.wave(region, WaveOp::Ballot { high: false }, vec![r[0]]);
+    let high = b.wave(region, WaveOp::Ballot { high: true }, vec![r[0]]);
+    let lane = b.core(region, Ty::I32, Op::Env(Env::LaneId));
+    let five = b.constant(region, Ty::I32, 5);
+    let few = b.cmp(region, IntPred::Ult, lane, five);
+    let inner = b.int(region, IntOp::And, few, r[0]);
+    let yes = b.constant(region, Ty::I1, 1);
+    let rest = b.int(region, IntOp::Xor, few, yes);
+    let other = b.int(region, IntOp::And, rest, r[0]);
+    let any = b.wave(region, WaveOp::Any, vec![inner]);
+    let shape = [Ty::I1, Ty::I64, Ty::I32, Ty::I32, Ty::I1];
+    let (then, t) = b.block(&shape);
+    let (otherwise, o) = b.block(&shape);
+    b.cond_br(region, any, (then, vec![inner, r[1], low, high, r[2]]), (otherwise, vec![other, r[1], low, high, r[2]]));
+    let (join, j) = b.block(&shape);
+    b.br(then, join, t.clone());
+    b.br(otherwise, join, o.clone());
+    let lo = b.wave(join, WaveOp::Ballot { high: false }, vec![j[0]]);
+    let hi = b.wave(join, WaveOp::Ballot { high: true }, vec![j[0]]);
+    let now = b.core(join, Ty::I64, Op::Pack64(lo, hi));
+    let saved = b.core(join, Ty::I64, Op::Pack64(j[2], j[3]));
+    let word = b.int(join, IntOp::Or, now, saved);
+    let lane = b.core(join, Ty::I32, Op::Env(Env::LaneId));
+    let wide = b.core(join, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let shifted = b.int(join, IntOp::LShr, word, wide);
+    let bit = b.core(join, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let valid = b.core(join, Ty::I1, Op::Env(Env::ValidLane));
+    let restored = b.int(join, IntOp::And, bit, valid);
+    let (read, x) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+    b.br(join, read, vec![restored, j[1], j[4]]);
+    (b, x[1], x[0], x[2])
+}
+
+#[test]
+fn a_pointer_read_after_a_restore_points_where_the_reading_lanes_set_it() {
+    let (b, pointer, restored, everyone) = read_after_a_restore();
+    let env = environment(64, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]);
+    let near = Regions::one(Some(Region::Allocation(1)));
+    for refine in [false, true] {
+        let (inside, outside) = addresses(&b, &env, |a| {
+            (a.regions(pointer, 0, Some(restored), refine), a.regions(pointer, 0, Some(everyone), refine))
+        });
+        assert_eq!(inside, near, "refine {}: a lane in the restored mask was in the region when it set its pointer", refine);
+        assert!(
+            outside.list.contains(&Some(Region::Allocation(2))),
+            "refine {}: a lane outside the region keeps the second buffer: {:?}",
+            refine,
+            outside
+        );
+    }
+}
