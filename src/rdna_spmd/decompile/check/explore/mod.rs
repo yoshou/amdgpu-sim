@@ -502,22 +502,8 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                 let leaves = self.eval.leaves(w.same.unwrap());
                 self.eval.q.and(cond, leaves)
             } else if let (true, Some(gw), Some(gl)) = (boolean, w.bits, l.bits) {
-                let equal = self.eval.logic().m.iff(gw, gl);
-                if self.eval.decide(equal, cond, WAVE) == Some(true) {
-                    let q = &mut *self.eval.q;
-                    let mut atoms: BTreeSet<u32> =
-                        q.logic().support(gw).iter().copied().collect();
-                    atoms.extend(q.logic().support(gl).iter().copied());
-                    let mut hs = Bdd::FALSE;
-                    for var in atoms {
-                        if let Atom::Bit(v) | Atom::View(v) | Atom::WordBit(v, _) = q.logic().atom_of(var) {
-                            hs = q.or(hs, q.h(v));
-                        }
-                    }
-                    q.and(cond, hs)
-                } else {
-                    cond
-                }
+                let varies = self.eval.varies(gw, gl);
+                self.eval.q.and(cond, varies)
             } else {
                 cond
             };
@@ -537,7 +523,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                     let mut foreign: HashMap<u32, ()> = HashMap::default();
                     let supports = [logic.support(differs), logic.support(relation)];
                     for &v in supports.iter().flat_map(|s| s.iter()) {
-                        if !matches!(logic.atom_of(v), Atom::Marker(_)) && logic.scope(facts, v) != Some(block) {
+                        if !matches!(logic.atom_of(v), Atom::Marker(_) | Atom::Lane(5)) && logic.scope(facts, v) != Some(block) {
                             foreign.insert(v, ());
                         }
                     }

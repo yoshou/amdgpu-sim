@@ -4854,3 +4854,207 @@ fn differences_hold_for_operations_the_relations_of_their_operands_leave_open() 
     let missed = check_differences(&b, &[], &cases, false);
     assert!(missed.is_empty(), "differences that miss a possible disagreement: {:?}", missed);
 }
+
+fn restored_after_lanes_leave(lanes: u32) -> Build {
+    let (mut b, k, _) = Build::kernel_in(&[], lanes);
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let flags = k.buffer(&mut b, e, 8);
+    let wide = lanes == 64;
+    let mask_shape = if wide { vec![Ty::I32, Ty::I32] } else { vec![Ty::I32] };
+    let ballot = |b: &mut Build, block: BlockId, bit: ValueId| -> Vec<ValueId> {
+        let low = b.wave(block, WaveOp::Ballot { high: false }, vec![bit]);
+        if wide {
+            let high = b.wave(block, WaveOp::Ballot { high: true }, vec![bit]);
+            vec![low, high]
+        } else {
+            vec![low]
+        }
+    };
+    let word = |b: &mut Build, block: BlockId, parts: &[ValueId]| -> ValueId {
+        match parts {
+            [low, high] => b.core(block, Ty::I64, Op::Pack64(*low, *high)),
+            [low] => *low,
+            _ => unreachable!(),
+        }
+    };
+    let own = |b: &mut Build, block: BlockId, w: ValueId| -> ValueId {
+        let lane = b.core(block, Ty::I32, Op::Env(Env::LaneId));
+        let shift = if wide { b.core(block, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane)) } else { lane };
+        let shifted = b.int(block, IntOp::LShr, w, shift);
+        b.core(block, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
+    };
+    let saved = ballot(&mut b, e, k.exec);
+    let zero = b.constant(e, Ty::I32, 0);
+    let mut head_shape = vec![Ty::I1];
+    head_shape.extend(&mask_shape);
+    head_shape.extend([Ty::I32, Ty::I64, Ty::I64]);
+    let (head, h) = b.block(&head_shape);
+    let (exit, x) = b.block(&head_shape);
+    let mut args = vec![k.exec];
+    args.extend(&saved);
+    args.extend([zero, buf, flags]);
+    b.br(e, head, args);
+    let m = mask_shape.len();
+    let (count, out, flag_buf) = (h[1 + m], h[2 + m], h[3 + m]);
+    let lane = b.core(head, Ty::I32, Op::Env(Env::LaneId));
+    let wave = b.constant(head, Ty::I32, lanes as u64);
+    let row = b.int(head, IntOp::Mul, count, wave);
+    let item = b.int(head, IntOp::Add, row, lane);
+    let at = byte_offset(&mut b, head, flag_buf, item, 4);
+    let flag = b.load(head, Space::Global, MemSize::B32, at, h[0]);
+    let z = b.constant(head, Ty::I32, 0);
+    let set = b.cmp(head, IntPred::Ne, flag, z);
+    let stay = b.int(head, IntOp::And, set, h[0]);
+    let parts = ballot(&mut b, head, stay);
+    let remaining = word(&mut b, head, &parts);
+    let none = b.constant(head, b.f.types[remaining.0], 0);
+    let more = b.cmp(head, IntPred::Ne, remaining, none);
+    let next = own(&mut b, head, remaining);
+    let one = b.constant(head, Ty::I32, 1);
+    let after = b.int(head, IntOp::Add, count, one);
+    let mut again = vec![next];
+    again.extend(&h[1..1 + m]);
+    again.extend([after, out, flag_buf]);
+    let mut leave = vec![h[0]];
+    leave.extend(&h[1..1 + m]);
+    leave.extend([after, out, flag_buf]);
+    b.cond_br(head, more, (head, again), (exit, leave));
+    let left = ballot(&mut b, exit, x[0]);
+    let left = word(&mut b, exit, &left);
+    let kept = word(&mut b, exit, &x[1..1 + m]);
+    let back = b.int(exit, IntOp::Or, left, kept);
+    let restored = own(&mut b, exit, back);
+    let valid = b.core(exit, Ty::I1, Op::Env(Env::ValidLane));
+    let active = b.int(exit, IntOp::And, restored, valid);
+    let lane = b.core(exit, Ty::I32, Op::Env(Env::LaneId));
+    let slot = byte_offset(&mut b, exit, x[2 + m], lane, 4);
+    let one = b.constant(exit, Ty::I32, 1);
+    b.store(exit, Space::Global, MemSize::B32, slot, one, active);
+    b
+}
+
+#[test]
+fn prove_restores_a_mask_saved_before_lanes_leave_a_loop_in_both_wave_sizes() {
+    let [narrow, _] = both(&restored_after_lanes_leave(32));
+    let [wide, _] = both(&restored_after_lanes_leave(64));
+    let counts = |k: &Kept| (k.queries.len(), k.words.len(), k.meets.len());
+    assert_eq!(counts(&wide), counts(&narrow), "the halves of the saved mask restore exactly the lanes they held");
+}
+
+fn restored_after_a_skipped_branch(lanes: u32) -> Build {
+    let (mut b, k, _) = Build::kernel_in(&[], lanes);
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let flags = k.buffer(&mut b, e, 8);
+    let wide = lanes == 64;
+    let mask_shape = if wide { vec![Ty::I32, Ty::I32] } else { vec![Ty::I32] };
+    let m = mask_shape.len();
+    let ballot = |b: &mut Build, block: BlockId, bit: ValueId| -> Vec<ValueId> {
+        let low = b.wave(block, WaveOp::Ballot { high: false }, vec![bit]);
+        if wide {
+            let high = b.wave(block, WaveOp::Ballot { high: true }, vec![bit]);
+            vec![low, high]
+        } else {
+            vec![low]
+        }
+    };
+    let word = |b: &mut Build, block: BlockId, parts: &[ValueId]| -> ValueId {
+        match parts {
+            [low, high] => b.core(block, Ty::I64, Op::Pack64(*low, *high)),
+            [low] => *low,
+            _ => unreachable!(),
+        }
+    };
+    let own = |b: &mut Build, block: BlockId, w: ValueId| -> ValueId {
+        let lane = b.core(block, Ty::I32, Op::Env(Env::LaneId));
+        let shift = if wide { b.core(block, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane)) } else { lane };
+        let shifted = b.int(block, IntOp::LShr, w, shift);
+        let bit = b.core(block, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let valid = b.core(block, Ty::I1, Op::Env(Env::ValidLane));
+        b.int(block, IntOp::And, bit, valid)
+    };
+    let mut shape = vec![Ty::I1];
+    shape.extend(&mask_shape);
+    shape.extend([Ty::I64, Ty::I64]);
+    let (test, t) = b.block(&shape);
+    let (body, y) = b.block(&shape);
+    let (join, j) = b.block(&shape);
+    let saved = ballot(&mut b, e, k.exec);
+    let mut first = vec![k.exec];
+    first.extend(&saved);
+    first.extend([buf, flags]);
+    b.br(e, test, first);
+    let lane = b.core(test, Ty::I32, Op::Env(Env::LaneId));
+    let at = byte_offset(&mut b, test, t[2 + m], lane, 4);
+    let flag = b.load(test, Space::Global, MemSize::B32, at, t[0]);
+    let z = b.constant(test, Ty::I32, 0);
+    let set = b.cmp(test, IntPred::Ne, flag, z);
+    let inside = b.int(test, IntOp::And, set, t[0]);
+    let entering = ballot(&mut b, test, inside);
+    let entering = word(&mut b, test, &entering);
+    let none = b.constant(test, b.f.types[entering.0], 0);
+    let any = b.cmp(test, IntPred::Ne, entering, none);
+    let held = ballot(&mut b, test, t[0]);
+    let held = word(&mut b, test, &held);
+    let skipped = own(&mut b, test, held);
+    let taken = own(&mut b, test, entering);
+    let mut into = vec![taken];
+    into.extend(&t[1..1 + m]);
+    into.extend([t[1 + m], t[2 + m]]);
+    let mut past = vec![skipped];
+    past.extend(&t[1..1 + m]);
+    past.extend([t[1 + m], t[2 + m]]);
+    b.cond_br(test, any, (body, into), (join, past));
+    let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+    let slot = byte_offset(&mut b, body, y[1 + m], lane, 4);
+    let one = b.constant(body, Ty::I32, 1);
+    b.store(body, Space::Global, MemSize::B32, slot, one, y[0]);
+    let left = ballot(&mut b, body, y[0]);
+    let left = word(&mut b, body, &left);
+    let kept = word(&mut b, body, &y[1..1 + m]);
+    let back = b.int(body, IntOp::Or, left, kept);
+    let restored = own(&mut b, body, back);
+    let mut out = vec![restored];
+    out.extend(&y[1..1 + m]);
+    out.extend([y[1 + m], y[2 + m]]);
+    b.br(body, join, out);
+    let lane = b.core(join, Ty::I32, Op::Env(Env::LaneId));
+    let base = b.constant(join, Ty::I64, 4096);
+    let far = b.int(join, IntOp::Add, j[1 + m], base);
+    let slot = byte_offset(&mut b, join, far, lane, 4);
+    let two = b.constant(join, Ty::I32, 2);
+    b.store(join, Space::Global, MemSize::B32, slot, two, j[0]);
+    b
+}
+
+#[test]
+fn prove_restores_a_mask_saved_around_a_branch_every_lane_may_skip_in_both_wave_sizes() {
+    let [narrow, _] = both(&restored_after_a_skipped_branch(32));
+    let [wide, _] = both(&restored_after_a_skipped_branch(64));
+    let counts = |k: &Kept| (k.queries.len(), k.words.len(), k.meets.len());
+    assert_eq!(counts(&wide), counts(&narrow), "the halves of the saved mask restore exactly the lanes they held");
+}
+
+#[test]
+fn an_eager_check_stops_early_with_the_same_verdict() {
+    let programs = [detour_home(false).0, detour_home(true).0, carried_query(false).0, carried_query(true).0];
+    for b in &programs {
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(&b.f, &facts).unwrap();
+        let hazards = no_hazards();
+        let listed = search::listed(&b.f, &facts, &hazards);
+        let verdict = |eager: bool| {
+            let logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &listed);
+            let mut check = Check::new(&b.f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+            if eager {
+                check.eager();
+            }
+            let proven = check.run();
+            (proven, check.violations().len())
+        };
+        let (patient, eager) = (verdict(false), verdict(true));
+        assert_eq!(eager.0, patient.0, "stopping early cannot change whether the program proves");
+        assert!(!eager.0 && eager.1 >= 1 && eager.1 <= patient.1, "{:?} {:?}", eager, patient);
+    }
+}
