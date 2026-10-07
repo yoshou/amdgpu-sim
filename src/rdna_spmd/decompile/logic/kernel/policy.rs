@@ -83,7 +83,7 @@ impl Policy {
             }
         }
         while let Some(v) = pending.pop() {
-            for a in sources(f, facts, v) {
+            for a in facts.materialized_sources(f, v) {
                 if !facts.lane_word[a.0] {
                     continue;
                 }
@@ -92,6 +92,29 @@ impl Policy {
                     whole[a.0] = joined;
                     pending.push(a);
                 }
+            }
+        }
+        for &id in &facts.order {
+            for inst in &f.blocks[&id].insts {
+                let Inst::Core { value, .. } = *inst else {
+                    continue;
+                };
+                if !facts.lane_word[value.0] {
+                    continue;
+                }
+                let words: Vec<ValueId> = facts
+                    .materialized_sources(f, value)
+                    .into_iter()
+                    .filter(|a| facts.lane_word[a.0])
+                    .collect();
+                if words.is_empty() {
+                    continue;
+                }
+                let mut all = Bdd::TRUE;
+                for a in words {
+                    all = m.and(all, whole[a.0]);
+                }
+                whole[value.0] = m.or(whole[value.0], all);
             }
         }
         Self {
@@ -195,20 +218,6 @@ pub(super) fn settled(atoms: &mut Atoms, m: &mut Manager, f: Bdd, kept: &BTreeSe
         return f;
     }
     m.compose(f, &|var| markers.get(&var).copied())
-}
-
-fn sources(f: &Func, facts: &Facts, v: ValueId) -> Vec<ValueId> {
-    match facts.site[v.0] {
-        Site::Param { block, index } if block != f.entry => {
-            facts.arguments(f, block, index).collect()
-        }
-        Site::Inst { .. } => match facts.op(f, v) {
-            Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) | Some(Op::Pack64(a, b)) => vec![a, b],
-            Some(Op::Convert(_, _, a)) | Some(Op::UnpackLo(a)) | Some(Op::UnpackHi(a)) => vec![a],
-            _ => vec![],
-        },
-        _ => vec![],
-    }
 }
 
 pub fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {

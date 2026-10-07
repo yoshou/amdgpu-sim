@@ -132,11 +132,20 @@ pub(super) fn joined(logic: &mut Logic, paths: &mut u32, entries: &BTreeMap<(Key
 }
 
 pub(super) fn between(logic: &mut Logic, fresh: &mut Fresh, side: usize, param: ValueId, a: Bdd, b: Bdd) -> Bdd {
-    if fresh.within(logic, a) || fresh.within(logic, b) {
-        return logic.atom(Atom::Fresh(side, param, 0));
+    let mut unknown = Vec::new();
+    for g in [a, b] {
+        if fresh.within(logic, g) {
+            for v in fresh_support(logic, g) {
+                if !unknown.contains(&v) {
+                    unknown.push(v);
+                }
+            }
+        }
     }
-    let low = logic.m.and(a, b);
-    let high = logic.m.or(a, b);
+    let both = logic.m.and(a, b);
+    let either = logic.m.or(a, b);
+    let low = logic.forall(&unknown, both);
+    let high = logic.exists(&unknown, either);
     if low == Bdd::FALSE && high == Bdd::TRUE {
         return logic.atom(Atom::Fresh(side, param, 0));
     }
@@ -200,6 +209,54 @@ mod tests {
         (0..1u32 << vars.len())
             .map(|row| vars.iter().enumerate().map(|(i, &v)| (v, row >> i & 1 == 1)).collect())
             .collect()
+    }
+
+    #[test]
+    fn between_ranges_over_the_bounds_both_arrivals_share_for_every_unknown() {
+        with_logic(|logic| {
+            let mut r = Random::new(53);
+            let mut fresh = Fresh::default();
+            let context = [Atom::Lane(0), Atom::Lane(1), Atom::Lane(2)];
+            let unknowns = [Atom::Fresh(WAVE, ValueId(1000), 0), Atom::Fresh(JOINT, ValueId(0), 1), Atom::Fresh(JOINT, ValueId(0), 2)];
+            let all: Vec<Atom> = context.iter().chain(&unknowns).copied().collect();
+            let unknown_vars: Vec<u32> = unknowns.iter().map(|&a| variable(logic, a)).collect();
+            let contexts = contexts(logic, &context);
+            let mut wrong = Vec::new();
+            for trial in 0..300 {
+                let a = random_function(logic, &mut r, if trial % 3 == 0 { &context[..] } else { &all[..] }, 4);
+                let b = random_function(logic, &mut r, &all, 4);
+                let merged = between(logic, &mut fresh, LANE, ValueId(77), a, b);
+                let own = fresh_support(logic, merged);
+                if own.iter().any(|&v| !matches!(logic.atom_of(v), Atom::Fresh(LANE, ValueId(77), _))) {
+                    wrong.push(format!("trial {} keeps an arrival's unknowns", trial));
+                    continue;
+                }
+                for context in &contexts {
+                    let (mut low, mut high) = (true, false);
+                    for hidden in 0..1u32 << unknown_vars.len() {
+                        let value = |var: u32| match unknown_vars.iter().position(|&v| v == var) {
+                            Some(i) => hidden >> i & 1 == 1,
+                            None => context.iter().find(|&&(v, _)| v == var).unwrap().1,
+                        };
+                        let (x, y) = (evaluate(&logic.m, a, &value), evaluate(&logic.m, b, &value));
+                        low &= x && y;
+                        high |= x || y;
+                    }
+                    let mut taken = BTreeSet::new();
+                    for choice in 0..1u32 << own.len() {
+                        let value = |var: u32| match own.iter().position(|&v| v == var) {
+                            Some(i) => choice >> i & 1 == 1,
+                            None => context.iter().find(|&&(v, _)| v == var).unwrap().1,
+                        };
+                        taken.insert(evaluate(&logic.m, merged, &value));
+                    }
+                    if taken != BTreeSet::from([low, high]) {
+                        wrong.push(format!("trial {} takes {:?} under {:?}, bounds {} {}", trial, taken, context, low, high));
+                    }
+                }
+            }
+            assert!(wrong.is_empty(), "the merge must range over exactly the shared bounds: {:?}", &wrong[..wrong.len().min(8)]);
+        });
     }
 
     #[test]

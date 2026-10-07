@@ -223,6 +223,79 @@ fn prove_keeps_a_ballot_whose_lane_test_masks_a_store() {
     assert!(wrong.is_empty(), "{:?}: a lane without the flag reads its own bit of the ballot as zero", wrong);
 }
 
+fn ballot_behind_a_lane_test(counted: impl Fn(ValueId, ValueId) -> ValueId) -> (Build, ValueId) {
+    let Flagged { mut b, k, buf, lane, c } = flagged();
+    let e = BlockId(0);
+    let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let zero = b.constant(e, Ty::I32, 0);
+    let none = b.cmp(e, IntPred::Eq, w, zero);
+    let shifted = b.int(e, IntOp::LShr, w, lane);
+    let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let valid = b.core(e, Ty::I1, Op::Env(Env::ValidLane));
+    let own = b.int(e, IntOp::And, bit, valid);
+    let (taken, t) = b.block(&[Ty::I1, Ty::I1, Ty::I1, Ty::I64]);
+    let (join, _) = b.block(&[Ty::I1]);
+    b.cond_br(e, none, (join, vec![k.exec]), (taken, vec![own, c, k.exec, buf]));
+    let x = counted(t[1], t[2]);
+    let m = b.wave(taken, WaveOp::Ballot { high: false }, vec![x]);
+    let at = b.core(taken, Ty::I32, Op::Env(Env::LaneId));
+    let address = byte_offset(&mut b, taken, t[3], at, 4);
+    b.store(taken, Space::Global, MemSize::B32, address, m, t[0]);
+    b.br(taken, join, vec![t[2]]);
+    (b, w)
+}
+
+#[test]
+fn prove_needs_no_word_for_a_branch_whose_skipping_lanes_add_nothing_to_a_ballot_behind_it() {
+    let (b, w) = ballot_behind_a_lane_test(|flag, _| flag);
+    let wrong: Vec<&str> = ["search", "direct"]
+        .iter()
+        .zip(both(&b))
+        .filter(|(_, kept)| kept.words.contains(&w))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(wrong.is_empty(), "{:?}: a lane that skips has no flag, so the wave's ballot of flags lacks nothing without it", wrong);
+}
+
+#[test]
+fn prove_keeps_the_word_of_a_branch_whose_skipping_lanes_add_to_a_ballot_behind_it() {
+    let (b, w) = ballot_behind_a_lane_test(|_, exec| exec);
+    let wrong: Vec<&str> = ["search", "direct"]
+        .iter()
+        .zip(both(&b))
+        .filter(|(_, kept)| !kept.words.contains(&w))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(wrong.is_empty(), "{:?}: a lane that skips is still in exec, so the wave's ballot of exec counts it", wrong);
+}
+
+fn wave_answer_carried_into_a_detour() -> (Build, ValueId, ValueId) {
+    let Flagged { mut b, k, buf, lane, c } = flagged();
+    let e = BlockId(0);
+    let branch = b.wave(e, WaveOp::Any, vec![c]);
+    let carried = b.wave(e, WaveOp::Any, vec![c]);
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let (store, s) = b.block(&[Ty::I1, Ty::I64, Ty::I1]);
+    let (join, _) = b.block(&[Ty::I1]);
+    b.cond_br(e, branch, (store, vec![carried, own, k.exec]), (join, vec![k.exec]));
+    let one = b.constant(store, Ty::I32, 1);
+    b.store(store, Space::Global, MemSize::B32, s[1], one, s[0]);
+    b.br(store, join, vec![s[2]]);
+    (b, branch, carried)
+}
+
+#[test]
+fn prove_keeps_both_queries_when_a_detour_carries_the_wave_answer_into_a_store_mask() {
+    let (b, branch, carried) = wave_answer_carried_into_a_detour();
+    let wrong: Vec<&str> = ["search", "direct"]
+        .iter()
+        .zip(both(&b))
+        .filter(|(_, kept)| !kept.queries.contains(&branch) || !kept.queries.contains(&carried))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(wrong.is_empty(), "{:?}: a lane without the flag follows the wave into the store, whose mask is the wave's answer", wrong);
+}
+
 #[test]
 fn prove_keeps_a_query_that_ends_a_loop() {
     let (mut b, k) = Build::kernel();

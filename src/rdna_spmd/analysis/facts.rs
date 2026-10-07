@@ -356,22 +356,44 @@ impl Facts {
                 continue;
             }
             self.materialized[v.0] = true;
-            let sources: Vec<ValueId> = match self.site[v.0] {
-                Site::Param { block, index } if block != f.entry => {
-                    self.arguments(f, block, index).collect()
-                }
-                Site::Inst { .. } => match self.op(f, v) {
-                    Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) | Some(Op::Pack64(a, b)) => {
-                        vec![a, b]
-                    }
-                    Some(Op::Convert(_, _, a)) | Some(Op::UnpackLo(a)) | Some(Op::UnpackHi(a)) => {
-                        vec![a]
-                    }
-                    _ => vec![],
-                },
-                _ => vec![],
-            };
+            let sources = self.materialized_sources(f, v);
             pending.extend(sources.into_iter().filter(|s| self.lane_word[s.0]));
+        }
+        for &id in &self.order {
+            for inst in &f.blocks[&id].insts {
+                let Inst::Core { value, .. } = *inst else {
+                    continue;
+                };
+                if !self.lane_word[value.0] || self.materialized[value.0] {
+                    continue;
+                }
+                let words: Vec<ValueId> = self
+                    .materialized_sources(f, value)
+                    .into_iter()
+                    .filter(|s| self.lane_word[s.0])
+                    .collect();
+                if !words.is_empty() && words.iter().all(|s| self.materialized[s.0]) {
+                    self.materialized[value.0] = true;
+                }
+            }
+        }
+    }
+
+    pub fn materialized_sources(&self, f: &Func, v: ValueId) -> Vec<ValueId> {
+        match self.site[v.0] {
+            Site::Param { block, index } if block != f.entry => {
+                self.arguments(f, block, index).collect()
+            }
+            Site::Inst { .. } => match self.op(f, v) {
+                Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) | Some(Op::Pack64(a, b)) => {
+                    vec![a, b]
+                }
+                Some(Op::Convert(_, _, a)) | Some(Op::UnpackLo(a)) | Some(Op::UnpackHi(a)) => {
+                    vec![a]
+                }
+                _ => vec![],
+            },
+            _ => vec![],
         }
     }
 

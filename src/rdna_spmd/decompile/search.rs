@@ -28,12 +28,14 @@ pub fn prove(
         .map(|(i, &c)| (c, i))
         .collect();
     let mut kept = Kept::default();
+    let mut added = BTreeSet::new();
     loop {
         let facts = Facts::new(f, inputs, &kept.words);
         let logic = Logic::fixed(f, &facts, &kept.choices(), &listed);
         let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
         if check.run() {
-            let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, &listed, kept.clone());
+            let failed = if added.len() == 1 { added.first().copied() } else { None };
+            let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, &listed, kept.clone(), failed);
             if minimal == kept {
                 let everyone = check.everyone(&BTreeSet::new());
                 return (without_covered_meetings(&mut check, kept), everyone);
@@ -44,7 +46,11 @@ pub fn prove(
         let mut blamed = BTreeSet::new();
         for i in 0..check.violations().len() {
             let condition = check.violations()[i].condition;
-            if let Some(v) = named(check.logic(), condition, &order) {
+            let mut choices = alone(check.logic(), condition, &order);
+            if choices.is_empty() {
+                choices.extend(named(check.logic(), condition, &order));
+            }
+            for v in choices {
                 if std::env::var_os("AMDGPU_SIM_PRINT_MEETINGS").is_some() {
                     let violation = &check.violations()[i];
                     eprintln!(
@@ -62,7 +68,9 @@ pub fn prove(
                 v.block.0, v.index, v.reason
             );
         }
-        for c in blamed {
+        let before = kept.choices();
+        added = blamed.into_iter().filter(|c| !before.contains(c)).collect();
+        for &c in &added {
             kept.insert(c);
         }
     }
@@ -99,6 +107,7 @@ fn without_redundant_choices(
     hazards: &Hazards,
     listed: &[Choice],
     mut kept: Kept,
+    failed: Option<Choice>,
 ) -> Kept {
     let candidates: Vec<Choice> = kept
         .queries
@@ -112,15 +121,22 @@ fn without_redundant_choices(
         trial
     };
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(candidates.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
     let alone: Vec<bool> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
-            .map(|w| {
-                let (candidates, without) = (&candidates, &without);
+            .map(|_| {
+                let (candidates, without, next) = (&candidates, &without, &next);
                 scope.spawn(move || {
-                    (w..candidates.len())
-                        .step_by(workers)
-                        .map(|i| (i, proves(f, inputs, exec_index, loops, hazards, listed, &without(candidates[i]))))
-                        .collect::<Vec<_>>()
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= candidates.len() {
+                            return done;
+                        }
+                        let redundant = Some(candidates[i]) != failed
+                            && proves(f, inputs, exec_index, loops, hazards, listed, &without(candidates[i]));
+                        done.push((i, redundant));
+                    }
                 })
             })
             .collect();
@@ -170,6 +186,37 @@ pub fn listed(f: &Func, facts: &Facts, hazards: &Hazards) -> Vec<Choice> {
     let mut listed = choices(f, facts);
     listed.extend((0..hazards.meetings.len()).rev().map(Choice::Meet));
     listed
+}
+
+fn alone(logic: &mut Logic, condition: Bdd, order: &HashMap<Choice, usize>) -> Vec<Choice> {
+    let mut marks: Vec<(usize, u32, Choice)> = logic
+        .support(condition)
+        .iter()
+        .filter_map(|&var| match logic.atom_of(var) {
+            Atom::Marker(c) => Some((order[&c], var, c)),
+            _ => None,
+        })
+        .collect();
+    marks.sort_unstable();
+    let mut left = condition;
+    for &(_, var, _) in &marks {
+        left = logic.m.cofactor(left, var, false);
+    }
+    let fixable = logic.m.not(left);
+    let mut out = Vec::new();
+    for &(_, var, c) in &marks {
+        let mut g = condition;
+        for &(_, other, _) in &marks {
+            if other != var {
+                g = logic.m.cofactor(g, other, false);
+            }
+        }
+        let g = logic.m.cofactor(g, var, true);
+        if logic.m.and(g, fixable) != Bdd::FALSE {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn named(logic: &mut Logic, condition: Bdd, order: &HashMap<Choice, usize>) -> Option<Choice> {
@@ -260,9 +307,71 @@ mod tests {
         }
         assert!(proves(f, inputs, Some(0), &loops, &hazards, &listed, &all));
         assert!(!proves(f, inputs, Some(0), &loops, &hazards, &listed, &Kept::default()), "a lane without the flag skips the store the wave makes");
-        let minimal = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &listed, all);
+        let minimal = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &listed, all.clone(), None);
         assert_eq!(minimal.choices(), BTreeSet::from([Choice::Query(needed)]), "every lane computes the same tests the wave asks about");
+        let known = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &listed, all, Some(Choice::Query(needed)));
+        assert_eq!(known.choices(), minimal.choices(), "a choice whose removal the search saw fail stays without a trial");
         let (kept, _) = prove(f, inputs, Some(0), &hazards);
         assert_eq!(kept.choices(), BTreeSet::from([Choice::Query(needed)]));
+    }
+
+    #[test]
+    fn alone_blames_exactly_the_choices_that_violate_beyond_what_keeping_everything_leaves() {
+        let (b, _, _) = needed_and_needless_queries();
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let listed: Vec<Choice> = (0..4).map(Choice::Meet).collect();
+        let order: HashMap<Choice, usize> = listed.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &listed);
+        let mut pool: Vec<Atom> = listed.iter().map(|&c| Atom::Marker(c)).collect();
+        pool.extend([Atom::Lane(0), Atom::Lane(1)]);
+        let vars: Vec<u32> = pool.iter().map(|&a| variable(&mut logic, a)).collect();
+        let mut r = Random::new(61);
+        let (mut some, mut wrong) = (0, Vec::new());
+        for trial in 0..400 {
+            let mut condition = Bdd::FALSE;
+            for _ in 0..1 + r.below(3) {
+                let mut cube = Bdd::TRUE;
+                for (i, &var) in vars.iter().enumerate() {
+                    let literal = match r.below(if i < listed.len() { 3 } else { 4 }) {
+                        0 => logic.m.var(var),
+                        1 if i >= listed.len() => {
+                            let v = logic.m.var(var);
+                            logic.m.not(v)
+                        }
+                        _ => Bdd::TRUE,
+                    };
+                    cube = logic.m.and(cube, literal);
+                }
+                condition = logic.m.or(condition, cube);
+            }
+            let got: BTreeSet<Choice> = alone(&mut logic, condition, &order).into_iter().collect();
+            let (vars, count) = (&vars, listed.len());
+            let at = |local: Option<usize>, lanes: u32| {
+                move |var: u32| match vars.iter().position(|&v| v == var) {
+                    Some(j) if j < count => Some(j) == local,
+                    Some(j) => lanes >> (j - count) & 1 == 1,
+                    None => false,
+                }
+            };
+            let support = logic.support(condition);
+            let expected: BTreeSet<Choice> = listed
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| support.contains(&vars[i]))
+                .filter(|&(i, _)| {
+                    (0..1u32 << 2).any(|lanes| {
+                        evaluate(&logic.m, condition, &at(Some(i), lanes)) && !evaluate(&logic.m, condition, &at(None, lanes))
+                    })
+                })
+                .map(|(_, &c)| c)
+                .collect();
+            some += got.len();
+            if got != expected {
+                wrong.push(format!("trial {} blames {:?}, expected {:?}", trial, got, expected));
+            }
+        }
+        assert!(some > 0, "some condition has a choice that violates alone");
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
     }
 }

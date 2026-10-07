@@ -2,7 +2,7 @@ use super::super::super::logic::{lane_test, projected_word, Atom, Choice, Logic}
 use super::super::queries::Queries;
 use super::decide::Decisions;
 use super::forms::{Form, Forms};
-use super::joint::{Desc, LANE};
+use super::joint::{Desc, LANE, WAVE};
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::Site;
 use crate::rdna_spmd::hash::HashMap;
@@ -134,6 +134,28 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
         };
         let same = Some(self.intern(ty, Form::Value(v)));
         Desc { same, bits }
+    }
+
+    pub(super) fn start_wave(&mut self, v: ValueId) -> Desc {
+        let d = self.start(v);
+        let Some(bits) = d.bits else {
+            return d;
+        };
+        let h = self.q.h(v);
+        if self.decisions.reliable(self.q, h) {
+            return d;
+        }
+        let atom = if self.q.program().f.types[v.0] == Ty::I1 {
+            Atom::Bit(v)
+        } else {
+            Atom::View(v)
+        };
+        let unknown = self.q.logic().atom(atom);
+        let bits = self.q.logic().m.ite(h, unknown, bits);
+        Desc {
+            same: d.same,
+            bits: Some(bits),
+        }
     }
 
     fn loaded(&mut self, ty: Ty, v: ValueId, t: usize) -> usize {
@@ -514,7 +536,12 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                 EffectOp::Memory { .. } => Bdd::FALSE,
             };
             if collective != Bdd::FALSE {
-                let differs = self.q.and(ev.cond, collective);
+                let mut differs = self.q.and(ev.cond, collective);
+                if ev.side == WAVE && matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. })) {
+                    let bit = self.bits_of(ev, inputs[0]);
+                    let present = self.weaken(bit, WAVE);
+                    differs = self.q.and(differs, present);
+                }
                 self.q.require(
                     ev.block,
                     index,
@@ -573,5 +600,103 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
         }
         let others = self.fresh(side, v, 0);
         self.logic().m.or(bit, others)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::super::hazard::Hazards;
+    use super::super::super::super::testing::*;
+    use super::super::super::differences::Differences;
+    use super::super::super::program::Program;
+    use super::super::super::Mode;
+    use super::*;
+    use crate::rdna_spmd::analysis::facts::Facts;
+    use crate::rdna_spmd::analysis::loops::Loops;
+    use std::collections::BTreeSet;
+
+    fn queried() -> (Build, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let flags = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let a = b.wave(e, WaveOp::Any, vec![c]);
+        (b, a)
+    }
+
+    #[test]
+    fn the_wave_side_starts_from_the_lane_value_only_where_the_programs_agree() {
+        let (b, a) = queried();
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(f, &facts).unwrap();
+        let hazards = Hazards {
+            accesses: Vec::new(),
+            together: BTreeSet::new(),
+            apart: BTreeSet::new(),
+            idle: BTreeSet::new(),
+            meetings: Vec::new(),
+        };
+        let mut r = Random::new(29);
+        let mut wrong = Vec::new();
+        let mut unknown_somewhere = 0;
+        for trial in 0..300 {
+            let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+            let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards);
+            let mut q = Differences::new(program, logic, Mode::Search);
+            let lane_bits = q.bit(a);
+            let mut pool: Vec<Atom> = q.logic().support(lane_bits).iter().map(|&v| q.logic().atom_of(v)).collect();
+            pool.extend([Atom::Lane(0), Atom::Lane(1)]);
+            let h = random_function(q.logic(), &mut r, &pool, 3);
+            q.raise_h(a, h);
+            let assume = random_function(q.logic(), &mut r, &pool, 3);
+            if assume == Bdd::FALSE {
+                continue;
+            }
+            let own = variable(q.logic(), Atom::Bit(a));
+            let vars: Vec<u32> = pool.iter().map(|&atom| variable(q.logic(), atom)).collect();
+            let mut eval = Eval::new(&mut q, assume);
+            let wave = eval.start_wave(a);
+            let lane = eval.start(a);
+            if wave.same != lane.same {
+                wrong.push(format!("trial {} changes the form", trial));
+            }
+            let bits = wave.bits.unwrap();
+            let (mut every, mut none) = (true, true);
+            for row in 0..1u32 << vars.len() {
+                let at = |var: u32| vars.iter().position(|&v| v == var).is_some_and(|i| row >> i & 1 == 1);
+                if !evaluate(&eval.q.logic().m, assume, &at) {
+                    continue;
+                }
+                let differs = evaluate(&eval.q.logic().m, h, &at);
+                let expected: BTreeSet<bool> = if differs {
+                    unknown_somewhere += 1;
+                    BTreeSet::from([false, true])
+                } else {
+                    BTreeSet::from([evaluate(&eval.q.logic().m, lane_bits, &at)])
+                };
+                let taken: BTreeSet<bool> = [false, true]
+                    .iter()
+                    .map(|&x| evaluate(&eval.q.logic().m, bits, &|var| if var == own { x } else { at(var) }))
+                    .collect();
+                if taken != expected {
+                    wrong.push(format!("trial {} row {} takes {:?}, expected {:?}", trial, row, taken, expected));
+                }
+                every &= expected.iter().all(|&x| x);
+                none &= expected.iter().all(|&x| !x);
+            }
+            let expected = if every { Some(true) } else if none { Some(false) } else { None };
+            let decided = eval.decide(bits, assume, WAVE);
+            if decided != expected {
+                wrong.push(format!("trial {} decides {:?}, expected {:?}", trial, decided, expected));
+            }
+        }
+        assert!(unknown_somewhere > 0, "some trial leaves the wave's answer unknown");
+        assert!(wrong.is_empty(), "the wave side must start from what the lane program shows where nothing differs: {:?}", &wrong[..wrong.len().min(8)]);
     }
 }
