@@ -11,6 +11,7 @@ pub(super) struct Verdict {
     exhausted: Option<(BlockId, usize, &'static str)>,
     stopped: bool,
     detouring: bool,
+    eager: bool,
 }
 
 impl Verdict {
@@ -22,7 +23,12 @@ impl Verdict {
             exhausted: None,
             stopped: false,
             detouring: false,
+            eager: false,
         }
+    }
+
+    pub(super) fn eager(&mut self) {
+        self.eager = true;
     }
 
     #[inline]
@@ -50,7 +56,7 @@ impl Verdict {
     pub(super) fn violated(&mut self, violation: Violation) {
         self.violations.push(violation);
         if self.mode == Mode::Search {
-            self.stopped |= !self.detouring;
+            self.stopped |= !self.detouring || self.eager;
         }
     }
 

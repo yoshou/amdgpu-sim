@@ -72,6 +72,11 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
     }
 
     #[inline]
+    pub(super) fn varies(&mut self, wave: Bdd, lane: Bdd) -> Bdd {
+        self.decisions.varies(self.q, wave, lane)
+    }
+
+    #[inline]
     pub(super) fn leaves(&self, t: usize) -> Bdd {
         self.leaves[t]
     }

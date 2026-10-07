@@ -74,6 +74,10 @@ impl<'a> Check<'a> {
         &mut self.differences.logic
     }
 
+    pub fn eager(&mut self) {
+        self.differences.eager();
+    }
+
     pub fn safe(&self) -> Bdd {
         self.differences.safe()
     }

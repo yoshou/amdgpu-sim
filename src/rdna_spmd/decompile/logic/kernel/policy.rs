@@ -6,7 +6,7 @@ use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeSet;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq)]
 pub struct Kept {
     pub queries: BTreeSet<ValueId>,
 
@@ -21,6 +21,14 @@ impl Kept {
             Choice::Query(v) => self.queries.insert(v),
             Choice::Word(v) => self.words.insert(v),
             Choice::Meet(i) => self.meets.insert(i),
+        };
+    }
+
+    pub fn remove(&mut self, choice: Choice) {
+        match choice {
+            Choice::Query(v) => self.queries.remove(&v),
+            Choice::Word(v) => self.words.remove(&v),
+            Choice::Meet(i) => self.meets.remove(&i),
         };
     }
 

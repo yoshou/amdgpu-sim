@@ -57,6 +57,10 @@ impl<'a> Differences<'a> {
         self.verdict.detouring(on);
     }
 
+    pub(super) fn eager(&mut self) {
+        self.verdict.eager();
+    }
+
     #[cfg(test)]
     pub(super) fn masks(&self) -> &Masks {
         &self.masks
