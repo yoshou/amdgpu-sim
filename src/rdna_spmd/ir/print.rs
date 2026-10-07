@@ -144,7 +144,8 @@ fn cache_policy(c: CachePolicy) -> &'static str {
 fn wave_op(w: WaveOp) -> &'static str {
     match w {
         WaveOp::Any => "any",
-        WaveOp::Ballot => "ballot",
+        WaveOp::Ballot { high: false } => "ballot",
+        WaveOp::Ballot { high: true } => "ballot.high",
         WaveOp::ReadFirstLane => "readfirstlane",
         WaveOp::ReadLane => "readlane",
         WaveOp::WriteLane => "writelane",

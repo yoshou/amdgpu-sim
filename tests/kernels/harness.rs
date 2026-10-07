@@ -39,8 +39,8 @@ pub(crate) struct Run<'a> {
 
 impl Kernels {
     pub(crate) fn load() -> Self {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/kernels_gfx1200.o");
-        let module = Module::open(path).unwrap_or_else(|e| panic!("{} (run tests/kernels/build.sh)", e));
+        let path = format!("{}/tests/data/{}", env!("CARGO_MANIFEST_DIR"), crate::OBJECT);
+        let module = Module::open(&path).unwrap_or_else(|e| panic!("{} (run tests/kernels/build.sh)", e));
         Kernels {
             module,
             functions: RefCell::new(Vec::new()),

@@ -1,4 +1,4 @@
-use super::super::address::{aligns, Region, LANES};
+use super::super::address::{aligns, Region};
 use super::demand::{demands, uses, Demand};
 use super::layout::{merge, pointers, points};
 use super::program::Program;
@@ -95,7 +95,7 @@ pub(super) fn exposures(sets: &Sets, env: &Environment) -> (Vec<Exposure>, Vec<S
                 }
                 let words = program.words(address, bytes);
                 let parts = if operands.iter().any(|&x| sets.has_parts(x)) {
-                    (0..LANES)
+                    (0..program.lanes())
                         .map(|lane| {
                             let mut part = vec![0; sets.words()];
                             for &x in operands {

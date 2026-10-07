@@ -5,6 +5,7 @@ mod decompile;
 mod dialect;
 mod engine;
 mod environment;
+mod gcn3;
 mod hash;
 mod host;
 mod ir;

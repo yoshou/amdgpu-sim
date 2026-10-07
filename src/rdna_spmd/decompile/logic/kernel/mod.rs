@@ -57,6 +57,10 @@ impl<S: Rules> Kernel<S> {
         &self.values.state
     }
 
+    pub fn lanes(&self) -> u32 {
+        self.values.atoms.lanes()
+    }
+
     pub fn state_mut(&mut self) -> &mut S {
         &mut self.values.state
     }

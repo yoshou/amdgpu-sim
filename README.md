@@ -28,21 +28,33 @@ The same commands run in CI (`.github/workflows/ci.yml`).
 | Architecture | Interpreter | LLVM JIT | SPMD JIT |
 |--------------|-------------|----------|----------|
 | gfx1200      | Supported   | Supported | Supported |
-| gfx803       | Supported   | Not supported | Not supported |
+| gfx803       | Supported   | Not supported | Supported |
 
-### RDNA SPMD backend
+### SPMD backend
 
-The gfx1200 SPMD backend converts wavefront execution into independent CPU
+The SPMD backend converts wavefront execution into independent CPU
 work-items. The examples use cooperative or segmented dispatch when barriers or
 cross-lane operations require synchronization.
 
+gfx1200 kernels are decoded by the RDNA4 frontend. gfx803 kernels are decoded
+by the GCN3 frontend in `src/rdna_spmd/gcn3`, which translates each instruction
+into the same intermediate representation, runs 64-lane wavefronts, and inlines
+every call site of the functions a kernel calls.
+
 Available examples are `bitonic_sort_spmd`, `histogram_spmd`,
 `raytracing_spmd`, `simple_hgemm_spmd`, `smallpt_spmd`, `texture_spmd`, and
-`warp_shuffle_spmd`.
+`warp_shuffle_spmd`. `bitonic_sort_spmd`, `histogram_spmd`, `smallpt_spmd`, and
+`texture_spmd` also run their gfx803 kernels.
 
 ```sh
 cargo run --release --example smallpt_spmd -- --arch gfx1200
+cargo run --release --example smallpt_spmd -- --arch gfx803
 ```
+
+`smallpt_spmd` defaults to gfx803, whose kernel takes about two minutes to
+compile. On gfx803, `texture_spmd` builds a GCN3 image resource; the backend
+samples single-channel 8-bit images with point filtering at the base level of a
+linear two-dimensional image, and stops with a trap on any other resource.
 
 Use `--num_threads N` to select the CPU thread count. Examples that support
 packed work-item execution also accept `--vec_width W`; `0` selects the

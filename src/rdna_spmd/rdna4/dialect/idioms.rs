@@ -52,18 +52,17 @@ impl<'a> View<'a> {
                 match inst {
                     Inst::Core { value, op, .. } => defs[value.0] = Some(*op),
                     Inst::Effect {
-                        op: EffectOp::Wave(query @ (WaveOp::Ballot | WaveOp::Any)),
+                        op: EffectOp::Wave(WaveOp::Ballot { high: false }),
                         inputs,
                         outputs,
                         ..
-                    } => {
-                        let asked = if *query == WaveOp::Ballot {
-                            &mut ballots
-                        } else {
-                            &mut anys
-                        };
-                        asked[outputs[0].0 .0] = Some(inputs[0]);
-                    }
+                    } if f.lanes == 32 => ballots[outputs[0].0 .0] = Some(inputs[0]),
+                    Inst::Effect {
+                        op: EffectOp::Wave(WaveOp::Any),
+                        inputs,
+                        outputs,
+                        ..
+                    } => anys[outputs[0].0 .0] = Some(inputs[0]),
                     Inst::Target {
                         op, args, outputs, ..
                     } => {

@@ -95,16 +95,23 @@ where
     };
     match inst {
         Inst::Effect {
-            op: EffectOp::Wave(WaveOp::Ballot),
+            op: EffectOp::Wave(WaveOp::Ballot { high }),
             inputs,
             ..
-        } => q.bit(f, facts, inputs[0]),
+        } => {
+            let own = q.bit(f, facts, inputs[0]);
+            if f.lanes == 32 {
+                return own;
+            }
+            let other = q.atom(opaque);
+            q.half(*high, own, other)
+        }
         Inst::Core { op, .. } => match *op {
             _ if lane_values(q, f, facts, w).is_some() => {
                 let values = lane_values(q, f, facts, w).unwrap();
-                q.lanes(|l| values[l as usize] >> l & 1 == 1)
+                q.lanes(|l| values[l as usize] >> (l & 31) & 1 == 1)
             }
-            Op::Const(_, k) => q.word(k as u32),
+            Op::Const(ty, k) => q.word_of(ty, k),
             Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
                 if constant_choices(f, facts, a).is_some() && constant_choices(f, facts, b).is_some() {
                     return constant_word(q, f, facts, k, a, b);
@@ -122,8 +129,30 @@ where
                 let b = q.view(f, facts, b);
                 q.m().ite(c, a, b)
             }
-            Op::Convert(Cvt::Bitcast, Ty::I32, a) if f.types[a.0] == Ty::I32 => {
+            Op::Convert(Cvt::Bitcast, to @ (Ty::I32 | Ty::I64), a) if f.types[a.0] == to => {
                 q.view(f, facts, a)
+            }
+            Op::Pack64(a, b) => {
+                let low = q.view(f, facts, a);
+                if f.lanes == 32 {
+                    return low;
+                }
+                let high = q.view(f, facts, b);
+                let upper = q.atom(Atom::Lane(5));
+                q.m().ite(upper, high, low)
+            }
+            Op::UnpackLo(a) => {
+                let own = q.view(f, facts, a);
+                if f.lanes == 32 {
+                    return own;
+                }
+                let other = q.atom(opaque);
+                q.half(false, own, other)
+            }
+            Op::UnpackHi(a) if f.lanes == 64 => {
+                let own = q.view(f, facts, a);
+                let other = q.atom(opaque);
+                q.half(true, own, other)
             }
             _ => q.atom(opaque),
         },
@@ -145,6 +174,6 @@ fn constant_word<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, k: IntOp, a: Va
         IntOp::And => x & y,
         IntOp::Or => x | y,
         _ => x ^ y,
-    } as u32;
-    q.word(word)
+    };
+    q.word_of(f.types[a.0], word)
 }

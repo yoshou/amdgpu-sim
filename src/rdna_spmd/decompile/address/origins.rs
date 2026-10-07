@@ -249,11 +249,12 @@ impl Origins {
                     ..
                 } => {
                     reliance.lane = true;
+                    let last = q.program().lanes() as u32 - 1;
                     match q.value(inputs[1], lane, None).0.form.as_constant() {
-                        Some(k) if !q.symbols().valid((k & 31) as usize) => none(),
-                        Some(k) => self.assumed_regions(q, inputs[0], (k & 31) as usize, None, refine).0,
+                        Some(k) if !q.symbols().valid((k & last) as usize) => none(),
+                        Some(k) => self.assumed_regions(q, inputs[0], (k & last) as usize, None, refine).0,
                         None => {
-                            let partial = !(0..LANES).all(|l| q.symbols().valid(l));
+                            let partial = !(0..q.program().lanes()).all(|l| q.symbols().valid(l));
                             self.lanes_regions(q, inputs[0], partial)
                         }
                     }
@@ -264,8 +265,9 @@ impl Origins {
                     ..
                 } => {
                     reliance.lane = true;
+                    let last = q.program().lanes() as u32 - 1;
                     match q.value(inputs[1], lane, None).0.form.as_constant() {
-                        Some(k) if (k & 31) as usize == lane => self.assumed_regions(q, inputs[0], lane, None, refine).0,
+                        Some(k) if (k & last) as usize == lane => self.assumed_regions(q, inputs[0], lane, None, refine).0,
                         Some(_) => self.assumed_regions(q, inputs[2], lane, None, refine).0,
                         None => {
                             let mut set = self.assumed_regions(q, inputs[0], lane, None, refine).0;
@@ -280,7 +282,7 @@ impl Origins {
                     ..
                 } => {
                     reliance.lane = true;
-                    let silent = *op == WaveOp::Bpermute || !(0..LANES).all(|l| q.symbols().valid(l));
+                    let silent = *op == WaveOp::Bpermute || !(0..q.program().lanes()).all(|l| q.symbols().valid(l));
                     self.lanes_regions(q, inputs[1], silent)
                 }
                 _ => none(),
@@ -393,7 +395,7 @@ impl Origins {
                 self.checked.insert((v, l, refine));
                 let held = self.regions(q, v, first, None, refine);
                 let bound = q.program().provenance.carried[&v].clone();
-                let all: Vec<usize> = (0..LANES).filter(|&k| q.symbols().valid(k)).collect();
+                let all: Vec<usize> = (0..q.program().lanes()).filter(|&k| q.symbols().valid(k)).collect();
                 let (lanes, mut known) = match (l == ALL, bound.len() > 1) {
                     (true, true) => (all, None),
                     (true, false) => {
@@ -462,7 +464,7 @@ impl Origins {
 
     pub(super) fn expose<'a, Q: Queries<'a>>(&mut self, q: &mut Q, open: &[u64], stake: &[u64]) -> Vec<u64> {
         let mut found: Vec<u64> = Vec::new();
-        let lanes: Vec<usize> = (0..LANES).filter(|&l| q.symbols().valid(l)).collect();
+        let lanes: Vec<usize> = (0..q.program().lanes()).filter(|&l| q.symbols().valid(l)).collect();
         for e in q.program().provenance.exposing.clone() {
             let mut fresh: Vec<u64> = e
                 .candidates
@@ -499,7 +501,7 @@ impl Origins {
         if silent {
             set.add(None);
         }
-        for l in 0..LANES {
+        for l in 0..q.program().lanes() {
             if q.symbols().valid(l) {
                 set.union(&self.regions(q, x, l, None, false));
             }

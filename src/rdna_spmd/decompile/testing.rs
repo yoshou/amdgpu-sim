@@ -19,7 +19,11 @@ pub(super) struct Build {
 
 impl Build {
     pub(super) fn new(sources: &[(ParameterSource, Ty)]) -> (Self, Vec<ValueId>) {
-        let mut f = Func::new(BlockId(0), Presence::Wave);
+        Self::with_lanes(sources, 32)
+    }
+
+    pub(super) fn with_lanes(sources: &[(ParameterSource, Ty)], lanes: u32) -> (Self, Vec<ValueId>) {
+        let mut f = Func::new(BlockId(0), Presence::Wave, lanes);
         let params: Vec<(ValueId, Ty)> = sources.iter().map(|&(_, ty)| (f.value(ty), ty)).collect();
         f.blocks.insert(
             BlockId(0),
@@ -41,6 +45,7 @@ impl Build {
         });
         let entry = EntryLayout {
             kernarg_ptr: Some(KERNARG),
+            workitem_ids: EntryLayout::PACKED,
             ..EntryLayout::default()
         };
         (
@@ -61,6 +66,10 @@ impl Build {
     }
 
     pub(super) fn kernel_with(extra: &[(ParameterSource, Ty)]) -> (Self, Kernel, Vec<ValueId>) {
+        Self::kernel_in(extra, 32)
+    }
+
+    pub(super) fn kernel_in(extra: &[(ParameterSource, Ty)], lanes: u32) -> (Self, Kernel, Vec<ValueId>) {
         let mut sources = vec![
             (ParameterSource::MaskBit(EXEC), Ty::I1),
             (ParameterSource::Vgpr(0), Ty::I32),
@@ -68,7 +77,7 @@ impl Build {
             (ParameterSource::Sgpr(KERNARG + 1), Ty::I32),
         ];
         sources.extend_from_slice(extra);
-        let (b, p) = Self::new(&sources);
+        let (b, p) = Self::with_lanes(&sources, lanes);
         (
             b,
             Kernel {

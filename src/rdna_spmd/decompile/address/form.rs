@@ -1,7 +1,5 @@
 use crate::rdna_spmd::ir::*;
 
-pub const LANES: usize = 32;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Region {
     Allocation(u64),

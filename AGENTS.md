@@ -26,6 +26,8 @@
 - The architecture split is intentional:
   - gfx803 uses the GCN decoder/interpreter path
   - gfx1200 uses the RDNA decoder/processor path and also has LLVM-based translation/JIT support through `src/rdna_translator.rs`
+- `src/rdna_spmd` is the SPMD JIT backend used by the `*_spmd` examples. It takes gfx1200 through `src/rdna_spmd/rdna4` and gfx803 through `src/rdna_spmd/gcn3`, which decodes GCN3, tracks the scalar state (M0, MODE, the scratch descriptor, call targets and return addresses, VGPR lanes written by `v_writelane`), inlines every call site, and lowers each instruction onto the RDNA4 lift.
+- SPMD test corpora: `tests/kernels` (gfx1200, wave32), `tests/kernels64` (gfx1200, wave64), `tests/kernels803` (gfx803), and `tests/gcn3` (GCN3 probes assembled with `llvm-mc` and `ld.lld` from `$LLVM_SYS_221_PREFIX/bin`).
 - `src/processor.rs` defines shared ABI-facing pieces such as `KernelDescriptor`, `Pointer`, and `HsaKernelDispatchPacket`; the example programs and processor implementations both rely on these types.
 - The example programs are not just demos; they show the expected host-side integration pattern. Each example loads code objects with the `object` crate, reads note metadata as YAML or MessagePack, allocates argument buffers manually, and invokes the simulator directly.
 
@@ -36,6 +38,7 @@
 - Architecture defaults vary by example, so be explicit when running commands:
   - `smallpt`, `bitonic_sort`, `histogram`, and `texture` default to `gfx803`
   - `raytracing` defaults to `gfx1200`
+  - among the `*_spmd` examples, `smallpt_spmd` defaults to `gfx803` (about two minutes of compilation) and the others default to `gfx1200`; `bitonic_sort_spmd`, `histogram_spmd`, `smallpt_spmd`, and `texture_spmd` accept both architectures
   - `simple_hgemm` should be run with `--arch gfx1200`; its source still has a `gfx942` default even though this repository ships `examples/simple_hgemm/kernel_gfx1200.o` and the dispatcher supports `gfx1200`
 - `smallpt` has repository-specific CLI details already captured in `.agents/skills/run-smallpt/SKILL.md`: it accepts `--arch` and `--nb_samples`, and it writes `image.png` at the repository root.
 - Register files are stored as flattened `(elem, register)` arrays in both processor implementations. The RDNA path uses `aligned_vec::AVec` for aligned storage, which is part of the performance-sensitive design rather than an incidental implementation detail.

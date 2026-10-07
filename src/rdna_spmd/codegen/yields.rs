@@ -46,7 +46,7 @@ impl YieldValues {
     }
     pub fn uniform_result(&self) -> bool {
         match self.op {
-            EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane) => true,
+            EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane) => true,
             EffectOp::Wave(WaveOp::ReadLane) => self.uniform_selector,
             EffectOp::BarrierSignal { is_first: true } => true,
             _ => false,

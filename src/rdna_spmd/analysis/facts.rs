@@ -16,6 +16,10 @@ pub enum Use {
     Ret(BlockId),
 }
 
+pub fn is_word(ty: Ty) -> bool {
+    matches!(ty, Ty::I32 | Ty::I64)
+}
+
 pub struct Facts {
     pub site: Vec<Site>,
     pub uses: Vec<Vec<Use>>,
@@ -92,7 +96,7 @@ impl Facts {
     fn solve_viewed(&mut self, f: &Func) {
         let mut pending: Vec<ValueId> = Vec::new();
         for v in 0..f.types.len() {
-            if f.types[v] != Ty::I32 {
+            if !is_word(f.types[v]) {
                 continue;
             }
             let projected = self.uses[v].iter().any(|&u| match u {
@@ -103,7 +107,7 @@ impl Facts {
                         ..
                     } => {
                         a.0 == v
-                            && self.is_lane_id(f, s)
+                            && self.is_lane_shift(f, a, s)
                             && self.uses[value.0].iter().any(|&t| {
                                 matches!(t, Use::Inst { block, index }
                                     if matches!(f.blocks[&block].insts[index],
@@ -127,19 +131,26 @@ impl Facts {
                 Site::Param { block, index } if block != f.entry => {
                     self.arguments(f, block, index).collect()
                 }
-                Site::Inst { .. } => match self.op(f, v) {
-                    Some(Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, a, b))
-                    | Some(Op::Select(_, a, b)) => vec![a, b],
-                    Some(Op::Convert(Cvt::Bitcast, Ty::I32, a)) => vec![a],
-                    _ => vec![],
-                },
+                Site::Inst { .. } => self.word_sources(f, v),
                 _ => vec![],
             };
             pending.extend(
                 sources
                     .into_iter()
-                    .filter(|s| f.types[s.0] == Ty::I32 && !self.viewed[s.0]),
+                    .filter(|s| is_word(f.types[s.0]) && !self.viewed[s.0]),
             );
+        }
+    }
+
+    fn word_sources(&self, f: &Func, v: ValueId) -> Vec<ValueId> {
+        match self.op(f, v) {
+            Some(Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, a, b))
+            | Some(Op::Select(_, a, b))
+            | Some(Op::Pack64(a, b)) => vec![a, b],
+            Some(Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a))
+            | Some(Op::UnpackLo(a))
+            | Some(Op::UnpackHi(a)) => vec![a],
+            _ => vec![],
         }
     }
 
@@ -166,6 +177,14 @@ impl Facts {
 
     pub fn is_lane_id(&self, f: &Func, v: ValueId) -> bool {
         matches!(self.op(f, v), Some(Op::Env(Env::LaneId)))
+    }
+
+    pub fn is_lane_shift(&self, f: &Func, w: ValueId, s: ValueId) -> bool {
+        match f.types[w.0] {
+            Ty::I32 => self.is_lane_id(f, s),
+            Ty::I64 => matches!(self.op(f, s), Some(Op::Convert(Cvt::ZExt, Ty::I64, l)) if self.is_lane_id(f, l)),
+            _ => false,
+        }
     }
 
     pub fn arguments<'f>(
@@ -218,7 +237,7 @@ impl Facts {
                                 op: MemoryOp::Load(_),
                                 ..
                             } => all,
-                            EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane) => {
+                            EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane) => {
                                 true
                             }
                             _ => false,
@@ -243,7 +262,7 @@ impl Facts {
                 let block = &f.blocks[&id];
                 if id != f.entry {
                     for (index, &(v, ty)) in block.params.iter().enumerate() {
-                        if ty == Ty::I32
+                        if is_word(ty)
                             && !self.lane_word[v.0]
                             && self.arguments(f, id, index).any(|a| self.lane_word[a.0])
                         {
@@ -255,15 +274,17 @@ impl Facts {
                 for inst in &block.insts {
                     let word = match inst {
                         Inst::Effect {
-                            op: EffectOp::Wave(WaveOp::Ballot),
+                            op: EffectOp::Wave(WaveOp::Ballot { .. }),
                             ..
                         } => true,
-                        Inst::Core {
-                            ty: Ty::I32, op, ..
-                        } => match *op {
+                        Inst::Core { ty, op, .. } if is_word(*ty) => match *op {
                             Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, a, b)
-                            | Op::Select(_, a, b) => self.lane_word[a.0] || self.lane_word[b.0],
-                            Op::Convert(Cvt::Bitcast, Ty::I32, a) => self.lane_word[a.0],
+                            | Op::Select(_, a, b)
+                            | Op::Pack64(a, b) => self.lane_word[a.0] || self.lane_word[b.0],
+                            Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a) | Op::UnpackLo(a) => {
+                                self.lane_word[a.0]
+                            }
+                            Op::UnpackHi(a) => f.lanes == 64 && self.lane_word[a.0],
                             _ => false,
                         },
                         _ => false,
@@ -290,14 +311,18 @@ impl Facts {
                 let Inst::Core { value, ty, op } = &f.blocks[&block].insts[index] else {
                     return false;
                 };
+                let covers = f.types[w.0].bits() >= f.lanes;
                 match *op {
-                    Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, ..) => *ty == Ty::I32,
+                    Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, ..) => is_word(*ty),
                     Op::Select(c, _, _) => c != w,
-                    Op::Convert(Cvt::Bitcast, Ty::I32, _) => true,
+                    Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, _) => true,
+                    Op::Pack64(..) | Op::UnpackLo(_) => true,
+                    Op::UnpackHi(_) => f.lanes == 64,
                     Op::Int(IntOp::LShr, a, s) => {
-                        a == w
+                        covers
+                            && a == w
                             && s != w
-                            && self.is_lane_id(f, s)
+                            && self.is_lane_shift(f, a, s)
                             && self.uses[value.0].iter().all(|&shifted| {
                                 matches!(shifted, Use::Inst { block, index }
                                     if matches!(f.blocks[&block].insts[index],
@@ -306,7 +331,7 @@ impl Facts {
                     }
                     Op::Cmp(IntPred::Eq | IntPred::Ne, a, b) => {
                         let other = if a == w { b } else { a };
-                        other != w && self.constant(f, other) == Some(0)
+                        covers && other != w && self.constant(f, other) == Some(0)
                     }
                     _ => false,
                 }
@@ -336,8 +361,12 @@ impl Facts {
                     self.arguments(f, block, index).collect()
                 }
                 Site::Inst { .. } => match self.op(f, v) {
-                    Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) => vec![a, b],
-                    Some(Op::Convert(_, _, a)) => vec![a],
+                    Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) | Some(Op::Pack64(a, b)) => {
+                        vec![a, b]
+                    }
+                    Some(Op::Convert(_, _, a)) | Some(Op::UnpackLo(a)) | Some(Op::UnpackHi(a)) => {
+                        vec![a]
+                    }
                     _ => vec![],
                 },
                 _ => vec![],
@@ -351,17 +380,14 @@ impl Facts {
             let block = &f.blocks[&id];
             if id != f.entry {
                 for &(v, ty) in &block.params {
-                    self.saturated[v.0] = ty == Ty::I32;
+                    self.saturated[v.0] = is_word(ty);
                 }
             }
             for inst in &block.insts {
-                if let Inst::Core {
-                    value,
-                    ty: Ty::I32,
-                    ..
-                } = inst
-                {
-                    self.saturated[value.0] = true;
+                if let Inst::Core { value, ty, .. } = inst {
+                    if is_word(*ty) {
+                        self.saturated[value.0] = true;
+                    }
                 }
             }
         }
@@ -372,7 +398,7 @@ impl Facts {
                 let block = &f.blocks[&id];
                 if id != f.entry {
                     for (index, &(v, ty)) in block.params.iter().enumerate() {
-                        if ty != Ty::I32 || !self.saturated[v.0] {
+                        if !is_word(ty) || !self.saturated[v.0] {
                             continue;
                         }
                         if !self.arguments(f, id, index).all(|a| self.saturated[a.0]) {
@@ -382,23 +408,24 @@ impl Facts {
                     }
                 }
                 for inst in &block.insts {
-                    let Inst::Core {
-                        value,
-                        ty: Ty::I32,
-                        op,
-                    } = inst
-                    else {
+                    let Inst::Core { value, ty, op } = inst else {
                         continue;
                     };
+                    if !is_word(*ty) {
+                        continue;
+                    }
+                    let ones = if *ty == Ty::I64 { u64::MAX } else { 0xffff_ffff };
                     let s = match *op {
-                        Op::Const(_, k) => k == 0 || k == 0xffff_ffff,
+                        Op::Const(_, k) => k == 0 || k == ones,
                         Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, a, b) => {
                             self.saturated[a.0] && self.saturated[b.0]
                         }
                         Op::Select(c, a, b) => {
                             self.uniform[c.0] && self.saturated[a.0] && self.saturated[b.0]
                         }
-                        Op::Convert(Cvt::Bitcast, Ty::I32, a) => self.saturated[a.0],
+                        Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a)
+                        | Op::UnpackLo(a)
+                        | Op::UnpackHi(a) => self.saturated[a.0],
                         _ => false,
                     };
                     if !s && self.saturated[value.0] {

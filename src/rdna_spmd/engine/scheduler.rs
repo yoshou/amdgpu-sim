@@ -1,6 +1,5 @@
 use std::thread;
 
-use crate::processor::KernelDescriptor;
 
 use super::super::ir::EffectOp;
 use super::dispatch::{setup_sgprs, EntryLayout, GridDims};
@@ -11,13 +10,11 @@ use super::kernel::{
 use super::super::codegen::YieldValues;
 use super::super::codegen::{DONE, ENTER, LEAVE};
 
-const WAVE: usize = 32;
-
-fn lanes_mask(width: usize) -> u32 {
-    if width >= 32 {
-        u32::MAX
+fn lanes_mask(width: usize) -> u64 {
+    if width >= 64 {
+        u64::MAX
     } else {
-        (1u32 << width) - 1
+        (1u64 << width) - 1
     }
 }
 fn fiber_stack_bytes(width: usize) -> usize {
@@ -38,6 +35,8 @@ pub struct View<'a> {
     exec: usize,
     frame: usize,
     depth: Vec<usize>,
+    lanes: usize,
+    layout: EntryLayout,
 }
 
 impl<'a> View<'a> {
@@ -62,6 +61,8 @@ impl<'a> View<'a> {
             exec: kernel.registers.exec as usize,
             frame: kernel.frame_words.max(1),
             depth,
+            lanes: kernel.lanes as usize,
+            layout: kernel.layout,
         }
     }
     fn fibers(&self) -> usize {
@@ -79,7 +80,7 @@ struct State {
     yielded: Vec<usize>,
     done: Vec<bool>,
     waiting: Vec<Option<u32>>,
-    valid: Vec<u32>,
+    valid: Vec<u64>,
     scratch: aligned_vec::AVec<u8, aligned_vec::ConstAlign<0x1_0000_0000>>,
     lds: Vec<u8>,
 }
@@ -156,7 +157,6 @@ struct Engine<'a> {
 
 pub fn run(
     view: View,
-    kd: &KernelDescriptor,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
     dims: GridDims,
@@ -165,7 +165,9 @@ pub fn run(
     num_threads: usize,
 ) {
     let width = view.width;
+    let wave = view.lanes;
     assert!(matches!(width, 1 | 2 | 4 | 8 | 16 | 32));
+    assert!(matches!(wave, 32 | 64));
     let wg_size = dims.workgroup_size() as usize;
     let unit = view.scheduler;
     match view.workgroup_x {
@@ -187,8 +189,8 @@ pub fn run(
         );
     }
     let num_wg = dims.num_wg_x as u64 * dims.num_wg_y as u64 * dims.num_wg_z as u64;
-    let packets_per_wave = WAVE / width;
-    let waves_per_wg = wg_size.div_ceil(WAVE);
+    let packets_per_wave = wave / width;
+    let waves_per_wg = wg_size.div_ceil(wave);
     let packets_per_wg = match unit {
         Scheduler::Independent => wg_size / width,
         _ => waves_per_wg * packets_per_wave,
@@ -225,7 +227,7 @@ pub fn run(
     };
     let scratch = match unit {
         Scheduler::Independent => width * stride,
-        _ => unit_waves * WAVE * stride,
+        _ => unit_waves * wave * stride,
     };
     let lds = if unit == Scheduler::Workgroup {
         group_segment_size.max(LDS_MIN_BYTES)
@@ -242,9 +244,10 @@ pub fn run(
         lds,
         stack: fiber_stack_bytes(width),
     };
+    let layout = view.layout;
     let engine = Engine {
         view,
-        layout: EntryLayout::of(kd),
+        layout,
         kernarg_ptr,
         aql_packet_addr,
         dims,
@@ -284,7 +287,7 @@ impl Engine<'_> {
             ),
             Scheduler::Wave => (
                 index / self.waves_per_wg as u64,
-                (index % self.waves_per_wg as u64) as usize * WAVE,
+                (index % self.waves_per_wg as u64) as usize * self.view.lanes,
             ),
             Scheduler::Workgroup => (index, 0),
         }
@@ -303,12 +306,13 @@ impl Engine<'_> {
             state.lds.fill(0);
         }
         let width = self.view.width;
+        let lanes = self.view.lanes;
         for packet in 0..self.shape.packets {
             let wave = packet / self.packets_per_wave;
             let wave_base = if self.unit == Scheduler::Independent {
                 0
             } else {
-                wave * WAVE * self.stride
+                wave * lanes * self.stride
             };
             let scratch_base = if state.scratch.is_empty() {
                 0
@@ -335,23 +339,25 @@ impl Engine<'_> {
             let wave_valid = {
                 let count = self
                     .wg_size
-                    .saturating_sub(local_base + (packet / self.packets_per_wave) * WAVE)
-                    .min(WAVE);
-                if count >= WAVE {
-                    u32::MAX
-                } else {
-                    ((1u64 << count) - 1) as u32
-                }
+                    .saturating_sub(local_base + (packet / self.packets_per_wave) * lanes)
+                    .min(lanes);
+                lanes_mask(count)
             };
             sgprs[self.view.exec] = valid_mask;
             let vgprs = &mut state.vgprs[packet];
             vgprs.fill(0);
+            let registers = vgprs.len() / width;
             for lane in 0..valid_lanes {
                 let item = (local + lane) as u32;
                 let x = item % self.dims.wg_x;
                 let y = (item / self.dims.wg_x) % self.dims.wg_y;
                 let z = item / (self.dims.wg_x * self.dims.wg_y);
-                vgprs[lane] = x | (y << 10) | (z << 20);
+                let ids = [x, y, z];
+                for (axis, f) in self.layout.workitem_ids.iter().enumerate() {
+                    if let Some(f) = f.filter(|f| (f.register as usize) < registers) {
+                        vgprs[f.register as usize * width + lane] |= ids[axis] << f.shift;
+                    }
+                }
             }
             state.done[packet] = valid_lanes == 0;
             {
@@ -383,13 +389,9 @@ impl Engine<'_> {
                 state.waiting[wave] = None;
                 let count = self
                     .wg_size
-                    .saturating_sub(local_base + wave * WAVE)
-                    .min(WAVE);
-                state.valid[wave] = if count == WAVE {
-                    u32::MAX
-                } else {
-                    (1u32 << count) - 1
-                };
+                    .saturating_sub(local_base + wave * lanes)
+                    .min(lanes);
+                state.valid[wave] = lanes_mask(count);
             }
         }
     }
@@ -441,7 +443,7 @@ impl Engine<'_> {
     fn run_wave(&self, regions: &[Region], state: &mut State) {
         let width = self.view.width;
         let valid = state.valid[0];
-        let mut live: u32 = 0;
+        let mut live: u64 = 0;
         for packet in 0..self.packets_per_wave {
             if !state.done[packet] {
                 live |= 1 << packet;
@@ -473,9 +475,9 @@ impl Engine<'_> {
                 .yields
                 .get(boundary as usize)
                 .expect("packet yield lacks a typed effect");
-            let holders: u32 = (0..self.packets_per_wave as u32)
-                .filter(|p| valid >> (p * width as u32) & lanes_mask(width) != 0)
-                .map(|p| 1 << p)
+            let holders: u64 = (0..self.packets_per_wave)
+                .filter(|p| valid >> (p * width) & lanes_mask(width) != 0)
+                .map(|p| 1u64 << p)
                 .sum();
             assert_eq!(
                 live & holders,

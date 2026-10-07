@@ -392,10 +392,10 @@ pub fn effects_of(inst: &InstFormat) -> InstEffects {
     }
 }
 
-pub fn word(slot: u32) -> Option<Word> {
+pub fn word(slot: u32, lanes: u32) -> Option<Word> {
     if slot >= VGPR_BASE {
         Some(Word::Vgpr(slot - VGPR_BASE))
     } else {
-        Word::scalar(slot)
+        Word::scalar_in(slot, lanes)
     }
 }

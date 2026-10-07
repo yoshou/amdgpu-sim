@@ -56,6 +56,35 @@ pub fn register(registry: &mut Dialect) -> Result<(), &'static str> {
             lower: Implementation::Single(image::sample),
         },
     )?;
+    registry.register(
+        ID,
+        39,
+        Operation {
+            name: "image_sample_lz_gcn3",
+            effect: Effect::ReadGlobal { every_lane: true },
+            immediates: &[(12, 3)],
+            inputs: &[
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I32,
+                Ty::I1,
+                Ty::F32,
+                Ty::F32,
+            ],
+            outputs: vec![Ty::I32],
+            lower: Implementation::Single(image::sample_gcn3),
+        },
+    )?;
     for (id, name, ty, lower) in [
         (
             1,
@@ -343,6 +372,12 @@ pub fn image_sample(registry: &DialectRegistry) -> TargetOp {
     registry
         .lookup(ID, "image_sample_lz")
         .expect("missing RDNA4 image provider")
+}
+
+pub fn image_sample_gcn3(registry: &DialectRegistry) -> TargetOp {
+    registry
+        .lookup(ID, "image_sample_lz_gcn3")
+        .expect("missing GCN3 image provider")
 }
 
 pub fn comparison(registry: &DialectRegistry, ty: Ty) -> TargetOp {

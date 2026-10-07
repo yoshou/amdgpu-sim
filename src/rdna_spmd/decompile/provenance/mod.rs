@@ -4,7 +4,7 @@ mod layout;
 mod program;
 mod sets;
 
-use super::address::{Copies, Region, Regions, LANES};
+use super::address::{Copies, Region, Regions};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::engine::EntryLayout;
 use crate::rdna_spmd::environment::Environment;
@@ -98,7 +98,7 @@ fn carried(sets: &Sets, bounds: &mut HashMap<ValueId, Vec<Regions>>) -> Vec<bool
             plain[v.0] = acc[0] & 1 != 0;
             continue;
         }
-        let lanes = if back.iter().any(|&a| sets.has_parts(a)) { LANES } else { 1 };
+        let lanes = if back.iter().any(|&a| sets.has_parts(a)) { program.lanes() } else { 1 };
         let mut parts = Vec::with_capacity(lanes);
         for lane in 0..lanes {
             acc.fill(0);
@@ -160,7 +160,7 @@ fn loaded(sets: &Sets, spills: &[Spill], bounds: &mut HashMap<ValueId, Vec<Regio
                     _ => true,
                 })
                 .collect();
-            let lanes = if from.iter().any(|sp| sp.parts.len() > 1) { LANES } else { 1 };
+            let lanes = if from.iter().any(|sp| sp.parts.len() > 1) { program.lanes() } else { 1 };
             let mut parts = Vec::with_capacity(lanes);
             let mut pointing = false;
             for lane in 0..lanes {

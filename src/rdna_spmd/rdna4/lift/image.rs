@@ -77,22 +77,29 @@ pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowe
     if !matches!(i.op, I::IMAGE_SAMPLE_LZ) {
         return None;
     }
-    let mut inputs = (0..8)
-        .map(|k| {
-            input(
-                SourceOperand::ScalarRegister((i.rsrc + k).try_into().unwrap()),
-                Ty::I32,
-            )
-        })
+    let rsrc: [u8; 8] = std::array::from_fn(|k| (i.rsrc + k as u16).try_into().unwrap());
+    let samp: [u8; 4] = std::array::from_fn(|k| (i.samp + k as u16).try_into().unwrap());
+    let target = crate::rdna_spmd::rdna4::dialect::image_sample(registry);
+    Some(sample(registry, target, rsrc, samp, [i.vaddr0, i.vaddr1], i.vdata, i.dmask, i.unrm != 0))
+}
+
+pub fn sample(
+    registry: &DialectRegistry,
+    target: TargetOp,
+    rsrc: [u8; 8],
+    samp: [u8; 4],
+    vaddr: [u8; 2],
+    vdata: u8,
+    dmask: u8,
+    unrm: bool,
+) -> Lowering {
+    let mut inputs = rsrc
+        .iter()
+        .chain(&samp)
+        .map(|&r| input(SourceOperand::ScalarRegister(r), Ty::I32))
         .collect::<Vec<_>>();
-    inputs.extend((0..4).map(|k| {
-        input(
-            SourceOperand::ScalarRegister((i.samp + k).try_into().unwrap()),
-            Ty::I32,
-        )
-    }));
-    inputs.push(input(SourceOperand::VectorRegister(i.vaddr0), Ty::F32));
-    inputs.push(input(SourceOperand::VectorRegister(i.vaddr1), Ty::F32));
+    inputs.push(input(SourceOperand::VectorRegister(vaddr[0]), Ty::F32));
+    inputs.push(input(SourceOperand::VectorRegister(vaddr[1]), Ty::F32));
     inputs.push(input(SourceOperand::ScalarRegister(126), Ty::I1));
     let mut b = Builder::new(registry, inputs);
 
@@ -106,11 +113,10 @@ pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowe
         };
         b.push(ty, Op::Select(ValueId(14), ValueId(k), zero))
     });
-    let target = crate::rdna_spmd::rdna4::dialect::image_sample(registry);
-    let unrm = b.k(Ty::I1, (i.unrm != 0) as u64);
+    let unrm = b.k(Ty::I1, unrm as u64);
     let mut results = vec![];
     for component in 0..4 {
-        if i.dmask & (1 << component) == 0 {
+        if dmask & (1 << component) == 0 {
             continue;
         }
         let component = b.k(Ty::I32, component);
@@ -121,9 +127,9 @@ pub fn instruction(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowe
         args[15] = safe[13];
         let value = b.target_one(target, Arguments::Sixteen(args));
         results.push((
-            Output::Vgpr(i.vdata as u32 + results.len() as u32, Ty::I32),
+            Output::Vgpr(vdata as u32 + results.len() as u32, Ty::I32),
             value,
         ));
     }
-    Some(b.finish_many(false, results))
+    b.finish_many(false, results)
 }

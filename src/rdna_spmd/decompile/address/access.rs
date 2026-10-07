@@ -140,12 +140,18 @@ pub(super) fn resource_span<'a, Q: Queries<'a>>(q: &mut Q, at: (BlockId, usize),
             };
             Some((Value::of(base.add(&sum.scale(1u32 << shift))), bytes, high))
         }
-        Reach::Image => {
+        Reach::Image { gcn3 } => {
             let (w1, w2, w4) = (word(q, 1)?.as_constant()?, word(q, 2)?.as_constant()?, word(q, 4)?.as_constant()?);
-            let width = ((w1 >> 30) | (w2 & 0x3fff) << 2) as u64 + 1;
-            let height = ((w2 >> 14) & 0xffff) as u64 + 1;
-            let pitch = (w4 & 0xffff) as u64;
-            let row = if pitch != 0 { pitch + 1 } else { width }.div_ceil(128) * 128;
+            let (width, height, row) = if gcn3 {
+                let width = (w2 & 0x3fff) as u64 + 1;
+                let height = ((w2 >> 14) & 0x3fff) as u64 + 1;
+                (width, height, ((w4 >> 13) & 0x3fff) as u64 + 1)
+            } else {
+                let width = ((w1 >> 30) | (w2 & 0x3fff) << 2) as u64 + 1;
+                let height = ((w2 >> 14) & 0xffff) as u64 + 1;
+                let pitch = (w4 & 0xffff) as u64;
+                (width, height, if pitch != 0 { pitch + 1 } else { width }.div_ceil(128) * 128)
+            };
             let constant = |this: &Q, index: usize| args.get(index).and_then(|&x| this.program().facts.constant(this.program().f, x));
             let sampler: Option<Vec<u32>> = (8..12).map(|i| constant(q, i).map(|k| k as u32)).collect();
             let point = sampler.as_ref().is_some_and(|s| crate::buffer::get_bits_u32(s, 84, 2) == 0);

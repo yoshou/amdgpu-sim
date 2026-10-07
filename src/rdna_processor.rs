@@ -16716,6 +16716,9 @@ fn decode_kernel_desc(kd: &[u8]) -> KernelDescriptor {
         enable_sgpr_workgroup_id_z: get_bit(kd, 52, 9),
         enable_sgpr_workgroup_info: get_bit(kd, 52, 10),
         enable_vgpr_workitem_id: get_bits(kd, 52, 11, 2),
+        float_mode: get_bits(kd, 48, 12, 8),
+        enable_dx10_clamp: get_bit(kd, 48, 21),
+        enable_ieee_mode: get_bit(kd, 48, 23),
     }
 }
 

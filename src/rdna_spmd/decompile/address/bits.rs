@@ -3,6 +3,7 @@ use super::control::{can_take, incoming};
 use super::form::*;
 use super::limits::{decide, offset};
 use super::queries::*;
+use super::wide::known_high;
 use crate::rdna_spmd::analysis::facts::Site;
 use crate::rdna_spmd::ir::*;
 
@@ -46,7 +47,7 @@ pub(super) fn compute_bit<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, lane: usize
             } => {
                 let input = inputs[0];
                 let mut unknown = false;
-                for l in 0..LANES {
+                for l in 0..q.program().lanes() {
                     if !q.symbols().valid(l) {
                         continue;
                     }
@@ -120,7 +121,11 @@ fn core_bit<'a, Q: Queries<'a>>(q: &mut Q, op: Op, block: BlockId, lane: usize, 
                 Some(k) => Some(k & 1 != 0),
                 None => match q.program().facts.op(q.program().f, x) {
                     Some(Op::Int(IntOp::LShr, w, s)) => {
+                        let width = q.program().f.types[w.0].bits();
                         match q.value(s, lane, None).0.form.as_constant() {
+                            Some(k) if q.program().facts.uniform[w.0] && matches!(width, 32 | 64) => {
+                                q.word_bit(w, (k & (width - 1)) as usize)
+                            }
                             Some(k) if k < 32 && (q.program().facts.uniform[w.0] || k as usize == lane) => {
                                 q.word_bit(w, k as usize)
                             }
@@ -168,8 +173,20 @@ fn core_bit<'a, Q: Queries<'a>>(q: &mut Q, op: Op, block: BlockId, lane: usize, 
                     _ => None,
                 },
             };
-            if plain.is_some() || wide {
+            if plain.is_some() {
                 plain
+            } else if wide {
+                let highs = (known_high(q, a, block, lane), known_high(q, b, block, lane));
+                let (Some(hx), Some(hy)) = highs else {
+                    return (None, used);
+                };
+                match (pred, difference.as_constant(), hx.sub(&hy).as_constant()) {
+                    (IntPred::Eq, _, Some(h)) if h != 0 => Some(false),
+                    (IntPred::Ne, _, Some(h)) if h != 0 => Some(true),
+                    (IntPred::Eq | IntPred::Ule | IntPred::Uge | IntPred::Sle | IntPred::Sge, Some(0), Some(0)) => Some(true),
+                    (IntPred::Ne | IntPred::Ult | IntPred::Ugt | IntPred::Slt | IntPred::Sgt, Some(0), Some(0)) => Some(false),
+                    _ => None,
+                }
             } else {
                 let limits = q.limits(block);
                 let mut encoding = Encoding::new(&q.symbols().unknowns, &|_: &UnknownInfo| false);
@@ -206,8 +223,11 @@ fn aperture<'a, Q: Queries<'a>>(q: &mut Q, a: ValueId, b: ValueId, lane: usize) 
 }
 
 pub(super) fn compute_word_bit<'a, Q: Queries<'a>>(q: &mut Q, w: ValueId, bit: usize) -> Option<bool> {
-    if let Some(k) = q.value(w, bit, None).0.form.as_constant() {
-        return Some(k >> bit & 1 != 0);
+    let at = if bit < q.program().lanes() { bit } else { 0 };
+    if q.program().f.types[w.0] == Ty::I32 {
+        if let Some(k) = q.value(w, at, None).0.form.as_constant() {
+            return Some(k >> bit & 1 != 0);
+        }
     }
     if let Site::Param { block, index } = q.program().facts.site[w.0] {
         if block == q.program().f.entry {
@@ -276,17 +296,27 @@ pub(super) fn compute_word_bit<'a, Q: Queries<'a>>(q: &mut Q, w: ValueId, bit: u
                 }
             },
             Op::Convert(Cvt::Bitcast, _, a) => q.word_bit(a, bit),
+            Op::Pack64(a, b) => {
+                if bit < 32 {
+                    q.word_bit(a, bit)
+                } else {
+                    q.word_bit(b, bit - 32)
+                }
+            }
+            Op::UnpackLo(a) => q.word_bit(a, bit),
+            Op::UnpackHi(a) => q.word_bit(a, bit + 32),
             _ => None,
         },
         Some(Inst::Effect {
-            op: EffectOp::Wave(WaveOp::Ballot),
+            op: EffectOp::Wave(WaveOp::Ballot { high }),
             inputs,
             ..
         }) => {
-            if !q.symbols().valid(bit) {
+            let lane = bit + if *high { 32 } else { 0 };
+            if !q.symbols().valid(lane) {
                 return Some(false);
             }
-            q.bit(inputs[0], bit, None).0
+            q.bit(inputs[0], lane, None).0
         }
         _ => None,
     }

@@ -2,9 +2,9 @@ use crate::rdna_spmd::dialect::{Dialect, DialectRegistry};
 use crate::rdna_spmd::program::Program;
 use std::sync::Arc;
 
-mod decode;
-mod dialect;
-mod lift;
+pub(crate) mod decode;
+pub(crate) mod dialect;
+pub(crate) mod lift;
 
 pub fn dialect() -> Dialect {
     let mut rdna4 = Dialect::new();
@@ -23,7 +23,7 @@ pub fn supports(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
-pub fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
+pub fn decode(entry_pc: usize, memory: &[u8], lanes: u32) -> Result<Program, String> {
     let decoded = decode::program(entry_pc, memory)?;
     let normalized = decode::ScalarProgram {
         entry_pc: decoded.entry_pc,
@@ -33,12 +33,13 @@ pub fn decode(entry_pc: usize, memory: &[u8]) -> Result<Program, String> {
             .map(|(&pc, b)| (pc, decode::lower_block(pc, &b.insts, &b.next_pcs)))
             .collect(),
     };
-    Ok(lift_program(&normalized, Arc::new(dialect().registry)))
+    Ok(lift_program(&normalized, Arc::new(dialect().registry), lanes))
 }
 
 fn lift_program(
     source: &decode::ScalarProgram,
     registry: Arc<DialectRegistry>,
+    lanes: u32,
 ) -> Program {
     use crate::rdna_spmd::ir::EffectOp;
     use crate::{
@@ -70,7 +71,7 @@ fn lift_program(
                     }
                 } else {
                     body.push(inst.clone());
-                    lowerings.push(lift::instruction_with_registry(inst, &registry));
+                    lowerings.push(lift::instruction_with_registry(inst, &registry, lanes));
                 }
             }
             b.body = body;
@@ -81,5 +82,5 @@ fn lift_program(
         .iter()
         .map(|(&pc, b)| (pc, b.iter().collect()))
         .collect();
-    lift::lift(registry, &normalized, &refs)
+    lift::lift(registry, &normalized, &refs, lanes)
 }

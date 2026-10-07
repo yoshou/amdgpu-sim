@@ -116,7 +116,7 @@ pub enum Numeric {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WaveOp {
     Any,
-    Ballot,
+    Ballot { high: bool },
     ReadFirstLane,
     ReadLane,
     WriteLane,
@@ -155,7 +155,7 @@ impl EffectOp {
             },
             Self::Wave(op) => match op {
                 WaveOp::Any => (vec![I1], vec![I1]),
-                WaveOp::Ballot => (vec![I1], vec![I32]),
+                WaveOp::Ballot { .. } => (vec![I1], vec![I32]),
                 WaveOp::ReadFirstLane => (vec![I32, I1], vec![I32]),
                 WaveOp::ReadLane => (vec![I32, I32, I32], vec![I32]),
                 WaveOp::WriteLane => (vec![I32, I32, I32, I32], vec![I32]),
@@ -174,7 +174,17 @@ impl EffectOp {
         inputs: &[ValueId],
         outputs: &[(ValueId, Ty)],
         types: &[Ty],
+        lanes: u32,
     ) -> Result<(), &'static str> {
+        match self {
+            Self::Wave(WaveOp::Ballot { high: true }) if lanes != 64 => {
+                return Err("a ballot of the high lanes needs a wave of 64 lanes")
+            }
+            Self::Wave(WaveOp::Wmma) if lanes != 32 => {
+                return Err("a matrix multiply needs a wave of 32 lanes")
+            }
+            _ => {}
+        }
         let (args, results) = self.signature();
         if inputs.len() != args.len() || outputs.len() != results.len() {
             return Err("effect arity mismatch");

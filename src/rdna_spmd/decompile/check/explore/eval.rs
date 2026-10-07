@@ -124,7 +124,7 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
         let ty = f.types[v.0];
         let bits = match ty {
             Ty::I1 => Some(self.q.bit(v)),
-            Ty::I32 if facts.viewed[v.0] => Some(self.q.view(v)),
+            Ty::I32 | Ty::I64 if facts.viewed[v.0] => Some(self.q.view(v)),
             _ => None,
         };
         let same = Some(self.intern(ty, Form::Value(v)));
@@ -151,9 +151,9 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
     fn formed(&mut self, side: usize, v: ValueId, t: Option<usize>) -> Desc {
         let (f, facts) = (self.q.program().f, self.q.program().facts);
         let ty = f.types[v.0];
-        if ty == Ty::I1 || (ty == Ty::I32 && facts.viewed[v.0]) {
+        if ty == Ty::I1 || (matches!(ty, Ty::I32 | Ty::I64) && facts.viewed[v.0]) {
             let bits = match t {
-                Some(t) => self.form_bits(side, v, t, ty == Ty::I32),
+                Some(t) => self.form_bits(side, v, t, ty != Ty::I1),
                 None => self.fresh(side, v, 0),
             };
             Desc {
@@ -219,7 +219,7 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                 let (value, ty, op) = (*value, *ty, *op);
                 let lane_only = match ty {
                     Ty::I1 => true,
-                    Ty::I32 => facts.viewed[value.0],
+                    Ty::I32 | Ty::I64 => facts.viewed[value.0],
                     _ => false,
                 };
                 let lanes = if lane_only { self.logic().lane_function(f, facts, value) } else { None };
@@ -229,7 +229,7 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                         let bits = if ty == Ty::I1 {
                             self.logic().lanes(|l| values[l as usize] & 1 == 1)
                         } else {
-                            self.logic().lanes(|l| values[l as usize] >> l & 1 == 1)
+                            self.logic().lanes(|l| values[l as usize] >> (l & 31) & 1 == 1)
                         };
                         Desc {
                             same: Some(self.form(ev, ty, op)),
@@ -239,7 +239,7 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                     Op::Const(_, k) => {
                         let bits = match ty {
                             Ty::I1 => Some(Manager::constant(k != 0)),
-                            Ty::I32 if facts.viewed[value.0] => Some(self.logic().word(k as u32)),
+                            Ty::I32 | Ty::I64 if facts.viewed[value.0] => Some(self.logic().word_of(ty, k)),
                             _ => None,
                         };
                         Desc {
@@ -277,9 +277,9 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                         }
                     }
                     Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b)
-                        if matches!(ty, Ty::I1 | Ty::I32) =>
+                        if matches!(ty, Ty::I1 | Ty::I32 | Ty::I64) =>
                     {
-                        if ty == Ty::I32 && !facts.viewed[value.0] {
+                        if ty != Ty::I1 && !facts.viewed[value.0] {
                             Desc {
                                 same: Some(self.form(ev, ty, op)),
                                 bits: None,
@@ -300,6 +300,34 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                         }
                     }
                     Op::Convert(Cvt::Bitcast, to, a) if f.types[a.0] == to => self.get(ev, a),
+                    Op::Pack64(a, b) if facts.viewed[value.0] => {
+                        let low = self.bits_of(ev, a);
+                        let bits = if f.lanes == 32 {
+                            low
+                        } else {
+                            let high = self.bits_of(ev, b);
+                            let upper = self.logic().atom(Atom::Lane(5));
+                            self.logic().m.ite(upper, high, low)
+                        };
+                        Desc {
+                            same: Some(self.form(ev, ty, op)),
+                            bits: Some(bits),
+                        }
+                    }
+                    Op::UnpackLo(a) | Op::UnpackHi(a) if facts.viewed[value.0] => {
+                        let high = matches!(op, Op::UnpackHi(_));
+                        let other = self.fresh(side, value, 0);
+                        let bits = if high && f.lanes == 32 {
+                            other
+                        } else {
+                            let own = self.bits_of(ev, a);
+                            self.logic().half(high, own, other)
+                        };
+                        Desc {
+                            same: Some(self.form(ev, ty, op)),
+                            bits: Some(bits),
+                        }
+                    }
                     Op::Convert(Cvt::Trunc, Ty::I1, s) if projected_word(f, facts, s).is_some() => {
                         let w = projected_word(f, facts, s).unwrap();
                         let same = self.form(ev, ty, op);
@@ -382,8 +410,14 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                         },
                     );
                 }
-                EffectOp::Wave(WaveOp::Ballot) => {
-                    let g = self.bits_of(ev, inputs[0]);
+                EffectOp::Wave(WaveOp::Ballot { high }) => {
+                    let own = self.bits_of(ev, inputs[0]);
+                    let g = if f.lanes == 32 {
+                        own
+                    } else {
+                        let other = self.fresh(side, outputs[0].0, 1);
+                        self.logic().half(*high, own, other)
+                    };
                     ev.descs.insert(
                         outputs[0].0,
                         Desc {
@@ -463,7 +497,7 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                     let local = self.logic().local(Choice::Query(outputs[0].0));
                     self.q.not(local)
                 }
-                EffectOp::Wave(WaveOp::Ballot) => {
+                EffectOp::Wave(WaveOp::Ballot { .. }) => {
                     self.logic().materialized(facts, outputs[0].0)
                 }
                 EffectOp::Wave(WaveOp::ReadFirstLane) => {

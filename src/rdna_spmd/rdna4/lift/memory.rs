@@ -676,7 +676,7 @@ impl Memory {
         result: ValueId,
     ) {
         let word = if self.scalar() {
-            super::regs::Word::scalar(self.dest + k)
+            super::regs::Word::scalar_in(self.dest + k, f.lanes)
         } else {
             Some(super::regs::Word::Vgpr(self.dest + k))
         };
@@ -686,9 +686,15 @@ impl Memory {
             }
             return;
         };
-        let stored = if matches!(word, super::regs::Word::Mask(_)) {
-            super::regs::project(f, &mut block.insts, result)
-        } else if self.scalar() {
+        if let super::regs::Word::Mask(m) = word {
+            let (_, high) = super::regs::mask_half(self.dest + k, f.lanes).unwrap();
+            let mut halves = [None, None];
+            halves[high as usize] = Some(result);
+            let stored = super::regs::masked(f, &mut block.insts, words, m, halves);
+            words.insert(word, stored);
+            return;
+        }
+        let stored = if self.scalar() {
             result
         } else {
             let old = words[&word];
@@ -702,11 +708,6 @@ impl Memory {
                 ty: Ty::I32,
                 op: Op::Select(mask, result, old),
             });
-            stored
-        };
-        let stored = if word == super::regs::Word::Mask(126) {
-            super::regs::valid_exec(f, &mut block.insts, stored)
-        } else {
             stored
         };
         words.insert(word, stored);

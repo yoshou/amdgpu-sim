@@ -101,7 +101,7 @@ fn only_lane<Q: Queries>(q: &mut Q, g: Bdd) -> Option<u32> {
         return None;
     }
     let mut found = None;
-    for lane in 0..32u32 {
+    for lane in 0..q.atoms().lanes() {
         if q.at_lane(g, lane) != Bdd::FALSE {
             if found.is_some() {
                 return None;

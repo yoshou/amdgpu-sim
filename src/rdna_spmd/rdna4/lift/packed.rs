@@ -197,7 +197,7 @@ fn dot_integer(
     Some(b.finish(Output::Vgpr(i.vdst as u32, Ty::I32), value))
 }
 
-fn narrow_wide_half(b: &mut Builder<'_>, value: ValueId) -> ValueId {
+pub fn narrow_wide_half(b: &mut Builder<'_>, value: ValueId) -> ValueId {
     let single = b.push(Ty::F32, Op::Convert(Cvt::FloatResizeRte, Ty::F32, value));
     let widened = b.push(Ty::F64, Op::Convert(Cvt::FloatResizeRte, Ty::F64, single));
     let magnitude = b.push(Ty::F64, Op::Unary(FloatUnary::Abs, value));

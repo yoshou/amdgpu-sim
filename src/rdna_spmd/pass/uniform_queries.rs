@@ -10,6 +10,7 @@ struct Facts<'a> {
     target: Vec<Option<(bool, Vec<ValueId>)>>,
     answered: Vec<bool>,
     inputs: &'a [Parameter],
+    layout: &'a crate::rdna_spmd::engine::EntryLayout,
     state: Vec<Option<bool>>,
 }
 
@@ -38,7 +39,7 @@ impl Facts<'_> {
         if let Some((block, index)) = self.parameter[value.0] {
             if block == self.f.entry {
                 return match self.inputs.get(index).map(|p| p.source) {
-                    Some(ParameterSource::Vgpr(0)) => false,
+                    Some(ParameterSource::Vgpr(r)) if self.layout.workitem_register(r) => false,
                     Some(ParameterSource::MaskBit(_)) => false,
                     Some(_) => true,
                     None => false,
@@ -87,7 +88,7 @@ impl Facts<'_> {
     }
 }
 
-fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
+fn run(f: &mut Func, inputs: &[Parameter], layout: &crate::rdna_spmd::engine::EntryLayout) -> usize {
     let mut defs = vec![None; f.types.len()];
     let mut parameter = vec![None; f.types.len()];
     let mut effect = vec![false; f.types.len()];
@@ -120,7 +121,7 @@ fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
                 } => {
                     let query = matches!(
                         op,
-                        EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane)
+                        EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane)
                     );
                     for &(v, _) in outputs {
                         effect[v.0] = !query;
@@ -144,6 +145,7 @@ fn run(f: &mut Func, inputs: &[Parameter]) -> usize {
         target,
         answered,
         inputs,
+        layout,
         state: vec![None; f.types.len()],
     };
     let mut renames = std::collections::BTreeMap::new();
@@ -171,6 +173,50 @@ impl Pass for UniformQueries {
         "uniform_queries"
     }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        run(f, analyses.context().inputs) > 0
+        run(f, analyses.context().inputs, &analyses.context().entry) > 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdna_spmd::engine::{EntryLayout, Field};
+
+    fn answered(layout: EntryLayout) -> usize {
+        let mut f = Func::new(BlockId(0), Presence::Wave, 64);
+        let sources = [ParameterSource::Vgpr(0), ParameterSource::Vgpr(1), ParameterSource::MaskBit(126)];
+        let types = [Ty::I32, Ty::I32, Ty::I1];
+        let params: Vec<_> = types.iter().map(|&t| (f.value(t), t)).collect();
+        let first = f.value(Ty::I32);
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: params.clone(),
+                insts: vec![Inst::Effect {
+                    provenance: 0,
+                    op: EffectOp::Wave(WaveOp::ReadFirstLane),
+                    inputs: vec![params[1].0, params[2].0],
+                    outputs: vec![(first, Ty::I32)],
+                }],
+                term: Term::Ret(vec![first]),
+            },
+        );
+        let inputs: Vec<Parameter> = sources.iter().zip(types).map(|(&source, ty)| Parameter { source, ty }).collect();
+        run(&mut f, &inputs, &layout)
+    }
+
+    #[test]
+    fn a_query_of_a_work_item_id_stays_a_query() {
+        let field = |register| Some(Field { register, shift: 0 });
+        let separate = EntryLayout {
+            workitem_ids: [field(0), field(1), None],
+            ..EntryLayout::default()
+        };
+        assert_eq!(answered(separate), 0, "v1 holds each lane's y");
+        let packed = EntryLayout {
+            workitem_ids: EntryLayout::PACKED,
+            ..EntryLayout::default()
+        };
+        assert_eq!(answered(packed), 1, "v1 holds no id, so every lane reads the same entry value");
     }
 }

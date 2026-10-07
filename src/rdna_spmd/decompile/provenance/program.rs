@@ -1,4 +1,4 @@
-use super::super::address::{condition, literals, Copies, LANES};
+use super::super::address::{condition, literals, Copies};
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::engine::EntryLayout;
 use crate::rdna_spmd::environment::Environment;
@@ -83,12 +83,16 @@ impl<'a> Program<'a> {
         }
     }
 
+    pub(super) fn lanes(&self) -> usize {
+        self.f.lanes as usize
+    }
+
     pub(super) fn partial(&self) -> bool {
-        self.workgroup % LANES != 0
+        self.workgroup % self.lanes() != 0
     }
 
     pub(super) fn lacks(&self, lane: usize) -> bool {
-        self.partial() && lane >= self.workgroup % LANES
+        self.partial() && lane >= self.workgroup % self.lanes()
     }
 
     pub(super) fn words(&self, address: ValueId, bytes: u32) -> Option<(u32, u32)> {

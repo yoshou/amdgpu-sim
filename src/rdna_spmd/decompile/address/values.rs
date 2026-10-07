@@ -411,7 +411,7 @@ impl<'a> Values<'a> {
     fn summary(&mut self, header: BlockId, seed: Option<Target>) -> (Bits, Vec<(StepKey, Step)>) {
         let params: Vec<(ValueId, Ty)> = self.symbols.program.f.blocks[&header].params.clone();
         let (entering, back) = edges_into(self, header);
-        let lanes: Vec<usize> = (0..LANES).filter(|&l| self.symbols.valid(l)).collect();
+        let lanes: Vec<usize> = (0..self.symbols.program.lanes()).filter(|&l| self.symbols.valid(l)).collect();
         let mut bits: Vec<((usize, u8), bool)> = match self.known::<LoopBits>(&header) {
             Some(bits) => (*bits).clone(),
             None => {

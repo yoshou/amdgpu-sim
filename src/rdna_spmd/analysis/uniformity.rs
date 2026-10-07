@@ -17,24 +17,26 @@ impl Analysis for Uniformity {
         let constants = analyses.get::<Constants>(f);
         packet(
             f,
-            &entry(f, ctx.inputs, aligned),
+            &entry(f, ctx.inputs, &ctx.entry, aligned),
             &constants,
         )
     }
 }
 
-fn entry(f: &Func, inputs: &[Parameter], aligned: bool) -> Entry {
+fn entry(f: &Func, inputs: &[Parameter], layout: &crate::rdna_spmd::engine::EntryLayout, aligned: bool) -> Entry {
     let block = &f.blocks[&f.entry];
     let mut uniform = Vec::new();
     let mut affine = Vec::new();
     let mut varying = Vec::new();
     for (input, &(id, _)) in inputs.iter().zip(&block.params) {
         match input.source {
-            ParameterSource::Vgpr(0) => {
-                if aligned {
+            ParameterSource::Vgpr(r) if layout.workitem_register(r) => {
+                if !aligned {
+                    varying.push(id)
+                } else if layout.workitem_fields(r).any(|field| field == (0, 0)) {
                     affine.push((id, 1, Some((0, 10))))
                 } else {
-                    varying.push(id)
+                    uniform.push(id)
                 }
             }
             ParameterSource::Vgpr(_) | ParameterSource::Sgpr(_) | ParameterSource::Scc => {
@@ -251,7 +253,9 @@ impl Uniformity {
 
 fn effect_output(op: EffectOp, inputs: &[Fact]) -> Fact {
     match op {
-        EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane | WaveOp::ReadLane) => {
+        EffectOp::Wave(
+            WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane | WaveOp::ReadLane,
+        ) => {
             Fact::Uniform
         }
         EffectOp::Wave(_) => Fact::Varying,
@@ -574,5 +578,53 @@ fn packet(
     .solve(f.types.len());
     Uniformity {
         facts: lanes.iter().map(|lane| lane.fact.get()).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Analyses, Context, Packet};
+    use super::*;
+    use crate::rdna_spmd::engine::{EntryLayout, Field};
+
+    fn facts(layout: EntryLayout, aligned: bool) -> Vec<Fact> {
+        let mut f = Func::new(BlockId(0), Presence::Packet, 32);
+        let sources = [ParameterSource::Vgpr(0), ParameterSource::Vgpr(1), ParameterSource::Vgpr(2), ParameterSource::Sgpr(6)];
+        let params: Vec<_> = sources.iter().map(|_| (f.value(Ty::I32), Ty::I32)).collect();
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: params.clone(),
+                insts: vec![],
+                term: Term::Ret(params.iter().map(|p| p.0).collect()),
+            },
+        );
+        let inputs: Vec<Parameter> = sources.iter().map(|&source| Parameter { source, ty: Ty::I32 }).collect();
+        let registry = crate::rdna_spmd::rdna4::dialect().registry;
+        let ctx = Context {
+            packet: Some(Packet { aligned }),
+            ..Context::new(&registry, &inputs, usize::MAX, 16, layout)
+        };
+        let analyses = Analyses::new(ctx);
+        let result = analyses.get::<Uniformity>(&f);
+        params.iter().map(|p| result.facts[p.0 .0]).collect()
+    }
+
+    #[test]
+    fn work_item_ids_in_their_own_registers_are_affine_or_uniform_in_aligned_packets() {
+        let field = |register| Some(Field { register, shift: 0 });
+        let layout = EntryLayout {
+            workitem_ids: [field(0), field(1), field(2)],
+            ..EntryLayout::default()
+        };
+        let affine = Fact::Affine { stride: 1, span: Some((0, 10)) };
+        assert_eq!(facts(layout, true), vec![affine, Fact::Uniform, Fact::Uniform, Fact::Uniform]);
+        assert_eq!(facts(layout, false), vec![Fact::Varying, Fact::Varying, Fact::Varying, Fact::Uniform]);
+        let packed = EntryLayout {
+            workitem_ids: EntryLayout::PACKED,
+            ..EntryLayout::default()
+        };
+        assert_eq!(facts(packed, true), vec![affine, Fact::Uniform, Fact::Uniform, Fact::Uniform]);
+        assert_eq!(facts(packed, false), vec![Fact::Varying, Fact::Uniform, Fact::Uniform, Fact::Uniform]);
     }
 }

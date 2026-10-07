@@ -233,7 +233,7 @@ impl YieldAction {
         for (&(v, t), dest) in outputs.iter().zip(&self.outputs) {
             let word = match *dest {
                 Destination::Vgpr(r) => Some(super::regs::Word::Vgpr(r)),
-                Destination::Sgpr(r) => super::regs::Word::scalar(r),
+                Destination::Sgpr(r) => super::regs::Word::scalar_in(r, f.lanes),
                 Destination::Scc => None,
             };
             let mut stored = v;
@@ -265,11 +265,11 @@ impl YieldAction {
                 stored = value;
             }
             if let Some(word) = word {
-                if matches!(word, super::regs::Word::Mask(_)) {
-                    stored = super::regs::project(f, &mut block.insts, stored);
-                }
-                if word == super::regs::Word::Mask(126) {
-                    stored = super::regs::valid_exec(f, &mut block.insts, stored);
+                if let (Destination::Sgpr(r), super::regs::Word::Mask(_)) = (*dest, word) {
+                    let (m, high) = super::regs::mask_half(r, f.lanes).unwrap();
+                    let mut halves = [None, None];
+                    halves[high as usize] = Some(stored);
+                    stored = super::regs::masked(f, &mut block.insts, words, m, halves);
                 }
                 words.insert(word, stored);
             } else if matches!(dest, Destination::Sgpr(r) if *r != 124) {

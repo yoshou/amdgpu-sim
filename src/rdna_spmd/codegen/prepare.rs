@@ -19,7 +19,7 @@ pub fn prepare(
         mut ir,
         parameter_inputs: inputs,
         registry,
-        ..
+        entry,
     } = f;
     ir.lowered_to_packets();
     let driver = Driver::new();
@@ -28,7 +28,7 @@ pub fn prepare(
         packet: Some(Packet {
             aligned: packing.aligned,
         }),
-        ..Context::of(&registry, &inputs, packing.lanes)
+        ..Context::of(&registry, &inputs, packing.lanes, entry)
     });
     let limit = 1 + ir.types.len();
     driver

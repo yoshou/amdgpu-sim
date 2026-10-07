@@ -9,6 +9,7 @@ mod words;
 #[cfg(test)]
 pub use floats::float_compare;
 pub(super) use state::State;
+pub use lanes::MAX_LANES;
 
 use super::kernel::Eval;
 use crate::rdna_spmd::analysis::bdd::Bdd;

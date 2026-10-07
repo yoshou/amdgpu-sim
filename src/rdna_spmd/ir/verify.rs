@@ -17,6 +17,9 @@ impl Func {
         if !self.blocks.contains_key(&self.entry) {
             return Err("missing entry");
         }
+        if !matches!(self.lanes, 32 | 64) {
+            return Err("a wave has 32 or 64 lanes");
+        }
         let count = self.types.len();
         let mut defined = vec![false; count];
         let mut definitions = 0usize;
@@ -109,7 +112,7 @@ impl Func {
                         if inputs.iter().any(|v| !seen(*v, &local)) {
                             return Err("non-dominating effect input");
                         }
-                        op.verify(inputs, outputs, &self.types)?;
+                        op.verify(inputs, outputs, &self.types, self.lanes)?;
                         for &(id, ty) in outputs {
                             define(id, ty, &mut local, &mut defined, &mut definitions)?;
                         }

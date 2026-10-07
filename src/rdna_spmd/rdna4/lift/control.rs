@@ -7,13 +7,25 @@ fn scalar_dests(inst: &InstFormat) -> u128 {
     let pair = |r: u32| bit(r) | bit(r + 1);
     match inst {
         InstFormat::SOP1(i) => match i.op {
-            I::S_MOV_B64 => pair(i.sdst as u32),
+            I::S_MOV_B64 | I::S_CMOV_B64 | I::S_NOT_B64 | I::S_CTZ_I32_B64 => pair(i.sdst as u32),
+            op if saveexec_op(op) && format!("{:?}", op).ends_with("_B64") => pair(i.sdst as u32),
             _ => bit(i.sdst as u32),
         },
         InstFormat::SOP2(i) => match i.op {
-            I::S_ADD_NC_U64 | I::S_MUL_U64 | I::S_LSHL_B64 | I::S_AND_B64 | I::S_OR_B64 => {
-                pair(i.sdst as u32)
-            }
+            I::S_ADD_NC_U64
+            | I::S_MUL_U64
+            | I::S_LSHL_B64
+            | I::S_LSHR_B64
+            | I::S_ASHR_I64
+            | I::S_AND_B64
+            | I::S_OR_B64
+            | I::S_XOR_B64
+            | I::S_AND_NOT1_B64
+            | I::S_OR_NOT1_B64
+            | I::S_NAND_B64
+            | I::S_NOR_B64
+            | I::S_XNOR_B64
+            | I::S_CSELECT_B64 => pair(i.sdst as u32),
             _ => bit(i.sdst as u32),
         },
         InstFormat::SOPK(i) => bit(i.sdst as u32),
@@ -48,9 +60,7 @@ fn scalar_dests(inst: &InstFormat) -> u128 {
 pub fn writes_exec(inst: &InstFormat) -> bool {
     scalar_dests(inst) & (1u128 << EXEC) != 0
         || matches!(inst,
-        InstFormat::SOP1(i) if matches!(i.op,
-            I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 |
-            I::S_OR_SAVEEXEC_B32 | I::S_XOR_SAVEEXEC_B32))
+        InstFormat::SOP1(i) if saveexec_op(i.op))
 }
 
 fn scalar_reg(op: &SourceOperand) -> Option<u32> {
@@ -63,18 +73,22 @@ fn scalar_reg(op: &SourceOperand) -> Option<u32> {
 fn mask_logic_op(op: I) -> bool {
     matches!(
         op,
-        I::S_AND_B32 | I::S_OR_B32 | I::S_XOR_B32 | I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32
+        I::S_AND_B32
+            | I::S_OR_B32
+            | I::S_XOR_B32
+            | I::S_AND_NOT1_B32
+            | I::S_OR_NOT1_B32
+            | I::S_AND_B64
+            | I::S_OR_B64
+            | I::S_XOR_B64
+            | I::S_AND_NOT1_B64
+            | I::S_OR_NOT1_B64
     )
 }
 
 fn saveexec_op(op: I) -> bool {
-    matches!(
-        op,
-        I::S_AND_SAVEEXEC_B32
-            | I::S_AND_NOT1_SAVEEXEC_B32
-            | I::S_OR_SAVEEXEC_B32
-            | I::S_XOR_SAVEEXEC_B32
-    )
+    let name = format!("{:?}", op);
+    name.contains("_SAVEEXEC_") || name.contains("_WREXEC_")
 }
 
 fn operand_is_reg(op: &SourceOperand, reg: u32) -> bool {

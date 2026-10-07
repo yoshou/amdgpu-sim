@@ -33,7 +33,7 @@ pub fn lane_test(f: &Func, facts: &Facts, a: ValueId, b: ValueId) -> Option<Valu
 
 pub fn projected_word(f: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
     match facts.op(f, s) {
-        Some(Op::Int(IntOp::LShr, w, lane)) if facts.is_lane_id(f, lane) => Some(w),
+        Some(Op::Int(IntOp::LShr, w, lane)) if facts.is_lane_shift(f, w, lane) => Some(w),
         _ => None,
     }
 }

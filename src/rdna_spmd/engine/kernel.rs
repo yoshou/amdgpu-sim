@@ -24,6 +24,8 @@ pub struct Kernel {
     pub(super) workgroup_x: Option<u32>,
     pub(super) scheduler: Scheduler,
     pub(super) width: u32,
+    pub(super) lanes: u32,
+    pub(super) layout: super::EntryLayout,
 }
 
 impl Kernel {
@@ -38,6 +40,8 @@ impl Kernel {
         workgroup_x: Option<u32>,
         scheduler: Scheduler,
         width: u32,
+        lanes: u32,
+        layout: super::EntryLayout,
     ) -> Self {
         assert!(!regions.is_empty(), "a kernel without its outermost region");
         assert_eq!(registers.scc_slot as usize + 1, SGPR_BUF);
@@ -52,6 +56,8 @@ impl Kernel {
             workgroup_x,
             scheduler,
             width,
+            lanes,
+            layout,
         }
     }
 }

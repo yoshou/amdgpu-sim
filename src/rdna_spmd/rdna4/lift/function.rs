@@ -8,20 +8,21 @@ pub fn lift(
     registry: std::sync::Arc<DialectRegistry>,
     program: &ScalarProgram,
     lowerings: &BTreeMap<usize, Vec<&Lowering>>,
+    lanes: u32,
 ) -> Program {
     let mut regs = BTreeSet::new();
     for block in lowerings.values() {
         for lowering in block {
-            let io = footprint(lowering);
-            regs.extend(register_words(&io.reads));
-            regs.extend(register_words(&io.writes));
+            let io = footprint(lowering, lanes);
+            regs.extend(register_words(&io.reads, lanes));
+            regs.extend(register_words(&io.writes, lanes));
         }
     }
     for block in program.blocks.values() {
         if let Terminator::Yield { action, .. } = &block.term {
             let io = action.io();
-            regs.extend(register_words(&io.reads));
-            regs.extend(register_words(&io.writes));
+            regs.extend(register_words(&io.reads, lanes));
+            regs.extend(register_words(&io.writes, lanes));
         }
     }
 
@@ -33,13 +34,13 @@ pub fn lift(
                     .reads
                     .into_iter()
                     .chain(rewrite.kills)
-                    .filter_map(super::rewrite::word),
+                    .filter_map(|slot| super::rewrite::word(slot, lanes)),
             );
             regs.extend(super::access::math_reads(inst).into_iter().map(Word::Vgpr));
             regs.extend(
                 super::control::mask_scalar_reads(inst)
                     .into_iter()
-                    .filter_map(Word::scalar),
+                    .filter_map(|r| Word::scalar_in(r, lanes)),
             );
             regs.extend(
                 super::access::f64_pairs(inst)
@@ -50,7 +51,7 @@ pub fn lift(
                 super::access::sgpr_u64_defs(inst)
                     .into_iter()
                     .flat_map(|r| [r, r + 1])
-                    .filter_map(Word::scalar),
+                    .filter_map(|r| Word::scalar_in(r, lanes)),
             );
             regs.extend(
                 super::access::vgpr_reads(inst)
@@ -62,7 +63,7 @@ pub fn lift(
     }
     regs.extend([Word::Mask(106), Word::Mask(126)]);
     let regs: Vec<_> = regs.into_iter().collect();
-    let mut f = Func::new(BlockId(program.entry_pc), crate::rdna_spmd::ir::Presence::Wave);
+    let mut f = Func::new(BlockId(program.entry_pc), crate::rdna_spmd::ir::Presence::Wave, lanes);
 
     for &pc in program.blocks.keys() {
         let mut params: Vec<_> = regs.iter().map(|r| (f.value(r.ty()), r.ty())).collect();
@@ -87,8 +88,8 @@ pub fn lift(
         let mut views: BTreeMap<(Word, Ty, bool), ValueId> = BTreeMap::new();
         let mut scc = block.params.last().unwrap().0;
         for lowering in lowerings[&pc].iter() {
-            let io = footprint(lowering);
-            let writes: Vec<_> = register_words(&io.writes).collect();
+            let io = footprint(lowering, lanes);
+            let writes: Vec<_> = register_words(&io.writes, lanes).collect();
             match lowering {
                 Lowering::Wave(action) => {
                     let plan = action.lift(&mut f, &mut block, &mut words, &mut provenance);

@@ -83,7 +83,7 @@ pub fn lower(
         registry,
         uniform,
         costs,
-        out: Func::new(BlockId(0), crate::rdna_spmd::ir::Presence::Wave),
+        out: Func::new(BlockId(0), crate::rdna_spmd::ir::Presence::Wave, q.lanes),
         cur: BlockId(0),
         masks: Masks::new(),
         lane: vec![None; q.types.len()],
@@ -1514,7 +1514,7 @@ impl Emit<'_> {
                 let answer = self.wave_query(provenance, held);
                 self.lane[lane.0] = Some(Val::Bit(answer));
             }
-            WaveOp::Ballot => {
+            WaveOp::Ballot { .. } => {
                 if self.demanded.contains(&provenance) {
                     self.everyone(mask);
                 }

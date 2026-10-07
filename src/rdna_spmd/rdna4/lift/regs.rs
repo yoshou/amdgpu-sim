@@ -30,6 +30,37 @@ pub fn project(f: &mut Func, insts: &mut Vec<Inst>, word: ValueId) -> ValueId {
     let shifted = core(f, insts, Ty::I32, Op::Int(IntOp::LShr, word, lane));
     core(f, insts, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
 }
+pub fn project_wide(f: &mut Func, insts: &mut Vec<Inst>, wide: ValueId) -> ValueId {
+    let lane = core(f, insts, Ty::I32, Op::Env(Env::LaneId));
+    let lane = core(f, insts, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let shifted = core(f, insts, Ty::I64, Op::Int(IntOp::LShr, wide, lane));
+    core(f, insts, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
+}
+pub fn mask_half(r: u32, lanes: u32) -> Option<(u32, bool)> {
+    match r {
+        106 | 126 => Some((r, false)),
+        107 | 127 if lanes == 64 => Some((r - 1, true)),
+        _ => None,
+    }
+}
+pub fn masked(f: &mut Func, insts: &mut Vec<Inst>, words: &Words, m: u32, halves: [Option<ValueId>; 2]) -> ValueId {
+    let raw = if f.lanes == 32 {
+        project(f, insts, halves[0].expect("a write to the high half of a mask in a wave of 32 lanes"))
+    } else {
+        let old = words[&Word::Mask(m)];
+        let [low, high] = [false, true].map(|high| match halves[high as usize] {
+            Some(word) => word,
+            None => query(f, insts, WaveOp::Ballot { high }, old),
+        });
+        let wide = core(f, insts, Ty::I64, Op::Pack64(low, high));
+        project_wide(f, insts, wide)
+    };
+    if m == 126 {
+        valid_exec(f, insts, raw)
+    } else {
+        raw
+    }
+}
 pub fn valid_exec(f: &mut Func, insts: &mut Vec<Inst>, bit: ValueId) -> ValueId {
     let valid = core(f, insts, Ty::I1, Op::Env(Env::ValidLane));
     core(f, insts, Ty::I1, Op::Int(IntOp::And, bit, valid))
@@ -41,6 +72,12 @@ impl Word {
             Some(Self::Mask(r))
         } else {
             (r < 128 && r != 124).then_some(Self::Sgpr(r))
+        }
+    }
+    pub fn scalar_in(r: u32, lanes: u32) -> Option<Self> {
+        match mask_half(r, lanes) {
+            Some((m, _)) => Some(Self::Mask(m)),
+            None => Self::scalar(r),
         }
     }
     pub fn ty(self) -> Ty {
@@ -67,10 +104,10 @@ impl Word {
         (0..ty.bits().div_ceil(32)).all(|k| self.offset(k).is_some_and(|r| r.ty() == Ty::I32))
     }
 }
-pub fn words(set: &RegSet) -> impl Iterator<Item = Word> + '_ {
+pub fn words(set: &RegSet, lanes: u32) -> impl Iterator<Item = Word> + '_ {
     set.vgprs()
         .map(Word::Vgpr)
-        .chain(set.sgprs().filter_map(Word::scalar))
+        .chain(set.sgprs().filter_map(move |r| Word::scalar_in(r, lanes)))
 }
 
 pub type Views = BTreeMap<(Word, Ty, bool), ValueId>;
@@ -168,8 +205,9 @@ impl Operands {
                     self.bindings.push((input.clone(), value));
                     return value;
                 }
+                let wide = f.lanes == 64 && matches!(source, SourceOperand::ScalarRegister(_));
                 let word = self.read(
-                    &super::input(source.clone(), Ty::I32),
+                    &super::input(source.clone(), if wide { Ty::I64 } else { Ty::I32 }),
                     scalar,
                     scc,
                     f,
@@ -177,7 +215,11 @@ impl Operands {
                     words,
                     views,
                 );
-                let bit = project(f, &mut self.core, word);
+                let bit = if wide {
+                    project_wide(f, &mut self.core, word)
+                } else {
+                    project(f, &mut self.core, word)
+                };
                 if let Some(key) = key {
                     views.insert(key, bit);
                 }
@@ -186,20 +228,21 @@ impl Operands {
             }
             if let SourceOperand::ScalarRegister(r) = *source {
                 let count = input.ty.bits().div_ceil(32);
-                if (0..count).any(|k| matches!(r as u32 + k, 106 | 124 | 126)) {
+                let lanes = f.lanes;
+                if (0..count).any(|k| r as u32 + k == 124 || mask_half(r as u32 + k, lanes).is_some()) {
                     let mut parts = vec![];
                     for k in 0..count {
                         let reg = r as u32 + k;
-                        if matches!(reg, 106 | 126) {
-                            let bit = words[&Word::Mask(reg)];
+                        if let Some((m, high)) = mask_half(reg, lanes) {
+                            let bit = words[&Word::Mask(m)];
                             self.bindings.push((
                                 Input {
-                                    source: InputSource::MaskBit(reg),
+                                    source: InputSource::MaskBit(m),
                                     ty: Ty::I1,
                                 },
                                 bit,
                             ));
-                            parts.push(query(f, &mut self.core, WaveOp::Ballot, bit));
+                            parts.push(query(f, &mut self.core, WaveOp::Ballot { high }, bit));
                         } else {
                             parts.push(self.read(
                                 &super::input(SourceOperand::ScalarRegister(reg as u8), Ty::I32),
@@ -302,14 +345,18 @@ fn source(set: &mut RegSet, src: &SourceOperand, count: u32) {
         }
     }
 }
-pub fn footprint(lowering: &Lowering) -> BoundaryIo {
+pub fn footprint(lowering: &Lowering, lanes: u32) -> BoundaryIo {
     let mut io = BoundaryIo::default();
+    let mask_words = lanes / 32;
     match lowering {
         Lowering::TypedAlu {
             inputs, outputs, ..
         } => {
             for input in inputs {
                 match &input.source {
+                    InputSource::Operand(s @ SourceOperand::ScalarRegister(_)) if input.ty == Ty::I1 => {
+                        source(&mut io.reads, s, mask_words)
+                    }
                     InputSource::Operand(s) => {
                         source(&mut io.reads, s, input.ty.bits().div_ceil(32))
                     }
@@ -330,7 +377,11 @@ pub fn footprint(lowering: &Lowering) -> BoundaryIo {
                             io.writes.add_sgpr(r + k);
                         }
                     }
-                    Output::Compare(r) | Output::Mask(r) => io.writes.add_sgpr(r),
+                    Output::Compare(r) | Output::Mask(r) => {
+                        for k in 0..mask_words {
+                            io.writes.add_sgpr(r + k);
+                        }
+                    }
                     Output::Scc => io.writes.add_scc(),
                 }
             }
@@ -412,8 +463,10 @@ pub fn define(
         Ty::I1,
         Op::Convert(Cvt::Bitcast, Ty::I1, words[&Word::Mask(126)]),
     );
+    let lanes = f.lanes;
     let mut stored = Vec::new();
     let mut word_defs = BTreeMap::new();
+    let mut halves: BTreeMap<u32, [Option<ValueId>; 2]> = BTreeMap::new();
     for (output_index, &(output, result)) in results.iter().enumerate() {
         let ty = output.ty();
         let value = match output {
@@ -432,10 +485,13 @@ pub fn define(
             Output::Compare(_) => core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec)),
             Output::Mask(reg) => match Word::scalar(reg) {
                 Some(word) => {
-                    let old = if matches!(word, Word::Mask(_)) {
-                        words[&word]
-                    } else {
-                        project(f, insts, words[&word])
+                    let old = match word {
+                        Word::Mask(_) => words[&word],
+                        _ if lanes == 64 => {
+                            let wide = core(f, insts, Ty::I64, Op::Pack64(words[&word], words[&Word::Sgpr(reg + 1)]));
+                            project_wide(f, insts, wide)
+                        }
+                        _ => project(f, insts, words[&word]),
                     };
                     core(f, insts, Ty::I1, Op::Select(exec, result, old))
                 }
@@ -445,25 +501,31 @@ pub fn define(
         stored.push((value, ty));
         if let Output::Compare(reg) | Output::Mask(reg) = output {
             if let Some(word) = Word::scalar(reg) {
-                let raw = if matches!(word, Word::Mask(_)) {
-                    value
-                } else if matches!(output, Output::Compare(_)) {
-                    query(f, insts, WaveOp::Ballot, value)
-                } else {
-                    let active = query(f, insts, WaveOp::Ballot, exec);
-                    let taken = core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec));
-                    let written = query(f, insts, WaveOp::Ballot, taken);
-                    let ones = core(f, insts, Ty::I32, Op::Const(Ty::I32, 0xffff_ffff));
-                    let idle = core(f, insts, Ty::I32, Op::Int(IntOp::Xor, active, ones));
-                    let kept = core(f, insts, Ty::I32, Op::Int(IntOp::And, words[&word], idle));
-                    core(f, insts, Ty::I32, Op::Int(IntOp::Or, kept, written))
-                };
-                let raw = if word == Word::Mask(126) {
-                    valid_exec(f, insts, raw)
-                } else {
-                    raw
-                };
-                word_defs.insert(word, raw);
+                if matches!(word, Word::Mask(_)) {
+                    let raw = if word == Word::Mask(126) {
+                        valid_exec(f, insts, value)
+                    } else {
+                        value
+                    };
+                    word_defs.insert(word, raw);
+                    continue;
+                }
+                for half in 0..lanes / 32 {
+                    let high = half == 1;
+                    let target = Word::Sgpr(reg + half);
+                    let raw = if matches!(output, Output::Compare(_)) {
+                        query(f, insts, WaveOp::Ballot { high }, value)
+                    } else {
+                        let active = query(f, insts, WaveOp::Ballot { high }, exec);
+                        let taken = core(f, insts, Ty::I1, Op::Int(IntOp::And, result, exec));
+                        let written = query(f, insts, WaveOp::Ballot { high }, taken);
+                        let ones = core(f, insts, Ty::I32, Op::Const(Ty::I32, 0xffff_ffff));
+                        let idle = core(f, insts, Ty::I32, Op::Int(IntOp::Xor, active, ones));
+                        let kept = core(f, insts, Ty::I32, Op::Int(IntOp::And, words[&target], idle));
+                        core(f, insts, Ty::I32, Op::Int(IntOp::Or, kept, written))
+                    };
+                    word_defs.insert(target, raw);
+                }
             }
             continue;
         }
@@ -480,39 +542,28 @@ pub fn define(
             value
         };
         for k in 0..ty.bits().div_ceil(32) {
-            let word = if scalar {
-                Word::scalar(reg + k)
-            } else {
-                Some(Word::Vgpr(reg + k))
-            };
-            if let Some(word) = word {
-                let raw = if ty.bits() == 32 {
+            let raw = |f: &mut Func, insts: &mut Vec<Inst>| {
+                if ty.bits() == 32 {
                     bits
                 } else {
-                    core(
-                        f,
-                        insts,
-                        Ty::I32,
-                        if k == 0 {
-                            Op::UnpackLo(bits)
-                        } else {
-                            Op::UnpackHi(bits)
-                        },
-                    )
-                };
-                let raw = if matches!(word, Word::Mask(_)) {
-                    project(f, insts, raw)
-                } else {
-                    raw
-                };
-                let raw = if word == Word::Mask(126) {
-                    valid_exec(f, insts, raw)
-                } else {
-                    raw
-                };
+                    core(f, insts, Ty::I32, if k == 0 { Op::UnpackLo(bits) } else { Op::UnpackHi(bits) })
+                }
+            };
+            if !scalar {
+                let raw = raw(f, insts);
+                word_defs.insert(Word::Vgpr(reg + k), raw);
+            } else if let Some((m, high)) = mask_half(reg + k, lanes) {
+                let raw = raw(f, insts);
+                halves.entry(m).or_default()[high as usize] = Some(raw);
+            } else if let Some(word) = Word::scalar(reg + k) {
+                let raw = raw(f, insts);
                 word_defs.insert(word, raw);
             }
         }
+    }
+    for (m, written) in halves {
+        let raw = masked(f, insts, words, m, written);
+        word_defs.insert(Word::Mask(m), raw);
     }
     for (word, raw) in &mut word_defs {
         if matches!(word, Word::Sgpr(_)) && raw.0 < first_value {

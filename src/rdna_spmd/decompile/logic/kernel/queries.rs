@@ -51,9 +51,10 @@ pub trait Queries {
     }
 
     fn lanes(&mut self, holds: impl Fn(u32) -> bool) -> Bdd {
-        let bits: Vec<Bdd> = (0..5).map(|i| self.atom(Atom::Lane(i))).collect();
+        let count = self.atoms().lanes();
+        let bits: Vec<Bdd> = (0..count.trailing_zeros() as u8).map(|i| self.atom(Atom::Lane(i))).collect();
         let mut any = Bdd::FALSE;
-        for l in (0..32u32).filter(|&l| holds(l)) {
+        for l in (0..count).filter(|&l| holds(l)) {
             let mut one = Bdd::TRUE;
             for (i, &bit) in bits.iter().enumerate() {
                 let literal = if l >> i & 1 == 1 { bit } else { self.m().not(bit) };
@@ -66,7 +67,24 @@ pub trait Queries {
 
     #[inline]
     fn word(&mut self, k: u32) -> Bdd {
-        self.lanes(|l| k >> l & 1 == 1)
+        self.lanes(|l| k >> (l & 31) & 1 == 1)
+    }
+
+    fn word_of(&mut self, ty: Ty, k: u64) -> Bdd {
+        if ty == Ty::I64 {
+            self.lanes(|l| k >> (l & 63) & 1 == 1)
+        } else {
+            self.word(k as u32)
+        }
+    }
+
+    fn half(&mut self, high: bool, own: Bdd, other: Bdd) -> Bdd {
+        if self.atoms().lanes() == 32 {
+            return if high { other } else { own };
+        }
+        let upper = self.atom(Atom::Lane(5));
+        let (above, below) = if high { (own, other) } else { (other, own) };
+        self.m().ite(upper, above, below)
     }
 
     fn lane_dependent(&mut self, f: Bdd) -> bool {
@@ -76,7 +94,7 @@ pub trait Queries {
 
     fn at_lane(&mut self, f: Bdd, lane: u32) -> Bdd {
         let mut f = f;
-        for i in 0..5u8 {
+        for i in 0..self.atoms().lanes().trailing_zeros() as u8 {
             if let Some(var) = self.atoms().var(Atom::Lane(i)) {
                 f = self.m().cofactor(f, var, lane >> i & 1 == 1);
             }

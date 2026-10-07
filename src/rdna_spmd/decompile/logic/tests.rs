@@ -396,8 +396,8 @@ fn bit_and_view_follow_the_operations() {
     let same = b.cmp(e, IntPred::Ne, lane, lane);
     let constants = b.cmp(e, IntPred::Eq, three, seven);
     let bits = b.cmp(e, IntPred::Ne, c, d);
-    let w = b.wave(e, WaveOp::Ballot, vec![c]);
-    let v = b.wave(e, WaveOp::Ballot, vec![d]);
+    let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let v = b.wave(e, WaveOp::Ballot { high: false }, vec![d]);
     let own = b.int(e, IntOp::LShr, w, lane);
     let own = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, own));
     let zero = b.constant(e, Ty::I32, 0);
@@ -474,10 +474,10 @@ fn bit_and_view_follow_the_operations() {
     expect.push(("converted any(c)", logic.bit(f, &facts, q), bc));
     expect.push(("1 & 2", logic.view(f, &facts, apart), Bdd::FALSE));
     expect.push(("1 & select(c, 2, 4)", logic.view(f, &facts, missed), Bdd::FALSE));
-    let k2 = logic.word(2);
+    let k2 = logic.word_of(Ty::I32, 2);
     let kept_formula = logic.m.and(bc, k2);
     expect.push(("3 & select(c, 2, 4)", logic.view(f, &facts, kept), kept_formula));
-    let k3 = logic.word(3);
+    let k3 = logic.word_of(Ty::I32, 3);
     let unequal = logic.m.and(xor, k3);
     expect.push(("select(c, 1, 2) ^ select(d, 1, 2)", logic.view(f, &facts, paired), unequal));
     let (nbc, nbd) = (logic.m.not(bc), logic.m.not(bd));
@@ -510,10 +510,10 @@ fn bit_and_view_follow_the_operations() {
     let with_item_bit = logic.bit(f, &facts, with_item);
     assert!(with_item_bit != Bdd::TRUE && with_item_bit != Bdd::FALSE, "lane + item < 3 stays open");
     let lane_one = logic.lanes(|l| l == 1);
-    let bits_of_two = logic.word(2);
+    let bits_of_two = logic.word_of(Ty::I32, 2);
     expect.push(("the lanes of 2", bits_of_two, lane_one));
-    let five = logic.word(5);
-    let seven_bits = logic.word(7);
+    let five = logic.word_of(Ty::I32, 5);
+    let seven_bits = logic.word_of(Ty::I32, 7);
     let both = logic.m.and(five, seven_bits);
     expect.push(("5 & 7 by lanes", both, five));
     let wrong: Vec<&str> = expect.iter().filter(|(_, got, want)| got != want).map(|(name, ..)| *name).collect();
@@ -726,4 +726,137 @@ fn choose_keeps_the_first_choices_it_can_convert_and_nothing_it_need_not_keep() 
         }
         assert_eq!(chosen, greedy, "the choice is not the greedy one in listed order");
     }
+}
+
+#[test]
+fn views_in_a_wave_of_64_lanes_hold_the_bit_each_lane_reads() {
+    let (mut b, p) = Build::with_lanes(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)], 64);
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let three = b.constant(e, Ty::I32, 3);
+    let c = b.cmp(e, IntPred::Ult, p[1], three);
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let high = b.wave(e, WaveOp::Ballot { high: true }, vec![c]);
+    let pair = b.core(e, Ty::I64, Op::Pack64(low, high));
+    let wide_lane = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let shifted = b.int(e, IntOp::LShr, pair, wide_lane);
+    let own = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let narrow = b.int(e, IntOp::LShr, low, lane);
+    let narrow_own = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, narrow));
+    let lo = b.core(e, Ty::I32, Op::UnpackLo(pair));
+    let hi = b.core(e, Ty::I32, Op::UnpackHi(pair));
+    let mask = b.constant(e, Ty::I64, 0x8000_0001_0000_0002);
+    let masked = b.int(e, IntOp::And, pair, mask);
+    let two = b.constant(e, Ty::I32, 2);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    assert!(facts.lane_word[pair.0] && facts.lane_word[lo.0] && facts.lane_word[hi.0], "a pair of ballot halves is a word of lanes");
+    let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    let bc = logic.bit(f, &facts, c);
+    let below = logic.lanes(|l| l < 32);
+    let above = logic.lanes(|l| l >= 32);
+    let restricted = |logic: &mut Logic, g: Bdd, half: Bdd| logic.m.and(g, half);
+    let mut expect: Vec<(&str, Bdd, Bdd)> = Vec::new();
+    expect.push(("the view of the pair", logic.view(f, &facts, pair), bc));
+    expect.push(("trunc(pair >> zext(lane))", logic.bit(f, &facts, own), bc));
+    let (vl, vh) = (logic.view(f, &facts, low), logic.view(f, &facts, high));
+    let (want_low, want_high) = (restricted(&mut logic, bc, below), restricted(&mut logic, bc, above));
+    expect.push(("the low ballot below lane 32", restricted(&mut logic, vl, below), want_low));
+    expect.push(("the high ballot from lane 32", restricted(&mut logic, vh, above), want_high));
+    let (ul, uh) = (logic.view(f, &facts, lo), logic.view(f, &facts, hi));
+    expect.push(("the low word of the pair below lane 32", restricted(&mut logic, ul, below), want_low));
+    expect.push(("the high word of the pair from lane 32", restricted(&mut logic, uh, above), want_high));
+    let bits = logic.lanes(|l| l == 1 || l == 32 || l == 63);
+    let and = logic.m.and(bc, bits);
+    expect.push(("pair & 0x8000000100000002", logic.view(f, &facts, masked), and));
+    let twos = logic.lanes(|l| l == 1 || l == 33);
+    expect.push(("a word of 32 bits repeats in the upper lanes", logic.view(f, &facts, two), twos));
+    let wrong: Vec<&str> = expect.iter().filter(|(_, got, want)| got != want).map(|(name, ..)| *name).collect();
+    assert!(wrong.is_empty(), "{:?}", wrong);
+    let upper_low = restricted(&mut logic, vl, above);
+    assert_ne!(upper_low, want_high, "the low ballot does not hold the upper lanes' bits");
+    let narrow_bit = logic.bit(f, &facts, narrow_own);
+    let narrow_low = restricted(&mut logic, narrow_bit, below);
+    assert_eq!(narrow_low, want_low, "the low ballot shifted by the lane holds the lower lanes' bits");
+    let narrow_high = restricted(&mut logic, narrow_bit, above);
+    assert_ne!(narrow_high, want_high, "shifting a 32-bit word by an upper lane reads a lower lane's bit");
+}
+
+#[test]
+fn views_of_wide_words_in_a_wave_of_32_lanes_read_the_low_word() {
+    let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)]);
+    let e = BlockId(0);
+    let three = b.constant(e, Ty::I32, 3);
+    let c = b.cmp(e, IntPred::Ult, p[1], three);
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let junk = b.constant(e, Ty::I32, 0x1234_5678);
+    let pair = b.core(e, Ty::I64, Op::Pack64(low, junk));
+    let lo = b.core(e, Ty::I32, Op::UnpackLo(pair));
+    let mask = b.constant(e, Ty::I64, 0x8000_0001_0000_0002);
+    let masked = b.int(e, IntOp::And, pair, mask);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    let bc = logic.bit(f, &facts, c);
+    assert_eq!(logic.view(f, &facts, pair), bc, "the view of a wide word is the view of its low word");
+    assert_eq!(logic.view(f, &facts, lo), bc, "the low word of a wide word keeps its view");
+    let lane_one = logic.lanes(|l| l == 1);
+    let and = logic.m.and(bc, lane_one);
+    assert_eq!(logic.view(f, &facts, masked), and, "only the low 32 bits of a wide constant reach a lane");
+}
+
+#[test]
+fn facts_treat_wide_words_and_the_halves_of_a_wave_of_64_lanes_by_the_lanes_they_cover() {
+    let (mut b, p) = Build::with_lanes(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)], 64);
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let three = b.constant(e, Ty::I32, 3);
+    let c = b.cmp(e, IntPred::Ult, p[1], three);
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let high = b.wave(e, WaveOp::Ballot { high: true }, vec![c]);
+    let pair = b.core(e, Ty::I64, Op::Pack64(low, high));
+    let wide_lane = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let shifted = b.int(e, IntOp::LShr, pair, wide_lane);
+    let _own = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let tested = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let zero = b.constant(e, Ty::I32, 0);
+    let _any = b.cmp(e, IntPred::Ne, tested, zero);
+    let projected = b.wave(e, WaveOp::Ballot { high: true }, vec![c]);
+    let narrow = b.int(e, IntOp::LShr, projected, lane);
+    let _bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, narrow));
+    let hi = b.core(e, Ty::I32, Op::UnpackHi(pair));
+    let ones = b.constant(e, Ty::I64, u64::MAX);
+    let mixed = b.core(e, Ty::I64, Op::Select(c, ones, pair));
+    let saturated = b.core(e, Ty::I32, Op::UnpackLo(ones));
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    for (name, v) in [("low", low), ("high", high), ("pair", pair), ("tested", tested), ("projected", projected), ("hi", hi)] {
+        assert!(facts.lane_word[v.0], "{} is a word of lanes", name);
+    }
+    assert!(facts.viewed[pair.0] && facts.viewed[low.0] && facts.viewed[high.0], "a projected pair is viewed with its halves");
+    assert!(!facts.materialized[pair.0] && !facts.materialized[low.0] && !facts.materialized[high.0], "a pair read only by its lanes stays a view");
+    assert!(facts.materialized[tested.0], "a test of a half asks about lanes the half does not cover");
+    assert!(facts.materialized[projected.0], "a half shifted by the lane reads another lane's bit above or below it");
+    assert!(facts.saturated[ones.0] && facts.saturated[saturated.0], "all-ones words and their halves are saturated");
+    assert!(!facts.saturated[mixed.0], "a select by a varying bit is not saturated");
+}
+
+#[test]
+fn facts_keep_the_high_word_of_a_wide_word_in_a_wave_of_32_lanes_whole() {
+    let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)]);
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let three = b.constant(e, Ty::I32, 3);
+    let c = b.cmp(e, IntPred::Ult, p[1], three);
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let zero = b.constant(e, Ty::I32, 0);
+    let pair = b.core(e, Ty::I64, Op::Pack64(low, zero));
+    let hi = b.core(e, Ty::I32, Op::UnpackHi(pair));
+    let shifted = b.int(e, IntOp::LShr, hi, lane);
+    let _bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    assert!(facts.lane_word[pair.0], "the pair is a word of lanes");
+    assert!(!facts.lane_word[hi.0], "no lane of 32 reads the high word, so it is a plain word");
+    assert!(facts.materialized[pair.0], "the high word needs the whole pair");
 }
