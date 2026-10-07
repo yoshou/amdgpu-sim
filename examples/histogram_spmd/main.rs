@@ -41,8 +41,8 @@ fn main() -> Result<()> {
     } else {
         "gfx1200".to_string()
     };
-    if arch != "gfx1200" {
-        println!("histogram_spmd supports gfx1200 only.");
+    if !matches!(arch.as_str(), "gfx1200" | "gfx803") {
+        println!("histogram_spmd supports gfx1200 and gfx803 only.");
         return Ok(());
     }
 

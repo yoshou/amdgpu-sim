@@ -480,7 +480,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
             }
             let atom = match ty {
                 Ty::I1 => Atom::Bit(param),
-                Ty::I32 if facts.viewed[param.0] => Atom::View(param),
+                Ty::I32 | Ty::I64 if facts.viewed[param.0] => Atom::View(param),
                 _ => continue,
             };
             if let Some(g) = sides[LANE][k].bits {
@@ -489,6 +489,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                 relation = self.eval.q.and(relation, link);
             }
         }
+        let mut restatements: HashMap<Bdd, Bdd> = HashMap::default();
         for (k, &(param, ty)) in dst.params.iter().enumerate() {
             if !self.eval.logic().carried(param) {
                 continue;
@@ -521,7 +522,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                 cond
             };
             let q = &mut *self.eval.q;
-            if ty == Ty::I32 && facts.lane_word[param.0] && !same {
+            if matches!(ty, Ty::I32 | Ty::I64) && facts.lane_word[param.0] && !same {
                 let mode = q.logic().materialized(facts, param);
                 let full = q.and(cond, mode);
                 differs = q.or(differs, full);
@@ -529,18 +530,23 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
             if differs == Bdd::FALSE {
                 continue;
             }
-            let joint = q.and(differs, relation);
+            let restated = match restatements.get(&differs) {
+                Some(&r) => r,
+                None => {
+                    let logic = q.logic();
+                    let mut foreign: HashMap<u32, ()> = HashMap::default();
+                    let supports = [logic.support(differs), logic.support(relation)];
+                    for &v in supports.iter().flat_map(|s| s.iter()) {
+                        if !matches!(logic.atom_of(v), Atom::Marker(_)) && logic.scope(facts, v) != Some(block) {
+                            foreign.insert(v, ());
+                        }
+                    }
+                    let r = logic.m.and_exists(differs, relation, &|v| foreign.contains_key(&v));
+                    restatements.insert(differs, r);
+                    r
+                }
+            };
             let logic = q.logic();
-            let foreign: Vec<u32> = logic
-                .support(joint)
-                .iter()
-                .copied()
-                .filter(|&v| {
-                    !matches!(logic.atom_of(v), Atom::Marker(_))
-                        && logic.scope(facts, v) != Some(block)
-                })
-                .collect();
-            let restated = logic.exists(&foreign, joint);
             if restated == Bdd::FALSE {
                 continue;
             }

@@ -8,8 +8,10 @@ pub(super) trait HasLanes {
     fn lanes_mut(&mut self) -> &mut LaneValues;
 }
 
+pub const MAX_LANES: usize = 64;
+
 #[inline]
-pub(super) fn lane_values<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]>
+pub(super) fn lane_values<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; MAX_LANES]>
 where
     Q::State: HasLanes,
 {
@@ -17,10 +19,10 @@ where
 }
 
 #[derive(Default)]
-pub(super) struct LaneValues(HashMap<ValueId, Option<[u32; 32]>>);
+pub(super) struct LaneValues(HashMap<ValueId, Option<[u32; MAX_LANES]>>);
 
 impl LaneValues {
-    pub(super) fn of(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; 32]> {
+    pub(super) fn of(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; MAX_LANES]> {
         if let Some(&r) = self.0.get(&v) {
             return r;
         }
@@ -32,20 +34,20 @@ impl LaneValues {
         r
     }
 
-    fn compute(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; 32]> {
+    fn compute(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> Option<[u32; MAX_LANES]> {
         let bits = match f.types[v.0] {
             Ty::I1 => 1,
             Ty::I32 => u32::MAX,
             _ => return None,
         };
-        let mut out = [0u32; 32];
+        let mut out = [0u32; MAX_LANES];
         match facts.op(f, v)? {
-            Op::Const(_, k) => out = [k as u32; 32],
+            Op::Const(_, k) => out = [k as u32; MAX_LANES],
             Op::Env(Env::LaneId) => out = std::array::from_fn(|l| l as u32),
             Op::Int(k, a, b) => {
                 let a = self.of(f, facts, a, depth + 1)?;
                 let b = self.of(f, facts, b, depth + 1)?;
-                for l in 0..32 {
+                for l in 0..f.lanes as usize {
                     let (x, y) = (a[l], b[l]);
                     out[l] = match k {
                         IntOp::Add => x.wrapping_add(y),
@@ -77,12 +79,12 @@ impl LaneValues {
         Some(out.map(|x| x & bits))
     }
 
-    pub(super) fn known_bits(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> [(u32, u32); 32] {
+    pub(super) fn known_bits(&mut self, f: &Func, facts: &Facts, v: ValueId, depth: u32) -> [(u32, u32); MAX_LANES] {
         if let Some(values) = self.of(f, facts, v, 0) {
             return std::array::from_fn(|l| (u32::MAX, values[l]));
         }
         if depth > 16 || f.types[v.0] != Ty::I32 {
-            return [(0, 0); 32];
+            return [(0, 0); MAX_LANES];
         }
         let constant = |x: ValueId| facts.constant(f, x).map(|k| k as u32);
         match facts.op(f, v) {
@@ -135,7 +137,7 @@ impl LaneValues {
                 let x = self.known_bits(f, facts, a, depth + 1);
                 std::array::from_fn(|l| ((x[l].0 >> k) | !(u32::MAX >> k), x[l].1 >> k))
             }
-            _ => [(0, 0); 32],
+            _ => [(0, 0); MAX_LANES],
         }
     }
 }

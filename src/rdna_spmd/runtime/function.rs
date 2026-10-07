@@ -1,7 +1,7 @@
 use super::buffer::{bytes_of, Buffer, Pod};
 use super::module::{Image, KernelMetadata};
 use super::Error;
-use crate::processor::{decode_kernel_desc, KernelDescriptor};
+use crate::processor::decode_kernel_desc;
 use crate::rdna_spmd::compiler::{decode_program, Jit};
 use crate::rdna_spmd::engine::{dispatch, GridDims, Kernel};
 use crate::rdna_spmd::environment::{Binding, Environment};
@@ -104,7 +104,6 @@ pub struct Function {
     name: String,
     image: Arc<Image>,
     metadata: KernelMetadata,
-    descriptor: KernelDescriptor,
     descriptor_address: usize,
     jit: Mutex<Jit>,
 }
@@ -120,21 +119,14 @@ impl Function {
             .get(descriptor_address..descriptor_address + 64)
             .ok_or_else(|| Error::new(format!("{}: the kernel descriptor lies outside the code object", name)))?;
         let descriptor = decode_kernel_desc(bytes);
-        if metadata.wavefront_size != 32 {
-            return Err(Error::new(format!(
-                "{}: wave{} kernels are not supported",
-                name, metadata.wavefront_size
-            )));
-        }
         let entry = descriptor_address + descriptor.kernel_code_entry_byte_offset;
-        let program = decode_program(target, &descriptor, entry, &image.memory)
+        let program = decode_program(target, &descriptor, entry, &image.memory, metadata.wavefront_size)
             .map_err(|e| Error::new(format!("{}: {}", name, e)))?;
         let jit = Mutex::new(Jit::new(program, descriptor.granulated_workitem_vgpr_count));
         Ok(Self {
             name,
             image,
             metadata,
-            descriptor,
             descriptor_address,
             jit,
         })
@@ -155,7 +147,6 @@ impl Function {
         let kernel = self.kernel(launch, &bound.environment);
         dispatch(
             &kernel,
-            &self.descriptor,
             bound.kernarg.as_ptr() as u64,
             &*bound.packet as *const DispatchPacket as u64,
             bound.dims,

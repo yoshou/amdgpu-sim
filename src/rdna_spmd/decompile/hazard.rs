@@ -1,4 +1,4 @@
-use super::address::{Addresses, Classes, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide, LANES};
+use super::address::{Addresses, Classes, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide};
 use super::encoding::{quickly_apart, Encoding, Shapes};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
@@ -42,7 +42,7 @@ pub enum Reach {
         bytes: u32,
         kinds: Option<(usize, u64, &'static [(u64, u32)])>,
     },
-    Image,
+    Image { gcn3: bool },
 }
 
 fn reach(registry: &DialectRegistry, op: TargetOp) -> Reach {
@@ -50,7 +50,8 @@ fn reach(registry: &DialectRegistry, op: TargetOp) -> Reach {
         return Reach::Anywhere;
     };
     match (registry.dialect_name(op.dialect()), spec.name) {
-        (Some("rdna4"), "image_sample_lz") => Reach::Image,
+        (Some("rdna4"), "image_sample_lz") => Reach::Image { gcn3: false },
+        (Some("rdna4"), "image_sample_lz_gcn3") => Reach::Image { gcn3: true },
         (Some("rdna4"), "image_bvh64_intersect_ray") => Reach::Node {
             offset: &[(2, !7)],
             shift: 3,
@@ -526,7 +527,7 @@ impl Place {
 
 fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> Vec<Option<Place>> {
     let within = |lane: usize| found[lane].clone().unwrap_or_else(|| Regions::one(None));
-    (0..LANES)
+    (0..addresses.lanes())
         .map(|lane| {
             if !addresses.valid(lane) {
                 return None;
@@ -582,7 +583,7 @@ fn shared(
             .iter()
             .enumerate()
             .map(|(i, a)| {
-                (0..LANES)
+                (0..addresses.lanes())
                     .map(|lane| {
                         (involved.contains(&i) && addresses.valid(lane)).then(|| region_of(addresses, a, lane, false))
                     })
@@ -615,7 +616,7 @@ fn shared(
             };
             refined.insert(next);
             let a = &accesses[next];
-            regions[next] = (0..LANES)
+            regions[next] = (0..addresses.lanes())
                 .map(|lane| addresses.valid(lane).then(|| region_of(addresses, a, lane, true)))
                 .collect();
             sharing.retain(|&(p, q)| (p != next && q != next) || may_share(env, &regions[p], &regions[q]));
@@ -722,7 +723,7 @@ fn widened(
 
 impl Judged<'_> {
     fn refined(&self, addresses: &mut Addresses, i: usize) -> Vec<Option<Regions>> {
-        (0..LANES)
+        (0..addresses.lanes())
             .map(|lane| addresses.valid(lane).then(|| region_of(addresses, &self.accesses[i], lane, true)))
             .collect()
     }
@@ -1847,6 +1848,54 @@ mod tests {
         assert!(!h.conflicts().contains(&key), "the stores meet only at v = 2, where the first does not run");
     }
 
+    fn elected_loop(lanes: u32, high: bool) -> bool {
+        let (mut b, k, _) = Build::kernel_in(&[], lanes);
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let chosen = b.constant(e, Ty::I32, if high { 40 } else { 0 });
+        let first = b.cmp(e, IntPred::Eq, lane, chosen);
+        let elected = b.int(e, IntOp::And, first, k.exec);
+        let (body, p) = b.block(&[Ty::I1, Ty::I64]);
+        let (done, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![elected, buf]);
+        let s = store_at(&mut b, body, p[1], p[0]);
+        let yes = b.constant(body, Ty::I1, 1);
+        let eight = b.constant(body, Ty::I64, 8);
+        let at = b.int(body, IntOp::Add, p[1], eight);
+        let lane = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+        let (word, mask, shift) = if lanes == 64 {
+            let low = b.wave(body, WaveOp::Ballot { high: false }, vec![p[0]]);
+            let high = b.wave(body, WaveOp::Ballot { high: true }, vec![p[0]]);
+            let word = b.core(body, Ty::I64, Op::Pack64(low, high));
+            let mask = b.load(body, Space::Global, MemSize::B64, at, yes);
+            let shift = b.core(body, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+            (word, mask, shift)
+        } else {
+            let word = b.wave(body, WaveOp::Ballot { high: false }, vec![p[0]]);
+            let mask = b.load(body, Space::Global, MemSize::B32, at, yes);
+            (word, mask, lane)
+        };
+        let remaining = b.int(body, IntOp::And, word, mask);
+        let none = b.constant(body, b.f.types[remaining.0], 0);
+        let more = b.cmp(body, IntPred::Ne, remaining, none);
+        let any = b.wave(body, WaveOp::Any, vec![more]);
+        let ty = b.f.types[remaining.0];
+        let chosen = b.core(body, ty, Op::Select(any, remaining, mask));
+        let shifted = b.int(body, IntOp::LShr, chosen, shift);
+        let next = b.core(body, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        b.cond_br(body, more, (body, vec![next, p[1]]), (done, vec![p[0]]));
+        let h = Hazards::find(&b.program(), &environment(lanes, &[(0, 1, 0x1000)]));
+        h.conflicts().contains(&pair(&h, s, s))
+    }
+
+    #[test]
+    fn find_keeps_one_elected_lane_alone_in_a_loop_whose_mask_only_narrows() {
+        assert!(!elected_loop(32, false), "only lane 0 enters, and the ballot it narrows keeps the others out");
+        assert!(!elected_loop(64, false), "the 64-bit mask keeps every lane but lane 0 out in both halves");
+        assert!(!elected_loop(64, true), "the 64-bit mask keeps every lane but lane 40 out in both halves");
+    }
+
     fn narrowed(bound: u64) -> (Hazards, (usize, usize), usize) {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -2184,7 +2233,7 @@ mod tests {
 
     fn by_workgroup(other: u64, grid: u32) -> bool {
         let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(WORKGROUP_ID_X), Ty::I32)]);
-        b.entry.workgroup_id_x = true;
+        b.entry.workgroup_ids[0] = Some(crate::rdna_spmd::engine::Field { register: crate::rdna_spmd::engine::WORKGROUP_ID_X, shift: 0 });
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let address = byte_offset(&mut b, e, buf, extra[0], 4);
@@ -2206,6 +2255,123 @@ mod tests {
     #[test]
     fn find_bounds_the_workgroup_id_by_the_grid() {
         assert!(!by_workgroup(4, 4), "there is no workgroup 4 in a grid of 4");
+    }
+
+    fn by_separate_workgroup(axis: usize, other: u64, grid: u32) -> bool {
+        let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(8), Ty::I32)]);
+        b.entry.workgroup_ids[axis] = Some(crate::rdna_spmd::engine::Field { register: 8, shift: 0 });
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let address = byte_offset(&mut b, e, buf, extra[0], 4);
+        let s1 = store_at(&mut b, e, address, k.exec);
+        let at = b.constant(e, Ty::I64, other * 4);
+        let there = b.int(e, IntOp::Add, buf, at);
+        let s2 = store_at(&mut b, e, there, k.exec);
+        let mut env = environment(32, &[(0, 1, 0x1000)]);
+        env.grid[axis] = grid;
+        let h = Hazards::find(&b.program(), &env);
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reads_a_workgroup_id_from_the_sgpr_the_layout_names() {
+        for axis in 0..3 {
+            assert!(by_separate_workgroup(axis, 2, 3), "workgroup 2 of 3 along axis {} stores to word 2", axis);
+            assert!(!by_separate_workgroup(axis, 3, 3), "there is no workgroup 3 of 3 along axis {}", axis);
+        }
+    }
+
+    fn by_separate_item(other: u64) -> bool {
+        let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Vgpr(1), Ty::I32)]);
+        b.entry.workitem_ids = [
+            Some(crate::rdna_spmd::engine::Field { register: 0, shift: 0 }),
+            Some(crate::rdna_spmd::engine::Field { register: 1, shift: 0 }),
+            None,
+        ];
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let address = byte_offset(&mut b, e, buf, extra[0], 4);
+        let s1 = store_at(&mut b, e, address, k.exec);
+        let at = b.constant(e, Ty::I64, other * 4);
+        let there = b.int(e, IntOp::Add, buf, at);
+        let s2 = store_at(&mut b, e, there, k.exec);
+        let mut env = environment(32, &[(0, 1, 0x1000)]);
+        env.block = [8, 4, 1];
+        let h = Hazards::find(&b.program(), &env);
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    fn by_wide_mask(build: &dyn Fn(&mut Build, BlockId, &[ValueId]) -> ValueId, other: u64) -> bool {
+        let extra = [(ParameterSource::Sgpr(8), Ty::I32), (ParameterSource::Sgpr(9), Ty::I32), (ParameterSource::Sgpr(10), Ty::I32), (ParameterSource::Sgpr(11), Ty::I32)];
+        let (mut b, k, params) = Build::kernel_in(&extra, 64);
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let taken = build(&mut b, e, &params);
+        let three = b.constant(e, Ty::I32, 3);
+        let five = b.constant(e, Ty::I32, 5);
+        let index = b.core(e, Ty::I32, Op::Select(taken, three, five));
+        let address = byte_offset(&mut b, e, buf, index, 4);
+        let s1 = store_at(&mut b, e, address, k.exec);
+        let at = b.constant(e, Ty::I64, other * 4);
+        let there = b.int(e, IntOp::Add, buf, at);
+        let s2 = store_at(&mut b, e, there, k.exec);
+        let h = Hazards::find(&b.program(), &environment(64, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s1, s2))
+    }
+
+    fn cleared(b: &mut Build, e: BlockId, p: &[ValueId]) -> (ValueId, ValueId) {
+        let zero = b.constant(e, Ty::I32, 0);
+        let lo = b.int(e, IntOp::And, p[0], zero);
+        let hi = b.int(e, IntOp::And, p[1], zero);
+        let x = b.core(e, Ty::I64, Op::Pack64(lo, hi));
+        let y = b.core(e, Ty::I64, Op::Pack64(p[2], p[3]));
+        (x, y)
+    }
+
+    #[test]
+    fn find_settles_a_test_of_a_wide_mask_whose_high_word_it_computes() {
+        let anded = |b: &mut Build, e: BlockId, p: &[ValueId]| {
+            let (x, y) = cleared(b, e, p);
+            let both = b.int(e, IntOp::And, x, y);
+            let zero = b.constant(e, Ty::I64, 0);
+            b.cmp(e, IntPred::Ne, both, zero)
+        };
+        assert!(by_wide_mask(&anded, 5), "the cleared mask leaves no bit, so every lane stores to word 5");
+        assert!(!by_wide_mask(&anded, 3), "word 3 is chosen only if some bit survives a cleared mask");
+        let ored = |b: &mut Build, e: BlockId, p: &[ValueId]| {
+            let (x, _) = cleared(b, e, p);
+            let ones = b.constant(e, Ty::I32, u32::MAX as u64);
+            let full = b.core(e, Ty::I64, Op::Pack64(ones, ones));
+            let either = b.int(e, IntOp::Or, x, full);
+            let all = b.constant(e, Ty::I64, u64::MAX);
+            b.cmp(e, IntPred::Eq, either, all)
+        };
+        assert!(!by_wide_mask(&ored, 5), "a mask ored with all ones is all ones");
+        let differing = |b: &mut Build, e: BlockId, p: &[ValueId]| {
+            let one = b.constant(e, Ty::I32, 1);
+            let two = b.constant(e, Ty::I32, 2);
+            let x = b.core(e, Ty::I64, Op::Pack64(p[0], one));
+            let y = b.core(e, Ty::I64, Op::Pack64(p[0], two));
+            b.cmp(e, IntPred::Eq, x, y)
+        };
+        assert!(!by_wide_mask(&differing, 3), "words whose high halves differ are never equal");
+        let chosen = |b: &mut Build, e: BlockId, p: &[ValueId]| {
+            let (x, y) = cleared(b, e, p);
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let seven = b.constant(e, Ty::I32, 7);
+            let odd = b.cmp(e, IntPred::Ult, lane, seven);
+            let either = b.core(e, Ty::I64, Op::Select(odd, x, y));
+            let masked = b.int(e, IntOp::And, either, x);
+            let zero = b.constant(e, Ty::I64, 0);
+            b.cmp(e, IntPred::Ne, masked, zero)
+        };
+        assert!(!by_wide_mask(&chosen, 3), "either choice of word, anded with a cleared mask, is zero");
+    }
+
+    #[test]
+    fn find_reads_a_work_item_id_from_its_own_vgpr() {
+        assert!(by_separate_item(3), "the lanes of row 3 of an 8 by 4 workgroup store to word 3");
+        assert!(!by_separate_item(4), "an 8 by 4 workgroup has no row 4");
     }
 
     fn by_packet(offset: u64, bytes: MemSize, block: [u32; 3], shift: u64) -> bool {
@@ -2268,7 +2434,7 @@ mod tests {
             _ => {
                 let four = b.constant(e, Ty::I32, 4);
                 let low = b.cmp(e, IntPred::Ult, lane, four);
-                b.wave(e, WaveOp::Ballot, vec![low])
+                b.wave(e, WaveOp::Ballot { high: false }, vec![low])
             }
         };
         let address = byte_offset(&mut b, e, buf, index, 4);
@@ -2656,6 +2822,50 @@ mod tests {
     #[test]
     fn find_keeps_a_texel_read_apart_from_stores_just_past_the_last_texel() {
         assert!(!texel_read_in(15 * 128 + 16, true), "the last texel is byte 15 * 128 + 15");
+    }
+
+    fn gcn3_texel_read(offset: u64, v: f32) -> bool {
+        let (mut b, k) = Build::kernel();
+        let op = rdna4(&mut b, "image_sample_lz_gcn3");
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let at = b.constant(e, Ty::I64, offset);
+        let address = b.int(e, IntOp::Add, buf, at);
+        let s = store_at(&mut b, e, address, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let mut args = [zero; 16];
+        args[0] = base_units(&mut b, e, buf);
+        args[1] = b.constant(e, Ty::I32, 1 << 20 | 4 << 26);
+        args[2] = b.constant(e, Ty::I32, 15 << 14 | 15);
+        args[3] = b.constant(e, Ty::I32, 9 << 28 | 8 << 20 | 4);
+        args[4] = b.constant(e, Ty::I32, 19 << 13);
+        args[13] = b.constant(e, Ty::I1, 1);
+        args[14] = b.core(e, Ty::F32, Op::Convert(Cvt::UnsignedToFloatRte, Ty::F32, k.item));
+        args[15] = b.constant(e, Ty::F32, v.to_bits() as u64);
+        let r = b.here(e);
+        b.target(e, op, Arguments::Sixteen(args), &[Ty::I32]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        h.together.contains(&pair(&h, s, r))
+    }
+
+    #[test]
+    fn find_orders_a_gcn3_texel_read_after_stores_into_its_row() {
+        assert!(gcn3_texel_read(3 * 20 + 5, 3.5), "v = 3.5 reads row 3, bytes 60 to 75 of rows 20 bytes apart");
+    }
+
+    #[test]
+    fn find_keeps_a_gcn3_texel_read_apart_from_the_bytes_its_pitch_skips() {
+        assert!(!gcn3_texel_read(3 * 20 + 16, 3.5), "row 3 ends at byte 75 and row 4 starts at byte 80");
+    }
+
+    #[test]
+    fn find_orders_a_gcn3_texel_read_clamped_to_the_last_row_after_stores_into_it() {
+        assert!(gcn3_texel_read(15 * 20 + 12, 20.0), "v = 20 clamps to row 15, whose texel 15 is byte 315");
+    }
+
+    #[test]
+    fn find_keeps_a_gcn3_texel_read_apart_from_stores_past_the_last_texel() {
+        assert!(!gcn3_texel_read(15 * 20 + 16, 20.0), "the last texel is byte 15 * 20 + 15");
     }
 
     fn twice(b: &mut Build, block: BlockId, address: ValueId, mask: ValueId) -> ((BlockId, usize), (BlockId, usize)) {
@@ -3410,7 +3620,7 @@ mod tests {
 
     fn workgroup_branch(entered: u64) -> bool {
         let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(WORKGROUP_ID_X), Ty::I32)]);
-        b.entry.workgroup_id_x = true;
+        b.entry.workgroup_ids[0] = Some(crate::rdna_spmd::engine::Field { register: crate::rdna_spmd::engine::WORKGROUP_ID_X, shift: 0 });
         let e = BlockId(0);
         let buf = k.buffer(&mut b, e, 0);
         let entered = b.constant(e, Ty::I32, entered);
@@ -3829,7 +4039,7 @@ mod tests {
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
         let four = b.constant(e, Ty::I32, 4);
         let low = b.cmp(e, IntPred::Ult, lane, four);
-        let w = b.wave(e, WaveOp::Ballot, vec![low]);
+        let w = b.wave(e, WaveOp::Ballot { high: false }, vec![low]);
         let k2 = b.constant(e, Ty::I32, bit);
         let shifted = b.int(e, IntOp::LShr, w, k2);
         let set = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
@@ -3837,6 +4047,33 @@ mod tests {
         let (s1, s2) = twice(&mut b, e, buf, mask);
         let h = Hazards::find(&b.program(), &env2());
         h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    fn ballot_pair_bit(bit: u64) -> bool {
+        let (mut b, k, _) = Build::kernel_in(&[], 64);
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let forty = b.constant(e, Ty::I32, 40);
+        let below = b.cmp(e, IntPred::Ult, lane, forty);
+        let low = b.wave(e, WaveOp::Ballot { high: false }, vec![below]);
+        let high = b.wave(e, WaveOp::Ballot { high: true }, vec![below]);
+        let halves = b.core(e, Ty::I64, Op::Pack64(low, high));
+        let k2 = b.constant(e, Ty::I64, bit);
+        let shifted = b.int(e, IntOp::LShr, halves, k2);
+        let set = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let mask = b.int(e, IntOp::And, set, k.exec);
+        let (s1, s2) = twice(&mut b, e, buf, mask);
+        let h = Hazards::find(&b.program(), &environment(64, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
+        h.conflicts().contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reads_a_fixed_bit_of_a_pair_of_ballot_halves() {
+        assert!(ballot_pair_bit(3), "lane 3 is below 40, so every lane stores");
+        assert!(ballot_pair_bit(35), "lane 35 is below 40, so every lane stores");
+        assert!(!ballot_pair_bit(45), "lane 45 is not below 40, so no lane stores");
+        assert!(!ballot_pair_bit(63), "lane 63 is not below 40, so no lane stores");
     }
 
     #[test]
@@ -3862,7 +4099,7 @@ mod tests {
         let z = b.constant(body, Ty::I32, 0);
         let fresh = b.cmp(body, IntPred::Ne, v, z);
         let both = b.int(body, IntOp::And, p[1], fresh);
-        let w = b.wave(body, WaveOp::Ballot, vec![both]);
+        let w = b.wave(body, WaveOp::Ballot { high: false }, vec![both]);
         let shifted = b.int(body, IntOp::LShr, w, lane);
         let still = b.core(body, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
         let mask = b.int(body, IntOp::And, p[1], p[0]);

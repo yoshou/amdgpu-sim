@@ -10,13 +10,15 @@ mod dual;
 mod half;
 mod image;
 mod memory;
-mod packed;
+pub(crate) mod packed;
 mod regs;
 mod rewrite;
 mod scalar;
 mod wave;
 
 pub use control::writes_exec;
+pub use half::source as half_source;
+pub use image::sample as image_sample;
 pub use function::lift;
 pub use wave::{Operand, YieldAction};
 
@@ -101,14 +103,14 @@ impl Output {
         }
     }
 }
-struct Builder<'r> {
+pub struct Builder<'r> {
     registry: &'r DialectRegistry,
     inputs: Vec<Input>,
     insts: Vec<ExprInst>,
     next_value: usize,
 }
 impl<'r> Builder<'r> {
-    fn new(registry: &'r DialectRegistry, inputs: Vec<Input>) -> Self {
+    pub fn new(registry: &'r DialectRegistry, inputs: Vec<Input>) -> Self {
         Self {
             registry,
             next_value: inputs.len(),
@@ -116,13 +118,13 @@ impl<'r> Builder<'r> {
             insts: vec![],
         }
     }
-    fn push(&mut self, ty: Ty, op: Op) -> ValueId {
+    pub fn push(&mut self, ty: Ty, op: Op) -> ValueId {
         let id = ValueId(self.next_value);
         self.next_value += 1;
         self.insts.push(ExprInst::Core(ty, op));
         id
     }
-    fn target(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> Vec<ValueId> {
+    pub fn target(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> Vec<ValueId> {
         let outputs = self
             .registry
             .operation(op)
@@ -136,18 +138,18 @@ impl<'r> Builder<'r> {
         self.insts.push(ExprInst::Target { op, args, outputs });
         values
     }
-    fn target_one(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> ValueId {
+    pub fn target_one(&mut self, op: crate::rdna_spmd::dialect::TargetOp, args: Arguments) -> ValueId {
         let values = self.target(op, args);
         assert_eq!(values.len(), 1);
         values[0]
     }
-    fn k(&mut self, ty: Ty, bits: u64) -> ValueId {
+    pub fn k(&mut self, ty: Ty, bits: u64) -> ValueId {
         self.push(ty, Op::Const(ty, bits))
     }
-    fn int(&mut self, op: IntOp, a: ValueId, b: ValueId) -> ValueId {
+    pub fn int(&mut self, op: IntOp, a: ValueId, b: ValueId) -> ValueId {
         self.push(Ty::I32, Op::Int(op, a, b))
     }
-    fn float_mod(&mut self, ty: Ty, mut a: ValueId, abs: u8, neg: u8, index: usize) -> ValueId {
+    pub fn float_mod(&mut self, ty: Ty, mut a: ValueId, abs: u8, neg: u8, index: usize) -> ValueId {
         if abs >> index & 1 != 0 {
             a = self.push(ty, Op::Unary(FloatUnary::Abs, a));
         }
@@ -157,7 +159,7 @@ impl<'r> Builder<'r> {
         a
     }
 
-    fn bits_mod(
+    pub fn bits_mod(
         &mut self,
         ty: Ty,
         bits: u32,
@@ -183,7 +185,7 @@ impl<'r> Builder<'r> {
         }
         value
     }
-    fn output_mod(&mut self, ty: Ty, mut value: ValueId, clamp: u8, omod: u8) -> ValueId {
+    pub fn output_mod(&mut self, ty: Ty, mut value: ValueId, clamp: u8, omod: u8) -> ValueId {
         if omod != 0 {
             let factor: f64 = match omod {
                 1 => 2.0,
@@ -234,10 +236,10 @@ impl<'r> Builder<'r> {
         }
         value
     }
-    fn finish(self, output: Output, result: ValueId) -> Lowering {
+    pub fn finish(self, output: Output, result: ValueId) -> Lowering {
         self.finish_many(false, vec![(output, result)])
     }
-    fn finish_many(self, scalar: bool, results: Vec<(Output, ValueId)>) -> Lowering {
+    pub fn finish_many(self, scalar: bool, results: Vec<(Output, ValueId)>) -> Lowering {
         let types: Vec<_> = self
             .inputs
             .iter()
@@ -270,14 +272,14 @@ impl<'r> Builder<'r> {
         }
     }
 }
-fn input(source: SourceOperand, ty: Ty) -> Input {
+pub fn input(source: SourceOperand, ty: Ty) -> Input {
     Input {
         source: InputSource::Operand(source),
         ty,
     }
 }
 
-fn signed_input(source: SourceOperand, ty: Ty) -> Input {
+pub fn signed_input(source: SourceOperand, ty: Ty) -> Input {
     input(
         match (source, ty) {
             (SourceOperand::LiteralConstant(word), Ty::I64) => {
@@ -403,7 +405,7 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     Some(b.finish_many(false, results))
 }
 
-pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) -> Lowering {
+pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry, lanes: u32) -> Lowering {
     if let Some(action) = wave::instruction(inst) {
         return Lowering::Wave(action);
     }
@@ -422,7 +424,7 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
     if let Some(alu) = carry(inst, registry).or_else(|| scalar::instruction(inst, registry)) {
         return alu;
     }
-    if let Some(alu) = dual::instruction(inst, registry) {
+    if let Some(alu) = dual::instruction(inst, registry, lanes) {
         return alu;
     }
     if let Some(alu) = compare::instruction(inst, registry) {
@@ -495,7 +497,7 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry) 
         )
     } else {
         let mut output = Output::Vgpr(dst, shape.float_ty.unwrap_or(Ty::I32));
-        let result = lower_integer(&mut q, alu.op, alu.cm, a, b, c)
+        let result = lower_integer(&mut q, alu.op, alu.cm, a, b, c, lanes)
             .or_else(|| lower_wide(&mut q, alu.op, a, b, &mut output, dst))
             .or_else(|| lower_float(&mut q, alu.op, shape.ty, a, b, c))
             .unwrap_or_else(|| panic!("instruction has no typed IR lowering: {:?}", inst));
@@ -787,6 +789,7 @@ fn lower_integer(
     a: ValueId,
     b: ValueId,
     c: ValueId,
+    lanes: u32,
 ) -> Option<ValueId> {
     Some(match op {
         I::V_MOV_B32 => a,
@@ -797,6 +800,23 @@ fn lower_integer(
         I::V_BFREV_B32 => q.push(Ty::I32, Op::ReverseBits(a)),
         I::V_BCNT_U32_B32 => {
             let count = q.push(Ty::I32, Op::PopulationCount(a));
+            q.int(IntOp::Add, count, b)
+        }
+        I::V_MBCNT_LO_U32_B32 | I::V_MBCNT_HI_U32_B32 if lanes == 64 => {
+            let lane = q.push(Ty::I32, Op::Env(Env::LaneId));
+            let one = q.k(Ty::I32, 1);
+            let bit = q.int(IntOp::Shl, one, lane);
+            let below = q.int(IntOp::Sub, bit, one);
+            let half = q.k(Ty::I32, 32);
+            let lower = q.push(Ty::I1, Op::Cmp(IntPred::Ult, lane, half));
+            let (in_lower, in_upper) = if matches!(op, I::V_MBCNT_LO_U32_B32) {
+                (below, q.k(Ty::I32, u32::MAX as u64))
+            } else {
+                (q.k(Ty::I32, 0), below)
+            };
+            let mask = q.push(Ty::I32, Op::Select(lower, in_lower, in_upper));
+            let taken = q.int(IntOp::And, a, mask);
+            let count = q.push(Ty::I32, Op::PopulationCount(taken));
             q.int(IntOp::Add, count, b)
         }
         I::V_MBCNT_LO_U32_B32 => {

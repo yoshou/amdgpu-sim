@@ -108,7 +108,9 @@ fn packet_state(f: &mut Func, whole_wave: bool) -> usize {
                             EffectOp::Wave(WaveOp::Any) if all || local.contains(&outputs[0].0) => {
                                 PacketOp::Any
                             }
-                            EffectOp::Wave(WaveOp::Ballot) if all => PacketOp::Ballot,
+                            EffectOp::Wave(WaveOp::Ballot { high: false }) if all => {
+                                PacketOp::Ballot
+                            }
                             _ => continue,
                         };
                         *inst = Inst::Packet {
@@ -135,7 +137,7 @@ impl Pass for PacketState {
         "packet_state"
     }
     fn run(&self, f: &mut Func, analyses: &Analyses) -> bool {
-        packet_state(f, analyses.context().lanes >= 32) > 0
+        packet_state(f, analyses.context().lanes >= f.lanes) > 0
     }
     fn preserves(&self) -> Preserved {
         Preserved::of::<Constants>()

@@ -7,7 +7,7 @@ pub struct KernelArgs {
     pub scratch_stride: u64,
     pub lane_base: u64,
     pub lds_base: u64,
-    pub valid_mask: u32,
+    pub valid_mask: u64,
     pub frame: *mut u32,
 }
 
@@ -30,7 +30,7 @@ pub type KernelFn = unsafe extern "C" fn(
     u64,
     u64,
     *mut FiberCtx,
-    u32,
+    u64,
     *mut u32,
 ) -> u64;
 
@@ -131,7 +131,7 @@ impl Fiber {
                         sgprs: std::ptr::null_mut(),
                         vgprs: std::ptr::null_mut(),
                         lds_base: 0,
-                        valid_mask: u32::MAX,
+                        valid_mask: u64::MAX,
                         scratch_base: 0,
                         scratch_stride: 0,
                         lane_base: 0,

@@ -9,7 +9,7 @@ use super::program::Program;
 fn wave_passes(f: &mut Program, idioms: &[Box<dyn Idiom>]) {
     let driver = Driver::new();
     let limit = 1 + f.ir.types.len();
-    let mut an = Analyses::new(Context::of(&f.registry, &f.parameter_inputs, 32));
+    let mut an = Analyses::new(Context::of(&f.registry, &f.parameter_inputs, f.ir.lanes, f.entry));
     driver
         .fixpoint(
             &mut f.ir,
@@ -82,6 +82,8 @@ fn compile_lockstep(
         workgroup_x,
         scheduler,
         width,
+        lane.function.ir.lanes,
+        lane.function.entry,
     )
 }
 
@@ -90,12 +92,22 @@ pub fn decode_program(
     descriptor: &crate::processor::KernelDescriptor,
     entry_pc: usize,
     memory: &[u8],
+    lanes: u32,
 ) -> Result<Program, String> {
-    if !super::rdna4::supports(arch) {
-        return Err(format!("no SPMD target supports {arch}"));
+    if !matches!(lanes, 32 | 64) {
+        return Err(format!("no SPMD target runs waves of {lanes} lanes"));
     }
-    let mut program = super::rdna4::decode(entry_pc, memory)?;
-    program.entry = super::engine::EntryLayout::of(descriptor);
+    let mut program = if super::rdna4::supports(arch) {
+        let mut program = super::rdna4::decode(entry_pc, memory, lanes)?;
+        program.entry = super::engine::EntryLayout::of(descriptor);
+        program
+    } else if super::gcn3::supports(arch) {
+        let (mut program, layout) = super::gcn3::decode(descriptor, entry_pc, memory, lanes)?;
+        program.entry = layout;
+        program
+    } else {
+        return Err(format!("no SPMD target supports {arch}"));
+    };
     wave_passes(&mut program, &super::rdna4::dialect().idioms);
     Ok(program)
 }

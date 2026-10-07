@@ -8,7 +8,7 @@ use crate::rdna_spmd::ir::*;
 
 fn word_is<Q: Queries>(q: &mut Q, w: ValueId, value: u32) -> Bdd {
     let mut g = Bdd::TRUE;
-    for i in 0..5u8 {
+    for i in 0..q.atoms().lanes().trailing_zeros() as u8 {
         let bit = q.atom(Atom::WordBit(w, i));
         let literal = if value >> i & 1 == 1 { bit } else { q.m().not(bit) };
         g = q.m().and(g, literal);
@@ -20,7 +20,7 @@ fn small_word(f: &Func, facts: &Facts, w: ValueId) -> Option<(u32, u32)> {
     if f.types[w.0] != Ty::I32 || !facts.uniform[w.0] || !matches!(facts.site[w.0], Site::Inst { .. }) || facts.constant(f, w).is_some() {
         return None;
     }
-    interval(f, facts, w, 0).filter(|&(_, high)| high < 32)
+    interval(f, facts, w, 0).filter(|&(_, high)| high < f.lanes)
 }
 
 pub(super) fn small_comparison<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Option<Bdd>
@@ -65,7 +65,7 @@ pub(super) fn lane_is<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: Blo
         }
         return Some(g);
     }
-    if !interval(f, facts, target, 0).is_some_and(|(_, high)| high < 32) {
+    if !interval(f, facts, target, 0).is_some_and(|(_, high)| high < f.lanes) {
         return None;
     }
     for inst in &f.blocks[&block].insts {

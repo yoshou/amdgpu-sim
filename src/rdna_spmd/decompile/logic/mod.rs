@@ -128,15 +128,23 @@ impl Logic {
         self.eval().view(f, facts, w)
     }
 
-    pub fn word(&mut self, k: u32) -> Bdd {
-        self.eval().word(k)
+    pub fn word_of(&mut self, ty: Ty, k: u64) -> Bdd {
+        self.eval().word_of(ty, k)
     }
 
-    pub fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); 32]> {
+    pub fn lane_count(&self) -> u32 {
+        self.kernel.lanes()
+    }
+
+    pub fn half(&mut self, high: bool, own: Bdd, other: Bdd) -> Bdd {
+        self.eval().half(high, own, other)
+    }
+
+    pub fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); rules::MAX_LANES]> {
         self.kernel.state_mut().lane_bits(f, facts, v)
     }
 
-    pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
+    pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; rules::MAX_LANES]> {
         self.kernel.state_mut().lane_function(f, facts, v)
     }
 

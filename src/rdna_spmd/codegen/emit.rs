@@ -92,7 +92,7 @@ pub fn emit_function(
     let (i32t, i64t, ptr) = (ir.i32(), ir.i64(), ir.ptr());
     let func = ir.add_function(
         symbol,
-        i64t.function(&[ptr, ptr, i64t, i64t, i64t, i64t, ptr, i32t, ptr]),
+        i64t.function(&[ptr, ptr, i64t, i64t, i64t, i64t, ptr, i64t, ptr]),
     );
     let entry = ir.append_block(func, "entry");
     ir.position_at_end(entry);
@@ -102,7 +102,7 @@ pub fn emit_function(
     let scratch_stride = func.param(3);
     let lds_base = func.param(4);
     let lane_base = func.param(5);
-    let valid_mask = func.param(7);
+    let valid_mask = ir.trunc(ir.lshr(func.param(7), func.param(5)), i32t);
     let width_lanes = p.width;
     let scratch_base_scalar = {
         let aperture = ir.and(scratch_base, ir.ci64(0xffff_ffff_0000_0000));
@@ -199,7 +199,7 @@ pub fn emit_function(
         let off = ir.mul(scratch_lane, stride_v);
         cg.scratch_vec = ir.add(base_v, off);
     }
-    let packet_valid = cg.lane_base_word(valid_mask);
+    let packet_valid = valid_mask;
     let valid_vec = cg.mask_to_vec(packet_valid);
     cg.em.valid_lane = Some(valid_vec);
     cg.em.set_lane_id(lane_base);
@@ -400,7 +400,7 @@ impl<'a> Cg<'a> {
                 ParameterSource::MaskBit(r) => {
                     let word = ir.load(ir.i32(), self.register_slot(self.sgprs_p, r));
                     let word = if r == self.regs().exec {
-                        ir.and(word, self.lane_base_word(self.valid_mask))
+                        ir.and(word, self.valid_mask)
                     } else {
                         word
                     };
@@ -506,7 +506,7 @@ impl<'a> Cg<'a> {
     }
 
     fn lane_base_word(&self, word: Value) -> Value {
-        self.ir.lshr(word, self.lane_base)
+        self.ir.lshr(word, self.ir.and(self.lane_base, self.ci32(31)))
     }
 
     fn any_of_word(&mut self, input: ValueId) -> Option<Value> {
@@ -516,7 +516,7 @@ impl<'a> Cg<'a> {
         let word = self.lane_base_word(word);
         let mut bits = self.ir.and(word, self.ci32(((1u64 << w) - 1) as u32));
         if valid {
-            let packet = self.lane_base_word(self.valid_mask);
+            let packet = self.valid_mask;
             bits = self.ir.and(bits, packet);
         }
         Some(self.ir.icmp(IntPred::Ne, bits, self.ci32(0)))

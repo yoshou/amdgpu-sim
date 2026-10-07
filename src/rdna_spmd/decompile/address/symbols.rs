@@ -3,7 +3,6 @@ use super::limits::{intersected, shifted_pieces, Limits};
 use super::program::Program;
 use super::trail::*;
 use super::HashSet;
-use crate::rdna_spmd::engine::{WORKGROUP_ID_X, WORKGROUP_ID_YZ};
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 
@@ -77,11 +76,12 @@ impl<'a> Symbols<'a> {
     }
 
     pub(super) fn valid(&self, lane: usize) -> bool {
-        ((self.wave * LANES + lane) as u32) < self.program.env.workgroup_size()
+        let lanes = self.program.lanes();
+        lane < lanes && ((self.wave * lanes + lane) as u32) < self.program.env.workgroup_size()
     }
 
     fn ids(&self, lane: usize) -> (u32, u32, u32) {
-        let flat = (self.wave * LANES + lane) as u32;
+        let flat = (self.wave * self.program.lanes() + lane) as u32;
         let [bx, by, _] = self.program.env.block;
         (flat % bx, (flat / bx) % by, flat / (bx * by))
     }
@@ -273,19 +273,22 @@ impl<'a> Symbols<'a> {
     }
 
     pub(super) fn input(&mut self, v: ValueId, index: usize, lane: usize) -> Value {
+        let entry = self.program.entry;
         match self.program.inputs[index].source {
-            ParameterSource::Vgpr(0) => {
+            ParameterSource::Vgpr(r) if entry.workitem_register(r) => {
                 let (x, y, z) = self.ids(lane);
-                Value::constant(x | y << 10 | z << 20)
+                let ids = [x, y, z];
+                Value::constant(entry.workitem_fields(r).fold(0, |sum, (axis, shift)| sum | ids[axis] << shift))
             }
-            ParameterSource::Sgpr(n) if Some(n) == self.program.entry.kernarg_ptr => self.base(Region::Kernarg),
-            ParameterSource::Sgpr(n) if Some(n) == self.program.entry.dispatch_ptr => self.base(Region::Dispatch),
-            ParameterSource::Sgpr(WORKGROUP_ID_X) if self.program.entry.workgroup_id_x => {
-                Value::of(Form::unknown(self.workgroup(0)))
-            }
-            ParameterSource::Sgpr(WORKGROUP_ID_YZ) if self.program.entry.workgroup_id_yz => {
-                let (y, z) = (self.workgroup(1), self.workgroup(2));
-                Value::of(Form::unknown(y).add(&Form::unknown(z).scale(1 << 16)))
+            ParameterSource::Sgpr(n) if Some(n) == entry.kernarg_ptr => self.base(Region::Kernarg),
+            ParameterSource::Sgpr(n) if Some(n) == entry.dispatch_ptr => self.base(Region::Dispatch),
+            ParameterSource::Sgpr(n) if entry.workgroup_fields(n).next().is_some() => {
+                let fields: Vec<_> = entry.workgroup_fields(n).collect();
+                let mut form = Form::constant(0);
+                for (axis, shift) in fields {
+                    form = form.add(&Form::unknown(self.workgroup(axis)).scale(1 << shift));
+                }
+                Value::of(form)
             }
             _ => self.opaque(v, lane, None),
         }
@@ -739,7 +742,7 @@ impl<'a> Symbols<'a> {
     }
 
     pub(super) fn waves(&self) -> usize {
-        (self.program.env.workgroup_size() as usize).div_ceil(LANES)
+        (self.program.env.workgroup_size() as usize).div_ceil(self.program.lanes())
     }
 }
 

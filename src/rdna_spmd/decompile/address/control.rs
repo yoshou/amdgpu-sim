@@ -7,7 +7,7 @@ use crate::rdna_spmd::ir::*;
 pub(super) type Edges = Vec<(BlockId, usize)>;
 
 pub(super) fn decide<'a, Q: Queries<'a>>(q: &mut Q, cond: ValueId) -> Option<bool> {
-    let lanes: Vec<usize> = (0..LANES).filter(|&l| q.symbols().valid(l)).collect();
+    let lanes: Vec<usize> = (0..q.program().lanes()).filter(|&l| q.symbols().valid(l)).collect();
     if q.program().facts.uniform[cond.0] {
         return lanes.first().and_then(|&l| q.bit(cond, l, None).0);
     }
@@ -214,7 +214,7 @@ pub(super) fn last_trip<'a, Q: Queries<'a>>(q: &mut Q, header: BlockId, trips: U
         if q.program().f.types[a.0] != Ty::I32 {
             return None;
         }
-        let mut lanes: Vec<usize> = (0..LANES).filter(|&l| q.symbols().valid(l)).collect();
+        let mut lanes: Vec<usize> = (0..q.program().lanes()).filter(|&l| q.symbols().valid(l)).collect();
         if q.program().facts.uniform[a.0] && q.program().facts.uniform[b.0] {
             lanes.truncate(1);
         }

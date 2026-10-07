@@ -22,7 +22,7 @@ pub(super) fn at_lane(logic: &mut Logic, x: Bdd, lane: u32) -> Bdd {
 pub(super) fn read_from(logic: &mut Logic, facts: &Facts, h: Bdd, source: impl Fn(usize) -> u32) -> Bdd {
     let mut seen: HashMap<u32, Bdd> = HashMap::default();
     let mut any = Bdd::FALSE;
-    for l in 0..32 {
+    for l in 0..logic.lane_count() as usize {
         let s = source(l);
         let there = match seen.get(&s) {
             Some(&there) => there,
@@ -40,16 +40,17 @@ pub(super) fn read_from(logic: &mut Logic, facts: &Facts, h: Bdd, source: impl F
     any
 }
 
-pub(super) fn read_from_any(logic: &mut Logic, facts: &Facts, h: Bdd, sources: impl Fn(usize) -> u32) -> Bdd {
-    let mut seen: HashMap<u32, Bdd> = HashMap::default();
+pub(super) fn read_from_any(logic: &mut Logic, facts: &Facts, h: Bdd, sources: impl Fn(usize) -> u64) -> Bdd {
+    let mut seen: HashMap<u64, Bdd> = HashMap::default();
     let mut any = Bdd::FALSE;
-    for l in 0..32 {
+    let count = logic.lane_count();
+    for l in 0..count as usize {
         let set = sources(l);
         let there = match seen.get(&set) {
             Some(&there) => there,
             None => {
                 let mut there = Bdd::FALSE;
-                for s in 0..32u32 {
+                for s in 0..count {
                     if set >> s & 1 == 1 {
                         let at = at_lane(logic, h, s);
                         let read = some_lane(logic, facts, at);
@@ -72,7 +73,7 @@ fn other_lanes(logic: &mut Logic, facts: &Facts, x: Bdd) -> Bdd {
         return some_lane(logic, facts, x);
     }
     let mut any = Bdd::FALSE;
-    for l in 0..32u32 {
+    for l in 0..logic.lane_count() {
         let at = at_lane(logic, x, l);
         let there = some_lane(logic, facts, at);
         if there == Bdd::FALSE {

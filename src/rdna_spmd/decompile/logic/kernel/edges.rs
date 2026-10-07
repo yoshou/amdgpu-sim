@@ -51,7 +51,7 @@ impl Edges {
             }
             let bound = match ty {
                 Ty::I1 => q.bit(f, facts, arg),
-                Ty::I32 => {
+                Ty::I32 | Ty::I64 => {
                     index.words.entry(arg).or_default().push(k);
                     if !(facts.lane_word[param.0] || facts.lane_word[arg.0]) {
                         continue;
@@ -152,7 +152,7 @@ impl Edges {
             }
             let (atom, bound) = match ty {
                 Ty::I1 => (Atom::Bit(param), q.bit(f, facts, arg)),
-                Ty::I32 if facts.viewed[param.0] && !facts.materialized[param.0] => {
+                Ty::I32 | Ty::I64 if facts.viewed[param.0] && !facts.materialized[param.0] => {
                     (Atom::View(param), q.view(f, facts, arg))
                 }
                 _ => continue,

@@ -1,8 +1,6 @@
 use yaml_rust::yaml::*;
 
 use amdgpu_sim::buffer::*;
-use amdgpu_sim::gcn_processor::*;
-use amdgpu_sim::processor::*;
 use amdgpu_sim::rdna_spmd::{Arg, Buffer, Launch, Module};
 use getopts::Options;
 use object::*;
@@ -441,7 +439,7 @@ fn main() -> Result<()> {
             .unwrap();
 
         let metadata = decode_note_metadata(note_section_data.data()).unwrap();
-        let (kernarg_seg_size, private_segment_size, wavefront_size) =
+        let (_, _, wavefront_size) =
             if let Metadata::Yaml(metadata) = metadata {
                 let metadatas = YamlLoader::load_from_str(&metadata).unwrap();
                 let metadata = &metadatas[0];
@@ -506,79 +504,13 @@ fn main() -> Result<()> {
                 panic!()
             };
 
-        let mut arg_buffer = vec![0u8; kernarg_seg_size];
-
-        let ls_ptr = (&ls[0] as *const Vector3) as u64;
-        let spheres_ptr = (&SPHERES[0] as *const Sphere) as u64;
-
-        set_u64(&mut arg_buffer, 0, spheres_ptr);
-        set_u64(&mut arg_buffer, 8, SPHERES.len() as u64);
-        set_u32(&mut arg_buffer, 16, width as u32);
-        set_u32(&mut arg_buffer, 20, height as u32);
-        set_u64(&mut arg_buffer, 24, ls_ptr);
-        set_u32(&mut arg_buffer, 32, nb_samples as u32);
-
-        set_u32(&mut arg_buffer, 40, (width / 16) as u32);
-        set_u32(&mut arg_buffer, 44, (height / 16) as u32);
-        set_u32(&mut arg_buffer, 48, 1);
-
-        set_u16(&mut arg_buffer, 52, 16);
-        set_u16(&mut arg_buffer, 54, 16);
-        set_u16(&mut arg_buffer, 56, 1);
-
-        println!("spheres_ptr: {}", spheres_ptr);
-        println!("ls_ptr: {}", ls_ptr);
-
-        println!("argument size: {}", arg_buffer.len());
-
-        let kernel_arg_ptr = (&arg_buffer[0] as *const u8) as u64;
-
-        println!("kernel_arg_ptr: 0x{:X}", kernel_arg_ptr);
-
-        let mut mem = Vec::<u8>::new();
-        for segment in elffile.segments() {
-            let offset = segment.address() as usize;
-            let size = segment.size() as usize;
-            let new_size = mem.len().max(offset + size);
-            mem.resize(new_size, 0);
-            mem[offset..(offset + size.min(segment.data().len()))].copy_from_slice(segment.data());
-        }
-
-        if let Some(kernel_sym) = elffile
-            .symbols()
-            .find(|sym| sym.name() == Some(kernel_name))
-        {
-            let kernel_addr = kernel_sym.address() as usize;
-
-            let aql = HsaKernelDispatchPacket {
-                header: 0,
-                setup: 0,
-                workgroup_size_x: 16,
-                workgroup_size_y: 16,
-                workgroup_size_z: 1,
-                grid_size_x: (width / 16) as u32,
-                grid_size_y: (height / 16) as u32,
-                grid_size_z: 1,
-                private_segment_size: private_segment_size as u32,
-                group_segment_size: 0,
-                kernel_object: Pointer::new(&mem, kernel_addr),
-                kernarg_address: Pointer::new(&arg_buffer, 0),
-            };
-
+        if elffile.symbols().any(|sym| sym.name() == Some(kernel_name)) {
             if (arch == "gfx803") && (wavefront_size != 64) {
                 println!("Wavefront size must be 64 for gfx803 architectures.");
                 return Ok(());
             }
 
-            if arch == "gfx803" {
-                let mut processor = GCNProcessor::new(&aql, 16, &mem);
-
-                use std::time::Instant;
-                let start = Instant::now();
-                processor.execute();
-                let end = start.elapsed();
-                println!("Elapsed time: {:.3} [ms]", end.as_secs_f64() * 1000.0);
-            } else if "gfx1200" == arch {
+            if matches!(arch.as_str(), "gfx803" | "gfx1200") {
                 use std::time::Instant;
 
                 let to_io = |e: amdgpu_sim::rdna_spmd::Error| Error::new(ErrorKind::Other, e);

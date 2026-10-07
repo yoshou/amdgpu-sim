@@ -25,7 +25,21 @@ fn require(e: &Emitter, mut valid: Value) {
     ir.position_at_end(next);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    Gfx12,
+    Gcn3,
+}
+
 pub fn sample(e: &Emitter, a: &[Value]) -> Value {
+    sample_in(e, a, Layout::Gfx12)
+}
+
+pub fn sample_gcn3(e: &Emitter, a: &[Value]) -> Value {
+    sample_in(e, a, Layout::Gcn3)
+}
+
+fn sample_in(e: &Emitter, a: &[Value], layout: Layout) -> Value {
     let ir = e.ir();
     let k = |v| e.constant(Ty::I32, v);
     let eq = |a, c| ir.icmp(IntPred::Eq, a, c);
@@ -45,18 +59,44 @@ pub fn sample(e: &Emitter, a: &[Value]) -> Value {
         };
         and(value, k((1u64 << size) - 1))
     };
-    let format = field(&a[..8], 49, 8);
-    let width = ir.add(field(&a[..8], 62, 16), k(1));
-    let height = ir.add(field(&a[..8], 78, 16), k(1));
-    let pitch = field(&a[..8], 128, 16);
-    let row = select(eq(pitch, k(0)), width, ir.add(pitch, k(1)));
-    let row = and(ir.add(row, k(127)), k(0xffff_ff80));
     let component_shift = ir.mul(a[12], k(3));
     let component = and(ir.lshr(a[3], component_shift), k(7));
     let data_component = ir.icmp(IntPred::Uge, component, k(4));
     let filter = field(&a[8..12], 84, 2);
-    let selector_valid = or(data_component, ir.icmp(IntPred::Ule, component, k(1)));
-    require(e, and(eq(filter, k(0)), selector_valid));
+    let (format, width, height, row) = match layout {
+        Layout::Gfx12 => {
+            let format = field(&a[..8], 49, 8);
+            let width = ir.add(field(&a[..8], 62, 16), k(1));
+            let height = ir.add(field(&a[..8], 78, 16), k(1));
+            let pitch = field(&a[..8], 128, 16);
+            let row = select(eq(pitch, k(0)), width, ir.add(pitch, k(1)));
+            let row = and(ir.add(row, k(127)), k(0xffff_ff80));
+            let selector_valid = or(data_component, ir.icmp(IntPred::Ule, component, k(1)));
+            require(e, and(eq(filter, k(0)), selector_valid));
+            (format, width, height, row)
+        }
+        Layout::Gcn3 => {
+            let number = field(&a[..8], 58, 4);
+            let code = select(eq(number, k(5)), k(6), k(0));
+            let code = select(eq(number, k(4)), k(5), code);
+            let code = select(eq(number, k(1)), k(2), code);
+            let code = select(eq(number, k(0)), k(1), code);
+            let format = select(eq(field(&a[..8], 52, 6), k(1)), code, k(0));
+            let width = ir.add(field(&a[..8], 64, 14), k(1));
+            let height = ir.add(field(&a[..8], 78, 14), k(1));
+            let row = ir.add(field(&a[..8], 141, 14), k(1));
+            let kind = field(&a[..8], 124, 4);
+            let flat = or(eq(kind, k(9)), and(eq(kind, k(13)), eq(field(&a[..8], 160, 13), k(0))));
+            let linear = eq(field(&a[..8], 116, 5), k(8));
+            let level = and(eq(field(&a[..8], 108, 4), k(0)), eq(field(&a[..8], 112, 4), k(0)));
+            let point = eq(field(&a[8..12], 86, 2), k(0));
+            let laid_out = and(and(flat, linear), and(level, point));
+            let selector_valid = or(eq(component, k(4)), ir.icmp(IntPred::Ule, component, k(1)));
+            let fetched = or(ir.not(data_component), laid_out);
+            require(e, and(and(eq(filter, k(0)), selector_valid), fetched));
+            (format, width, height, row)
+        }
+    };
 
     let unrm = or(a[13], eq(field(&a[8..12], 15, 1), k(1)));
     let axis = |value, size, shift| {

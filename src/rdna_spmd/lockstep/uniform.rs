@@ -16,6 +16,7 @@ pub fn context(lane: &Program, packing: Packing) -> Context<'_> {
             &lane.parameter_inputs,
             exec_index(&lane.parameter_inputs, lane.registry.registers().exec),
             packing.lanes,
+            lane.entry,
         )
     }
 }

@@ -178,7 +178,7 @@ fn collective(program: &Program, logic: &mut Logic, inst: &Inst) -> Option<Bdd> 
             let local = logic.local(Choice::Query(out));
             Some(logic.m.not(local))
         }
-        WaveOp::Ballot => Some(logic.materialized(program.facts, out)),
+        WaveOp::Ballot { .. } => Some(logic.materialized(program.facts, out)),
         _ => None,
     }
 }

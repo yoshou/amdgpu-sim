@@ -2,7 +2,7 @@ use crate::bit::*;
 use crate::gcn_instructions::*;
 use crate::instructions::*;
 
-fn decode_sop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_sop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
         0 => Ok((I::S_MOV_B32, 4)),
         1 => Ok((I::S_MOV_B64, 4)),
@@ -57,7 +57,7 @@ fn decode_sop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_sop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_sop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
         0 => Ok((I::S_ADD_U32, 4)),
         1 => Ok((I::S_SUB_U32, 4)),
@@ -107,7 +107,7 @@ fn decode_sop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_sopk_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_sopk_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
         0 => Ok((I::S_MOVK_I32, 4)),
         1 => Ok((I::S_CMOVK_I32, 4)),
@@ -133,7 +133,7 @@ fn decode_sopk_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_sopc_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_sopc_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
         0 => Ok((I::S_CMP_EQ_I32, 4)),
         1 => Ok((I::S_CMP_LG_I32, 4)),
@@ -159,7 +159,7 @@ fn decode_sopc_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_sopp_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_sopp_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode as u8 {
         0 => Ok((I::S_NOP, 4)),
         1 => Ok((I::S_ENDPGM, 4)),
@@ -194,7 +194,7 @@ fn decode_sopp_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_vop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_vop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0 => Ok((I::V_NOP, 4)),
         1 => Ok((I::V_MOV_B32, 4)),
@@ -276,7 +276,7 @@ fn decode_vop1_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_vop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_vop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0 => Ok((I::V_CNDMASK_B32, 4)),
         1 => Ok((I::V_ADD_F32, 4)),
@@ -301,7 +301,7 @@ fn decode_vop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
         20 => Ok((I::V_OR_B32, 4)),
         21 => Ok((I::V_XOR_B32, 4)),
         22 => Ok((I::V_MAC_F32, 4)),
-        23 => Ok((I::V_MADMK_F32, 4)),
+        23 => Ok((I::V_MADMK_F32, 8)),
         24 => Ok((I::V_MADAK_F32, 8)),
         25 => Ok((I::V_ADD_U32, 4)),
         26 => Ok((I::V_SUB_U32, 4)),
@@ -314,8 +314,8 @@ fn decode_vop2_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
         33 => Ok((I::V_SUBREV_F16, 4)),
         34 => Ok((I::V_MUL_F16, 4)),
         35 => Ok((I::V_MAC_F16, 4)),
-        36 => Ok((I::V_MADMK_F16, 4)),
-        37 => Ok((I::V_MADAK_F16, 4)),
+        36 => Ok((I::V_MADMK_F16, 8)),
+        37 => Ok((I::V_MADAK_F16, 8)),
         38 => Ok((I::V_ADD_U16, 4)),
         39 => Ok((I::V_SUB_U16, 4)),
         40 => Ok((I::V_SUBREV_U16, 4)),
@@ -370,7 +370,7 @@ fn decode_op8(opcode: u32) -> Option<OP8> {
     }
 }
 
-fn decode_vopc_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_vopc_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0x10 => Ok((I::V_CMP_CLASS_F32, 4)),
         0x11 => Ok((I::V_CMPX_CLASS_F32, 4)),
@@ -400,7 +400,7 @@ fn decode_vopc_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_vop3a_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_vop3a_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0..=255 => {
             let (op, _) = decode_vopc_opcode_gcn3(opcode)?;
@@ -533,7 +533,7 @@ fn decode_vop3b_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_smem_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_smem_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0 => Ok((I::S_LOAD_DWORD, 8)),
         1 => Ok((I::S_LOAD_DWORDX2, 8)),
@@ -563,7 +563,7 @@ fn decode_smem_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_flat_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_flat_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         16 => Ok((I::FLAT_LOAD_UBYTE, 8)),
         17 => Ok((I::FLAT_LOAD_SBYTE, 8)),
@@ -583,7 +583,7 @@ fn decode_flat_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
         65 => Ok((I::FLAT_ATOMIC_CMPSWAP, 8)),
         66 => Ok((I::FLAT_ATOMIC_ADD, 8)),
         67 => Ok((I::FLAT_ATOMIC_SUB, 8)),
-        53 => Ok((I::FLAT_ATOMIC_SMIN, 8)),
+        68 => Ok((I::FLAT_ATOMIC_SMIN, 8)),
         69 => Ok((I::FLAT_ATOMIC_UMIN, 8)),
         70 => Ok((I::FLAT_ATOMIC_SMAX, 8)),
         71 => Ok((I::FLAT_ATOMIC_UMAX, 8)),
@@ -609,7 +609,7 @@ fn decode_flat_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_mubuf_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_mubuf_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0 => Ok((I::BUFFER_LOAD_FORMAT_X, 8)),
         1 => Ok((I::BUFFER_LOAD_FORMAT_XY, 8)),
@@ -648,7 +648,7 @@ fn decode_mubuf_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     }
 }
 
-fn decode_ds_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
+pub(crate) fn decode_ds_opcode_gcn3(opcode: u32) -> Result<(I, usize), ()> {
     match opcode {
         0 => Ok((I::DS_ADD_U32, 8)),
         1 => Ok((I::DS_SUB_U32, 8)),

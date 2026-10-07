@@ -6,16 +6,15 @@ mod scheduler;
 mod wmma;
 mod yields;
 
-pub use dispatch::{EntryLayout, GridDims, WORKGROUP_ID_X, WORKGROUP_ID_YZ};
+pub use dispatch::{EntryLayout, GridDims};
+#[cfg(test)]
+pub use dispatch::{Field, WORKGROUP_ID_X};
 pub use fiber::yield_address;
 pub use kernel::{Kernel, Region, Scheduler};
 pub use wmma::warm_wmma;
 
-use crate::processor::KernelDescriptor;
-
 pub fn dispatch(
     kernel: &Kernel,
-    kd: &KernelDescriptor,
     kernarg_ptr: u64,
     aql_packet_addr: u64,
     dims: GridDims,
@@ -25,7 +24,6 @@ pub fn dispatch(
 ) {
     scheduler::run(
         scheduler::View::of(kernel),
-        kd,
         kernarg_ptr,
         aql_packet_addr,
         dims,

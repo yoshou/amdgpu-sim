@@ -92,7 +92,11 @@ struct Flagged {
 }
 
 fn flagged() -> Flagged {
-    let (mut b, k) = Build::kernel();
+    flagged_in(32)
+}
+
+fn flagged_in(lanes: u32) -> Flagged {
+    let (mut b, k, _) = Build::kernel_in(&[], lanes);
     let e = BlockId(0);
     let buf = k.buffer(&mut b, e, 0);
     let flags = k.buffer(&mut b, e, 8);
@@ -203,7 +207,7 @@ fn prove_keeps_a_query_that_masks_a_store() {
 fn prove_keeps_a_ballot_whose_lane_test_masks_a_store() {
     let Flagged { mut b, k, buf, lane, c, .. } = flagged();
     let e = BlockId(0);
-    let w = b.wave(e, WaveOp::Ballot, vec![c]);
+    let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
     let zero = b.constant(e, Ty::I32, 0);
     let any = b.cmp(e, IntPred::Ne, w, zero);
     let mask = b.int(e, IntOp::And, any, k.exec);
@@ -834,7 +838,7 @@ fn flag_between(b: &mut Build, e: BlockId, k: &Kernel) -> (ValueId, ValueId, Val
 fn prove_needs_no_meeting_across_a_ballot_whose_whole_word_is_stored() {
     let (program, s1, s2) = with_between(|b, e, k| {
         let (_, c, slot) = flag_between(b, e, k);
-        let w = b.wave(e, WaveOp::Ballot, vec![c]);
+        let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
         b.store(e, Space::Global, MemSize::B32, slot, w, k.exec);
     });
     let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
@@ -845,7 +849,7 @@ fn prove_needs_no_meeting_across_a_ballot_whose_whole_word_is_stored() {
 fn prove_orders_two_stores_across_a_ballot_whose_own_bit_alone_is_used() {
     let (program, s1, s2) = with_between(|b, e, k| {
         let (_, c, slot) = flag_between(b, e, k);
-        let w = b.wave(e, WaveOp::Ballot, vec![c]);
+        let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
         let shifted = b.int(e, IntOp::LShr, w, lane);
         let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
@@ -1684,7 +1688,7 @@ fn constants_over_a_ballot(low: u64) -> Build {
     let zero = b.constant(e, Ty::I32, 0);
     let pick = b.cmp(e, IntPred::Ne, flag, zero);
     let pick = b.int(e, IntOp::And, pick, k.exec);
-    let word = b.wave(e, WaveOp::Ballot, vec![pick]);
+    let word = b.wave(e, WaveOp::Ballot { high: false }, vec![pick]);
     let low = b.constant(e, Ty::I32, low);
     let two = b.constant(e, Ty::I32, 2);
     let inner = b.int(e, IntOp::And, word, low);
@@ -2582,7 +2586,7 @@ fn word_test_into_a_query(uniform: bool) -> Build {
     let zero = b.constant(e, Ty::I32, 0);
     let set = b.cmp(e, IntPred::Ne, flag, zero);
     let c = b.int(e, IntOp::And, set, k.exec);
-    let w = if uniform { uniform_load(&mut b, &k, e, 16) } else { b.wave(e, WaveOp::Ballot, vec![c]) };
+    let w = if uniform { uniform_load(&mut b, &k, e, 16) } else { b.wave(e, WaveOp::Ballot { high: false }, vec![c]) };
     let t = b.cmp(e, IntPred::Ne, w, zero);
     let buf = k.buffer(&mut b, e, 0);
     let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
@@ -2949,7 +2953,7 @@ fn ballot_count(masked: bool) -> (Build, u64) {
     let low = b.cmp(e, IntPred::Ult, lane, five);
     let x = if masked { b.int(e, IntOp::And, low, k.exec) } else { low };
     let at = b.here(e);
-    let w = b.wave(e, WaveOp::Ballot, vec![x]);
+    let w = b.wave(e, WaveOp::Ballot { high: false }, vec![x]);
     let count = b.core(e, Ty::I32, Op::PopulationCount(w));
     store_own(&mut b, &k, e, count, k.exec);
     let Inst::Effect { provenance, .. } = b.f.blocks[&e].insts[at.1] else { unreachable!() };
@@ -2983,8 +2987,8 @@ fn prove_keeps_a_query_that_picks_which_whole_word_a_count_reads() {
     let four = b.constant(e, Ty::I32, 4);
     let low = b.cmp(e, IntPred::Ult, lane, four);
     let low = b.int(e, IntOp::And, low, k.exec);
-    let w1 = b.wave(e, WaveOp::Ballot, vec![low]);
-    let w2 = b.wave(e, WaveOp::Ballot, vec![k.exec]);
+    let w1 = b.wave(e, WaveOp::Ballot { high: false }, vec![low]);
+    let w2 = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
     let w = b.core(e, Ty::I32, Op::Select(q, w1, w2));
     let count = b.core(e, Ty::I32, Op::PopulationCount(w));
     store_own(&mut b, &k, e, count, k.exec);
@@ -3112,7 +3116,7 @@ fn prove_converts_a_query_that_masks_only_lanes_that_hold_the_bit() {
 fn prove_converts_a_ballot_whose_lane_test_only_lanes_that_hold_the_bit_use() {
     let Flagged { mut b, buf, lane, c, .. } = flagged();
     let e = BlockId(0);
-    let w = b.wave(e, WaveOp::Ballot, vec![c]);
+    let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
     let zero = b.constant(e, Ty::I32, 0);
     let any = b.cmp(e, IntPred::Ne, w, zero);
     let mask = b.int(e, IntOp::And, any, c);
@@ -3120,6 +3124,77 @@ fn prove_converts_a_ballot_whose_lane_test_only_lanes_that_hold_the_bit_use() {
     let one = b.constant(e, Ty::I32, 1);
     b.store(e, Space::Global, MemSize::B32, own, one, mask);
     assert!(converted(&b).is_empty(), "{:?}: (ballot(c) != 0) & c is c in both programs", converted(&b));
+}
+
+fn ballot_pair(b: &mut Build, e: BlockId, c: ValueId) -> (ValueId, ValueId, ValueId) {
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let high = b.wave(e, WaveOp::Ballot { high: true }, vec![c]);
+    (low, high, b.core(e, Ty::I64, Op::Pack64(low, high)))
+}
+
+#[test]
+fn prove_converts_a_pair_of_ballot_halves_whose_lane_test_only_lanes_that_hold_the_bit_use() {
+    let Flagged { mut b, buf, lane, c, .. } = flagged_in(64);
+    let e = BlockId(0);
+    let (_, _, pair) = ballot_pair(&mut b, e, c);
+    let zero = b.constant(e, Ty::I64, 0);
+    let any = b.cmp(e, IntPred::Ne, pair, zero);
+    let mask = b.int(e, IntOp::And, any, c);
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let one = b.constant(e, Ty::I32, 1);
+    b.store(e, Space::Global, MemSize::B32, own, one, mask);
+    assert!(converted(&b).is_empty(), "{:?}: (pair(c) != 0) & c is c in both programs", converted(&b));
+}
+
+#[test]
+fn prove_keeps_a_pair_of_ballot_halves_whose_lane_test_masks_a_store() {
+    let Flagged { mut b, k, buf, lane, c } = flagged_in(64);
+    let e = BlockId(0);
+    let (_, _, pair) = ballot_pair(&mut b, e, c);
+    let zero = b.constant(e, Ty::I64, 0);
+    let any = b.cmp(e, IntPred::Ne, pair, zero);
+    let mask = b.int(e, IntOp::And, any, k.exec);
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let one = b.constant(e, Ty::I32, 1);
+    b.store(e, Space::Global, MemSize::B32, own, one, mask);
+    let wrong: Vec<&str> = ["search", "direct"]
+        .iter()
+        .zip(both(&b))
+        .filter(|(_, kept)| !kept.words.contains(&pair))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(wrong.is_empty(), "{:?}: a lane without the flag reads its own bit of the pair as zero", wrong);
+}
+
+#[test]
+fn prove_keeps_a_low_ballot_whose_lane_test_also_masks_the_upper_lanes() {
+    let Flagged { mut b, buf, lane, c, .. } = flagged_in(64);
+    let e = BlockId(0);
+    let (low, _, _) = ballot_pair(&mut b, e, c);
+    let zero = b.constant(e, Ty::I32, 0);
+    let any = b.cmp(e, IntPred::Ne, low, zero);
+    let mask = b.int(e, IntOp::And, any, c);
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let one = b.constant(e, Ty::I32, 1);
+    b.store(e, Space::Global, MemSize::B32, own, one, mask);
+    for (name, kept) in ["search", "direct"].iter().zip(both(&b)) {
+        let facts = Facts::new(&b.f, &b.inputs, &kept.words);
+        assert!(facts.materialized[low.0], "{}: an upper lane with the flag stores only if a lower lane has it", name);
+    }
+}
+
+#[test]
+fn prove_converts_a_projected_pair_of_ballot_halves_as_each_lane_s_own_bit() {
+    let Flagged { mut b, buf, lane, c, .. } = flagged_in(64);
+    let e = BlockId(0);
+    let (_, _, pair) = ballot_pair(&mut b, e, c);
+    let wide_lane = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let shifted = b.int(e, IntOp::LShr, pair, wide_lane);
+    let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let one = b.constant(e, Ty::I32, 1);
+    b.store(e, Space::Global, MemSize::B32, own, one, bit);
+    assert!(converted(&b).is_empty(), "{:?}: each lane's bit of the pair is its own flag", converted(&b));
 }
 
 #[test]
@@ -3135,8 +3210,8 @@ fn prove_converts_a_query_whose_whole_word_only_lanes_that_hold_the_bit_count() 
     let four = b.constant(e, Ty::I32, 4);
     let low = b.cmp(e, IntPred::Ult, lane, four);
     let low = b.int(e, IntOp::And, low, k.exec);
-    let w1 = b.wave(e, WaveOp::Ballot, vec![low]);
-    let w2 = b.wave(e, WaveOp::Ballot, vec![k.exec]);
+    let w1 = b.wave(e, WaveOp::Ballot { high: false }, vec![low]);
+    let w2 = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
     let w = b.core(e, Ty::I32, Op::Select(q, w1, w2));
     let count = b.core(e, Ty::I32, Op::PopulationCount(w));
     store_own(&mut b, &k, e, count, c);
@@ -4455,7 +4530,7 @@ fn program() -> Program {
     let v = b.load(e, Space::Global, MemSize::B32, table, yes);
     cases.push(Case { name: "unmasked load of a fixed word", value: v, truth: Box::new(|_, _| Bdd::FALSE) });
     let masked = b.int(e, IntOp::And, q, k.exec);
-    let w = b.wave(e, WaveOp::Ballot, vec![masked]);
+    let w = b.wave(e, WaveOp::Ballot { high: false }, vec![masked]);
     let v = b.core(e, Ty::I32, Op::PopulationCount(w));
     cases.push(Case { name: "popcount(ballot(q & exec))", value: v, truth: Box::new(move |_, bit| bit(q)) });
     let kept = b.wave(e, WaveOp::Any, vec![masked]);

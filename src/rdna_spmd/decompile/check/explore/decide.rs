@@ -1,13 +1,13 @@
 use super::super::super::logic::{Atom, PATH};
 use super::super::queries::Queries;
-use super::joint::WAVE;
+use super::joint::{COPY, WAVE};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 
 pub(super) struct Decisions {
     assume: Bdd,
-    unreliable: HashMap<u32, bool>,
+    unreliable: HashMap<u32, Bdd>,
     decided: HashMap<(Bdd, Bdd, usize), Option<bool>>,
 }
 
@@ -33,41 +33,47 @@ impl Decisions {
         q.and(assume, leaves) == Bdd::FALSE
     }
 
-    fn is_unreliable<'a, Q: Queries<'a>>(&mut self, q: &mut Q, var: u32) -> bool {
+    fn unreliable<'a, Q: Queries<'a>>(&mut self, q: &mut Q, var: u32) -> Bdd {
         if let Some(&u) = self.unreliable.get(&var) {
             return u;
         }
-        let assume = self.assume;
-        let differs = |q: &mut Q, v: ValueId| {
-            let h = q.h(v);
-            h != Bdd::FALSE && q.and(assume, h) != Bdd::FALSE
+        let differs = |q: &mut Q, values: &[ValueId]| {
+            values.iter().fold(Bdd::FALSE, |u, &v| {
+                let h = q.h(v);
+                q.or(u, h)
+            })
         };
         let u = match q.logic().atom_of(var) {
-            Atom::Bit(v) | Atom::View(v) | Atom::WordBit(v, _) => differs(q, v),
+            Atom::Bit(v) | Atom::View(v) | Atom::WordBit(v, _) => differs(q, &[v]),
             Atom::Cell(block, group, _) => {
                 let leaves: Vec<ValueId> = q.logic().cell_leaves(block, group).to_vec();
-                leaves.iter().any(|&v| differs(q, v))
+                differs(q, &leaves)
             }
             Atom::Some(block, _) => {
                 let sources = q.logic().answer_sources(block);
-                sources.iter().any(|&v| differs(q, v))
+                differs(q, &sources)
             }
-            _ => false,
+            _ => Bdd::FALSE,
         };
+        let u = if q.and(self.assume, u) == Bdd::FALSE { Bdd::FALSE } else { u };
         self.unreliable.insert(var, u);
         u
     }
 
-    fn unknowns<'a, Q: Queries<'a>>(&mut self, q: &mut Q, g: Bdd, side: usize, forms: bool) -> Vec<u32> {
+    fn unknowns<'a, Q: Queries<'a>>(&mut self, q: &mut Q, g: Bdd, side: usize, forms: bool) -> Vec<(u32, Bdd)> {
         let support = q.logic().support(g);
         support
             .iter()
-            .copied()
-            .filter(|&v| match q.logic().atom_of(v) {
-                Atom::Fresh(PATH, ..) => false,
-                Atom::Fresh(..) => true,
-                Atom::Term(..) => forms,
-                _ => side == WAVE && self.is_unreliable(q, v),
+            .filter_map(|&v| {
+                let unknown = match q.logic().atom_of(v) {
+                    Atom::Fresh(PATH, ..) => Bdd::FALSE,
+                    Atom::Fresh(..) => Bdd::TRUE,
+                    Atom::Term(..) if forms => Bdd::TRUE,
+                    Atom::Term(..) => Bdd::FALSE,
+                    _ if side == WAVE => self.unreliable(q, v),
+                    _ => Bdd::FALSE,
+                };
+                (unknown != Bdd::FALSE).then_some((v, unknown))
             })
             .collect()
     }
@@ -81,12 +87,12 @@ impl Decisions {
             return d;
         }
         let unknown = self.unknowns(q, g, side, true);
-        let holds = q.logic().forall(&unknown, g);
+        let holds = quantify(q, &unknown, g, true);
         let d = if q.logic().m.implies(cond, holds) {
             Some(true)
         } else {
             let ng = q.logic().m.not(g);
-            let fails = q.logic().forall(&unknown, ng);
+            let fails = quantify(q, &unknown, ng, true);
             if q.logic().m.implies(cond, fails) {
                 Some(false)
             } else {
@@ -99,8 +105,39 @@ impl Decisions {
 
     pub(super) fn weaken<'a, Q: Queries<'a>>(&mut self, q: &mut Q, g: Bdd, side: usize) -> Bdd {
         let unknown = self.unknowns(q, g, side, false);
-        q.logic().exists(&unknown, g)
+        quantify(q, &unknown, g, false)
     }
+}
+
+fn quantify<'a, Q: Queries<'a>>(q: &mut Q, unknown: &[(u32, Bdd)], g: Bdd, all: bool) -> Bdd {
+    let over = |q: &mut Q, vars: &[u32], g: Bdd| {
+        if all {
+            q.logic().forall(vars, g)
+        } else {
+            q.logic().exists(vars, g)
+        }
+    };
+    let rename = |q: &mut Q, g: Bdd, from: u32, to: u32| {
+        let (high, low) = (q.logic().m.cofactor(g, from, true), q.logic().m.cofactor(g, from, false));
+        let to = q.logic().m.var(to);
+        q.logic().m.ite(to, high, low)
+    };
+    let everywhere: Vec<u32> = unknown.iter().filter(|&&(_, c)| c == Bdd::TRUE).map(|&(v, _)| v).collect();
+    let mut copies = Vec::new();
+    let mut g = g;
+    for &(v, condition) in unknown.iter().filter(|&&(_, c)| c != Bdd::TRUE) {
+        let copy = q.logic().atom(Atom::Fresh(COPY, ValueId(v as usize), 0));
+        let copy = q.logic().m.decompose(copy).expect("a variable").0;
+        g = rename(q, g, v, copy);
+        copies.push((v, copy, condition));
+    }
+    g = over(q, &everywhere, g);
+    for (v, copy, condition) in copies {
+        let quantified = over(q, &[copy], g);
+        let kept = rename(q, g, copy, v);
+        g = q.logic().m.ite(condition, quantified, kept);
+    }
+    g
 }
 
 #[cfg(test)]
@@ -111,7 +148,7 @@ mod tests {
     use super::super::super::differences::Differences;
     use super::super::super::program::Program;
     use super::super::super::Mode;
-    use super::super::joint::{JOINT, LANE, PATHS};
+    use super::super::joint::{COPY, JOINT, LANE, PATHS, WAVE};
     use super::*;
     use crate::rdna_spmd::analysis::facts::Facts;
     use crate::rdna_spmd::analysis::loops::Loops;
@@ -186,5 +223,85 @@ mod tests {
             }
             assert!(wrong.is_empty(), "decide and weaken must quantify the unknowns and keep the paths: {:?}", &wrong[..wrong.len().min(8)]);
         });
+    }
+
+    #[test]
+    fn the_wave_side_leaves_an_atom_unknown_exactly_where_its_value_differs() {
+        let mut wrong = Vec::new();
+        let mut r = Random::new(71);
+        for trial in 0..300 {
+            with_differences(|q| {
+                let context = [Atom::Lane(0), Atom::Lane(1), Atom::Fresh(PATH, ValueId(0), PATHS)];
+                let differing = [Atom::Bit(ValueId(0)), Atom::View(ValueId(1)), Atom::View(ValueId(2))];
+                let unknown = Atom::Fresh(LANE, ValueId(1001), 0);
+                let world: Vec<Atom> = context.iter().chain(&differing).copied().collect();
+                let mut h = Vec::new();
+                for &atom in &differing {
+                    let pool: Vec<Atom> = if trial % 3 == 0 {
+                        context.to_vec()
+                    } else {
+                        world.iter().copied().filter(|&a| a != atom).collect()
+                    };
+                    let condition = random_function(q.logic(), &mut r, &pool, 3);
+                    let v = match atom {
+                        Atom::Bit(v) | Atom::View(v) => v,
+                        _ => unreachable!(),
+                    };
+                    q.raise_h(v, condition);
+                    h.push((variable(q.logic(), atom), condition));
+                }
+                let world_vars: Vec<u32> = world.iter().map(|&a| variable(q.logic(), a)).collect();
+                let unknown_var = variable(q.logic(), unknown);
+                let all: Vec<Atom> = world.iter().copied().chain([unknown]).collect();
+                let g = random_function(q.logic(), &mut r, &all, 5);
+                let cond = random_function(q.logic(), &mut r, &world, 3);
+                if cond == Bdd::FALSE {
+                    return;
+                }
+                let mut decisions = Decisions::new(Bdd::TRUE);
+                let (mut every, mut none) = (true, true);
+                let mut weak_rows = Vec::new();
+                for row in 0..1u32 << world_vars.len() {
+                    let lane_side = |var: u32| world_vars.iter().position(|&v| v == var).is_some_and(|i| row >> i & 1 == 1);
+                    let free: Vec<u32> = h
+                        .iter()
+                        .filter(|&&(_, c)| evaluate(&q.logic.m, c, &lane_side))
+                        .map(|&(v, _)| v)
+                        .chain([unknown_var])
+                        .collect();
+                    let mut some = false;
+                    for hidden in 0..1u32 << free.len() {
+                        let wave_side = |var: u32| match free.iter().position(|&v| v == var) {
+                            Some(i) => hidden >> i & 1 == 1,
+                            None => lane_side(var),
+                        };
+                        let holds = evaluate(&q.logic.m, g, &wave_side);
+                        some |= holds;
+                        if evaluate(&q.logic.m, cond, &lane_side) {
+                            every &= holds;
+                            none &= !holds;
+                        }
+                    }
+                    weak_rows.push(some);
+                }
+                let expected = if every { Some(true) } else if none { Some(false) } else { None };
+                let decided = decisions.decide(q, g, cond, WAVE);
+                if decided != expected {
+                    wrong.push(format!("trial {} decides {:?}, expected {:?}", trial, decided, expected));
+                }
+                let weak = decisions.weaken(q, g, WAVE);
+                for (row, &some) in weak_rows.iter().enumerate() {
+                    let lane_side = |var: u32| world_vars.iter().position(|&v| v == var).is_some_and(|i| row >> i & 1 == 1);
+                    if evaluate(&q.logic.m, weak, &lane_side) != some {
+                        wrong.push(format!("trial {} weakens to {} at {}, expected {}", trial, !some, row, some));
+                    }
+                }
+                let leftover: Vec<Atom> = q.logic().support(weak).iter().map(|&v| q.logic().atom_of(v)).filter(|a| matches!(a, Atom::Fresh(COPY, ..))).collect();
+                if !leftover.is_empty() {
+                    wrong.push(format!("trial {} leaves copies {:?}", trial, leftover));
+                }
+            });
+        }
+        assert!(wrong.is_empty(), "the wave side must quantify an atom only where it differs: {:?}", &wrong[..wrong.len().min(8)]);
     }
 }

@@ -195,8 +195,8 @@ fn sources(f: &Func, facts: &Facts, v: ValueId) -> Vec<ValueId> {
             facts.arguments(f, block, index).collect()
         }
         Site::Inst { .. } => match facts.op(f, v) {
-            Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) => vec![a, b],
-            Some(Op::Convert(_, _, a)) => vec![a],
+            Some(Op::Int(_, a, b)) | Some(Op::Select(_, a, b)) | Some(Op::Pack64(a, b)) => vec![a, b],
+            Some(Op::Convert(_, _, a)) | Some(Op::UnpackLo(a)) | Some(Op::UnpackHi(a)) => vec![a],
             _ => vec![],
         },
         _ => vec![],
@@ -214,7 +214,7 @@ pub fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
             if let Inst::Effect { op, inputs, .. } = inst {
                 if !matches!(
                     op,
-                    EffectOp::Wave(WaveOp::Any | WaveOp::Ballot | WaveOp::ReadFirstLane)
+                    EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane)
                 ) {
                     pending.extend(inputs);
                 }

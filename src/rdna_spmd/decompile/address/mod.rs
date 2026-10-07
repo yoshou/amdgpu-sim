@@ -24,7 +24,7 @@ mod origins;
 #[cfg(test)]
 mod tests;
 
-pub use form::{aligns, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide, LANES};
+pub use form::{aligns, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide};
 pub use graph::{Copies, PRIVATE_MEMORY};
 pub use limits::{compare, condition, literals, Classes};
 
@@ -86,6 +86,10 @@ impl<'a> Addresses<'a> {
 
     pub fn valid(&self, lane: usize) -> bool {
         self.values.symbols().valid(lane)
+    }
+
+    pub fn lanes(&self) -> usize {
+        self.values.program().lanes()
     }
 
     pub fn bounds(&self, form: &Form) -> Option<(u64, u64)> {

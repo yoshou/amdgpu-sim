@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 pub(super) const WAVE: usize = 0;
 pub(super) const LANE: usize = 1;
 pub(super) const JOINT: usize = 2;
+pub(super) const COPY: usize = 4;
 pub(super) const PATHS: u32 = 1 << 15;
 
 #[derive(Clone, Copy, PartialEq, Eq)]

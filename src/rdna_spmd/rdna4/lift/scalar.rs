@@ -27,9 +27,6 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
         | I::S_LSHL_B64
         | I::S_LSHR_B64
         | I::S_ASHR_I64
-        | I::S_AND_B64
-        | I::S_OR_B64
-        | I::S_XOR_B64
         | I::S_CSELECT_B64 => Ty::I64,
         _ => return None,
     };
@@ -106,17 +103,6 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
         I::S_MUL_I32 | I::S_MUL_U64 => b.push(ty, Op::Int(IntOp::Mul, a, c)),
         I::S_ADD_NC_U64 => b.push(Ty::I64, Op::Int(IntOp::Add, a, c)),
         I::S_CSELECT_B32 | I::S_CSELECT_B64 => b.push(ty, Op::Select(ValueId(2), a, c)),
-        I::S_AND_B64 | I::S_OR_B64 | I::S_XOR_B64 => {
-            let op = match i.op {
-                I::S_AND_B64 => IntOp::And,
-                I::S_OR_B64 => IntOp::Or,
-                _ => IntOp::Xor,
-            };
-            let value = b.push(ty, Op::Int(op, a, c));
-            let zero = b.k(ty, 0);
-            flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero)));
-            value
-        }
         I::S_LSHL_B32
         | I::S_LSHR_B32
         | I::S_ASHR_I32
@@ -233,6 +219,7 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         I::S_MOV_B32 => (Ty::I32, Ty::I32, None),
         I::S_MOV_B64 => (Ty::I64, Ty::I64, None),
         I::S_CTZ_I32_B32 | I::S_SEXT_I32_I16 | I::S_BREV_B32 => (Ty::I32, Ty::I32, None),
+        I::S_CTZ_I32_B64 => (Ty::I64, Ty::I32, None),
         I::S_BREV_B64 => (Ty::I64, Ty::I64, None),
         I::S_CVT_F32_I32 => (Ty::I32, Ty::F32, Some(Cvt::SignedToFloatRte)),
         I::S_CVT_F32_U32 => (Ty::I32, Ty::F32, Some(Cvt::UnsignedToFloatRte)),
@@ -253,9 +240,14 @@ fn unary(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         b.int(IntOp::AShr, high, shift)
     } else if matches!(i.op, I::S_BREV_B32 | I::S_BREV_B64) {
         b.push(to, Op::ReverseBits(ValueId(0)))
-    } else if matches!(i.op, I::S_CTZ_I32_B32) {
-        let count = b.push(Ty::I32, Op::TrailingZeros(ValueId(0)));
-        let zero = b.k(Ty::I32, 0);
+    } else if matches!(i.op, I::S_CTZ_I32_B32 | I::S_CTZ_I32_B64) {
+        let count = b.push(from, Op::TrailingZeros(ValueId(0)));
+        let count = if from == Ty::I64 {
+            b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, count))
+        } else {
+            count
+        };
+        let zero = b.k(from, 0);
         let empty = b.push(Ty::I1, Op::Cmp(IntPred::Eq, ValueId(0), zero));
         let missing = b.k(Ty::I32, u32::MAX as u64);
         b.push(Ty::I32, Op::Select(empty, missing, count))
@@ -438,36 +430,125 @@ fn float(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, ty), result)]))
 }
 
+#[derive(Clone, Copy)]
+enum Logic {
+    And,
+    Or,
+    Xor,
+    Nand,
+    Nor,
+    Xnor,
+    AndNot0,
+    OrNot0,
+    AndNot1,
+    OrNot1,
+}
+
+fn logic(b: &mut Builder, ty: Ty, op: Logic, a: ValueId, c: ValueId) -> ValueId {
+    let all = b.k(ty, if ty == Ty::I64 { u64::MAX } else { u32::MAX as u64 });
+    let not = |b: &mut Builder, x: ValueId| b.push(ty, Op::Int(IntOp::Xor, x, all));
+    let (a, c, k, invert) = match op {
+        Logic::And => (a, c, IntOp::And, false),
+        Logic::Or => (a, c, IntOp::Or, false),
+        Logic::Xor => (a, c, IntOp::Xor, false),
+        Logic::Nand => (a, c, IntOp::And, true),
+        Logic::Nor => (a, c, IntOp::Or, true),
+        Logic::Xnor => (a, c, IntOp::Xor, true),
+        Logic::AndNot0 => (not(b, a), c, IntOp::And, false),
+        Logic::OrNot0 => (not(b, a), c, IntOp::Or, false),
+        Logic::AndNot1 => (a, not(b, c), IntOp::And, false),
+        Logic::OrNot1 => (a, not(b, c), IntOp::Or, false),
+    };
+    let value = b.push(ty, Op::Int(k, a, c));
+    if invert {
+        not(b, value)
+    } else {
+        value
+    }
+}
+
+fn saveexec(op: I) -> Option<(Logic, Ty, bool)> {
+    use Logic::*;
+    Some(match op {
+        I::S_AND_SAVEEXEC_B32 => (And, Ty::I32, false),
+        I::S_OR_SAVEEXEC_B32 => (Or, Ty::I32, false),
+        I::S_XOR_SAVEEXEC_B32 => (Xor, Ty::I32, false),
+        I::S_NAND_SAVEEXEC_B32 => (Nand, Ty::I32, false),
+        I::S_NOR_SAVEEXEC_B32 => (Nor, Ty::I32, false),
+        I::S_XNOR_SAVEEXEC_B32 => (Xnor, Ty::I32, false),
+        I::S_AND_NOT0_SAVEEXEC_B32 => (AndNot0, Ty::I32, false),
+        I::S_OR_NOT0_SAVEEXEC_B32 => (OrNot0, Ty::I32, false),
+        I::S_AND_NOT1_SAVEEXEC_B32 => (AndNot1, Ty::I32, false),
+        I::S_OR_NOT1_SAVEEXEC_B32 => (OrNot1, Ty::I32, false),
+        I::S_AND_NOT0_WREXEC_B32 => (AndNot0, Ty::I32, true),
+        I::S_AND_NOT1_WREXEC_B32 => (AndNot1, Ty::I32, true),
+        I::S_AND_SAVEEXEC_B64 => (And, Ty::I64, false),
+        I::S_OR_SAVEEXEC_B64 => (Or, Ty::I64, false),
+        I::S_XOR_SAVEEXEC_B64 => (Xor, Ty::I64, false),
+        I::S_NAND_SAVEEXEC_B64 => (Nand, Ty::I64, false),
+        I::S_NOR_SAVEEXEC_B64 => (Nor, Ty::I64, false),
+        I::S_XNOR_SAVEEXEC_B64 => (Xnor, Ty::I64, false),
+        I::S_AND_NOT0_SAVEEXEC_B64 => (AndNot0, Ty::I64, false),
+        I::S_OR_NOT0_SAVEEXEC_B64 => (OrNot0, Ty::I64, false),
+        I::S_AND_NOT1_SAVEEXEC_B64 => (AndNot1, Ty::I64, false),
+        I::S_OR_NOT1_SAVEEXEC_B64 => (OrNot1, Ty::I64, false),
+        I::S_AND_NOT0_WREXEC_B64 => (AndNot0, Ty::I64, true),
+        I::S_AND_NOT1_WREXEC_B64 => (AndNot1, Ty::I64, true),
+        _ => return None,
+    })
+}
+
+fn binary_logic(op: I) -> Option<(Logic, Ty)> {
+    use Logic::*;
+    Some(match op {
+        I::S_AND_B32 => (And, Ty::I32),
+        I::S_OR_B32 => (Or, Ty::I32),
+        I::S_XOR_B32 => (Xor, Ty::I32),
+        I::S_NAND_B32 => (Nand, Ty::I32),
+        I::S_NOR_B32 => (Nor, Ty::I32),
+        I::S_XNOR_B32 => (Xnor, Ty::I32),
+        I::S_AND_NOT1_B32 => (AndNot1, Ty::I32),
+        I::S_OR_NOT1_B32 => (OrNot1, Ty::I32),
+        I::S_AND_B64 => (And, Ty::I64),
+        I::S_OR_B64 => (Or, Ty::I64),
+        I::S_XOR_B64 => (Xor, Ty::I64),
+        I::S_NAND_B64 => (Nand, Ty::I64),
+        I::S_NOR_B64 => (Nor, Ty::I64),
+        I::S_XNOR_B64 => (Xnor, Ty::I64),
+        I::S_AND_NOT1_B64 => (AndNot1, Ty::I64),
+        I::S_OR_NOT1_B64 => (OrNot1, Ty::I64),
+        _ => return None,
+    })
+}
+
 fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     if let InstFormat::SOP1(i) = inst {
-        let op = match i.op {
-            I::S_AND_SAVEEXEC_B32 | I::S_AND_NOT1_SAVEEXEC_B32 => IntOp::And,
-            I::S_OR_SAVEEXEC_B32 => IntOp::Or,
-            I::S_XOR_SAVEEXEC_B32 => IntOp::Xor,
-            _ => return None,
-        };
+        if matches!(i.op, I::S_NOT_B32 | I::S_NOT_B64) {
+            let ty = if matches!(i.op, I::S_NOT_B64) { Ty::I64 } else { Ty::I32 };
+            let mut b = Builder::new(registry, vec![input(i.ssrc0, ty)]);
+            let all = b.k(ty, if ty == Ty::I64 { u64::MAX } else { u32::MAX as u64 });
+            let value = b.push(ty, Op::Int(IntOp::Xor, ValueId(0), all));
+            let zero = b.k(ty, 0);
+            let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero));
+            return Some(b.finish_many(true, vec![(Output::Scalar(i.sdst as u32, ty), value), (Output::Scc, flag)]));
+        }
+        let (op, ty, written) = saveexec(i.op)?;
         let mut b = Builder::new(
             registry,
             vec![
-                input(i.ssrc0, Ty::I32),
-                input(SourceOperand::ScalarRegister(126), Ty::I32),
+                input(i.ssrc0, ty),
+                input(SourceOperand::ScalarRegister(126), ty),
             ],
         );
         let old = ValueId(1);
-        let rhs = if matches!(i.op, I::S_AND_NOT1_SAVEEXEC_B32) {
-            let all = b.k(Ty::I32, u32::MAX as u64);
-            b.push(Ty::I32, Op::Int(IntOp::Xor, old, all))
-        } else {
-            old
-        };
-        let next = b.push(Ty::I32, Op::Int(op, ValueId(0), rhs));
-        let zero = b.k(Ty::I32, 0);
+        let next = logic(&mut b, ty, op, ValueId(0), old);
+        let zero = b.k(ty, 0);
         let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, next, zero));
         return Some(b.finish_many(
             true,
             vec![
-                (Output::Scalar(i.sdst as u32, Ty::I32), old),
-                (Output::Scalar(126, Ty::I32), next),
+                (Output::Scalar(i.sdst as u32, ty), if written { next } else { old }),
+                (Output::Scalar(126, ty), next),
                 (Output::Scc, flag),
             ],
         ));
@@ -475,29 +556,15 @@ fn masks(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     let InstFormat::SOP2(i) = inst else {
         return None;
     };
-    let op = match i.op {
-        I::S_AND_B32 | I::S_AND_NOT1_B32 => IntOp::And,
-        I::S_OR_B32 | I::S_OR_NOT1_B32 => IntOp::Or,
-        I::S_XOR_B32 => IntOp::Xor,
-        _ => return None,
-    };
-    let mut b = Builder::new(
-        registry,
-        vec![input(i.ssrc0, Ty::I32), input(i.ssrc1, Ty::I32)],
-    );
-    let rhs = if matches!(i.op, I::S_AND_NOT1_B32 | I::S_OR_NOT1_B32) {
-        let all = b.k(Ty::I32, u32::MAX as u64);
-        b.int(IntOp::Xor, ValueId(1), all)
-    } else {
-        ValueId(1)
-    };
-    let value = b.int(op, ValueId(0), rhs);
-    let zero = b.k(Ty::I32, 0);
+    let (op, ty) = binary_logic(i.op)?;
+    let mut b = Builder::new(registry, vec![input(i.ssrc0, ty), input(i.ssrc1, ty)]);
+    let value = logic(&mut b, ty, op, ValueId(0), ValueId(1));
+    let zero = b.k(ty, 0);
     let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero));
     Some(b.finish_many(
         true,
         vec![
-            (Output::Scalar(i.sdst as u32, Ty::I32), value),
+            (Output::Scalar(i.sdst as u32, ty), value),
             (Output::Scc, flag),
         ],
     ))

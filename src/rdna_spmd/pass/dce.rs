@@ -82,7 +82,7 @@ fn run(f: &mut Func) -> usize {
                     ..
                 } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
                 Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot),
+                    op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. }),
                     outputs,
                     ..
                 } => outputs.iter().any(|(v, _)| uses[v.0] != 0),
@@ -117,7 +117,7 @@ fn live_values(f: &Func) -> Vec<bool> {
         for (index, inst) in block.insts.iter().enumerate() {
             let observed = match inst {
                 Inst::Effect { op, .. } => {
-                    !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot))
+                    !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. }))
                 }
                 Inst::Target { provenance, .. } => provenance.is_some(),
                 _ => false,
@@ -172,7 +172,7 @@ fn dead_params(f: &mut Func) -> usize {
             block.insts.retain(|inst| match inst {
                 Inst::Core { value, .. } | Inst::Packet { output: value, .. } => live[value.0],
                 Inst::Effect { op, outputs, .. } => {
-                    !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot))
+                    !matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. }))
                         || outputs.iter().any(|(v, _)| live[v.0])
                 }
                 Inst::Target {

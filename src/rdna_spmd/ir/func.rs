@@ -119,15 +119,18 @@ pub struct Func {
     pub types: Vec<Ty>,
 
     pub regions: BTreeMap<BlockId, Presence>,
+    pub lanes: u32,
 }
 impl Func {
 
-    pub fn new(entry: BlockId, presence: Presence) -> Self {
+    pub fn new(entry: BlockId, presence: Presence, lanes: u32) -> Self {
+        assert!(matches!(lanes, 32 | 64), "a wave of {} lanes", lanes);
         Self {
             entry,
             blocks: BTreeMap::new(),
             types: Vec::new(),
             regions: BTreeMap::from([(entry, presence)]),
+            lanes,
         }
     }
 

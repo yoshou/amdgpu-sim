@@ -445,7 +445,7 @@ fn effect<'a, Q: Queries<'a>>(
         }
         EffectOp::Wave(WaveOp::ReadFirstLane) => {
             let mut first = Some(0);
-            let lanes: Vec<usize> = (0..LANES).filter(|&l| q.symbols().valid(l)).collect();
+            let lanes: Vec<usize> = (0..q.program().lanes()).filter(|&l| q.symbols().valid(l)).collect();
             for l in lanes {
                 match q.bit(inputs[1], l, None).0 {
                     Some(true) => {
@@ -463,7 +463,8 @@ fn effect<'a, Q: Queries<'a>>(
         }
         EffectOp::Wave(WaveOp::ReadLane) => {
             let (selector, _) = q.value(inputs[1], lane, None);
-            match selector.form.as_constant().map(|k| (k & 31) as usize) {
+            let last = q.program().lanes() as u32 - 1;
+            match selector.form.as_constant().map(|k| (k & last) as usize) {
                 Some(chosen) if !q.symbols().valid(chosen) => unassumed(Value::constant(0)),
                 Some(chosen) => unassumed(uniform_read(q, v, inputs[0], Some(chosen))),
                 None => unassumed(any_lane_read(q, v, inputs[0], inputs[1], lane)),
@@ -471,8 +472,9 @@ fn effect<'a, Q: Queries<'a>>(
         }
         EffectOp::Wave(WaveOp::WriteLane) => {
             let (selector, _) = q.value(inputs[1], lane, None);
+            let last = q.program().lanes() as u32 - 1;
             match selector.form.as_constant() {
-                Some(k) if (k & 31) as usize == lane => {
+                Some(k) if (k & last) as usize == lane => {
                     let at = q.program().block_of(v);
                     unassumed(q.operand(inputs[0], at, lane, None).0)
                 }
@@ -488,7 +490,7 @@ fn effect<'a, Q: Queries<'a>>(
             let Some(byte) = index.form.as_constant() else {
                 return unassumed(q.symbols_mut().opaque(v, lane, None));
             };
-            let source = ((byte >> 2) & 31) as usize;
+            let source = ((byte >> 2) & (q.program().lanes() as u32 - 1)) as usize;
             if !q.symbols().valid(source) {
                 return unassumed(Value::constant(0));
             }
@@ -503,14 +505,15 @@ fn effect<'a, Q: Queries<'a>>(
                 None => unassumed(q.symbols_mut().opaque(v, lane, None)),
             }
         }
-        EffectOp::Wave(WaveOp::Ballot) => {
+        EffectOp::Wave(WaveOp::Ballot { high }) => {
             let mut mask = 0u32;
-            for l in 0..LANES {
+            let first = if high { 32 } else { 0 };
+            for l in first..first + 32 {
                 if !q.symbols().valid(l) {
                     continue;
                 }
                 match q.bit(inputs[0], l, None).0 {
-                    Some(true) => mask |= 1 << l,
+                    Some(true) => mask |= 1 << (l - first),
                     Some(false) => {}
                     None => return unassumed(q.symbols_mut().opaque(v, lane, None)),
                 }
@@ -525,13 +528,13 @@ fn any_lane_read<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, x: ValueId, selector
     let at = q.program().block_of(v);
     let mut agreed: Option<Value> = None;
     let mut differ = false;
-    let lanes: Vec<usize> = (0..LANES).filter(|&l| q.symbols().valid(l)).collect();
+    let lanes: Vec<usize> = (0..q.program().lanes()).filter(|&l| q.symbols().valid(l)).collect();
     for l in lanes {
         let (value, _) = q.operand(x, at, l, None);
         differ |= agreed.as_ref().is_some_and(|a| *a != value);
         agreed = Some(value);
     }
-    if !(0..LANES).all(|l| q.symbols().valid(l)) && agreed.as_ref().is_some_and(|a| a.form.as_constant() != Some(0)) {
+    if !(0..q.program().lanes()).all(|l| q.symbols().valid(l)) && agreed.as_ref().is_some_and(|a| a.form.as_constant() != Some(0)) {
         differ = true;
     }
     match agreed {
@@ -544,7 +547,7 @@ fn any_lane_read<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, x: ValueId, selector
 fn uniform_read<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, x: ValueId, from: Option<usize>) -> Value {
     let lanes: Vec<usize> = match from {
         Some(l) => vec![l],
-        None => (0..LANES).filter(|&l| q.symbols().valid(l)).collect(),
+        None => (0..q.program().lanes()).filter(|&l| q.symbols().valid(l)).collect(),
     };
     let mut agreed: Option<Value> = None;
     let at = q.program().block_of(v);

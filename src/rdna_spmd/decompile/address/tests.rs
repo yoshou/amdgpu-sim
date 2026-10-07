@@ -941,7 +941,7 @@ struct Branches {
 
 fn branches(lanes: u32) -> Branches {
     let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Sgpr(crate::rdna_spmd::engine::WORKGROUP_ID_X), Ty::I32)]);
-    b.entry.workgroup_id_x = true;
+    b.entry.workgroup_ids[0] = Some(crate::rdna_spmd::engine::Field { register: crate::rdna_spmd::engine::WORKGROUP_ID_X, shift: 0 });
     let e = BlockId(0);
     let table = k.buffer(&mut b, e, 8);
     let yes = b.constant(e, Ty::I1, 1);

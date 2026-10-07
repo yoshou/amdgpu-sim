@@ -37,7 +37,7 @@ impl Masks {
     fn settle(&mut self, program: &Program, logic: &mut Logic) {
         let (f, facts) = (program.f, program.facts);
         let n = f.types.len();
-        let word = |v: ValueId| f.types[v.0] == Ty::I32 && facts.lane_word[v.0];
+        let word = |v: ValueId| crate::rdna_spmd::analysis::facts::is_word(f.types[v.0]) && facts.lane_word[v.0];
         let Some(ei) = program.exec_index else {
             self.masked = vec![true; n];
             self.faithful = (0..n).map(|v| word(ValueId(v))).collect();
@@ -78,7 +78,7 @@ impl Masks {
                 for inst in &block.insts {
                     for v in inst.outputs() {
                         let ty = f.types[v.0];
-                        if ty != Ty::I1 && ty != Ty::I32 {
+                        if ty != Ty::I1 && !crate::rdna_spmd::analysis::facts::is_word(ty) {
                             continue;
                         }
                         let formula = if ty == Ty::I1 {
@@ -187,12 +187,14 @@ impl Masks {
             match facts.inst(f, w) {
                 None => self.faithful[w.0].then(|| logic.view(f, facts, w)),
                 Some(Inst::Effect {
-                    op: EffectOp::Wave(WaveOp::Ballot),
+                    op: EffectOp::Wave(WaveOp::Ballot { high }),
                     inputs,
                     ..
                 }) => {
                     let x = logic.bit(f, facts, inputs[0]);
-                    Some(logic.m.and(x, active))
+                    let own = logic.m.and(x, active);
+                    let other = logic.atom(Atom::View(w));
+                    Some(logic.half(*high, own, other))
                 }
                 Some(Inst::Core { op, .. }) => match *op {
                     Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
@@ -220,7 +222,29 @@ impl Masks {
                             _ => None,
                         }
                     }
-                    Op::Convert(Cvt::Bitcast, Ty::I32, a) => self.lockstep_view(program, logic, a, active, memo),
+                    Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a) => self.lockstep_view(program, logic, a, active, memo),
+                    Op::Pack64(a, b) => {
+                        let low = self.lockstep_view(program, logic, a, active, memo);
+                        if f.lanes == 32 {
+                            low
+                        } else {
+                            match (low, self.lockstep_view(program, logic, b, active, memo)) {
+                                (Some(low), Some(high)) => {
+                                    let upper = logic.atom(Atom::Lane(5));
+                                    Some(logic.m.ite(upper, high, low))
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
+                    Op::UnpackLo(a) => self.lockstep_view(program, logic, a, active, memo).map(|own| {
+                        let other = logic.atom(Atom::View(w));
+                        logic.half(false, own, other)
+                    }),
+                    Op::UnpackHi(a) if f.lanes == 64 => self.lockstep_view(program, logic, a, active, memo).map(|own| {
+                        let other = logic.atom(Atom::View(w));
+                        logic.half(true, own, other)
+                    }),
                     _ => Some(logic.view(f, facts, w)),
                 },
                 Some(_) => None,

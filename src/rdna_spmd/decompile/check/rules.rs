@@ -1,5 +1,5 @@
 use super::super::address::compare;
-use super::super::logic::{constant_choices, lane_test, projected_word, Choice};
+use super::super::logic::{constant_choices, lane_test, projected_word, Atom, Choice};
 use super::super::terms::Terms;
 use super::lanes::*;
 use super::queries::Queries;
@@ -98,12 +98,29 @@ fn core<'a, Q: Queries<'a>>(q: &mut Q, inst: &Inst, value: ValueId, ty: Ty, op: 
         {
             Bdd::FALSE
         }
-        Op::Convert(Cvt::Bitcast, Ty::I32, x) if facts.lane_word[value.0] => q.h(x),
+        Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, x) if facts.lane_word[value.0] => q.h(x),
+        Op::Pack64(x, y) if facts.lane_word[value.0] => {
+            let low = q.h(x);
+            if f.lanes == 32 {
+                return low;
+            }
+            let high = q.h(y);
+            let upper = q.logic().atom(Atom::Lane(5));
+            q.logic().m.ite(upper, high, low)
+        }
+        Op::UnpackLo(x) if facts.lane_word[value.0] => {
+            let own = q.h(x);
+            q.logic().half(false, own, Bdd::TRUE)
+        }
+        Op::UnpackHi(x) if facts.lane_word[value.0] => {
+            let own = q.h(x);
+            q.logic().half(true, own, Bdd::TRUE)
+        }
         Op::Convert(Cvt::Trunc, Ty::I1, s) => match projected_word(f, facts, s) {
             Some(w) if facts.lane_word[w.0] => q.h(w),
             _ => q.h(s),
         },
-        Op::Int(IntOp::LShr, w, lane) if facts.lane_word[w.0] && facts.is_lane_id(f, lane) => q.h(w),
+        Op::Int(IntOp::LShr, w, lane) if facts.lane_word[w.0] && facts.is_lane_shift(f, w, lane) => q.h(w),
         Op::Cmp(IntPred::Eq | IntPred::Ne, x, y) if lane_test(f, facts, x, y).is_some() => {
             let w = lane_test(f, facts, x, y).unwrap();
             let mode = q.logic().materialized(facts, w);
@@ -160,7 +177,10 @@ fn wave<'a, Q: Queries<'a>>(
             let gathered = some_lane(q.logic(), facts, hx);
             q.logic().m.ite(local, answered, gathered)
         }
-        WaveOp::Ballot => q.h(inputs[0]),
+        WaveOp::Ballot { high } => {
+            let own = q.h(inputs[0]);
+            q.logic().half(high, own, Bdd::TRUE)
+        }
         WaveOp::ReadFirstLane => {
             let (x, mask) = (inputs[0], inputs[1]);
             if facts.uniform[x.0] {
@@ -185,12 +205,13 @@ fn wave<'a, Q: Queries<'a>>(
             let (x, selector) = (inputs[0], inputs[1]);
             let own = q.whole(selector);
             let hx = q.whole(x);
+            let last = q.logic().lane_count() - 1;
             let read = match (q.logic().lane_function(f, facts, selector), constant_choices(f, facts, selector)) {
-                (Some(sources), _) => read_from(q.logic(), facts, hx, |l| sources[l] & 31),
+                (Some(sources), _) => read_from(q.logic(), facts, hx, |l| sources[l] & last),
                 (None, Some(lanes)) => {
                     let mut any = Bdd::FALSE;
                     for lane in lanes {
-                        let there = at_lane(q.logic(), hx, lane as u32 & 31);
+                        let there = at_lane(q.logic(), hx, lane as u32 & last);
                         let there = some_lane(q.logic(), facts, there);
                         any = q.or(any, there);
                     }
@@ -205,9 +226,10 @@ fn wave<'a, Q: Queries<'a>>(
             let written = at_lane(q.logic(), written, 0);
             let written = some_lane(q.logic(), facts, written);
             let old = any_of(q, &inputs[2..]);
+            let last = q.logic().lane_count() as u64 - 1;
             match facts.constant(f, inputs[1]) {
                 Some(k) => {
-                    let target = q.logic().lanes(|l| l as u64 == k & 31);
+                    let target = q.logic().lanes(|l| l as u64 == k & last);
                     q.logic().m.ite(target, written, old)
                 }
                 None => match q.logic().lane_is(f, facts, b, inputs[1]) {
@@ -218,20 +240,22 @@ fn wave<'a, Q: Queries<'a>>(
         }
         WaveOp::Bpermute | WaveOp::BpermuteFi => {
             let (index, x, mask) = (inputs[0], inputs[1], inputs[2]);
+            let count = q.logic().lane_count();
+            let last = count - 1;
             let read = match q.logic().lane_function(f, facts, index) {
                 Some(indices) => {
                     let hx = q.whole(x);
                     let h = gated(q, op, mask, hx);
-                    read_from(q.logic(), facts, h, |l| (indices[l] >> 2) & 31)
+                    read_from(q.logic(), facts, h, |l| (indices[l] >> 2) & last)
                 }
                 None => match q.logic().lane_bits(f, facts, index) {
-                    Some(bits) if bits.iter().any(|&(m, _)| (m >> 2) & 31 != 0) => {
+                    Some(bits) if bits[..count as usize].iter().any(|&(m, _)| (m >> 2) & last != 0) => {
                         let hx = q.whole(x);
                         let h = gated(q, op, mask, hx);
                         read_from_any(q.logic(), facts, h, |l| {
                             let (m, v) = bits[l];
-                            let (m, v) = ((m >> 2) & 31, (v >> 2) & 31);
-                            (0..32u32).filter(|s| s & m == v & m).fold(0u32, |set, s| set | 1 << s)
+                            let (m, v) = ((m >> 2) & last, (v >> 2) & last);
+                            (0..count).filter(|s| s & m == v & m).fold(0u64, |set, s| set | 1 << s)
                         })
                     }
                     _ if op == WaveOp::Bpermute => masked_read(q, mask, x),
@@ -322,7 +346,7 @@ pub(super) fn word_difference<'a, Q: Queries<'a>>(q: &mut Q, inst: &Inst, value:
     match inst {
         Inst::Effect {
             provenance,
-            op: EffectOp::Wave(WaveOp::Ballot),
+            op: EffectOp::Wave(WaveOp::Ballot { high }),
             inputs,
             ..
         } => {
@@ -331,6 +355,9 @@ pub(super) fn word_difference<'a, Q: Queries<'a>>(q: &mut Q, inst: &Inst, value:
                 q.demand(*provenance, whole);
             }
             let x = q.h(inputs[0]);
+            let high = *high;
+            let half = q.logic().lanes(|l| (l >= 32) == high);
+            let x = q.and(x, half);
             some_lane(q.logic(), facts, x)
         }
         Inst::Core {

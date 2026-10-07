@@ -81,21 +81,23 @@ pub(super) fn compute_high<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, lane: usiz
                     }
                 }
                 Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
-                    let (m, other) = match (q.program().facts.constant(f, a), q.program().facts.constant(f, b)) {
-                        (_, Some(m)) => (m, a),
-                        (Some(m), _) => (m, b),
-                        _ => return None,
+                    let (ha, hb) = (high_operand(q, a, block, lane), high_operand(q, b, block, lane));
+                    let (m, high) = match (ha.as_constant(), hb.as_constant()) {
+                        (Some(x), Some(y)) => {
+                            return Some(Form::constant(match k {
+                                IntOp::And => x & y,
+                                IntOp::Or => x | y,
+                                _ => x ^ y,
+                            }))
+                        }
+                        (Some(m), None) => (m, hb),
+                        (None, Some(m)) => (m, ha),
+                        (None, None) => return None,
                     };
-                    let m = (m >> 32) as u32;
-                    let high = high_operand(q, other, block, lane);
-                    match (k, m, high.as_constant()) {
-                        (_, _, Some(h)) => Some(Form::constant(match k {
-                            IntOp::And => h & m,
-                            IntOp::Or => h | m,
-                            _ => h ^ m,
-                        })),
-                        (IntOp::And, 0, _) => Some(Form::constant(0)),
-                        (IntOp::And, u32::MAX, _) | (IntOp::Or | IntOp::Xor, 0, _) => Some(high),
+                    match (k, m) {
+                        (IntOp::And, 0) => Some(Form::constant(0)),
+                        (IntOp::Or, u32::MAX) => Some(Form::constant(u32::MAX)),
+                        (IntOp::And, u32::MAX) | (IntOp::Or | IntOp::Xor, 0) => Some(high),
                         _ => None,
                     }
                 }

@@ -110,7 +110,7 @@ impl<'a> Program<'a> {
                 let guard = match inst {
                     Inst::Effect { op: EffectOp::Memory { op: MemoryOp::Fence, .. }, .. } => continue,
                     Inst::Effect { op: EffectOp::Memory { op, .. }, inputs, .. } => inputs.get(op.mask_input()).copied(),
-                    Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot), inputs, .. } => Some(inputs[0]),
+                    Inst::Effect { op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. }), inputs, .. } => Some(inputs[0]),
                     Inst::Effect { .. } => None,
                     Inst::Target { op, args, .. } => match registry.operation(*op).map(|spec| spec.effect) {
                         Ok(Effect::Pure) | Err(_) => continue,
@@ -157,6 +157,10 @@ impl<'a> Program<'a> {
             }
         }
         this
+    }
+
+    pub(super) fn lanes(&self) -> usize {
+        self.f.lanes as usize
     }
 
     pub(super) fn block_of(&self, v: ValueId) -> BlockId {
@@ -235,7 +239,7 @@ impl<'a> Program<'a> {
         }
         seen.insert(x, false);
         let known = self.plain_high(x)
-            || matches!(self.facts.op(self.f, x), Some(Op::Int(IntOp::Add | IntOp::Sub, a, b)) if self.summed_high(a, seen) && self.summed_high(b, seen));
+            || matches!(self.facts.op(self.f, x), Some(Op::Int(IntOp::Add | IntOp::Sub | IntOp::And | IntOp::Or | IntOp::Xor, a, b) | Op::Select(_, a, b)) if self.summed_high(a, seen) && self.summed_high(b, seen));
         seen.insert(x, known);
         known
     }
@@ -321,10 +325,11 @@ impl<'a> Program<'a> {
         let root = |x: ValueId| self.copies.get(&x).copied().unwrap_or(x);
         let top = |x: ValueId| -> Option<u64> {
             match (facts.op(f, x), facts.site[x.0]) {
-                (Some(Op::Env(Env::LaneId)), _) => Some(LANES as u64 - 1),
-                (_, Site::Param { block, index }) if block == f.entry && matches!(self.inputs[index].source, ParameterSource::Vgpr(0)) => {
-                    let [bx, by, bz] = self.env.block.map(|n| n.max(1) as u64 - 1);
-                    Some(bx | by << 10 | bz << 20)
+                (Some(Op::Env(Env::LaneId)), _) => Some(f.lanes as u64 - 1),
+                (_, Site::Param { block, index }) if block == f.entry && matches!(self.inputs[index].source, ParameterSource::Vgpr(r) if self.entry.workitem_register(r)) => {
+                    let ParameterSource::Vgpr(r) = self.inputs[index].source else { unreachable!() };
+                    let tops = self.env.block.map(|n| n.max(1) as u64 - 1);
+                    Some(self.entry.workitem_fields(r).fold(0, |sum, (axis, shift)| sum | tops[axis] << shift))
                 }
                 (Some(Op::Int(IntOp::And, a, b)), _) => facts.constant(f, a).or(facts.constant(f, b)).map(|k| k & 0xffff_ffff),
                 _ => match facts.inst(f, x) {
@@ -459,7 +464,7 @@ impl<'a> Program<'a> {
                     inputs,
                     ..
                 }) => match self.facts.constant(self.f, inputs[1]) {
-                    Some(k) if (k & 31) as usize == lane => x = inputs[0],
+                    Some(k) if (k as usize) & (self.lanes() - 1) == lane => x = inputs[0],
                     Some(_) => x = inputs[2],
                     None => break,
                 },
@@ -469,7 +474,7 @@ impl<'a> Program<'a> {
                     ..
                 }) => match self.facts.constant(self.f, inputs[1]) {
                     Some(k) => {
-                        lane = (k & 31) as usize;
+                        lane = (k as usize) & (self.lanes() - 1);
                         x = inputs[0];
                     }
                     None => break,
@@ -759,7 +764,7 @@ impl Conditions {
                 None => self.implies(program, x, v, edge) && self.implies(program, y, v, edge),
             },
             Some(Op::Convert(Cvt::Trunc, Ty::I1, shifted)) => match program.facts.op(program.f, shifted) {
-                Some(Op::Int(IntOp::LShr, w, s)) if program.facts.op(program.f, s) == Some(Op::Env(Env::LaneId)) => {
+                Some(Op::Int(IntOp::LShr, w, s)) if program.facts.is_lane_shift(program.f, w, s) => {
                     self.word_holds(program, w, v, edge)
                 }
                 _ => false,
@@ -777,10 +782,10 @@ impl Conditions {
     pub(super) fn holds(&self, program: &Program, w: ValueId, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
         match program.facts.inst(program.f, w) {
             Some(Inst::Effect {
-                op: EffectOp::Wave(WaveOp::Ballot),
+                op: EffectOp::Wave(WaveOp::Ballot { high: false }),
                 inputs,
                 ..
-            }) => self.implies(program, inputs[0], v, edge),
+            }) if program.f.lanes == 32 => self.implies(program, inputs[0], v, edge),
             Some(Inst::Core { op, .. }) => match *op {
                 Op::Int(IntOp::And, x, y) => {
                     self.word_holds(program, x, v, edge) || self.word_holds(program, y, v, edge)
@@ -793,11 +798,42 @@ impl Conditions {
                     None => self.word_holds(program, x, v, edge) && self.word_holds(program, y, v, edge),
                 },
                 Op::Convert(Cvt::Bitcast, _, x) => self.word_holds(program, x, v, edge),
+                Op::Pack64(low, high) if program.f.lanes == 64 => {
+                    self.half_holds(program, low, false, v, edge) && self.half_holds(program, high, true, v, edge)
+                }
                 Op::Const(_, 0) => true,
                 _ => false,
             },
             _ => false,
         }
+    }
+
+    fn half_holds(&self, program: &Program, w: ValueId, high: bool, v: ValueId, edge: Option<(ValueId, bool)>) -> bool {
+        let w = program.copies.get(&w).copied().unwrap_or(w);
+        let v = program.copies.get(&v).copied().unwrap_or(v);
+        self.remembered(Implication::Half(high), w, v, edge, |this| match program.facts.inst(program.f, w) {
+            Some(Inst::Effect {
+                op: EffectOp::Wave(WaveOp::Ballot { high: half }),
+                inputs,
+                ..
+            }) if *half == high => this.implies(program, inputs[0], v, edge),
+            Some(Inst::Core { op, .. }) => match *op {
+                Op::Int(IntOp::And, x, y) => {
+                    this.half_holds(program, x, high, v, edge) || this.half_holds(program, y, high, v, edge)
+                }
+                Op::Int(IntOp::Or, x, y) => {
+                    this.half_holds(program, x, high, v, edge) && this.half_holds(program, y, high, v, edge)
+                }
+                Op::Select(c, x, y) => match program.decided(c, edge) {
+                    Some(taken) => this.half_holds(program, if taken { x } else { y }, high, v, edge),
+                    None => this.half_holds(program, x, high, v, edge) && this.half_holds(program, y, high, v, edge),
+                },
+                Op::Convert(Cvt::Bitcast, _, x) => this.half_holds(program, x, high, v, edge),
+                Op::Const(_, 0) => true,
+                _ => false,
+            },
+            _ => false,
+        })
     }
 
     pub(super) fn word_implies(&self, program: &Program, a: ValueId, w: ValueId, edge: Option<(ValueId, bool)>) -> bool {
@@ -828,5 +864,6 @@ impl Conditions {
 pub(super) enum Implication {
     Bit,
     Holds,
+    Half(bool),
     Word,
 }

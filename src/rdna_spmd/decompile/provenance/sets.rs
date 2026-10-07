@@ -1,4 +1,4 @@
-use super::super::address::{aligns, Region, LANES, PRIVATE_MEMORY};
+use super::super::address::{aligns, Region, PRIVATE_MEMORY};
 use super::layout::{merge, pointers, points, Layout};
 use super::program::Program;
 use crate::rdna_spmd::analysis::facts::Site;
@@ -140,9 +140,9 @@ impl<'p, 'a> Sets<'p, 'a> {
                 if !incoming.iter().any(|&(args, _)| self.parts.contains_key(&args[index])) {
                     return None;
                 }
-                let mut out = vec![0; LANES * w];
+                let mut out = vec![0; self.program.lanes() * w];
                 for &(args, _) in incoming {
-                    for lane in 0..LANES {
+                    for lane in 0..self.program.lanes() {
                         merge(&mut out[lane * w..(lane + 1) * w], self.part(args[index], lane));
                     }
                 }
@@ -153,8 +153,8 @@ impl<'p, 'a> Sets<'p, 'a> {
                     op: Op::Select(_, a, b),
                     ..
                 } if self.parts.contains_key(a) || self.parts.contains_key(b) => {
-                    let mut out = vec![0; LANES * w];
-                    for lane in 0..LANES {
+                    let mut out = vec![0; self.program.lanes() * w];
+                    for lane in 0..self.program.lanes() {
                         merge(&mut out[lane * w..(lane + 1) * w], self.part(*a, lane));
                         merge(&mut out[lane * w..(lane + 1) * w], self.part(*b, lane));
                     }
@@ -165,17 +165,17 @@ impl<'p, 'a> Sets<'p, 'a> {
                     inputs,
                     ..
                 } => {
-                    let mut out = vec![0; LANES * w];
-                    for lane in 0..LANES {
+                    let mut out = vec![0; self.program.lanes() * w];
+                    for lane in 0..self.program.lanes() {
                         out[lane * w..(lane + 1) * w].copy_from_slice(self.part(inputs[2], lane));
                     }
                     match self.program.constant(inputs[1]) {
                         Some(k) => {
-                            let k = (k & 31) as usize;
+                            let k = (k & (self.program.lanes() as u32 - 1)) as usize;
                             out[k * w..(k + 1) * w].copy_from_slice(self.of(inputs[0]));
                         }
                         None => {
-                            for lane in 0..LANES {
+                            for lane in 0..self.program.lanes() {
                                 merge(&mut out[lane * w..(lane + 1) * w], self.of(inputs[0]));
                             }
                         }
@@ -191,8 +191,8 @@ impl<'p, 'a> Sets<'p, 'a> {
                     inputs,
                     ..
                 } if !self.slots.is_empty() => {
-                    let mut out = vec![0; LANES * w];
-                    for lane in 0..LANES {
+                    let mut out = vec![0; self.program.lanes() * w];
+                    for lane in 0..self.program.lanes() {
                         let part = &mut out[lane * w..(lane + 1) * w];
                         self.slot(inputs[0], size.bytes(), lane, part);
                         part[0] |= 1;
@@ -327,7 +327,7 @@ impl<'p, 'a> Sets<'p, 'a> {
             } => {
                 acc[0] |= 1;
                 if *space == Space::Scratch {
-                    for lane in 0..LANES {
+                    for lane in 0..self.program.lanes() {
                         self.slot(inputs[0], size.bytes(), lane, acc);
                     }
                 } else if self.layout.has(self.of(inputs[0]), Some(Region::Kernarg)) {
@@ -359,7 +359,7 @@ impl<'p, 'a> Sets<'p, 'a> {
                 ..
             } => match self.program.constant(inputs[1]) {
                 Some(k) => {
-                    let k = (k & 31) as usize;
+                    let k = (k & (self.program.lanes() as u32 - 1)) as usize;
                     merge(acc, self.part(inputs[0], k));
                     if self.program.lacks(k) {
                         acc[0] |= 1;
@@ -377,7 +377,7 @@ impl<'p, 'a> Sets<'p, 'a> {
                 ..
             } => {
                 if let Some(parts) = self.split(v) {
-                    for lane in 0..LANES {
+                    for lane in 0..self.program.lanes() {
                         merge(acc, &parts[lane * self.words..(lane + 1) * self.words]);
                     }
                 }
@@ -427,8 +427,9 @@ impl<'p, 'a> Sets<'p, 'a> {
         let w = self.words;
         match self.program.words(inputs[0], bytes) {
             Some((first, end)) => {
-                let mut lanes = vec![0; LANES * w];
-                for lane in 0..LANES {
+                let count = self.program.lanes();
+                let mut lanes = vec![0; count * w];
+                for lane in 0..count {
                     for &d in &inputs[1..op.mask_input()] {
                         merge(&mut lanes[lane * w..(lane + 1) * w], self.part(d, lane));
                     }
@@ -436,7 +437,7 @@ impl<'p, 'a> Sets<'p, 'a> {
                 }
                 let mut changed = false;
                 for word in first..end {
-                    changed |= merge(self.slots.entry(word).or_insert_with(|| vec![0; LANES * w]), &lanes);
+                    changed |= merge(self.slots.entry(word).or_insert_with(|| vec![0; count * w]), &lanes);
                 }
                 changed
             }

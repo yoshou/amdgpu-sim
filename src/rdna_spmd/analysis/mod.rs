@@ -22,6 +22,7 @@ pub struct Packet {
 
 #[derive(Clone, Copy)]
 pub struct Context<'r> {
+    pub entry: super::engine::EntryLayout,
     pub registry: &'r DialectRegistry,
     pub inputs: &'r [Parameter],
     pub exec_index: usize,
@@ -31,9 +32,14 @@ pub struct Context<'r> {
 }
 
 impl<'r> Context<'r> {
-    pub fn of(registry: &'r DialectRegistry, inputs: &'r [Parameter], lanes: u32) -> Self {
+    pub fn of(
+        registry: &'r DialectRegistry,
+        inputs: &'r [Parameter],
+        lanes: u32,
+        entry: super::engine::EntryLayout,
+    ) -> Self {
         let exec = super::ir::exec_index(inputs, registry.registers().exec);
-        Self::new(registry, inputs, exec, lanes)
+        Self::new(registry, inputs, exec, lanes, entry)
     }
 
     pub fn new(
@@ -41,8 +47,10 @@ impl<'r> Context<'r> {
         inputs: &'r [Parameter],
         exec_index: usize,
         lanes: u32,
+        entry: super::engine::EntryLayout,
     ) -> Self {
         Self {
+            entry,
             registry,
             inputs,
             exec_index,

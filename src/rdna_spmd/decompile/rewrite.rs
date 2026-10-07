@@ -30,15 +30,26 @@ impl Block<'_> {
         if converted(facts, v) {
             return v;
         }
-        match facts.constant(p, v).map(|k| k as u32) {
+        let ty = p.types[v.0];
+        let ones = if ty == Ty::I64 { u64::MAX } else { u32::MAX as u64 };
+        match facts.constant(p, v) {
             Some(0) => self.core(Ty::I1, Op::Const(Ty::I1, 0)),
-            Some(u32::MAX) => self.core(Ty::I1, Op::Const(Ty::I1, 1)),
+            Some(k) if k == ones => self.core(Ty::I1, Op::Const(Ty::I1, 1)),
             _ => {
-                let lane = self.lane_id();
-                let shifted = self.core(Ty::I32, Op::Int(IntOp::LShr, v, lane));
+                let mut lane = self.lane_id();
+                if ty == Ty::I64 {
+                    lane = self.core(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+                }
+                let shifted = self.core(ty, Op::Int(IntOp::LShr, v, lane));
                 self.core(Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
             }
         }
+    }
+
+    fn upper(&mut self) -> ValueId {
+        let lane = self.lane_id();
+        let half = self.core(Ty::I32, Op::Const(Ty::I32, 32));
+        self.core(Ty::I1, Op::Cmp(IntPred::Uge, lane, half))
     }
 }
 
@@ -89,7 +100,7 @@ fn converted(facts: &Facts, v: ValueId) -> bool {
 
 fn projection(p: &Func, facts: &Facts, s: ValueId) -> Option<ValueId> {
     match facts.op(p, s) {
-        Some(Op::Int(IntOp::LShr, w, lane)) if facts.is_lane_id(p, lane) && converted(facts, w) => {
+        Some(Op::Int(IntOp::LShr, w, lane)) if facts.is_lane_shift(p, w, lane) && converted(facts, w) => {
             Some(w)
         }
         _ => None,
@@ -103,7 +114,7 @@ pub fn lane_program(
     meetings: &std::collections::BTreeMap<(BlockId, usize), u64>,
 ) -> Func {
     let reachable: std::collections::BTreeSet<BlockId> = facts.order.iter().copied().collect();
-    let mut q = Func::new(p.entry, Presence::Wave);
+    let mut q = Func::new(p.entry, Presence::Wave, p.lanes);
     q.blocks = p
         .blocks
         .iter()
@@ -178,7 +189,7 @@ fn rewrite_inst(p: &Func, facts: &Facts, kept: &Kept, b: &mut Block, inst: Inst)
             }
         }
         Inst::Effect {
-            op: EffectOp::Wave(WaveOp::Ballot),
+            op: EffectOp::Wave(WaveOp::Ballot { .. }),
             ref inputs,
             ref outputs,
             ..
@@ -259,8 +270,14 @@ fn rewrite_inst(p: &Func, facts: &Facts, kept: &Kept, b: &mut Block, inst: Inst)
                     Op::Int(k, b.bit(p, facts, x), b.bit(p, facts, y))
                 }
                 Op::Select(c, x, y) => Op::Select(c, b.bit(p, facts, x), b.bit(p, facts, y)),
-                Op::Convert(Cvt::Bitcast, Ty::I32, x) => {
+                Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, x) | Op::UnpackLo(x) | Op::UnpackHi(x) => {
                     Op::Convert(Cvt::Bitcast, Ty::I1, b.bit(p, facts, x))
+                }
+                Op::Pack64(x, _) if p.lanes == 32 => Op::Convert(Cvt::Bitcast, Ty::I1, b.bit(p, facts, x)),
+                Op::Pack64(x, y) => {
+                    let (low, high) = (b.bit(p, facts, x), b.bit(p, facts, y));
+                    let upper = b.upper();
+                    Op::Select(upper, high, low)
                 }
                 other => unreachable!("a lane word defined by {:?}", other),
             };
@@ -444,8 +461,8 @@ mod tests {
         let small = b.cmp(e, IntPred::Ult, flag, five);
         let q = b.wave(e, WaveOp::Any, vec![c]);
         let kept_query = b.wave(e, WaveOp::Any, vec![small]);
-        let w = b.wave(e, WaveOp::Ballot, vec![c]);
-        let v = b.wave(e, WaveOp::Ballot, vec![small]);
+        let w = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+        let v = b.wave(e, WaveOp::Ballot { high: false }, vec![small]);
         let shifted = b.int(e, IntOp::LShr, w, lane);
         let own_bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
         let any = b.cmp(e, IntPred::Ne, w, zero);
@@ -504,6 +521,51 @@ mod tests {
     }
 
     #[test]
+    fn lane_program_reads_a_pair_of_ballot_halves_as_each_lane_s_own_bit() {
+        let (mut b, k, _) = Build::kernel_in(&[], 64);
+        let e = BlockId(0);
+        let flags = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, flags, lane, 4);
+        let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let set = b.cmp(e, IntPred::Ne, flag, zero);
+        let c = b.int(e, IntOp::And, set, k.exec);
+        let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+        let high = b.wave(e, WaveOp::Ballot { high: true }, vec![c]);
+        let pair = b.core(e, Ty::I64, Op::Pack64(low, high));
+        let wide_lane = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+        let shifted = b.int(e, IntOp::LShr, pair, wide_lane);
+        let own_bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let wide_zero = b.constant(e, Ty::I64, 0);
+        let any = b.cmp(e, IntPred::Ne, pair, wide_zero);
+        let none = b.cmp(e, IntPred::Eq, wide_zero, pair);
+        let mask = b.constant(e, Ty::I64, 0xf0_0000_00f0);
+        let masked = b.int(e, IntOp::And, pair, mask);
+        let masked_any = b.cmp(e, IntPred::Ne, masked, wide_zero);
+        let lo = b.core(e, Ty::I32, Op::UnpackLo(pair));
+        let hi = b.core(e, Ty::I32, Op::UnpackHi(pair));
+        let repacked = b.core(e, Ty::I64, Op::Pack64(lo, hi));
+        let repacked_any = b.cmp(e, IntPred::Ne, repacked, wide_zero);
+        let tests = vec![own_bit, any, none, masked_any, repacked_any];
+        let buf = k.buffer(&mut b, e, 0);
+        let out = byte_offset(&mut b, e, buf, lane, 4);
+        let one = b.constant(e, Ty::I32, 1);
+        for &t in &tests {
+            b.store(e, Space::Global, MemSize::B32, out, one, t);
+        }
+        let l = lower(&b, &Kept::default(), &BTreeMap::new());
+        assert_eq!(valid(&b, &l), Ok(()));
+        for &w in &[low, high, pair, lo, hi, repacked] {
+            assert_eq!(l.lane.types[w.0], Ty::I1, "v{} is read only by lanes and tests, so it becomes a bit", w.0);
+        }
+        let halves = [low, high, lo, hi];
+        let wrong: Vec<ValueId> = mismatches(&b, &l).into_iter().filter(|v| !halves.contains(v)).collect();
+        assert_eq!(wrong, Vec::<ValueId>::new(), "every value read off the pair agrees with the wave program");
+        assert!(l.lane.blocks[&e].insts.iter().all(|i| !matches!(i, Inst::Effect { op: EffectOp::Wave(_), .. })), "no lane asks the wave");
+    }
+
+    #[test]
     fn lane_program_hands_a_materialized_word_to_a_converted_parameter_as_its_own_bit() {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
@@ -511,7 +573,7 @@ mod tests {
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
         let five = b.constant(e, Ty::I32, 5);
         let small = b.cmp(e, IntPred::Ult, lane, five);
-        let w = b.wave(e, WaveOp::Ballot, vec![small]);
+        let w = b.wave(e, WaveOp::Ballot { high: false }, vec![small]);
         let count = b.core(e, Ty::I32, Op::PopulationCount(w));
         let out = byte_offset(&mut b, e, buf, lane, 4);
         b.store(e, Space::Global, MemSize::B32, out, count, k.exec);

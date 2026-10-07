@@ -29,11 +29,13 @@ const MARKERS_LAST: u32 = 0xfffe_0000;
 pub const PATH: usize = 3;
 
 pub struct Atoms {
+    lanes: u32,
     markers_first: bool,
     vars: HashMap<Atom, u32>,
     atoms: HashMap<u32, Atom>,
     params: HashMap<ValueId, (usize, usize)>,
     markers: HashMap<Choice, u32>,
+    blocks: HashMap<BlockId, u32>,
     detour: HashMap<Atom, u32>,
     supports: HashMap<Bdd, Rc<Vec<u32>>>,
 }
@@ -53,11 +55,13 @@ impl Atoms {
             .map(|(i, &c)| (c, i as u32))
             .collect();
         Self {
+            lanes: f.lanes,
             markers_first,
             vars: HashMap::default(),
             atoms: HashMap::default(),
             params,
             markers,
+            blocks: f.blocks.keys().enumerate().map(|(rank, &id)| (id, rank as u32)).collect(),
             detour: HashMap::default(),
             supports: HashMap::default(),
         }
@@ -91,10 +95,10 @@ impl Atoms {
                 match self.params.get(&v) {
                     Some(&(rank, index)) => {
                         assert!(
-                            index < 1 << 13 && rank < 1 << 16,
+                            index < 1 << 13 && rank < 1 << 15,
                             "register layout too large"
                         );
-                        ((index as u32) << 17) | (view << 16) | rank as u32
+                        return (1 << 23) + (((index as u32) << 16) | (view << 15) | rank as u32);
                     }
                     None => {
                         assert!(v.0 < 1 << 28, "function too large");
@@ -102,14 +106,17 @@ impl Atoms {
                     }
                 }
             }
+            Atom::Lane(5) => return 1 << 17,
             Atom::Lane(i) => (2 << 30) | i as u32,
             Atom::Cell(block, group, bit) => {
-                assert!(block.0 < 1 << 19 && group < 64 && bit < 16, "too many cells");
-                (1 << 30) | (1 << 29) | ((block.0 as u32) << 10) | ((group as u32) << 4) | bit as u32
+                let rank = self.blocks[&block];
+                assert!(rank < 1 << 12 && group < 1 << 12 && bit < 16, "too many cells");
+                (1 << 30) | (1 << 29) | (rank << 16) | ((group as u32) << 4) | bit as u32
             }
             Atom::Some(block, k) => {
-                assert!(block.0 < 1 << 19 && k < 1 << 10, "too many answers");
-                (1 << 30) | (1 << 29) | (1 << 28) | ((block.0 as u32) << 10) | k as u32
+                let rank = self.blocks[&block];
+                assert!(rank < 1 << 12 && k < 1 << 10, "too many answers");
+                (1 << 30) | (1 << 29) | (1 << 28) | (rank << 10) | k as u32
             }
             Atom::WordBit(v, i) => {
                 assert!(v.0 < 1 << 26, "function too large");
@@ -121,11 +128,16 @@ impl Atoms {
             }
             Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => {
                 let next = self.detour.len() as u32;
-                assert!(next < 1 << 29, "too many detour values");
-                (3 << 30) | *self.detour.entry(atom).or_insert(next)
+                assert!(next < 1 << 22, "too many detour values");
+                return (1 << 17) + 1 + *self.detour.entry(atom).or_insert(next);
             }
         };
-        var + (1 << 17)
+        var + (1 << 17) + 1
+    }
+
+    #[inline]
+    pub fn lanes(&self) -> u32 {
+        self.lanes
     }
 
     #[inline]
@@ -184,5 +196,97 @@ pub(super) fn scope(atom: Atom, facts: &Facts) -> Option<BlockId> {
         },
         Atom::Cell(block, ..) | Atom::Some(block, _) => Some(block),
         Atom::Lane(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn cells_number_by_block_order_and_leave_room_for_many_groups() {
+        let mut f = Func::new(BlockId(0x15208), Presence::Wave, 64);
+        let far = BlockId(0x7_fff0);
+        for (id, next) in [(BlockId(0x15208), Some(far)), (far, None)] {
+            f.blocks.insert(
+                id,
+                Block {
+                    params: vec![],
+                    insts: vec![],
+                    term: match next {
+                        Some(dst) => Term::Br(Edge { dst, args: vec![] }),
+                        None => Term::Ret(vec![]),
+                    },
+                },
+            );
+        }
+        let facts = Facts::new(&f, &[], &BTreeSet::new());
+        let mut atoms = Atoms::new(&f, &facts, false, &[]);
+        let atoms_in_order = [
+            Atom::Cell(BlockId(0x15208), 0, 0),
+            Atom::Cell(BlockId(0x15208), 0, 15),
+            Atom::Cell(BlockId(0x15208), 96, 0),
+            Atom::Cell(BlockId(0x15208), 4095, 15),
+            Atom::Cell(far, 0, 0),
+            Atom::Cell(far, 4095, 15),
+            Atom::Some(BlockId(0x15208), 0),
+            Atom::Some(far, 1023),
+        ];
+        let numbers: Vec<u32> = atoms_in_order.iter().map(|&a| atoms.number(a)).collect();
+        assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
+    }
+
+    #[test]
+    fn detour_values_and_the_upper_half_come_before_every_atom_of_the_program() {
+        let mut f = Func::new(BlockId(0), Presence::Wave, 64);
+        let (a, b) = (f.value(Ty::I1), f.value(Ty::I32));
+        let (c, d) = (f.value(Ty::I1), f.value(Ty::I32));
+        let inner = f.value(Ty::I32);
+        let last = BlockId(1);
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![(a, Ty::I1), (b, Ty::I32)],
+                insts: vec![],
+                term: Term::Br(Edge { dst: last, args: vec![a, b] }),
+            },
+        );
+        f.blocks.insert(
+            last,
+            Block {
+                params: vec![(c, Ty::I1), (d, Ty::I32)],
+                insts: vec![],
+                term: Term::Ret(vec![]),
+            },
+        );
+        let facts = Facts::new(&f, &[], &BTreeSet::new());
+        let listed = [Choice::Meet(0), Choice::Word(b)];
+        let mut atoms = Atoms::new(&f, &facts, true, &listed);
+        let atoms_in_order = [
+            Atom::Marker(Choice::Meet(0)),
+            Atom::Marker(Choice::Word(b)),
+            Atom::Fresh(PATH, ValueId(0), 0),
+            Atom::Fresh(PATH, ValueId(0), (1 << 16) - 1),
+            Atom::Lane(5),
+            Atom::Fresh(0, ValueId(7), 0),
+            Atom::Term(3, true),
+            Atom::Fresh(4, ValueId(9), 0),
+            Atom::Bit(a),
+            Atom::Bit(c),
+            Atom::View(b),
+            Atom::View(d),
+            Atom::Bit(inner),
+            Atom::Cell(last, 0, 0),
+            Atom::Lane(0),
+            Atom::Lane(4),
+            Atom::WordBit(inner, 0),
+        ];
+        let numbers: Vec<u32> = atoms_in_order.iter().map(|&x| atoms.number(x)).collect();
+        assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
+        let mut last_markers = Atoms::new(&f, &facts, false, &listed);
+        let lane = last_markers.number(Atom::Lane(5));
+        let marker = last_markers.number(Atom::Marker(Choice::Meet(0)));
+        assert!(lane < last_markers.number(Atom::Fresh(1, ValueId(0), 0)) && marker > last_markers.number(Atom::WordBit(inner, 0)));
     }
 }

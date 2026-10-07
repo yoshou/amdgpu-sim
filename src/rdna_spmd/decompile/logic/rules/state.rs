@@ -2,7 +2,7 @@ use super::super::kernel::{Atom, Atoms, Binding, Queries, Rules};
 use super::answers::{Answers, HasAnswers};
 use super::bits::{compute_bit, compute_view};
 use super::cells::{self, Cells, HasCells};
-use super::lanes::{HasLanes, LaneValues};
+use super::lanes::{HasLanes, LaneValues, MAX_LANES};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::ir::*;
@@ -15,11 +15,11 @@ pub struct State {
 }
 
 impl State {
-    pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; 32]> {
+    pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; MAX_LANES]> {
         self.lanes.of(f, facts, v, 0)
     }
 
-    pub fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); 32]> {
+    pub fn lane_bits(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[(u32, u32); MAX_LANES]> {
         if f.types[v.0] != Ty::I32 {
             return None;
         }
