@@ -860,3 +860,61 @@ fn facts_keep_the_high_word_of_a_wide_word_in_a_wave_of_32_lanes_whole() {
     assert!(!facts.lane_word[hi.0], "no lane of 32 reads the high word, so it is a plain word");
     assert!(facts.materialized[pair.0], "the high word needs the whole pair");
 }
+
+fn halves_of_two_conditions() -> (Build, [ValueId; 7]) {
+    let (mut b, p) = Build::with_lanes(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)], 64);
+    let e = BlockId(0);
+    let three = b.constant(e, Ty::I32, 3);
+    let five = b.constant(e, Ty::I32, 5);
+    let c = b.cmp(e, IntPred::Ult, p[1], three);
+    let d = b.cmp(e, IntPred::Ult, p[1], five);
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![c]);
+    let high = b.wave(e, WaveOp::Ballot { high: true }, vec![c]);
+    let other = b.wave(e, WaveOp::Ballot { high: true }, vec![d]);
+    let kept = b.core(e, Ty::I64, Op::Pack64(low, high));
+    let same = b.core(e, Ty::I64, Op::Pack64(low, high));
+    let partial = b.core(e, Ty::I64, Op::Pack64(low, other));
+    let both = b.int(e, IntOp::And, same, kept);
+    let zero = b.constant(e, Ty::I64, 0);
+    for w in [kept, same, partial, both] {
+        b.cmp(e, IntPred::Ne, w, zero);
+    }
+    (b, [low, high, other, kept, same, partial, both])
+}
+
+#[test]
+fn facts_materialize_a_word_built_only_from_materialized_words() {
+    let (b, [low, high, other, kept, same, partial, both]) = halves_of_two_conditions();
+    let f = &b.f;
+    let none = Facts::new(f, &b.inputs, &BTreeSet::new());
+    for (name, v) in [("low", low), ("high", high), ("other", other), ("kept", kept), ("same", same), ("partial", partial), ("both", both)] {
+        assert!(none.lane_word[v.0], "{} is a word of lanes", name);
+        assert!(!none.materialized[v.0], "{} is only tested, so it stays a view while nothing is kept", name);
+    }
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::from([kept]));
+    assert!(facts.materialized[kept.0] && facts.materialized[low.0] && facts.materialized[high.0], "a kept pair needs its halves whole");
+    assert!(facts.materialized[same.0], "another pair of the same whole halves is a whole word at no cost");
+    assert!(facts.materialized[both.0], "a word of whole words is whole, also through a word made whole on the way");
+    assert!(!facts.materialized[other.0], "nothing needs the other half whole");
+    assert!(!facts.materialized[partial.0], "a pair with a viewed half stays a view");
+}
+
+#[test]
+fn the_open_policy_materializes_exactly_what_the_facts_of_each_kept_set_do() {
+    let (b, values) = halves_of_two_conditions();
+    let f = &b.f;
+    let base = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let words = values[3..].to_vec();
+    let listed: Vec<Choice> = words.iter().map(|&w| Choice::Word(w)).collect();
+    let mut logic = Logic::open(f, &base, &listed);
+    for subset in 0..1usize << words.len() {
+        let kept_words: BTreeSet<ValueId> = (0..words.len()).filter(|i| subset >> i & 1 == 1).map(|i| words[i]).collect();
+        let kept: BTreeSet<Choice> = kept_words.iter().map(|&w| Choice::Word(w)).collect();
+        let facts = Facts::new(f, &b.inputs, &kept_words);
+        for v in values {
+            let whole = logic.materialized(&base, v);
+            let settled = logic.settled(whole, &kept);
+            assert_eq!(settled.constant(), Some(facts.materialized[v.0]), "v{} with {:?} kept", v.0, kept_words);
+        }
+    }
+}

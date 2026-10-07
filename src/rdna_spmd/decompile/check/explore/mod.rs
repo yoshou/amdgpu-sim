@@ -85,7 +85,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
         let edges: Vec<&Edge> = f.blocks[&self.branch].term.edges().collect();
         let (e0, e1) = (edges[wave], edges[lane]);
         let sides = [
-            e0.args.iter().map(|&a| self.eval.start(a)).collect(),
+            e0.args.iter().map(|&a| self.eval.start_wave(a)).collect(),
             e1.args.iter().map(|&a| self.eval.start(a)).collect(),
         ];
         let first: Key = [Some(e0.dst), Some(e1.dst)];
