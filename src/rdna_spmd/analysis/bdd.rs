@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use crate::rdna_spmd::hash::{HashMap, Mix};
 use std::hash::Hasher;
 
@@ -35,7 +34,9 @@ pub struct Manager {
     ite: Vec<(Bdd, Bdd, Bdd, Bdd)>,
     restrict: HashMap<(Bdd, Bdd), Bdd>,
     implications: HashMap<(Bdd, Bdd), bool>,
-    memo: HashMap<Bdd, Bdd>,
+    marks: Vec<(u32, Bdd)>,
+    generation: u32,
+    pairs: HashMap<(Bdd, Bdd), Bdd>,
 }
 
 impl Manager {
@@ -51,7 +52,9 @@ impl Manager {
             ite: Vec::new(),
             restrict: HashMap::default(),
             implications: HashMap::default(),
-            memo: HashMap::default(),
+            marks: Vec::new(),
+            generation: 0,
+            pairs: HashMap::default(),
         }
     }
 
@@ -217,39 +220,34 @@ impl Manager {
         result
     }
 
-    fn quantify(&mut self, f: Bdd, chosen: &dyn Fn(u32) -> bool, any: bool) -> Bdd {
-        let mut memo = self.take_memo();
-        let r = self.quantify_memo(f, chosen, any, &mut memo);
-        self.memo = memo;
-        r
-    }
-
-    fn take_memo(&mut self) -> HashMap<Bdd, Bdd> {
-        let mut memo = std::mem::take(&mut self.memo);
-        if memo.capacity() > 4 * memo.len().max(1 << 10) {
-            memo = HashMap::with_capacity_and_hasher(memo.len().max(1 << 10), Default::default());
-        } else {
-            memo.clear();
+    fn generation(&mut self) -> u32 {
+        if self.marks.len() < self.nodes.len() {
+            self.marks.resize(self.nodes.len(), (0, Bdd::FALSE));
         }
-        memo
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.marks.fill((0, Bdd::FALSE));
+            self.generation = 1;
+        }
+        self.generation
     }
 
-    fn quantify_memo(
-        &mut self,
-        f: Bdd,
-        chosen: &dyn Fn(u32) -> bool,
-        any: bool,
-        memo: &mut HashMap<Bdd, Bdd>,
-    ) -> Bdd {
+    fn quantify(&mut self, f: Bdd, chosen: &dyn Fn(u32) -> bool, any: bool) -> Bdd {
+        let generation = self.generation();
+        self.quantify_memo(f, chosen, any, generation)
+    }
+
+    fn quantify_memo(&mut self, f: Bdd, chosen: &dyn Fn(u32) -> bool, any: bool, generation: u32) -> Bdd {
         if f.constant().is_some() {
             return f;
         }
-        if let Some(&r) = memo.get(&f) {
+        let (seen, r) = self.marks[f.0 as usize];
+        if seen == generation {
             return r;
         }
         let node = self.nodes[f.0 as usize];
-        let low = self.quantify_memo(node.low, chosen, any, memo);
-        let high = self.quantify_memo(node.high, chosen, any, memo);
+        let low = self.quantify_memo(node.low, chosen, any, generation);
+        let high = self.quantify_memo(node.high, chosen, any, generation);
         let r = if chosen(node.var) {
             if any {
                 self.or(low, high)
@@ -257,16 +255,22 @@ impl Manager {
                 self.and(low, high)
             }
         } else {
-            let v = self.var(node.var);
-            self.ite(v, high, low)
+            self.node(node.var, low, high)
         };
-        memo.insert(f, r);
+        self.marks[f.0 as usize] = (generation, r);
         r
     }
 
     pub fn and_exists(&mut self, f: Bdd, g: Bdd, chosen: &dyn Fn(u32) -> bool) -> Bdd {
-        let mut memo = HashMap::default();
-        self.and_exists_memo(f, g, chosen, &mut memo)
+        let mut memo = std::mem::take(&mut self.pairs);
+        if memo.capacity() > 4 * memo.len().max(1 << 10) {
+            memo = HashMap::with_capacity_and_hasher(memo.len().max(1 << 10), Default::default());
+        } else {
+            memo.clear();
+        }
+        let r = self.and_exists_memo(f, g, chosen, &mut memo);
+        self.pairs = memo;
+        r
     }
 
     fn and_exists_memo(
@@ -314,33 +318,26 @@ impl Manager {
     }
 
     pub fn compose(&mut self, f: Bdd, map: &dyn Fn(u32) -> Option<Bdd>) -> Bdd {
-        let mut memo = self.take_memo();
-        let r = self.compose_memo(f, map, u32::MAX, &mut memo);
-        self.memo = memo;
-        r
+        let generation = self.generation();
+        self.compose_memo(f, map, u32::MAX, generation)
     }
 
     pub fn compose_many(&mut self, fs: &[Bdd], map: &dyn Fn(u32) -> Option<Bdd>, last: u32) -> Vec<Bdd> {
-        let mut memo = HashMap::default();
-        fs.iter().map(|&f| self.compose_memo(f, map, last, &mut memo)).collect()
+        let generation = self.generation();
+        fs.iter().map(|&f| self.compose_memo(f, map, last, generation)).collect()
     }
 
-    fn compose_memo(
-        &mut self,
-        f: Bdd,
-        map: &dyn Fn(u32) -> Option<Bdd>,
-        last: u32,
-        memo: &mut HashMap<Bdd, Bdd>,
-    ) -> Bdd {
+    fn compose_memo(&mut self, f: Bdd, map: &dyn Fn(u32) -> Option<Bdd>, last: u32, generation: u32) -> Bdd {
         if f.constant().is_some() || self.top(f) > last {
             return f;
         }
-        if let Some(&r) = memo.get(&f) {
+        let (seen, r) = self.marks[f.0 as usize];
+        if seen == generation {
             return r;
         }
         let node = self.nodes[f.0 as usize];
-        let low = self.compose_memo(node.low, map, last, memo);
-        let high = self.compose_memo(node.high, map, last, memo);
+        let low = self.compose_memo(node.low, map, last, generation);
+        let high = self.compose_memo(node.high, map, last, generation);
         let v = match map(node.var) {
             Some(g) => g,
             None => self.var(node.var),
@@ -351,23 +348,26 @@ impl Manager {
         } else {
             self.ite(v, high, low)
         };
-        memo.insert(f, r);
+        self.marks[f.0 as usize] = (generation, r);
         r
     }
 
-    pub fn support(&self, f: Bdd) -> BTreeSet<u32> {
-        let mut out = BTreeSet::new();
+    pub fn support(&mut self, f: Bdd) -> Vec<u32> {
+        let generation = self.generation();
+        let mut out = Vec::new();
         let mut stack = vec![f];
-        let mut seen: HashMap<Bdd, ()> = HashMap::default();
         while let Some(g) = stack.pop() {
-            if g.constant().is_some() || seen.insert(g, ()).is_some() {
+            if g.constant().is_some() || self.marks[g.0 as usize].0 == generation {
                 continue;
             }
+            self.marks[g.0 as usize].0 = generation;
             let node = self.nodes[g.0 as usize];
-            out.insert(node.var);
+            out.push(node.var);
             stack.push(node.low);
             stack.push(node.high);
         }
+        out.sort_unstable();
+        out.dedup();
         out
     }
 }
@@ -408,6 +408,42 @@ mod tests {
             g = if value(var) { high } else { low };
         }
         g == Bdd::TRUE
+    }
+
+    #[test]
+    fn support_lists_exactly_the_variables_a_function_reads_in_order() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let mut m = Manager::new();
+        let vars = 10;
+        for _ in 0..400 {
+            let f = random_function(&mut m, &mut state, vars);
+            let want: Vec<u32> = (0..vars).filter(|&v| m.cofactor(f, v, false) != m.cofactor(f, v, true)).collect();
+            assert_eq!(m.support(f), want, "the support must be the sorted variables whose cofactors differ");
+            let g = random_function(&mut m, &mut state, vars);
+            let both = m.and(f, g);
+            let mut joint: Vec<u32> = m.support(f).into_iter().chain(m.support(g)).collect();
+            joint.sort_unstable();
+            joint.dedup();
+            assert!(m.support(both).iter().all(|v| joint.contains(v)));
+            assert_eq!(m.support(f), want, "asking again must give the same support");
+        }
+    }
+
+    #[test]
+    fn memo_generations_wrap_without_reading_old_marks() {
+        let mut m = Manager::new();
+        let (x, y, z) = (m.var(0), m.var(1), m.var(2));
+        let xy = m.and(x, y);
+        let f = m.or(xy, z);
+        let g = {
+            let (u, w) = (m.var(5), m.var(6));
+            m.xor(u, w)
+        };
+        assert_eq!(m.support(f), vec![0, 1, 2]);
+        m.generation = u32::MAX - 1;
+        assert_eq!(m.support(g), vec![5, 6]);
+        assert_eq!(m.support(g), vec![5, 6]);
+        assert_eq!(m.support(f), vec![0, 1, 2], "a generation that wraps around must not see the marks of earlier ones");
     }
 
     #[test]

@@ -461,7 +461,7 @@ impl Emit<'_> {
 
         if self.keeps_wave(self.s.regions[region].span[u].iter().copied()) {
             let full = *self.full.last().unwrap();
-            let own = self.masks.m.support(full);
+            let own: BTreeSet<u32> = self.masks.m.support(full).into_iter().collect();
             return self.all_or_none(mask, &own).then(|| self.open(mask));
         }
         let deciding = if self.query_is_scalar(mask) {
@@ -1442,7 +1442,7 @@ impl Emit<'_> {
     }
 
     fn go_around_together(&mut self, mask: Bdd, continuing: Bdd) -> bool {
-        let own: BTreeSet<u32> = self.masks.m.support(mask);
+        let own: BTreeSet<u32> = self.masks.m.support(mask).into_iter().collect();
         self.all_or_none(continuing, &own)
     }
 

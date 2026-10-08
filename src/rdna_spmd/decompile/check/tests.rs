@@ -576,6 +576,47 @@ fn prove_orders_a_store_in_a_later_block() {
     keeps_exactly(&program, &hazards, &[s2], "the store in the next block must follow the first");
 }
 
+fn outcome(check: &mut Check) -> (bool, Vec<(BlockId, usize, &'static str)>) {
+    let ran = check.run();
+    (ran, check.violations().iter().map(|v| (v.block, v.index, v.reason)).collect())
+}
+
+#[test]
+fn a_check_resumed_after_a_new_meeting_reports_what_a_fresh_check_does() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let s1 = store(&mut b, e, buf, 1, k.exec);
+    let s2 = store(&mut b, e, buf, 2, k.exec);
+    let s3 = store(&mut b, e, buf, 3, k.exec);
+    let program = b.program();
+    let hazards = Hazards::given(&program, &[(s1, s2), (s2, s3), (s1, s3)], &[], &[]);
+    let (f, inputs) = (&program.ir, &program.parameter_inputs[..]);
+    let facts = Facts::new(f, inputs, &BTreeSet::new());
+    let loops = Loops::new(f, &facts).unwrap();
+    let listed = search::listed(f, &facts, &hazards);
+    let structure = super::super::logic::Structure::of(f, &facts);
+    let fresh = |kept: &BTreeSet<Choice>| {
+        let logic = Logic::structured(&structure, f, &facts, kept, &listed);
+        Check::new(f, &facts, inputs, Some(0), &loops, &hazards, logic)
+    };
+    let meets: Vec<Choice> = listed.iter().copied().filter(|c| matches!(c, Choice::Meet(_))).collect();
+    let mut kept = BTreeSet::new();
+    let mut check = fresh(&kept);
+    let mut outcomes = vec![outcome(&mut check)];
+    for &m in &meets {
+        kept.insert(m);
+        let mut resumed = Check::resume(f, &facts, inputs, Some(0), &loops, &hazards, check.retire(), &kept);
+        let mut again = fresh(&kept);
+        let (got, want) = (outcome(&mut resumed), outcome(&mut again));
+        assert_eq!(got, want, "a check that takes over the logic of the last one must report what a new one reports with {:?}", kept);
+        outcomes.push(got);
+        check = resumed;
+    }
+    assert!(!outcomes[0].0 && outcomes.last().unwrap().0, "the stores need the meetings and are ordered with all of them: {:?}", outcomes);
+    assert!(outcomes.windows(2).any(|w| w[0] != w[1]), "some meeting must change what the check reports");
+}
+
 fn read_after(write: impl Fn(&mut Build, BlockId, ValueId) -> ValueId) -> (crate::rdna_spmd::program::Program, Position, Position) {
     let (mut b, k) = Build::kernel();
     let e = BlockId(0);

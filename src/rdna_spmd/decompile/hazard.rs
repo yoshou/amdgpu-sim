@@ -827,6 +827,9 @@ fn meet(
     differ: Option<Unknown>,
     judgments: &mut Shapes,
 ) -> Option<[bool; 2]> {
+    if addresses.known_unreached(pa.block) || addresses.known_unreached(qa.block) {
+        return None;
+    }
     let mut idle: Option<[bool; 2]> = None;
     let mut lanes_p: Vec<Option<LaneFacts>> = vec![None; p.len()];
     let mut lanes_q: Vec<Option<LaneFacts>> = vec![None; q.len()];
@@ -1461,6 +1464,42 @@ mod tests {
         b.store(e, Space::Global, MemSize::B32, buf, zero, k.exec);
         let h = Hazards::find(&b.program(), &environment(lanes, &[(0, 1, 0x1000)]));
         h.together.contains(&pair(&h, s1, s2))
+    }
+
+    #[test]
+    fn find_reports_no_pair_with_a_store_no_lane_reaches() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let never = b.constant(e, Ty::I1, 0);
+        let (dead, d) = b.block(&[Ty::I1, Ty::I64]);
+        let (live, l) = b.block(&[Ty::I1, Ty::I64]);
+        b.cond_br(e, never, (dead, vec![k.exec, buf]), (live, vec![k.exec, buf]));
+        let stores = |b: &mut Build, block: BlockId, at: ValueId, mask: ValueId| -> Vec<(BlockId, usize)> {
+            (0..3)
+                .map(|i| {
+                    let value = b.constant(block, Ty::I32, i);
+                    let here = b.here(block);
+                    b.store(block, Space::Global, MemSize::B32, at, value, mask);
+                    here
+                })
+                .collect()
+        };
+        let dead_stores = stores(&mut b, dead, d[1], d[0]);
+        b.br(dead, live, vec![d[0], d[1]]);
+        let live_stores = stores(&mut b, live, l[1], l[0]);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+        let conflicts = h.conflicts();
+        for &p in &dead_stores {
+            for &q in dead_stores.iter().chain(&live_stores) {
+                assert!(!conflicts.contains(&pair(&h, p, q)), "no lane reaches the store at {:?}", p);
+            }
+        }
+        for (i, &p) in live_stores.iter().enumerate() {
+            for &q in &live_stores[i + 1..] {
+                assert!(h.together.contains(&pair(&h, p, q)), "every lane stores the word at {:?} and at {:?}", p, q);
+            }
+        }
     }
 
     #[test]

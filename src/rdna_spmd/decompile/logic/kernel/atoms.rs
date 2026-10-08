@@ -164,7 +164,7 @@ impl Atoms {
         if let Some(s) = self.supports.get(&f) {
             return s.clone();
         }
-        let s: Rc<Vec<u32>> = Rc::new(m.support(f).into_iter().collect());
+        let s: Rc<Vec<u32>> = Rc::new(m.support(f));
         self.supports.insert(f, s.clone());
         s
     }

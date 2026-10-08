@@ -10,7 +10,7 @@ use super::{Mode, Violation};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct Differences<'a> {
     program: Program<'a>,
@@ -20,6 +20,7 @@ pub(super) struct Differences<'a> {
     lattice: Lattice,
     verdict: Verdict,
     settles: HashMap<ValueId, bool>,
+    basis: Option<(BTreeMap<BlockId, Bdd>, Masks)>,
 }
 
 impl<'a> Differences<'a> {
@@ -33,7 +34,18 @@ impl<'a> Differences<'a> {
             lattice: Lattice::new(n),
             verdict: Verdict::new(mode),
             settles: HashMap::default(),
+            basis: None,
         }
+    }
+
+    pub(super) fn based(mut self, reach: BTreeMap<BlockId, Bdd>, masks: Masks) -> Self {
+        self.basis = Some((reach, masks));
+        self
+    }
+
+    pub(super) fn basis(self) -> (Logic, BTreeMap<BlockId, Bdd>, Masks) {
+        let (reach, masks) = self.basis.expect("a check hands on what it started from");
+        (self.logic, reach, masks)
     }
 
     #[inline]
@@ -74,10 +86,18 @@ impl<'a> Differences<'a> {
                 .atom(Atom::Bit(f.blocks[&f.entry].params[index].0)),
             None => Bdd::TRUE,
         };
-        let reach = self.logic.reach(f, self.program.facts, f.entry, start);
-        self.lattice.start(reach);
+        let (reach, masks) = match self.basis.take() {
+            Some(basis) => basis,
+            None => {
+                let reach = self.logic.reach(f, self.program.facts, f.entry, start);
+                let masks = Masks::solve(&self.program, &mut self.logic);
+                (reach, masks)
+            }
+        };
+        self.lattice.start(reach.clone());
         self.orderings = Orderings::new(&self.program, &mut self.logic);
-        self.masks = Masks::solve(&self.program, &mut self.logic);
+        self.masks = masks.clone();
+        self.basis = Some((reach, masks));
     }
 
     pub(super) fn reorder(&mut self) -> Orderings {

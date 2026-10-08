@@ -34,6 +34,12 @@ pub enum Mode {
     Direct,
 }
 
+pub struct Basis {
+    logic: Logic,
+    reach: BTreeMap<BlockId, Bdd>,
+    masks: masks::Masks,
+}
+
 pub struct Violation {
     pub block: BlockId,
     pub index: usize,
@@ -68,6 +74,33 @@ impl<'a> Check<'a> {
             detoured: BTreeMap::new(),
             memo: Memo::default(),
         }
+    }
+
+    pub fn resume(
+        f: &'a Func,
+        facts: &'a Facts,
+        inputs: &'a [Parameter],
+        exec_index: Option<usize>,
+        loops: &'a Loops,
+        hazards: &'a Hazards,
+        basis: Basis,
+        kept: &BTreeSet<Choice>,
+    ) -> Self {
+        let Basis { mut logic, reach, masks } = basis;
+        logic.keep(kept);
+        let program = Program::new(f, facts, inputs, exec_index, loops, hazards);
+        Self {
+            schedule: Schedule::new(Mode::Search, &program),
+            differences: Differences::new(program, logic, Mode::Search).based(reach, masks),
+            version: BTreeMap::new(),
+            detoured: BTreeMap::new(),
+            memo: Memo::default(),
+        }
+    }
+
+    pub fn retire(self) -> Basis {
+        let (logic, reach, masks) = self.differences.basis();
+        Basis { logic, reach, masks }
     }
 
     pub fn logic(&mut self) -> &mut Logic {
