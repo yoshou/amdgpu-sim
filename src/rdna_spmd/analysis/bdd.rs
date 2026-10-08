@@ -26,6 +26,8 @@ struct Node {
 
 const TERMINAL: u32 = u32::MAX;
 
+const ITE_SLOTS: usize = 1 << 19;
+
 pub struct Manager {
     nodes: Vec<Node>,
     unique: HashMap<(u32, Bdd, Bdd), Bdd>,
@@ -33,6 +35,7 @@ pub struct Manager {
     ite: Vec<(Bdd, Bdd, Bdd, Bdd)>,
     restrict: HashMap<(Bdd, Bdd), Bdd>,
     implications: HashMap<(Bdd, Bdd), bool>,
+    memo: HashMap<Bdd, Bdd>,
 }
 
 impl Manager {
@@ -48,6 +51,7 @@ impl Manager {
             ite: Vec::new(),
             restrict: HashMap::default(),
             implications: HashMap::default(),
+            memo: HashMap::default(),
         }
     }
 
@@ -153,8 +157,8 @@ impl Manager {
         } else {
             (f, g, h)
         };
-        if self.ite.len() < self.nodes.len() && self.ite.len() < 1 << 22 {
-            let slots = (self.nodes.len() * 2).next_power_of_two().max(1 << 10);
+        if self.ite.len() < self.nodes.len().min(ITE_SLOTS) {
+            let slots = (self.nodes.len() * 2).next_power_of_two().clamp(1 << 10, ITE_SLOTS);
             self.ite = vec![(Bdd::FALSE, Bdd::FALSE, Bdd::FALSE, Bdd::FALSE); slots];
         }
         let slot = self.slot(f, g, h);
@@ -214,8 +218,20 @@ impl Manager {
     }
 
     fn quantify(&mut self, f: Bdd, chosen: &dyn Fn(u32) -> bool, any: bool) -> Bdd {
-        let mut memo = HashMap::default();
-        self.quantify_memo(f, chosen, any, &mut memo)
+        let mut memo = self.take_memo();
+        let r = self.quantify_memo(f, chosen, any, &mut memo);
+        self.memo = memo;
+        r
+    }
+
+    fn take_memo(&mut self) -> HashMap<Bdd, Bdd> {
+        let mut memo = std::mem::take(&mut self.memo);
+        if memo.capacity() > 4 * memo.len().max(1 << 10) {
+            memo = HashMap::with_capacity_and_hasher(memo.len().max(1 << 10), Default::default());
+        } else {
+            memo.clear();
+        }
+        memo
     }
 
     fn quantify_memo(
@@ -298,8 +314,10 @@ impl Manager {
     }
 
     pub fn compose(&mut self, f: Bdd, map: &dyn Fn(u32) -> Option<Bdd>) -> Bdd {
-        let mut memo = HashMap::default();
-        self.compose_memo(f, map, u32::MAX, &mut memo)
+        let mut memo = self.take_memo();
+        let r = self.compose_memo(f, map, u32::MAX, &mut memo);
+        self.memo = memo;
+        r
     }
 
     pub fn compose_many(&mut self, fs: &[Bdd], map: &dyn Fn(u32) -> Option<Bdd>, last: u32) -> Vec<Bdd> {
@@ -327,7 +345,12 @@ impl Manager {
             Some(g) => g,
             None => self.var(node.var),
         };
-        let r = self.ite(v, high, low);
+        let n = self.nodes[v.0 as usize];
+        let r = if n.low == Bdd::FALSE && n.high == Bdd::TRUE && n.var < self.top(low) && n.var < self.top(high) {
+            self.node(n.var, low, high)
+        } else {
+            self.ite(v, high, low)
+        };
         memo.insert(f, r);
         r
     }
@@ -385,6 +408,66 @@ mod tests {
             g = if value(var) { high } else { low };
         }
         g == Bdd::TRUE
+    }
+
+    #[test]
+    fn each_quantification_reads_only_its_own_variables() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut m = Manager::new();
+        let vars = 8;
+        for round in 0..600 {
+            let f = random_function(&mut m, &mut state, vars);
+            let chosen: Vec<u32> = (0..vars).filter(|_| random(&mut state) % 3 == 0).collect();
+            let any = round % 2 == 0;
+            let g = if any { m.exists(f, &|v| chosen.contains(&v)) } else { m.forall(f, &|v| chosen.contains(&v)) };
+            for row in 0..1u32 << vars {
+                let mut outcomes = (0..1u32 << chosen.len()).map(|pick| {
+                    let value = |v: u32| match chosen.iter().position(|&c| c == v) {
+                        Some(i) => pick >> i & 1 == 1,
+                        None => row >> v & 1 == 1,
+                    };
+                    evaluate(&m, f, &value)
+                });
+                let want = if any { outcomes.any(|x| x) } else { outcomes.all(|x| x) };
+                assert_eq!(evaluate(&m, g, &|v| row >> v & 1 == 1), want, "quantifying over {:?}", chosen);
+            }
+        }
+    }
+
+    #[test]
+    fn compose_renames_variables_to_others_above_and_below_them() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let mut m = Manager::new();
+        let vars = 10;
+        let mut moved = 0;
+        for _ in 0..400 {
+            let f = random_function(&mut m, &mut state, vars);
+            let mut map: HashMap<u32, Bdd> = HashMap::default();
+            for _ in 0..1 + random(&mut state) % 5 {
+                let v = random(&mut state) as u32 % vars;
+                let w = random(&mut state) as u32 % vars;
+                moved += (v != w) as usize;
+                let target = m.var(w);
+                map.insert(v, if random(&mut state) % 4 == 0 { m.not(target) } else { target });
+            }
+            let g = m.compose(f, &|v| map.get(&v).copied());
+            let mut stack = vec![g];
+            while let Some((var, low, high)) = stack.pop().and_then(|x| m.decompose(x)) {
+                for child in [low, high] {
+                    assert!(m.decompose(child).is_none_or(|(below, _, _)| var < below), "a node must test its variable before every variable below it");
+                    stack.push(child);
+                }
+            }
+            for row in 0..1u32 << vars {
+                let before = |v: u32| row >> v & 1 == 1;
+                let after = |v: u32| match map.get(&v) {
+                    Some(&target) => evaluate(&m, target, &before),
+                    None => before(v),
+                };
+                assert_eq!(evaluate(&m, g, &before), evaluate(&m, f, &after), "renaming must read each mapped variable as its target");
+            }
+        }
+        assert!(moved > 1000);
     }
 
     #[test]

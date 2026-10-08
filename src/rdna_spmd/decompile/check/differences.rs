@@ -1,5 +1,5 @@
 use super::super::logic::{Atom, Choice, Logic};
-use super::lattice::Lattice;
+use super::lattice::{Lattice, Sent};
 use super::masks::Masks;
 use super::orderings::Orderings;
 use super::program::Program;
@@ -98,6 +98,11 @@ impl<'a> Differences<'a> {
     #[inline]
     pub(super) fn arrive(&mut self, b: BlockId, k: usize, width: usize, c: Bdd) -> bool {
         self.lattice.arrive(&mut self.logic.m, b, k, width, c)
+    }
+
+    #[inline]
+    pub(super) fn unsent(&mut self, key: Sent, x: Bdd) -> Bdd {
+        self.lattice.unsent(&mut self.logic.m, key, x)
     }
 
     #[inline]

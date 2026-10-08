@@ -3,6 +3,8 @@ use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeMap;
 
+pub(super) type Sent = (BlockId, usize, BlockId, usize, bool);
+
 pub(super) struct Lattice {
     safe: Bdd,
     h: Vec<Bdd>,
@@ -10,6 +12,7 @@ pub(super) struct Lattice {
     arrivals: BTreeMap<BlockId, Vec<Bdd>>,
     reach: BTreeMap<BlockId, Bdd>,
     guards: HashMap<(usize, usize), Bdd>,
+    sent: HashMap<Sent, Bdd>,
 }
 
 impl Lattice {
@@ -21,6 +24,7 @@ impl Lattice {
             arrivals: BTreeMap::new(),
             reach: BTreeMap::new(),
             guards: HashMap::default(),
+            sent: HashMap::default(),
         }
     }
 
@@ -57,6 +61,14 @@ impl Lattice {
     #[inline]
     pub(super) fn keep_guard(&mut self, pred: BlockId, slot: usize, guard: Bdd) {
         self.guards.insert((pred.0, slot), guard);
+    }
+
+    pub(super) fn unsent(&mut self, m: &mut Manager, key: Sent, x: Bdd) -> Bdd {
+        match self.sent.insert(key, x) {
+            Some(before) if before == x => Bdd::FALSE,
+            Some(before) => m.ite(before, Bdd::FALSE, x),
+            None => x,
+        }
     }
 
     pub(super) fn start(&mut self, reach: BTreeMap<BlockId, Bdd>) {
@@ -128,6 +140,54 @@ impl Lattice {
             }
         }
         self.guards.clear();
+        self.sent.clear();
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsent_passes_on_only_what_a_slot_has_not_sent_since_the_last_narrowing() {
+        let mut m = Manager::new();
+        let mut lattice = Lattice::new(1);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let vars: Vec<Bdd> = (0..6).map(|v| m.var(v)).collect();
+        let mut grew = 0;
+        for round in 0..200 {
+            let key = (BlockId(round), 0, BlockId(1), 0, false);
+            let mut sent = Bdd::FALSE;
+            for _ in 0..6 {
+                let mut cube = Bdd::TRUE;
+                for &v in &vars {
+                    let literal = match next() % 3 {
+                        0 => v,
+                        1 => m.not(v),
+                        _ => Bdd::TRUE,
+                    };
+                    cube = m.and(cube, literal);
+                }
+                let x = m.or(sent, cube);
+                let delta = lattice.unsent(&mut m, key, x);
+                grew += (x != sent) as usize;
+                assert_eq!(m.and(delta, sent), Bdd::FALSE, "a slot passes on nothing it sent before");
+                assert_eq!(m.or(delta, sent), x, "a slot passes on everything it has not sent");
+                assert_eq!(lattice.unsent(&mut m, key, x), Bdd::FALSE, "a slot sends a difference once");
+                sent = x;
+            }
+            let word = (BlockId(round), 0, BlockId(1), 0, true);
+            assert_eq!(lattice.unsent(&mut m, word, sent), sent, "each slot keeps its own record");
+            assert!(lattice.narrow(&mut m, Bdd::TRUE));
+            assert_eq!(lattice.unsent(&mut m, key, sent), sent, "narrowing forgets what every slot sent");
+        }
+        assert!(grew > 600);
     }
 }

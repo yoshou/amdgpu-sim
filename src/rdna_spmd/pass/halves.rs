@@ -1,6 +1,8 @@
 use super::super::analysis::Analyses;
+use super::super::hash::HashMap;
 use super::super::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::Hash;
 
 pub struct Halves;
 impl super::Pass for Halves {
@@ -12,7 +14,7 @@ impl super::Pass for Halves {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Claim {
     Equal(ValueId, ValueId),
     Symmetric(ValueId),
@@ -118,7 +120,7 @@ impl<'a> Program<'a> {
 }
 
 fn proven(program: &Program, roots: Vec<Claim>) -> BTreeSet<Claim> {
-    let mut premises: BTreeMap<Claim, Option<Vec<Claim>>> = BTreeMap::new();
+    let mut premises: HashMap<Claim, Option<Vec<Claim>>> = HashMap::default();
     let mut pending = roots;
     while let Some(claim) = pending.pop() {
         if premises.contains_key(&claim) {
@@ -130,20 +132,31 @@ fn proven(program: &Program, roots: Vec<Claim>) -> BTreeSet<Claim> {
         }
         premises.insert(claim, needs);
     }
-    let mut holds: BTreeSet<Claim> = premises.iter().filter(|(_, p)| p.is_some()).map(|(&c, _)| c).collect();
-    loop {
-        let failed: Vec<Claim> = holds
-            .iter()
-            .copied()
-            .filter(|c| premises[c].as_ref().unwrap().iter().any(|p| !holds.contains(p)))
-            .collect();
-        if failed.is_empty() {
-            return holds;
-        }
-        for c in failed {
-            holds.remove(&c);
+    greatest(&premises)
+}
+
+fn greatest<C: Copy + Ord + Hash>(premises: &HashMap<C, Option<Vec<C>>>) -> BTreeSet<C> {
+    let mut users: HashMap<C, Vec<C>> = HashMap::default();
+    let mut failed = Vec::new();
+    for (&c, needs) in premises {
+        match needs {
+            Some(needs) => {
+                for &n in needs {
+                    users.entry(n).or_default().push(c);
+                }
+            }
+            None => failed.push(c),
         }
     }
+    let mut holds: HashMap<C, bool> = premises.iter().map(|(&c, p)| (c, p.is_some())).collect();
+    while let Some(c) = failed.pop() {
+        for &u in users.get(&c).into_iter().flatten() {
+            if std::mem::replace(holds.get_mut(&u).unwrap(), false) {
+                failed.push(u);
+            }
+        }
+    }
+    holds.into_iter().filter(|&(_, held)| held).map(|(c, _)| c).collect()
 }
 
 fn run(f: &mut Func) -> usize {
@@ -166,14 +179,17 @@ fn run(f: &mut Func) -> usize {
         return 0;
     }
     let holds = proven(&program, roots);
-    let mut position: BTreeMap<ValueId, (BlockId, usize)> = BTreeMap::new();
+    if !holds.iter().any(|c| matches!(c, Claim::Equal(..))) {
+        return 0;
+    }
+    let mut position: Vec<Option<(BlockId, usize)>> = vec![None; f.types.len()];
     for (&id, block) in &f.blocks {
         for (index, &(v, _)) in block.params.iter().enumerate() {
-            position.insert(v, (id, index));
+            position[v.0] = Some((id, index));
         }
         for (index, inst) in block.insts.iter().enumerate() {
             if let Inst::Core { value, .. } = inst {
-                position.insert(*value, (id, block.params.len() + index));
+                position[value.0] = Some((id, block.params.len() + index));
             }
         }
     }
@@ -192,7 +208,7 @@ fn run(f: &mut Func) -> usize {
         if ra == rb {
             continue;
         }
-        let (keep, drop) = if position[&ra] <= position[&rb] { (ra, rb) } else { (rb, ra) };
+        let (keep, drop) = if position[ra.0].unwrap() <= position[rb.0].unwrap() { (ra, rb) } else { (rb, ra) };
         parent.insert(drop, keep);
     }
     if parent.is_empty() {
@@ -437,6 +453,43 @@ mod tests {
         assert!(run(&mut f) > 0);
         let (lo, hi) = halves_of(&f, wide);
         assert_eq!(lo, hi, "both halves select the same bit of the wave's flag");
+    }
+
+    #[test]
+    fn the_greatest_fixpoint_keeps_exactly_the_claims_that_reach_no_failure() {
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let mut kept = 0;
+        for _ in 0..2000 {
+            let n = 1 + r.below(10);
+            let premises: HashMap<usize, Option<Vec<usize>>> = (0..n)
+                .map(|c| {
+                    let needs = if r.below(6) == 0 {
+                        None
+                    } else {
+                        Some((0..r.below(4)).map(|_| r.below(n)).collect())
+                    };
+                    (c, needs)
+                })
+                .collect();
+            let fails = |start: usize| {
+                let mut seen = vec![false; n];
+                let mut stack = vec![start];
+                while let Some(c) = stack.pop() {
+                    if std::mem::replace(&mut seen[c], true) {
+                        continue;
+                    }
+                    match &premises[&c] {
+                        None => return true,
+                        Some(needs) => stack.extend(needs),
+                    }
+                }
+                false
+            };
+            let want: BTreeSet<usize> = (0..n).filter(|&c| !fails(c)).collect();
+            kept += want.len();
+            assert_eq!(greatest(&premises), want, "premises {:?}", premises);
+        }
+        assert!(kept > 1000, "the random premises let too few claims hold to test anything");
     }
 
     #[test]

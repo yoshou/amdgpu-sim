@@ -683,6 +683,116 @@ fn post_equals_the_projection_of_the_formula_and_every_argument_relation() {
 }
 
 #[test]
+fn restate_equals_the_projection_of_the_formula_and_every_link_onto_the_block() {
+    let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+    let e = BlockId(0);
+    let (src, s) = b.block(&[Ty::I1; 4]);
+    let (dst, d) = b.block(&[Ty::I1; 4]);
+    b.br(e, src, vec![p[0]; 4]);
+    b.br(src, dst, s.clone());
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let tags = [Choice::Meet(0)];
+    let mut pool: Vec<Atom> = s.iter().chain(&d).map(|&v| Atom::Bit(v)).collect();
+    pool.extend([Atom::Lane(0), Atom::Lane(5), Atom::Marker(Choice::Meet(0)), Atom::Fresh(1, d[0], 0)]);
+    let mut r = Random::new(71);
+    let mut projected = 0;
+    for _ in 0..400 {
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &tags);
+        let formula = random_function(&mut logic, &mut r, &pool, 4);
+        let mut links = Vec::new();
+        for _ in 0..r.below(5) {
+            let atom = logic.atom(Atom::Bit(d[r.below(d.len() as u64) as usize]));
+            let bound = random_function(&mut logic, &mut r, &pool, 3);
+            links.push((atom, bound));
+        }
+        let mut whole = formula;
+        for &(atom, bound) in &links {
+            let link = logic.m.iff(atom, bound);
+            whole = logic.m.and(whole, link);
+        }
+        let foreign: Vec<u32> = logic
+            .support(whole)
+            .iter()
+            .copied()
+            .filter(|&v| !matches!(logic.atom_of(v), Atom::Marker(_) | Atom::Lane(5)) && logic.scope(&facts, v) != Some(dst))
+            .collect();
+        let want = logic.exists(&foreign, whole);
+        let got = logic.restate(&facts, dst, formula, &links);
+        assert_eq!(got, want, "restating must project away every atom outside the block but the markers and the upper half");
+        projected += (!foreign.is_empty() && want != whole) as usize;
+    }
+    assert!(projected > 100, "too few rounds had anything to project");
+}
+
+fn canonical(m: &crate::rdna_spmd::analysis::bdd::Manager, g: Bdd) -> String {
+    fn walk(m: &crate::rdna_spmd::analysis::bdd::Manager, g: Bdd, seen: &mut HashMap<Bdd, usize>, out: &mut Vec<String>) -> String {
+        match m.decompose(g) {
+            None => format!("{}", g == Bdd::TRUE),
+            Some((var, low, high)) => {
+                if let Some(&i) = seen.get(&g) {
+                    return format!("#{}", i);
+                }
+                let (low, high) = (walk(m, low, seen, out), walk(m, high, seen, out));
+                out.push(format!("{}?{}:{}", var, high, low));
+                seen.insert(g, out.len() - 1);
+                format!("#{}", out.len() - 1)
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let root = walk(m, g, &mut HashMap::default(), &mut out);
+    format!("{} {}", root, out.join(" "))
+}
+
+#[test]
+fn a_structured_logic_reads_every_comparison_and_crossing_as_a_lazy_one() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let yes = b.constant(e, Ty::I1, 1);
+    let table = k.buffer(&mut b, e, 8);
+    let u = b.load(e, Space::Global, MemSize::B32, table, yes);
+    let at = b.constant(e, Ty::I64, 4);
+    let second = b.int(e, IntOp::Add, table, at);
+    let v = b.load(e, Space::Global, MemSize::B32, second, yes);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let mut tests = Vec::new();
+    for (pred, x, y) in [(IntPred::Ult, u, v), (IntPred::Eq, u, v), (IntPred::Ult, lane, u), (IntPred::Ugt, v, lane)] {
+        tests.push(b.cmp(e, pred, x, y));
+    }
+    let five = b.constant(e, Ty::I32, 5);
+    tests.push(b.cmp(e, IntPred::Ult, u, five));
+    let sum = b.int(e, IntOp::Add, u, lane);
+    tests.push(b.cmp(e, IntPred::Ult, sum, v));
+    let (next, n) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I1]);
+    b.br(e, next, vec![k.exec, u, v, tests[0]]);
+    for (pred, x, y) in [(IntPred::Ult, n[1], n[2]), (IntPred::Ugt, n[1], n[2]), (IntPred::Ne, n[1], n[2])] {
+        tests.push(b.cmp(next, pred, x, y));
+    }
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let structure = Structure::of(f, &facts);
+    let mut lazy = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    let mut known = Logic::structured(&structure, f, &facts, &BTreeSet::new(), &[]);
+    let mut cells = 0;
+    for &t in &tests {
+        let (x, y) = (lazy.bit(f, &facts, t), known.bit(f, &facts, t));
+        assert_eq!(canonical(&lazy.m, x), canonical(&known.m, y), "the bit of v{}", t.0);
+        cells += lazy.support(x).iter().filter(|&&var| matches!(lazy.atom_of(var), Atom::Cell(..))).count();
+    }
+    let crossing = |logic: &mut Logic| {
+        let x = logic.bit(f, &facts, tests[2]);
+        let y = logic.bit(f, &facts, tests[5]);
+        let both = logic.m.and(x, y);
+        let crossed = logic.image(f, &facts, e, 0, both);
+        assert_ne!(crossed, Bdd::FALSE);
+        canonical(&logic.m, crossed)
+    };
+    assert_eq!(crossing(&mut lazy), crossing(&mut known), "the difference a crossing carries");
+    assert!(cells > 0, "the comparisons must read cells for the test to check the structure");
+}
+
+#[test]
 fn choose_keeps_the_first_choices_it_can_convert_and_nothing_it_need_not_keep() {
     let (b, _) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
     let f = &b.f;

@@ -185,6 +185,7 @@ impl Hazards {
         let mut state = start.clone();
         let settled = |s: &Judgments| s.iter().all(|&(found, idle)| found && idle == [false; 2]);
         let mut open = Opening::default();
+        let mut shapes = Shapes::default();
         let mut wave = 0;
         while wave < waves {
             if state.values().all(settled) {
@@ -255,6 +256,7 @@ impl Hazards {
                             (&hazards.accesses[q], &lanes[q]),
                             &variant,
                             differ,
+                            &mut shapes,
                         );
                         if let Some(idle) = found {
                             now[k].0 = true;
@@ -823,11 +825,11 @@ fn meet(
     (qa, q): (&Access, &[Option<Place>]),
     variant: &dyn Fn(&UnknownInfo) -> bool,
     differ: Option<Unknown>,
+    judgments: &mut Shapes,
 ) -> Option<[bool; 2]> {
     let mut idle: Option<[bool; 2]> = None;
     let mut lanes_p: Vec<Option<LaneFacts>> = vec![None; p.len()];
     let mut lanes_q: Vec<Option<LaneFacts>> = vec![None; q.len()];
-    let mut judgments = Shapes::default();
     for (a, x) in p.iter().enumerate() {
         let Some(x) = x else { continue };
         for (b, y) in q.iter().enumerate() {
@@ -859,9 +861,9 @@ fn meet(
             }
             let (lp, lq) = (lanes_p[a].as_ref().unwrap(), lanes_q[b].as_ref().unwrap());
             let limits = [&lp.classes, &lq.classes];
-            let apart = !may_overlap_within(addresses.unknowns(), &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, &mut judgments)
+            let apart = !may_overlap_within(addresses.unknowns(), &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, judgments)
                 || match (&lp.wide, &lq.wide) {
-                    (Some(wx), Some(wy)) => wide_apart(addresses.unknowns(), (wx, x.bytes), (wy, y.bytes), variant, differ, limits, &mut judgments),
+                    (Some(wx), Some(wy)) => wide_apart(addresses.unknowns(), (wx, x.bytes), (wy, y.bytes), variant, differ, limits, judgments),
                     _ => false,
                 };
             if apart {
@@ -1137,6 +1139,28 @@ mod tests {
             };
         }
         (unknowns, variant, x, y, a, b)
+    }
+
+    #[test]
+    fn one_shape_cache_shared_by_every_pair_judges_each_as_a_fresh_one_does() {
+        let mut r = Random::new(19);
+        let none = Classes::new();
+        let mut shared = Shapes::default();
+        let mut overlapping = 0;
+        for round in 0..30000 {
+            let (unknowns, variant, x, y, a, b) = match round % 3 {
+                0 => random_case(&mut r, false),
+                1 => random_case(&mut r, true),
+                _ => random_set_case(&mut r),
+            };
+            let differ = (r.below(3) == 0).then(|| r.below(unknowns.len() as u64) as Unknown);
+            let variant = |i: &UnknownInfo| variant[i.rank];
+            let fresh = may_overlap_within(&unknowns, &x, &y, a, b, &variant, differ, [&none, &none], &mut Shapes::default());
+            let reused = may_overlap_within(&unknowns, &x, &y, a, b, &variant, differ, [&none, &none], &mut shared);
+            assert_eq!(fresh, reused, "{:?} ({} bytes) and {:?} ({} bytes) differing in {:?}", x, a, y, b, differ);
+            overlapping += fresh as usize;
+        }
+        assert!(overlapping > 1000 && overlapping < 29000, "{} of 30000 overlap", overlapping);
     }
 
     #[test]

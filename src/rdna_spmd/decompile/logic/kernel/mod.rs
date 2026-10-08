@@ -121,6 +121,7 @@ impl<S: Rules> Kernel<S> {
         self.values.state.uniform(&self.values.atoms, facts, var)
     }
 
+    #[cfg(test)]
     pub fn scope(&self, facts: &Facts, var: u32) -> Option<BlockId> {
         atoms::scope(self.values.atoms.of(var), facts)
     }
@@ -139,6 +140,14 @@ impl<S: Rules> Kernel<S> {
             values: &mut self.values,
         };
         self.edges.image(&mut q, f, facts, src, slot, formula)
+    }
+
+    pub fn restate(&mut self, m: &mut Manager, facts: &Facts, block: BlockId, formula: Bdd, links: &[(Bdd, Bdd)]) -> Bdd {
+        let mut q = Eval {
+            m,
+            values: &mut self.values,
+        };
+        edges::restate(&mut q, facts, block, formula, links)
     }
 
     #[cfg(test)]

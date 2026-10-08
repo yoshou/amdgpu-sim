@@ -1,8 +1,8 @@
 use super::check::Check;
 use super::hazard::Hazards;
-use super::logic::{choices, Atom, Choice, Kept, Logic};
+use super::logic::{choices, Atom, Choice, Kept, Logic, Structure};
 use crate::rdna_spmd::analysis::bdd::Bdd;
-use crate::rdna_spmd::analysis::facts::Facts;
+use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
@@ -22,6 +22,7 @@ pub fn prove(
         )
     });
     let listed = listed(f, &base, hazards);
+    let structure = Structure::of(f, &base);
     let order: HashMap<Choice, usize> = listed
         .iter()
         .enumerate()
@@ -31,11 +32,11 @@ pub fn prove(
     let mut added = BTreeSet::new();
     loop {
         let facts = Facts::new(f, inputs, &kept.words);
-        let logic = Logic::fixed(f, &facts, &kept.choices(), &listed);
+        let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
         let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
         if check.run() {
             let failed = if added.len() == 1 { added.first().copied() } else { None };
-            let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, &listed, kept.clone(), failed);
+            let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, &base, &structure, &listed, kept.clone(), failed);
             if minimal == kept {
                 let everyone = check.everyone(&BTreeSet::new());
                 return (without_covered_meetings(&mut check, kept), everyone);
@@ -75,7 +76,7 @@ pub fn prove(
         }
     }
     let facts = Facts::new(f, inputs, &kept.words);
-    let logic = Logic::fixed(f, &facts, &kept.choices(), &listed);
+    let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
     let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
     assert!(check.run(), "the conversion policy left after dropping redundant choices no longer proves");
     let everyone = check.everyone(&BTreeSet::new());
@@ -89,11 +90,12 @@ fn proves(
     exec_index: Option<usize>,
     loops: &Loops,
     hazards: &Hazards,
+    structure: &Structure,
     listed: &[Choice],
     kept: &Kept,
 ) -> bool {
     let facts = Facts::new(f, inputs, &kept.words);
-    let logic = Logic::fixed(f, &facts, &kept.choices(), listed);
+    let logic = Logic::structured(structure, f, &facts, &kept.choices(), listed);
     let mut check = Check::new(f, &facts, inputs, exec_index, loops, hazards, logic);
     check.eager();
     check.run()
@@ -105,6 +107,8 @@ fn without_redundant_choices(
     exec_index: Option<usize>,
     loops: &Loops,
     hazards: &Hazards,
+    base: &Facts,
+    structure: &Structure,
     listed: &[Choice],
     mut kept: Kept,
     failed: Option<Choice>,
@@ -115,6 +119,7 @@ fn without_redundant_choices(
         .map(|&v| Choice::Query(v))
         .chain(kept.words.iter().map(|&v| Choice::Word(v)))
         .collect();
+    let schedule = latest_first(base, &candidates);
     let without = |choice: Choice| {
         let mut trial = kept.clone();
         trial.remove(choice);
@@ -125,16 +130,15 @@ fn without_redundant_choices(
     let alone: Vec<bool> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
-                let (candidates, without, next) = (&candidates, &without, &next);
+                let (candidates, schedule, without, next) = (&candidates, &schedule, &without, &next);
                 scope.spawn(move || {
                     let mut done = Vec::new();
                     loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= candidates.len() {
+                        let Some(&i) = schedule.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else {
                             return done;
-                        }
+                        };
                         let redundant = Some(candidates[i]) != failed
-                            && proves(f, inputs, exec_index, loops, hazards, listed, &without(candidates[i]));
+                            && proves(f, inputs, exec_index, loops, hazards, structure, listed, &without(candidates[i]));
                         done.push((i, redundant));
                     }
                 })
@@ -155,12 +159,29 @@ fn without_redundant_choices(
         }
         let mut trial = kept.clone();
         trial.remove(choice);
-        if first || proves(f, inputs, exec_index, loops, hazards, listed, &trial) {
+        if first || proves(f, inputs, exec_index, loops, hazards, structure, listed, &trial) {
             kept = trial;
         }
         first = false;
     }
     kept
+}
+
+fn latest_first(facts: &Facts, candidates: &[Choice]) -> Vec<usize> {
+    let rank: HashMap<BlockId, usize> = facts.order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
+    let position = |c: Choice| {
+        let (Choice::Query(v) | Choice::Word(v)) = c else {
+            return None;
+        };
+        match facts.site[v.0] {
+            Site::Param { block, index } => Some((rank[&block], 0, index)),
+            Site::Inst { block, index } => Some((rank[&block], 1, index)),
+            _ => None,
+        }
+    };
+    let mut order: Vec<usize> = (0..candidates.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(position(candidates[i])));
+    order
 }
 
 fn without_covered_meetings(check: &mut Check, mut kept: Kept) -> Kept {
@@ -287,6 +308,28 @@ mod tests {
     }
 
     #[test]
+    fn trials_start_from_the_choice_latest_in_the_program() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let one = b.constant(e, Ty::I32, 1);
+        let odd = b.int(e, IntOp::And, lane, one);
+        let test = b.cmp(e, IntPred::Ne, odd, one);
+        let early = b.wave(e, WaveOp::Any, vec![test]);
+        let word = b.int(e, IntOp::Add, lane, one);
+        let (later, l) = b.block(&[Ty::I1, Ty::I32]);
+        b.br(e, later, vec![p[0], word]);
+        let late = b.wave(later, WaveOp::Any, vec![l[0]]);
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let candidates = [Choice::Query(early), Choice::Word(l[1]), Choice::Query(late), Choice::Word(word)];
+        assert_eq!(
+            latest_first(&facts, &candidates),
+            vec![2, 1, 3, 0],
+            "the later block first, its parameters before its instructions, and later instructions before earlier ones"
+        );
+    }
+
+    #[test]
     fn redundant_choices_go_and_needed_ones_stay() {
         let (b, needed, needless) = needed_and_needless_queries();
         let (f, inputs) = (&b.f, &b.inputs[..]);
@@ -300,16 +343,17 @@ mod tests {
         let base = Facts::new(f, inputs, &BTreeSet::new());
         let loops = Loops::new(f, &base).unwrap();
         let listed = listed(f, &base, &hazards);
+        let structure = Structure::of(f, &base);
         let mut all = Kept::default();
         for q in [needed, needless[0], needless[1]] {
             assert!(listed.contains(&Choice::Query(q)));
             all.insert(Choice::Query(q));
         }
-        assert!(proves(f, inputs, Some(0), &loops, &hazards, &listed, &all));
-        assert!(!proves(f, inputs, Some(0), &loops, &hazards, &listed, &Kept::default()), "a lane without the flag skips the store the wave makes");
-        let minimal = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &listed, all.clone(), None);
+        assert!(proves(f, inputs, Some(0), &loops, &hazards, &structure, &listed, &all));
+        assert!(!proves(f, inputs, Some(0), &loops, &hazards, &structure, &listed, &Kept::default()), "a lane without the flag skips the store the wave makes");
+        let minimal = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &base, &structure, &listed, all.clone(), None);
         assert_eq!(minimal.choices(), BTreeSet::from([Choice::Query(needed)]), "every lane computes the same tests the wave asks about");
-        let known = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &listed, all, Some(Choice::Query(needed)));
+        let known = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &base, &structure, &listed, all, Some(Choice::Query(needed)));
         assert_eq!(known.choices(), minimal.choices(), "a choice whose removal the search saw fail stays without a trial");
         let (kept, _) = prove(f, inputs, Some(0), &hazards);
         assert_eq!(kept.choices(), BTreeSet::from([Choice::Query(needed)]));

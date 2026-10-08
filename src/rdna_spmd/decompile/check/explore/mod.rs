@@ -473,7 +473,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
     ) {
         let (f, facts) = (self.eval.q.program().f, self.eval.q.program().facts);
         let dst = &f.blocks[&block];
-        let mut relation = Bdd::TRUE;
+        let mut links = Vec::new();
         for (k, &(param, ty)) in dst.params.iter().enumerate() {
             if !self.eval.logic().carried(param) {
                 continue;
@@ -485,8 +485,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
             };
             if let Some(g) = sides[LANE][k].bits {
                 let a = self.eval.logic().atom(atom);
-                let link = self.eval.logic().m.iff(a, g);
-                relation = self.eval.q.and(relation, link);
+                links.push((a, g));
             }
         }
         let mut restatements: HashMap<Bdd, Bdd> = HashMap::default();
@@ -519,15 +518,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
             let restated = match restatements.get(&differs) {
                 Some(&r) => r,
                 None => {
-                    let logic = q.logic();
-                    let mut foreign: HashMap<u32, ()> = HashMap::default();
-                    let supports = [logic.support(differs), logic.support(relation)];
-                    for &v in supports.iter().flat_map(|s| s.iter()) {
-                        if !matches!(logic.atom_of(v), Atom::Marker(_) | Atom::Lane(5)) && logic.scope(facts, v) != Some(block) {
-                            foreign.insert(v, ());
-                        }
-                    }
-                    let r = logic.m.and_exists(differs, relation, &|v| foreign.contains_key(&v));
+                    let r = q.logic().restate(facts, block, differs, &links);
                     restatements.insert(differs, r);
                     r
                 }
@@ -541,5 +532,77 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                 .or_insert_with(|| vec![Bdd::FALSE; dst.params.len()]);
             entry[k] = logic.m.or(entry[k], restated);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::hazard::Hazards;
+    use super::super::super::logic::{Choice, Logic};
+    use super::super::super::testing::*;
+    use super::super::differences::Differences;
+    use super::super::Mode;
+    use super::*;
+    use crate::rdna_spmd::analysis::facts::Facts;
+    use crate::rdna_spmd::analysis::loops::Loops;
+
+    #[test]
+    fn a_meeting_restates_each_difference_through_every_bit_the_lane_brings() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::MaskBit(EXEC + 1), Ty::I1)]);
+        let e = BlockId(0);
+        let (join, j) = b.block(&[Ty::I1; 4]);
+        b.br(e, join, vec![p[0], p[1], p[0], p[1]]);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(f, &facts).unwrap();
+        let hazards = Hazards {
+            accesses: Vec::new(),
+            together: BTreeSet::new(),
+            apart: BTreeSet::new(),
+            idle: BTreeSet::new(),
+            meetings: Vec::new(),
+        };
+        let tags = [Choice::Meet(0)];
+        let mut pool: Vec<Atom> = p.iter().chain(&j).map(|&v| Atom::Bit(v)).collect();
+        pool.extend([Atom::Lane(0), Atom::Lane(5), Atom::Marker(Choice::Meet(0)), Atom::Fresh(LANE, j[1], 0)]);
+        let mut r = Random::new(43);
+        let mut restated = 0;
+        for _ in 0..200 {
+            let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards);
+            let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &tags);
+            let mut d = Differences::new(program, logic, Mode::Search);
+            let cond = random_function(&mut d.logic, &mut r, &pool, 3);
+            let lane: Vec<Desc> = j
+                .iter()
+                .map(|_| Desc {
+                    same: None,
+                    bits: (r.below(4) != 0).then(|| random_function(&mut d.logic, &mut r, &pool, 3)),
+                })
+                .collect();
+            let wave = vec![Desc { same: None, bits: None }; j.len()];
+            let mut want = cond;
+            for (&v, desc) in j.iter().zip(&lane) {
+                if let Some(g) = desc.bits {
+                    let a = d.logic.atom(Atom::Bit(v));
+                    let link = d.logic.m.iff(a, g);
+                    want = d.logic.m.and(want, link);
+                }
+            }
+            let foreign: Vec<u32> = d
+                .logic
+                .support(want)
+                .iter()
+                .copied()
+                .filter(|&v| !matches!(d.logic.atom_of(v), Atom::Marker(_) | Atom::Lane(5)) && d.logic.scope(&facts, v) != Some(join))
+                .collect();
+            let want = d.logic.exists(&foreign, want);
+            let mut memo = Memo::default();
+            let mut arrivals = BTreeMap::new();
+            Explore::new(&mut d, &mut memo, e, Bdd::TRUE).meet(join, cond, &[wave, lane], &mut arrivals);
+            let got = arrivals.get(&join).cloned().unwrap_or_else(|| vec![Bdd::FALSE; j.len()]);
+            assert_eq!(got, vec![want; j.len()], "every parameter differs where the paths meet, read through the bits the lane brings");
+            restated += (want != Bdd::FALSE && want != cond) as usize;
+        }
+        assert!(restated > 50, "too few meetings restated anything");
     }
 }

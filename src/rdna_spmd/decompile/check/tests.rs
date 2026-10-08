@@ -4475,6 +4475,39 @@ fn masked_tests_of_words_hold_only_where_inactive_lanes_see_zero() {
     assert!(wrong.is_empty(), "{:?}", wrong);
 }
 
+#[test]
+fn masks_forget_a_parameter_once_one_of_its_arguments_is_not_masked() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let sixteen = b.constant(e, Ty::I32, 16);
+    let low = b.cmp(e, IntPred::Ult, lane, sixteen);
+    let (then, t) = b.block(&[Ty::I1, Ty::I1]);
+    b.br(e, then, vec![k.exec, low]);
+    let lane = b.core(then, Ty::I32, Op::Env(Env::LaneId));
+    let eight = b.constant(then, Ty::I32, 8);
+    let small = b.cmp(then, IntPred::Ult, lane, eight);
+    let under_flag = b.int(then, IntOp::And, t[1], small);
+    let under_exec = b.int(then, IntOp::And, t[0], small);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let loops = Loops::new(f, &facts).unwrap();
+    let hazards = Hazards {
+        accesses: Vec::new(),
+        together: BTreeSet::new(),
+        apart: BTreeSet::new(),
+        idle: BTreeSet::new(),
+        meetings: Vec::new(),
+    };
+    let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+    assert!(check.run());
+    let masks = check.differences.masks();
+    assert!(!masks.masked(t[1]), "the flag is a test every lane makes, active or not");
+    assert!(!masks.masked(under_flag), "an inactive lane whose flag is set computes a true bit");
+    assert!(masks.masked(under_exec), "a bit under the lane's own exec bit is false in every inactive lane");
+}
+
 type Formula = Box<dyn Fn(&mut Logic, &dyn Fn(ValueId) -> Bdd) -> Bdd>;
 
 struct Case {

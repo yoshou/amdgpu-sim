@@ -21,6 +21,14 @@ pub struct Logic {
     kernel: Kernel<State>,
 }
 
+pub struct Structure(rules::Cells);
+
+impl Structure {
+    pub fn of(f: &Func, facts: &Facts) -> Self {
+        Self(rules::Cells::of(f, facts))
+    }
+}
+
 impl Logic {
     #[inline]
     fn eval(&mut self) -> Eval<'_, State> {
@@ -31,6 +39,13 @@ impl Logic {
         Self {
             m: Manager::new(),
             kernel: Kernel::fixed(f, facts, kept, tags, State::default()),
+        }
+    }
+
+    pub fn structured(structure: &Structure, f: &Func, facts: &Facts, kept: &BTreeSet<Choice>, tags: &[Choice]) -> Self {
+        Self {
+            m: Manager::new(),
+            kernel: Kernel::fixed(f, facts, kept, tags, State::with_cells(structure.0.clone())),
         }
     }
 
@@ -104,6 +119,7 @@ impl Logic {
         self.kernel.uniform_atom(facts, var)
     }
 
+    #[cfg(test)]
     pub fn scope(&self, facts: &Facts, var: u32) -> Option<BlockId> {
         self.kernel.scope(facts, var)
     }
@@ -182,6 +198,10 @@ impl Logic {
         formula: Bdd,
     ) -> Bdd {
         self.kernel.image(&mut self.m, f, facts, src, slot, formula)
+    }
+
+    pub fn restate(&mut self, facts: &Facts, block: BlockId, formula: Bdd, links: &[(Bdd, Bdd)]) -> Bdd {
+        self.kernel.restate(&mut self.m, facts, block, formula, links)
     }
 
     #[cfg(test)]
