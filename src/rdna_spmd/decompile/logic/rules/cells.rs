@@ -6,13 +6,13 @@ use crate::rdna_spmd::analysis::facts::{Facts, Site};
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 type HashSet<T> = std::collections::HashSet<T, std::hash::BuildHasherDefault<crate::rdna_spmd::hash::Mix>>;
 
 #[derive(Default)]
 struct BlockCells {
-    of: HashMap<ValueId, Rc<Tree>>,
+    of: HashMap<ValueId, Arc<Tree>>,
     opaque: HashMap<ValueId, (IntPred, ValueId, ValueId)>,
     placed: HashMap<usize, (u16, usize)>,
     groups: Vec<CellGroup>,
@@ -22,8 +22,8 @@ struct BlockCells {
 enum Tree {
     Const(bool),
     Leaf(usize),
-    Pick(ValueId, Rc<Tree>, Rc<Tree>),
-    Test(ValueId, bool, Rc<Tree>),
+    Pick(ValueId, Arc<Tree>, Arc<Tree>),
+    Test(ValueId, bool, Arc<Tree>),
 }
 
 impl Tree {
@@ -45,11 +45,11 @@ impl Tree {
 #[derive(Default)]
 struct Distributor {
     preds: Vec<(IntPred, ValueId, ValueId)>,
-    trees: HashMap<(IntPred, ValueId, ValueId), Rc<Tree>>,
+    trees: HashMap<(IntPred, ValueId, ValueId), Arc<Tree>>,
 }
 
 impl Distributor {
-    fn distribute(&mut self, f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Rc<Tree> {
+    fn distribute(&mut self, f: &Func, facts: &Facts, p: IntPred, a: ValueId, b: ValueId) -> Arc<Tree> {
         if let Some(tree) = self.trees.get(&(p, a, b)) {
             return tree.clone();
         }
@@ -78,10 +78,10 @@ impl Distributor {
             Tree::Leaf(index)
         };
         let tree = match (p, lane_test(f, facts, a, b)) {
-            (IntPred::Eq | IntPred::Ne, Some(w)) => Tree::Test(w, p == IntPred::Eq, Rc::new(tree)),
+            (IntPred::Eq | IntPred::Ne, Some(w)) => Tree::Test(w, p == IntPred::Eq, Arc::new(tree)),
             _ => tree,
         };
-        let tree = Rc::new(tree);
+        let tree = Arc::new(tree);
         self.trees.insert((p, a, b), tree.clone());
         tree
     }
@@ -169,14 +169,80 @@ const CELLS: usize = 64;
 const GROUP: usize = 12;
 const JOINT: usize = 1 << 10;
 
-#[derive(Default)]
-pub(super) struct Cells {
-    blocks: HashMap<BlockId, Rc<BlockCells>>,
+#[derive(Default, Clone)]
+pub struct Cells {
+    blocks: HashMap<BlockId, Arc<BlockCells>>,
     groups: HashMap<(BlockId, u16), (u8, Vec<ValueId>)>,
     uniform_tests: HashSet<ValueId>,
 }
 
 impl Cells {
+    pub fn of(f: &Func, facts: &Facts) -> Self {
+        let mut cells = Cells::default();
+        for &block in &facts.order {
+            cells.block(f, facts, block);
+        }
+        cells
+    }
+
+    fn block(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Arc<BlockCells> {
+        if let Some(cells) = self.blocks.get(&block) {
+            return cells.clone();
+        }
+        let mut distributor = Distributor::default();
+        let mut trees: Vec<(ValueId, IntPred, ValueId, ValueId, Arc<Tree>)> = Vec::new();
+        for inst in &f.blocks[&block].insts {
+            if let Inst::Core { value, op: Op::Cmp(p, a, b), .. } = inst {
+                trees.push((*value, *p, *a, *b, distributor.distribute(f, facts, *p, *a, *b)));
+            }
+        }
+        let preds = distributor.preds;
+        let terms = Terms::new(f, facts);
+        let leaves_of = |a: ValueId, b: ValueId| {
+            if f.types[a.0] != Ty::I32 {
+                return None;
+            }
+            let (mut set, mut lane) = (BTreeSet::new(), false);
+            terms.leaves(a, 0, &mut set, &mut lane);
+            terms.leaves(b, 0, &mut set, &mut lane);
+            (!set.is_empty() && set.iter().all(|l| !facts.lane_word[l.0])).then_some(set)
+        };
+        let leaves: Vec<Option<BTreeSet<ValueId>>> = preds.iter().map(|&(_, a, b)| leaves_of(a, b)).collect();
+        let mut cells = BlockCells::default();
+        for list in grouped(&leaves) {
+            if list.len() > GROUP {
+                continue;
+            }
+            let preds: Vec<(IntPred, ValueId, ValueId)> = list.iter().map(|&i| preds[i]).collect();
+            let Some(worlds) = Terms::new(f, facts).worlds(&preds, CELLS) else {
+                continue;
+            };
+            if worlds.is_empty() {
+                continue;
+            }
+            let uniform: Vec<bool> = preds.iter().map(|&p| Terms::new(f, facts).uniform(p)).collect();
+            let leaves: BTreeSet<ValueId> = list.iter().flat_map(|&i| leaves[i].iter().flatten().copied()).collect();
+            let group = CellGroup::new(worlds, preds, leaves, uniform);
+            let number = cells.groups.len() as u16;
+            self.groups.insert((block, number), (CellGroup::bits(group.counts.0), group.leaves.iter().copied().collect()));
+            for (k, &i) in list.iter().enumerate() {
+                cells.placed.insert(i, (number, k));
+            }
+            cells.groups.push(group);
+        }
+        for (value, p, a, b, tree) in trees {
+            let mut indices = BTreeSet::new();
+            tree.leaves(&mut indices);
+            if indices.iter().any(|i| !cells.placed.contains_key(i)) && !facts.uniform[value.0] && a != b && leaves_of(a, b).is_some() {
+                cells.opaque.insert(value, (p, a, b));
+            }
+            cells.of.insert(value, tree);
+        }
+        let cells = Arc::new(cells);
+        self.blocks.insert(block, cells.clone());
+        cells
+    }
+
     #[inline]
     pub(super) fn leaves(&self, block: BlockId, group: u16) -> &[ValueId] {
         &self.groups[&(block, group)].1
@@ -194,69 +260,14 @@ impl Cells {
 }
 
 pub(super) trait HasCells {
-    fn cells(&self) -> &Cells;
     fn cells_mut(&mut self) -> &mut Cells;
 }
 
-fn block_cells<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId) -> Rc<BlockCells>
+fn block_cells<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId) -> Arc<BlockCells>
 where
     Q::State: HasCells,
 {
-    if let Some(cells) = q.state().cells().blocks.get(&block) {
-        return cells.clone();
-    }
-    let mut distributor = Distributor::default();
-    let mut trees: Vec<(ValueId, IntPred, ValueId, ValueId, Rc<Tree>)> = Vec::new();
-    for inst in &f.blocks[&block].insts {
-        if let Inst::Core { value, op: Op::Cmp(p, a, b), .. } = inst {
-            trees.push((*value, *p, *a, *b, distributor.distribute(f, facts, *p, *a, *b)));
-        }
-    }
-    let preds = distributor.preds;
-    let terms = Terms::new(f, facts);
-    let leaves_of = |a: ValueId, b: ValueId| {
-        if f.types[a.0] != Ty::I32 {
-            return None;
-        }
-        let (mut set, mut lane) = (BTreeSet::new(), false);
-        terms.leaves(a, 0, &mut set, &mut lane);
-        terms.leaves(b, 0, &mut set, &mut lane);
-        (!set.is_empty() && set.iter().all(|l| !facts.lane_word[l.0])).then_some(set)
-    };
-    let leaves: Vec<Option<BTreeSet<ValueId>>> = preds.iter().map(|&(_, a, b)| leaves_of(a, b)).collect();
-    let mut cells = BlockCells::default();
-    for list in grouped(&leaves) {
-        if list.len() > GROUP {
-            continue;
-        }
-        let preds: Vec<(IntPred, ValueId, ValueId)> = list.iter().map(|&i| preds[i]).collect();
-        let Some(worlds) = Terms::new(f, facts).worlds(&preds, CELLS) else {
-            continue;
-        };
-        if worlds.is_empty() {
-            continue;
-        }
-        let uniform: Vec<bool> = preds.iter().map(|&p| Terms::new(f, facts).uniform(p)).collect();
-        let leaves: BTreeSet<ValueId> = list.iter().flat_map(|&i| leaves[i].iter().flatten().copied()).collect();
-        let group = CellGroup::new(worlds, preds, leaves, uniform);
-        let number = cells.groups.len() as u16;
-        q.state_mut().cells_mut().groups.insert((block, number), (CellGroup::bits(group.counts.0), group.leaves.iter().copied().collect()));
-        for (k, &i) in list.iter().enumerate() {
-            cells.placed.insert(i, (number, k));
-        }
-        cells.groups.push(group);
-    }
-    for (value, p, a, b, tree) in trees {
-        let mut indices = BTreeSet::new();
-        tree.leaves(&mut indices);
-        if indices.iter().any(|i| !cells.placed.contains_key(i)) && !facts.uniform[value.0] && a != b && leaves_of(a, b).is_some() {
-            cells.opaque.insert(value, (p, a, b));
-        }
-        cells.of.insert(value, tree);
-    }
-    let cells = Rc::new(cells);
-    q.state_mut().cells_mut().blocks.insert(block, cells.clone());
-    cells
+    q.state_mut().cells_mut().block(f, facts, block)
 }
 
 pub(super) fn cell_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<Bdd>
@@ -306,8 +317,8 @@ fn leaf_bit<Q: Queries>(q: &mut Q, block: BlockId, v: ValueId, index: usize, cel
     result
 }
 
-fn tree_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId, v: ValueId, tree: &Rc<Tree>, cells: &BlockCells, done: &mut HashMap<*const Tree, Bdd>) -> Bdd {
-    if let Some(&b) = done.get(&Rc::as_ptr(tree)) {
+fn tree_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId, v: ValueId, tree: &Arc<Tree>, cells: &BlockCells, done: &mut HashMap<*const Tree, Bdd>) -> Bdd {
+    if let Some(&b) = done.get(&Arc::as_ptr(tree)) {
         return b;
     }
     let result = match &**tree {
@@ -342,7 +353,7 @@ fn tree_bit<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, block: BlockId, v: V
             q.m().ite(c, yes, no)
         }
     };
-    done.insert(Rc::as_ptr(tree), result);
+    done.insert(Arc::as_ptr(tree), result);
     result
 }
 

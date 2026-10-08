@@ -15,6 +15,13 @@ pub struct State {
 }
 
 impl State {
+    pub fn with_cells(cells: Cells) -> Self {
+        Self {
+            cells,
+            ..Self::default()
+        }
+    }
+
     pub fn lane_function(&mut self, f: &Func, facts: &Facts, v: ValueId) -> Option<[u32; MAX_LANES]> {
         self.lanes.of(f, facts, v, 0)
     }
@@ -43,11 +50,6 @@ impl HasLanes for State {
 }
 
 impl HasCells for State {
-    #[inline]
-    fn cells(&self) -> &Cells {
-        &self.cells
-    }
-
     #[inline]
     fn cells_mut(&mut self) -> &mut Cells {
         &mut self.cells

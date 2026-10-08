@@ -191,12 +191,14 @@ impl<'a> Check<'a> {
                 for &(pred, slot) in &facts.incoming[&b] {
                     let arg = f.blocks[&pred].term.edges().nth(slot).unwrap().args[k];
                     let x = d.h(arg);
+                    let x = d.unsent((b, k, pred, slot, false), x);
                     if x != Bdd::FALSE {
                         let image = d.edge_difference(pred, slot, x);
                         h = d.or(h, image);
                     }
                     if mode != Bdd::FALSE {
                         let x = d.whole(arg);
+                        let x = d.unsent((b, k, pred, slot, true), x);
                         if x != Bdd::FALSE {
                             let image = d.edge_difference(pred, slot, x);
                             word = d.or(word, image);

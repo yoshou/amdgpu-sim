@@ -9,6 +9,7 @@ mod words;
 #[cfg(test)]
 pub use floats::float_compare;
 pub(super) use state::State;
+pub use cells::Cells;
 pub use lanes::MAX_LANES;
 
 use super::kernel::Eval;

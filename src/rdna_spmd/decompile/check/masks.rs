@@ -10,6 +10,17 @@ pub(super) struct Masks {
     faithful: Vec<bool>,
 }
 
+fn any_of(logic: &mut Logic, atoms: impl Iterator<Item = Atom>) -> Bdd {
+    let mut literals: Vec<(u32, Bdd)> = atoms
+        .map(|atom| {
+            let literal = logic.atom(atom);
+            (logic.m.decompose(literal).unwrap().0, literal)
+        })
+        .collect();
+    literals.sort_unstable_by_key(|&(var, _)| std::cmp::Reverse(var));
+    literals.into_iter().fold(Bdd::FALSE, |acc, (_, literal)| logic.m.or(literal, acc))
+}
+
 impl Masks {
     pub(super) fn unsolved(n: usize) -> Self {
         Self {
@@ -56,24 +67,34 @@ impl Masks {
                 self.faithful[param.0] = assumed && word(param);
             }
         }
+        let mut actives: Vec<Option<(Vec<ValueId>, Bdd)>> = vec![None; facts.order.len()];
         let mut changed = true;
         while changed {
             changed = false;
-            for &b in &facts.order {
+            for (rank, &b) in facts.order.iter().enumerate() {
                 let block = &f.blocks[&b];
                 let exec = block.params[ei].0;
-                let mut active = logic.atom(Atom::Bit(exec));
-                for &(param, ty) in &block.params {
-                    if param != exec && self.masked[param.0] {
-                        let atom = if ty == Ty::I1 {
-                            Atom::Bit(param)
-                        } else {
-                            Atom::View(param)
-                        };
-                        let known = logic.atom(atom);
-                        active = logic.m.or(active, known);
+                let known: Vec<ValueId> = block
+                    .params
+                    .iter()
+                    .map(|&(param, _)| param)
+                    .filter(|&param| param == exec || self.masked[param.0])
+                    .collect();
+                let active = match &actives[rank] {
+                    Some((same, active)) if *same == known => *active,
+                    _ => {
+                        let atoms = known.iter().map(|&param| {
+                            if param == exec || f.types[param.0] == Ty::I1 {
+                                Atom::Bit(param)
+                            } else {
+                                Atom::View(param)
+                            }
+                        });
+                        let active = any_of(logic, atoms);
+                        actives[rank] = Some((known, active));
+                        active
                     }
-                }
+                };
                 let mut lockstep = HashMap::default();
                 for inst in &block.insts {
                     for v in inst.outputs() {
@@ -252,5 +273,45 @@ impl Masks {
         };
         memo.insert(w, l);
         l
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::testing::*;
+    use super::*;
+    use crate::rdna_spmd::analysis::facts::Facts;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn any_of_is_the_disjunction_of_its_atoms_in_any_order() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let types = [Ty::I1, Ty::I32, Ty::I1, Ty::I1, Ty::I32, Ty::I1, Ty::I32, Ty::I1];
+        let (next, params) = b.block(&types);
+        let zero = b.constant(BlockId(0), Ty::I32, 0);
+        let args = types.iter().map(|&ty| if ty == Ty::I1 { p[0] } else { zero }).collect();
+        b.br(BlockId(0), next, args);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let pool: Vec<Atom> = params
+            .iter()
+            .zip(&types)
+            .map(|(&v, &ty)| if ty == Ty::I1 { Atom::Bit(v) } else { Atom::View(v) })
+            .chain([Atom::Lane(0), Atom::Lane(5)])
+            .collect();
+        let mut r = Random::new(5);
+        for _ in 0..300 {
+            let mut atoms: Vec<Atom> = pool.iter().copied().filter(|_| r.below(2) == 0).collect();
+            for i in (1..atoms.len()).rev() {
+                atoms.swap(i, r.below(i as u64 + 1) as usize);
+            }
+            let mut want = Bdd::FALSE;
+            for &a in &atoms {
+                let x = logic.atom(a);
+                want = logic.m.or(want, x);
+            }
+            assert_eq!(any_of(&mut logic, atoms.iter().copied()), want, "{:?}", atoms);
+        }
     }
 }

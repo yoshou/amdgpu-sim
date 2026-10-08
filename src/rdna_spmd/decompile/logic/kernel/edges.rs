@@ -314,8 +314,32 @@ fn project<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, formula: Bdd, lin
     schedule(q, facts, src, formula, &rest)
 }
 
+pub(super) fn restate<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, formula: Bdd, links: &[(Bdd, Bdd)]) -> Bdd {
+    let foreign = |q: &mut Q, f: Bdd| -> Vec<u32> {
+        q.support(f)
+            .iter()
+            .copied()
+            .filter(|&v| !matches!(q.atoms().of(v), Atom::Marker(_) | Atom::Lane(5)) && q.scope(facts, v) != Some(block))
+            .collect()
+    };
+    let formula_atoms: BTreeSet<u32> = foreign(q, formula).into_iter().collect();
+    let links: Vec<Binding> = links
+        .iter()
+        .map(|&(atom, bound)| Binding {
+            atom,
+            bound,
+            support: foreign(q, bound),
+        })
+        .collect();
+    product(q, formula_atoms, formula, &links)
+}
+
 fn schedule<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, formula: Bdd, links: &[Binding]) -> Bdd {
     let formula_atoms: BTreeSet<u32> = q.scoped(facts, formula, src).into_iter().collect();
+    product(q, formula_atoms, formula, links)
+}
+
+fn product<Q: Queries>(q: &mut Q, formula_atoms: BTreeSet<u32>, formula: Bdd, links: &[Binding]) -> Bdd {
     let mut occurrences: HashMap<u32, usize> = HashMap::default();
     for link in links {
         for &v in &link.support {
