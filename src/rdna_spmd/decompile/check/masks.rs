@@ -5,6 +5,7 @@ use crate::rdna_spmd::analysis::facts::Site;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 
+#[derive(Clone)]
 pub(super) struct Masks {
     masked: Vec<bool>,
     faithful: Vec<bool>,

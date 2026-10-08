@@ -1,4 +1,4 @@
-use super::check::Check;
+use super::check::{Basis, Check};
 use super::hazard::Hazards;
 use super::logic::{choices, Atom, Choice, Kept, Logic, Structure};
 use crate::rdna_spmd::analysis::bdd::Bdd;
@@ -30,10 +30,16 @@ pub fn prove(
         .collect();
     let mut kept = Kept::default();
     let mut added = BTreeSet::new();
+    let mut basis: Option<Basis> = None;
     loop {
         let facts = Facts::new(f, inputs, &kept.words);
-        let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
-        let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
+        let mut check = match basis.take() {
+            Some(basis) => Check::resume(f, &facts, inputs, exec_index, &loops, hazards, basis, &kept.choices()),
+            None => {
+                let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
+                Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic)
+            }
+        };
         if check.run() {
             let failed = if added.len() == 1 { added.first().copied() } else { None };
             let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, &base, &structure, &listed, kept.clone(), failed);
@@ -71,6 +77,9 @@ pub fn prove(
         }
         let before = kept.choices();
         added = blamed.into_iter().filter(|c| !before.contains(c)).collect();
+        if added.iter().all(|c| matches!(c, Choice::Meet(_))) {
+            basis = Some(check.retire());
+        }
         for &c in &added {
             kept.insert(c);
         }

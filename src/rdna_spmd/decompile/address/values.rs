@@ -209,6 +209,10 @@ impl<'a> Values<'a> {
         }
     }
 
+    pub(super) fn unreached(&self, b: BlockId) -> bool {
+        self.memo.reach.done.get(&b).is_some_and(|&(reached, _)| !reached)
+    }
+
     pub(super) fn enter(&mut self, wave: usize) -> bool {
         if self.entered == Some(wave) {
             return false;
