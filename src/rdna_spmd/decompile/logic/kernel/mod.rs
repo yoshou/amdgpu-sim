@@ -23,6 +23,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use values::Values;
 
+#[cfg(test)]
+pub fn with_joint_limit<T>(limit: usize, f: impl FnOnce() -> T) -> T {
+    let before = edges::JOINT_LIMIT.with(|l| l.replace(limit));
+    let r = f();
+    edges::JOINT_LIMIT.with(|l| l.set(before));
+    r
+}
+
 pub struct Kernel<S> {
     values: Values<S>,
     edges: Edges,

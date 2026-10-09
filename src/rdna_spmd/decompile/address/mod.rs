@@ -104,10 +104,6 @@ impl<'a> Addresses<'a> {
         self.values.reached(b)
     }
 
-    pub fn known_unreached(&self, b: BlockId) -> bool {
-        self.values.unreached(b)
-    }
-
     pub fn operand(&mut self, x: ValueId, at: BlockId, lane: usize, assume: Option<ValueId>) -> Assumed<Value> {
         self.values.operand(x, at, lane, assume)
     }

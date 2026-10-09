@@ -827,9 +827,6 @@ fn meet(
     differ: Option<Unknown>,
     judgments: &mut Shapes,
 ) -> Option<[bool; 2]> {
-    if addresses.known_unreached(pa.block) || addresses.known_unreached(qa.block) {
-        return None;
-    }
     let mut idle: Option<[bool; 2]> = None;
     let mut lanes_p: Vec<Option<LaneFacts>> = vec![None; p.len()];
     let mut lanes_q: Vec<Option<LaneFacts>> = vec![None; q.len()];

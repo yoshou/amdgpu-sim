@@ -21,15 +21,53 @@ struct Node {
     var: u32,
     low: Bdd,
     high: Bdd,
+    next: u32,
+}
+
+const PAGE: usize = 2 << 20;
+
+#[cfg(target_os = "linux")]
+fn advise<T>(v: &Vec<T>) {
+    let bytes = v.capacity() * std::mem::size_of::<T>();
+    let start = (v.as_ptr() as usize).next_multiple_of(PAGE);
+    let end = (v.as_ptr() as usize + bytes) / PAGE * PAGE;
+    if start < end {
+        unsafe {
+            libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise<T>(_: &Vec<T>) {}
+
+fn paged<T>(capacity: usize) -> Vec<T> {
+    let v = Vec::with_capacity(capacity);
+    advise(&v);
+    v
+}
+
+fn reserve<T: Copy>(v: &mut Vec<T>, len: usize) {
+    if len > v.capacity() {
+        let mut grown = paged(len.max(2 * v.capacity()));
+        grown.extend_from_slice(v);
+        *v = grown;
+    }
+}
+
+fn place(var: u32, low: Bdd, high: Bdd) -> usize {
+    let key = (low.0 as u64 | (high.0 as u64) << 32) ^ (var as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let h = key.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    (h ^ h >> 31) as usize
 }
 
 const TERMINAL: u32 = u32::MAX;
 
-const ITE_SLOTS: usize = 1 << 19;
+const ITE_SLOTS: usize = 1 << 16;
 
 pub struct Manager {
     nodes: Vec<Node>,
-    unique: HashMap<(u32, Bdd, Bdd), Bdd>,
+    heads: Vec<u32>,
 
     ite: Vec<(Bdd, Bdd, Bdd, Bdd)>,
     restrict: HashMap<(Bdd, Bdd), Bdd>,
@@ -45,10 +83,11 @@ impl Manager {
             var: TERMINAL,
             low: Bdd(value),
             high: Bdd(value),
+            next: 0,
         };
         Self {
             nodes: vec![terminal(0), terminal(1)],
-            unique: HashMap::default(),
+            heads: vec![0; 1 << 10],
             ite: Vec::new(),
             restrict: HashMap::default(),
             implications: HashMap::default(),
@@ -111,13 +150,41 @@ impl Manager {
         if low == high {
             return low;
         }
-        if let Some(&id) = self.unique.get(&(var, low, high)) {
-            return id;
+        let slot = place(var, low, high) & (self.heads.len() - 1);
+        let mut id = self.heads[slot];
+        while id != 0 {
+            let node = self.nodes[id as usize];
+            if node.var == var && node.low == low && node.high == high {
+                return Bdd(id);
+            }
+            id = node.next;
         }
-        let id = Bdd(self.nodes.len() as u32);
-        self.nodes.push(Node { var, low, high });
-        self.unique.insert((var, low, high), id);
-        id
+        let id = self.nodes.len() as u32;
+        reserve(&mut self.nodes, id as usize + 1);
+        self.nodes.push(Node {
+            var,
+            low,
+            high,
+            next: self.heads[slot],
+        });
+        self.heads[slot] = id;
+        if self.nodes.len() > self.heads.len() {
+            self.rehash();
+        }
+        Bdd(id)
+    }
+
+    fn rehash(&mut self) {
+        let size = 2 * self.heads.len();
+        let mut heads = paged(size);
+        heads.resize(size, 0);
+        for id in 2..self.nodes.len() {
+            let node = self.nodes[id];
+            let slot = place(node.var, node.low, node.high) & (size - 1);
+            self.nodes[id].next = heads[slot];
+            heads[slot] = id as u32;
+        }
+        self.heads = heads;
     }
 
     pub fn var(&mut self, var: u32) -> Bdd {
@@ -162,7 +229,8 @@ impl Manager {
         };
         if self.ite.len() < self.nodes.len().min(ITE_SLOTS) {
             let slots = (self.nodes.len() * 2).next_power_of_two().clamp(1 << 10, ITE_SLOTS);
-            self.ite = vec![(Bdd::FALSE, Bdd::FALSE, Bdd::FALSE, Bdd::FALSE); slots];
+            self.ite = paged(slots);
+            self.ite.resize(slots, (Bdd::FALSE, Bdd::FALSE, Bdd::FALSE, Bdd::FALSE));
         }
         let slot = self.slot(f, g, h);
         let (cf, cg, ch, cached) = self.ite[slot];
@@ -176,7 +244,15 @@ impl Manager {
         let (h0, h1) = self.cofactors(h, var);
         let low = self.ite(f0, g0, h0);
         let high = self.ite(f1, g1, h1);
-        let r = self.node(var, low, high);
+        let r = if (low, high) == (g0, g1) {
+            g
+        } else if (low, high) == (h0, h1) {
+            h
+        } else if (low, high) == (f0, f1) {
+            f
+        } else {
+            self.node(var, low, high)
+        };
 
         let slot = self.slot(f, g, h);
         self.ite[slot] = (f, g, h, r);
@@ -222,6 +298,7 @@ impl Manager {
 
     fn generation(&mut self) -> u32 {
         if self.marks.len() < self.nodes.len() {
+            reserve(&mut self.marks, self.nodes.len());
             self.marks.resize(self.nodes.len(), (0, Bdd::FALSE));
         }
         self.generation = self.generation.wrapping_add(1);
@@ -254,6 +331,8 @@ impl Manager {
             } else {
                 self.and(low, high)
             }
+        } else if (low, high) == (node.low, node.high) {
+            f
         } else {
             self.node(node.var, low, high)
         };
@@ -303,7 +382,13 @@ impl Manager {
             }
         } else {
             let high = self.and_exists_memo(f1, g1, chosen, memo);
-            self.node(var, low, high)
+            if (low, high) == (f0, f1) {
+                f
+            } else if (low, high) == (g0, g1) {
+                g
+            } else {
+                self.node(var, low, high)
+            }
         };
         memo.insert((f, g), r);
         r
@@ -338,23 +423,47 @@ impl Manager {
         let node = self.nodes[f.0 as usize];
         let low = self.compose_memo(node.low, map, last, generation);
         let high = self.compose_memo(node.high, map, last, generation);
-        let v = match map(node.var) {
-            Some(g) => g,
-            None => self.var(node.var),
-        };
-        let n = self.nodes[v.0 as usize];
-        let r = if n.low == Bdd::FALSE && n.high == Bdd::TRUE && n.var < self.top(low) && n.var < self.top(high) {
-            self.node(n.var, low, high)
-        } else {
-            self.ite(v, high, low)
+        let r = match map(node.var) {
+            Some(v) => {
+                let n = self.nodes[v.0 as usize];
+                if n.low == Bdd::FALSE && n.high == Bdd::TRUE && n.var < self.top(low) && n.var < self.top(high) {
+                    self.node(n.var, low, high)
+                } else {
+                    self.ite(v, high, low)
+                }
+            }
+            None if (low, high) == (node.low, node.high) => f,
+            None if node.var < self.top(low) && node.var < self.top(high) => self.node(node.var, low, high),
+            None => {
+                let v = self.var(node.var);
+                self.ite(v, high, low)
+            }
         };
         self.marks[f.0 as usize] = (generation, r);
         r
     }
 
+    pub fn size(&mut self, f: Bdd) -> usize {
+        let generation = self.generation();
+        let mut count = 0;
+        let mut stack = vec![f];
+        while let Some(g) = stack.pop() {
+            if g.constant().is_some() || self.marks[g.0 as usize].0 == generation {
+                continue;
+            }
+            self.marks[g.0 as usize].0 = generation;
+            count += 1;
+            let node = self.nodes[g.0 as usize];
+            stack.push(node.low);
+            stack.push(node.high);
+        }
+        count
+    }
+
     pub fn support(&mut self, f: Bdd) -> Vec<u32> {
         let generation = self.generation();
         let mut out = Vec::new();
+        let mut recent = [TERMINAL; 256];
         let mut stack = vec![f];
         while let Some(g) = stack.pop() {
             if g.constant().is_some() || self.marks[g.0 as usize].0 == generation {
@@ -362,7 +471,11 @@ impl Manager {
             }
             self.marks[g.0 as usize].0 = generation;
             let node = self.nodes[g.0 as usize];
-            out.push(node.var);
+            let slot = (node.var.wrapping_mul(0x9e37_79b9) >> 24) as usize;
+            if recent[slot] != node.var {
+                recent[slot] = node.var;
+                out.push(node.var);
+            }
             stack.push(node.low);
             stack.push(node.high);
         }
@@ -426,6 +539,148 @@ mod tests {
             joint.dedup();
             assert!(m.support(both).iter().all(|v| joint.contains(v)));
             assert_eq!(m.support(f), want, "asking again must give the same support");
+        }
+    }
+
+    #[test]
+    fn support_keeps_each_of_many_scattered_variables_once() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut m = Manager::new();
+        let vars: Vec<u32> = (0..700u32).map(|i| (1 << 30) | (i << 7) | (i % 5)).collect();
+        for round in 0..40 {
+            let mut f = Bdd::FALSE;
+            let mut picked = Vec::new();
+            for _ in 0..40 + round * 15 {
+                let v = vars[random(&mut state) as usize % vars.len()];
+                let x = m.var(v);
+                f = m.xor(f, x);
+                picked.push(v);
+            }
+            picked.sort_unstable();
+            picked.dedup();
+            let want: Vec<u32> = picked.into_iter().filter(|&v| m.cofactor(f, v, false) != m.cofactor(f, v, true)).collect();
+            assert!(want.len() > 20 + round * 5);
+            assert_eq!(m.support(f), want, "the support must list every variable whose cofactors differ once, in order");
+        }
+    }
+
+    #[test]
+    fn ite_follows_its_operands_row_by_row() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let mut m = Manager::new();
+        let vars = 8;
+        for _ in 0..500 {
+            let f = random_function(&mut m, &mut state, vars);
+            let g = random_function(&mut m, &mut state, vars);
+            let h = if random(&mut state) % 4 == 0 { m.and(g, f) } else { random_function(&mut m, &mut state, vars) };
+            let r = m.ite(f, g, h);
+            for row in 0..1u32 << vars {
+                let value = |v: u32| row >> v & 1 == 1;
+                let want = if evaluate(&m, f, &value) { evaluate(&m, g, &value) } else { evaluate(&m, h, &value) };
+                assert_eq!(evaluate(&m, r, &value), want, "ite must take g where f holds and h elsewhere");
+            }
+        }
+    }
+
+    #[test]
+    fn and_exists_conjoins_before_quantifying() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let mut m = Manager::new();
+        let vars = 8;
+        for _ in 0..500 {
+            let f = random_function(&mut m, &mut state, vars);
+            let g = if random(&mut state) % 3 == 0 { m.or(f, Bdd::FALSE) } else { random_function(&mut m, &mut state, vars) };
+            let chosen: Vec<u32> = (0..vars).filter(|_| random(&mut state) % 3 == 0).collect();
+            let r = m.and_exists(f, g, &|v| chosen.contains(&v));
+            let both = m.and(f, g);
+            assert_eq!(r, m.exists(both, &|v| chosen.contains(&v)), "quantifying {:?} out of the conjunction", chosen);
+            for row in 0..1u32 << vars {
+                let want = (0..1u32 << chosen.len()).any(|pick| {
+                    let value = |v: u32| match chosen.iter().position(|&c| c == v) {
+                        Some(i) => pick >> i & 1 == 1,
+                        None => row >> v & 1 == 1,
+                    };
+                    evaluate(&m, f, &value) && evaluate(&m, g, &value)
+                });
+                assert_eq!(evaluate(&m, r, &|v| row >> v & 1 == 1), want);
+            }
+        }
+    }
+
+    #[test]
+    fn equal_functions_keep_one_node_while_the_table_grows() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let mut m = Manager::new();
+        let vars = 9;
+        let mut built: Vec<(Bdd, Vec<bool>)> = Vec::new();
+        let rows = |m: &Manager, f: Bdd| -> Vec<bool> { (0..1u32 << vars).map(|row| evaluate(m, f, &|v| row >> v & 1 == 1)).collect() };
+        let start = m.heads.len();
+        while m.nodes.len() < 40 * start {
+            let f = random_function(&mut m, &mut state, vars);
+            let table = rows(&m, f);
+            built.push((f, table));
+        }
+        assert!(m.heads.len() >= 32 * start, "the table must have grown several times");
+        let mut first: HashMap<Vec<bool>, Bdd> = HashMap::default();
+        for (f, table) in &built {
+            assert_eq!(*first.entry(table.clone()).or_insert(*f), *f, "equal functions must be one node");
+        }
+        let count = m.nodes.len();
+        let mut again = 0x2545_f491_4f6c_dd1d;
+        for (f, _) in &built {
+            assert_eq!(random_function(&mut m, &mut again, vars), *f, "building a function again must find its node");
+        }
+        assert_eq!(m.nodes.len(), count, "building functions again must create no node");
+        for id in 2..m.nodes.len() {
+            let node = m.nodes[id];
+            assert_eq!(m.node(node.var, node.low, node.high), Bdd(id as u32), "every node must be found by its own fields");
+        }
+    }
+
+    #[test]
+    fn reserve_keeps_contents_and_room() {
+        for len in [0usize, 1, 1000, 3 << 20] {
+            let mut v: Vec<u32> = (0..len as u32).collect();
+            v.shrink_to_fit();
+            let full = v.capacity();
+            reserve(&mut v, len + 1);
+            assert!(v.capacity() > len && v.capacity() >= 2 * full, "growing must at least double the room");
+            assert!(v.iter().copied().eq(0..len as u32), "growing must keep every element");
+            let before = v.capacity();
+            reserve(&mut v, len);
+            assert_eq!(v.capacity(), before, "room already there must not move the elements");
+            let w: Vec<u64> = paged(len);
+            assert!(w.capacity() >= len && w.is_empty());
+        }
+    }
+
+    #[test]
+    fn advice_leaves_every_element_in_place() {
+        for len in [0usize, 10, 1 << 20, 5 << 20] {
+            let v: Vec<u64> = (0..len as u64).map(|i| i.wrapping_mul(0x9e37_79b9_7f4a_7c15)).collect();
+            advise(&v);
+            assert!(v.iter().enumerate().all(|(i, &x)| x == (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)));
+        }
+    }
+
+    #[test]
+    fn size_counts_every_node_a_function_reaches_once() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        let mut m = Manager::new();
+        for _ in 0..300 {
+            let f = random_function(&mut m, &mut state, 8);
+            let mut seen = std::collections::BTreeSet::new();
+            let mut stack = vec![f];
+            while let Some(g) = stack.pop() {
+                if let Some((_, low, high)) = m.decompose(g) {
+                    if seen.insert(g) {
+                        stack.push(low);
+                        stack.push(high);
+                    }
+                }
+            }
+            assert_eq!(m.size(f), seen.len());
+            assert_eq!(m.size(f), seen.len(), "counting again must give the same size");
         }
     }
 
