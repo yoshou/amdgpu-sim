@@ -197,12 +197,20 @@ impl<'a> Terms<'a> {
         Some(())
     }
 
-    pub(super) fn uniform(&mut self, (pred, x, y): (IntPred, ValueId, ValueId)) -> bool {
+    pub(super) fn uniform(&mut self, p: (IntPred, ValueId, ValueId)) -> bool {
+        self.uniform_noting(p, &mut |_, _| {})
+    }
+
+    pub(super) fn uniform_noting(&mut self, (pred, x, y): (IntPred, ValueId, ValueId), read: &mut dyn FnMut(ValueId, bool)) -> bool {
         let (wx, wy) = (self.word(x), self.word(y));
         let mut other = self.clone();
         other.words.clear();
         other.lane = None;
-        other.values.retain(|v, _| self.facts.uniform[v.0]);
+        let uniform = &self.facts.uniform;
+        other.values.retain(|v, _| {
+            read(*v, uniform[v.0]);
+            uniform[v.0]
+        });
         let (ox, oy) = (other.word(x), other.word(y));
         let mut problem = other.problem;
         problem.either.push(relation_options(outcomes(pred), (wx, wy)));
@@ -611,6 +619,43 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{} wrong: {:#?}", wrong.len(), &wrong[..wrong.len().min(4)]);
+    }
+
+    #[test]
+    fn uniform_notes_every_value_whose_uniformity_can_change_the_answer() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(9122 + shift);
+        let (mut flipped, mut noted, mut decisive) = (0, 0, 0);
+        for case in 0..12 * scale {
+            let c = oracle_case(&mut r);
+            let facts = Facts::new(&c.b.f, &c.b.inputs, &BTreeSet::new());
+            let mut other = Facts::new(&c.b.f, &c.b.inputs, &BTreeSet::new());
+            let words: Vec<usize> = (0..c.b.f.types.len()).filter(|&v| c.b.f.types[v] == Ty::I32).collect();
+            for _ in 0..3 {
+                let (i, j) = (r.below(6) as usize, r.below(6) as usize);
+                let p = (ORACLE_PREDS[r.below(10) as usize], c.exprs[i].1, c.exprs[j].1);
+                let mut reads: Vec<(ValueId, bool)> = Vec::new();
+                let answer = Terms::new(&c.b.f, &facts).uniform_noting(p, &mut |v, u| reads.push((v, u)));
+                assert_eq!(answer, Terms::new(&c.b.f, &facts).uniform(p), "case {}: noting must not change the answer", case);
+                for &(v, u) in &reads {
+                    assert_eq!(u, facts.uniform[v.0], "case {}: v{} noted with the wrong uniformity", case, v.0);
+                }
+                noted += reads.len();
+                for &v in &words {
+                    let read = reads.iter().any(|&(w, _)| w.0 == v);
+                    other.uniform[v] = !other.uniform[v];
+                    let changed = Terms::new(&c.b.f, &other).uniform(p) != answer;
+                    other.uniform[v] = !other.uniform[v];
+                    if read {
+                        decisive += changed as usize;
+                    } else {
+                        flipped += 1;
+                        assert!(!changed, "case {}: flipping v{}, which was not noted, changes the answer", case, v);
+                    }
+                }
+            }
+        }
+        assert!(noted > 40 && flipped > 500 && decisive > 5, "noted {} flipped {} decisive {}", noted, flipped, decisive);
     }
 
     #[test]

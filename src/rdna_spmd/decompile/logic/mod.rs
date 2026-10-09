@@ -47,7 +47,7 @@ impl Logic {
     pub fn structured(structure: &Structure, f: &Func, facts: &Facts, kept: &BTreeSet<Choice>, tags: &[Choice]) -> Self {
         Self {
             m: Manager::new(),
-            kernel: Kernel::fixed(f, facts, kept, tags, State::with_cells(structure.0.clone())),
+            kernel: Kernel::fixed(f, facts, kept, tags, State::with_cells(structure.0.agreeing(facts))),
         }
     }
 
