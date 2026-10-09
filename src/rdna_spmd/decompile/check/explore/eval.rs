@@ -16,6 +16,7 @@ pub(super) struct Write {
     pub(super) address: Option<usize>,
     pub(super) data: Option<usize>,
     pub(super) mask: Bdd,
+    pub(super) semantics: MemorySemantics,
     pub(super) partnered: bool,
 }
 
@@ -460,7 +461,7 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                 } => {
                     let (out, ty) = outputs[0];
                     let pred = self.bits_of(ev, inputs[1]);
-                    let same = if !ev.stored && self.decide(pred, cond, side) == Some(true) {
+                    let same = if !self.stored_before(ev, out) && self.decide(pred, cond, side) == Some(true) {
                         let a = self.operand(ev, inputs[0]);
                         let t = self.intern(ty, Form::Load(*space, *size, a));
                         Some(self.loaded(ty, out, t))
@@ -480,6 +481,13 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
             Inst::Target {
                 op, args, outputs, ..
             } => {
+                if outputs.first().is_some_and(|&(v, _)| self.reads_memory(v) && self.stored_before(ev, v)) {
+                    for &(v, _) in outputs {
+                        let d = self.formed(side, v, None);
+                        ev.descs.insert(v, d);
+                    }
+                    return;
+                }
                 let terms: Vec<usize> =
                     args.values().iter().map(|&a| self.operand(ev, a)).collect();
                 for (i, &(v, ty)) in outputs.iter().enumerate() {
@@ -491,6 +499,20 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
             }
             Inst::Packet { .. } => unreachable!("a packet query in a wave program"),
         }
+    }
+
+    fn stored_before(&self, ev: &Evaluation, v: ValueId) -> bool {
+        let Site::Inst { index, .. } = self.q.program().facts.site[v.0] else {
+            return ev.stored || ev.writes.iter().any(|w| w.op != MemoryOp::Fence);
+        };
+        ev.stored || ev.writes.iter().any(|w| w.op != MemoryOp::Fence && w.at.1 < index)
+    }
+
+    fn reads_memory(&self, v: ValueId) -> bool {
+        let Site::Inst { block, index } = self.q.program().facts.site[v.0] else {
+            return true;
+        };
+        self.q.program().hazards.accesses.iter().any(|a| (a.block, a.index) == (block, index))
     }
 
     pub(super) fn check_effects(&mut self, ev: &mut Evaluation) {
@@ -553,11 +575,30 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                 }
             }
             if let EffectOp::Memory {
+                space,
+                op: MemoryOp::Fence,
+                semantics,
+            } = op
+            {
+                let at = (ev.block, index);
+                ev.writes.push(Write {
+                    at,
+                    space: *space,
+                    op: MemoryOp::Fence,
+                    address: None,
+                    data: None,
+                    mask: Bdd::TRUE,
+                    semantics: *semantics,
+                    partnered: false,
+                });
+            }
+            if let EffectOp::Memory {
                 op:
                     memory @ (MemoryOp::Store(_)
                     | MemoryOp::AtomicAdd(_)
                     | MemoryOp::AtomicRmw(_)
                     | MemoryOp::AtomicCmpSwap),
+                semantics,
                 ..
             } = op
             {
@@ -583,9 +624,9 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                         address,
                         data,
                         mask: pred,
+                        semantics: *semantics,
                         partnered: self.q.program().partnered(at),
                     });
-                    ev.stored = true;
                 }
             }
         }

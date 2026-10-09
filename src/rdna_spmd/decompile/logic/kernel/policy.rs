@@ -129,6 +129,8 @@ impl Policy {
 
     pub(super) fn keep(&mut self, kept: &BTreeSet<Choice>) {
         if let Choices::Fixed { kept: fixed } = &mut self.choices {
+            let conversions = |s: &BTreeSet<Choice>| s.iter().filter(|c| !matches!(c, Choice::Meet(_))).copied().collect::<Vec<_>>();
+            assert!(conversions(fixed) == conversions(kept), "keep changes only which meetings are kept");
             *fixed = kept.clone();
         }
     }

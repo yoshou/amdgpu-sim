@@ -2,7 +2,7 @@ use super::check::Check;
 use super::hazard::Hazards;
 use super::logic::{Kept, Logic};
 use super::search::listed;
-use crate::rdna_spmd::analysis::facts::Facts;
+use crate::rdna_spmd::analysis::facts::{Conversion, Facts};
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeSet;
@@ -13,7 +13,7 @@ pub fn prove(
     exec_index: Option<usize>,
     hazards: &Hazards,
 ) -> (Kept, BTreeSet<u64>) {
-    let facts = Facts::new(f, inputs, &BTreeSet::new());
+    let facts = Facts::converted(f, inputs, &BTreeSet::new(), Conversion::Open);
     let loops = Loops::new(f, &facts).unwrap_or_else(|block| {
         panic!(
             "b{}: control flow enters a cycle other than through its header",

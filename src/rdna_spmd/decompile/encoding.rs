@@ -610,3 +610,72 @@ impl<'a> Encoding<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn holds(e: &Linear, wa: i128, wb: i128) -> i128 {
+        e.terms.iter().fold(e.constant, |acc, &(v, c)| acc + c * if v == 0 { wa } else { wb })
+    }
+
+    fn outcome(a: u32, b: u32) -> u8 {
+        let (u, s) = (a.cmp(&b), (a as i32).cmp(&(b as i32)));
+        use std::cmp::Ordering::*;
+        match (u, s) {
+            (Equal, _) => 1,
+            (Less, Less) => 2,
+            (Less, Greater) => 4,
+            (Greater, Less) => 8,
+            (Greater, Greater) => 16,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn relation_options_match_every_mask() {
+        let interesting = [0u32, 1, 2, 0x7fff_fffe, 0x7fff_ffff, 0x8000_0000, 0x8000_0001, 0xffff_fffe, 0xffff_ffff, 12345, 0x9000_0000];
+        let mut wrong = Vec::new();
+        for mask in 0u8..32 {
+            for &a in &interesting {
+                for &b in &interesting {
+                    let options = relation_options(mask, (0, 1));
+                    let sat = options.iter().any(|c| {
+                        c.equal.iter().all(|e| holds(e, a as i128, b as i128) == 0) && c.at_least.iter().all(|e| holds(e, a as i128, b as i128) >= 0)
+                    });
+                    let expected = mask & outcome(a, b) != 0;
+                    if sat != expected {
+                        wrong.push((mask, a, b, sat));
+                    }
+                    if (mirrored(mask) & outcome(b, a) != 0) != (mask & outcome(a, b) != 0) {
+                        wrong.push((mask, a, b, true));
+                    }
+                }
+            }
+        }
+        let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ugt, IntPred::Ule, IntPred::Uge, IntPred::Slt, IntPred::Sgt, IntPred::Sle, IntPred::Sge];
+        for p in preds {
+            for &a in &interesting {
+                for &b in &interesting {
+                    let (sa, sb) = (a as i32, b as i32);
+                    let truth = match p {
+                        IntPred::Eq => a == b,
+                        IntPred::Ne => a != b,
+                        IntPred::Ult => a < b,
+                        IntPred::Ugt => a > b,
+                        IntPred::Ule => a <= b,
+                        IntPred::Uge => a >= b,
+                        IntPred::Slt => sa < sb,
+                        IntPred::Sgt => sa > sb,
+                        IntPred::Sle => sa <= sb,
+                        IntPred::Sge => sa >= sb,
+                    };
+                    if (outcomes(p) & outcome(a, b) != 0) != truth || (outcomes(negated(p)) & outcome(a, b) != 0) == truth {
+                        wrong.push((outcomes(p), a, b, truth));
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
+    }
+}

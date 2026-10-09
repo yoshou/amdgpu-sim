@@ -213,11 +213,11 @@ struct Solver {
 }
 
 fn gcd(a: i128, b: i128) -> i128 {
-    let (mut a, mut b) = (a.abs(), b.abs());
+    let (mut a, mut b) = (a.unsigned_abs(), b.unsigned_abs());
     while b != 0 {
         (a, b) = (b, a % b);
     }
-    a
+    if a > i128::MAX as u128 { 1 } else { a as i128 }
 }
 
 fn floor_div(a: i128, b: i128) -> i128 {
@@ -230,7 +230,7 @@ fn ceil_div(a: i128, b: i128) -> i128 {
 
 fn modhat(a: i128, m: i128) -> Option<i128> {
     let two_a = a.checked_mul(2)?;
-    Some(a - m * floor_div(two_a.checked_add(m)?, 2 * m))
+    a.checked_sub(m.checked_mul(floor_div(two_a.checked_add(m)?, m.checked_mul(2)?))?)
 }
 
 impl Solver {
@@ -300,7 +300,8 @@ impl Solver {
             if !normalize(&mut rows) {
                 return Some(false);
             }
-            if let Some(k) = rows.iter().position(|r| r.equality) {
+            let smallest = |r: &Row| r.coef.iter().filter(|&&c| c != 0).map(|c| c.unsigned_abs()).min();
+            if let Some(k) = (0..rows.len()).filter(|&k| rows[k].equality).min_by_key(|&k| smallest(&rows[k])) {
                 let row = rows[k].clone();
                 if !self.eliminate_equality(&mut rows, &row, &mut n)? {
                     return Some(false);
@@ -314,6 +315,9 @@ impl Solver {
                 if let Some((v, lo, hi)) = narrowest(&rows, n) {
                     let mut unknown = false;
                     for k in lo..=hi {
+                        if self.steps > STEPS {
+                            return None;
+                        }
                         let mut case = rows.clone();
                         let mut coef = vec![0; n];
                         coef[v] = 1;
@@ -375,6 +379,9 @@ impl Solver {
                 }
                 let top = floor_div(a.checked_mul(bmax)?.checked_sub(a)?.checked_sub(bmax)?, bmax);
                 for i in 0..=top {
+                    if self.steps > STEPS {
+                        return None;
+                    }
                     let mut splinter = rows.clone();
                     let mut eq = l.clone();
                     eq.constant = eq.constant.checked_sub(i)?;
@@ -419,7 +426,7 @@ impl Solver {
     }
 
     fn eliminate_equality(&mut self, rows: &mut Vec<Row>, row: &Row, n: &mut usize) -> Option<bool> {
-        let Some(k) = (0..*n).filter(|&v| row.coef[v] != 0).min_by_key(|&v| row.coef[v].abs()) else {
+        let Some(k) = (0..*n).filter(|&v| row.coef[v] != 0).min_by_key(|&v| row.coef[v].unsigned_abs()) else {
             return Some(row.constant == 0);
         };
         let a = row.coef[k];
@@ -429,15 +436,15 @@ impl Solver {
             constant: 0,
             equality: false,
         };
-        if a.abs() == 1 {
+        if a.unsigned_abs() == 1 {
             for v in 0..*n {
                 if v != k {
-                    expr.coef[v] = -sign * row.coef[v];
+                    expr.coef[v] = row.coef[v].checked_mul(-sign)?;
                 }
             }
-            expr.constant = -sign * row.constant;
+            expr.constant = row.constant.checked_mul(-sign)?;
         } else {
-            let m = a.abs() + 1;
+            let m = a.checked_abs()?.checked_add(1)?;
             for v in 0..*n {
                 if v != k {
                     expr.coef[v] = sign * modhat(row.coef[v], m)?;
@@ -512,4 +519,225 @@ fn combine(l: &Row, u: &Row, x: Var, exact: bool) -> Option<Row> {
         constant,
         equality: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::Random;
+    use super::*;
+
+    const BOX: i128 = 6;
+
+    fn random_linear(r: &mut Random, n: usize, coef: i128, constant: i128) -> Linear {
+        let mut e = Linear::constant(r.below((2 * constant + 1) as u64) as i128 - constant);
+        for v in 0..n {
+            if r.below(3) != 0 {
+                e.add(v, r.below((2 * coef + 1) as u64) as i128 - coef);
+            }
+        }
+        e
+    }
+
+    fn holds(e: &Linear, xs: &[i128]) -> i128 {
+        e.terms.iter().fold(e.constant, |acc, &(v, c)| acc + c * xs[v])
+    }
+
+    fn in_domain(d: &Domain, x: i128) -> bool {
+        match d {
+            Domain::Free => true,
+            Domain::Within(pieces) => pieces.iter().any(|&(lo, hi)| lo <= x && x <= hi),
+        }
+    }
+
+    fn satisfied(p: &Problem, xs: &[i128]) -> bool {
+        p.domains.iter().zip(xs).all(|(d, &x)| in_domain(d, x))
+            && p.equal.iter().all(|e| holds(e, xs) == 0)
+            && p.at_least.iter().all(|e| holds(e, xs) >= 0)
+            && p.either.iter().all(|options| {
+                options.iter().any(|c| c.equal.iter().all(|e| holds(e, xs) == 0) && c.at_least.iter().all(|e| holds(e, xs) >= 0))
+            })
+    }
+
+    fn brute(p: &Problem) -> bool {
+        let n = p.domains.len();
+        let mut xs = vec![-BOX; n];
+        loop {
+            if satisfied(p, &xs) {
+                return true;
+            }
+            let mut k = 0;
+            loop {
+                if k == n {
+                    return false;
+                }
+                xs[k] += 1;
+                if xs[k] <= BOX {
+                    break;
+                }
+                xs[k] = -BOX;
+                k += 1;
+            }
+        }
+    }
+
+    fn random_problem(r: &mut Random, coef: i128) -> Problem {
+        let n = 1 + r.below(4) as usize;
+        let mut p = Problem::default();
+        for v in 0..n {
+            match r.below(4) {
+                0 => {
+                    let w = p.free();
+                    assert_eq!(v, w);
+                    let lo = r.below(13) as i128 - BOX;
+                    let hi = r.below(13) as i128 - BOX;
+                    p.at_least(Linear::constant(-lo).term(v, 1));
+                    p.at_most(Linear::constant(0).term(v, 1), hi.max(lo));
+                }
+                1 => {
+                    let k = 1 + r.below(5);
+                    let values: Vec<i128> = (0..k).map(|_| r.below(13) as i128 - BOX).collect();
+                    p.var(Domain::of_values(values));
+                }
+                _ => {
+                    let lo = r.below(13) as i128 - BOX;
+                    let hi = lo + r.below(13) as i128;
+                    p.between(lo, hi.min(BOX));
+                }
+            }
+        }
+        for _ in 0..r.below(3) {
+            let e = random_linear(r, n, coef, 12);
+            p.equal(e);
+        }
+        for _ in 0..r.below(5) {
+            let e = random_linear(r, n, coef, 12);
+            p.at_least(e);
+        }
+        if r.below(4) == 0 {
+            let options = (0..2)
+                .map(|_| Clause {
+                    equal: if r.below(3) == 0 { vec![random_linear(r, n, coef, 12)] } else { Vec::new() },
+                    at_least: vec![random_linear(r, n, coef, 12)],
+                })
+                .collect();
+            p.either.push(options);
+        }
+        p
+    }
+
+
+    fn knobs() -> (u64, usize) {
+        let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let scale = std::env::var("ORACLE_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        (seed, scale)
+    }
+
+    fn check(seed: u64, trials: usize, coef: i128) {
+        let (shift, scale) = knobs();
+        let trials = trials * scale;
+        let mut r = Random::new(seed + shift);
+        let mut wrong = Vec::new();
+        let mut unknown = 0;
+        for trial in 0..trials {
+            let p = random_problem(&mut r, coef);
+            let truth = brute(&p);
+            match p.feasible() {
+                Some(found) if found != truth => {
+                    wrong.push(format!("trial {}: feasible() says {} but truth is {}: {:?}", trial, found, truth, p));
+                }
+                None => unknown += 1,
+                _ => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong ({} unknown): {:#?}", wrong.len(), unknown, &wrong[..wrong.len().min(3)]);
+    }
+
+    #[test]
+    fn two_equalities_are_eliminated_without_cycling() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rows = vec![
+                Row { coef: vec![-39, -760], constant: 0, equality: true },
+                Row { coef: vec![-2, -39], constant: 0, equality: true },
+                Row { coef: vec![1, 0], constant: -1, equality: false },
+            ];
+            let mut solver = Solver { steps: 0 };
+            let answer = solver.solve(rows, 2);
+            let _ = tx.send((answer, solver.steps));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(matches!(result, Ok((Some(false), steps)) if steps < 100), "{:?}", result);
+    }
+
+    fn within(seconds: u64, p: Problem) -> Result<Option<bool>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(p.feasible());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(seconds)).map_err(|e| match e {
+            std::sync::mpsc::RecvTimeoutError::Timeout => format!("feasible() still running after {} s", seconds),
+            std::sync::mpsc::RecvTimeoutError::Disconnected => "feasible() panicked".to_string(),
+        })
+    }
+
+    #[test]
+    fn feasible_decides_a_word_problem_quickly() {
+        let mut p = Problem::default();
+        p.between(1 << 30, 1 << 30);
+        p.between(0, 1048575);
+        p.between(0, (1 << 32) - 1);
+        p.between(0, 1048574);
+        p.equal(Linear::constant(0).term(1, (1 << 32) - 5).term(3, -(1 << 32)).term(2, -1));
+        p.equal(Linear::constant(0).term(0, 1).term(2, -1));
+        let truth = (0..=1048575i128).any(|v1| {
+            let x = ((1i128 << 32) - 5) * v1 - (1 << 30);
+            x.rem_euclid(1 << 32) == 0 && (0..=1048574).contains(&(x / (1 << 32)))
+        });
+        assert!(!truth);
+        let answer = within(10, p);
+        assert!(matches!(answer, Ok(Some(false)) | Ok(None)), "{:?}", answer);
+    }
+
+    #[test]
+    fn feasible_decides_a_small_problem_with_two_equalities_quickly() {
+        let mut p = Problem::default();
+        p.between(6, 6);
+        p.between(0, 3);
+        p.equal(Linear::constant(1).term(0, -9).term(1, -11));
+        p.equal(Linear::constant(-8).term(0, -10).term(1, -12));
+        p.at_least(Linear::constant(-9).term(0, 5).term(1, -9));
+        assert_eq!(within(5, p), Ok(Some(false)), "x0 = 6 forces 11 x1 = -53");
+    }
+
+    #[test]
+    fn feasible_survives_coefficients_reaching_i128_min() {
+        let mut p = Problem::default();
+        p.free();
+        p.free();
+        p.between(4, 5);
+        p.equal(Linear::constant(0).term(0, -4).term(1, -3));
+        p.equal(Linear::constant(-9).term(0, -3).term(1, 4).term(2, 0));
+        p.at_least(Linear::constant(0).term(0, 1));
+        p.at_least(Linear::constant(4).term(0, -1));
+        p.at_least(Linear::constant(-3).term(1, 1));
+        p.at_least(Linear::constant(3).term(1, -1));
+        p.at_least(Linear::constant(-6).term(0, 3).term(1, -4).term(2, 2));
+        let answer = within(20, p);
+        assert!(matches!(answer, Ok(Some(false)) | Ok(None)), "x1 = 3 forces 4 x0 = -9: {:?}", answer);
+    }
+
+    #[test]
+    fn feasible_agrees_with_brute_force_small_coefficients() {
+        check(101, 3000, 2);
+    }
+
+    #[test]
+    fn feasible_agrees_with_brute_force_large_coefficients() {
+        check(202, 3000, 5);
+    }
+
+    #[test]
+    fn feasible_agrees_with_brute_force_huge_coefficients() {
+        check(303, 2000, 13);
+    }
 }

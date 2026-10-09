@@ -17,6 +17,7 @@ use std::collections::BTreeSet;
 
 pub(super) struct Bounds {
     pub(super) known: Vec<Option<Option<Region>>>,
+    pub(super) allocating: Vec<bool>,
     pub(super) plain: Vec<bool>,
     pub(super) carried: HashMap<ValueId, Vec<Regions>>,
     pub(super) loaded: HashMap<ValueId, Regions>,
@@ -63,11 +64,13 @@ pub(super) fn bounds(
     let mut bounds = HashMap::default();
     let plain = carried(&sets, &mut bounds);
     let known = known(&sets);
+    let allocating = (0..f.types.len()).map(|x| layout.allocates(sets.of(ValueId(x)))).collect();
     let (exposing, spills) = exposure::exposures(&sets, env);
     let loaded = loaded(&sets, &spills, &mut bounds);
     let written = written(&sets);
     Bounds {
         known,
+        allocating,
         plain,
         carried: bounds,
         loaded,

@@ -109,6 +109,7 @@ pub fn decode_program(
         return Err(format!("no SPMD target supports {arch}"));
     };
     wave_passes(&mut program, &super::rdna4::dialect().idioms);
+    program.ir.detach_entry();
     Ok(program)
 }
 

@@ -44,6 +44,10 @@ impl Layout {
         set[i / 64] >> (i % 64) & 1 != 0
     }
 
+    pub(super) fn allocates(&self, set: &[u64]) -> bool {
+        (FIXED.len()..FIXED.len() + self.allocations.len()).any(|i| set[i / 64] >> (i % 64) & 1 != 0)
+    }
+
     pub(super) fn region(&self, i: usize) -> Option<Region> {
         match FIXED.get(i) {
             Some(&r) => r,

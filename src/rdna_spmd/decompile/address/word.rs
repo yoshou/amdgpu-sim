@@ -187,10 +187,11 @@ fn core<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, op: Op, lane: usize, assume: 
         Op::Const(_, k) => Value::constant(k as u32),
         Op::Env(Env::LaneId) => Value::constant(lane as u32),
         Op::Env(Env::ScratchBase) => q.symbols_mut().base(Region::Private),
-        Op::Int(IntOp::Add, a, b) => {
-            let (a, b) = (get!(q, a), get!(q, b));
+        Op::Int(IntOp::Add, x, y) => {
+            let (a, b) = (get!(q, x), get!(q, y));
             let region = match (a.region, b.region) {
-                (Some(r), None) | (None, Some(r)) => Some(r),
+                (Some(r), None) if plain(q, y) => Some(r),
+                (None, Some(r)) if plain(q, x) => Some(r),
                 _ => None,
             };
             Value {
@@ -198,10 +199,10 @@ fn core<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, op: Op, lane: usize, assume: 
                 region,
             }
         }
-        Op::Int(IntOp::Sub, a, b) => {
-            let (a, b) = (get!(q, a), get!(q, b));
+        Op::Int(IntOp::Sub, x, y) => {
+            let (a, b) = (get!(q, x), get!(q, y));
             let region = match (a.region, b.region) {
-                (Some(r), None) => Some(r),
+                (Some(r), None) if plain(q, y) => Some(r),
                 _ => None,
             };
             Value {
@@ -421,6 +422,10 @@ fn core<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, op: Op, lane: usize, assume: 
     (value, used)
 }
 
+fn plain<'a, Q: Queries<'a>>(q: &Q, v: ValueId) -> bool {
+    !q.program().provenance.allocating[v.0]
+}
+
 fn effect<'a, Q: Queries<'a>>(
     q: &mut Q,
     v: ValueId,
@@ -590,7 +595,7 @@ pub(super) fn concrete<'a, Q: Queries<'a>>(q: &mut Q, x: ValueId, param: ValueId
     }
     let x = q.program().copies.get(&x).copied().unwrap_or(x);
     if x == param {
-        return Some(value as u64);
+        return (q.program().f.types[param.0] != Ty::I64).then_some(value as u64);
     }
     let ty = q.program().f.types[x.0];
     let bits = ty.bits() as u64;
@@ -715,6 +720,9 @@ fn stepped<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, block: BlockId, index: usi
 }
 
 fn induction<'a, Q: Queries<'a>>(q: &mut Q, v: ValueId, block: BlockId, index: usize, lane: usize) -> Option<(u32, u32)> {
+    if q.program().f.types[v.0] != Ty::I32 {
+        return None;
+    }
     let own = q.program().rank[&block];
     let mut high = 0u64;
     for &(pred, slot) in &q.program().facts.incoming[&block].clone() {

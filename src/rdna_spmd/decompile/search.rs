@@ -2,7 +2,7 @@ use super::check::{Basis, Check};
 use super::hazard::Hazards;
 use super::logic::{choices, Atom, Choice, Kept, Logic, Structure};
 use crate::rdna_spmd::analysis::bdd::Bdd;
-use crate::rdna_spmd::analysis::facts::{Facts, Site};
+use crate::rdna_spmd::analysis::facts::{Conversion, Facts, Site};
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
@@ -32,7 +32,7 @@ pub fn prove(
     let mut added = BTreeSet::new();
     let mut basis: Option<Basis> = None;
     loop {
-        let facts = Facts::new(f, inputs, &kept.words);
+        let facts = Facts::converted(f, inputs, &kept.words, Conversion::Keeping(&kept.queries));
         let mut check = match basis.take() {
             Some(basis) => Check::resume(f, &facts, inputs, exec_index, &loops, hazards, basis, &kept.choices()),
             None => {
@@ -84,7 +84,7 @@ pub fn prove(
             kept.insert(c);
         }
     }
-    let facts = Facts::new(f, inputs, &kept.words);
+    let facts = Facts::converted(f, inputs, &kept.words, Conversion::Keeping(&kept.queries));
     let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
     let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
     assert!(check.run(), "the conversion policy left after dropping redundant choices no longer proves");
@@ -103,7 +103,7 @@ fn proves(
     listed: &[Choice],
     kept: &Kept,
 ) -> bool {
-    let facts = Facts::new(f, inputs, &kept.words);
+    let facts = Facts::converted(f, inputs, &kept.words, Conversion::Keeping(&kept.queries));
     let logic = Logic::structured(structure, f, &facts, &kept.choices(), listed);
     let mut check = Check::new(f, &facts, inputs, exec_index, loops, hazards, logic);
     check.eager();

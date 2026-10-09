@@ -28,16 +28,27 @@ enum Tree {
 
 impl Tree {
     fn leaves(&self, out: &mut BTreeSet<usize>) {
+        self.leaves_once(out, &mut HashSet::default());
+    }
+
+    fn leaves_once(&self, out: &mut BTreeSet<usize>, seen: &mut HashSet<*const Tree>) {
         match self {
             Tree::Const(_) => {}
             Tree::Leaf(i) => {
                 out.insert(*i);
             }
             Tree::Pick(_, a, b) => {
-                a.leaves(out);
-                b.leaves(out);
+                for t in [a, b] {
+                    if seen.insert(Arc::as_ptr(t)) {
+                        t.leaves_once(out, seen);
+                    }
+                }
             }
-            Tree::Test(_, _, inner) => inner.leaves(out),
+            Tree::Test(_, _, inner) => {
+                if seen.insert(Arc::as_ptr(inner)) {
+                    inner.leaves_once(out, seen);
+                }
+            }
         }
     }
 }
@@ -167,6 +178,7 @@ impl CellGroup {
 
 const CELLS: usize = 64;
 const GROUP: usize = 12;
+const GROUPS: usize = 1 << 12;
 const JOINT: usize = 1 << 10;
 
 #[derive(Default, Clone)]
@@ -210,6 +222,9 @@ impl Cells {
         let leaves: Vec<Option<BTreeSet<ValueId>>> = preds.iter().map(|&(_, a, b)| leaves_of(a, b)).collect();
         let mut cells = BlockCells::default();
         for list in grouped(&leaves) {
+            if cells.groups.len() == GROUPS {
+                break;
+            }
             if list.len() > GROUP {
                 continue;
             }
