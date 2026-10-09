@@ -36,7 +36,7 @@ fn signed(x: u32) -> i32 {
 fn sixteen_bit_integer_operations_zero_the_high_half() {
     let inputs = lanes(3, short);
     let ops: [(&str, fn(u32, u32) -> u32); 11] = [
-        ("v_add_u16", |a, b| low(a + b)),
+        ("v_add_u16", |a, b| low(a.wrapping_add(b))),
         ("v_sub_u16", |a, b| low(a.wrapping_sub(b))),
         ("v_subrev_u16", |a, b| low(b.wrapping_sub(a))),
         ("v_mul_lo_u16", |a, b| low(a.wrapping_mul(b))),
