@@ -16,11 +16,16 @@ pub(super) struct Trail {
     pub(super) checking: usize,
 }
 
-pub(super) struct Journal<E>(Vec<(E, Depth)>);
+pub(super) struct Journal<E> {
+    entries: Vec<(E, Depth)>,
+    spare: Vec<(E, Depth)>,
+}
 
-pub(super) fn evict<K: std::hash::Hash + Eq, V>(cache: &mut Cached<K, V>, key: &K, depth: usize) {
-    if cache.get(key).is_some_and(|e| e.1 .1 >= depth) {
-        cache.remove(key);
+pub(super) fn evict<K: std::hash::Hash + Eq, V>(cache: &mut Cached<K, V>, key: K, depth: usize) {
+    if let std::collections::hash_map::Entry::Occupied(found) = cache.entry(key) {
+        if found.get().1 .1 >= depth {
+            found.remove();
+        }
     }
 }
 
@@ -75,7 +80,10 @@ impl Trail {
 
 impl<E> Default for Journal<E> {
     fn default() -> Self {
-        Self(Vec::new())
+        Self {
+            entries: Vec::new(),
+            spare: Vec::new(),
+        }
     }
 }
 
@@ -83,24 +91,80 @@ impl<E> Journal<E> {
     #[inline]
     pub(super) fn note(&mut self, entry: E, depth: Depth) {
         if depth != FREE {
-            self.0.push((entry, depth));
+            self.entries.push((entry, depth));
         }
     }
 
     #[inline]
     pub(super) fn mark(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     #[inline]
     pub(super) fn settle(&mut self, mark: usize, depth: usize, mut evict: impl FnMut(E)) {
-        let entries: Vec<(E, Depth)> = self.0.drain(mark..).collect();
-        for (entry, at) in entries {
+        let mut kept = std::mem::take(&mut self.spare);
+        for (entry, at) in self.entries.drain(mark..) {
             if at.1 < depth {
-                self.0.push((entry, at));
+                kept.push((entry, at));
             } else {
                 evict(entry);
             }
+        }
+        self.entries.append(&mut kept);
+        self.spare = kept;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evict_drops_only_entries_stored_at_or_inside_the_closed_level() {
+        let mut cache: Cached<u32, char> = HashMap::default();
+        cache.insert(1, ('a', (0, 2)));
+        cache.insert(2, ('b', (1, 3)));
+        cache.insert(3, ('c', (2, 5)));
+        evict(&mut cache, 1, 3);
+        evict(&mut cache, 2, 3);
+        evict(&mut cache, 3, 3);
+        evict(&mut cache, 4, 3);
+        assert_eq!(cache.get(&1).map(|e| e.0), Some('a'), "an entry from outside the level stays");
+        assert!(!cache.contains_key(&2), "an entry stored at the level goes");
+        assert!(!cache.contains_key(&3), "an entry stored inside the level goes");
+        assert_eq!(cache.len(), 1, "evicting a missing key adds nothing");
+    }
+
+    #[test]
+    fn settle_keeps_outer_entries_in_order_and_evicts_the_rest_in_order() {
+        let mut journal: Journal<u32> = Journal::default();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut model: Vec<(u32, Depth)> = Vec::new();
+        for round in 0..300u32 {
+            for i in 0..next() % 12 {
+                let low = (next() % 6) as usize;
+                let depth = if next() % 5 == 0 { FREE } else { (low, low + (next() % 4) as usize) };
+                journal.note(round * 100 + i as u32, depth);
+                if depth != FREE {
+                    model.push((round * 100 + i as u32, depth));
+                }
+            }
+            let mark = (next() as usize) % (model.len() + 1);
+            let depth = (next() % 8) as usize;
+            let mut evicted = Vec::new();
+            journal.settle(mark, depth, |e| evicted.push(e));
+            let tail: Vec<(u32, Depth)> = model.drain(mark..).collect();
+            let want: Vec<u32> = tail.iter().filter(|e| e.1 .1 >= depth).map(|e| e.0).collect();
+            model.extend(tail.into_iter().filter(|e| e.1 .1 < depth));
+            assert_eq!(evicted, want, "entries recorded at or inside the level leave in the order they came");
+            assert_eq!(journal.mark(), model.len());
+            assert_eq!(journal.entries, model, "entries from outside the level stay in their order");
         }
     }
 }

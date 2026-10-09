@@ -684,6 +684,25 @@ fn post_equals_the_projection_of_the_formula_and_every_argument_relation() {
 
 #[test]
 fn restate_equals_the_projection_of_the_formula_and_every_link_onto_the_block() {
+    for limit in [0, usize::MAX] {
+        let projected = with_joint_limit(limit, restatements);
+        assert!(projected > 100, "too few rounds had anything to project");
+    }
+}
+
+#[test]
+fn images_equal_their_projections_whether_or_not_links_join_before_the_product() {
+    for limit in [0, usize::MAX] {
+        with_joint_limit(limit, || {
+            let wrong = crossings(31, 400, true, |_, got, _, reachable| got == reachable);
+            assert!(wrong.is_empty(), "limit {}: difference images that differ from the projection: {:?}", limit, wrong);
+            let wrong = images(29, 400, |_, got, full, _| got == full);
+            assert!(wrong.is_empty(), "limit {}: images that differ from the projection: {:?}", limit, wrong);
+        });
+    }
+}
+
+fn restatements() -> usize {
     let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
     let e = BlockId(0);
     let (src, s) = b.block(&[Ty::I1; 4]);
@@ -722,7 +741,7 @@ fn restate_equals_the_projection_of_the_formula_and_every_link_onto_the_block() 
         assert_eq!(got, want, "restating must project away every atom outside the block but the markers and the upper half");
         projected += (!foreign.is_empty() && want != whole) as usize;
     }
-    assert!(projected > 100, "too few rounds had anything to project");
+    projected
 }
 
 fn canonical(m: &crate::rdna_spmd::analysis::bdd::Manager, g: Bdd) -> String {

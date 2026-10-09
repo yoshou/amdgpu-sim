@@ -71,7 +71,7 @@ impl<'a> Symbols<'a> {
     #[inline]
     pub(super) fn close(&mut self, (mark, depth): (usize, usize)) -> Depth {
         let keys = &mut self.keys;
-        self.journal.settle(mark, depth, |key| evict(keys, &key, depth));
+        self.journal.settle(mark, depth, |key| evict(keys, key, depth));
         self.trail.close(depth)
     }
 

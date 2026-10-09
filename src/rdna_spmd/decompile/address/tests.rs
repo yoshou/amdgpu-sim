@@ -1033,32 +1033,6 @@ fn reaches_block_drops_only_blocks_no_execution_reaches() {
 }
 
 #[test]
-fn known_unreached_names_only_blocks_found_unreachable_and_every_one_found() {
-    let mut wrong = Vec::new();
-    let mut unreached = 0;
-    for lanes in [32, 2] {
-        let Branches { b, blocks } = branches(lanes);
-        let mut env = environment(lanes, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
-        env.grid = [4, 1, 1];
-        addresses(&b, &env, |a| {
-            for (name, block, _) in &blocks {
-                let known = a.known_unreached(*block);
-                let reached = a.reaches_block(*block);
-                if known && reached {
-                    wrong.push(format!("{}: known unreached before it was reached", name));
-                }
-                if a.known_unreached(*block) == reached {
-                    wrong.push(format!("{}: known unreached is {} after the block was found {}", name, !reached, if reached { "reached" } else { "unreached" }));
-                }
-                unreached += !reached as usize;
-            }
-        });
-    }
-    assert!(wrong.is_empty(), "{:?}", wrong);
-    assert!(unreached > 0, "the branches must leave some block unreached");
-}
-
-#[test]
 fn reaches_block_drops_every_block_whose_branch_is_decided_against_it() {
     let mut loose = reaching(32).1;
     loose.extend(reaching(2).1);

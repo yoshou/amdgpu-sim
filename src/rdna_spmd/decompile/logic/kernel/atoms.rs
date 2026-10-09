@@ -107,7 +107,7 @@ impl Atoms {
                 }
             }
             Atom::Lane(5) => return 1 << 17,
-            Atom::Lane(i) => (2 << 30) | i as u32,
+            Atom::Lane(i) => return (1 << 17) + 1 + i as u32,
             Atom::Cell(block, group, bit) => {
                 let rank = self.blocks[&block];
                 assert!(rank < 1 << 12 && group < 1 << 12 && bit < 16, "too many cells");
@@ -129,7 +129,7 @@ impl Atoms {
             Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => {
                 let next = self.detour.len() as u32;
                 assert!(next < 1 << 22, "too many detour values");
-                return (1 << 17) + 1 + *self.detour.entry(atom).or_insert(next);
+                return (1 << 17) + 8 + *self.detour.entry(atom).or_insert(next);
             }
         };
         var + (1 << 17) + 1
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn detour_values_and_the_upper_half_come_before_every_atom_of_the_program() {
+    fn lane_bits_and_detour_values_come_before_every_atom_of_the_program() {
         let mut f = Func::new(BlockId(0), Presence::Wave, 64);
         let (a, b) = (f.value(Ty::I1), f.value(Ty::I32));
         let (c, d) = (f.value(Ty::I1), f.value(Ty::I32));
@@ -269,6 +269,8 @@ mod tests {
             Atom::Fresh(PATH, ValueId(0), 0),
             Atom::Fresh(PATH, ValueId(0), (1 << 16) - 1),
             Atom::Lane(5),
+            Atom::Lane(0),
+            Atom::Lane(4),
             Atom::Fresh(0, ValueId(7), 0),
             Atom::Term(3, true),
             Atom::Fresh(4, ValueId(9), 0),
@@ -278,8 +280,6 @@ mod tests {
             Atom::View(d),
             Atom::Bit(inner),
             Atom::Cell(last, 0, 0),
-            Atom::Lane(0),
-            Atom::Lane(4),
             Atom::WordBit(inner, 0),
         ];
         let numbers: Vec<u32> = atoms_in_order.iter().map(|&x| atoms.number(x)).collect();

@@ -375,6 +375,14 @@ fn product<Q: Queries>(q: &mut Q, formula_atoms: BTreeSet<u32>, formula: Bdd, li
         .copied()
         .filter(|v| !occurrences.contains_key(v))
         .collect();
+    if pending.is_empty() {
+        return q.exists(&lone, formula);
+    }
+    if let Some(relation) = joint(q, &pending) {
+        let mut quantified: Vec<u32> = lone.iter().chain(occurrences.keys()).copied().collect();
+        quantified.sort_unstable();
+        return q.m().and_exists(formula, relation, &|v| quantified.binary_search(&v).is_ok());
+    }
     let mut acc = q.exists(&lone, formula);
     let mut built: BTreeSet<u32> = q.support(acc).iter().copied().collect();
     while !pending.is_empty() {
@@ -414,6 +422,35 @@ fn product<Q: Queries>(q: &mut Q, formula_atoms: BTreeSet<u32>, formula: Bdd, li
         }
     }
     acc
+}
+
+const JOINT: usize = 1 << 8;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static JOINT_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(JOINT) };
+}
+
+#[cfg(test)]
+fn joint_limit() -> usize {
+    JOINT_LIMIT.with(|limit| limit.get())
+}
+
+#[cfg(not(test))]
+fn joint_limit() -> usize {
+    JOINT
+}
+
+fn joint<Q: Queries>(q: &mut Q, pending: &[&Binding]) -> Option<Bdd> {
+    let mut relation = Bdd::TRUE;
+    for link in pending {
+        let own = q.m().iff(link.atom, link.bound);
+        relation = q.m().and(relation, own);
+        if q.m().size(relation) > joint_limit() {
+            return None;
+        }
+    }
+    Some(relation)
 }
 
 fn arriving(src: BlockId, dst: BlockId, atom: Atom) -> Atom {

@@ -7,6 +7,8 @@ mod tests;
 pub use kernel::{choices, constant_choices, lane_test, projected_word, Atom, Choice, Kept, PATH};
 #[cfg(test)]
 pub(super) use rules::float_compare;
+#[cfg(test)]
+use kernel::with_joint_limit;
 
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
 use crate::rdna_spmd::analysis::facts::Facts;

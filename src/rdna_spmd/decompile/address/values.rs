@@ -84,7 +84,7 @@ macro_rules! tables {
             #[inline]
             fn evict(&mut self, entry: Entry, depth: usize) {
                 match entry {
-                    $(Entry::$query(key) => evict(&mut self.$table.done, &key, depth),)*
+                    $(Entry::$query(key) => evict(&mut self.$table.done, key, depth),)*
                 }
             }
         }
@@ -207,10 +207,6 @@ impl<'a> Values<'a> {
             journal: Journal::default(),
             guessing: Guessing::default(),
         }
-    }
-
-    pub(super) fn unreached(&self, b: BlockId) -> bool {
-        self.memo.reach.done.get(&b).is_some_and(|&(reached, _)| !reached)
     }
 
     pub(super) fn enter(&mut self, wave: usize) -> bool {
