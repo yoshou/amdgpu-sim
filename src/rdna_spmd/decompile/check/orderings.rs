@@ -70,6 +70,12 @@ impl Orderings {
                             let mut pending = [Bdd::FALSE; 2];
                             if hazards.together.contains(&key) && !again {
                                 pending[0] = logic.m.or(within, fresh);
+                                let target_rank = program.rank[&b];
+                                let inner = (0..program.loops.count())
+                                    .any(|l| program.loops.contains(l, source_rank) && !program.loops.contains(l, target_rank));
+                                if inner {
+                                    pending[0] = logic.m.or(pending[0], around);
+                                }
                             }
                             if hazards.apart.contains(&key) {
                                 pending[1] = around;
@@ -172,7 +178,7 @@ fn collective(program: &Program, logic: &mut Logic, inst: &Inst) -> Option<Bdd> 
     else {
         return None;
     };
-    let out = outputs[0].0;
+    let out = outputs.first()?.0;
     match op {
         WaveOp::Any => {
             let local = logic.local(Choice::Query(out));

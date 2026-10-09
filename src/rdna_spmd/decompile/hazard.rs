@@ -913,10 +913,10 @@ fn above(
     if let (Some(kx), Some(ky)) = (hx.as_constant(), hy.as_constant()) {
         if let (Some((x_low, x_high)), Some((y_low, y_high))) = (addresses.bounds(&x.form), addresses.bounds(&y.form)) {
             if x_high < 1 << 32 && y_high < 1 << 32 {
-                let above = (ky as i64 - kx as i64) << 32;
-                let least = above + y_low as i64 - x_high as i64;
-                let most = above + y_high as i64 - x_low as i64;
-                if most <= -(y_bytes as i64) || least >= x_bytes as i64 {
+                let above = (ky as i128 - kx as i128) << 32;
+                let least = above + y_low as i128 - x_high as i128;
+                let most = above + y_high as i128 - x_low as i128;
+                if most <= -(y_bytes as i128) || least >= x_bytes as i128 {
                     return true;
                 }
             }
@@ -5334,5 +5334,358 @@ mod tests {
     #[test]
     fn find_reports_a_store_whose_product_the_predicate_leaves_open() {
         assert!(product_fixed_by_the_predicate(false), "x * y may equal 7y + 1 for some x and y");
+    }
+
+    fn knobs() -> (u64, usize) {
+        let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let scale = std::env::var("ORACLE_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        (seed, scale)
+    }
+
+    fn oracle_gcd(a: u64, b: u64) -> u64 {
+        let (mut a, mut b) = (a, b);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a
+    }
+
+    fn coef(form: &Form, u: usize) -> u32 {
+        form.terms.iter().filter(|&&(v, _)| v as usize == u).fold(0u32, |acc, &(_, c)| acc.wrapping_add(c))
+    }
+
+    fn oracle_whole(info: &UnknownInfo) -> bool {
+        info.range.is_none() && info.values.is_none()
+    }
+
+    fn oracle_in(pieces: &[(u64, u64)], w: u32) -> bool {
+        pieces.iter().any(|&(lo, hi)| lo <= w as u64 && w as u64 <= hi)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn oracle_exact(
+        unknowns: &[UnknownInfo],
+        variant: &[bool],
+        x: &Form,
+        y: &Form,
+        x_bytes: u32,
+        y_bytes: u32,
+        differ: Option<usize>,
+        classes: [&Classes; 2],
+    ) -> bool {
+        let n = unknowns.len();
+        let mut g: u64 = 1 << 32;
+        for u in 0..n {
+            if oracle_whole(&unknowns[u]) {
+                let (cx, cy) = (coef(x, u), coef(y, u));
+                if variant[u] {
+                    g = oracle_gcd(oracle_gcd(g, cx as u64), cy as u64);
+                } else {
+                    g = oracle_gcd(g, cx.wrapping_sub(cy) as u64);
+                }
+            }
+        }
+        let small = |info: &UnknownInfo| if oracle_whole(info) { vec![0] } else { values(info) };
+        let mut choices: Vec<Vec<u32>> = unknowns.iter().map(small).collect();
+        for (u, info) in unknowns.iter().enumerate() {
+            choices.push(if variant[u] { small(info) } else { vec![0] });
+        }
+        let mut index = vec![0usize; 2 * n];
+        loop {
+            let xs: Vec<u32> = (0..n).map(|u| choices[u][index[u]]).collect();
+            let ys: Vec<u32> = (0..n).map(|u| if variant[u] { choices[n + u][index[n + u]] } else { xs[u] }).collect();
+            let allowed = differ.is_none_or(|u| xs[u] != ys[u] || oracle_whole(&unknowns[u]))
+                && classes[0].iter().all(|(f, p)| oracle_in(p, evaluate(f, &xs)))
+                && classes[1].iter().all(|(f, p)| oracle_in(p, evaluate(f, &ys)));
+            if allowed {
+                let d = evaluate(x, &xs).wrapping_sub(evaluate(y, &ys)) as i64;
+                if (-(x_bytes as i64) + 1..=y_bytes as i64 - 1).any(|t| (t - d).rem_euclid(g as i64) == 0) {
+                    return true;
+                }
+            }
+            let mut k = 0;
+            loop {
+                if k == 2 * n {
+                    return false;
+                }
+                index[k] += 1;
+                if index[k] < choices[k].len() {
+                    break;
+                }
+                index[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
+    fn oracle_case(r: &mut Random) -> (Vec<UnknownInfo>, Vec<bool>, Form, Form, u32, u32) {
+        let top = r.below(2) == 0;
+        let (mut unknowns, variant, x, y, a, b) = random_case(r, top);
+        for (u, info) in unknowns.iter_mut().enumerate() {
+            if r.below(3) == 0 {
+                *info = self::info(u, None);
+            }
+        }
+        (unknowns, variant, x, y, a, b)
+    }
+
+    #[test]
+    fn may_overlap_is_exact_with_whole_unknowns() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(4242 + shift);
+        let none = Classes::new();
+        let mut missed = Vec::new();
+        let mut loose = 0;
+        for _ in 0..20000 * scale {
+            let (unknowns, variant, x, y, a, b) = oracle_case(&mut r);
+            let exact = oracle_exact(&unknowns, &variant, &x, &y, a, b, None, [&none, &none]);
+            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank], None);
+            if exact && !found {
+                missed.push(format!("{:?} ({}) {:?} ({}) over {:?} variant {:?}", x, a, y, b, unknowns.iter().map(|i| i.range).collect::<Vec<_>>(), variant));
+            }
+            if found && !exact {
+                loose += 1;
+            }
+        }
+        assert!(missed.is_empty(), "{} missed overlaps ({} loose): {:#?}", missed.len(), loose, &missed[..missed.len().min(4)]);
+        assert_eq!(loose, 0, "over-conservative answers");
+    }
+
+    #[test]
+    fn may_overlap_with_differing_copies_never_misses() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(777 + shift);
+        let none = Classes::new();
+        let mut missed = Vec::new();
+        let mut loose = 0;
+        let mut tried = 0;
+        for _ in 0..40000 * scale {
+            let (unknowns, variant, x, y, a, b) = if r.below(2) == 0 { random_case(&mut r, false) } else { random_set_case(&mut r) };
+            let Some(u) = (0..unknowns.len()).find(|&u| variant[u]) else { continue };
+            tried += 1;
+            let exact = oracle_exact(&unknowns, &variant, &x, &y, a, b, Some(u), [&none, &none]);
+            let found = may_overlap(&unknowns, &x, &y, a, b, &|i: &UnknownInfo| variant[i.rank], Some(u as Unknown));
+            if exact && !found {
+                missed.push(format!("differ u{} {:?} ({}) {:?} ({}) over {:?} variant {:?}", u, x, a, y, b, unknowns.iter().map(|i| (i.range, i.values.clone())).collect::<Vec<_>>(), variant));
+            }
+            if found && !exact {
+                loose += 1;
+            }
+        }
+        assert!(tried > 1000);
+        assert!(missed.is_empty(), "{} missed overlaps ({} loose of {}): {:#?}", missed.len(), loose, tried, &missed[..missed.len().min(4)]);
+    }
+
+    fn oracle_class(r: &mut Random, n: usize, unknowns: &[UnknownInfo]) -> (Form, Vec<(u64, u64)>) {
+        let form = random_form(r, n);
+        let mut pieces = Vec::new();
+        for _ in 0..1 + r.below(3) {
+            let at: Vec<u32> = unknowns.iter().map(|i| if oracle_whole(i) { r.next() as u32 } else { let v = values(i); v[r.below(v.len() as u64) as usize] }).collect();
+            let w = evaluate(&form, &at) as u64;
+            let width = [0u64, 1, 3, 100][r.below(4) as usize];
+            pieces.push((w.saturating_sub(r.below(width + 1)), (w + width).min(u32::MAX as u64)));
+        }
+        pieces.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (lo, hi) in pieces {
+            match merged.last_mut() {
+                Some(last) if lo <= last.1 + 1 => last.1 = last.1.max(hi),
+                _ => merged.push((lo, hi)),
+            }
+        }
+        (form, merged)
+    }
+
+    #[test]
+    fn may_overlap_within_classes_never_misses() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(99 + shift);
+        let mut missed = Vec::new();
+        let mut loose = 0;
+        for _ in 0..2000 * scale {
+            let (pick, top) = (r.below(2) == 0, r.below(2) == 0);
+            let (unknowns, variant, x, y, a, b) = if pick { random_case(&mut r, top) } else { random_set_case(&mut r) };
+            let n = unknowns.len();
+            let c0: Classes = (0..r.below(3)).map(|_| oracle_class(&mut r, n, &unknowns)).collect();
+            let c1: Classes = (0..r.below(3)).map(|_| oracle_class(&mut r, n, &unknowns)).collect();
+            let differ = if r.below(2) == 0 { (0..n).find(|&u| variant[u]) } else { None };
+            let exact = oracle_exact(&unknowns, &variant, &x, &y, a, b, differ, [&c0, &c1]);
+            let found = may_overlap_within(
+                &unknowns,
+                &x,
+                &y,
+                a,
+                b,
+                &|i: &UnknownInfo| variant[i.rank],
+                differ.map(|u| u as Unknown),
+                [&c0, &c1],
+                &mut Shapes::default(),
+            );
+            if exact && !found {
+                missed.push(format!(
+                    "{:?} ({}) {:?} ({}) over {:?} variant {:?} differ {:?} classes {:?} / {:?}",
+                    x, a, y, b, unknowns.iter().map(|i| (i.range, i.values.clone())).collect::<Vec<_>>(), variant, differ, c0, c1
+                ));
+            }
+            if found && !exact {
+                loose += 1;
+            }
+        }
+        assert!(missed.is_empty(), "{} missed overlaps ({} loose): {:#?}", missed.len(), loose, &missed[..missed.len().min(4)]);
+    }
+
+    fn oracle_wide(r: &mut Random, n: usize) -> Wide {
+        let mut terms = Vec::new();
+        let mut words = Vec::new();
+        for u in 0..n {
+            match r.below(3) {
+                0 => terms.push((u as Unknown, [1i128, 2, 4, -1, -4, 1 << 32, -(1 << 32)][r.below(7) as usize])),
+                1 => {}
+                _ => {}
+            }
+        }
+        for _ in 0..r.below(3) {
+            let f = random_form(r, n);
+            words.push((f, [1i128, 4, -1, 1 << 32][r.below(4) as usize]));
+        }
+        let constant = match r.below(3) {
+            0 => r.below(16) as i128,
+            1 => (1i128 << 32) - r.below(16) as i128,
+            _ => r.next() as u32 as i128 - (1 << 31),
+        };
+        Wide { constant, terms, words }
+    }
+
+    fn eval_wide(w: &Wide, values: &[u32]) -> i128 {
+        let mut s = w.constant;
+        for &(u, c) in &w.terms {
+            s += c * values[u as usize] as i128;
+        }
+        for (f, c) in &w.words {
+            s += c * evaluate(f, values) as i128;
+        }
+        s
+    }
+
+    #[test]
+    fn wide_apart_never_hides_an_overlap() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(31337 + shift);
+        let none = Classes::new();
+        let mut missed = Vec::new();
+        for _ in 0..500 * scale {
+            let top = r.below(2) == 0;
+            let (unknowns, variant, _, _, a, b) = random_case(&mut r, top);
+            let n = unknowns.len();
+            let (wx, wy) = (oracle_wide(&mut r, n), oracle_wide(&mut r, n));
+            let mut choices: Vec<Vec<u32>> = unknowns.iter().map(values).collect();
+            for (u, info) in unknowns.iter().enumerate() {
+                choices.push(if variant[u] { values(info) } else { vec![0] });
+            }
+            let mut index = vec![0usize; 2 * n];
+            let exact = 'search: loop {
+                let xs: Vec<u32> = (0..n).map(|u| choices[u][index[u]]).collect();
+                let ys: Vec<u32> = (0..n).map(|u| if variant[u] { choices[n + u][index[n + u]] } else { xs[u] }).collect();
+                let d = eval_wide(&wx, &xs) - eval_wide(&wy, &ys);
+                if d > -(a as i128) && d < b as i128 {
+                    break 'search true;
+                }
+                let mut k = 0;
+                loop {
+                    if k == 2 * n {
+                        break 'search false;
+                    }
+                    index[k] += 1;
+                    if index[k] < choices[k].len() {
+                        break;
+                    }
+                    index[k] = 0;
+                    k += 1;
+                }
+            };
+            let apart = wide_apart(&unknowns, (&wx, a), (&wy, b), &|i: &UnknownInfo| variant[i.rank], None, [&none, &none], &mut Shapes::default());
+            if exact && apart {
+                missed.push(format!("{:?} ({}) {:?} ({}) over {:?} variant {:?}", wx, a, wy, b, unknowns.iter().map(|i| i.range).collect::<Vec<_>>(), variant));
+            }
+        }
+        assert!(missed.is_empty(), "{} hidden overlaps: {:#?}", missed.len(), &missed[..missed.len().min(4)]);
+    }
+
+    fn low_word_sum(coefficient: u64, mask: u64) -> bool {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let other = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, other, lane, 16);
+        let yes = b.constant(e, Ty::I1, 1);
+        let m = b.constant(e, Ty::I32, mask);
+        let field = |b: &mut Build, at: u64| {
+            let offset = b.constant(e, Ty::I64, at);
+            let p = b.int(e, IntOp::Add, own, offset);
+            let w = b.load(e, Space::Global, MemSize::B32, p, yes);
+            b.int(e, IntOp::And, w, m)
+        };
+        let (p, q, r) = (field(&mut b, 0), field(&mut b, 4), field(&mut b, 8));
+        let c = b.constant(e, Ty::I32, coefficient);
+        let six = b.constant(e, Ty::I32, 6);
+        let np = b.int(e, IntOp::Mul, p, c);
+        let nq = b.int(e, IntOp::Mul, q, c);
+        let sr = b.int(e, IntOp::Mul, r, six);
+        let base_lo = b.core(e, Ty::I32, Op::UnpackLo(buf));
+        let base_hi = b.core(e, Ty::I32, Op::UnpackHi(buf));
+        let k0 = b.constant(e, Ty::I32, 0x1000);
+        let s1 = b.int(e, IntOp::Add, base_lo, k0);
+        let s2 = b.int(e, IntOp::Add, s1, np);
+        let s3 = b.int(e, IntOp::Add, s2, nq);
+        let lo = b.int(e, IntOp::Add, s3, sr);
+        let address = b.core(e, Ty::I64, Op::Pack64(lo, base_hi));
+        let zero = b.constant(e, Ty::I32, 0);
+        let st1 = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, address, zero, k.exec);
+        let st2 = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, buf, zero, k.exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]));
+        h.conflicts().contains(&pair(&h, st1, st2))
+    }
+
+    #[test]
+    fn find_reports_an_overlap_whose_low_word_bounds_wrap_u64() {
+        assert!(low_word_sum(0xffff_ffff, 0x7fff_ffff), "p = 0x1000, q = r = 0 puts X at buf");
+    }
+
+    #[test]
+    fn find_reports_the_same_overlap_with_narrow_fields() {
+        assert!(low_word_sum(0xffff_ffff, 0x7fff), "p = 0x1000, q = r = 0 puts X at buf");
+    }
+
+    fn word_class_case() -> (Vec<UnknownInfo>, [bool; 3], Form, Form, Classes) {
+        let set = |u: usize, v: &[u32]| UnknownInfo {
+            range: Some((v[0], v[v.len() - 1])),
+            values: Some(v.to_vec().into()),
+            ..info(u, None)
+        };
+        let unknowns = vec![set(0, &[65536, 65537, 65551, 65567]), set(1, &[14, 18, 26, 42]), set(2, &[0, 1, 15])];
+        let x = Form { constant: 11, terms: vec![(0, 0xffff_ffff), (1, 1), (2, 4)] };
+        let y = Form { constant: 1165957957, terms: vec![(0, 3), (1, 0x4000_0000), (2, 0xffff_ffff)] };
+        let c0: Classes = vec![(Form { constant: 0xffff_fff3, terms: vec![(1, 1), (2, 0x4000_0000)] }, vec![(0, 113), (3221225406, 3221225585)])];
+        (unknowns, [true, false, false], x, y, c0)
+    }
+
+    #[test]
+    fn may_overlap_within_returns_promptly_on_a_word_class() {
+        let (unknowns, variant, x, y, c0) = word_class_case();
+        let none = Classes::new();
+        let exact = oracle_exact(&unknowns, &variant, &x, &y, 8, 8, None, [&c0, &none]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (unknowns, variant, x, y, c0) = word_class_case();
+            let none = Classes::new();
+            let found = may_overlap_within(&unknowns, &x, &y, 8, 8, &|i: &UnknownInfo| variant[i.rank], None, [&c0, &none], &mut Shapes::default());
+            let _ = tx.send(found);
+        });
+        let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(answer.is_ok(), "may_overlap_within still running after 10 s (exact answer: {})", exact);
+        assert!(answer.unwrap() || !exact);
     }
 }

@@ -406,11 +406,49 @@ impl<'a> Program<'a> {
                 None => return None,
             }
         }
-        if !wide && reach >= 1 << 32 {
+        if !wide && reach + 4 > 1 << 32 {
+            return None;
+        }
+        if base.is_some_and(|b| !self.invariant(b, 0)) {
             return None;
         }
         let allowed: Vec<ValueId> = indices.iter().map(|&(x, _)| x).collect();
         self.only_of(data, &allowed, 0).then_some(base)
+    }
+
+    fn invariant(&self, v: ValueId, depth: usize) -> bool {
+        let v = self.copies.get(&v).copied().unwrap_or(v);
+        if depth > 16 || !self.facts.uniform[v.0] {
+            return false;
+        }
+        let pointer = |n: Option<u32>, r: u32| n.is_some_and(|n| r == n || r == n + 1);
+        match (self.facts.inst(self.f, v), self.facts.site[v.0]) {
+            (_, Site::Param { block, index }) if block == self.f.entry => match self.inputs[index].source {
+                ParameterSource::Sgpr(r) => pointer(self.entry.kernarg_ptr, r) || pointer(self.entry.dispatch_ptr, r),
+                _ => false,
+            },
+            (Some(Inst::Core { op: Op::Env(_), .. }), _) => false,
+            (Some(Inst::Core { op, .. }), _) => {
+                let mut all = true;
+                op.map(|a| {
+                    all &= self.invariant(a, depth + 1);
+                    a
+                });
+                all
+            }
+            (
+                Some(Inst::Effect {
+                    op: EffectOp::Memory { op: MemoryOp::Load(_), .. },
+                    inputs,
+                    ..
+                }),
+                _,
+            ) => {
+                matches!(self.provenance.known[inputs[0].0], Some(Some(Region::Kernarg | Region::Dispatch)))
+                    && self.invariant(inputs[0], depth + 1)
+            }
+            _ => false,
+        }
     }
 
     fn only_of(&self, v: ValueId, allowed: &[ValueId], depth: usize) -> bool {
@@ -537,7 +575,7 @@ impl<'a> Program<'a> {
 
     pub(super) fn guard(&self, pred: BlockId, slot: usize) -> Option<(ValueId, bool)> {
         let (mut block, mut slot) = (pred, slot);
-        loop {
+        for _ in 0..=self.facts.order.len() {
             if let Some(condition) = self.edge_condition(block, slot) {
                 return Some(condition);
             }
@@ -546,6 +584,7 @@ impl<'a> Program<'a> {
                 _ => return None,
             }
         }
+        None
     }
 
     pub(super) fn edge_condition(&self, pred: BlockId, slot: usize) -> Option<(ValueId, bool)> {

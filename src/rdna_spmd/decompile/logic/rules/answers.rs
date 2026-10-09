@@ -12,6 +12,7 @@ struct BlockAnswers {
 }
 
 const ANSWERS: usize = 1 << 10;
+const RESIDUALS: usize = 1 << 10;
 
 #[derive(Default)]
 pub(super) struct Answers(HashMap<BlockId, BlockAnswers>);
@@ -130,7 +131,9 @@ where
     let (Site::Inst { block, .. }, Some(Inst::Effect { inputs, .. })) = (facts.site[out.0], facts.inst(f, out)) else {
         return q.atom(Atom::Bit(out));
     };
-    let some = some_lane_holds(q, facts, block, g, inputs[0], &mut HashMap::default());
+    let Some(some) = some_lane_holds(q, facts, block, g, inputs[0], &mut HashMap::default()) else {
+        return q.atom(Atom::Bit(out));
+    };
     q.m().or(g, some)
 }
 
@@ -189,22 +192,22 @@ fn answers_possible<Q: Queries>(q: &mut Q, residuals: &[Bdd], chosen: &[bool], d
     true
 }
 
-fn some_lane_holds<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, g: Bdd, source: ValueId, done: &mut HashMap<Bdd, Bdd>) -> Bdd
+fn some_lane_holds<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, g: Bdd, source: ValueId, done: &mut HashMap<Bdd, Bdd>) -> Option<Bdd>
 where
     Q::State: HasAnswers,
 {
     if g == Bdd::FALSE || g == Bdd::TRUE {
-        return g;
+        return Some(g);
     }
     if let Some(&b) = done.get(&g) {
-        return b;
+        return Some(b);
     }
     let support = q.support(g);
     let result = match support.iter().copied().find(|&v| q.uniform_atom(facts, v)) {
         Some(var) => {
             let (low, high) = (q.m().cofactor(g, var, false), q.m().cofactor(g, var, true));
-            let no = some_lane_holds(q, facts, block, low, source, done);
-            let yes = some_lane_holds(q, facts, block, high, source, done);
+            let no = some_lane_holds(q, facts, block, low, source, done)?;
+            let yes = some_lane_holds(q, facts, block, high, source, done)?;
             let x = q.m().var(var);
             q.m().ite(x, yes, no)
         }
@@ -212,14 +215,15 @@ where
             let answers = q.state_mut().answers_mut().0.entry(block).or_default();
             let k = match answers.residuals.iter().position(|&(x, _)| x == g) {
                 Some(k) => k,
-                None => {
+                None if answers.residuals.len() < RESIDUALS => {
                     answers.residuals.push((g, source));
                     answers.residuals.len() - 1
                 }
+                None => return None,
             };
             q.atom(Atom::Some(block, k as u16))
         }
     };
     done.insert(g, result);
-    result
+    Some(result)
 }

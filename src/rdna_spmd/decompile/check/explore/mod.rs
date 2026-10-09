@@ -138,7 +138,8 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                 [None, Some(_)] => LANE,
             };
             let block = key[side].unwrap();
-            let steps = self.step(side, block, &sides[side], cond, !writes[side].is_empty());
+            let stored = writes[side].iter().any(|w| w.op != MemoryOp::Fence);
+            let steps = self.step(side, block, &sides[side], cond, stored);
             if self.eval.q.stopped() {
                 return;
             }
@@ -357,11 +358,13 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
     fn match_writes(&mut self, cond: Bdd, writes: &[Vec<Write>; 2]) {
         let (wave, lane) = (&writes[WAVE], &writes[LANE]);
         let same = |w: &Write, l: &Write| {
+            let fence = w.op == MemoryOp::Fence;
             w.space == l.space
                 && w.op == l.op
-                && w.address.is_some()
+                && w.semantics == l.semantics
+                && (fence || w.address.is_some())
                 && w.address == l.address
-                && w.data.is_some()
+                && (fence || w.data.is_some())
                 && w.data == l.data
                 && w.mask == l.mask
         };
@@ -383,6 +386,9 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
         });
         for &(i, _) in &pairs {
             let w = wave[i];
+            if w.op == MemoryOp::Fence {
+                continue;
+            }
             let (address, data) = (self.eval.leaves(w.address.unwrap()), self.eval.leaves(w.data.unwrap()));
             let q = &mut *self.eval.q;
             let mut differs = q.or(address, data);

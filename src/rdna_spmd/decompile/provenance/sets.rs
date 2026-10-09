@@ -225,7 +225,6 @@ impl<'p, 'a> Sets<'p, 'a> {
         }
         if block == self.program.f.entry {
             let r = match self.program.inputs[index].source {
-                ParameterSource::Vgpr(n) if n != 0 => return,
                 ParameterSource::Sgpr(n) if Some(n) == self.program.entry.kernarg_ptr => Some(Region::Kernarg),
                 ParameterSource::Sgpr(n) if Some(n) == self.program.entry.dispatch_ptr => Some(Region::Dispatch),
                 _ => None,
@@ -265,7 +264,7 @@ impl<'p, 'a> Sets<'p, 'a> {
                 }
                 Op::Int(IntOp::Sub, a, b) => {
                     let (x, y) = (self.of(a), self.of(b));
-                    if y[0] & 1 != 0 {
+                    if y[0] & 1 != 0 || (points(x) && points(y)) {
                         pointers(acc, x);
                     }
                     if x[0] & 1 != 0 || (points(x) && points(y)) {
@@ -337,12 +336,12 @@ impl<'p, 'a> Sets<'p, 'a> {
                                 self.layout.mark(acc, Some(Region::Allocation(id)));
                             }
                         }
-                        Some(_) => {}
-                        None => {
+                        None if size.bytes() >= 4 => {
                             for &id in self.layout.allocations() {
                                 self.layout.mark(acc, Some(Region::Allocation(id)));
                             }
                         }
+                        _ => {}
                     }
                 }
             }

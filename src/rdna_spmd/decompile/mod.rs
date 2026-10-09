@@ -54,7 +54,7 @@ pub fn decompile(function: &Program, hazards: &Hazards) -> Lane {
         Ok("search") | Err(_) => search::prove(f, inputs, exec_index, hazards),
         Ok(other) => panic!("AMDGPU_SIM_PROOF={}: expected search or direct", other),
     };
-    let facts = facts::Facts::new(f, &function.parameter_inputs, &kept.words);
+    let facts = facts::Facts::converted(f, &function.parameter_inputs, &kept.words, facts::Conversion::Keeping(&kept.queries));
     if std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() {
         eprintln!(
             "; the lane program keeps {} queries, {} words and {} of {} meetings",
@@ -127,6 +127,11 @@ fn assert_exec_position(f: &Func, facts: &facts::Facts, exec_index: Option<usize
 }
 
 fn assert_premises(f: &Func, facts: &facts::Facts, exec_index: Option<usize>) {
+    assert!(
+        facts.incoming[&f.entry].is_empty(),
+        "b{}: an edge enters the entry block",
+        f.entry.0
+    );
     assert_exec_position(f, facts, exec_index);
     for &b in &facts.order {
         let block = &f.blocks[&b];
@@ -187,6 +192,25 @@ mod tests {
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
         let (next, _) = b.block(&[Ty::I32]);
         b.br(e, next, vec![lane]);
+        premises(&b);
+    }
+
+    #[test]
+    #[should_panic(expected = "an edge enters the entry block")]
+    fn premises_reject_an_entry_block_that_an_edge_enters() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let e = BlockId(0);
+        b.br(e, e, vec![p[0]]);
+        premises(&b);
+    }
+
+    #[test]
+    fn premises_hold_once_detach_entry_gives_a_looping_entry_a_preheader() {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+        let e = BlockId(0);
+        b.br(e, e, vec![p[0]]);
+        b.f.detach_entry();
+        assert_ne!(b.f.entry, e);
         premises(&b);
     }
 

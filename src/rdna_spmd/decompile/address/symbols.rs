@@ -255,8 +255,8 @@ impl<'a> Symbols<'a> {
         };
         let range = self.range(u);
         let choices: Vec<u32> = match (&self.unknowns[u as usize].values, range) {
-            (Some(set), _) => set.to_vec(),
-            (None, Some((low, high))) if ((high - low) as usize) < most => (low..=high).collect(),
+            (Some(set), _) if set.len() <= most => set.to_vec(),
+            (_, Some((low, high))) if ((high - low) as usize) < most => (low..=high).collect(),
             _ => return None,
         };
         Some(choices.into_iter().map(|x| form.constant.wrapping_add(c.wrapping_mul(x))).collect())
@@ -266,8 +266,8 @@ impl<'a> Symbols<'a> {
         let (mut low, mut high) = (form.constant as u64, form.constant as u64);
         for &(u, c) in &form.terms {
             let (l, h) = self.range(u)?;
-            low += c as u64 * l as u64;
-            high += c as u64 * h as u64;
+            low = low.checked_add(c as u64 * l as u64)?;
+            high = high.checked_add(c as u64 * h as u64)?;
         }
         (high < 1 << 32).then_some((low, high))
     }

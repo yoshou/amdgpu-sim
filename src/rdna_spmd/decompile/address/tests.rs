@@ -3577,3 +3577,2965 @@ fn a_pointer_read_after_a_restore_points_where_the_reading_lanes_set_it() {
         );
     }
 }
+
+fn colliding_lds_word() -> (Build, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let four = b.constant(e, Ty::I32, 4);
+    let own = b.int(e, IntOp::Mul, lane, four);
+    let top = b.constant(e, Ty::I32, 128);
+    let base = b.int(e, IntOp::Sub, top, own);
+    let address = b.int(e, IntOp::Add, base, own);
+    b.store(e, Space::Lds, MemSize::B32, address, lane, k.exec);
+    let back = b.load(e, Space::Lds, MemSize::B32, address, k.exec);
+    (b, back)
+}
+
+#[test]
+fn lds_read_back_with_a_lane_varying_base_does_not_claim_the_lane_own_word() {
+    let (b, back) = colliding_lds_word();
+    let form = addresses(&b, &two_words(), |a| a.values.value(back, 3, None).0.form);
+    assert_ne!(
+        form,
+        Form::constant(3),
+        "every lane stores its lane id to LDS byte 128 ((128 - 4 lane) + 4 lane), so lane 3 reads back the winning lane's id, not necessarily 3"
+    );
+}
+
+fn colliding_global_word() -> (Build, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let narrow_four = b.constant(e, Ty::I32, 4);
+    let narrow_own = b.int(e, IntOp::Mul, lane, narrow_four);
+    let top = b.constant(e, Ty::I32, 124);
+    let rest = b.int(e, IntOp::Sub, top, narrow_own);
+    let wide_rest = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, rest));
+    let base = b.int(e, IntOp::Add, buf, wide_rest);
+    let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let four = b.constant(e, Ty::I64, 4);
+    let own = b.int(e, IntOp::Mul, wide, four);
+    let address = b.int(e, IntOp::Add, base, own);
+    b.store(e, Space::Global, MemSize::B32, address, lane, k.exec);
+    let back = b.load(e, Space::Global, MemSize::B32, address, k.exec);
+    (b, back)
+}
+
+#[test]
+fn global_read_back_with_a_lane_varying_base_does_not_claim_the_lane_own_word() {
+    let (b, back) = colliding_global_word();
+    let form = addresses(&b, &environment(32, &[(0, 1, 0x1000)]), |a| a.values.value(back, 3, None).0.form);
+    assert_ne!(
+        form,
+        Form::constant(3),
+        "every lane stores its lane id to buf + 124 ((buf + zext(124 - 4 lane)) + 4 zext(lane)), so lane 3 reads back the winning lane's id, not necessarily 3"
+    );
+}
+
+fn lds_word_per_wave_base() -> (Build, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let four = b.constant(e, Ty::I32, 4);
+    let own = b.int(e, IntOp::Mul, lane, four);
+    let high = b.constant(e, Ty::I32, 0xffff_ffe0);
+    let first = b.int(e, IntOp::And, k.item, high);
+    let base = b.int(e, IntOp::Add, first, first);
+    let address = b.int(e, IntOp::Add, base, own);
+    b.store(e, Space::Lds, MemSize::B32, address, lane, k.exec);
+    let back = b.load(e, Space::Lds, MemSize::B32, address, k.exec);
+    (b, back)
+}
+
+#[test]
+fn lds_read_back_with_a_base_that_differs_between_waves_does_not_claim_the_lane_own_word() {
+    let (b, back) = lds_word_per_wave_base();
+    let env = environment(64, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+    let form = addresses(&b, &env, |a| a.values.value(back, 16, None).0.form);
+    assert_ne!(
+        form,
+        Form::constant(16),
+        "wave 0 lane 16 stores 16 at LDS byte 2 * 0 + 64, wave 1 lane 0 stores 0 at 2 * 32 + 0 = 64 too, so the word read back is not fixed"
+    );
+}
+
+fn wrapping_lds_word() -> (Build, ValueId, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let table = k.buffer(&mut b, e, 8);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, table, lane, 4);
+    let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+    let mask = b.constant(e, Ty::I32, 0x3333_3333);
+    let x = b.int(e, IntOp::And, w, mask);
+    let five = b.constant(e, Ty::I32, 5);
+    let scaled = b.int(e, IntOp::Mul, x, five);
+    let four = b.constant(e, Ty::I32, 4);
+    let address = b.int(e, IntOp::Add, scaled, four);
+    b.store(e, Space::Lds, MemSize::B32, address, x, k.exec);
+    let back = b.load(e, Space::Lds, MemSize::B32, address, k.exec);
+    let difference = b.int(e, IntOp::Sub, back, x);
+    (b, back, difference)
+}
+
+#[test]
+fn lds_read_back_does_not_claim_words_whose_addresses_overlap_after_wrapping() {
+    let (b, _, difference) = wrapping_lds_word();
+    let form = addresses(&b, &two_words(), |a| a.values.value(difference, 0, None).0.form);
+    assert_ne!(
+        form.as_constant(),
+        Some(0),
+        "x = w & 0x33333333 is 0 in one lane and 0x33333333 in another: 4 + 5 * 0x33333333 wraps to 3, so the two lanes' words overlap and neither need read back its own x"
+    );
+}
+
+fn power_minus_both() -> (Build, ValueId, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let table = k.buffer(&mut b, e, 8);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, table, lane, 4);
+    let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+    let four = b.constant(e, Ty::I32, 4);
+    let at = b.constant(e, Ty::I64, 4);
+    let next = b.int(e, IntOp::Add, own, at);
+    let x = b.load(e, Space::Global, MemSize::B32, next, k.exec);
+    let both = b.int(e, IntOp::And, w, x);
+    let thirty_one = b.constant(e, Ty::I32, 31);
+    let s = b.int(e, IntOp::And, w, thirty_one);
+    let one = b.constant(e, Ty::I32, 1);
+    let power = b.int(e, IntOp::Shl, one, s);
+    let scaled = b.int(e, IntOp::Mul, power, four);
+    let v = b.int(e, IntOp::Sub, scaled, both);
+    let three = b.constant(e, Ty::I32, 3);
+    let small = b.cmp(e, IntPred::Ult, v, three);
+    (b, v, small)
+}
+
+#[test]
+fn bounds_of_a_form_whose_coefficient_products_pass_two_to_the_sixty_four_hold_its_values() {
+    let (b, v, _) = power_minus_both();
+    let (form, bounds) = addresses(&b, &two_words(), |a| {
+        let form = a.values.value(v, 0, None).0.form;
+        let bounds = a.bounds(&form);
+        (form, bounds)
+    });
+    if let Some((low, high)) = bounds {
+        assert!(low <= 4 && 4 <= high, "4 * (1 << (w & 31)) - (w & x) is 4 when w = 0, yet bounds of {:?} are {:?}", form, (low, high));
+    }
+}
+
+#[test]
+fn comparisons_of_a_form_whose_coefficient_products_pass_two_to_the_sixty_four_decide_nothing_false() {
+    let (b, _, small) = power_minus_both();
+    let found = addresses(&b, &two_words(), |a| a.bit(small, 0, None).0);
+    assert_eq!(found, None, "4 * (1 << (w & 31)) - (w & x) < 3 is false for w = 0 (4) and true for w = x = 0xffffffff (4 * 2^31 - 0xffffffff = 1 mod 2^32)");
+}
+
+#[test]
+fn a_loop_whose_header_is_the_entry_block_is_analysed_in_finite_time() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(0), Ty::I32)]);
+        let e = BlockId(0);
+        let one = b.constant(e, Ty::I32, 1);
+        let next = b.int(e, IntOp::Add, p[1], one);
+        b.br(e, e, vec![p[0], next]);
+        let reached = addresses(&b, &two_words(), |a| a.reaches_block(e));
+        let _ = tx.send(reached);
+    });
+    let outcome = rx.recv_timeout(std::time::Duration::from_secs(20));
+    assert!(!matches!(outcome, Err(std::sync::mpsc::RecvTimeoutError::Timeout)), "the analysis did not finish within 20 s");
+}
+
+fn halving_wide_loop() -> (Build, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let zero = b.constant(e, Ty::I32, 0);
+    let one = b.constant(e, Ty::I32, 1);
+    let start = b.core(e, Ty::I64, Op::Pack64(zero, one));
+    let (body, p) = b.block(&[Ty::I1, Ty::I64]);
+    let (exit, _) = b.block(&[Ty::I1]);
+    b.br(e, body, vec![k.exec, start]);
+    let shift = b.constant(body, Ty::I64, 1);
+    let next = b.int(body, IntOp::LShr, p[1], shift);
+    let none = b.constant(body, Ty::I64, 0);
+    let again = b.cmp(body, IntPred::Ne, next, none);
+    b.cond_br(body, again, (body, vec![p[0], next]), (exit, vec![p[0]]));
+    (b, p[1])
+}
+
+#[test]
+fn low_words_of_a_wide_value_halved_each_iteration_hold_every_value_it_takes() {
+    let (b, v) = halving_wide_loop();
+    let env = environment(32, &[(0, 1, 0x1000)]);
+    let (form, held) = addresses(&b, &env, |a| {
+        let form = a.values.value(v, 0, None).0.form;
+        let held = representable(a.unknowns(), &form, 0x8000_0000);
+        let ranges: Vec<_> = form.terms.iter().map(|&(u, _)| a.unknowns()[u as usize].range).collect();
+        (format!("{:?} with ranges {:?}", form, ranges), held)
+    });
+    assert!(held, "v takes 2^32 then 2^31 = 0x80000000, whose low word is 0x80000000, but its low word form is {:?}", form);
+}
+
+
+static ORACLE_CHECKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ORACLE_TIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn oracle_holds(unknowns: &[UnknownInfo], form: &Form, truth: u32) -> bool {
+    let mut enumerated: Vec<(u32, Vec<u32>)> = Vec::new();
+    let mut free_shift = 32u32;
+    for &(u, c) in &form.terms {
+        let info = &unknowns[u as usize];
+        let set: Option<Vec<u32>> = match (&info.values, info.range) {
+            (Some(set), _) if set.len() <= 4096 => Some(set.to_vec()),
+            (_, Some((lo, hi))) if hi - lo < 4096 => Some((lo..=hi).collect()),
+            _ => None,
+        };
+        match set {
+            Some(s) => enumerated.push((c, s)),
+            None => free_shift = free_shift.min(c.trailing_zeros()),
+        }
+    }
+    let mask = if free_shift >= 32 { u32::MAX } else { (1u32 << free_shift) - 1 };
+    ORACLE_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if free_shift >= 32 {
+        ORACLE_TIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut reachable: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    reachable.insert(form.constant & mask);
+    for (c, set) in &enumerated {
+        let mut next = std::collections::HashSet::new();
+        for &x in &reachable {
+            for &v in set {
+                next.insert(x.wrapping_add(c.wrapping_mul(v)) & mask);
+            }
+            if next.len() > 1 << 16 {
+                return true;
+            }
+        }
+        reachable = next;
+    }
+    reachable.contains(&(truth & mask))
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Update {
+    Add(u32),
+    Affine(u32, u32),
+    Xor(u32),
+    And(u32),
+    Or(u32),
+    AddOther,
+    Other,
+    Choose(IntPred, u32, u32, u32),
+    ShlOrCounter,
+    Shr(u32),
+    AddLane,
+    AddCounter,
+    SubFrom(u32),
+    MulOther,
+}
+
+fn random_update(r: &mut Random) -> Update {
+    use Update::*;
+    match r.below(14) {
+        0 => Add(interesting(r)),
+        1 => Affine(interesting(r), interesting(r)),
+        2 => Xor(interesting(r)),
+        3 => And(interesting(r)),
+        4 => Or(interesting(r)),
+        5 => AddOther,
+        6 => Other,
+        7 => Choose(PREDICATES[r.below(10) as usize], interesting(r), interesting(r), interesting(r)),
+        8 => ShlOrCounter,
+        9 => Shr(r.below(33) as u32),
+        10 => AddLane,
+        11 => AddCounter,
+        12 => SubFrom(interesting(r)),
+        _ => MulOther,
+    }
+}
+
+fn build_update(b: &mut Build, h: BlockId, u: Update, own: ValueId, other: ValueId, i: ValueId, lane: ValueId) -> ValueId {
+    use Update::*;
+    let c = |b: &mut Build, k: u32| b.constant(h, Ty::I32, k as u64);
+    match u {
+        Add(k) => {
+            let k = c(b, k);
+            b.int(h, IntOp::Add, own, k)
+        }
+        Affine(m, k) => {
+            let (m, k) = (c(b, m), c(b, k));
+            let x = b.int(h, IntOp::Mul, own, m);
+            b.int(h, IntOp::Add, x, k)
+        }
+        Xor(k) => {
+            let k = c(b, k);
+            b.int(h, IntOp::Xor, own, k)
+        }
+        And(k) => {
+            let k = c(b, k);
+            b.int(h, IntOp::And, own, k)
+        }
+        Or(k) => {
+            let k = c(b, k);
+            b.int(h, IntOp::Or, own, k)
+        }
+        AddOther => b.int(h, IntOp::Add, own, other),
+        Other => {
+            let zero = c(b, 0);
+            b.int(h, IntOp::Add, other, zero)
+        }
+        Choose(p, k, x, y) => {
+            let (k, x, y) = (c(b, k), c(b, x), c(b, y));
+            let t = b.cmp(h, p, own, k);
+            let ox = b.int(h, IntOp::Add, own, x);
+            let oy = b.int(h, IntOp::Add, own, y);
+            b.core(h, Ty::I32, Op::Select(t, ox, oy))
+        }
+        ShlOrCounter => {
+            let (one, k1) = (c(b, 1), c(b, 1));
+            let s = b.int(h, IntOp::Shl, own, one);
+            let low = b.int(h, IntOp::And, i, k1);
+            b.int(h, IntOp::Or, s, low)
+        }
+        Shr(k) => {
+            let k = c(b, k);
+            b.int(h, IntOp::LShr, own, k)
+        }
+        AddLane => b.int(h, IntOp::Add, own, lane),
+        AddCounter => b.int(h, IntOp::Add, own, i),
+        SubFrom(k) => {
+            let k = c(b, k);
+            b.int(h, IntOp::Sub, k, own)
+        }
+        MulOther => b.int(h, IntOp::Mul, own, other),
+    }
+}
+
+fn run_update(u: Update, own: u32, other: u32, i: u32, lane: u32) -> u32 {
+    use Update::*;
+    match u {
+        Add(k) => own.wrapping_add(k),
+        Affine(m, k) => own.wrapping_mul(m).wrapping_add(k),
+        Xor(k) => own ^ k,
+        And(k) => own & k,
+        Or(k) => own | k,
+        AddOther => own.wrapping_add(other),
+        Other => other,
+        Choose(p, k, x, y) => {
+            if compare(p, own, k) {
+                own.wrapping_add(x)
+            } else {
+                own.wrapping_add(y)
+            }
+        }
+        ShlOrCounter => (own << 1) | (i & 1),
+        Shr(k) => own >> (k & 31),
+        AddLane => own.wrapping_add(lane),
+        AddCounter => own.wrapping_add(i),
+        SubFrom(k) => k.wrapping_sub(own),
+        MulOther => own.wrapping_mul(other),
+    }
+}
+
+struct Loop {
+    b: Build,
+    header: BlockId,
+    params: [ValueId; 3],
+    nexts: [ValueId; 3],
+    exits: [ValueId; 3],
+    again: ValueId,
+    visits: Vec<Vec<[u32; 3]>>,
+    steps: Vec<Vec<([u32; 3], bool)>>,
+    finals: Vec<Option<[u32; 3]>>,
+    name: String,
+}
+
+const ORACLE_CAP: usize = 300;
+
+fn oracle_loop(r: &mut Random) -> Loop {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let (ma, ca) = (if r.below(2) == 0 { 0 } else { interesting(r) }, interesting(r));
+    let (mb, cb) = (if r.below(2) == 0 { 0 } else { interesting(r) }, interesting(r));
+    let i0 = if r.below(2) == 0 { r.below(8) as u32 } else { interesting(r) };
+    let si = [1u32, 2, 3, u32::MAX, u32::MAX - 1, 0x8000_0000, 4, interesting(r)][r.below(8) as usize];
+    let pred = PREDICATES[r.below(10) as usize];
+    let limit = if r.below(2) == 0 { i0.wrapping_add(si.wrapping_mul(r.below(40) as u32)) } else { interesting(r) };
+    let (ua, ub) = (random_update(r), random_update(r));
+    let lane_free = |u: Update| !matches!(u, Update::AddLane);
+    let uniform = ma == 0 && mb == 0 && lane_free(ua) && lane_free(ub);
+    let on_a = uniform && r.below(3) == 0;
+    let init = |b: &mut Build, m: u32, c: u32| {
+        let km = b.constant(e, Ty::I32, m as u64);
+        let kc = b.constant(e, Ty::I32, c as u64);
+        let x = b.int(e, IntOp::Mul, lane, km);
+        b.int(e, IntOp::Add, x, kc)
+    };
+    let a0 = init(&mut b, ma, ca);
+    let b0 = init(&mut b, mb, cb);
+    let start = b.constant(e, Ty::I32, i0 as u64);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+    let (x, xp) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+    b.br(e, h, vec![k.exec, start, a0, b0]);
+    let hl = b.core(h, Ty::I32, Op::Env(Env::LaneId));
+    let ks = b.constant(h, Ty::I32, si as u64);
+    let ni = b.int(h, IntOp::Add, p[1], ks);
+    let na = build_update(&mut b, h, ua, p[2], p[3], p[1], hl);
+    let nb = build_update(&mut b, h, ub, p[3], p[2], p[1], hl);
+    let kl = b.constant(h, Ty::I32, limit as u64);
+    let again = b.cmp(h, pred, if on_a { na } else { ni }, kl);
+    b.cond_br(h, again, (h, vec![p[0], ni, na, nb]), (x, vec![p[0], ni, na, nb]));
+    let mut visits = Vec::new();
+    let mut steps = Vec::new();
+    let mut finals = Vec::new();
+    for l in 0..32u32 {
+        let (mut i, mut a, mut c) = (i0, l.wrapping_mul(ma).wrapping_add(ca), l.wrapping_mul(mb).wrapping_add(cb));
+        let mut seen = Vec::new();
+        let mut stepped = Vec::new();
+        let mut last = None;
+        for _ in 0..ORACLE_CAP {
+            seen.push([i, a, c]);
+            let ni = i.wrapping_add(si);
+            let na = run_update(ua, a, c, i, l);
+            let nb = run_update(ub, c, a, i, l);
+            let go = compare(pred, if on_a { na } else { ni }, limit);
+            stepped.push(([ni, na, nb], go));
+            if !go {
+                last = Some([ni, na, nb]);
+                break;
+            }
+            (i, a, c) = (ni, na, nb);
+        }
+        visits.push(seen);
+        steps.push(stepped);
+        finals.push(last);
+    }
+    let name = format!(
+        "i0 {:#x} step {:#x} {:?} {:#x} on_a {} a0 = lane*{:#x}+{:#x} b0 = lane*{:#x}+{:#x} a' = {:?} b' = {:?}",
+        i0, si, pred, limit, on_a, ma, ca, mb, cb, ua, ub
+    );
+    Loop {
+        b,
+        header: h,
+        params: [p[1], p[2], p[3]],
+        nexts: [ni, na, nb],
+        exits: [xp[1], xp[2], xp[3]],
+        again,
+        visits,
+        steps,
+        finals,
+        name,
+    }
+}
+
+fn loop_failures(seed: u64, count: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    let only: Option<usize> = std::env::var("ORACLE_CASE").ok().and_then(|s| s.parse().ok());
+    for case in 0..count {
+        let c = oracle_loop(&mut r);
+        if only.is_some_and(|o| o != case) {
+            continue;
+        }
+        if std::env::var("ORACLE_TRACE").is_ok() {
+            eprintln!("case {} [{}]", case, c.name);
+        }
+        let env = environment(32, &[]);
+        addresses(&c.b, &env, |a| {
+            for &lane in &[0usize, 5, 31] {
+                let names = ["i", "a", "b"];
+                for k in 0..3 {
+                    let form = a.values.value(c.params[k], lane, None).0.form;
+                    if let Some(t) = c.visits[lane].iter().map(|v| v[k]).find(|&t| !oracle_holds(a.unknowns(), &form, t)) {
+                        wrong.push(format!("case {} [{}] lane {}: param {} = {:?} misses {:#x}", case, c.name, lane, names[k], form, t));
+                    }
+                    let form = a.values.value(c.nexts[k], lane, None).0.form;
+                    if let Some(t) = c.steps[lane].iter().map(|v| v.0[k]).find(|&t| !oracle_holds(a.unknowns(), &form, t)) {
+                        wrong.push(format!("case {} [{}] lane {}: next {} = {:?} misses {:#x}", case, c.name, lane, names[k], form, t));
+                    }
+                    if let Some(f) = c.finals[lane] {
+                        let form = a.values.value(c.exits[k], lane, None).0.form;
+                        if !oracle_holds(a.unknowns(), &form, f[k]) {
+                            wrong.push(format!("case {} [{}] lane {}: exit {} = {:?} misses {:#x}", case, c.name, lane, names[k], form, f[k]));
+                        }
+                    }
+                }
+                if let Some(bit) = a.bit(c.again, lane, None).0 {
+                    if c.steps[lane].iter().any(|s| s.1 != bit) {
+                        wrong.push(format!("case {} [{}] lane {}: the back-edge condition said always {}", case, c.name, lane, bit));
+                    }
+                }
+            }
+            if let Some(u) = a.trip(c.header) {
+                if let Some((_, last)) = a.unknowns()[u as usize].range {
+                    let visits = c.visits[0].len();
+                    if visits as u64 > last as u64 + 1 {
+                        wrong.push(format!("case {} [{}]: trips said at most {}, the loop visits its header {} times", case, c.name, last, visits));
+                    }
+                }
+            }
+        });
+    }
+    wrong
+}
+
+#[test]
+fn loop_values_hold_every_value_a_random_loop_gives() {
+    let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(101);
+    let count = std::env::var("ORACLE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let wrong = loop_failures(seed, count);
+    if std::env::var("ORACLE_STATS").is_ok() {
+        eprintln!(
+            "checks {} tight {}",
+            ORACLE_CHECKS.load(std::sync::atomic::Ordering::Relaxed),
+            ORACLE_TIGHT.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+    assert!(wrong.is_empty(), "{} wrong, first: {:#?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+}
+
+fn offset_by_second_vgpr() -> (Build, Kernel, ValueId, ValueId) {
+    offset_by_input(ParameterSource::Vgpr(1))
+}
+
+fn offset_by_input(source: ParameterSource) -> (Build, Kernel, ValueId, ValueId) {
+    let (mut b, k, extra) = Build::kernel_with(&[(source, Ty::I32)]);
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, extra[0]));
+    let address = b.int(e, IntOp::Add, buf, wide);
+    (b, k, buf, address)
+}
+
+#[test]
+fn an_address_offset_by_a_second_vgpr_input_points_into_the_buffer() {
+    let (b, _, _, address) = offset_by_second_vgpr();
+    let env = environment(32, &[(0, 1, 0x1000)]);
+    let (coarse, refined) = addresses(&b, &env, |a| (a.regions(address, 3, None, false), a.regions(address, 3, None, true)));
+    for set in [coarse, refined] {
+        assert!(
+            set.reaches(Some(Region::Allocation(1)), |x, y| x == y),
+            "buf + v1 points into allocation 1, but its regions are {:?}",
+            set
+        );
+    }
+}
+
+fn stores_through_input_meet(source: ParameterSource) -> bool {
+    let (mut b, k, buf, through) = offset_by_input(source);
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let zero = b.constant(e, Ty::I32, 0);
+    b.store(e, Space::Global, MemSize::B32, through, zero, k.exec);
+    b.store(e, Space::Global, MemSize::B32, own, zero, k.exec);
+    let h = super::super::hazard::Hazards::find(&b.program(), &environment(32, &[(0, 1, 0x1000)]));
+    !h.conflicts().is_empty()
+}
+
+#[test]
+fn hazards_report_stores_through_an_unknown_scalar_input_that_meet_another_lane() {
+    assert!(stores_through_input_meet(ParameterSource::Sgpr(20)), "control: an unknown scalar offset may be 0");
+}
+
+#[test]
+fn hazards_report_stores_through_a_second_vgpr_input_that_meet_another_lane() {
+    assert!(
+        stores_through_input_meet(ParameterSource::Vgpr(1)),
+        "lanes 1..31 store to buf[0] through v1 while lane 0 stores to buf[0] through its lane id"
+    );
+}
+
+fn nested_affine_loops(outer: u64, inner: u64) -> (Build, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let one = b.constant(e, Ty::I32, 1);
+    let zero = b.constant(e, Ty::I32, 0);
+    let (h1, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+    let (h2, q) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32, Ty::I32]);
+    let (latch, l) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+    let (exit, _) = b.block(&[Ty::I1]);
+    b.br(e, h1, vec![k.exec, one, zero]);
+    let z = b.constant(h1, Ty::I32, 0);
+    b.br(h1, h2, vec![p[0], p[1], p[2], p[1], z]);
+    let five = b.constant(h2, Ty::I32, 5);
+    let seven = b.constant(h2, Ty::I32, 7);
+    let scaled = b.int(h2, IntOp::Mul, q[3], five);
+    let next_j = b.int(h2, IntOp::Add, scaled, seven);
+    let one2 = b.constant(h2, Ty::I32, 1);
+    let next_m = b.int(h2, IntOp::Add, q[4], one2);
+    let limit2 = b.constant(h2, Ty::I32, inner);
+    let again2 = b.cmp(h2, IntPred::Ult, next_m, limit2);
+    b.cond_br(h2, again2, (h2, vec![q[0], q[1], q[2], next_j, next_m]), (latch, vec![q[0], q[1], q[2]]));
+    let three = b.constant(latch, Ty::I32, 3);
+    let one3 = b.constant(latch, Ty::I32, 1);
+    let tripled = b.int(latch, IntOp::Mul, l[1], three);
+    let next_x = b.int(latch, IntOp::Add, tripled, one3);
+    let next_n = b.int(latch, IntOp::Add, l[2], one3);
+    let limit1 = b.constant(latch, Ty::I32, outer);
+    let again1 = b.cmp(latch, IntPred::Ult, next_n, limit1);
+    b.cond_br(latch, again1, (h1, vec![l[0], next_x, next_n]), (exit, vec![l[0]]));
+    (b, q[3])
+}
+
+#[test]
+fn loop_value_sets_stay_within_the_sequence_limit() {
+    let (b, j) = nested_affine_loops(300, 300);
+    let largest = addresses(&b, &environment(32, &[]), |a| {
+        let form = a.values.value(j, 0, None).0.form;
+        form.terms.iter().filter_map(|&(u, _)| a.unknowns()[u as usize].values.as_ref().map(|s| s.len())).max()
+    });
+    assert!(largest.is_none_or(|n| n <= 1 << 16), "a sequence unknown holds {:?} words", largest);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Pointer {
+    Same,
+    Other,
+    Offset,
+    ByCounter,
+    ByLane,
+    First,
+    Second,
+    Reloaded,
+    Integer,
+}
+
+fn random_pointer(r: &mut Random) -> Pointer {
+    use Pointer::*;
+    [Same, Other, Offset, ByCounter, ByLane, First, Second, Reloaded, Integer][r.below(9) as usize]
+}
+
+struct PointerLoop {
+    b: Build,
+    watched: Vec<(&'static str, ValueId, Vec<Vec<Option<u64>>>)>,
+    name: String,
+}
+
+fn pointer_loop(r: &mut Random) -> PointerLoop {
+    use Pointer::*;
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let first = k.buffer(&mut b, e, 0);
+    let second = k.buffer(&mut b, e, 8);
+    let slot = b.constant(e, Ty::I32, 32);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let entry_spill = r.below(2) == 0;
+    if entry_spill {
+        b.store(e, Space::Scratch, MemSize::B64, slot, first, k.exec);
+    }
+    let zero = b.constant(e, Ty::I32, 0);
+    let (fp, fq) = (r.below(2) == 0, r.below(2) == 0);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+    let (x, _) = b.block(&[Ty::I1]);
+    b.br(e, h, vec![k.exec, zero, if fp { first } else { second }, if fq { first } else { second }]);
+    let (up, uq) = (random_pointer(r), random_pointer(r));
+    let trips = 1 + r.below(6) as u32;
+    let respill = r.below(2) == 0;
+    let reloaded = b.load(h, Space::Scratch, MemSize::B64, slot, p[0]);
+    let one = b.constant(h, Ty::I32, 1);
+    let parity = b.int(h, IntOp::And, p[1], one);
+    let even = b.cmp(h, IntPred::Eq, parity, zero);
+    let sixteen = b.constant(h, Ty::I32, 16);
+    let low = b.cmp(h, IntPred::Ult, lane, sixteen);
+    let eight = b.constant(h, Ty::I64, 8);
+    let build = |b: &mut Build, u: Pointer, own: ValueId, other: ValueId| match u {
+        Same => own,
+        Other => other,
+        Offset => b.int(h, IntOp::Add, own, eight),
+        ByCounter => b.core(h, Ty::I64, Op::Select(even, own, other)),
+        ByLane => b.core(h, Ty::I64, Op::Select(low, own, other)),
+        First => first,
+        Second => second,
+        Reloaded => reloaded,
+        Integer => {
+            let w = b.core(h, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+            b.int(h, IntOp::Add, w, eight)
+        }
+    };
+    let np = build(&mut b, up, p[2], p[3]);
+    let nq = build(&mut b, uq, p[3], p[2]);
+    if respill {
+        b.store(h, Space::Scratch, MemSize::B64, slot, nq, p[0]);
+    }
+    let ni = b.int(h, IntOp::Add, p[1], one);
+    let limit = b.constant(h, Ty::I32, trips as u64);
+    let again = b.cmp(h, IntPred::Ult, ni, limit);
+    b.cond_br(h, again, (h, vec![p[0], ni, np, nq]), (x, vec![p[0]]));
+    let tag = |f: bool| Some(if f { 1u64 } else { 2 });
+    let mut tp: Vec<Vec<Option<u64>>> = vec![Vec::new(); 32];
+    let mut tq = tp.clone();
+    let mut tr = tp.clone();
+    let mut tnp = tp.clone();
+    let mut tnq = tp.clone();
+    for l in 0..32usize {
+        let (mut cp, mut cq) = (tag(fp), tag(fq));
+        let mut held = if entry_spill { Some(1u64) } else { None };
+        for t in 0..trips {
+            let rl = held;
+            let step = |u: Pointer, own: Option<u64>, other: Option<u64>| match u {
+                Same | Offset => own,
+                Other => other,
+                ByCounter => {
+                    if t & 1 == 0 {
+                        own
+                    } else {
+                        other
+                    }
+                }
+                ByLane => {
+                    if l < 16 {
+                        own
+                    } else {
+                        other
+                    }
+                }
+                First => Some(1),
+                Second => Some(2),
+                Reloaded => rl,
+                Integer => None,
+            };
+            let (np, nq) = (step(up, cp, cq), step(uq, cq, cp));
+            tp[l].push(cp);
+            tq[l].push(cq);
+            tr[l].push(rl);
+            tnp[l].push(np);
+            tnq[l].push(nq);
+            if respill {
+                held = nq;
+            }
+            (cp, cq) = (np, nq);
+        }
+    }
+    let name = format!("p0 {} q0 {} spill {} respill {} p' {:?} q' {:?} trips {}", tag(fp).unwrap(), tag(fq).unwrap(), entry_spill, respill, up, uq, trips);
+    PointerLoop {
+        b,
+        watched: vec![("p", p[2], tp), ("q", p[3], tq), ("reloaded", reloaded, tr), ("p'", np, tnp), ("q'", nq, tnq)],
+        name,
+    }
+}
+
+fn modes() -> Vec<bool> {
+    match std::env::var("ORACLE_MODES").as_deref() {
+        Ok("refined") => vec![true],
+        Ok("coarse") => vec![false],
+        _ => vec![false, true],
+    }
+}
+
+fn pointer_failures(seed: u64, count: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for case in 0..count {
+        let c = pointer_loop(&mut r);
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        addresses(&c.b, &env, |a| {
+            loop {
+                for (_, v, _) in &c.watched {
+                    for l in 0..32 {
+                        for refine in modes() {
+                            a.regions(*v, l, None, refine);
+                        }
+                    }
+                }
+                if !a.settle_loops() {
+                    break;
+                }
+            }
+            for (name, v, truth) in &c.watched {
+                for l in [0usize, 20] {
+                    for refine in modes() {
+                        let set = a.regions(*v, l, None, refine);
+                        for t in &truth[l] {
+                            let hit = match t {
+                                Some(id) => set.reaches(Some(Region::Allocation(*id)), |x, y| x == y),
+                                None => set.lost(),
+                            };
+                            if !hit {
+                                wrong.push(format!("case {} [{}] {} lane {} refine {}: {:?} misses {:?}", case, c.name, name, l, refine, set, t));
+                                break;
+                            }
+                        }
+                    }
+                    let value = a.values.value(*v, l, None).0;
+                    if let Some(region) = value.region {
+                        if truth[l].iter().any(|t| t.map(Region::Allocation) != Some(region)) {
+                            wrong.push(format!("case {} [{}] {} lane {}: value says {:?}, truth {:?}", case, c.name, name, l, region, truth[l]));
+                        }
+                    }
+                }
+            }
+        });
+    }
+    wrong
+}
+
+#[test]
+fn regions_hold_every_allocation_a_random_pointer_loop_carries() {
+    let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let count = std::env::var("ORACLE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let wrong = pointer_failures(seed, count);
+    assert!(wrong.is_empty(), "{} wrong, first: {:#?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+}
+
+fn spilled_choice() -> (Build, Kernel, ValueId, ValueId, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let first = k.buffer(&mut b, e, 0);
+    let second = k.buffer(&mut b, e, 8);
+    let u = loaded_word(&mut b, &k, e, 16, MemSize::B32);
+    let zero = b.constant(e, Ty::I32, 0);
+    let c = b.cmp(e, IntPred::Ne, u, zero);
+    let either = b.core(e, Ty::I64, Op::Select(c, first, second));
+    let slot = b.constant(e, Ty::I32, 16);
+    b.store(e, Space::Scratch, MemSize::B64, slot, either, k.exec);
+    let reloaded = b.load(e, Space::Scratch, MemSize::B64, slot, k.exec);
+    (b, k, either, reloaded, second)
+}
+
+#[test]
+fn a_reloaded_spill_of_a_choice_between_two_buffers_points_into_both() {
+    let (b, _, either, reloaded, _) = spilled_choice();
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]);
+    let (before, after) = addresses(&b, &env, |a| {
+        let mut sets = Vec::new();
+        for v in [either, reloaded] {
+            loop {
+                for refine in [false, true] {
+                    a.regions(v, 0, None, refine);
+                }
+                if !a.settle_loops() {
+                    break;
+                }
+            }
+            sets.push(a.regions(v, 0, None, true));
+        }
+        (sets[0].clone(), sets[1].clone())
+    });
+    for id in [1u64, 2] {
+        assert!(before.reaches(Some(Region::Allocation(id)), |x, y| x == y), "the choice: {:?}", before);
+        assert!(
+            after.reaches(Some(Region::Allocation(id)), |x, y| x == y),
+            "the spill reloads the choice between allocations 1 and 2, but its regions are {:?} (before the spill {:?})",
+            after,
+            before
+        );
+    }
+}
+
+fn stores_through_choice_meet(spilled: bool) -> bool {
+    let (mut b, k, either, reloaded, _) = spilled_choice();
+    let e = BlockId(0);
+    let first = k.buffer(&mut b, e, 0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, first, lane, 4);
+    let zero = b.constant(e, Ty::I32, 0);
+    b.store(e, Space::Global, MemSize::B32, if spilled { reloaded } else { either }, zero, k.exec);
+    b.store(e, Space::Global, MemSize::B32, own, zero, k.exec);
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]);
+    let h = super::super::hazard::Hazards::find(&b.program(), &env);
+    !h.conflicts().is_empty()
+}
+
+#[test]
+fn hazards_report_stores_through_a_choice_between_two_buffers() {
+    assert!(stores_through_choice_meet(false), "control: the choice may be first");
+}
+
+#[test]
+fn hazards_report_stores_through_a_reloaded_spill_of_a_choice_between_two_buffers() {
+    assert!(stores_through_choice_meet(true), "the reloaded choice may be first, so lanes 1..31 meet lane 0 at first[0]");
+}
+
+struct Shaped {
+    b: Build,
+    header: BlockId,
+    watched: Vec<(&'static str, ValueId, Vec<Vec<u32>>)>,
+    guard: Option<(ValueId, Vec<Vec<bool>>)>,
+    name: String,
+}
+
+fn shaped_loop(r: &mut Random) -> Shaped {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let (ma, ca) = (if r.below(2) == 0 { 0 } else { interesting(r) }, interesting(r));
+    let (mb, cb) = (if r.below(2) == 0 { 0 } else { interesting(r) }, interesting(r));
+    let s0 = interesting(r);
+    let i0 = r.below(8) as u32;
+    let si = [1u32, 2, 3, u32::MAX, 4][r.below(5) as usize];
+    let pred = PREDICATES[r.below(10) as usize];
+    let limit = if r.below(3) != 0 { i0.wrapping_add(si.wrapping_mul(r.below(30) as u32)) } else { interesting(r) };
+    let (ua, ub, us) = (random_update(r), random_update(r), random_update(r));
+    let branch_kind = r.below(3);
+    let branch_k = r.below(6) as u32;
+    let split = r.below(2) == 0;
+    let store_in_t = r.below(2) == 0;
+    let init = |b: &mut Build, m: u32, c: u32| {
+        let km = b.constant(e, Ty::I32, m as u64);
+        let kc = b.constant(e, Ty::I32, c as u64);
+        let x = b.int(e, IntOp::Mul, lane, km);
+        b.int(e, IntOp::Add, x, kc)
+    };
+    let a0 = init(&mut b, ma, ca);
+    let b0 = init(&mut b, mb, cb);
+    let slot = b.constant(e, Ty::I32, 64);
+    let ks0 = b.constant(e, Ty::I32, s0 as u64);
+    b.store(e, Space::Scratch, MemSize::B32, slot, ks0, k.exec);
+    let start = b.constant(e, Ty::I32, i0 as u64);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+    let (t, tp) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32, Ty::I32]);
+    let (f, fp) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32, Ty::I32]);
+    let (j, jp) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+    let (x, xp) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+    b.br(e, h, vec![k.exec, start, a0, b0]);
+    let hslot = b.constant(h, Ty::I32, 64);
+    let s = b.load(h, Space::Scratch, MemSize::B32, hslot, p[0]);
+    let kb = b.constant(h, Ty::I32, branch_k as u64);
+    let cond_in = match branch_kind {
+        0 => {
+            let one = b.constant(h, Ty::I32, 1);
+            let parity = b.int(h, IntOp::And, p[1], one);
+            let zero = b.constant(h, Ty::I32, 0);
+            b.cmp(h, IntPred::Eq, parity, zero)
+        }
+        1 => b.cmp(h, IntPred::Ult, p[1], kb),
+        _ => b.cmp(h, IntPred::Ne, p[1], kb),
+    };
+    let taken_in = |i: u32| match branch_kind {
+        0 => i & 1 == 0,
+        1 => i < branch_k,
+        _ => i != branch_k,
+    };
+    b.cond_br(h, cond_in, (t, vec![p[0], p[1], p[2], p[3], s]), (f, vec![p[0], p[1], p[2], p[3], s]));
+    let tl = b.core(t, Ty::I32, Op::Env(Env::LaneId));
+    let na = build_update(&mut b, t, ua, tp[2], tp[3], tp[1], tl);
+    let ns = build_update(&mut b, t, us, tp[4], tp[2], tp[1], tl);
+    if store_in_t {
+        let tslot = b.constant(t, Ty::I32, 64);
+        b.store(t, Space::Scratch, MemSize::B32, tslot, ns, tp[0]);
+    }
+    let fl = b.core(f, Ty::I32, Op::Env(Env::LaneId));
+    let nb = build_update(&mut b, f, ub, fp[3], fp[2], fp[1], fl);
+    let (ka, kf) = (b.constant(t, Ty::I32, si as u64), b.constant(f, Ty::I32, si as u64));
+    let (la, lf) = (b.constant(t, Ty::I32, limit as u64), b.constant(f, Ty::I32, limit as u64));
+    let (kj, lj) = (b.constant(j, Ty::I32, si as u64), b.constant(j, Ty::I32, limit as u64));
+    let guard;
+    if split {
+        let ti = b.int(t, IntOp::Add, tp[1], ka);
+        let tc = b.cmp(t, pred, ti, la);
+        b.cond_br(t, tc, (h, vec![tp[0], ti, na, tp[3]]), (x, vec![tp[0], ti, na, tp[3]]));
+        let fi = b.int(f, IntOp::Add, fp[1], kf);
+        let fc = b.cmp(f, pred, fi, lf);
+        b.cond_br(f, fc, (h, vec![fp[0], fi, fp[2], nb]), (x, vec![fp[0], fi, fp[2], nb]));
+        let _ = (kj, lj, jp);
+        b.br(j, x, vec![k.exec, p[1], p[2], p[3]]);
+        guard = None;
+    } else {
+        b.br(t, j, vec![tp[0], tp[1], na, tp[3]]);
+        b.br(f, j, vec![fp[0], fp[1], fp[2], nb]);
+        let ji = b.int(j, IntOp::Add, jp[1], kj);
+        let jc = b.cmp(j, pred, ji, lj);
+        b.cond_br(j, jc, (h, vec![jp[0], ji, jp[2], jp[3]]), (x, vec![jp[0], ji, jp[2], jp[3]]));
+        guard = Some(jc);
+    }
+    let mut ti = vec![Vec::new(); 32];
+    let (mut ta, mut tb, mut ts, mut tna, mut tnb, mut tns, mut tx) = (ti.clone(), ti.clone(), ti.clone(), ti.clone(), ti.clone(), ti.clone(), ti.clone());
+    let mut tg: Vec<Vec<bool>> = vec![Vec::new(); 32];
+    for l in 0..32u32 {
+        let (mut i, mut a, mut c, mut held) = (i0, l.wrapping_mul(ma).wrapping_add(ca), l.wrapping_mul(mb).wrapping_add(cb), s0);
+        for _ in 0..ORACLE_CAP {
+            let li = l as usize;
+            ti[li].push(i);
+            ta[li].push(a);
+            tb[li].push(c);
+            ts[li].push(held);
+            let ni = i.wrapping_add(si);
+            if taken_in(i) {
+                let na = run_update(ua, a, c, i, l);
+                let ns = run_update(us, held, a, i, l);
+                tna[li].push(na);
+                tns[li].push(ns);
+                if store_in_t {
+                    held = ns;
+                }
+                a = na;
+            } else {
+                let nb = run_update(ub, c, a, i, l);
+                tnb[li].push(nb);
+                c = nb;
+            }
+            let go = compare(pred, ni, limit);
+            tg[li].push(go);
+            if !go {
+                tx[li].push(a);
+                break;
+            }
+            i = ni;
+        }
+    }
+    let name = format!(
+        "i0 {} step {:#x} {:?} {:#x} branch {} {} split {} store {} a0 = lane*{:#x}+{:#x} b0 = lane*{:#x}+{:#x} s0 {:#x} a' {:?} b' {:?} s' {:?}",
+        i0, si, pred, limit, branch_kind, branch_k, split, store_in_t, ma, ca, mb, cb, s0, ua, ub, us
+    );
+    let exit_a = xp[2];
+    Shaped {
+        b,
+        header: h,
+        watched: vec![
+            ("i", p[1], ti),
+            ("a", p[2], ta),
+            ("b", p[3], tb),
+            ("slot", s, ts),
+            ("a'", na, tna),
+            ("b'", nb, tnb),
+            ("s'", ns, tns),
+            ("exit a", exit_a, tx),
+        ],
+        guard: guard.map(|g| (g, tg)),
+        name,
+    }
+}
+
+fn shaped_failures(seed: u64, count: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    let only: Option<usize> = std::env::var("ORACLE_CASE").ok().and_then(|s| s.parse().ok());
+    for case in 0..count {
+        let c = shaped_loop(&mut r);
+        if only.is_some_and(|o| o != case) {
+            continue;
+        }
+        let env = environment(32, &[]);
+        addresses(&c.b, &env, |a| {
+            for &lane in &[0usize, 5, 31] {
+                for (name, v, truth) in &c.watched {
+                    let form = a.values.value(*v, lane, None).0.form;
+                    if let Some(t) = truth[lane].iter().find(|&&t| !oracle_holds(a.unknowns(), &form, t)) {
+                        wrong.push(format!("case {} [{}] lane {}: {} = {:?} misses {:#x}", case, c.name, lane, name, form, t));
+                    }
+                }
+                if let Some((g, truth)) = &c.guard {
+                    if let Some(bit) = a.bit(*g, lane, None).0 {
+                        if truth[lane].iter().any(|&t| t != bit) {
+                            wrong.push(format!("case {} [{}] lane {}: the guard said always {}", case, c.name, lane, bit));
+                        }
+                    }
+                }
+            }
+            if let Some(u) = a.trip(c.header) {
+                if let Some((_, last)) = a.unknowns()[u as usize].range {
+                    let visits = c.watched[0].2[0].len();
+                    if visits as u64 > last as u64 + 1 {
+                        wrong.push(format!("case {} [{}]: trips said at most {}, the loop visits its header {} times", case, c.name, last, visits));
+                    }
+                }
+            }
+        });
+    }
+    wrong
+}
+
+#[test]
+fn values_hold_every_value_a_random_branching_loop_gives() {
+    let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
+    let count = std::env::var("ORACLE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let wrong = shaped_failures(seed, count);
+    assert!(wrong.is_empty(), "{} wrong, first: {:#?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+}
+
+fn flag_loop(r: &mut Random) -> Shaped {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let (ma, ca) = (if r.below(2) == 0 { 0 } else { interesting(r) }, interesting(r));
+    let f0_kind = r.below(3);
+    let i0 = r.below(8) as u32;
+    let si = [1u32, 2, 3, u32::MAX, 4][r.below(5) as usize];
+    let pred = PREDICATES[r.below(10) as usize];
+    let limit = if r.below(3) != 0 { i0.wrapping_add(si.wrapping_mul(r.below(30) as u32)) } else { interesting(r) };
+    let x = interesting(r);
+    let ua = random_update(r);
+    let uf = r.below(7);
+    let fk = r.below(8) as u32;
+    let nested = r.below(2) == 0;
+    let inner = 1 + r.below(4) as u32;
+    let m = interesting(r);
+    let on_flag = f0_kind != 2 && !matches!(uf, 5) && r.below(4) == 0;
+    let km = b.constant(e, Ty::I32, ma as u64);
+    let kc = b.constant(e, Ty::I32, ca as u64);
+    let scaled = b.int(e, IntOp::Mul, lane, km);
+    let a0 = b.int(e, IntOp::Add, scaled, kc);
+    let f0 = match f0_kind {
+        0 => b.constant(e, Ty::I1, 1),
+        1 => b.constant(e, Ty::I1, 0),
+        _ => {
+            let eight = b.constant(e, Ty::I32, 8);
+            b.cmp(e, IntPred::Ult, lane, eight)
+        }
+    };
+    let start = b.constant(e, Ty::I32, i0 as u64);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I1]);
+    let (x_block, _) = b.block(&[Ty::I1]);
+    b.br(e, h, vec![k.exec, start, a0, f0]);
+    let hl = b.core(h, Ty::I32, Op::Env(Env::LaneId));
+    let kx = b.constant(h, Ty::I32, x as u64);
+    let plus = b.int(h, IntOp::Add, p[2], kx);
+    let other = build_update(&mut b, h, ua, p[2], p[2], p[1], hl);
+    let chosen = b.core(h, Ty::I32, Op::Select(p[3], plus, other));
+    let kf = b.constant(h, Ty::I32, fk as u64);
+    let one1 = b.constant(h, Ty::I1, 1);
+    let cmp_i = b.cmp(h, IntPred::Ult, p[1], kf);
+    let nf = match uf {
+        0 => p[3],
+        1 => b.int(h, IntOp::Xor, p[3], one1),
+        2 => cmp_i,
+        3 => b.int(h, IntOp::And, p[3], cmp_i),
+        4 => b.int(h, IntOp::Or, p[3], cmp_i),
+        5 => {
+            let low = b.cmp(h, IntPred::Ult, hl, kf);
+            b.int(h, IntOp::And, p[3], low)
+        }
+        _ => {
+            let z = b.constant(h, Ty::I32, 0);
+            let c = b.cmp(h, IntPred::Ne, chosen, z);
+            b.int(h, IntOp::And, p[3], c)
+        }
+    };
+    let ks = b.constant(h, Ty::I32, si as u64);
+    let ni = b.int(h, IntOp::Add, p[1], ks);
+    let kl = b.constant(h, Ty::I32, limit as u64);
+    let (body_end, na) = if nested {
+        let (ih, ip) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        let (after, ap) = b.block(&[Ty::I1, Ty::I32]);
+        let zero = b.constant(h, Ty::I32, 0);
+        b.br(h, ih, vec![p[0], chosen, zero]);
+        let kmm = b.constant(ih, Ty::I32, m as u64);
+        let added = b.int(ih, IntOp::Add, ip[1], kmm);
+        let one = b.constant(ih, Ty::I32, 1);
+        let nj = b.int(ih, IntOp::Add, ip[2], one);
+        let ki = b.constant(ih, Ty::I32, inner as u64);
+        let more = b.cmp(ih, IntPred::Ult, nj, ki);
+        b.cond_br(ih, more, (ih, vec![ip[0], added, nj]), (after, vec![ip[0], added]));
+        (after, ap[1])
+    } else {
+        (h, chosen)
+    };
+    let again = if on_flag { nf } else { b.cmp(body_end, pred, ni, kl) };
+    b.cond_br(body_end, again, (h, vec![p[0], ni, na, nf]), (x_block, vec![p[0]]));
+    let mut ti = vec![Vec::new(); 32];
+    let (mut ta, mut tna, mut tf) = (ti.clone(), ti.clone(), ti.clone());
+    let mut tg: Vec<Vec<bool>> = vec![Vec::new(); 32];
+    for l in 0..32u32 {
+        let li = l as usize;
+        let (mut i, mut a) = (i0, l.wrapping_mul(ma).wrapping_add(ca));
+        let mut f = match f0_kind {
+            0 => true,
+            1 => false,
+            _ => l < 8,
+        };
+        for _ in 0..ORACLE_CAP {
+            ti[li].push(i);
+            ta[li].push(a);
+            tf[li].push(f as u32);
+            let chosen = if f { a.wrapping_add(x) } else { run_update(ua, a, a, i, l) };
+            let nf = match uf {
+                0 => f,
+                1 => !f,
+                2 => i < fk,
+                3 => f && i < fk,
+                4 => f || i < fk,
+                5 => f && l < fk,
+                _ => f && chosen != 0,
+            };
+            let na = if nested { chosen.wrapping_add(m.wrapping_mul(inner)) } else { chosen };
+            tna[li].push(na);
+            let ni = i.wrapping_add(si);
+            let go = if on_flag { nf } else { compare(pred, ni, limit) };
+            tg[li].push(go);
+            if !go {
+                break;
+            }
+            (i, a, f) = (ni, na, nf);
+        }
+    }
+    let name = format!(
+        "i0 {} step {:#x} {:?} {:#x} on_flag {} a0 = lane*{:#x}+{:#x} f0 {} x {:#x} a' {:?} f' {} k {} nested {} inner {} m {:#x}",
+        i0, si, pred, limit, on_flag, ma, ca, f0_kind, x, ua, uf, fk, nested, inner, m
+    );
+    Shaped {
+        b,
+        header: h,
+        watched: vec![("i", p[1], ti), ("a", p[2], ta), ("a'", na, tna), ("f", p[3], tf)],
+        guard: Some((again, tg)),
+        name,
+    }
+}
+
+fn flag_failures(seed: u64, count: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    let only: Option<usize> = std::env::var("ORACLE_CASE").ok().and_then(|s| s.parse().ok());
+    for case in 0..count {
+        let c = flag_loop(&mut r);
+        if only.is_some_and(|o| o != case) {
+            continue;
+        }
+        let env = environment(32, &[]);
+        addresses(&c.b, &env, |a| {
+            for &lane in &[0usize, 5, 31] {
+                for (name, v, truth) in &c.watched {
+                    if *name == "f" {
+                        if let Some(bit) = a.bit(*v, lane, None).0 {
+                            if truth[lane].iter().any(|&t| (t != 0) != bit) {
+                                wrong.push(format!("case {} [{}] lane {}: flag said always {}, truth {:?}", case, c.name, lane, bit, &truth[lane][..truth[lane].len().min(8)]));
+                            }
+                        }
+                        continue;
+                    }
+                    let form = a.values.value(*v, lane, None).0.form;
+                    if let Some(t) = truth[lane].iter().find(|&&t| !oracle_holds(a.unknowns(), &form, t)) {
+                        wrong.push(format!("case {} [{}] lane {}: {} = {:?} misses {:#x}", case, c.name, lane, name, form, t));
+                    }
+                }
+                if let Some((g, truth)) = &c.guard {
+                    if let Some(bit) = a.bit(*g, lane, None).0 {
+                        if truth[lane].iter().any(|&t| t != bit) {
+                            wrong.push(format!("case {} [{}] lane {}: the guard said always {}", case, c.name, lane, bit));
+                        }
+                    }
+                }
+            }
+            if let Some(u) = a.trip(c.header) {
+                if let Some((_, last)) = a.unknowns()[u as usize].range {
+                    let visits = c.watched[0].2[0].len();
+                    if visits as u64 > last as u64 + 1 {
+                        wrong.push(format!("case {} [{}]: trips said at most {}, the loop visits its header {} times", case, c.name, last, visits));
+                    }
+                }
+            }
+        });
+    }
+    wrong
+}
+
+#[test]
+fn values_hold_every_value_a_random_loop_with_a_carried_flag_gives() {
+    let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(13);
+    let count = std::env::var("ORACLE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let wrong = flag_failures(seed, count);
+    assert!(wrong.is_empty(), "{} wrong, first: {:#?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+}
+
+#[test]
+fn first_failure_names_the_first_exit_even_far_out() {
+    let mut r = Random::new(77);
+    let mut checked = 0;
+    let mut wrong = Vec::new();
+    for _ in 0..2_000_000 {
+        let pred = PREDICATES[r.below(10) as usize];
+        let taken = r.below(2) == 0;
+        let x = (interesting(&mut r), if r.below(2) == 0 { 0 } else { interesting(&mut r) });
+        let y = (interesting(&mut r), if r.below(3) == 0 { interesting(&mut r) } else { 0 });
+        let Some(last) = first_failure(pred, taken, x, y) else { continue };
+        if !(4096..=1 << 22).contains(&last) {
+            continue;
+        }
+        checked += 1;
+        let at = |v: (u32, u32), t: u32| v.0.wrapping_add(v.1.wrapping_mul(t));
+        if let Some(t) = (0..last).find(|&t| compare(pred, at(x, t), at(y, t)) != taken) {
+            wrong.push(format!("{:?} taken={} {:?} {:?}: leaves at {}, said {}", pred, taken, x, y, t, last));
+        }
+        if checked > 300 {
+            break;
+        }
+    }
+    assert!(wrong.is_empty(), "checked {}: {:?}", checked, wrong);
+}
+
+fn derived_store_meets(
+    env: &Environment,
+    derive: impl Fn(&mut Build, BlockId, ValueId, ValueId) -> ValueId,
+    second_is_target: bool,
+) -> bool {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let first = k.buffer(&mut b, e, 0);
+    let second = k.buffer(&mut b, e, 8);
+    let derived = derive(&mut b, e, first, second);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, if second_is_target { second } else { first }, lane, 4);
+    let zero = b.constant(e, Ty::I32, 0);
+    b.store(e, Space::Global, MemSize::B32, derived, zero, k.exec);
+    b.store(e, Space::Global, MemSize::B32, own, zero, k.exec);
+    let h = super::super::hazard::Hazards::find(&b.program(), env);
+    !h.conflicts().is_empty()
+}
+
+#[test]
+fn hazards_report_stores_through_a_pointer_negated_twice() {
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+    let meets = derived_store_meets(
+        &env,
+        |b, e, first, _| {
+            let zero = b.constant(e, Ty::I64, 0);
+            let negated = b.int(e, IntOp::Sub, zero, first);
+            b.int(e, IntOp::Sub, zero, negated)
+        },
+        false,
+    );
+    assert!(meets, "0 - (0 - first) is first, so every lane meets lane 0 at first[0]");
+}
+
+#[test]
+fn hazards_report_stores_through_a_pointer_aligned_by_shifting() {
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+    let meets = derived_store_meets(
+        &env,
+        |b, e, first, _| {
+            let four = b.constant(e, Ty::I64, 4);
+            let down = b.int(e, IntOp::LShr, first, four);
+            b.int(e, IntOp::Shl, down, four)
+        },
+        false,
+    );
+    assert!(meets, "(first >> 4) << 4 is first, so every lane meets lane 0 at first[0]");
+}
+
+fn pointer_slots(r: &mut Random) -> PointerLoop {
+    use Pointer::*;
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let first = k.buffer(&mut b, e, 0);
+    let second = k.buffer(&mut b, e, 8);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let init = [r.below(3), r.below(3)];
+    let slots_init: Vec<ValueId> = (0..2u64).map(|s| b.constant(e, Ty::I32, 32 + 8 * s)).collect();
+    for (s, &which) in init.iter().enumerate() {
+        match which {
+            0 => b.store(e, Space::Scratch, MemSize::B64, slots_init[s], first, k.exec),
+            1 => b.store(e, Space::Scratch, MemSize::B64, slots_init[s], second, k.exec),
+            _ => {}
+        }
+    }
+    let zero = b.constant(e, Ty::I32, 0);
+    let (fp, fq) = (r.below(2) == 0, r.below(2) == 0);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+    let (x, _) = b.block(&[Ty::I1]);
+    b.br(e, h, vec![k.exec, zero, if fp { first } else { second }, if fq { first } else { second }]);
+    let d = r.below(2) as u32;
+    let stored = r.below(3);
+    let (up, uq) = (random_pointer(r), random_pointer(r));
+    let nested = r.below(2) == 0;
+    let inner = 1 + r.below(3) as u32;
+    let trips = 1 + r.below(6) as u32;
+    let one = b.constant(h, Ty::I32, 1);
+    let eight = b.constant(h, Ty::I32, 8);
+    let base = b.constant(h, Ty::I32, 32);
+    let kd = b.constant(h, Ty::I32, d as u64);
+    let shifted = b.int(h, IntOp::Add, p[1], kd);
+    let rbit = b.int(h, IntOp::And, shifted, one);
+    let roff = b.int(h, IntOp::Mul, rbit, eight);
+    let raddr = b.int(h, IntOp::Add, base, roff);
+    let reloaded = b.load(h, Space::Scratch, MemSize::B64, raddr, p[0]);
+    let wbit = b.int(h, IntOp::And, p[1], one);
+    let woff = b.int(h, IntOp::Mul, wbit, eight);
+    let waddr = b.int(h, IntOp::Add, base, woff);
+    let data = [p[2], p[3], reloaded][stored as usize];
+    b.store(h, Space::Scratch, MemSize::B64, waddr, data, p[0]);
+    let even = b.cmp(h, IntPred::Eq, wbit, zero);
+    let sixteen = b.constant(h, Ty::I32, 16);
+    let low = b.cmp(h, IntPred::Ult, lane, sixteen);
+    let (body, bp) = if nested {
+        let (ih, ip) = b.block(&[Ty::I1, Ty::I64, Ty::I64, Ty::I32]);
+        let (after, ap) = b.block(&[Ty::I1, Ty::I64, Ty::I64]);
+        b.br(h, ih, vec![p[0], p[2], p[3], zero]);
+        let one2 = b.constant(ih, Ty::I32, 1);
+        let nj = b.int(ih, IntOp::Add, ip[3], one2);
+        let ki = b.constant(ih, Ty::I32, inner as u64);
+        let more = b.cmp(ih, IntPred::Ult, nj, ki);
+        b.cond_br(ih, more, (ih, vec![ip[0], ip[2], ip[1], nj]), (after, vec![ip[0], ip[2], ip[1]]));
+        (after, [ap[1], ap[2]])
+    } else {
+        (h, [p[2], p[3]])
+    };
+    let eight64 = b.constant(body, Ty::I64, 8);
+    let build = |b: &mut Build, u: Pointer, own: ValueId, other: ValueId| match u {
+        Same => own,
+        Other => other,
+        Offset => b.int(body, IntOp::Add, own, eight64),
+        ByCounter => b.core(body, Ty::I64, Op::Select(even, own, other)),
+        ByLane => b.core(body, Ty::I64, Op::Select(low, own, other)),
+        First => first,
+        Second => second,
+        Reloaded => reloaded,
+        Integer => {
+            let w = b.core(body, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+            b.int(body, IntOp::Add, w, eight64)
+        }
+    };
+    let np = build(&mut b, up, bp[0], bp[1]);
+    let nq = build(&mut b, uq, bp[1], bp[0]);
+    let one3 = b.constant(body, Ty::I32, 1);
+    let ni = b.int(body, IntOp::Add, p[1], one3);
+    let limit = b.constant(body, Ty::I32, trips as u64);
+    let again = b.cmp(body, IntPred::Ult, ni, limit);
+    b.cond_br(body, again, (h, vec![p[0], ni, np, nq]), (x, vec![p[0]]));
+    let tag = |f: bool| Some(if f { 1u64 } else { 2 });
+    let mut tp: Vec<Vec<Option<u64>>> = vec![Vec::new(); 32];
+    let (mut tq, mut tr, mut tnp, mut tnq) = (tp.clone(), tp.clone(), tp.clone(), tp.clone());
+    for l in 0..32usize {
+        let (mut cp, mut cq) = (tag(fp), tag(fq));
+        let mut slot: [Option<u64>; 2] = [None, None];
+        for s in 0..2 {
+            slot[s] = match init[s] {
+                0 => Some(1),
+                1 => Some(2),
+                _ => None,
+            };
+        }
+        for t in 0..trips {
+            let rl = slot[((t + d) & 1) as usize];
+            let data = [cp, cq, rl][stored as usize];
+            slot[(t & 1) as usize] = data;
+            let (bp, bq) = if nested && inner % 2 == 1 { (cq, cp) } else { (cp, cq) };
+            let step = |u: Pointer, own: Option<u64>, other: Option<u64>| match u {
+                Same | Offset => own,
+                Other => other,
+                ByCounter => {
+                    if t & 1 == 0 {
+                        own
+                    } else {
+                        other
+                    }
+                }
+                ByLane => {
+                    if l < 16 {
+                        own
+                    } else {
+                        other
+                    }
+                }
+                First => Some(1),
+                Second => Some(2),
+                Reloaded => rl,
+                Integer => None,
+            };
+            let (np, nq) = (step(up, bp, bq), step(uq, bq, bp));
+            tp[l].push(cp);
+            tq[l].push(cq);
+            tr[l].push(rl);
+            tnp[l].push(np);
+            tnq[l].push(nq);
+            (cp, cq) = (np, nq);
+        }
+    }
+    let name = format!(
+        "p0 {} q0 {} init {:?} d {} stored {} p' {:?} q' {:?} nested {} inner {} trips {}",
+        tag(fp).unwrap(),
+        tag(fq).unwrap(),
+        init,
+        d,
+        stored,
+        up,
+        uq,
+        nested,
+        inner,
+        trips
+    );
+    PointerLoop {
+        b,
+        watched: vec![("p", p[2], tp), ("q", p[3], tq), ("reloaded", reloaded, tr), ("p'", np, tnp), ("q'", nq, tnq)],
+        name,
+    }
+}
+
+#[test]
+fn regions_hold_every_allocation_random_pointer_slots_carry() {
+    let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(17);
+    let count: usize = std::env::var("ORACLE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(1500);
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for case in 0..count {
+        let c = pointer_slots(&mut r);
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+        addresses(&c.b, &env, |a| {
+            loop {
+                for (_, v, _) in &c.watched {
+                    for l in 0..32 {
+                        for refine in modes() {
+                            a.regions(*v, l, None, refine);
+                        }
+                    }
+                }
+                if !a.settle_loops() {
+                    break;
+                }
+            }
+            for (name, v, truth) in &c.watched {
+                for l in [0usize, 20] {
+                    for refine in modes() {
+                        let set = a.regions(*v, l, None, refine);
+                        for t in &truth[l] {
+                            let hit = match t {
+                                Some(id) => set.reaches(Some(Region::Allocation(*id)), |x, y| x == y),
+                                None => set.lost(),
+                            };
+                            if !hit {
+                                wrong.push(format!("case {} [{}] {} lane {} refine {}: {:?} misses {:?}", case, c.name, name, l, refine, set, t));
+                                break;
+                            }
+                        }
+                    }
+                    let value = a.values.value(*v, l, None).0;
+                    if let Some(region) = value.region {
+                        if truth[l].iter().any(|t| t.map(Region::Allocation) != Some(region)) {
+                            wrong.push(format!("case {} [{}] {} lane {}: value says {:?}, truth {:?}", case, c.name, name, l, region, truth[l]));
+                        }
+                    }
+                }
+            }
+        });
+    }
+    assert!(wrong.is_empty(), "{} wrong, first: {:#?}", wrong.len(), &wrong[..wrong.len().min(10)]);
+}
+
+#[test]
+fn nested_affine_loop_values_hold_every_value_the_inner_parameter_takes() {
+    let mut wrong = Vec::new();
+    for (outer, inner) in [(1u64, 1u64), (2, 3), (5, 7), (7, 5), (40, 3), (3, 40)] {
+        let (b, j) = nested_affine_loops(outer, inner);
+        let mut truth = Vec::new();
+        let mut x = 1u32;
+        for _ in 0..outer {
+            let mut v = x;
+            for _ in 0..inner {
+                truth.push(v);
+                v = v.wrapping_mul(5).wrapping_add(7);
+            }
+            x = x.wrapping_mul(3).wrapping_add(1);
+        }
+        addresses(&b, &environment(32, &[]), |a| {
+            let form = a.values.value(j, 0, None).0.form;
+            for &t in &truth {
+                if !oracle_holds(a.unknowns(), &form, t) {
+                    wrong.push(format!("outer {} inner {}: {:?} misses {:#x}", outer, inner, form, t));
+                    break;
+                }
+            }
+        });
+    }
+    assert!(wrong.is_empty(), "{:?}", wrong);
+}
+
+#[test]
+fn a_reloaded_spill_of_a_pointer_a_loop_swaps_points_into_both_buffers() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let first = k.buffer(&mut b, e, 0);
+    let second = k.buffer(&mut b, e, 8);
+    let zero = b.constant(e, Ty::I32, 0);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64, Ty::I64]);
+    let (x, _) = b.block(&[Ty::I1]);
+    b.br(e, h, vec![k.exec, zero, first, second]);
+    let slot = b.constant(h, Ty::I32, 16);
+    b.store(h, Space::Scratch, MemSize::B64, slot, p[2], p[0]);
+    let reloaded = b.load(h, Space::Scratch, MemSize::B64, slot, p[0]);
+    let one = b.constant(h, Ty::I32, 1);
+    let ni = b.int(h, IntOp::Add, p[1], one);
+    let four = b.constant(h, Ty::I32, 4);
+    let again = b.cmp(h, IntPred::Ult, ni, four);
+    b.cond_br(h, again, (h, vec![p[0], ni, p[3], p[2]]), (x, vec![p[0]]));
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+    let (param, spilled) = addresses(&b, &env, |a| {
+        loop {
+            for v in [p[2], reloaded] {
+                for refine in [false, true] {
+                    a.regions(v, 0, None, refine);
+                }
+            }
+            if !a.settle_loops() {
+                break;
+            }
+        }
+        (a.regions(p[2], 0, None, true), a.regions(reloaded, 0, None, true))
+    });
+    for id in [1u64, 2] {
+        assert!(param.reaches(Some(Region::Allocation(id)), |x, y| x == y), "p: {:?}", param);
+        assert!(
+            spilled.reaches(Some(Region::Allocation(id)), |x, y| x == y),
+            "the reload gives p back, which points into allocations 1 and 2, but its regions are {:?} (p: {:?})",
+            spilled,
+            param
+        );
+    }
+}
+
+#[test]
+fn copies_name_a_root_every_incoming_edge_brings_or_copies() {
+    let mut r = Random::new(29);
+    let mut wrong = Vec::new();
+    for case in 0..3000 {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let consts: Vec<ValueId> = (0..3).map(|i| b.constant(e, Ty::I32, i)).collect();
+        let n = 2 + r.below(5) as usize;
+        let mut blocks = Vec::new();
+        for _ in 0..n {
+            let count = 1 + r.below(3) as usize;
+            let mut types = vec![Ty::I1];
+            types.extend(std::iter::repeat_n(Ty::I32, count));
+            blocks.push(b.block(&types));
+        }
+        let pick = |r: &mut Random, from: &[ValueId]| -> ValueId {
+            let all: Vec<ValueId> = consts.iter().copied().chain(from.iter().copied()).collect();
+            all[r.below(all.len() as u64) as usize]
+        };
+        let args_for = |r: &mut Random, dst: usize, own: &[ValueId], exec: ValueId| -> Vec<ValueId> {
+            let mut args = vec![exec];
+            for _ in 1..blocks[dst].1.len() {
+                args.push(pick(r, own));
+            }
+            args
+        };
+        let first_args = args_for(&mut r, 0, &[], k.exec);
+        b.br(e, blocks[0].0, first_args);
+        for i in 0..n {
+            let (id, ref params) = blocks[i];
+            let own: Vec<ValueId> = params[1..].to_vec();
+            let next = (i + 1).min(n - 1);
+            let back = r.below(i as u64 + 1) as usize;
+            if i + 1 == n {
+                if r.below(2) == 0 {
+                    let c = b.constant(id, Ty::I1, 0);
+                    let args = args_for(&mut r, back, &own, params[0]);
+                    let (exit, _) = b.block(&[Ty::I1]);
+                    b.cond_br(id, c, (blocks[back].0, args), (exit, vec![params[0]]));
+                }
+                continue;
+            }
+            let c = b.constant(id, Ty::I1, 0);
+            let target = if r.below(2) == 0 { back } else { (i + 1 + r.below((n - i - 1) as u64) as usize).min(n - 1) };
+            let a1 = args_for(&mut r, next, &own, params[0]);
+            let a2 = args_for(&mut r, target, &own, params[0]);
+            b.cond_br(id, c, (blocks[next].0, a1), (blocks[target].0, a2));
+        }
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let copies = super::graph::copies(&b.f, &facts);
+        let params: BTreeSet<ValueId> = blocks.iter().flat_map(|(_, p)| p[1..].iter().copied()).collect();
+        for &p in &params {
+            let Some(&root) = copies.get(&p) else { continue };
+            if facts.site[p.0] == crate::rdna_spmd::analysis::facts::Site::Unreached {
+                continue;
+            }
+            let crate::rdna_spmd::analysis::facts::Site::Param { block, index } = facts.site[p.0] else { continue };
+            for &(pred, slot) in &facts.incoming[&block] {
+                let a = b.f.blocks[&pred].term.edges().nth(slot).unwrap().args[index];
+                let ra = copies.get(&a).copied().unwrap_or(a);
+                if ra != root {
+                    wrong.push(format!("case {}: v{} called a copy of v{}, but an edge brings v{} (a copy of v{})", case, p.0, root.0, a.0, ra.0));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(5)]);
+}
+
+#[test]
+fn a_loop_parameter_fed_through_a_second_vgpr_input_points_into_the_buffer() {
+    let (mut b, k, extra) = Build::kernel_with(&[(ParameterSource::Vgpr(1), Ty::I32)]);
+    let e = BlockId(0);
+    let second = k.buffer(&mut b, e, 8);
+    let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, extra[0]));
+    let zero = b.constant(e, Ty::I32, 0);
+    let null = b.constant(e, Ty::I64, 0);
+    let (h, p) = b.block(&[Ty::I1, Ty::I32, Ty::I64]);
+    let (x, _) = b.block(&[Ty::I1]);
+    b.br(e, h, vec![k.exec, zero, null]);
+    let moved = b.int(h, IntOp::Add, second, wide);
+    let one = b.constant(h, Ty::I32, 1);
+    let ni = b.int(h, IntOp::Add, p[1], one);
+    let four = b.constant(h, Ty::I32, 4);
+    let again = b.cmp(h, IntPred::Ult, ni, four);
+    b.cond_br(h, again, (h, vec![p[0], ni, moved]), (x, vec![p[0]]));
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)]);
+    let set = addresses(&b, &env, |a| {
+        loop {
+            for refine in [false, true] {
+                a.regions(p[2], 0, None, refine);
+            }
+            if !a.settle_loops() {
+                break;
+            }
+        }
+        a.regions(p[2], 0, None, true)
+    });
+    assert!(set.reaches(Some(Region::Allocation(2)), |x, y| x == y), "p is second from the second trip on, but its regions are {:?}", set);
+}
+
+
+fn halving_wide_loop_counted(bounded: bool) -> (Build, ValueId, ValueId, Vec<u32>) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let start = b.constant(e, Ty::I64, 0x1_0000_0000);
+    let zero = b.constant(e, Ty::I32, 0);
+    let limit = if bounded { b.constant(e, Ty::I32, 4) } else { loaded_word(&mut b, &k, e, 0, MemSize::B32) };
+    let (body, p) = b.block(&[Ty::I1, Ty::I64, Ty::I32]);
+    let (exit, _) = b.block(&[Ty::I1]);
+    b.br(e, body, vec![k.exec, start, zero]);
+    let low = b.core(body, Ty::I32, Op::UnpackLo(p[1]));
+    let nothing = b.constant(body, Ty::I32, 0);
+    let low_is_zero = b.cmp(body, IntPred::Eq, low, nothing);
+    let one64 = b.constant(body, Ty::I64, 1);
+    let halved = b.int(body, IntOp::LShr, p[1], one64);
+    let one = b.constant(body, Ty::I32, 1);
+    let next = b.int(body, IntOp::Add, p[2], one);
+    let again = b.cmp(body, IntPred::Ult, next, limit);
+    b.cond_br(body, again, (body, vec![p[0], halved, next]), (exit, vec![p[0]]));
+    (b, low, low_is_zero, vec![0, 0x8000_0000, 0x4000_0000, 0x2000_0000])
+}
+
+fn halving_wide_answers(bounded: bool) -> Vec<String> {
+    let (b, low, low_is_zero, truth) = halving_wide_loop_counted(bounded);
+    let mut wrong = Vec::new();
+    addresses(&b, &two_words(), |a| {
+        let form = a.values.value(low, 0, None).0.form;
+        for &t in &truth {
+            if !representable(a.unknowns(), &form, t) {
+                let info: Vec<_> = form.terms.iter().map(|&(u, _)| (a.unknowns()[u as usize].range, a.unknowns()[u as usize].values.clone())).collect();
+                wrong.push(format!("low word {:?} (ranges {:?}) cannot be {:#x}", form, info, t));
+            }
+        }
+        if let Some(decided) = a.bit(low_is_zero, 0, None).0 {
+            wrong.push(format!("low word == 0 decided {}, but it holds only in the first iteration", decided));
+        }
+    });
+    wrong
+}
+
+#[test]
+fn halving_wide_loop_parameters_hold_every_low_word_over_a_known_trip_count() {
+    let wrong = halving_wide_answers(true);
+    assert!(wrong.is_empty(), "{:?}", wrong);
+}
+
+#[test]
+fn halving_wide_loop_parameters_hold_every_low_word_over_an_unknown_trip_count() {
+    let wrong = halving_wide_answers(false);
+    assert!(wrong.is_empty(), "{:?}", wrong);
+}
+
+type Eval = std::rc::Rc<dyn Fn(&[u32; 4]) -> u32>;
+
+fn oracle_constant(r: &mut Random) -> u32 {
+    match r.below(4) {
+        0 => r.below(40) as u32,
+        1 => (1u32 << r.below(32)).wrapping_sub(r.below(2) as u32),
+        2 => !((1u32 << r.below(32)).wrapping_sub(1)),
+        _ => interesting(r),
+    }
+}
+
+fn oracle_word(b: &mut Build, e: BlockId, r: &mut Random, leaves: &[ValueId; 4], depth: u32) -> (ValueId, String, Eval) {
+    use IntOp::*;
+    if depth == 0 || r.below(5) == 0 {
+        let i = r.below(5) as usize;
+        if i < 4 {
+            let name = ["u", "z", "w", "lane"][i].to_string();
+            return (leaves[i], name, std::rc::Rc::new(move |x: &[u32; 4]| x[i]));
+        }
+        let k = oracle_constant(r);
+        return (b.constant(e, Ty::I32, k as u64), format!("{:#x}", k), std::rc::Rc::new(move |_: &[u32; 4]| k));
+    }
+    let ops = [Add, Sub, Mul, And, Or, Xor, Shl, LShr, AShr];
+    match r.below(10) {
+        0..=5 => {
+            let op = ops[r.below(9) as usize];
+            let (x, nx, fx) = oracle_word(b, e, r, leaves, depth - 1);
+            let (y, ny, fy) = if r.below(2) == 0 {
+                let k = if matches!(op, Shl | LShr | AShr) { r.below(40) as u32 } else { oracle_constant(r) };
+                let f: Eval = std::rc::Rc::new(move |_: &[u32; 4]| k);
+                (b.constant(e, Ty::I32, k as u64), format!("{:#x}", k), f)
+            } else {
+                oracle_word(b, e, r, leaves, depth - 1)
+            };
+            let v = b.int(e, op, x, y);
+            let f: Eval = std::rc::Rc::new(move |i: &[u32; 4]| {
+                let (a, s) = (fx(i), fy(i));
+                match op {
+                    Add => a.wrapping_add(s),
+                    Sub => a.wrapping_sub(s),
+                    Mul => a.wrapping_mul(s),
+                    And => a & s,
+                    Or => a | s,
+                    Xor => a ^ s,
+                    Shl => a << (s & 31),
+                    LShr => a >> (s & 31),
+                    AShr => ((a as i32) >> (s & 31)) as u32,
+                }
+            });
+            (v, format!("({} {:?} {})", nx, op, ny), f)
+        }
+        6 | 7 => {
+            let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ugt, IntPred::Ule, IntPred::Uge, IntPred::Slt, IntPred::Sgt, IntPred::Sle, IntPred::Sge];
+            let pred = preds[r.below(10) as usize];
+            let (x, nx, fx) = oracle_word(b, e, r, leaves, depth - 1);
+            let (y, ny, fy) = oracle_word(b, e, r, leaves, depth - 1);
+            let (p, np, fp) = oracle_word(b, e, r, leaves, depth - 1);
+            let (q, nq, fq) = oracle_word(b, e, r, leaves, depth - 1);
+            let c = b.cmp(e, pred, x, y);
+            let v = b.core(e, Ty::I32, Op::Select(c, p, q));
+            let f: Eval = std::rc::Rc::new(move |i: &[u32; 4]| if super::compare(pred, fx(i), fy(i)) { fp(i) } else { fq(i) });
+            (v, format!("({} {:?} {} ? {} : {})", nx, pred, ny, np, nq), f)
+        }
+        8 => {
+            let k = r.below(4) as u8;
+            let (x, nx, fx) = oracle_word(b, e, r, leaves, depth - 1);
+            let op = [Op::PopulationCount(x), Op::TrailingZeros(x), Op::LeadingZeros(x), Op::ReverseBits(x)][k as usize];
+            let v = b.core(e, Ty::I32, op);
+            let f: Eval = std::rc::Rc::new(move |i: &[u32; 4]| {
+                let a = fx(i);
+                match k {
+                    0 => a.count_ones(),
+                    1 => a.trailing_zeros(),
+                    2 => a.leading_zeros(),
+                    _ => a.reverse_bits(),
+                }
+            });
+            (v, format!("{:?}({})", ["popcount", "tz", "lz", "rev"][k as usize], nx), f)
+        }
+        _ => {
+            let (x, nx, fx) = oracle_word(b, e, r, leaves, depth - 1);
+            let preds = [IntPred::Ult, IntPred::Slt, IntPred::Eq];
+            let pred = preds[r.below(3) as usize];
+            let k = oracle_constant(r);
+            let kk = b.constant(e, Ty::I32, k as u64);
+            let c = b.cmp(e, pred, x, kk);
+            let sext = r.below(2) == 0;
+            let v = b.core(e, Ty::I32, Op::Convert(if sext { Cvt::SExt } else { Cvt::ZExt }, Ty::I32, c));
+            let f: Eval = std::rc::Rc::new(move |i: &[u32; 4]| match (super::compare(pred, fx(i), k), sext) {
+                (false, _) => 0,
+                (true, false) => 1,
+                (true, true) => u32::MAX,
+            });
+            (v, format!("ext({} {:?} {:#x})", nx, pred, k), f)
+        }
+    }
+}
+
+fn oracle_samples(r: &mut Random) -> Vec<[u32; 3]> {
+    let mut out = Vec::new();
+    for &u in &[0u32, 1, 2, 3, 7, 8, 0x7fff, 0x8000, 0xfffe, 0xffff] {
+        for _ in 0..3 {
+            out.push([u, interesting(r), interesting(r)]);
+        }
+    }
+    for _ in 0..30 {
+        out.push([r.below(65536) as u32, interesting(r), r.next() as u32]);
+    }
+    out
+}
+
+fn random_words(seed: u64, programs: usize, per: usize, depth: u32) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for _ in 0..programs {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let four = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, four);
+        let z = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let leaves = [u, z, w, lane];
+        let mut words = Vec::new();
+        let mut bits = Vec::new();
+        for _ in 0..per {
+            let (v, name, f) = oracle_word(&mut b, e, &mut r, &leaves, depth);
+            let (v2, name2, f2) = oracle_word(&mut b, e, &mut r, &leaves, depth - 1);
+            let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ugt, IntPred::Ule, IntPred::Uge, IntPred::Slt, IntPred::Sgt, IntPred::Sle, IntPred::Sge];
+            let pred = preds[r.below(10) as usize];
+            let c = b.cmp(e, pred, v, v2);
+            bits.push((c, format!("{} {:?} {}", name, pred, name2), f.clone(), f2.clone(), pred));
+            words.push((v, name, f));
+            words.push((v2, name2, f2));
+        }
+        let samples = oracle_samples(&mut r);
+        let ws: Vec<Vec<u32>> = (0..samples.len()).map(|_| (0..32).map(|_| interesting(&mut r)).collect()).collect();
+        addresses(&b, &two_words(), |a| {
+            for lane in [0usize, 5, 31] {
+                let forms: Vec<Form> = words.iter().map(|(v, _, _)| a.values.value(*v, lane, None).0.form).collect();
+                let decided: Vec<Option<bool>> = bits.iter().map(|(c, ..)| a.bit(*c, lane, None).0).collect();
+                for (s, sample) in samples.iter().enumerate() {
+                    let input = [sample[0], sample[1], ws[s][lane], lane as u32];
+                    for (i, (_, name, f)) in words.iter().enumerate() {
+                        let t = f(&input);
+                        if !core_holds(a.unknowns(), &forms[i], t) {
+                            wrong.push(format!("{} lane {} at {:x?}: {:?} cannot be {:#x}", name, lane, input, forms[i], t));
+                        }
+                    }
+                    for i in 0..words.len() {
+                        for j in 0..i {
+                            if forms[i].terms.is_empty() || forms[i].terms != forms[j].terms {
+                                continue;
+                            }
+                            let d = forms[i].constant.wrapping_sub(forms[j].constant);
+                            let t = (words[i].2)(&input).wrapping_sub((words[j].2)(&input));
+                            if d != t {
+                                wrong.push(format!("{} minus {} lane {} at {:x?}: forms differ by {:#x}, values by {:#x}", words[i].1, words[j].1, lane, input, d, t));
+                            }
+                        }
+                    }
+                    for (i, (_, name, f1, f2, pred)) in bits.iter().enumerate() {
+                        if let Some(k) = decided[i] {
+                            if k != super::compare(*pred, f1(&input), f2(&input)) {
+                                wrong.push(format!("{} lane {} at {:x?}: decided {}", name, lane, input, k));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_word_expressions_hold_every_value_and_decide_only_what_holds() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
+    let depth: u32 = std::env::var("ORACLE_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let wrong = random_words(seed, n, 4, depth);
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+fn solves(lo: u32, hi: u32, c: u32, need: u32) -> bool {
+    let z = c.trailing_zeros();
+    if z >= 32 {
+        return need == 0;
+    }
+    if need & ((1u64 << z) - 1) as u32 != 0 {
+        return false;
+    }
+    let modulus = 1u64 << (32 - z);
+    let odd = (c >> z) as u64;
+    let mut inverse = 1u64;
+    for _ in 0..6 {
+        inverse = inverse.wrapping_mul(2u64.wrapping_sub(odd.wrapping_mul(inverse))) % modulus;
+    }
+    let first = ((need >> z) as u64 * inverse) % modulus;
+    let start = if (lo as u64) <= first { first } else { first + (lo as u64 - first).div_ceil(modulus) * modulus };
+    start <= hi as u64
+}
+
+fn core_holds(unknowns: &[UnknownInfo], form: &Form, truth: u32) -> bool {
+    let choices = |u: Unknown| -> Option<Vec<u32>> {
+        match (&unknowns[u as usize].values, unknowns[u as usize].range) {
+            (Some(set), _) => Some(set.to_vec()),
+            (None, Some((lo, hi))) if hi - lo < 1 << 16 => Some((lo..=hi).collect()),
+            _ => None,
+        }
+    };
+    let size = |u: Unknown| -> u64 {
+        match (&unknowns[u as usize].values, unknowns[u as usize].range) {
+            (Some(set), _) => set.len() as u64,
+            (None, Some((lo, hi))) => hi as u64 - lo as u64 + 1,
+            _ => 1 << 32,
+        }
+    };
+    if form.terms.is_empty() {
+        return form.constant == truth;
+    }
+    let solved = (0..form.terms.len())
+        .filter(|&i| unknowns[form.terms[i].0 as usize].values.is_none())
+        .max_by_key(|&i| size(form.terms[i].0));
+    let rest: Vec<usize> = (0..form.terms.len()).filter(|&i| Some(i) != solved).collect();
+    let sets: Option<Vec<Vec<u32>>> = rest.iter().map(|&i| choices(form.terms[i].0)).collect();
+    let Some(sets) = sets else {
+        return if std::env::var("ORACLE_SOLVE").is_ok() { representable(unknowns, form, truth) } else { true };
+    };
+    if sets.iter().try_fold(1u64, |acc, s| acc.checked_mul(s.len() as u64)).is_none_or(|n| n > 1 << 13) {
+        return if std::env::var("ORACLE_SOLVE").is_ok() { representable(unknowns, form, truth) } else { true };
+    }
+    let mut index = vec![0usize; sets.len()];
+    loop {
+        let partial = rest
+            .iter()
+            .zip(&index)
+            .zip(&sets)
+            .fold(form.constant, |acc, ((&t, &i), set)| acc.wrapping_add(form.terms[t].1.wrapping_mul(set[i])));
+        let hit = match solved {
+            Some(t) => {
+                let (u, c) = form.terms[t];
+                let (lo, hi) = unknowns[u as usize].range.unwrap_or((0, u32::MAX));
+                solves(lo, hi, c, truth.wrapping_sub(partial))
+            }
+            None => partial == truth,
+        };
+        if hit {
+            return true;
+        }
+        let mut k = 0;
+        loop {
+            if k == index.len() {
+                return false;
+            }
+            if index[k] + 1 < sets[k].len() {
+                index[k] += 1;
+                break;
+            }
+            index[k] = 0;
+            k += 1;
+        }
+    }
+}
+
+fn fields(leaf_size: MemSize) -> Vec<String> {
+    use IntOp::*;
+    let scales = [1u32, 2, 3, 4, 6, 8, 0x10, 0x10000, 0x8000_0000, 0xffff_fffc, 0xffff_ffff];
+    let offsets = [0u32, 1, 3, 4, 7, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0xffff_fffc, 0x1234_5678];
+    let mut operations: Vec<(IntOp, u32)> = Vec::new();
+    for k in [1u32, 2, 3, 4, 16, 31] {
+        operations.push((LShr, k));
+        operations.push((AShr, k));
+    }
+    for m in [0u32, 7, 0xff, 0x3c, 0xff00, 0xfff0, 0xffff_fff0, 0x8000_0000, 0x7fff_ffff, 0xf_ffff, 0xffff_0000] {
+        operations.push((And, m));
+    }
+    for c in [1u32, 2, 3, 5, 0x10, 0x3c, 0x7fff_ffff] {
+        operations.push((Or, c));
+        operations.push((Xor, c));
+    }
+    let mut wrong = Vec::new();
+    for chunk in scales.chunks(3) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let x = b.load(e, Space::Global, leaf_size, table, yes);
+        let mut cases = Vec::new();
+        for &m in chunk {
+            let km = b.constant(e, Ty::I32, m as u64);
+            let scaled = b.int(e, Mul, x, km);
+            for &c in &offsets {
+                let kc = b.constant(e, Ty::I32, c as u64);
+                let sum = b.int(e, Add, scaled, kc);
+                for &(op, n) in &operations {
+                    let kn = b.constant(e, Ty::I32, n as u64);
+                    let v = b.int(e, op, sum, kn);
+                    cases.push((v, m, c, op, n));
+                }
+            }
+        }
+        let mut r = Random::new(99);
+        let mut values: Vec<u32> = vec![0, 1, 2, 3, 0x7fff, 0x8000, 0xffff, 0x3fff_ffff, 0x4000_0000, 0x7fff_ffff, 0x8000_0000, 0xffff_ffff, 0xffff_fffe];
+        for _ in 0..24 {
+            values.push(r.next() as u32);
+        }
+        if leaf_size == MemSize::U16 {
+            values.iter_mut().for_each(|v| *v &= 0xffff);
+        }
+        addresses(&b, &two_words(), |a| {
+            let forms: Vec<Form> = cases.iter().map(|c| a.values.value(c.0, 0, None).0.form).collect();
+            for &x in &values {
+                let truths: Vec<u32> = cases
+                    .iter()
+                    .map(|&(_, m, c, op, n)| {
+                        let s = x.wrapping_mul(m).wrapping_add(c);
+                        match op {
+                            LShr => s >> n,
+                            AShr => ((s as i32) >> n) as u32,
+                            And => s & n,
+                            Or => s | n,
+                            _ => s ^ n,
+                        }
+                    })
+                    .collect();
+                for (i, &(_, m, c, op, n)) in cases.iter().enumerate() {
+                    if !core_holds(a.unknowns(), &forms[i], truths[i]) {
+                        wrong.push(format!("({:#x} x + {:#x}) {:?} {:#x} at x = {:#x}: {:?} cannot be {:#x}", m, c, op, n, x, forms[i], truths[i]));
+                    }
+                }
+                for i in 0..cases.len() {
+                    for j in 0..i {
+                        if forms[i].terms.is_empty() || forms[i].terms != forms[j].terms {
+                            continue;
+                        }
+                        let d = forms[i].constant.wrapping_sub(forms[j].constant);
+                        let t = truths[i].wrapping_sub(truths[j]);
+                        if d != t {
+                            let (ci, cj) = (cases[i], cases[j]);
+                            wrong.push(format!("({:#x} x + {:#x}) {:?} {:#x} minus ({:#x} x + {:#x}) {:?} {:#x} at x = {:#x}: forms differ by {:#x}, values by {:#x}", ci.1, ci.2, ci.3, ci.4, cj.1, cj.2, cj.3, cj.4, x, d, t));
+                        }
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn fields_of_scaled_unbounded_words_hold_every_value() {
+    let wrong = fields(MemSize::B32);
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+#[test]
+fn fields_of_scaled_halfwords_hold_every_value() {
+    let wrong = fields(MemSize::U16);
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+type WideEval = std::rc::Rc<dyn Fn(&[u32; 3]) -> u64>;
+
+fn wide_constant(r: &mut Random) -> u64 {
+    match r.below(5) {
+        0 => r.below(70),
+        1 => 1u64 << r.below(64),
+        2 => (r.below(16)).wrapping_neg(),
+        3 => (interesting(r) as u64) | (interesting(r) as u64) << 32,
+        _ => r.next(),
+    }
+}
+
+fn oracle_wide(b: &mut Build, e: BlockId, r: &mut Random, leaves: &[ValueId; 3], depth: u32) -> (ValueId, String, WideEval) {
+    use IntOp::*;
+    if depth == 0 || r.below(4) == 0 {
+        return match r.below(6) {
+            0 => (b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, leaves[0])), "zext u".into(), std::rc::Rc::new(|x: &[u32; 3]| x[0] as u64)),
+            1 => {
+                let k = interesting(r);
+                let kk = b.constant(e, Ty::I32, k as u64);
+                let s = b.int(e, Sub, leaves[0], kk);
+                (b.core(e, Ty::I64, Op::Convert(Cvt::SExt, Ty::I64, s)), format!("sext(u - {:#x})", k), std::rc::Rc::new(move |x: &[u32; 3]| x[0].wrapping_sub(k) as i32 as i64 as u64))
+            }
+            2 => (b.core(e, Ty::I64, Op::Pack64(leaves[0], leaves[1])), "pack(u, z)".into(), std::rc::Rc::new(|x: &[u32; 3]| x[0] as u64 | (x[1] as u64) << 32)),
+            3 => (b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, leaves[1])), "zext z".into(), std::rc::Rc::new(|x: &[u32; 3]| x[1] as u64)),
+            4 => (b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, leaves[2])), "zext lane".into(), std::rc::Rc::new(|x: &[u32; 3]| x[2] as u64)),
+            _ => {
+                let k = wide_constant(r);
+                (b.constant(e, Ty::I64, k), format!("{:#x}", k), std::rc::Rc::new(move |_: &[u32; 3]| k))
+            }
+        };
+    }
+    let ops = [Add, Sub, Mul, And, Or, Xor, Shl, LShr, AShr];
+    match r.below(8) {
+        0..=6 => {
+            let op = ops[r.below(9) as usize];
+            let (x, nx, fx) = oracle_wide(b, e, r, leaves, depth - 1);
+            let constant = matches!(op, Mul | And | Or | Xor | Shl | LShr | AShr) || r.below(2) == 0;
+            let (y, ny, fy) = if constant {
+                let k = if matches!(op, Shl | LShr | AShr) { r.below(70) } else { wide_constant(r) };
+                let f: WideEval = std::rc::Rc::new(move |_: &[u32; 3]| k);
+                (b.constant(e, Ty::I64, k), format!("{:#x}", k), f)
+            } else {
+                oracle_wide(b, e, r, leaves, depth - 1)
+            };
+            let v = b.int(e, op, x, y);
+            let f: WideEval = std::rc::Rc::new(move |i: &[u32; 3]| {
+                let (a, s) = (fx(i), fy(i));
+                match op {
+                    Add => a.wrapping_add(s),
+                    Sub => a.wrapping_sub(s),
+                    Mul => a.wrapping_mul(s),
+                    And => a & s,
+                    Or => a | s,
+                    Xor => a ^ s,
+                    Shl => a << (s & 63),
+                    LShr => a >> (s & 63),
+                    AShr => ((a as i64) >> (s & 63)) as u64,
+                }
+            });
+            (v, format!("({} {:?} {})", nx, op, ny), f)
+        }
+        _ => {
+            let (x, nx, fx) = oracle_wide(b, e, r, leaves, depth - 1);
+            let (y, ny, fy) = oracle_wide(b, e, r, leaves, depth - 1);
+            let k = r.below(70000) as u32;
+            let kk = b.constant(e, Ty::I32, k as u64);
+            let c = b.cmp(e, IntPred::Ult, leaves[0], kk);
+            let v = b.core(e, Ty::I64, Op::Select(c, x, y));
+            let f: WideEval = std::rc::Rc::new(move |i: &[u32; 3]| if i[0] < k { fx(i) } else { fy(i) });
+            (v, format!("(u < {} ? {} : {})", k, nx, ny), f)
+        }
+    }
+}
+
+fn random_wides(seed: u64, programs: usize, per: usize, depth: u32) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for _ in 0..programs {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let four = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, four);
+        let z = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let leaves = [u, z, lane];
+        let mut cases = Vec::new();
+        for _ in 0..per {
+            let (v, name, f) = oracle_wide(&mut b, e, &mut r, &leaves, depth);
+            let hi = b.core(e, Ty::I32, Op::UnpackHi(v));
+            let (w, wname, g) = oracle_wide(&mut b, e, &mut r, &leaves, depth - 1);
+            let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Slt];
+            let pred = preds[r.below(4) as usize];
+            let c = b.cmp(e, pred, v, w);
+            cases.push((v, hi, c, name, f, wname, g, pred));
+        }
+        let mut samples: Vec<[u32; 2]> = Vec::new();
+        for &uu in &[0u32, 1, 2, 3, 0x7fff, 0x8000, 0xfffe, 0xffff] {
+            for _ in 0..3 {
+                samples.push([uu, interesting(&mut r)]);
+            }
+        }
+        for _ in 0..16 {
+            samples.push([r.below(65536) as u32, r.next() as u32]);
+        }
+        addresses(&b, &two_words(), |a| {
+            let uu = a.values.value(u, 0, None).0.form;
+            let zz = a.values.value(z, 0, None).0.form;
+            let (Some(&(ui, 1)), Some(&(zi, 1))) = (uu.terms.first(), zz.terms.first()) else {
+                wrong.push(format!("leaves are not plain unknowns: {:?} {:?}", uu, zz));
+                return;
+            };
+            for lane in [0usize, 7] {
+                for (v, hi, c, name, f, wname, g, pred) in &cases {
+                    let low = a.values.value(*v, lane, None).0.form;
+                    let high = a.high(*v, lane);
+                    let unpacked = a.values.value(*hi, lane, None).0.form;
+                    let decided = a.bit(*c, lane, None).0;
+                    let wide = a.wide_value(*v, e, lane);
+                    let exact = wide.as_ref().filter(|w| w.words.is_empty() && w.terms.iter().all(|&(t, _)| t == ui || t == zi));
+                    for s in &samples {
+                        let input = [s[0], s[1], lane as u32];
+                        let t = f(&input);
+                        if !core_holds(a.unknowns(), &low, t as u32) {
+                            wrong.push(format!("low of {} lane {} at {:x?}: {:?} cannot be {:#x}", name, lane, input, low, t as u32));
+                        }
+                        if !core_holds(a.unknowns(), &high, (t >> 32) as u32) {
+                            wrong.push(format!("high of {} lane {} at {:x?}: {:?} cannot be {:#x}", name, lane, input, high, (t >> 32) as u32));
+                        }
+                        if !core_holds(a.unknowns(), &unpacked, (t >> 32) as u32) {
+                            wrong.push(format!("unpacked high of {} lane {} at {:x?}: {:?} cannot be {:#x}", name, lane, input, unpacked, (t >> 32) as u32));
+                        }
+                        if let Some(k) = decided {
+                            let (x, y) = (t, g(&input));
+                            let truth = match pred {
+                                IntPred::Eq => x == y,
+                                IntPred::Ne => x != y,
+                                IntPred::Ult => x < y,
+                                _ => (x as i64) < (y as i64),
+                            };
+                            if k != truth {
+                                wrong.push(format!("{} {:?} {} lane {} at {:x?}: decided {}", name, pred, wname, lane, input, k));
+                            }
+                        }
+                        if let Some(w) = exact {
+                            let value = w.terms.iter().fold(w.constant, |acc, &(t, c)| acc + c * if t == ui { s[0] as i128 } else { s[1] as i128 });
+                            if value != t as i128 {
+                                wrong.push(format!("wide value of {} lane {} at {:x?}: {:?} gives {:#x}, not {:#x}", name, lane, input, w, value, t));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_wide_expressions_hold_every_value_and_decide_only_what_holds() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(11);
+    let depth: u32 = std::env::var("ORACLE_DEPTH").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let wrong = random_wides(seed, n, 4, depth);
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+fn or_of_select_and_bit(sext: bool) -> (Build, ValueId, ValueId, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let table = k.buffer(&mut b, e, 8);
+    let yes = b.constant(e, Ty::I1, 1);
+    let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+    let four = b.constant(e, Ty::I64, 4);
+    let second = b.int(e, IntOp::Add, table, four);
+    let z = b.load(e, Space::Global, MemSize::B32, second, yes);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, table, lane, 4);
+    let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+    let c = b.cmp(e, IntPred::Sge, u, w);
+    let small = b.constant(e, Ty::I32, 4);
+    let big = b.constant(e, Ty::I32, 0x8000_0005);
+    let chosen = b.core(e, Ty::I32, Op::Select(c, small, big));
+    let limit = b.constant(e, Ty::I32, 0xfffc_0000);
+    let below = b.cmp(e, IntPred::Ult, z, limit);
+    let cvt = if sext { Cvt::SExt } else { Cvt::ZExt };
+    let bit = b.core(e, Ty::I32, Op::Convert(cvt, Ty::I32, below));
+    let either = b.int(e, IntOp::Or, chosen, bit);
+    let less = b.cmp(e, IntPred::Ult, either, u);
+    (b, either, u, less)
+}
+
+#[test]
+fn or_of_a_select_and_an_extended_bit_decides_only_what_holds() {
+    let mut wrong = Vec::new();
+    for sext in [false, true] {
+        let (b, either, u, less) = or_of_select_and_bit(sext);
+        addresses(&b, &two_words(), |a| {
+            let x = a.values.value(either, 0, None).0.form;
+            let y = a.values.value(u, 0, None).0.form;
+            let info: Vec<_> = x.terms.iter().chain(&y.terms).map(|&(t, _)| (t, a.unknowns()[t as usize].range, a.unknowns()[t as usize].values.clone())).collect();
+            let decided = a.bit(less, 0, None).0;
+            if let Some((low, high)) = a.bounds(&x) {
+                if low > high || !core_holds(a.unknowns(), &x, 4) || 4 < low || 4 > high {
+                    wrong.push(format!("sext {}: bounds of {:?} over {:?} are {:?}, which leave out 4 (u = 0x8000, w = 5, z = ~0)", sext, x, info, (low, high)));
+                }
+            }
+            if decided == Some(false) {
+                wrong.push(format!("sext {}: ({:?}) < ({:?}) over {:?} decided false, but u = 0x8000, w = 5, z = ~0 gives 4 < 0x8000", sext, x, y, info));
+            }
+        });
+    }
+    assert!(wrong.is_empty(), "{:#?}", wrong);
+}
+
+type LoopEval = std::rc::Rc<dyn Fn(u64, u64, u32) -> u64>;
+
+fn oracle_step(b: &mut Build, e: BlockId, r: &mut Random, ty: Ty, v: ValueId, i: ValueId, depth: u32) -> (ValueId, String, LoopEval) {
+    use IntOp::*;
+    let bits = ty.bits();
+    let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let leaf = |b: &mut Build, r: &mut Random| -> (ValueId, String, LoopEval) {
+        match r.below(4) {
+            0 | 2 => (v, "v".into(), std::rc::Rc::new(|v: u64, _: u64, _: u32| v)),
+            1 => {
+                let x = if ty == Ty::I64 { b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, i)) } else { i };
+                (x, "i".into(), std::rc::Rc::new(|_: u64, i: u64, _: u32| i))
+            }
+            _ => {
+                let k = if r.below(2) == 0 { r.below(9) } else { wide_constant(r) & mask };
+                (b.constant(e, ty, k), format!("{:#x}", k), std::rc::Rc::new(move |_: u64, _: u64, _: u32| k))
+            }
+        }
+    };
+    if depth == 0 {
+        return leaf(b, r);
+    }
+    let ops = [Add, Add, Sub, Mul, And, Or, Xor, Shl, LShr, AShr];
+    let op = ops[r.below(10) as usize];
+    let (x, nx, fx) = if r.below(3) == 0 { leaf(b, r) } else { oracle_step(b, e, r, ty, v, i, depth - 1) };
+    let (y, ny, fy) = if matches!(op, Shl | LShr | AShr) {
+        let k = r.below(bits as u64 + 4);
+        let f: LoopEval = std::rc::Rc::new(move |_: u64, _: u64, _: u32| k);
+        (b.constant(e, ty, k), format!("{}", k), f)
+    } else if r.below(2) == 0 {
+        leaf(b, r)
+    } else {
+        oracle_step(b, e, r, ty, v, i, depth - 1)
+    };
+    let value = b.int(e, op, x, y);
+    let f: LoopEval = std::rc::Rc::new(move |v: u64, i: u64, u: u32| {
+        let (a, s) = (fx(v, i, u), fy(v, i, u));
+        let out = match op {
+            Add => a.wrapping_add(s),
+            Sub => a.wrapping_sub(s),
+            Mul => a.wrapping_mul(s),
+            And => a & s,
+            Or => a | s,
+            Xor => a ^ s,
+            Shl => a << (s & (bits as u64 - 1)),
+            LShr => (a & mask) >> (s & (bits as u64 - 1)),
+            AShr => (((a << (64 - bits)) as i64 >> (64 - bits)) >> (s & (bits as u64 - 1))) as u64,
+        };
+        out & mask
+    });
+    (value, format!("({} {:?} {})", nx, op, ny), f)
+}
+
+fn random_loops(seed: u64, programs: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for _ in 0..programs {
+        let ty = if r.below(3) == 0 && std::env::var("ORACLE_TY").map_or(true, |t| t == "64") { Ty::I64 } else { Ty::I32 };
+        let mask = if ty == Ty::I64 { u64::MAX } else { u32::MAX as u64 };
+        let bounded = r.below(2) == 0;
+        let trips = 1 + r.below(6) as u32;
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U8, table, yes);
+        let from_u = r.below(2) == 0;
+        let start_k = wide_constant(&mut r) & mask;
+        let start = if from_u {
+            let kk = b.constant(e, Ty::I32, start_k & 0xffff_ffff);
+            let s = b.int(e, IntOp::Add, u, kk);
+            if ty == Ty::I64 { b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, s)) } else { s }
+        } else {
+            b.constant(e, ty, start_k)
+        };
+        let first = move |uu: u32| if from_u { (uu as u64).wrapping_add(start_k & 0xffff_ffff) & 0xffff_ffff } else { start_k };
+        let limit = if bounded { b.constant(e, Ty::I32, trips as u64) } else { loaded_word(&mut b, &k, e, 4, MemSize::B32) };
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, ty, Ty::I32]);
+        let (exit, x) = b.block(&[Ty::I1, ty]);
+        b.br(e, body, vec![k.exec, start, zero]);
+        let (next, name, f) = oracle_step(&mut b, body, &mut r, ty, p[1], p[2], 2);
+        let one = b.constant(body, Ty::I32, 1);
+        let ni = b.int(body, IntOp::Add, p[2], one);
+        let again = b.cmp(body, IntPred::Ult, ni, limit);
+        b.cond_br(body, again, (body, vec![p[0], next, ni]), (exit, vec![p[0], next]));
+        let runs = if bounded { trips } else { 7 };
+        let described = if bounded { trips.to_string() } else { "unknown".into() };
+        addresses(&b, &two_words(), |a| {
+            let inside = a.values.value(p[1], 0, None).0.form;
+            let after = a.values.value(x[1], 0, None).0.form;
+            for uu in [0u32, 1, 2, 77, 128, 254, 255] {
+                let mut v = first(uu);
+                for t in 0..runs {
+                    if !core_holds(a.unknowns(), &inside, v as u32) {
+                        wrong.push(format!("{:?} v' = {} from {:#x} (u = {}), {} trips: iteration {} value {:#x} not in {:?}", ty, name, first(uu), uu, described, t, v, inside));
+                    }
+                    v = f(v, t as u64, uu);
+                    if (bounded && t + 1 == runs || !bounded) && !core_holds(a.unknowns(), &after, v as u32) {
+                        wrong.push(format!("{:?} v' = {} from {:#x} (u = {}), {} trips: exit after {} value {:#x} not in {:?}", ty, name, first(uu), uu, described, t + 1, v, after));
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_loops_hold_every_value_an_iteration_gives() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(13);
+    let wrong = random_loops(seed, n);
+    if std::env::var("ORACLE_ALL").is_ok() {
+        for w in &wrong {
+            eprintln!("{}", w);
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+fn random_branches(seed: u64, programs: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ugt, IntPred::Ule, IntPred::Uge, IntPred::Slt, IntPred::Sgt, IntPred::Sle, IntPred::Sge];
+    for _ in 0..programs {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let four = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, four);
+        let z = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let leaves = [u, z, w, lane];
+        let on_u = r.below(2) == 0;
+        let s = if on_u { u } else { z };
+        let pred = preds[r.below(10) as usize];
+        let bound = if on_u { [0u32, 1, 7, 0x8000, 0xffff, 100][r.below(6) as usize] } else { [0u32, 1, 7, 0x8000_0000, 0xffff_ffff, 0x7fff_ffff, 100][r.below(7) as usize] };
+        let kb = b.constant(e, Ty::I32, bound as u64);
+        let c = b.cmp(e, pred, s, kb);
+        let direct = r.below(2) == 0;
+        let (merge, m) = b.block(&[Ty::I1, Ty::I32]);
+        let (arm_yes, yv, yname, fy) = if direct {
+            let (v, n, f) = oracle_word(&mut b, e, &mut r, &leaves, 2);
+            (e, v, n, f)
+        } else {
+            let (blk, _) = b.block(&[Ty::I1]);
+            let (v, n, f) = oracle_word(&mut b, blk, &mut r, &leaves, 2);
+            b.br(blk, merge, vec![k.exec, v]);
+            (blk, v, n, f)
+        };
+        let (arm_no, _) = b.block(&[Ty::I1]);
+        let (nv, nname, fnn) = oracle_word(&mut b, arm_no, &mut r, &leaves, 2);
+        b.br(arm_no, merge, vec![k.exec, nv]);
+        let yes_target = if direct { (merge, vec![k.exec, yv]) } else { (arm_yes, vec![k.exec]) };
+        b.cond_br(e, c, yes_target, (arm_no, vec![k.exec]));
+        let (after, an, fa) = oracle_word(&mut b, merge, &mut r, &[m[1], z, w, lane], 1);
+        let cmp_pred = preds[r.below(10) as usize];
+        let probe = b.cmp(merge, cmp_pred, m[1], u);
+        let mut samples: Vec<[u32; 3]> = Vec::new();
+        for _ in 0..30 {
+            let mut uu = [0u32, 1, 7, 0x8000, 0xffff, 100, 99, 101][r.below(8) as usize];
+            let mut zz = interesting(&mut r);
+            if r.below(3) == 0 {
+                if on_u {
+                    uu = bound & 0xffff;
+                } else {
+                    zz = bound;
+                }
+            }
+            if r.below(4) == 0 {
+                uu = r.below(65536) as u32;
+            }
+            samples.push([uu, zz, interesting(&mut r)]);
+        }
+        addresses(&b, &two_words(), |a| {
+            for lane in [0usize, 9] {
+                let joined = a.values.value(m[1], lane, None).0.form;
+                let later = a.values.value(after, lane, None).0.form;
+                let arm_y = a.values.value(yv, lane, None).0.form;
+                let arm_n = a.values.value(nv, lane, None).0.form;
+                let decided = a.bit(probe, lane, None).0;
+                let _ = arm_yes;
+                for sm in &samples {
+                    let input = [sm[0], sm[1], sm[2], lane as u32];
+                    let taken = super::compare(pred, if on_u { sm[0] } else { sm[1] }, bound);
+                    let t = if taken { fy(&input) } else { fnn(&input) };
+                    let what = format!("if {} {:?} {:#x} then {} else {} (direct {}) lane {} at {:x?}", if on_u { "u" } else { "z" }, pred, bound, yname, nname, direct, lane, input);
+                    if !core_holds(a.unknowns(), &joined, t) {
+                        wrong.push(format!("{}: joined {:?} cannot be {:#x}", what, joined, t));
+                    }
+                    let ta = fa(&[t, sm[1], sm[2], lane as u32]);
+                    if !core_holds(a.unknowns(), &later, ta) {
+                        wrong.push(format!("{}: {} after the join {:?} cannot be {:#x}", what, an, later, ta));
+                    }
+                    if taken && !direct && !core_holds(a.unknowns(), &arm_y, t) {
+                        wrong.push(format!("{}: yes arm {:?} cannot be {:#x}", what, arm_y, t));
+                    }
+                    if !taken && !core_holds(a.unknowns(), &arm_n, t) {
+                        wrong.push(format!("{}: no arm {:?} cannot be {:#x}", what, arm_n, t));
+                    }
+                    if let Some(d) = decided {
+                        if d != super::compare(cmp_pred, t, sm[0]) {
+                            wrong.push(format!("{}: joined {:?} u decided {}", what, cmp_pred, d));
+                        }
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_branches_hold_every_value_the_taken_edge_brings() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(100);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(17);
+    let wrong = random_branches(seed, n);
+    if std::env::var("ORACLE_ALL").is_ok() {
+        for w in &wrong {
+            eprintln!("{}", w);
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Data {
+    Constant(u32),
+    U(u32),
+    Lane,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OracleWhen {
+    Always,
+    Never,
+    Below(u32),
+    Exec,
+}
+
+fn random_scratch(seed: u64, programs: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for _ in 0..programs {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let no = b.constant(e, Ty::I1, 0);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let four = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, four);
+        let z = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let symbolic = r.below(2) == 0;
+        let base = if symbolic {
+            let k64 = b.constant(e, Ty::I32, 64);
+            b.int(e, IntOp::Mul, u, k64)
+        } else {
+            b.constant(e, Ty::I32, 0x100)
+        };
+        let diamond = r.below(2) == 0;
+        let split = b.constant(e, Ty::I32, 0x8000_0000);
+        let branch = b.cmp(e, IntPred::Ult, z, split);
+        let (then, _) = b.block(&[Ty::I1]);
+        let (other, _) = b.block(&[Ty::I1]);
+        let (join, _) = b.block(&[Ty::I1]);
+        let count = 1 + r.below(5) as usize;
+        let mut plan = Vec::new();
+        for _ in 0..count {
+            let place = if diamond { r.below(4) as usize } else { 0 };
+            let off = [0u32, 4, 8, 2, 1, 6, 0xffff_fffc][r.below(7) as usize];
+            let size = [MemSize::B32, MemSize::B32, MemSize::B32, MemSize::U8, MemSize::U16][r.below(5) as usize];
+            let data = match r.below(3) {
+                0 => Data::Constant(interesting(&mut r)),
+                1 => Data::U(interesting(&mut r)),
+                _ => Data::Lane,
+            };
+            let when = match r.below(5) {
+                0 | 1 => OracleWhen::Always,
+                2 => OracleWhen::Never,
+                3 => OracleWhen::Below([0x10u32, 0x8000_0000, 0xffff_ffff][r.below(3) as usize]),
+                _ => OracleWhen::Exec,
+            };
+            plan.push((place, off, size, data, when));
+        }
+        plan.sort_by_key(|p| p.0);
+        let load_off = [0u32, 4, 8, 0xffff_fffc, 2][r.below(5) as usize];
+        let block_of = |place: usize| if !diamond { e } else { [e, then, other, join][place] };
+        for &(place, off, size, data, when) in &plan {
+            let at = block_of(place);
+            let ko = b.constant(at, Ty::I32, off as u64);
+            let address = b.int(at, IntOp::Add, base, ko);
+            let value = match data {
+                Data::Constant(c) => b.constant(at, Ty::I32, c as u64),
+                Data::U(c) => {
+                    let kc = b.constant(at, Ty::I32, c as u64);
+                    b.int(at, IntOp::Add, u, kc)
+                }
+                Data::Lane => lane,
+            };
+            let predicate = match when {
+                OracleWhen::Always => yes,
+                OracleWhen::Never => no,
+                OracleWhen::Below(limit) => {
+                    let kl = b.constant(at, Ty::I32, limit as u64);
+                    b.cmp(at, IntPred::Ult, z, kl)
+                }
+                OracleWhen::Exec => k.exec,
+            };
+            b.store(at, Space::Scratch, size, address, value, predicate);
+        }
+        if diamond {
+            b.cond_br(e, branch, (then, vec![k.exec]), (other, vec![k.exec]));
+            b.br(then, join, vec![k.exec]);
+            b.br(other, join, vec![k.exec]);
+        }
+        let last = if diamond { join } else { e };
+        let kl = b.constant(last, Ty::I32, load_off as u64);
+        let address = b.int(last, IntOp::Add, base, kl);
+        let loaded = b.load(last, Space::Scratch, MemSize::B32, address, k.exec);
+        let samples: Vec<(u32, u32)> = (0..24).map(|_| ([0u32, 1, 2, 0x7fff, 0xffff][r.below(5) as usize], interesting(&mut r))).collect();
+        addresses(&b, &two_words(), |a| {
+            for l in [0usize, 3] {
+                let form = a.values.value(loaded, l, None).0.form;
+                for &(uu, zz) in &samples {
+                    let mut memory: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
+                    for &(place, off, size, data, when) in &plan {
+                        let taken = zz < 0x8000_0000;
+                        if diamond && ((place == 1 && !taken) || (place == 2 && taken)) {
+                            continue;
+                        }
+                        let runs = match when {
+                            OracleWhen::Always | OracleWhen::Exec => true,
+                            OracleWhen::Never => false,
+                            OracleWhen::Below(limit) => zz < limit,
+                        };
+                        if !runs {
+                            continue;
+                        }
+                        let value = match data {
+                            Data::Constant(c) => c,
+                            Data::U(c) => uu.wrapping_add(c),
+                            Data::Lane => l as u32,
+                        };
+                        for i in 0..size.bytes() {
+                            memory.insert(off.wrapping_add(i), (value >> (8 * i)) as u8);
+                        }
+                    }
+                    let bytes: Option<Vec<u8>> = (0..4).map(|i| memory.get(&load_off.wrapping_add(i)).copied()).collect();
+                    let Some(bytes) = bytes else { continue };
+                    let t = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    if !core_holds(a.unknowns(), &form, t) {
+                        wrong.push(format!("symbolic {} diamond {} stores {:x?} load at {:#x} lane {} u {:#x} z {:#x}: {:?} cannot be {:#x}", symbolic, diamond, plan, load_off, l, uu, zz, form, t));
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_private_stores_read_back_every_word_they_leave() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(19);
+    let wrong = random_scratch(seed, n);
+    if std::env::var("ORACLE_ALL").is_ok() {
+        for w in &wrong {
+            eprintln!("{}", w);
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+fn random_scratch_loops(seed: u64, programs: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for _ in 0..programs {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let symbolic = r.below(2) == 0;
+        let base = if symbolic {
+            let k64 = b.constant(e, Ty::I32, 64);
+            b.int(e, IntOp::Mul, u, k64)
+        } else {
+            b.constant(e, Ty::I32, 0x100)
+        };
+        let offs = [0u32, 4, 8, 2];
+        let init: Vec<(u32, u32)> = offs.iter().map(|&o| (o, interesting(&mut r))).collect();
+        for &(o, v) in &init {
+            let ko = b.constant(e, Ty::I32, o as u64);
+            let address = b.int(e, IntOp::Add, base, ko);
+            let kv = b.constant(e, Ty::I32, v as u64);
+            if o != 2 {
+                b.store(e, Space::Scratch, MemSize::B32, address, kv, yes);
+            }
+        }
+        let trips = 1 + r.below(5) as u32;
+        let bounded = r.below(2) == 0;
+        let limit = if bounded { b.constant(e, Ty::I32, trips as u64) } else { loaded_word(&mut b, &k, e, 4, MemSize::B32) };
+        let zero = b.constant(e, Ty::I32, 0);
+        let (body, p) = b.block(&[Ty::I1, Ty::I32]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, body, vec![k.exec, zero]);
+        let load_off = offs[r.below(3) as usize];
+        let kl = b.constant(body, Ty::I32, load_off as u64);
+        let at = b.int(body, IntOp::Add, base, kl);
+        let inside = b.load(body, Space::Scratch, MemSize::B32, at, k.exec);
+        let store_off = offs[r.below(4) as usize];
+        let size = [MemSize::B32, MemSize::B32, MemSize::U8, MemSize::U16][r.below(4) as usize];
+        let ks = b.constant(body, Ty::I32, store_off as u64);
+        let sat = b.int(body, IntOp::Add, base, ks);
+        let mode = r.below(3);
+        let scale = interesting(&mut r);
+        let kscale = b.constant(body, Ty::I32, scale as u64);
+        let data = match mode {
+            0 => b.int(body, IntOp::Mul, p[1], kscale),
+            1 => b.int(body, IntOp::Add, inside, kscale),
+            _ => kscale,
+        };
+        let guarded = r.below(2) == 0;
+        let predicate = if guarded {
+            let two = b.constant(body, Ty::I32, 2);
+            b.cmp(body, IntPred::Ult, p[1], two)
+        } else {
+            yes
+        };
+        b.store(body, Space::Scratch, size, sat, data, predicate);
+        let one = b.constant(body, Ty::I32, 1);
+        let ni = b.int(body, IntOp::Add, p[1], one);
+        let again = b.cmp(body, IntPred::Ult, ni, limit);
+        b.cond_br(body, again, (body, vec![p[0], ni]), (exit, vec![p[0]]));
+        let kx = b.constant(exit, Ty::I32, load_off as u64);
+        let xat = b.int(exit, IntOp::Add, base, kx);
+        let after = b.load(exit, Space::Scratch, MemSize::B32, xat, k.exec);
+        let runs = if bounded { trips } else { 6 };
+        addresses(&b, &two_words(), |a| {
+            let fin = a.values.value(inside, 0, None).0.form;
+            let fout = a.values.value(after, 0, None).0.form;
+            let mut memory: std::collections::HashMap<u32, u8> = std::collections::HashMap::new();
+            for &(o, v) in &init {
+                if o != 2 {
+                    for i in 0..4 {
+                        memory.insert(o + i, (v >> (8 * i)) as u8);
+                    }
+                }
+            }
+            let read = |m: &std::collections::HashMap<u32, u8>, o: u32| u32::from_le_bytes([0, 1, 2, 3].map(|i| m[&(o + i)]));
+            for t in 0..runs {
+                let x = read(&memory, load_off);
+                let what = format!("symbolic {} bounded {} trips {} load {} store {} {:?} mode {} scale {:#x} guarded {}", symbolic, bounded, runs, load_off, store_off, size, mode, scale, guarded);
+                if !core_holds(a.unknowns(), &fin, x) {
+                    wrong.push(format!("{}: iteration {} reload {:?} cannot be {:#x}", what, t, fin, x));
+                }
+                let value = match mode {
+                    0 => t.wrapping_mul(scale),
+                    1 => x.wrapping_add(scale),
+                    _ => scale,
+                };
+                if !guarded || t < 2 {
+                    for i in 0..size.bytes() {
+                        memory.insert(store_off + i, (value >> (8 * i)) as u8);
+                    }
+                }
+                if bounded && t + 1 == runs || !bounded {
+                    let y = read(&memory, load_off);
+                    if !core_holds(a.unknowns(), &fout, y) {
+                        wrong.push(format!("{}: after {} trips {:?} cannot be {:#x}", what, t + 1, fout, y));
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_private_words_a_loop_stores_read_back_every_value() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(23);
+    let wrong = random_scratch_loops(seed, n);
+    if std::env::var("ORACLE_ALL").is_ok() {
+        for w in &wrong {
+            eprintln!("{}", w);
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}
+
+type OracleBallot = std::rc::Rc<dyn Fn(u32, &[u32; 32], usize, u32) -> u32>;
+
+fn ballot_word(b: &mut Build, e: BlockId, r: &mut Random, k: &Kernel, leaves: &[ValueId; 3], depth: u32) -> (ValueId, String, OracleBallot) {
+    let preds = [IntPred::Ult, IntPred::Ugt, IntPred::Eq, IntPred::Ne, IntPred::Slt];
+    if depth == 0 || r.below(3) == 0 {
+        if r.below(5) == 0 {
+            let c = interesting(r);
+            return (b.constant(e, Ty::I32, c as u64), format!("{:#x}", c), std::rc::Rc::new(move |_: u32, _: &[u32; 32], _: usize, _: u32| c));
+        }
+        let pred = preds[r.below(5) as usize];
+        let which = r.below(3) as usize;
+        let bound = match which {
+            0 => r.below(33) as u32,
+            1 => [0u32, 1, 100, 0x8000_0000][r.below(4) as usize],
+            _ => [0u32, 3, 0x8000, 0xffff][r.below(4) as usize],
+        };
+        let kb = b.constant(e, Ty::I32, bound as u64);
+        let c = b.cmp(e, pred, leaves[which], kb);
+        let masked = b.int(e, IntOp::And, c, k.exec);
+        let word = b.wave(e, WaveOp::Ballot { high: false }, vec![masked]);
+        let f: OracleBallot = std::rc::Rc::new(move |u: u32, w: &[u32; 32], _: usize, valid: u32| {
+            (0..32).filter(|&l| valid >> l & 1 != 0).fold(0u32, |m, l| {
+                let x = [l as u32, w[l], u][which];
+                m | (super::compare(pred, x, bound) as u32) << l
+            })
+        });
+        return (word, format!("ballot({} {:?} {:#x})", ["lane", "w", "u"][which], pred, bound), f);
+    }
+    let (x, nx, fx) = ballot_word(b, e, r, k, leaves, depth - 1);
+    let (y, ny, fy) = ballot_word(b, e, r, k, leaves, depth - 1);
+    match r.below(4) {
+        0 => {
+            let v = b.int(e, IntOp::And, x, y);
+            (v, format!("({} & {})", nx, ny), std::rc::Rc::new(move |u: u32, w: &[u32; 32], l: usize, valid: u32| fx(u, w, l, valid) & fy(u, w, l, valid)))
+        }
+        1 => {
+            let v = b.int(e, IntOp::Or, x, y);
+            (v, format!("({} | {})", nx, ny), std::rc::Rc::new(move |u: u32, w: &[u32; 32], l: usize, valid: u32| fx(u, w, l, valid) | fy(u, w, l, valid)))
+        }
+        2 => {
+            let v = b.int(e, IntOp::Xor, x, y);
+            (v, format!("({} ^ {})", nx, ny), std::rc::Rc::new(move |u: u32, w: &[u32; 32], l: usize, valid: u32| fx(u, w, l, valid) ^ fy(u, w, l, valid)))
+        }
+        _ => {
+            let kb = [0u32, 0x8000][r.below(2) as usize];
+            let kk = b.constant(e, Ty::I32, kb as u64);
+            let c = b.cmp(e, IntPred::Ult, leaves[2], kk);
+            let v = b.core(e, Ty::I32, Op::Select(c, x, y));
+            (v, format!("(u < {:#x} ? {} : {})", kb, nx, ny), std::rc::Rc::new(move |u: u32, w: &[u32; 32], l: usize, valid: u32| if u < kb { fx(u, w, l, valid) } else { fy(u, w, l, valid) }))
+        }
+    }
+}
+
+fn random_ballots(seed: u64, programs: usize) -> Vec<String> {
+    let mut r = Random::new(seed);
+    let mut wrong = Vec::new();
+    for _ in 0..programs {
+        let size = [32u32, 20, 1, 31][r.below(4) as usize];
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let yes = b.constant(e, Ty::I1, 1);
+        let u = b.load(e, Space::Global, MemSize::U16, table, yes);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, table, lane, 4);
+        let w = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        let leaves = [lane, w, u];
+        let (word, name, f) = ballot_word(&mut b, e, &mut r, &k, &leaves, 2);
+        let by_lane = r.below(2) == 0;
+        let fixed = r.below(32) as u32;
+        let amount = if by_lane { lane } else { b.constant(e, Ty::I32, fixed as u64) };
+        let shifted = b.int(e, IntOp::LShr, word, amount);
+        let bit = b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let valid: u32 = if size == 32 { u32::MAX } else { (1u32 << size) - 1 };
+        let samples: Vec<(u32, [u32; 32])> = (0..12)
+            .map(|_| ([0u32, 3, 0x7fff, 0x8000, 0xffff][r.below(5) as usize], std::array::from_fn(|_| [0u32, 1, 100, 0x8000_0000, 99][r.below(5) as usize])))
+            .collect();
+        addresses(&b, &environment(size, &[(0, 1, 0x1000), (8, 2, 0x2000)]), |a| {
+            for l in 0..size as usize {
+                let decided = a.bit(bit, l, None).0;
+                let form = a.values.value(word, l, None).0.form;
+                for (uu, ws) in &samples {
+                    let t = f(*uu, ws, l, valid);
+                    let s = if by_lane { l as u32 } else { fixed };
+                    let truth = t >> s & 1 != 0;
+                    if decided.is_some_and(|d| d != truth) {
+                        wrong.push(format!("{} >> {} in a wave of {} lane {} u {:#x}: decided {:?}, truth {}", name, if by_lane { "lane".to_string() } else { fixed.to_string() }, size, l, uu, decided, truth));
+                    }
+                    if !core_holds(a.unknowns(), &form, t) {
+                        wrong.push(format!("{} in a wave of {} lane {} u {:#x}: {:?} cannot be {:#x}", name, size, l, uu, form, t));
+                    }
+                }
+            }
+        });
+    }
+    wrong.sort();
+    wrong.dedup();
+    wrong
+}
+
+#[test]
+fn random_ballot_bits_decide_only_what_holds() {
+    let n: usize = std::env::var("ORACLE_N").ok().and_then(|s| s.parse().ok()).unwrap_or(200);
+    let seed: u64 = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(29);
+    let wrong = random_ballots(seed, n);
+    if std::env::var("ORACLE_ALL").is_ok() {
+        for w in &wrong {
+            eprintln!("{}", w);
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong, first {:#?}", wrong.len(), &wrong[..wrong.len().min(12)]);
+}

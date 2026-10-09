@@ -662,4 +662,40 @@ mod tests {
         assert!(!l.lane.blocks.contains_key(&dead));
         assert_eq!(l.lane.blocks[&e].term, Term::Ret(Vec::new()));
     }
+
+    #[test]
+    fn lane_program_converts_a_carried_word_whose_back_edge_brings_a_materialized_word() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let five = b.constant(e, Ty::I32, 5);
+        let small = b.cmp(e, IntPred::Ult, lane, five);
+        let w = b.wave(e, WaveOp::Ballot { high: false }, vec![small]);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (head, h) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, head, vec![k.exec, w, zero, buf]);
+        let lane_h = b.core(head, Ty::I32, Op::Env(Env::LaneId));
+        let shifted = b.int(head, IntOp::LShr, h[1], lane_h);
+        let own = b.core(head, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+        let mask = b.int(head, IntOp::And, own, h[0]);
+        let one = b.constant(head, Ty::I32, 1);
+        b.store(head, Space::Global, MemSize::B32, h[3], one, mask);
+        let three = b.constant(head, Ty::I32, 3);
+        let odd = b.cmp(head, IntPred::Ult, lane_h, three);
+        let w2 = b.wave(head, WaveOp::Ballot { high: false }, vec![odd]);
+        let count = b.core(head, Ty::I32, Op::PopulationCount(w2));
+        b.store(head, Space::Global, MemSize::B32, h[3], count, h[0]);
+        let next = b.int(head, IntOp::Add, h[2], one);
+        let four = b.constant(head, Ty::I32, 4);
+        let again = b.cmp(head, IntPred::Ult, next, four);
+        b.cond_br(head, again, (head, vec![h[0], w2, next, h[3]]), (exit, vec![h[0]]));
+        let l = lower(&b, &Kept::default(), &BTreeMap::new());
+        assert_eq!(l.lane.types[h[1].0], Ty::I1, "the carried word is read only by a lane test");
+        assert_eq!(l.lane.types[w2.0], Ty::I32, "the population count needs the whole word");
+        assert_eq!(l.lane.types[w.0], Ty::I1, "the entering ballot is read only through the parameter");
+        assert_eq!(valid(&b, &l), Ok(()));
+        assert_eq!(mismatches(&b, &l), Vec::<ValueId>::new());
+    }
 }

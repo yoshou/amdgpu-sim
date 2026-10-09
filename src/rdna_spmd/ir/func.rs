@@ -161,6 +161,28 @@ impl Func {
         order.reverse();
         order
     }
+    pub fn detach_entry(&mut self) {
+        let entry = self.entry;
+        if !self.blocks.values().any(|b| b.term.edges().any(|e| e.dst == entry)) {
+            return;
+        }
+        let id = BlockId(self.blocks.keys().next_back().unwrap().0 + 1);
+        let types: Vec<Ty> = self.blocks[&entry].params.iter().map(|&(_, ty)| ty).collect();
+        let params: Vec<(ValueId, Ty)> = types.into_iter().map(|ty| (self.value(ty), ty)).collect();
+        let args = params.iter().map(|&(v, _)| v).collect();
+        self.blocks.insert(
+            id,
+            Block {
+                params,
+                insts: Vec::new(),
+                term: Term::Br(Edge { dst: entry, args }),
+            },
+        );
+        if let Some(presence) = self.regions.remove(&entry) {
+            self.regions.insert(id, presence);
+        }
+        self.entry = id;
+    }
     pub fn rename(&mut self, map: &BTreeMap<ValueId, ValueId>) {
         let m = |v: ValueId| {
             let mut v = v;

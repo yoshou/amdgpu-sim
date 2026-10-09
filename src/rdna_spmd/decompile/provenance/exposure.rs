@@ -1,7 +1,6 @@
 use super::super::address::{aligns, Region};
 use super::demand::{demands, uses, Demand};
 use super::layout::{merge, pointers, points};
-use super::program::Program;
 use super::sets::Sets;
 use super::{Exposure, Spill};
 use crate::rdna_spmd::environment::Environment;
@@ -28,7 +27,7 @@ pub(super) fn exposures(sets: &Sets, env: &Environment) -> (Vec<Exposure>, Vec<S
         for (index, inst) in f.blocks[&b].insts.iter().enumerate() {
             let (operands, lanewise, assume, scratch): (&[ValueId], _, _, _) = match inst {
                 Inst::Core { value, op, .. } => {
-                    let n = exposed(program, *value, *op, &mut buffer);
+                    let n = exposed(sets, *value, *op, &mut buffer);
                     (&buffer[..n], true, None, None)
                 }
                 Inst::Target { op, args, .. } if program.pure(*op) => (args.values(), true, None, None),
@@ -52,7 +51,8 @@ pub(super) fn exposures(sets: &Sets, env: &Environment) -> (Vec<Exposure>, Vec<S
                 }
                 _ => continue,
             };
-            let reaching = |set: &[u64]| set.iter().zip(&wanted).any(|(x, y)| x & y != 0);
+            let holds = |set: &[u64]| layout.has(set, Some(Region::Kernarg)) || layout.has(set, Some(Region::Dispatch));
+            let reaching = |set: &[u64]| holds(set) || set.iter().zip(&wanted).any(|(x, y)| x & y != 0);
             let relevant = match scratch {
                 Some(_) => operands.iter().any(|&x| points(sets.of(x))),
                 None => operands.iter().any(|&x| reaching(sets.of(x))),
@@ -123,7 +123,7 @@ pub(super) fn exposures(sets: &Sets, env: &Environment) -> (Vec<Exposure>, Vec<S
                 .allocations()
                 .iter()
                 .copied()
-                .filter(|&id| layout.has(&acc, Some(Region::Allocation(id))) && layout.has(&wanted, Some(Region::Allocation(id))))
+                .filter(|&id| (holds(&acc) || layout.has(&acc, Some(Region::Allocation(id)))) && layout.has(&wanted, Some(Region::Allocation(id))))
                 .collect();
             if !candidates.is_empty() {
                 exposing.push(Exposure {
@@ -137,15 +137,19 @@ pub(super) fn exposures(sets: &Sets, env: &Environment) -> (Vec<Exposure>, Vec<S
     (exposing, spills)
 }
 
-fn exposed(program: &Program, v: ValueId, op: Op, out: &mut [ValueId; 3]) -> usize {
+fn exposed(sets: &Sets, v: ValueId, op: Op, out: &mut [ValueId; 3]) -> usize {
+    let program = sets.program();
+    let pointing = |x: ValueId| points(sets.of(x));
     let wide = program.f.types[v.0] == Ty::I64;
-    let high = |s: ValueId| wide && program.constant(s).is_some_and(|k| k >= 32);
+    let high = |s: ValueId| wide && program.constant(s).is_some_and(|k| k & 63 >= 32);
     let list: &[ValueId] = match op {
         Op::Int(IntOp::And, a, b) => match (program.constant(a), program.constant(b)) {
             (None, Some(m)) | (Some(m), None) if aligns(m) => &[],
             _ => &[a, b],
         },
         Op::Int(IntOp::Mul | IntOp::Shl, a, b) | Op::Float(_, a, b) => &[a, b],
+        Op::Int(IntOp::Add, a, b) if pointing(a) && pointing(b) => &[a, b],
+        Op::Int(IntOp::Sub, a, b) if pointing(b) => &[a, b],
         Op::Int(IntOp::AShr, a, b) if !high(b) => &[a, b],
         Op::Int(IntOp::LShr, a, b) if wide && !high(b) => &[a, b],
         Op::Pack64(_, a) | Op::ReverseBits(a) | Op::Unary(_, a) => &[a],
@@ -201,7 +205,7 @@ fn under(sets: &Sets, x: ValueId, held: &[ValueId], memo: &mut HashMap<ValueId, 
         }
         Some(Op::Int(IntOp::Sub, a, b)) => {
             let (y, z) = (under(sets, a, held, memo), under(sets, b, held, memo));
-            if z[0] & 1 != 0 {
+            if z[0] & 1 != 0 || (points(&y) && points(&z)) {
                 pointers(&mut acc, &y);
             }
             if y[0] & 1 != 0 || (points(&y) && points(&z)) {
@@ -241,4 +245,181 @@ fn under(sets: &Sets, x: ValueId, held: &[ValueId], memo: &mut HashMap<ValueId, 
     }
     memo.insert(x, acc.clone());
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::address::{Addresses, Region};
+    use super::super::super::hazard::Hazards;
+    use super::super::super::testing::*;
+    use crate::rdna_spmd::analysis::facts::Facts;
+    use crate::rdna_spmd::analysis::loops::Loops;
+    use crate::rdna_spmd::environment::Environment;
+    use crate::rdna_spmd::ir::*;
+    use std::collections::BTreeSet;
+
+    fn addresses<T>(b: &Build, env: &Environment, f: impl FnOnce(&mut Addresses) -> T) -> T {
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(&b.f, &facts).expect("a reducible test program");
+        let headers: BTreeSet<BlockId> = (0..loops.count()).map(|l| facts.order[loops.header(l)]).collect();
+        let mut a = Addresses::new(&b.f, &facts, &b.inputs, EXEC, b.entry, env, headers, &b.registry);
+        a.enter(0);
+        f(&mut a)
+    }
+
+    fn store_at(b: &mut Build, block: BlockId, address: ValueId, mask: ValueId) -> (BlockId, usize) {
+        let zero = b.constant(block, Ty::I32, 0);
+        let at = b.here(block);
+        b.store(block, Space::Global, MemSize::B32, address, zero, mask);
+        at
+    }
+
+    fn pair(h: &Hazards, p: (BlockId, usize), q: (BlockId, usize)) -> (usize, usize) {
+        let at = |x: (BlockId, usize)| h.accesses.iter().position(|a| (a.block, a.index) == x).unwrap();
+        let (p, q) = (at(p), at(q));
+        (p.min(q), p.max(q))
+    }
+
+    fn two_buffers() -> Environment {
+        environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000)])
+    }
+
+    struct Moved {
+        b: Build,
+        moved: ValueId,
+        second: ValueId,
+        exec: ValueId,
+    }
+
+    fn moved_by(build: impl Fn(&mut Build, BlockId, ValueId, ValueId) -> ValueId) -> Moved {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let moved = build(&mut b, e, first, second);
+        Moved { b, moved, second, exec: k.exec }
+    }
+
+    fn difference(b: &mut Build, e: BlockId, first: ValueId, second: ValueId) -> ValueId {
+        let gap = b.int(e, IntOp::Sub, second, first);
+        b.int(e, IntOp::Add, first, gap)
+    }
+
+    fn cancelled(b: &mut Build, e: BlockId, first: ValueId, second: ValueId) -> ValueId {
+        let zero = b.int(e, IntOp::Xor, first, first);
+        b.int(e, IntOp::Add, second, zero)
+    }
+
+    #[test]
+    fn a_pointer_moved_by_the_difference_of_two_buffers_may_point_into_the_second() {
+        let Moved { b, moved, .. } = moved_by(difference);
+        let set = addresses(&b, &two_buffers(), |a| a.regions(moved, 0, None, true));
+        assert!(
+            set.reaches(Some(Region::Allocation(2)), |a, b| a == b) || set.lost(),
+            "first + (second - first) is second, so it must reach second or be lost, but its regions are {:?}",
+            set
+        );
+    }
+
+    #[test]
+    fn lanes_storing_through_the_difference_of_two_buffers_meet_at_the_second() {
+        let Moved { mut b, moved, second, exec } = moved_by(difference);
+        let e = BlockId(0);
+        let s1 = store_at(&mut b, e, moved, exec);
+        let s2 = store_at(&mut b, e, second, exec);
+        let h = Hazards::find(&b.program(), &two_buffers());
+        assert!(
+            h.together.contains(&pair(&h, s1, s2)),
+            "both stores write word 0 of the second buffer in every lane"
+        );
+    }
+
+    #[test]
+    fn lanes_storing_through_a_pointer_plus_a_cancelled_xor_meet_at_it() {
+        let Moved { mut b, moved, second, exec } = moved_by(cancelled);
+        let e = BlockId(0);
+        let s1 = store_at(&mut b, e, moved, exec);
+        let s2 = store_at(&mut b, e, second, exec);
+        let h = Hazards::find(&b.program(), &two_buffers());
+        assert!(h.together.contains(&pair(&h, s1, s2)), "both stores write word 0 of the second buffer in every lane");
+    }
+
+    fn meetings_before_the_reload(through_difference: bool) -> (Vec<(BlockId, usize)>, (BlockId, usize), usize) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let first = k.buffer(&mut b, e, 0);
+        let second = k.buffer(&mut b, e, 8);
+        let out = k.buffer(&mut b, e, 16);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let target = if through_difference { difference(&mut b, e, first, second) } else { second };
+        b.store(e, Space::Global, MemSize::B32, target, lane, k.exec);
+        let load = b.here(e);
+        let v = b.load(e, Space::Global, MemSize::B32, second, k.exec);
+        let own = byte_offset(&mut b, e, out, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, own, v, k.exec);
+        let program = b.program();
+        let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]);
+        let hazards = Hazards::find(&program, &env);
+        let (kept, _) = super::super::super::search::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+        let before = kept.meets.iter().map(|&m| hazards.meetings[m]).collect();
+        (before, load, hazards.conflicts().len())
+    }
+
+    #[test]
+    fn decompile_orders_a_load_after_stores_straight_through_the_second_buffer() {
+        let (before, load, _) = meetings_before_the_reload(false);
+        assert_eq!(before, vec![load], "the control case: the same program storing through second itself");
+    }
+
+    #[test]
+    fn decompile_orders_a_load_after_stores_through_the_difference_of_two_buffers() {
+        let (before, load, conflicts) = meetings_before_the_reload(true);
+        assert!(
+            before.contains(&load),
+            "every lane must read the id the last lane stored, but the lane program keeps meetings only before {:?} ({} conflicts found)",
+            before,
+            conflicts
+        );
+    }
+
+    #[test]
+    fn lanes_storing_through_a_pointer_shifted_by_64_meet_at_it() {
+        let mut missed = Vec::new();
+        for op in [IntOp::LShr, IntOp::AShr] {
+            let (mut b, k) = Build::kernel();
+            let e = BlockId(0);
+            let buf = k.buffer(&mut b, e, 0);
+            let sixty_four = b.constant(e, Ty::I64, 64);
+            let shifted = b.int(e, op, buf, sixty_four);
+            let s1 = store_at(&mut b, e, shifted, k.exec);
+            let s2 = store_at(&mut b, e, buf, k.exec);
+            let set = addresses(&b, &two_buffers(), |a| a.regions(shifted, 0, None, true));
+            let h = Hazards::find(&b.program(), &two_buffers());
+            if !h.together.contains(&pair(&h, s1, s2)) {
+                missed.push((op, set));
+            }
+        }
+        assert!(missed.is_empty(), "buf shifted by 64 is buf, where every lane stores next, but these miss it: {:?}", missed);
+    }
+
+    #[test]
+    fn lanes_storing_through_a_buffer_read_via_a_laundered_kernarg_pointer_meet_at_it() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let base = b.core(e, Ty::I64, Op::Pack64(k.kernarg.0, k.kernarg.1));
+        let one = b.constant(e, Ty::I64, 1);
+        let laundered = b.int(e, IntOp::Mul, base, one);
+        let yes = b.constant(e, Ty::I1, 1);
+        let reread = b.load(e, Space::Global, MemSize::B64, laundered, yes);
+        let s1 = store_at(&mut b, e, reread, k.exec);
+        let s2 = store_at(&mut b, e, buf, k.exec);
+        let set = addresses(&b, &two_buffers(), |a| a.regions(reread, 0, None, true));
+        let h = Hazards::find(&b.program(), &two_buffers());
+        assert!(
+            h.together.contains(&pair(&h, s1, s2)),
+            "both stores write word 0 of the first buffer in every lane; the re-read pointer has regions {:?}",
+            set
+        );
+    }
 }

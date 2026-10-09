@@ -240,7 +240,6 @@ impl Origins {
         let (f, facts) = (q.program().f, q.program().facts);
         match facts.site[v.0] {
             Site::Param { block, index } if block == f.entry => match q.program().inputs[index].source {
-                ParameterSource::Vgpr(n) if n != 0 => Regions::default(),
                 ParameterSource::Sgpr(n) if Some(n) == q.program().entry.kernarg_ptr => Regions::one(Some(Region::Kernarg)),
                 ParameterSource::Sgpr(n) if Some(n) == q.program().entry.dispatch_ptr => Regions::one(Some(Region::Dispatch)),
                 _ => none(),
@@ -284,10 +283,14 @@ impl Origins {
                         (Some(r), None) | (None, Some(r)) => Some(r),
                         _ => None,
                     }),
-                    Op::Int(IntOp::Sub, a, b) => regions!(a).combine(&regions!(b), |x, y| match (x, y) {
-                        (Some(r), None) => Some(r),
-                        _ => None,
-                    }),
+                    Op::Int(IntOp::Sub, a, b) => {
+                        let (x, y) = (regions!(a), regions!(b));
+                        let mut set = x.combine(&y, |x, _| x);
+                        if y.any || y.list.iter().any(|r| r.is_some()) {
+                            set.add(None);
+                        }
+                        set
+                    }
                     Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, to, a)
                         if to.bits() >= 32 && f.types[a.0].bits() >= 32 =>
                     {
@@ -380,7 +383,9 @@ impl Origins {
                         *reliance |= u;
                         reliance.lane |= !facts.uniform[v.0];
                         let mut set = Regions::one(value.region);
-                        if (q.program().provenance.carried.contains_key(&v) || q.program().provenance.loaded.contains_key(&v)) && q.symbols().unresolved(v, lane, &value) {
+                        let unresolved = q.symbols().unresolved(v, lane, &value);
+                        let carried = q.program().provenance.carried.contains_key(&v) && (unresolved || value.region.is_none());
+                        if carried || (q.program().provenance.loaded.contains_key(&v) && unresolved) {
                             match q.program().provenance.loaded.get(&v) {
                                 Some(loaded) => set.union(loaded),
                                 None => self.carry(q, v, lane, refine, &mut set, reliance),
@@ -630,7 +635,9 @@ impl Origins {
                     if fresh.is_empty() {
                         break;
                     }
-                    let meets = |set: &Regions, id: u64| set.any || set.list.contains(&Some(Region::Allocation(id)));
+                    let meets = |set: &Regions, id: u64| {
+                        set.any || set.list.iter().any(|&r| r == Some(Region::Allocation(id)) || matches!(r, Some(Region::Kernarg | Region::Dispatch)))
+                    };
                     let coarse = self.regions(q, x, lane, e.assume, false);
                     if !fresh.iter().any(|&id| meets(&coarse, id)) {
                         continue;

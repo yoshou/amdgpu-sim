@@ -1068,3 +1068,785 @@ fn the_open_policy_materializes_exactly_what_the_facts_of_each_kept_set_do() {
         }
     }
 }
+
+#[derive(Clone)]
+enum Float {
+    Var(usize),
+    Const(u32),
+    Sel(usize, Box<Float>, Box<Float>),
+}
+
+fn float_value(e: &Float, xs: &[f32; 3], truths: &[bool]) -> f32 {
+    match e {
+        Float::Var(i) => xs[*i],
+        Float::Const(k) => f32::from_bits(*k),
+        Float::Sel(c, u, v) => {
+            if truths[*c] {
+                float_value(u, xs, truths)
+            } else {
+                float_value(v, xs, truths)
+            }
+        }
+    }
+}
+
+fn oracle_name(e: &Float) -> String {
+    match e {
+        Float::Var(i) => ["x", "y", "z"][*i].to_string(),
+        Float::Const(k) => format!("{:?}", f32::from_bits(*k)),
+        Float::Sel(c, u, v) => format!("c{} ? {} : {}", c, oracle_name(u), oracle_name(v)),
+    }
+}
+
+fn emit(b: &mut Build, e: BlockId, vars: &[ValueId], cmps: &[(FloatPred, Float, Float, ValueId)], x: &Float) -> ValueId {
+    match x {
+        Float::Var(i) => vars[*i],
+        Float::Const(k) => b.constant(e, Ty::F32, *k as u64),
+        Float::Sel(c, u, v) => {
+            let (u, v) = (emit(b, e, vars, cmps, u), emit(b, e, vars, cmps, v));
+            b.core(e, Ty::F32, Op::Select(cmps[*c].3, u, v))
+        }
+    }
+}
+
+const ORACLE_SPECIALS: [u32; 18] = [
+    0x3f7f_ffff, 0x0080_0000, 0x007f_ffff, 0x8080_0000,
+    0x0000_0000, 0x8000_0000, 0x3f80_0000, 0xbf80_0000, 0x7f80_0000, 0xff80_0000, 0x7fc0_0000, 0xffc0_0001, 0x0000_0001, 0x8000_0001, 0x7f7f_ffff, 0xff7f_ffff, 0x3f80_0001, 0x4000_0000,
+];
+
+#[test]
+fn float_rules_hold_for_special_values() {
+    use FloatPred::*;
+    let preds = [Oeq, Ogt, Oge, Olt, Ole, One, Ord, Uno, Ueq, Ugt, Uge, Ult, Ule, Une];
+    let mut r = Random::new(1001);
+    let mut wrong = Vec::new();
+    let (mut derived, mut total) = (0usize, 0usize);
+    for round in 0..1000 {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32), (ParameterSource::Vgpr(2), Ty::I32), (ParameterSource::Vgpr(3), Ty::I32)]);
+        let e = BlockId(0);
+        let vars: Vec<ValueId> = (1..4).map(|i| b.core(e, Ty::F32, Op::Convert(Cvt::Bitcast, Ty::F32, p[i]))).collect();
+        let mut cmps: Vec<(FloatPred, Float, Float, ValueId)> = Vec::new();
+        let mut index: HashMap<ValueId, usize> = HashMap::default();
+        let special = |r: &mut Random| ORACLE_SPECIALS[r.below(ORACLE_SPECIALS.len() as u64) as usize];
+        let var = |r: &mut Random| if r.below(3) == 0 { r.below(3) as usize } else { 0 };
+        for _ in 0..10 {
+            let pred = preds[r.below(14) as usize];
+            let (a, c): (Float, Float) = match r.below(6) {
+                0 | 1 => (Float::Var(var(&mut r)), Float::Const(special(&mut r))),
+                2 => (Float::Const(special(&mut r)), Float::Var(var(&mut r))),
+                3 => {
+                    let i = r.below(3) as usize;
+                    let j = (i + 1 + r.below(2) as usize) % 3;
+                    (Float::Var(i), Float::Var(j))
+                }
+                _ if !cmps.is_empty() => {
+                    let k = r.below(cmps.len() as u64) as usize;
+                    let arm = |r: &mut Random| if r.below(3) == 0 { Float::Var(var(r)) } else { Float::Const(special(r)) };
+                    let s = Float::Sel(k, Box::new(arm(&mut r)), Box::new(arm(&mut r)));
+                    let other = arm(&mut r);
+                    if r.below(2) == 0 {
+                        (s, other)
+                    } else {
+                        (other, s)
+                    }
+                }
+                _ => (Float::Var(0), Float::Const(special(&mut r))),
+            };
+            let (ea, ec) = (emit(&mut b, e, &vars, &cmps, &a), emit(&mut b, e, &vars, &cmps, &c));
+            let v = b.core(e, Ty::I1, Op::FCmp(pred, ea, ec));
+            index.insert(v, cmps.len());
+            cmps.push((pred, a, c, v));
+        }
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let bits: Vec<Bdd> = cmps.iter().map(|c| logic.bit(f, &facts, c.3)).collect();
+        for (c, &g) in cmps.iter().zip(&bits) {
+            total += 1;
+            if g != logic.atom(Atom::Bit(c.3)) {
+                derived += 1;
+            }
+        }
+        let mut atoms: HashMap<u32, usize> = HashMap::default();
+        for &g in &bits {
+            for &var in logic.support(g).iter() {
+                match logic.atom_of(var) {
+                    Atom::Bit(w) if index.contains_key(&w) => {
+                        atoms.insert(var, index[&w]);
+                    }
+                    other => panic!("unexpected atom {:?} in a float fact", other),
+                }
+            }
+        }
+        let mut reported = false;
+        for &kx in &ORACLE_SPECIALS {
+            for &ky in &ORACLE_SPECIALS {
+                for &kz in &ORACLE_SPECIALS {
+                    let xs = [f32::from_bits(kx), f32::from_bits(ky), f32::from_bits(kz)];
+                    let mut truths: Vec<bool> = Vec::new();
+                    for (pred, a, c, _) in &cmps {
+                        let (x, y) = (float_value(a, &xs, &truths), float_value(c, &xs, &truths));
+                        truths.push(float_compare(*pred, x as f64, y as f64));
+                    }
+                    for (i, &g) in bits.iter().enumerate() {
+                        let got = evaluate(&logic.m, g, &|var| truths[atoms[&var]]);
+                        if got != truths[i] && !reported {
+                            reported = true;
+                            let program: Vec<String> = cmps.iter().enumerate().map(|(j, (p, a, c, _))| format!("c{} = {:?}({}, {})", j, p, oracle_name(a), oracle_name(c))).collect();
+                            wrong.push(format!("round {}: c{} is {} at x={:#x} y={:#x} z={:#x}, fact says {}; program {:?}", round, i, truths[i], kx, ky, kz, got, program));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(derived > total / 4, "only {} of {} float facts were derived", derived, total);
+    assert!(wrong.is_empty(), "{} wrong: {:#?}", wrong.len(), &wrong[..wrong.len().min(4)]);
+}
+
+#[test]
+fn a_block_with_many_independent_comparisons_gets_its_bits() {
+    let n = 70;
+    let mut sources = vec![(ParameterSource::MaskBit(EXEC), Ty::I1)];
+    sources.extend((1..=n).map(|i| (ParameterSource::Vgpr(i as u32), Ty::I32)));
+    let (mut b, p) = Build::new(&sources);
+    let e = BlockId(0);
+    let ten = b.constant(e, Ty::I32, 10);
+    let tests: Vec<ValueId> = (1..=n).map(|i| b.cmp(e, IntPred::Ult, p[i], ten)).collect();
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    for &t in &tests {
+        let g = logic.bit(f, &facts, t);
+        assert!(g != Bdd::TRUE && g != Bdd::FALSE, "v < 10 is open for a vector register");
+    }
+}
+
+#[test]
+fn kept_query_answers_admit_every_wave() {
+    let mut r = Random::new(2027);
+    let mut wrong = Vec::new();
+    let mut nontrivial = 0;
+    for round in 0..300 {
+        let (mut b, p) = Build::new(&[
+            (ParameterSource::MaskBit(EXEC), Ty::I1),
+            (ParameterSource::Sgpr(10), Ty::I1),
+            (ParameterSource::Sgpr(11), Ty::I1),
+            (ParameterSource::MaskBit(106), Ty::I1),
+            (ParameterSource::MaskBit(108), Ty::I1),
+            (ParameterSource::Vgpr(1), Ty::I32),
+            (ParameterSource::Sgpr(12), Ty::I32),
+        ]);
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let mut leaves: Vec<ValueId> = vec![p[1], p[2], p[3], p[4]];
+        for k in [1u64, 3, 16, 31] {
+            let kc = b.constant(e, Ty::I32, k);
+            leaves.push(b.cmp(e, IntPred::Ult, lane, kc));
+            leaves.push(b.cmp(e, IntPred::Eq, lane, kc));
+        }
+        for k in [3u64, 5, 9] {
+            let kc = b.constant(e, Ty::I32, k);
+            leaves.push(b.cmp(e, IntPred::Ult, p[5], kc));
+            leaves.push(b.cmp(e, IntPred::Ult, p[6], kc));
+        }
+        leaves.push(b.cmp(e, IntPred::Ult, p[5], p[6]));
+        let mut queries = Vec::new();
+        for _ in 0..4 {
+            let mut x = leaves[r.below(leaves.len() as u64) as usize];
+            for _ in 0..r.below(4) {
+                let y = leaves[r.below(leaves.len() as u64) as usize];
+                x = match r.below(4) {
+                    0 => b.int(e, IntOp::And, x, y),
+                    1 => b.int(e, IntOp::Or, x, y),
+                    2 => b.int(e, IntOp::Xor, x, y),
+                    _ => {
+                        let z = leaves[r.below(leaves.len() as u64) as usize];
+                        b.core(e, Ty::I1, Op::Select(z, x, y))
+                    }
+                };
+            }
+            let x = b.int(e, IntOp::And, x, p[0]);
+            let q = b.wave(e, WaveOp::Any, vec![x]);
+            queries.push((x, q));
+        }
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let kept: BTreeSet<Choice> = queries.iter().map(|&(_, q)| Choice::Query(q)).collect();
+        let mut logic = Logic::fixed(f, &facts, &kept, &[]);
+        let inputs: Vec<Bdd> = queries.iter().map(|&(x, _)| logic.bit(f, &facts, x)).collect();
+        let answers: Vec<Bdd> = queries.iter().map(|&(_, q)| logic.bit(f, &facts, q)).collect();
+        let exec = logic.bit(f, &facts, p[0]);
+        let mut roots = inputs.clone();
+        roots.extend(answers.iter().copied());
+        roots.push(exec);
+        let mut vars: BTreeSet<u32> = BTreeSet::new();
+        for &g in &roots {
+            vars.extend(logic.support(g).iter().copied());
+        }
+        let mut uniform = Vec::new();
+        let mut varying = Vec::new();
+        for &v in &vars {
+            match logic.atom_of(v) {
+                Atom::Some(..) => {}
+                Atom::Lane(_) => {}
+                _ if logic.uniform_atom(&facts, v) => uniform.push(v),
+                _ => varying.push(v),
+            }
+        }
+        if answers.iter().any(|&g| logic.support(g).iter().any(|&v| matches!(logic.atom_of(v), Atom::Some(..)))) {
+            nontrivial += 1;
+        }
+        let lanes: Vec<(u32, u8)> = vars.iter().filter_map(|&v| match logic.atom_of(v) { Atom::Lane(i) => Some((v, i)), _ => None }).collect();
+        for state in 0..60 {
+            let shared: HashMap<u32, bool> = uniform.iter().map(|&v| (v, r.below(2) == 0)).collect();
+            let own: Vec<HashMap<u32, bool>> = (0..32u32)
+                .map(|l| {
+                    let mut m: HashMap<u32, bool> = varying.iter().map(|&v| (v, r.below(4) != 0)).collect();
+                    for &(v, i) in &lanes {
+                        m.insert(v, l >> i & 1 == 1);
+                    }
+                    m.extend(shared.iter().map(|(&k, &x)| (k, x)));
+                    m
+                })
+                .collect();
+            let value = |logic: &Logic, g: Bdd, l: usize| evaluate(&logic.m, g, &|v| own[l][&v]);
+            let active: Vec<usize> = (0..32).filter(|&l| value(&logic, exec, l)).collect();
+            if active.is_empty() {
+                continue;
+            }
+            let mut joint = Bdd::TRUE;
+            for (k, &g) in answers.iter().enumerate() {
+                let truth = active.iter().any(|&l| value(&logic, inputs[k], l));
+                let want = if truth { g } else { logic.m.not(g) };
+                let want = logic.consistent(want);
+                joint = logic.m.and(joint, want);
+            }
+            let mut admitted = Bdd::TRUE;
+            for &l in &active {
+                let mut at = joint;
+                for (&v, &x) in &own[l] {
+                    at = logic.m.cofactor(at, v, x);
+                }
+                admitted = logic.m.and(admitted, at);
+            }
+            if admitted == Bdd::FALSE {
+                wrong.push(format!("round {} state {}: no answer atoms fit every active lane ({} active)", round, state, active.len()));
+                break;
+            }
+        }
+    }
+    assert!(nontrivial > 0, "no answer used an answer atom");
+    assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(6)]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Node {
+    Param(usize),
+    Lane,
+    Const(u32),
+    Int(IntOp, usize, usize),
+    Sel(usize, usize, usize),
+    Cmp(IntPred, usize, usize),
+    Bool(IntOp, usize, usize),
+}
+
+fn integer_wave(r: &mut Random) -> (Build, Vec<(Node, ValueId)>) {
+    let (mut b, p) = Build::new(&[
+        (ParameterSource::MaskBit(EXEC), Ty::I1),
+        (ParameterSource::Vgpr(1), Ty::I32),
+        (ParameterSource::Vgpr(2), Ty::I32),
+        (ParameterSource::Sgpr(10), Ty::I32),
+        (ParameterSource::Sgpr(11), Ty::I32),
+    ]);
+    let e = BlockId(0);
+    let mut nodes: Vec<(Node, ValueId)> = (1..5).map(|i| (Node::Param(i - 1), p[i])).collect();
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    nodes.push((Node::Lane, lane));
+    for k in [0u32, 1, 3, 31, 32, 0x8000_0000, 0xffff_ffff] {
+        let v = b.constant(e, Ty::I32, k as u64);
+        nodes.push((Node::Const(k), v));
+    }
+    let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge];
+    for _ in 0..24 {
+        let words: Vec<usize> = (0..nodes.len()).filter(|&i| !matches!(nodes[i].0, Node::Cmp(..) | Node::Bool(..))).collect();
+        let bits: Vec<usize> = (0..nodes.len()).filter(|&i| matches!(nodes[i].0, Node::Cmp(..) | Node::Bool(..))).collect();
+        let pick = |r: &mut Random, from: &[usize]| from[r.below(from.len() as u64) as usize];
+        let consts: Vec<usize> = (0..nodes.len()).filter(|&i| matches!(nodes[i].0, Node::Const(_))).collect();
+        let node = match r.below(10) {
+            0 | 1 | 2 | 3 => Node::Cmp(preds[r.below(10) as usize], pick(r, &words), pick(r, &words)),
+            4 if !bits.is_empty() => {
+                let op = [IntOp::And, IntOp::Or, IntOp::Xor][r.below(3) as usize];
+                Node::Bool(op, pick(r, &bits), pick(r, &bits))
+            }
+            5 if !bits.is_empty() => Node::Sel(pick(r, &bits), pick(r, &words), pick(r, &words)),
+            6 => {
+                let op = [IntOp::Mul, IntOp::Shl, IntOp::LShr, IntOp::And][r.below(4) as usize];
+                Node::Int(op, pick(r, &words), pick(r, &consts))
+            }
+            _ => {
+                let op = [IntOp::Add, IntOp::Sub, IntOp::Or, IntOp::Xor, IntOp::And][r.below(5) as usize];
+                Node::Int(op, pick(r, &words), pick(r, &words))
+            }
+        };
+        let v = match node {
+            Node::Cmp(pr, a, c) => b.cmp(e, pr, nodes[a].1, nodes[c].1),
+            Node::Bool(op, a, c) | Node::Int(op, a, c) => b.int(e, op, nodes[a].1, nodes[c].1),
+            Node::Sel(c, a, d) => b.core(e, Ty::I32, Op::Select(nodes[c].1, nodes[a].1, nodes[d].1)),
+            _ => unreachable!(),
+        };
+        nodes.push((node, v));
+    }
+    (b, nodes)
+}
+
+fn integer_values(nodes: &[(Node, ValueId)], params: &[u32; 4], lane: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::with_capacity(nodes.len());
+    for &(node, _) in nodes {
+        let x = match node {
+            Node::Param(i) => params[i],
+            Node::Lane => lane,
+            Node::Const(k) => k,
+            Node::Int(op, a, c) | Node::Bool(op, a, c) => {
+                let (x, y) = (out[a], out[c]);
+                match op {
+                    IntOp::Add => x.wrapping_add(y),
+                    IntOp::Sub => x.wrapping_sub(y),
+                    IntOp::Mul => x.wrapping_mul(y),
+                    IntOp::And => x & y,
+                    IntOp::Or => x | y,
+                    IntOp::Xor => x ^ y,
+                    IntOp::Shl => x << (y & 31),
+                    IntOp::LShr => x >> (y & 31),
+                    IntOp::AShr => ((x as i32) >> (y & 31)) as u32,
+                }
+            }
+            Node::Sel(c, a, d) => {
+                if out[c] & 1 == 1 {
+                    out[a]
+                } else {
+                    out[d]
+                }
+            }
+            Node::Cmp(p, a, c) => compare(p, out[a], out[c]) as u32,
+        };
+        out.push(x);
+    }
+    out
+}
+
+#[test]
+fn integer_facts_admit_every_wave() {
+    let mut r = Random::new(4049);
+    let mut wrong = Vec::new();
+    let mut derived = 0;
+    for round in 0..200 {
+        let (b, nodes) = integer_wave(&mut r);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let tests: Vec<usize> = (0..nodes.len()).filter(|&i| matches!(nodes[i].0, Node::Cmp(..) | Node::Bool(..))).collect();
+        let bits: Vec<Bdd> = tests.iter().map(|&i| logic.bit(f, &facts, nodes[i].1)).collect();
+        for (&i, &g) in tests.iter().zip(&bits) {
+            if g != logic.atom(Atom::Bit(nodes[i].1)) {
+                derived += 1;
+            }
+        }
+        let mut vars: BTreeSet<u32> = BTreeSet::new();
+        for &g in &bits {
+            vars.extend(logic.support(g).iter().copied());
+        }
+        let lanes: Vec<(u32, u8)> = vars.iter().filter_map(|&v| match logic.atom_of(v) { Atom::Lane(i) => Some((v, i)), _ => None }).collect();
+        let varying: Vec<u32> = vars.iter().copied().filter(|&v| !matches!(logic.atom_of(v), Atom::Lane(_)) && !logic.uniform_atom(&facts, v)).collect();
+        for state in 0..30 {
+            let (s1, s2) = (interesting(&mut r), interesting(&mut r));
+            let mut admitted = Bdd::TRUE;
+            for l in 0..32u32 {
+                let params = [interesting(&mut r), interesting(&mut r), s1, s2];
+                let values = integer_values(&nodes, &params, l);
+                let mut holds = Bdd::TRUE;
+                for (&i, &g) in tests.iter().zip(&bits) {
+                    let literal = if values[i] & 1 == 1 { g } else { logic.m.not(g) };
+                    holds = logic.m.and(holds, literal);
+                }
+                for &(v, i) in &lanes {
+                    holds = logic.m.cofactor(holds, v, l >> i & 1 == 1);
+                }
+                let holds = logic.exists(&varying, holds);
+                admitted = logic.m.and(admitted, holds);
+                if admitted == Bdd::FALSE {
+                    let program: Vec<String> = nodes.iter().enumerate().map(|(k, (n, _))| format!("n{} = {:?}", k, n)).collect();
+                    wrong.push(format!("round {} state {}: no atoms fit lanes 0..={} (s = {:#x}, {:#x}); {:?}", round, state, l, s1, s2, program));
+                    break;
+                }
+            }
+            if admitted == Bdd::FALSE {
+                break;
+            }
+        }
+    }
+    assert!(derived > 0);
+    assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(2)]);
+}
+
+#[test]
+fn bit_of_a_hashed_word_comparison_finishes() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32)]);
+        let e = BlockId(0);
+        let hash = b.constant(e, Ty::I32, 0x27d4_eb2d);
+        let hashed = b.int(e, IntOp::Mul, p[1], hash);
+        let bound = b.constant(e, Ty::I32, 1000);
+        let small = b.cmp(e, IntPred::Ult, hashed, bound);
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
+        let g = logic.bit(&b.f, &facts, small);
+        let _ = done.send(g != Bdd::TRUE && g != Bdd::FALSE);
+    });
+    let open = finished.recv_timeout(std::time::Duration::from_secs(20)).expect("bit(v * 0x27d4eb2d < 1000) did not finish within 20 s");
+    assert!(open, "the comparison stays open");
+}
+
+#[test]
+fn bit_after_a_chain_of_compare_exchanges_finishes() {
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32), (ParameterSource::Vgpr(2), Ty::I32)]);
+        let e = BlockId(0);
+        let (mut lo, mut hi) = (p[1], p[2]);
+        for _ in 0..24 {
+            let c = b.cmp(e, IntPred::Ult, lo, hi);
+            let (l, h) = (b.core(e, Ty::I32, Op::Select(c, lo, hi)), b.core(e, Ty::I32, Op::Select(c, hi, lo)));
+            lo = l;
+            hi = h;
+        }
+        let bound = b.constant(e, Ty::I32, 10);
+        let small = b.cmp(e, IntPred::Ult, lo, bound);
+        let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
+        let g = logic.bit(&b.f, &facts, small);
+        let _ = done.send(g != Bdd::TRUE && g != Bdd::FALSE);
+    });
+    let open = finished.recv_timeout(std::time::Duration::from_secs(20)).expect("bit(lo < 10) after 24 compare-exchanges did not finish within 20 s");
+    assert!(open, "the comparison stays open");
+}
+
+#[test]
+fn post_keeps_the_successor_of_every_concrete_state() {
+    let preds = [IntPred::Eq, IntPred::Ne, IntPred::Ult, IntPred::Ule, IntPred::Ugt, IntPred::Uge, IntPred::Slt, IntPred::Sle, IntPred::Sgt, IntPred::Sge];
+    let mut r = Random::new(5051);
+    let mut wrong = Vec::new();
+    let mut bridged = 0;
+    for round in 0..300 {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::Vgpr(1), Ty::I32), (ParameterSource::Vgpr(2), Ty::I32), (ParameterSource::Sgpr(10), Ty::I32)]);
+        let e = BlockId(0);
+        let one = b.constant(e, Ty::I32, 1);
+        let x1 = b.int(e, IntOp::Add, p[1], one);
+        let ys = b.int(e, IntOp::Sub, p[2], p[3]);
+        let mut src_nodes: Vec<(Node, ValueId)> = vec![(Node::Param(0), p[1]), (Node::Param(1), p[2]), (Node::Param(2), p[3])];
+        src_nodes.push((Node::Const(1), one));
+        src_nodes.push((Node::Int(IntOp::Add, 0, 3), x1));
+        src_nodes.push((Node::Int(IntOp::Sub, 1, 2), ys));
+        for k in [5u32, 0x8000_0000] {
+            let c = b.constant(e, Ty::I32, k as u64);
+            src_nodes.push((Node::Const(k), c));
+        }
+        let words = src_nodes.len();
+        for _ in 0..5 {
+            let (i, j) = (r.below(words as u64) as usize, r.below(words as u64) as usize);
+            let pr = preds[r.below(10) as usize];
+            let v = b.cmp(e, pr, src_nodes[i].1, src_nodes[j].1);
+            src_nodes.push((Node::Cmp(pr, i, j), v));
+        }
+        let (dst, q) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I32]);
+        let picks: Vec<usize> = (0..3).map(|_| r.below(words as u64) as usize).collect();
+        b.br(e, dst, vec![p[0], src_nodes[picks[0]].1, src_nodes[picks[1]].1, src_nodes[picks[2]].1]);
+        let mut dst_nodes: Vec<(Node, ValueId)> = (0..3).map(|i| (Node::Param(i), q[i + 1])).collect();
+        let d1 = b.constant(dst, Ty::I32, 1);
+        dst_nodes.push((Node::Const(1), d1));
+        let a1 = b.int(dst, IntOp::Add, q[1], d1);
+        dst_nodes.push((Node::Int(IntOp::Add, 0, 3), a1));
+        for k in [5u32, 0x8000_0000] {
+            let c = b.constant(dst, Ty::I32, k as u64);
+            dst_nodes.push((Node::Const(k), c));
+        }
+        let dwords = dst_nodes.len();
+        for _ in 0..5 {
+            let (i, j) = (r.below(dwords as u64) as usize, r.below(dwords as u64) as usize);
+            let pr = preds[r.below(10) as usize];
+            let v = b.cmp(dst, pr, dst_nodes[i].1, dst_nodes[j].1);
+            dst_nodes.push((Node::Cmp(pr, i, j), v));
+        }
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let src_tests: Vec<usize> = (words..src_nodes.len()).collect();
+        let dst_tests: Vec<usize> = (dwords..dst_nodes.len()).collect();
+        let src_bits: Vec<Bdd> = src_tests.iter().map(|&i| logic.bit(f, &facts, src_nodes[i].1)).collect();
+        let dst_bits: Vec<Bdd> = dst_tests.iter().map(|&i| logic.bit(f, &facts, dst_nodes[i].1)).collect();
+        let terms: Vec<Vec<(usize, bool)>> = (0..3).map(|_| (0..2).map(|_| (r.below(src_tests.len() as u64) as usize, r.below(2) == 0)).collect()).collect();
+        let mut formula = Bdd::FALSE;
+        for term in &terms {
+            let mut t = Bdd::TRUE;
+            for &(i, positive) in term {
+                let g = if positive { src_bits[i] } else { logic.m.not(src_bits[i]) };
+                t = logic.m.and(t, g);
+            }
+            formula = logic.m.or(formula, t);
+        }
+        let image = logic.post(f, &facts, e, 0, formula);
+        if logic.support(image).iter().any(|&v| matches!(logic.atom_of(v), Atom::Cell(..))) {
+            bridged += 1;
+        }
+        for _ in 0..200 {
+            let params = [interesting(&mut r), interesting(&mut r), interesting(&mut r), 0];
+            let src_values = integer_values(&src_nodes, &params, 0);
+            let holds = terms.iter().any(|t| t.iter().all(|&(i, positive)| (src_values[src_tests[i]] & 1 == 1) == positive));
+            if !holds {
+                continue;
+            }
+            let args = [src_values[picks[0]], src_values[picks[1]], src_values[picks[2]], 0];
+            let dst_values = integer_values(&dst_nodes, &args, 0);
+            let mut state = image;
+            for (k, &i) in dst_tests.iter().enumerate() {
+                let g = if dst_values[i] & 1 == 1 { dst_bits[k] } else { logic.m.not(dst_bits[k]) };
+                state = logic.m.and(state, g);
+            }
+            let exec = logic.atom(Atom::Bit(q[0]));
+            state = logic.m.and(state, exec);
+            if state == Bdd::FALSE {
+                let program: Vec<String> = src_nodes.iter().chain(&dst_nodes).map(|(n, _)| format!("{:?}", n)).collect();
+                wrong.push(format!("round {}: the successor of src {:?} (args {:?}) leaves the image; picks {:?} terms {:?}; {:?}", round, params, args, picks, terms, program));
+                break;
+            }
+        }
+    }
+    assert!(bridged > 0, "no image related cells across the edge");
+    assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(2)]);
+}
+
+#[test]
+fn wave_answer_over_many_uniform_bits_does_not_panic() {
+    let n = 11;
+    let mut sources = vec![(ParameterSource::MaskBit(EXEC), Ty::I1)];
+    sources.extend((0..n).map(|i| (ParameterSource::Sgpr(10 + i as u32), Ty::I1)));
+    sources.extend((0..n).map(|i| (ParameterSource::MaskBit(20 + 2 * i as u32), Ty::I1)));
+    let (mut b, p) = Build::new(&sources);
+    let e = BlockId(0);
+    let mut x = b.constant(e, Ty::I1, 0);
+    for i in 0..n {
+        let both = b.int(e, IntOp::And, p[1 + i], p[1 + n + i]);
+        x = b.int(e, IntOp::Or, x, both);
+    }
+    let x = b.int(e, IntOp::And, x, p[0]);
+    let q = b.wave(e, WaveOp::Any, vec![x]);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let kept: BTreeSet<Choice> = std::iter::once(Choice::Query(q)).collect();
+    let mut logic = Logic::fixed(f, &facts, &kept, &[]);
+    let g = logic.bit(f, &facts, q);
+    assert_ne!(g, Bdd::FALSE);
+}
+
+#[test]
+#[should_panic(expected = "keep changes only which meetings are kept")]
+fn keep_refuses_to_change_which_queries_are_kept() {
+    let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::MaskBit(106), Ty::I1)]);
+    let e = BlockId(0);
+    let x = b.int(e, IntOp::And, p[1], p[0]);
+    let q = b.wave(e, WaveOp::Any, vec![x]);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    let converted = logic.bit(f, &facts, q);
+    assert_eq!(converted, logic.bit(f, &facts, x), "a converted query reads the lane's own bit");
+    let kept: BTreeSet<Choice> = std::iter::once(Choice::Query(q)).collect();
+    logic.keep(&kept);
+}
+
+#[test]
+fn keep_changes_which_meetings_are_kept() {
+    let (b, _) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+    let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+    let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[Choice::Meet(0)]);
+    assert_eq!(logic.local(Choice::Meet(0)), Bdd::TRUE);
+    logic.keep(&std::iter::once(Choice::Meet(0)).collect());
+    assert_eq!(logic.local(Choice::Meet(0)), Bdd::FALSE);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum OracleWord {
+    Bit(usize),
+    LaneBelow(u32),
+    Not(usize),
+    Ballot(usize),
+    Const(u32),
+    OneShl,
+    Sel(usize, usize, usize),
+    Logic(IntOp, usize, usize),
+    Cast(usize),
+    Own(usize),
+}
+
+#[test]
+fn views_hold_in_every_lane() {
+    let mut r = Random::new(6067);
+    let mut wrong = Vec::new();
+    for round in 0..400 {
+        let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1), (ParameterSource::MaskBit(106), Ty::I1), (ParameterSource::MaskBit(108), Ty::I1), (ParameterSource::Sgpr(10), Ty::I1)]);
+        let e = BlockId(0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let one = b.constant(e, Ty::I32, 1);
+        let mut nodes: Vec<(OracleWord, ValueId, bool)> = (1..4).map(|i| (OracleWord::Bit(i - 1), p[i], false)).collect();
+        for k in [3u32, 17] {
+            let kc = b.constant(e, Ty::I32, k as u64);
+            nodes.push((OracleWord::LaneBelow(k), b.cmp(e, IntPred::Ult, lane, kc), false));
+        }
+        let shl = b.int(e, IntOp::Shl, one, lane);
+        nodes.push((OracleWord::OneShl, shl, true));
+        for _ in 0..16 {
+            let bits: Vec<usize> = (0..nodes.len()).filter(|&i| !nodes[i].2).collect();
+            let words: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].2).collect();
+            let pick = |r: &mut Random, from: &[usize]| from[r.below(from.len() as u64) as usize];
+            let (node, v, word) = match r.below(9) {
+                0 | 1 => {
+                    let x = pick(&mut r, &bits);
+                    (OracleWord::Ballot(x), b.wave(e, WaveOp::Ballot { high: false }, vec![nodes[x].1]), true)
+                }
+                2 => {
+                    let k = interesting(&mut r);
+                    (OracleWord::Const(k), b.constant(e, Ty::I32, k as u64), true)
+                }
+                3 => {
+                    let (c, x, y) = (pick(&mut r, &bits), pick(&mut r, &words), pick(&mut r, &words));
+                    (OracleWord::Sel(c, x, y), b.core(e, Ty::I32, Op::Select(nodes[c].1, nodes[x].1, nodes[y].1)), true)
+                }
+                4 | 5 => {
+                    let op = [IntOp::And, IntOp::Or, IntOp::Xor][r.below(3) as usize];
+                    let (x, y) = (pick(&mut r, &words), pick(&mut r, &words));
+                    (OracleWord::Logic(op, x, y), b.int(e, op, nodes[x].1, nodes[y].1), true)
+                }
+                6 => {
+                    let x = pick(&mut r, &words);
+                    (OracleWord::Cast(x), b.core(e, Ty::I32, Op::Convert(Cvt::Bitcast, Ty::I32, nodes[x].1)), true)
+                }
+                7 => {
+                    let x = pick(&mut r, &words);
+                    let s = b.int(e, IntOp::LShr, nodes[x].1, lane);
+                    (OracleWord::Own(x), b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, s)), false)
+                }
+                _ => {
+                    let x = pick(&mut r, &bits);
+                    let t = b.constant(e, Ty::I1, 1);
+                    (OracleWord::Not(x), b.int(e, IntOp::Xor, nodes[x].1, t), false)
+                }
+            };
+            nodes.push((node, v, word));
+        }
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+        let facts_of: Vec<Bdd> = nodes.iter().map(|&(_, v, word)| if word { logic.view(f, &facts, v) } else { logic.bit(f, &facts, v) }).collect();
+        for _ in 0..30 {
+            let own: Vec<[bool; 3]> = (0..32).map(|_| [r.below(2) == 0, r.below(2) == 0, false]).collect();
+            let shared = r.below(2) == 0;
+            let mut values: Vec<[u32; 32]> = Vec::new();
+            for &(node, _, _) in &nodes {
+                let at = |values: &Vec<[u32; 32]>, i: usize, l: usize| values[i][l];
+                let mut out = [0u32; 32];
+                for l in 0..32 {
+                    out[l] = match node {
+                        OracleWord::Bit(i) => (if i == 2 { shared } else { own[l][i] }) as u32,
+                        OracleWord::LaneBelow(k) => ((l as u32) < k) as u32,
+                        OracleWord::Not(x) => at(&values, x, l) ^ 1,
+                        OracleWord::Ballot(x) => (0..32).filter(|&m| at(&values, x, m) == 1).fold(0u32, |w, m| w | 1 << m),
+                        OracleWord::Const(k) => k,
+                        OracleWord::OneShl => 1u32 << l,
+                        OracleWord::Sel(c, x, y) => if at(&values, c, l) == 1 { at(&values, x, l) } else { at(&values, y, l) },
+                        OracleWord::Logic(op, x, y) => match op {
+                            IntOp::And => at(&values, x, l) & at(&values, y, l),
+                            IntOp::Or => at(&values, x, l) | at(&values, y, l),
+                            _ => at(&values, x, l) ^ at(&values, y, l),
+                        },
+                        OracleWord::Cast(x) => at(&values, x, l),
+                        OracleWord::Own(x) => at(&values, x, l) >> l & 1,
+                    };
+                }
+                values.push(out);
+            }
+            let mut reported = false;
+            for l in 0..32usize {
+                let assignment = |var: u32| match logic.atom_of(var) {
+                    Atom::Bit(v) if v == p[1] => own[l][0],
+                    Atom::Bit(v) if v == p[2] => own[l][1],
+                    Atom::Bit(v) if v == p[3] => shared,
+                    Atom::Lane(i) => l >> i & 1 == 1,
+                    other => panic!("unexpected atom {:?}", other),
+                };
+                for (k, &(node, _, word)) in nodes.iter().enumerate() {
+                    let truth = if word { values[k][l] >> l & 1 == 1 } else { values[k][l] == 1 };
+                    let got = evaluate(&logic.m, facts_of[k], &assignment);
+                    if got != truth && !reported {
+                        reported = true;
+                        wrong.push(format!("round {}: node {} = {:?} at lane {} is {}, fact says {}", round, k, node, l, truth, got));
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong: {:?}", wrong.len(), &wrong[..wrong.len().min(4)]);
+}
+
+fn no_hazards() -> super::super::hazard::Hazards {
+    super::super::hazard::Hazards {
+        accesses: Vec::new(),
+        together: BTreeSet::new(),
+        apart: BTreeSet::new(),
+        idle: BTreeSet::new(),
+        meetings: Vec::new(),
+    }
+}
+
+fn query_fed_through_a_parameter() -> (Build, ValueId, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let flags = k.buffer(&mut b, e, 8);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, flags, lane, 4);
+    let flag = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+    let zero = b.constant(e, Ty::I32, 0);
+    let set = b.cmp(e, IntPred::Ne, flag, zero);
+    let c = b.int(e, IntOp::And, set, k.exec);
+    let a = b.wave(e, WaveOp::Any, vec![c]);
+    let out = k.buffer(&mut b, e, 0);
+    let addr = byte_offset(&mut b, e, out, lane, 8);
+    let (next, p) = b.block(&[Ty::I1, Ty::I1, Ty::I64]);
+    b.br(e, next, vec![k.exec, a, addr]);
+    let m = b.int(next, IntOp::And, p[1], p[0]);
+    let q = b.wave(next, WaveOp::Any, vec![m]);
+    let x = b.int(next, IntOp::Xor, q, p[1]);
+    let one = b.constant(next, Ty::I32, 1);
+    let two = b.constant(next, Ty::I32, 2);
+    let first = b.core(next, Ty::I32, Op::Select(x, one, two));
+    b.store(next, Space::Global, MemSize::B32, p[2], first, p[0]);
+    let four = b.constant(next, Ty::I64, 4);
+    let second_addr = b.int(next, IntOp::Add, p[2], four);
+    let second = b.core(next, Ty::I32, Op::Select(q, one, two));
+    b.store(next, Space::Global, MemSize::B32, second_addr, second, p[0]);
+    (b, a, q)
+}
+
+#[test]
+fn prove_keeps_a_query_whose_answer_a_parameter_carries_into_a_kept_query() {
+    let (b, a, q) = query_fed_through_a_parameter();
+    let mut wrong = Vec::new();
+    let searched = super::super::search::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0;
+    let direct = super::super::direct::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0;
+    for (name, kept) in [("search", searched), ("direct", direct)] {
+        if !kept.queries.contains(&a) {
+            wrong.push(format!("{}: keeps {:?} but not A = {:?} (B = {:?})", name, kept.queries, a, q));
+        }
+    }
+    assert!(wrong.is_empty(), "{:?}", wrong);
+}

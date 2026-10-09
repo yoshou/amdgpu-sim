@@ -20,6 +20,13 @@ pub fn is_word(ty: Ty) -> bool {
     matches!(ty, Ty::I32 | Ty::I64)
 }
 
+#[derive(Clone, Copy)]
+pub enum Conversion<'a> {
+    Wave,
+    Keeping(&'a BTreeSet<ValueId>),
+    Open,
+}
+
 pub struct Facts {
     pub site: Vec<Site>,
     pub uses: Vec<Vec<Use>>,
@@ -35,6 +42,10 @@ pub struct Facts {
 impl Facts {
 
     pub fn new(f: &Func, inputs: &[Parameter], kept: &BTreeSet<ValueId>) -> Self {
+        Self::converted(f, inputs, kept, Conversion::Wave)
+    }
+
+    pub fn converted(f: &Func, inputs: &[Parameter], kept: &BTreeSet<ValueId>, conversion: Conversion) -> Self {
         let n = f.types.len();
         let order = f.reverse_postorder();
         let mut site = vec![Site::Unreached; n];
@@ -85,7 +96,7 @@ impl Facts {
             saturated: vec![false; n],
             viewed: vec![false; n],
         };
-        facts.solve_uniform(f, inputs);
+        facts.solve_uniform(f, inputs, conversion);
         facts.solve_lane_words(f);
         facts.solve_materialized(f, kept);
         facts.solve_saturated(f);
@@ -198,7 +209,7 @@ impl Facts {
         })
     }
 
-    fn solve_uniform(&mut self, f: &Func, inputs: &[Parameter]) {
+    fn solve_uniform(&mut self, f: &Func, inputs: &[Parameter], conversion: Conversion) {
         let entry = &f.blocks[&f.entry];
         for (index, &(v, _)) in entry.params.iter().enumerate() {
             self.uniform[v.0] = matches!(
@@ -237,9 +248,12 @@ impl Facts {
                                 op: MemoryOp::Load(_),
                                 ..
                             } => all,
-                            EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane) => {
-                                true
-                            }
+                            EffectOp::Wave(WaveOp::Any) => match conversion {
+                                Conversion::Wave => true,
+                                Conversion::Keeping(kept) => all || inst.outputs().iter().all(|v| kept.contains(v)),
+                                Conversion::Open => all,
+                            },
+                            EffectOp::Wave(WaveOp::Ballot { .. } | WaveOp::ReadFirstLane) => true,
                             _ => false,
                         },
                     };

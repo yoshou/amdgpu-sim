@@ -294,7 +294,7 @@ impl<'a> Check<'a> {
             };
             let d = &mut self.differences;
             let hc = d.h(*cond);
-            if hc == Bdd::FALSE || yes.dst == no.dst {
+            if hc == Bdd::FALSE || (yes.dst == no.dst && yes.args == no.args) {
                 continue;
             }
             let version = self.version.get(&b).copied().unwrap_or(0);
@@ -310,6 +310,20 @@ impl<'a> Check<'a> {
                 let assume = d.and(assume, reachable);
                 let assume = d.and(assume, d.safe());
                 if assume == Bdd::FALSE {
+                    continue;
+                }
+                let program = d.program();
+                let rank = |x: BlockId| program.rank[&x];
+                let (stays, leaves) = ([yes, no][lane].dst, [yes, no][wave].dst);
+                let spins = (0..program.loops.count()).any(|l| {
+                    program.loops.contains(l, rank(b)) && program.loops.contains(l, rank(stays)) && !program.loops.contains(l, rank(leaves))
+                });
+                if spins {
+                    let at = f.blocks[&b].insts.len();
+                    d.require(b, at, "a converted lane may stay in a loop the wave leaves", assume);
+                    if d.stopped() {
+                        return arrivals;
+                    }
                     continue;
                 }
                 let parts = match d.mode() {

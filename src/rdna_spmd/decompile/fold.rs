@@ -118,15 +118,18 @@ fn apply(q: &mut Func, decided: &Decided) {
                         op: Op::Const(Ty::I1, decided.constant[&value] as u64),
                     });
                 }
-                Inst::Effect { outputs, .. }
+                Inst::Effect { ref outputs, .. }
                     if outputs.len() == 1 && decided.constant.contains_key(&outputs[0].0) =>
                 {
-                    let value = outputs[0].0;
+                    let old = outputs[0].0;
+                    let value = q.value(Ty::I1);
+                    insts.push(inst);
                     insts.push(Inst::Core {
                         value,
                         ty: Ty::I1,
-                        op: Op::Const(Ty::I1, decided.constant[&value] as u64),
+                        op: Op::Const(Ty::I1, decided.constant[&old] as u64),
                     });
+                    renames.insert(old, value);
                 }
                 other => insts.push(other),
             }
@@ -434,5 +437,72 @@ mod tests {
             "the carried bit is true on entry and false after an iteration whose fresh bit is false, but fold made it constant: {:?}",
             f.blocks[&body].insts
         );
+    }
+
+    fn toggled(flip: bool) -> (Func, Vec<Parameter>, BlockId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let (head, h) = b.block(&[Ty::I1, Ty::I1, Ty::I32, Ty::I64]);
+        let (latch, l) = b.block(&[Ty::I1, Ty::I1, Ty::I32, Ty::I64]);
+        let (exit, _) = b.block(&[Ty::I1]);
+        b.br(e, head, vec![k.exec, yes, zero, buf]);
+        let mask = b.int(head, IntOp::And, h[1], h[0]);
+        let seven = b.constant(head, Ty::I32, 7);
+        b.store(head, Space::Global, MemSize::B32, h[3], seven, mask);
+        b.br(head, latch, vec![h[0], h[1], h[2], h[3]]);
+        let one = b.constant(latch, Ty::I1, 1);
+        let next_flag = if flip {
+            b.int(latch, IntOp::Xor, l[1], one)
+        } else {
+            let lane = b.core(latch, Ty::I32, Op::Env(Env::LaneId));
+            let five = b.constant(latch, Ty::I32, 5);
+            let small = b.cmp(latch, IntPred::Ult, lane, five);
+            let no = b.constant(latch, Ty::I1, 0);
+            b.core(latch, Ty::I1, Op::Select(small, l[1], no))
+        };
+        let step = b.constant(latch, Ty::I32, 1);
+        let next = b.int(latch, IntOp::Add, l[2], step);
+        let four = b.constant(latch, Ty::I32, 4);
+        let again = b.cmp(latch, IntPred::Ult, next, four);
+        b.cond_br(latch, again, (head, vec![l[0], next_flag, next, l[3]]), (exit, vec![l[0]]));
+        (b.f, b.inputs, head)
+    }
+
+    #[test]
+    fn fold_keeps_a_kept_query_whose_answer_the_lane_program_decides() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let one = b.constant(e, Ty::I32, 1);
+        b.store(e, Space::Global, MemSize::B32, buf, one, k.exec);
+        let q = b.wave(e, WaveOp::Any, vec![k.exec]);
+        let two = b.constant(e, Ty::I32, 2);
+        b.store(e, Space::Global, MemSize::B32, buf, two, k.exec);
+        let zero = b.constant(e, Ty::I32, 0);
+        let data = b.core(e, Ty::I32, Op::Select(q, one, zero));
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let out = k.buffer(&mut b, e, 8);
+        let slot = byte_offset(&mut b, e, out, lane, 4);
+        b.store(e, Space::Global, MemSize::B32, slot, data, k.exec);
+        let mut f = b.f;
+        fold(&mut f, &b.inputs, &BTreeSet::new(), Some(0));
+        let kept = f.blocks[&e].insts.iter().any(|i| {
+            matches!(i, Inst::Effect { op: EffectOp::Wave(WaveOp::Any), outputs, .. } if outputs[0].0 == q)
+        });
+        assert!(kept, "the query between the two stores is gone: {:?}", f.blocks[&e].insts);
+    }
+
+    #[test]
+    fn fold_keeps_a_bit_the_latch_of_a_two_block_loop_changes() {
+        for flip in [true, false] {
+            let (mut f, inputs, head) = toggled(flip);
+            fold(&mut f, &inputs, &BTreeSet::new(), Some(0));
+            let masks = stores(&f, head);
+            assert_eq!(masks.len(), 1, "flip {}: the store in the header runs while the bit is set", flip);
+            assert_eq!(constant(&f, masks[0].1), None, "flip {}: the header's bit is set on entry and clear later", flip);
+        }
     }
 }

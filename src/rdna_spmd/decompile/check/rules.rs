@@ -120,7 +120,11 @@ fn core<'a, Q: Queries<'a>>(q: &mut Q, inst: &Inst, value: ValueId, ty: Ty, op: 
             Some(w) if facts.lane_word[w.0] => q.h(w),
             _ => q.h(s),
         },
-        Op::Int(IntOp::LShr, w, lane) if facts.lane_word[w.0] && facts.is_lane_shift(f, w, lane) => q.h(w),
+        Op::Int(IntOp::LShr, w, lane) if facts.lane_word[w.0] && facts.is_lane_shift(f, w, lane) => {
+            let mode = q.logic().materialized(facts, w);
+            let (hw, whole) = (q.h(w), q.whole(w));
+            q.logic().m.ite(mode, whole, hw)
+        }
         Op::Cmp(IntPred::Eq | IntPred::Ne, x, y) if lane_test(f, facts, x, y).is_some() => {
             let w = lane_test(f, facts, x, y).unwrap();
             let mode = q.logic().materialized(facts, w);

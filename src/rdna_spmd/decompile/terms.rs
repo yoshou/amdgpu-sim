@@ -227,7 +227,7 @@ impl<'a> Terms<'a> {
 }
 
 pub(super) fn interval(f: &Func, facts: &Facts, v: ValueId, depth: usize) -> Option<(u32, u32)> {
-    if depth > 16 {
+    if depth > 16 || f.types[v.0] != Ty::I32 {
         return None;
     }
     if let Some(k) = facts.constant(f, v) {
@@ -399,5 +399,257 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    fn knobs() -> (u64, usize) {
+        let seed = std::env::var("ORACLE_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let scale = std::env::var("ORACLE_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        (seed, scale)
+    }
+
+    #[derive(Clone)]
+    enum Expr {
+        Leaf(usize),
+        Lane,
+        Const(u32),
+        Bin(IntOp, Box<Expr>, Box<Expr>),
+    }
+
+    fn eval(e: &Expr, leaves: &[u32], lane: u32) -> u32 {
+        match e {
+            Expr::Leaf(i) => leaves[*i],
+            Expr::Lane => lane,
+            Expr::Const(k) => *k,
+            Expr::Bin(op, a, b) => {
+                let (x, y) = (eval(a, leaves, lane), eval(b, leaves, lane));
+                match op {
+                    IntOp::Add => x.wrapping_add(y),
+                    IntOp::Sub => x.wrapping_sub(y),
+                    IntOp::Mul => x.wrapping_mul(y),
+                    IntOp::Shl => x << (y & 31),
+                    IntOp::LShr => x >> (y & 31),
+                    IntOp::And => x & y,
+                    IntOp::Or => x | y,
+                    IntOp::Xor => x ^ y,
+                    IntOp::AShr => ((x as i32) >> (y & 31)) as u32,
+                }
+            }
+        }
+    }
+
+    fn compare(p: IntPred, x: u32, y: u32) -> bool {
+        let (sx, sy) = (x as i32, y as i32);
+        match p {
+            IntPred::Eq => x == y,
+            IntPred::Ne => x != y,
+            IntPred::Ult => x < y,
+            IntPred::Ule => x <= y,
+            IntPred::Ugt => x > y,
+            IntPred::Uge => x >= y,
+            IntPred::Slt => sx < sy,
+            IntPred::Sle => sx <= sy,
+            IntPred::Sgt => sx > sy,
+            IntPred::Sge => sx >= sy,
+        }
+    }
+
+    const ORACLE_PREDS: [IntPred; 10] = [
+        IntPred::Eq,
+        IntPred::Ne,
+        IntPred::Ult,
+        IntPred::Ugt,
+        IntPred::Ule,
+        IntPred::Uge,
+        IntPred::Slt,
+        IntPred::Sgt,
+        IntPred::Sle,
+        IntPred::Sge,
+    ];
+
+    fn oracle_constant(r: &mut Random) -> u32 {
+        match r.below(4) {
+            0 => r.below(8) as u32,
+            1 => (r.below(8) as u32).wrapping_neg(),
+            2 => [0x8000_0000, 0x7fff_ffff, 0x4000_0000, 0xffff_fffc, 0x8000_0001][r.below(5) as usize],
+            _ => r.next() as u32,
+        }
+    }
+
+    fn expr(r: &mut Random, depth: usize, leaves: usize) -> Expr {
+        if depth == 0 || r.below(4) == 0 {
+            return match r.below(5) {
+                0 => Expr::Lane,
+                1 => Expr::Const(oracle_constant(r)),
+                _ => Expr::Leaf(r.below(leaves as u64) as usize),
+            };
+        }
+        let a = Box::new(expr(r, depth - 1, leaves));
+        match r.below(8) {
+            0 | 1 => Expr::Bin(IntOp::Add, a, Box::new(expr(r, depth - 1, leaves))),
+            2 => Expr::Bin(IntOp::Sub, a, Box::new(expr(r, depth - 1, leaves))),
+            3 => Expr::Bin(IntOp::Mul, a, Box::new(Expr::Const(oracle_constant(r)))),
+            4 => Expr::Bin(IntOp::Shl, a, Box::new(Expr::Const(r.below(34) as u32))),
+            5 => Expr::Bin(IntOp::LShr, a, Box::new(Expr::Const(r.below(33) as u32))),
+            6 => Expr::Bin(IntOp::And, a, Box::new(Expr::Const(oracle_constant(r)))),
+            _ => Expr::Bin(IntOp::Mul, a, Box::new(expr(r, depth - 1, leaves))),
+        }
+    }
+
+    fn build(b: &mut Build, e: BlockId, x: &Expr, leaves: &[ValueId], lane: ValueId) -> ValueId {
+        match x {
+            Expr::Leaf(i) => leaves[*i],
+            Expr::Lane => lane,
+            Expr::Const(k) => b.constant(e, Ty::I32, *k as u64),
+            Expr::Bin(op, p, q) => {
+                let (p, q) = (build(b, e, p, leaves, lane), build(b, e, q, leaves, lane));
+                b.int(e, *op, p, q)
+            }
+        }
+    }
+
+    struct Case {
+        b: Build,
+        exprs: Vec<(Expr, ValueId)>,
+        leaves: Vec<ValueId>,
+        masks: Vec<u32>,
+    }
+
+    fn oracle_case(r: &mut Random) -> Case {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let table = k.buffer(&mut b, e, 8);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let yes = b.constant(e, Ty::I1, 1);
+        let mut leaves = Vec::new();
+        let mut masks = Vec::new();
+        for i in 0..3u64 {
+            let address = if r.below(2) == 0 { byte_offset(&mut b, e, table, lane, 4 + i) } else { table };
+            let loaded = b.load(e, Space::Global, MemSize::U8, address, yes);
+            let mask = [1u32, 3, 7][r.below(3) as usize];
+            let m = b.constant(e, Ty::I32, mask as u64);
+            leaves.push(b.int(e, IntOp::And, loaded, m));
+            masks.push(mask);
+        }
+        let mut exprs = Vec::new();
+        for _ in 0..6 {
+            let x = expr(r, 3, leaves.len());
+            let v = build(&mut b, e, &x, &leaves, lane);
+            exprs.push((x, v));
+        }
+        Case { b, exprs, leaves, masks }
+    }
+
+    fn assignments(masks: &[u32]) -> Vec<Vec<u32>> {
+        let mut out = vec![Vec::new()];
+        for &m in masks {
+            out = out.into_iter().flat_map(|prefix| (0..=m).map(move |v| [prefix.clone(), vec![v]].concat())).collect();
+        }
+        out
+    }
+
+    #[test]
+    fn decided_matches_every_assignment() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(2024 + shift);
+        let mut wrong = Vec::new();
+        let mut decided = 0;
+        for case in 0..50 * scale {
+            let c = oracle_case(&mut r);
+            let facts = Facts::new(&c.b.f, &c.b.inputs, &BTreeSet::new());
+            let all = assignments(&c.masks);
+            for _ in 0..8 {
+                let (i, j) = (r.below(6) as usize, r.below(6) as usize);
+                let p = ORACLE_PREDS[r.below(10) as usize];
+                let ((x, vx), (y, vy)) = (&c.exprs[i], &c.exprs[j]);
+                if vx == vy {
+                    continue;
+                }
+                let Some(answer) = Terms::new(&c.b.f, &facts).decided(p, *vx, *vy) else {
+                    continue;
+                };
+                decided += 1;
+                'search: for leaves in &all {
+                    for lane in 0..32 {
+                        let (a, b) = (eval(x, leaves, lane), eval(y, leaves, lane));
+                        if compare(p, a, b) != answer {
+                            wrong.push(format!("case {}: {:?} on {} and {} decided {} but leaves {:?} lane {} give {:#x} vs {:#x}", case, p, i, j, answer, leaves, lane, a, b));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(decided > 50, "only {} decided", decided);
+        assert!(wrong.is_empty(), "{} wrong of {}: {:#?}", wrong.len(), decided, &wrong[..wrong.len().min(4)]);
+    }
+
+    #[test]
+    fn worlds_hold_every_realised_outcome() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(4048 + shift);
+        let mut wrong = Vec::new();
+        for case in 0..50 * scale {
+            let c = oracle_case(&mut r);
+            let facts = Facts::new(&c.b.f, &c.b.inputs, &BTreeSet::new());
+            let all = assignments(&c.masks);
+            let preds: Vec<(IntPred, usize, usize)> = (0..1 + r.below(3)).map(|_| (ORACLE_PREDS[r.below(10) as usize], r.below(6) as usize, r.below(6) as usize)).collect();
+            let ids: Vec<(IntPred, ValueId, ValueId)> = preds.iter().map(|&(p, i, j)| (p, c.exprs[i].1, c.exprs[j].1)).collect();
+            let Some(worlds) = Terms::new(&c.b.f, &facts).worlds(&ids, 64) else {
+                continue;
+            };
+            'search: for leaves in &all {
+                for lane in 0..32 {
+                    let world: Vec<bool> = preds
+                        .iter()
+                        .map(|&(p, i, j)| compare(p, eval(&c.exprs[i].0, leaves, lane), eval(&c.exprs[j].0, leaves, lane)))
+                        .collect();
+                    if !worlds.contains(&world) {
+                        wrong.push(format!("case {}: preds {:?} realise {:?} at leaves {:?} lane {} but worlds are {:?}", case, preds, world, leaves, lane, worlds));
+                        break 'search;
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong: {:#?}", wrong.len(), &wrong[..wrong.len().min(4)]);
+    }
+
+    #[test]
+    fn uniform_predicates_agree_on_every_lane() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(8096 + shift);
+        let mut wrong = Vec::new();
+        let mut claimed = 0;
+        for case in 0..50 * scale {
+            let c = oracle_case(&mut r);
+            let facts = Facts::new(&c.b.f, &c.b.inputs, &BTreeSet::new());
+            let uniform: Vec<bool> = c.leaves.iter().map(|l| facts.uniform[l.0]).collect();
+            let all = assignments(&c.masks);
+            for _ in 0..6 {
+                let (i, j) = (r.below(6) as usize, r.below(6) as usize);
+                let p = ORACLE_PREDS[r.below(10) as usize];
+                if !Terms::new(&c.b.f, &facts).uniform((p, c.exprs[i].1, c.exprs[j].1)) {
+                    continue;
+                }
+                claimed += 1;
+                let key = |leaves: &[u32]| -> Vec<u32> { leaves.iter().zip(&uniform).map(|(&v, &u)| if u { v } else { u32::MAX }).collect() };
+                let mut seen: crate::rdna_spmd::hash::HashMap<Vec<u32>, bool> = Default::default();
+                'search: for leaves in &all {
+                    for lane in 0..32 {
+                        let t = compare(p, eval(&c.exprs[i].0, leaves, lane), eval(&c.exprs[j].0, leaves, lane));
+                        match seen.get(&key(leaves)) {
+                            Some(&old) if old != t => {
+                                wrong.push(format!("case {}: {:?} on {} and {} claimed uniform; differs at leaves {:?} lane {} (uniform leaves {:?})", case, p, i, j, leaves, lane, uniform));
+                                break 'search;
+                            }
+                            Some(_) => {}
+                            None => {
+                                seen.insert(key(leaves), t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong of {}: {:#?}", wrong.len(), claimed, &wrong[..wrong.len().min(4)]);
     }
 }
