@@ -186,6 +186,7 @@ pub struct Cells {
     blocks: HashMap<BlockId, Arc<BlockCells>>,
     groups: HashMap<(BlockId, u16), (u8, Vec<ValueId>)>,
     uniform_tests: HashSet<ValueId>,
+    reads: HashMap<BlockId, Vec<(ValueId, bool)>>,
 }
 
 impl Cells {
@@ -197,10 +198,23 @@ impl Cells {
         cells
     }
 
+    pub fn agreeing(&self, facts: &Facts) -> Self {
+        let mut cells = self.clone();
+        for (&block, reads) in &self.reads {
+            if reads.iter().any(|&(v, uniform)| facts.uniform[v.0] != uniform) {
+                cells.blocks.remove(&block);
+                cells.reads.remove(&block);
+                cells.groups.retain(|&(b, _), _| b != block);
+            }
+        }
+        cells
+    }
+
     fn block(&mut self, f: &Func, facts: &Facts, block: BlockId) -> Arc<BlockCells> {
         if let Some(cells) = self.blocks.get(&block) {
             return cells.clone();
         }
+        let mut reads: Vec<(ValueId, bool)> = Vec::new();
         let mut distributor = Distributor::default();
         let mut trees: Vec<(ValueId, IntPred, ValueId, ValueId, Arc<Tree>)> = Vec::new();
         for inst in &f.blocks[&block].insts {
@@ -235,7 +249,7 @@ impl Cells {
             if worlds.is_empty() {
                 continue;
             }
-            let uniform: Vec<bool> = preds.iter().map(|&p| Terms::new(f, facts).uniform(p)).collect();
+            let uniform: Vec<bool> = preds.iter().map(|&p| Terms::new(f, facts).uniform_noting(p, &mut |v, u| reads.push((v, u)))).collect();
             let leaves: BTreeSet<ValueId> = list.iter().flat_map(|&i| leaves[i].iter().flatten().copied()).collect();
             let group = CellGroup::new(worlds, preds, leaves, uniform);
             let number = cells.groups.len() as u16;
@@ -248,11 +262,17 @@ impl Cells {
         for (value, p, a, b, tree) in trees {
             let mut indices = BTreeSet::new();
             tree.leaves(&mut indices);
-            if indices.iter().any(|i| !cells.placed.contains_key(i)) && !facts.uniform[value.0] && a != b && leaves_of(a, b).is_some() {
-                cells.opaque.insert(value, (p, a, b));
+            if indices.iter().any(|i| !cells.placed.contains_key(i)) {
+                reads.push((value, facts.uniform[value.0]));
+                if !facts.uniform[value.0] && a != b && leaves_of(a, b).is_some() {
+                    cells.opaque.insert(value, (p, a, b));
+                }
             }
             cells.of.insert(value, tree);
         }
+        reads.sort_unstable();
+        reads.dedup();
+        self.reads.insert(block, reads);
         let cells = Arc::new(cells);
         self.blocks.insert(block, cells.clone());
         cells
@@ -466,4 +486,85 @@ where
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::super::testing::*;
+    use super::*;
+
+    fn fingerprint(cells: &Cells) -> Vec<String> {
+        let mut blocks: Vec<&BlockId> = cells.blocks.keys().collect();
+        blocks.sort();
+        let mut out: Vec<String> = blocks
+            .into_iter()
+            .map(|b| {
+                let c = &cells.blocks[b];
+                let groups: Vec<String> = c.groups.iter().map(|g| format!("{:?} {:?} {:?} {:?}", g.preds, g.uniform, g.counts, g.worlds)).collect();
+                let mut opaque: Vec<String> = c.opaque.iter().map(|(v, o)| format!("{:?} {:?}", v, o)).collect();
+                opaque.sort();
+                let mut placed: Vec<(&usize, &(u16, usize))> = c.placed.iter().collect();
+                placed.sort();
+                format!("b{} {:?} {:?} {:?}", b.0, groups, opaque, placed)
+            })
+            .collect();
+        let mut groups: Vec<String> = cells.groups.iter().map(|(k, v)| format!("{:?} {:?}", k, v)).collect();
+        groups.sort();
+        out.extend(groups);
+        out
+    }
+
+    #[test]
+    fn agreeing_keeps_every_block_whose_reads_hold_and_rebuilds_the_rest_as_new() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let yes = b.constant(e, Ty::I1, 1);
+        let table = k.buffer(&mut b, e, 8);
+        let u = b.load(e, Space::Global, MemSize::B32, table, yes);
+        let at = b.constant(e, Ty::I64, 4);
+        let second = b.int(e, IntOp::Add, table, at);
+        let v = b.load(e, Space::Global, MemSize::B32, second, yes);
+        let mut values = vec![u, v];
+        for (pred, x, y) in [(IntPred::Ult, u, v), (IntPred::Eq, u, v)] {
+            values.push(b.cmp(e, pred, x, y));
+        }
+        let (crowd, c) = b.block(&[Ty::I1, Ty::I32]);
+        b.br(e, crowd, vec![k.exec, u]);
+        for i in 0..GROUP as u64 + 2 {
+            let bound = b.constant(crowd, Ty::I32, 3 + 5 * i);
+            values.push(b.cmp(crowd, IntPred::Ult, c[1], bound));
+        }
+        values.push(c[1]);
+        let (rest, r) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+        b.br(crowd, rest, vec![c[0], u, v]);
+        for (pred, x, y) in [(IntPred::Ult, r[1], r[2]), (IntPred::Ne, r[1], r[2])] {
+            values.push(b.cmp(rest, pred, x, y));
+        }
+        values.extend([r[1], r[2]]);
+        let f = &b.f;
+        let none = BTreeSet::new();
+        let facts = Facts::new(f, &b.inputs, &none);
+        let all = Cells::of(f, &facts);
+        let (mut dropped, mut shared) = (0, 0);
+        for &x in &values {
+            let mut other = Facts::new(f, &b.inputs, &none);
+            other.uniform[x.0] = !other.uniform[x.0];
+            let agreed = all.agreeing(&other);
+            for (block, cells) in &agreed.blocks {
+                assert!(Arc::ptr_eq(cells, &all.blocks[block]), "b{} must stay shared when flipping v{}", block.0, x.0);
+                shared += 1;
+            }
+            for block in all.blocks.keys().filter(|b| !agreed.blocks.contains_key(b)) {
+                assert!(!agreed.groups.keys().any(|&(g, _)| g == *block), "b{} keeps groups after it is dropped", block.0);
+                assert!(!agreed.reads.contains_key(block));
+                dropped += 1;
+            }
+            let mut completed = agreed;
+            for &block in &other.order {
+                completed.block(f, &other, block);
+            }
+            assert_eq!(fingerprint(&completed), fingerprint(&Cells::of(f, &other)), "flipping the uniformity of v{}", x.0);
+        }
+        assert!(dropped > 0 && shared > 0, "dropped {} shared {}", dropped, shared);
+    }
 }

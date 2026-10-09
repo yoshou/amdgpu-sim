@@ -765,6 +765,52 @@ fn canonical(m: &crate::rdna_spmd::analysis::bdd::Manager, g: Bdd) -> String {
 }
 
 #[test]
+fn a_structure_built_under_other_facts_reads_every_comparison_as_a_lazy_logic_with_the_checks_facts() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let yes = b.constant(e, Ty::I1, 1);
+    let table = k.buffer(&mut b, e, 8);
+    let u = b.load(e, Space::Global, MemSize::B32, table, yes);
+    let at = b.constant(e, Ty::I64, 4);
+    let second = b.int(e, IntOp::Add, table, at);
+    let v = b.load(e, Space::Global, MemSize::B32, second, yes);
+    let w = b.load(e, Space::Global, MemSize::B32, table, yes);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let mut tests = Vec::new();
+    for (pred, x, y) in [(IntPred::Ult, u, v), (IntPred::Eq, u, v), (IntPred::Ugt, v, lane), (IntPred::Ult, v, w)] {
+        tests.push(b.cmp(e, pred, x, y));
+    }
+    let (next, n) = b.block(&[Ty::I1, Ty::I32, Ty::I32]);
+    b.br(e, next, vec![k.exec, v, w]);
+    for (pred, x, y) in [(IntPred::Ult, n[1], n[2]), (IntPred::Ne, n[1], n[2])] {
+        tests.push(b.cmp(next, pred, x, y));
+    }
+    let f = &b.f;
+    let none = BTreeSet::new();
+    let built_under = Facts::new(f, &b.inputs, &none);
+    let mut checked = Facts::new(f, &b.inputs, &none);
+    assert!(checked.uniform[u.0], "the load from one address must start uniform");
+    checked.uniform[u.0] = false;
+    let built = Structure::of(f, &built_under);
+    let kept: BTreeSet<Choice> = BTreeSet::new();
+    let mut under_built = Logic::fixed(f, &built_under, &kept, &[]);
+    let mut lazy = Logic::fixed(f, &checked, &kept, &[]);
+    let mut known = Logic::structured(&built, f, &checked, &kept, &[]);
+    let read = |logic: &mut Logic, facts: &Facts, t: ValueId| -> (String, Vec<(Atom, bool)>) {
+        let x = logic.bit(f, facts, t);
+        let atoms = logic.support(x).iter().map(|&var| (logic.atom_of(var), logic.uniform_atom(facts, var))).collect();
+        (canonical(&logic.m, x), atoms)
+    };
+    let mut differ = 0;
+    for &t in &tests {
+        let want = read(&mut lazy, &checked, t);
+        assert_eq!(read(&mut known, &checked, t), want, "the bit of v{} and which of its atoms are uniform under the check's facts", t.0);
+        differ += (read(&mut under_built, &built_under, t) != want) as usize;
+    }
+    assert!(differ > 0, "the facts must change some comparison for the test to check the structure");
+}
+
+#[test]
 fn a_structured_logic_reads_every_comparison_and_crossing_as_a_lazy_one() {
     let (mut b, k) = Build::kernel();
     let e = BlockId(0);
