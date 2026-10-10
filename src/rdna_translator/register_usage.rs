@@ -206,6 +206,7 @@ impl RegisterUsage {
 impl RDNATranslator {
     pub(crate) fn analyze_instructions(inst: &InstFormat, reg_usage: &mut RegisterUsage) {
         match inst {
+            InstFormat::DPP(inst) => Self::analyze_instructions(&inst.inner, reg_usage),
             InstFormat::SOPP(inst) => match inst.op {
                 I::S_CLAUSE => {}
                 I::S_WAIT_KMCNT => {}

@@ -99,6 +99,39 @@ fn flat_atomics_return_the_old_value() {
     });
 }
 
+#[test]
+fn flat_atomics_combine_bits_swap_and_wrap() {
+    let inputs = lanes(3, word);
+    let cases: [(&str, fn(u32, u32) -> u32); 7] = [
+        ("flat_atomic_and", |m, d| m & d),
+        ("flat_atomic_or", |m, d| m | d),
+        ("flat_atomic_xor", |m, d| m ^ d),
+        ("flat_atomic_swap", |_, d| d),
+        ("flat_atomic_sub", |m, d| m.wrapping_sub(d)),
+        ("flat_atomic_inc", |m, d| if m >= d { 0 } else { m + 1 }),
+        ("flat_atomic_dec", |m, d| if m == 0 || m > d { d } else { m - 1 }),
+    ];
+    for (op, f) in cases {
+        let body = format!(
+            "{OWN}
+             flat_store_dword v[12:13], v1
+             s_waitcnt vmcnt(0)
+             {op} v20, v[12:13], v2 glc
+             s_waitcnt vmcnt(0)
+             flat_load_dword v21, v[12:13]
+             s_waitcnt vmcnt(0)
+             {op} v[12:13], v3
+             s_waitcnt vmcnt(0)
+             flat_load_dword v22, v[12:13]
+             s_waitcnt vmcnt(0)"
+        );
+        Probe::new(3, 3, &body).check(&inputs, |_, x| {
+            let first = f(x[0], x[1]);
+            vec![x[0], first, f(first, x[2])]
+        });
+    }
+}
+
 fn shared(body: &str) -> String {
     format!(
         "s_mov_b32 m0, -1
@@ -173,6 +206,61 @@ fn local_data_share_atomics_and_wide_words() {
 }
 
 #[test]
+fn local_data_share_atomics_combine_compare_and_exchange() {
+    let inputs = lanes(3, word);
+    let cases: [(&str, &str, fn(u32, u32) -> u32); 10] = [
+        ("ds_max_u32", "ds_max_rtn_u32", |m, d| m.max(d)),
+        ("ds_min_u32", "ds_min_rtn_u32", |m, d| m.min(d)),
+        ("ds_max_i32", "ds_max_rtn_i32", |m, d| (m as i32).max(d as i32) as u32),
+        ("ds_min_i32", "ds_min_rtn_i32", |m, d| (m as i32).min(d as i32) as u32),
+        ("ds_and_b32", "ds_and_rtn_b32", |m, d| m & d),
+        ("ds_or_b32", "ds_or_rtn_b32", |m, d| m | d),
+        ("ds_xor_b32", "ds_xor_rtn_b32", |m, d| m ^ d),
+        ("ds_sub_u32", "ds_sub_rtn_u32", |m, d| m.wrapping_sub(d)),
+        ("ds_inc_u32", "ds_inc_rtn_u32", |m, d| if m >= d { 0 } else { m + 1 }),
+        ("ds_dec_u32", "ds_dec_rtn_u32", |m, d| if m == 0 || m > d { d } else { m - 1 }),
+    ];
+    for (plain, rtn, f) in cases {
+        let body = shared(&format!(
+            "ds_write_b32 v10, v1
+             s_waitcnt lgkmcnt(0)
+             {plain} v10, v2
+             s_waitcnt lgkmcnt(0)
+             {rtn} v20, v10, v3
+             s_waitcnt lgkmcnt(0)
+             ds_read_b32 v21, v10
+             s_waitcnt lgkmcnt(0)"
+        ));
+        Probe::new(3, 2, &body).shared(1024).check(&inputs, |_, x| {
+            let first = f(x[0], x[1]);
+            vec![first, f(first, x[2])]
+        });
+    }
+    let body = shared(
+        "ds_write_b32 v10, v1
+         s_waitcnt lgkmcnt(0)
+         ds_wrxchg_rtn_b32 v20, v10, v2
+         s_waitcnt lgkmcnt(0)
+         ds_read_b32 v21, v10
+         s_waitcnt lgkmcnt(0)
+         ds_cmpst_rtn_b32 v22, v10, v2, v3
+         s_waitcnt lgkmcnt(0)
+         ds_read_b32 v23, v10
+         s_waitcnt lgkmcnt(0)
+         ds_cmpst_b32 v10, v1, v2
+         s_waitcnt lgkmcnt(0)
+         ds_read_b32 v24, v10
+         s_waitcnt lgkmcnt(0)",
+    );
+    Probe::new(3, 5, &body).shared(1024).check(&inputs, |_, x| {
+        let swapped = x[1];
+        let after_compare = if swapped == x[1] { x[2] } else { swapped };
+        let after_second = if after_compare == x[0] { x[1] } else { after_compare };
+        vec![x[0], swapped, swapped, after_compare, after_second]
+    });
+}
+
+#[test]
 fn private_buffers_address_each_lane_by_offset() {
     let inputs = lanes(3, |l, k| if k == 2 { (l as u32 % 3) * 4 } else { word(l, k) });
     let body = "s_add_u32 s0, s0, s7
@@ -212,5 +300,4 @@ fn the_frontend_refuses_what_it_cannot_model_exactly() {
         "denormal mode",
     );
     refused(Probe::new(1, 1, "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 0, 2), 1\nv_add_f32 v20, v1, v1"), "rounding");
-    refused(Probe::new(1, 1, "v_mov_b32_dpp v20, v1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"), "DPP");
 }

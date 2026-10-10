@@ -2,6 +2,8 @@ use crate::instructions::I;
 use crate::rdna_instructions::{InstFormat, SourceOperand};
 use crate::rdna_spmd::dialect::{Arguments, DialectRegistry};
 use crate::rdna_spmd::ir::*;
+pub mod dpp;
+pub use regs::{footprint, BoundaryIo};
 mod access;
 mod compare;
 mod control;
@@ -320,6 +322,7 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
                     | I::V_SUB_CO_CI_U32
                     | I::V_SUBREV_CO_CI_U32
                     | I::V_MAD_CO_U64_U32
+                    | I::V_MAD_CO_I64_I32
             ) =>
         {
             (
@@ -331,7 +334,7 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         }
         _ => return None,
     };
-    let mad = matches!(op, I::V_MAD_CO_U64_U32);
+    let mad = matches!(op, I::V_MAD_CO_U64_U32 | I::V_MAD_CO_I64_I32);
     let carry_in = matches!(
         op,
         I::V_ADD_CO_CI_U32 | I::V_SUB_CO_CI_U32 | I::V_SUBREV_CO_CI_U32
@@ -358,15 +361,20 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
             })
             .collect(),
     );
-    let neg = if let InstFormat::VOP3SD(i) = inst {
-        i.neg
+    let (neg, cm) = if let InstFormat::VOP3SD(i) = inst {
+        (i.neg, i.cm)
     } else {
-        0
+        (0, 0)
     };
     let a = b.bits_mod(Ty::I32, 32, ValueId(0), 0, neg, 0);
     let c = b.bits_mod(Ty::I32, 32, ValueId(1), 0, neg, 1);
-    let a = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, a));
-    let c = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, c));
+    let extend = if matches!(op, I::V_MAD_CO_I64_I32) {
+        Cvt::SExt
+    } else {
+        Cvt::ZExt
+    };
+    let a = b.push(Ty::I64, Op::Convert(extend, Ty::I64, a));
+    let c = b.push(Ty::I64, Op::Convert(extend, Ty::I64, c));
     let (result, flag, ty) = if mad {
         let product = b.push(Ty::I64, Op::Int(IntOp::Mul, a, c));
         let sum = b.push(Ty::I64, Op::Int(IntOp::Add, product, ValueId(2)));
@@ -391,11 +399,18 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
             let cin = b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, ValueId(2)));
             wide = b.push(Ty::I64, Op::Int(arithmetic, wide, cin));
         }
-        let result = b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, wide));
+        let mut result = b.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, wide));
         let shift = b.k(Ty::I64, 32);
         let high = b.push(Ty::I64, Op::Int(IntOp::LShr, wide, shift));
         let zero = b.k(Ty::I64, 0);
         let flag = b.push(Ty::I1, Op::Cmp(IntPred::Ne, high, zero));
+        if cm != 0 {
+            let bound = b.k(
+                Ty::I32,
+                if arithmetic == IntOp::Sub { 0 } else { u32::MAX as u64 },
+            );
+            result = b.push(Ty::I32, Op::Select(flag, bound, result));
+        }
         (result, flag, Ty::I32)
     };
     let mut results = vec![(Output::Vgpr(dst as u32, ty), result)];
@@ -709,6 +724,8 @@ fn float_type(op: I) -> Option<Ty> {
         | I::V_MAX_F32
         | I::V_MIN_NUM_F32
         | I::V_MAX_NUM_F32
+        | I::V_MINMAX_NUM_F32
+        | I::V_MAXMIN_NUM_F32
         | I::V_RCP_F32
         | I::V_RCP_IFLAG_F32
         | I::V_RSQ_F32
@@ -727,6 +744,7 @@ fn arity(op: I) -> usize {
         | I::V_NOT_B32
         | I::V_BFREV_B32
         | I::V_CLZ_I32_U32
+        | I::V_CTZ_I32_B32
         | I::V_RCP_F32
         | I::V_RCP_IFLAG_F32
         | I::V_RSQ_F32
@@ -765,6 +783,9 @@ fn arity(op: I) -> usize {
         | I::V_BFI_B32
         | I::V_PERM_B32
         | I::V_ALIGNBIT_B32
+        | I::V_SAD_U32
+        | I::V_MINMAX_NUM_F32
+        | I::V_MAXMIN_NUM_F32
         | I::V_FMA_F32
         | I::V_FMA_F64 => 3,
         _ => 2,
@@ -875,6 +896,24 @@ fn lower_integer(
                 }
             }
         }
+        I::V_MUL_HI_U32_U24 | I::V_MUL_HI_I32_I24 => {
+            let (a, b) = if matches!(op, I::V_MUL_HI_I32_I24) {
+                (sign_extend_24(q, a), sign_extend_24(q, b))
+            } else {
+                (mask_24(q, a), mask_24(q, b))
+            };
+            let extend = if matches!(op, I::V_MUL_HI_I32_I24) {
+                Cvt::SExt
+            } else {
+                Cvt::ZExt
+            };
+            let a = q.push(Ty::I64, Op::Convert(extend, Ty::I64, a));
+            let b = q.push(Ty::I64, Op::Convert(extend, Ty::I64, b));
+            let product = q.push(Ty::I64, Op::Int(IntOp::Mul, a, b));
+            let shift = q.k(Ty::I64, 32);
+            let high = q.push(Ty::I64, Op::Int(IntOp::LShr, product, shift));
+            q.push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, high))
+        }
         I::V_MAD_U32_U24 | I::V_MAD_I32_I24 => {
             let (a, b) = if matches!(op, I::V_MAD_I32_I24) {
                 (sign_extend_24(q, a), sign_extend_24(q, b))
@@ -890,6 +929,20 @@ fn lower_integer(
             let empty = q.push(Ty::I1, Op::Cmp(IntPred::Eq, a, zero));
             let missing = q.k(Ty::I32, u32::MAX as u64);
             q.push(Ty::I32, Op::Select(empty, missing, count))
+        }
+        I::V_CTZ_I32_B32 => {
+            let count = q.push(Ty::I32, Op::TrailingZeros(a));
+            let zero = q.k(Ty::I32, 0);
+            let empty = q.push(Ty::I1, Op::Cmp(IntPred::Eq, a, zero));
+            let missing = q.k(Ty::I32, u32::MAX as u64);
+            q.push(Ty::I32, Op::Select(empty, missing, count))
+        }
+        I::V_SAD_U32 => {
+            let greater = q.push(Ty::I1, Op::Cmp(IntPred::Ugt, a, b));
+            let forward = q.int(IntOp::Sub, a, b);
+            let backward = q.int(IntOp::Sub, b, a);
+            let distance = q.push(Ty::I32, Op::Select(greater, forward, backward));
+            q.int(IntOp::Add, distance, c)
         }
         I::V_ADD_NC_U32 => {
             let sum = q.int(IntOp::Add, a, b);
@@ -1199,6 +1252,15 @@ fn lower_float(
                 result = q.push(Ty::F32, Op::Select(nan_a, result, right_nan));
             }
             result
+        }
+        I::V_MINMAX_NUM_F32 | I::V_MAXMIN_NUM_F32 => {
+            let (first, second) = if matches!(op, I::V_MINMAX_NUM_F32) {
+                (FloatOp::MinNum, FloatOp::MaxNum)
+            } else {
+                (FloatOp::MaxNum, FloatOp::MinNum)
+            };
+            let ab = q.push(ty, Op::Float(first, a, b));
+            q.push(ty, Op::Float(second, ab, c))
         }
         I::V_FMA_F64 => q.push(ty, Op::MulAdd(a, b, c)),
         I::V_FMA_F32 | I::V_FMAC_F32 | I::V_FMAAK_F32 => q.push(ty, Op::Fma(a, b, c)),

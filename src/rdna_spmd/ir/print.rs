@@ -182,6 +182,13 @@ fn effect_op(op: EffectOp) -> String {
                 MemoryOp::AtomicRmw(Rmw::SignedMax) => "atomic_smax".into(),
                 MemoryOp::AtomicRmw(Rmw::UnsignedMin) => "atomic_umin".into(),
                 MemoryOp::AtomicRmw(Rmw::UnsignedMax) => "atomic_umax".into(),
+                MemoryOp::AtomicRmw(Rmw::And) => "atomic_and".into(),
+                MemoryOp::AtomicRmw(Rmw::Or) => "atomic_or".into(),
+                MemoryOp::AtomicRmw(Rmw::Xor) => "atomic_xor".into(),
+                MemoryOp::AtomicRmw(Rmw::Swap) => "atomic_swap".into(),
+                MemoryOp::AtomicRmw(Rmw::Sub) => "atomic_sub".into(),
+                MemoryOp::AtomicRmw(Rmw::IncWrap) => "atomic_inc".into(),
+                MemoryOp::AtomicRmw(Rmw::DecWrap) => "atomic_dec".into(),
                 MemoryOp::AtomicCmpSwap => "atomic_cmpswap".into(),
                 MemoryOp::Fence => "fence".into(),
             };

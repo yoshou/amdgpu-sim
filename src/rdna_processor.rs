@@ -1291,6 +1291,7 @@ impl SIMD32 {
 
     fn execute_inst(&mut self, inst: InstFormat) -> Signals {
         match inst {
+            InstFormat::DPP(_) => panic!("not implemented: DPP"),
             InstFormat::SOP1(fields) => self.execute_sop1(fields),
             InstFormat::SOP2(fields) => self.execute_sop2(fields),
             InstFormat::SOPC(fields) => self.execute_sopc(fields),

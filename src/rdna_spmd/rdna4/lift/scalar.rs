@@ -21,7 +21,11 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
         | I::S_ASHR_I32
         | I::S_BFM_B32
         | I::S_BFE_U32
-        | I::S_MAX_U32 => Ty::I32,
+        | I::S_BFE_I32
+        | I::S_MAX_U32
+        | I::S_MIN_U32
+        | I::S_MAX_I32
+        | I::S_MIN_I32 => Ty::I32,
         I::S_ADD_NC_U64
         | I::S_MUL_U64
         | I::S_LSHL_B64
@@ -143,10 +147,43 @@ fn arithmetic(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering>
             flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero)));
             value
         }
-        I::S_MAX_U32 => {
-            let greater = b.push(Ty::I1, Op::Cmp(IntPred::Ugt, a, c));
-            flag = Some(greater);
-            b.push(Ty::I32, Op::Select(greater, a, c))
+        I::S_BFE_I32 => {
+            let offset_mask = b.k(Ty::I32, 0x1f);
+            let offset = b.int(IntOp::And, c, offset_mask);
+            let sixteen = b.k(Ty::I32, 16);
+            let width = b.int(IntOp::LShr, c, sixteen);
+            let field_mask = b.k(Ty::I32, 0x7f);
+            let width = b.int(IntOp::And, width, field_mask);
+            let one = b.k(Ty::I32, 1);
+            let power = b.int(IntOp::Shl, one, width);
+            let low_mask = b.int(IntOp::Sub, power, one);
+            let thirty_two = b.k(Ty::I32, 32);
+            let wide = b.push(Ty::I1, Op::Cmp(IntPred::Uge, width, thirty_two));
+            let all = b.k(Ty::I32, u32::MAX as u64);
+            let mask = b.push(Ty::I32, Op::Select(wide, all, low_mask));
+            let shifted = b.int(IntOp::LShr, a, offset);
+            let field = b.int(IntOp::And, shifted, mask);
+            let zero = b.k(Ty::I32, 0);
+            let empty = b.push(Ty::I1, Op::Cmp(IntPred::Eq, width, zero));
+            let capped = b.push(Ty::I32, Op::Select(wide, thirty_two, width));
+            let top = b.int(IntOp::Sub, capped, one);
+            let sign_bit = b.int(IntOp::Shl, one, top);
+            let sign_bit = b.push(Ty::I32, Op::Select(empty, zero, sign_bit));
+            let flipped = b.int(IntOp::Xor, field, sign_bit);
+            let value = b.int(IntOp::Sub, flipped, sign_bit);
+            flag = Some(b.push(Ty::I1, Op::Cmp(IntPred::Ne, value, zero)));
+            value
+        }
+        I::S_MAX_U32 | I::S_MIN_U32 | I::S_MAX_I32 | I::S_MIN_I32 => {
+            let predicate = match i.op {
+                I::S_MAX_U32 => IntPred::Uge,
+                I::S_MIN_U32 => IntPred::Ult,
+                I::S_MAX_I32 => IntPred::Sge,
+                _ => IntPred::Slt,
+            };
+            let first = b.push(Ty::I1, Op::Cmp(predicate, a, c));
+            flag = Some(first);
+            b.push(Ty::I32, Op::Select(first, a, c))
         }
         _ => unreachable!(),
     };
@@ -174,6 +211,9 @@ fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         I::S_CMP_LE_I32 => (Ty::I32, IntPred::Sle),
         I::S_CMP_EQ_U64 => (Ty::I64, IntPred::Eq),
         I::S_CMP_LG_U64 => (Ty::I64, IntPred::Ne),
+        I::S_BITCMP0_B32 | I::S_BITCMP1_B32 | I::S_BITCMP0_B64 | I::S_BITCMP1_B64 => {
+            return bit_compare(i, registry)
+        }
         _ => return float_compare(i, registry),
     };
     let mut b = Builder::new(
@@ -181,6 +221,33 @@ fn compare(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
         vec![input(i.ssrc0.clone(), ty), input(i.ssrc1.clone(), ty)],
     );
     let flag = b.push(Ty::I1, Op::Cmp(predicate, ValueId(0), ValueId(1)));
+    Some(b.finish_many(true, vec![(Output::Scc, flag)]))
+}
+
+fn bit_compare(i: &crate::rdna_instructions::SOPC, registry: &DialectRegistry) -> Option<Lowering> {
+    let wide = matches!(i.op, I::S_BITCMP0_B64 | I::S_BITCMP1_B64);
+    let ty = if wide { Ty::I64 } else { Ty::I32 };
+    let mut b = Builder::new(
+        registry,
+        vec![input(i.ssrc0.clone(), ty), input(i.ssrc1.clone(), Ty::I32)],
+    );
+    let position_mask = b.k(Ty::I32, if wide { 63 } else { 31 });
+    let position = b.int(IntOp::And, ValueId(1), position_mask);
+    let position = if wide {
+        b.push(Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, position))
+    } else {
+        position
+    };
+    let shifted = b.push(ty, Op::Int(IntOp::LShr, ValueId(0), position));
+    let one = b.k(ty, 1);
+    let bit = b.push(ty, Op::Int(IntOp::And, shifted, one));
+    let predicate = if matches!(i.op, I::S_BITCMP0_B32 | I::S_BITCMP0_B64) {
+        IntPred::Eq
+    } else {
+        IntPred::Ne
+    };
+    let zero = b.k(ty, 0);
+    let flag = b.push(Ty::I1, Op::Cmp(predicate, bit, zero));
     Some(b.finish_many(true, vec![(Output::Scc, flag)]))
 }
 

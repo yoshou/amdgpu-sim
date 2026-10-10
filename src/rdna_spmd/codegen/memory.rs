@@ -742,13 +742,7 @@ impl<'a> Cg<'a> {
         let mut result = self.vi32().poison();
         for (k, (_, ptr)) in self.lane_pointers(addr, exec).into_iter().enumerate() {
             let value = ir.extract_at(d, k as u32);
-            let (signed, max) = match op {
-                Rmw::SignedMin => (true, false),
-                Rmw::SignedMax => (true, true),
-                Rmw::UnsignedMin => (false, false),
-                Rmw::UnsignedMax => (false, true),
-            };
-            let old = ir.atomic_min_max(ptr, value, signed, max, Atomic::SequentiallyConsistent);
+            let old = ir.atomic_rmw(op, ptr, value, Atomic::SequentiallyConsistent);
             result = ir.insert_at(result, old, k as u32);
         }
         if let Some(r) = result_id {

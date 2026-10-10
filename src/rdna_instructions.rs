@@ -86,6 +86,19 @@ pub struct VOP1 {
 }
 
 #[derive(Debug, Clone)]
+pub struct DPP {
+    pub inner: Box<InstFormat>,
+    pub ctrl: u16,
+    pub sel: Option<[u8; 8]>,
+    pub row_mask: u8,
+    pub bank_mask: u8,
+    pub bound_ctrl: bool,
+    pub fi: bool,
+    pub neg: u8,
+    pub abs: u8,
+}
+
+#[derive(Debug, Clone)]
 pub struct VOPC {
     pub src0: SourceOperand,
     pub vsrc1: u8,
@@ -260,6 +273,7 @@ pub const VSCRATCH_ENCODE: u32 = 0b11101101;
 
 #[derive(Debug, Clone)]
 pub enum InstFormat {
+    DPP(DPP),
     SOP1(SOP1),
     SOP2(SOP2),
     SOPK(SOPK),

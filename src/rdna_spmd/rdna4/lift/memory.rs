@@ -58,15 +58,22 @@ impl Memory {
 
     fn word_offset(&self, word: u32) -> u32 {
         match &self.pair {
-            Some(pair) => {
+            Some(pair) if self.op != MemoryOp::AtomicCmpSwap => {
                 let n = self.words / 2;
                 pair.offsets[(word / n) as usize] + (word % n) * 4
             }
-            None => word * 4,
+            _ => word * 4,
         }
     }
     fn data_register(&self, word: u32) -> u32 {
         match &self.pair {
+            Some(pair) if self.op == MemoryOp::AtomicCmpSwap => {
+                if word == 0 {
+                    self.data
+                } else {
+                    pair.second_data
+                }
+            }
             Some(pair) if word >= self.words / 2 => pair.second_data + word - self.words / 2,
             _ => self.data + word,
         }
@@ -305,13 +312,49 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         | I::FLAT_LOAD_D16_HI_I8 => (Load(I8), 1),
         I::GLOBAL_LOAD_D16_B16 | I::FLAT_LOAD_D16_B16 | I::GLOBAL_LOAD_D16_HI_B16
         | I::FLAT_LOAD_D16_HI_B16 => (Load(U16), 1),
-        I::GLOBAL_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => (AtomicAdd(Numeric::Unsigned), 1),
-        I::GLOBAL_ATOMIC_ADD_F32 | I::DS_ADD_F32 | I::DS_ADD_RTN_F32 => (AtomicAdd(Numeric::Float), 1),
-        I::GLOBAL_ATOMIC_MIN_I32 => (AtomicRmw(Rmw::SignedMin), 1),
-        I::GLOBAL_ATOMIC_MAX_I32 => (AtomicRmw(Rmw::SignedMax), 1),
-        I::GLOBAL_ATOMIC_MIN_U32 => (AtomicRmw(Rmw::UnsignedMin), 1),
-        I::GLOBAL_ATOMIC_MAX_U32 => (AtomicRmw(Rmw::UnsignedMax), 1),
-        I::GLOBAL_ATOMIC_CMPSWAP_B32 => (AtomicCmpSwap, 1),
+        I::GLOBAL_ATOMIC_ADD_U32 | I::FLAT_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => {
+            (AtomicAdd(Numeric::Unsigned), 1)
+        }
+        I::GLOBAL_ATOMIC_ADD_F32 | I::FLAT_ATOMIC_ADD_F32 | I::DS_ADD_F32 | I::DS_ADD_RTN_F32 => {
+            (AtomicAdd(Numeric::Float), 1)
+        }
+        I::GLOBAL_ATOMIC_MIN_I32 | I::FLAT_ATOMIC_MIN_I32 | I::DS_MIN_I32 | I::DS_MIN_RTN_I32 => {
+            (AtomicRmw(Rmw::SignedMin), 1)
+        }
+        I::GLOBAL_ATOMIC_MAX_I32 | I::FLAT_ATOMIC_MAX_I32 | I::DS_MAX_I32 | I::DS_MAX_RTN_I32 => {
+            (AtomicRmw(Rmw::SignedMax), 1)
+        }
+        I::GLOBAL_ATOMIC_MIN_U32 | I::FLAT_ATOMIC_MIN_U32 | I::DS_MIN_U32 | I::DS_MIN_RTN_U32 => {
+            (AtomicRmw(Rmw::UnsignedMin), 1)
+        }
+        I::GLOBAL_ATOMIC_MAX_U32 | I::FLAT_ATOMIC_MAX_U32 | I::DS_MAX_U32 | I::DS_MAX_RTN_U32 => {
+            (AtomicRmw(Rmw::UnsignedMax), 1)
+        }
+        I::GLOBAL_ATOMIC_AND_B32 | I::FLAT_ATOMIC_AND_B32 | I::DS_AND_B32 | I::DS_AND_RTN_B32 => {
+            (AtomicRmw(Rmw::And), 1)
+        }
+        I::GLOBAL_ATOMIC_OR_B32 | I::FLAT_ATOMIC_OR_B32 | I::DS_OR_B32 | I::DS_OR_RTN_B32 => {
+            (AtomicRmw(Rmw::Or), 1)
+        }
+        I::GLOBAL_ATOMIC_XOR_B32 | I::FLAT_ATOMIC_XOR_B32 | I::DS_XOR_B32 | I::DS_XOR_RTN_B32 => {
+            (AtomicRmw(Rmw::Xor), 1)
+        }
+        I::GLOBAL_ATOMIC_SWAP_B32 | I::FLAT_ATOMIC_SWAP_B32 | I::DS_STOREXCHG_RTN_B32 => {
+            (AtomicRmw(Rmw::Swap), 1)
+        }
+        I::GLOBAL_ATOMIC_SUB_U32 | I::FLAT_ATOMIC_SUB_U32 | I::DS_SUB_U32 | I::DS_SUB_RTN_U32 => {
+            (AtomicRmw(Rmw::Sub), 1)
+        }
+        I::GLOBAL_ATOMIC_INC_U32 | I::FLAT_ATOMIC_INC_U32 | I::DS_INC_U32 | I::DS_INC_RTN_U32 => {
+            (AtomicRmw(Rmw::IncWrap), 1)
+        }
+        I::GLOBAL_ATOMIC_DEC_U32 | I::FLAT_ATOMIC_DEC_U32 | I::DS_DEC_U32 | I::DS_DEC_RTN_U32 => {
+            (AtomicRmw(Rmw::DecWrap), 1)
+        }
+        I::GLOBAL_ATOMIC_CMPSWAP_B32
+        | I::FLAT_ATOMIC_CMPSWAP_B32
+        | I::DS_CMPSTORE_B32
+        | I::DS_CMPSTORE_RTN_B32 => (AtomicCmpSwap, 1),
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
         _ => panic!("unsupported memory lift {:?}", opcode),
     };
@@ -351,11 +394,19 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
             offsets: [i.offset0 as u32 * stride, i.offset1 as u32 * stride],
             second_data: i.data1 as u32,
         })
+    } else if matches!(opcode, I::DS_CMPSTORE_B32 | I::DS_CMPSTORE_RTN_B32) {
+        let InstFormat::DS(i) = inst else {
+            unreachable!()
+        };
+        Some(LdsPair {
+            offsets: [0, 0],
+            second_data: i.data1 as u32,
+        })
     } else {
         None
     };
     let returns = matches!(op, Load(_))
-        || op.atomic() && (th & 1 != 0 || matches!(opcode, I::DS_ADD_RTN_U32));
+        || op.atomic() && (th & 1 != 0 || format!("{:?}", opcode).contains("_RTN_"));
     let mut semantics = semantics(scope, th, op, matches!(address, Address::Scalar { .. }));
     if matches!(address, Address::Lds { .. }) {
         semantics.scope = Scope::Workgroup;

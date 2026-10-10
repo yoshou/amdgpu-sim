@@ -33,14 +33,37 @@ pub fn decode(entry_pc: usize, memory: &[u8], lanes: u32) -> Result<Program, Str
             .map(|(&pc, b)| (pc, decode::lower_block(pc, &b.insts, &b.next_pcs)))
             .collect(),
     };
-    Ok(lift_program(&normalized, Arc::new(dialect().registry), lanes))
+    lift_program(&normalized, Arc::new(dialect().registry), lanes)
+}
+
+pub fn reserves_temporaries(footprints: impl IntoIterator<Item = lift::BoundaryIo>) -> Result<(), String> {
+    for io in footprints {
+        for r in lift::dpp::TEMPORARIES {
+            if io.reads.vgprs().any(|v| v == r) || io.writes.vgprs().any(|v| v == r) {
+                return Err(format!("v{r} is reserved for DPP, but the program uses it"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn permlane(inst: &crate::rdna_instructions::InstFormat) -> Option<&crate::rdna_instructions::VOP3> {
+    use crate::instructions::I;
+    match inst {
+        crate::rdna_instructions::InstFormat::VOP3(i)
+            if matches!(i.op, I::V_PERMLANE16_B32 | I::V_PERMLANEX16_B32) =>
+        {
+            Some(i)
+        }
+        _ => None,
+    }
 }
 
 fn lift_program(
     source: &decode::ScalarProgram,
     registry: Arc<DialectRegistry>,
     lanes: u32,
-) -> Program {
+) -> Result<Program, String> {
     use crate::rdna_spmd::ir::EffectOp;
     use crate::{
         instructions::I,
@@ -48,6 +71,7 @@ fn lift_program(
     };
     use lift::{Lowering, YieldAction};
     let mut normalized = source.clone();
+    let mut plain = Vec::new();
     let lowered: std::collections::BTreeMap<_, Vec<_>> = normalized
         .blocks
         .iter_mut()
@@ -69,18 +93,31 @@ fn lift_program(
                             vec![],
                         )));
                     }
+                } else if let InstFormat::DPP(d) = inst {
+                    for lowering in lift::dpp::lowerings(d, &registry, lanes) {
+                        body.push(inst.clone());
+                        lowerings.push(lowering);
+                    }
+                } else if let Some(i) = permlane(inst) {
+                    for lowering in lift::dpp::permlane_lowerings(i, &registry, lanes) {
+                        body.push(inst.clone());
+                        lowerings.push(lowering);
+                    }
                 } else {
                     body.push(inst.clone());
-                    lowerings.push(lift::instruction_with_registry(inst, &registry, lanes));
+                    let lowering = lift::instruction_with_registry(inst, &registry, lanes);
+                    plain.push(lift::footprint(&lowering, lanes));
+                    lowerings.push(lowering);
                 }
             }
             b.body = body;
             (pc, lowerings)
         })
         .collect();
+    reserves_temporaries(plain)?;
     let refs = lowered
         .iter()
         .map(|(&pc, b)| (pc, b.iter().collect()))
         .collect();
-    lift::lift(registry, &normalized, &refs, lanes)
+    Ok(lift::lift(registry, &normalized, &refs, lanes))
 }

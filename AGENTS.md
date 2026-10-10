@@ -68,7 +68,7 @@
 - The public API lives in `runtime`: `Module`, `Function`, `Launch`, `Arg`, `Buffer`, `Pod` and `Error`. The `*_spmd` examples load a `Module`, look up a `Function` and call `launch`. `launch` compiles on first use; `prepare` compiles ahead of time, which lets an example time the JIT apart from the run.
 - `compiler.rs` drives the pipeline:
   1. `decode_program` lifts the kernel into the SSA IR in `ir/`.
-     - gfx1200 goes through `rdna4/`.
+     - gfx1200 goes through `rdna4/`. DPP and `v_permlane16/x16` become a bpermute sequence through VGPRs 253-255 (`rdna4/lift/dpp.rs`); a kernel that uses those registers is refused.
      - gfx803 goes through `gcn3/`. It tracks scalar state (M0, MODE, the scratch descriptor, call targets and return addresses, VGPR lanes written by `v_writelane`) and inlines every call site.
      - The wave passes in `pass/` then run to a fixpoint: PrivateSlots, Halves, Idioms, UniformQueries, BranchSelects, Simplify and Dce.
   2. `Jit::kernel` runs `Hazards::find` whenever the launch environment changes. This is the address analysis of memory accesses between lanes, in `decompile/address/` and `decompile/hazard.rs`.

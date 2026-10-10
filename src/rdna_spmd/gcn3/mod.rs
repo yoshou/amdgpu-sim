@@ -65,6 +65,7 @@ pub fn decode(descriptor: &KernelDescriptor, entry_pc: usize, memory: &[u8], lan
     let span = graph.span();
     let mut blocks = BTreeMap::new();
     let mut lowerings = BTreeMap::new();
+    let mut plain = Vec::new();
     for (&(context, start), states) in &traced.states {
         let block = &graph.blocks[&start];
         let (end, last) = block.insts.last().expect("a block without instructions");
@@ -78,6 +79,15 @@ pub fn decode(descriptor: &KernelDescriptor, entry_pc: usize, memory: &[u8], lan
         let mut lowered = Vec::new();
         for ((at, inst), state) in body.iter().zip(states) {
             let result = lower::lower(*at, inst, state, &target).map_err(|e| format!("{at:#x}: {e}"))?;
+            let dpp = matches!(
+                inst.form,
+                decode::Form::Vop1 { ext: decode::Ext::Dpp(_), .. }
+                    | decode::Form::Vop2 { ext: decode::Ext::Dpp(_), .. }
+                    | decode::Form::Vopc { ext: decode::Ext::Dpp(_), .. }
+            );
+            if !dpp {
+                plain.extend(result.lowerings.iter().map(|l| lower::footprint(l, lanes)));
+            }
             scan.extend(result.scan);
             lowered.extend(result.lowerings);
         }
@@ -101,6 +111,7 @@ pub fn decode(descriptor: &KernelDescriptor, entry_pc: usize, memory: &[u8], lan
         lowerings.insert(here, lowered);
     }
     let program = ScalarProgram { entry_pc, blocks };
+    super::rdna4::reserves_temporaries(plain)?;
     let refs = lowerings.iter().map(|(&pc, b)| (pc, b.iter().collect())).collect();
     Ok((lift::lift(registry.clone(), &program, &refs, lanes), layout))
 }

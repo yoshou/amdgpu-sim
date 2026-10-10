@@ -554,20 +554,21 @@ impl Builder {
             ))
         }
     }
-    pub fn atomic_min_max(
-        &self,
-        ptr: Value,
-        v: Value,
-        signed: bool,
-        max: bool,
-        order: Atomic,
-    ) -> Value {
+    pub fn atomic_rmw(&self, op: super::ir::Rmw, ptr: Value, v: Value, order: Atomic) -> Value {
         use llvm_sys::LLVMAtomicRMWBinOp::*;
-        let op = match (signed, max) {
-            (true, false) => LLVMAtomicRMWBinOpMin,
-            (true, true) => LLVMAtomicRMWBinOpMax,
-            (false, false) => LLVMAtomicRMWBinOpUMin,
-            (false, true) => LLVMAtomicRMWBinOpUMax,
+        use super::ir::Rmw;
+        let op = match op {
+            Rmw::SignedMin => LLVMAtomicRMWBinOpMin,
+            Rmw::SignedMax => LLVMAtomicRMWBinOpMax,
+            Rmw::UnsignedMin => LLVMAtomicRMWBinOpUMin,
+            Rmw::UnsignedMax => LLVMAtomicRMWBinOpUMax,
+            Rmw::And => LLVMAtomicRMWBinOpAnd,
+            Rmw::Or => LLVMAtomicRMWBinOpOr,
+            Rmw::Xor => LLVMAtomicRMWBinOpXor,
+            Rmw::Swap => LLVMAtomicRMWBinOpXchg,
+            Rmw::Sub => LLVMAtomicRMWBinOpSub,
+            Rmw::IncWrap => LLVMAtomicRMWBinOpUIncWrap,
+            Rmw::DecWrap => LLVMAtomicRMWBinOpUDecWrap,
         };
         unsafe { Value(LLVMBuildAtomicRMW(self.b, op, ptr.0, v.0, ordering(order), 0)) }
     }

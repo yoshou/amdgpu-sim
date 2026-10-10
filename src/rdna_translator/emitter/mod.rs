@@ -1245,6 +1245,7 @@ impl IREmitter {
         inst: &InstFormat,
     ) -> llvm::prelude::LLVMBasicBlockRef {
         match inst {
+            InstFormat::DPP(_) => panic!("not implemented: DPP"),
             InstFormat::SOPP(inst) => self.emit_sopp(bb, inst),
             InstFormat::VOPC(inst) => self.emit_vopc(bb, inst),
             InstFormat::VOP1(inst) => self.emit_vop1(bb, inst),

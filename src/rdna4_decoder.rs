@@ -1637,6 +1637,63 @@ fn decode_source_operand(operand: u16, literal_constant: &[u8]) -> SourceOperand
     }
 }
 
+const DPP16: u16 = 250;
+const DPP8: u16 = 233;
+const DPP8_FI: u16 = 234;
+
+fn decode_dpp(src0: u16, inner: InstFormat, insts: &[u8]) -> InstFormat {
+    let second = buffer::get_u32(insts, 4);
+    let vgpr = (second & 0xff) as u8;
+    let inner = Box::new(match inner {
+        InstFormat::VOP1(mut i) => {
+            i.src0 = SourceOperand::VectorRegister(vgpr);
+            InstFormat::VOP1(i)
+        }
+        InstFormat::VOP2(mut i) => {
+            i.src0 = SourceOperand::VectorRegister(vgpr);
+            InstFormat::VOP2(i)
+        }
+        InstFormat::VOPC(mut i) => {
+            i.src0 = SourceOperand::VectorRegister(vgpr);
+            InstFormat::VOPC(i)
+        }
+        other => other,
+    });
+    if src0 == DPP16 {
+        InstFormat::DPP(DPP {
+            inner,
+            ctrl: ((second >> 8) & 0x1ff) as u16,
+            sel: None,
+            row_mask: ((second >> 28) & 0xf) as u8,
+            bank_mask: ((second >> 24) & 0xf) as u8,
+            bound_ctrl: (second >> 19) & 1 != 0,
+            fi: (second >> 18) & 1 != 0,
+            neg: ((second >> 20) & 1 | (second >> 21) & 2) as u8,
+            abs: ((second >> 21) & 1 | (second >> 22) & 2) as u8,
+        })
+    } else {
+        let mut sel = [0u8; 8];
+        for (k, s) in sel.iter_mut().enumerate() {
+            *s = ((second >> (8 + 3 * k)) & 7) as u8;
+        }
+        InstFormat::DPP(DPP {
+            inner,
+            ctrl: 0,
+            sel: Some(sel),
+            row_mask: 0xf,
+            bank_mask: 0xf,
+            bound_ctrl: false,
+            fi: src0 == DPP8_FI,
+            neg: 0,
+            abs: 0,
+        })
+    }
+}
+
+fn is_dpp(src0: u16) -> bool {
+    matches!(src0, DPP16 | DPP8 | DPP8_FI)
+}
+
 pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> {
     let inst = buffer::get_u64(inst_stream.insts, 0);
     if (get_bits(inst, 31, 23) as u32) == SOP1_ENCODE {
@@ -1705,6 +1762,14 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
     } else if (get_bits(inst, 31, 25) as u32) == VOPC_ENCODE {
         let (op, size) = decode_vopc_opcode_rdna4(get_bits(inst, 24, 17) as u32)?;
         let src0 = get_bits(inst, 8, 0) as u16;
+        if is_dpp(src0) {
+            let inner = InstFormat::VOPC(VOPC {
+                src0: SourceOperand::VectorRegister(0),
+                vsrc1: get_bits(inst, 16, 9) as u8,
+                op,
+            });
+            return Ok((decode_dpp(src0, inner, inst_stream.insts), 8));
+        }
         Ok((
             InstFormat::VOPC(VOPC {
                 src0: decode_source_operand(src0, &inst_stream.insts[4..]),
@@ -1759,6 +1824,14 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
     } else if (get_bits(inst, 31, 25) as u32) == VOP1_ENCODE {
         let src0 = get_bits(inst, 8, 0) as u16;
         let (op, size) = decode_vop1_opcode_rdna4(get_bits(inst, 15, 9) as u32)?;
+        if is_dpp(src0) {
+            let inner = InstFormat::VOP1(VOP1 {
+                src0: SourceOperand::VectorRegister(0),
+                op,
+                vdst: get_bits(inst, 24, 17) as u8,
+            });
+            return Ok((decode_dpp(src0, inner, inst_stream.insts), 8));
+        }
         Ok((
             InstFormat::VOP1(VOP1 {
                 src0: decode_source_operand(src0, &inst_stream.insts[4..]),
@@ -1770,6 +1843,16 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
     } else if (get_bits(inst, 31, 31) as u32) == VOP2_ENCODE {
         let src0 = get_bits(inst, 8, 0) as u16;
         let (op, size) = decode_vop2_opcode_rdna4(get_bits(inst, 30, 25) as u32)?;
+        if is_dpp(src0) {
+            let inner = InstFormat::VOP2(VOP2 {
+                src0: SourceOperand::VectorRegister(0),
+                vsrc1: get_bits(inst, 16, 9) as u8,
+                vdst: get_bits(inst, 24, 17) as u8,
+                op,
+                literal_constant: None,
+            });
+            return Ok((decode_dpp(src0, inner, inst_stream.insts), 8));
+        }
         let literal_constant = if size == 8 {
             Some(buffer::get_u32(inst_stream.insts, 4))
         } else {

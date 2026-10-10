@@ -113,6 +113,7 @@ fn scalar_mask_read(inst: &InstFormat, reg: u32) -> bool {
         InstFormat::SMEM(i) => range_contains(i.sbase as u32, 2, reg) || i.soffset as u32 == reg,
         InstFormat::VOP1(i) => operand_is_reg(&i.src0, reg),
         InstFormat::VOP2(i) => operand_is_reg(&i.src0, reg),
+        InstFormat::DPP(d) => scalar_mask_read(&d.inner, reg),
         InstFormat::VOP3(i) => {
 
             operand_is_reg(&i.src0, reg)

@@ -395,7 +395,13 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                         ),
                         MemoryOp::AtomicRmw(rmw) => (
                             Kind::Update {
-                                commutes: Some(Commutes::Rmw(rmw)),
+                                commutes: (!matches!(
+                                    rmw,
+                                    crate::rdna_spmd::ir::Rmw::Swap
+                                        | crate::rdna_spmd::ir::Rmw::IncWrap
+                                        | crate::rdna_spmd::ir::Rmw::DecWrap
+                                ))
+                                .then_some(Commutes::Rmw(rmw)),
                                 used,
                             },
                             4,

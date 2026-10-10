@@ -184,6 +184,173 @@ fn sixty_four_bit_shifts_and_wide_multiply_add() {
 }
 
 #[test]
+fn find_first_low_bit_and_sum_of_absolute_differences() {
+    let inputs = lanes(3, word);
+    Probe::new(3, 1, "v_ffbl_b32 v20, v1").check(&inputs, |_, x| {
+        vec![if x[0] == 0 { u32::MAX } else { x[0].trailing_zeros() }]
+    });
+    Probe::new(3, 1, "v_sad_u32 v20, v1, v2, v3").check(&inputs, |_, x| vec![x[0].abs_diff(x[1]).wrapping_add(x[2])]);
+}
+
+#[test]
+fn signed_wide_multiply_add_and_saturating_carries() {
+    let inputs = lanes(4, word);
+    let pair = |x: &[u32], k: usize| x[k] as u64 | (x[k + 1] as u64) << 32;
+    Probe::new(
+        4,
+        3,
+        "v_mad_i64_i32 v[20:21], s[12:13], v1, v2, v[3:4]
+         v_cndmask_b32 v22, 0, 1, s[12:13]",
+    )
+    .check(&inputs, |_, x| {
+        let product = (x[0] as i32 as i64).wrapping_mul(x[1] as i32 as i64) as u64;
+        let (sum, over) = product.overflowing_add(pair(x, 2));
+        vec![sum as u32, (sum >> 32) as u32, over as u32]
+    });
+    Probe::new(
+        4,
+        2,
+        "v_add_u32_e64 v20, s[12:13], v1, v2 clamp
+         v_cndmask_b32 v21, 0, 1, s[12:13]",
+    )
+    .check(&inputs, |_, x| {
+        let (sum, over) = x[0].overflowing_add(x[1]);
+        vec![if over { u32::MAX } else { sum }, over as u32]
+    });
+    Probe::new(
+        4,
+        2,
+        "v_sub_u32_e64 v20, s[12:13], v1, v2 clamp
+         v_cndmask_b32 v21, 0, 1, s[12:13]",
+    )
+    .check(&inputs, |_, x| {
+        let (difference, under) = x[0].overflowing_sub(x[1]);
+        vec![if under { 0 } else { difference }, under as u32]
+    });
+}
+
+fn dpp_source(ctrl: &str, l: usize) -> Option<usize> {
+    let row = l / 16 * 16;
+    let column = l % 16;
+    match ctrl {
+        "quad_perm:[1,0,3,2]" => Some(l ^ 1),
+        "quad_perm:[2,3,0,1]" => Some(l ^ 2),
+        "quad_perm:[3,3,3,3]" => Some(l / 4 * 4 + 3),
+        "row_shl:1" => (column + 1 < 16).then(|| l + 1),
+        "row_shr:3" => (column >= 3).then(|| l - 3),
+        "row_ror:5" => Some(row + (column + 11) % 16),
+        "wave_shl:1" => (l + 1 < LANES).then(|| l + 1),
+        "wave_rol:1" => Some((l + 1) % LANES),
+        "wave_shr:1" => (l >= 1).then(|| l - 1),
+        "wave_ror:1" => Some((l + LANES - 1) % LANES),
+        "row_mirror" => Some(row + 15 - column),
+        "row_half_mirror" => Some(l / 8 * 8 + 7 - l % 8),
+        "row_bcast:15" => (l >= 16).then(|| row - 1),
+        "row_bcast:31" => (l >= 32).then(|| 31),
+        _ => unreachable!(),
+    }
+}
+
+const DPP_CONTROLS: [&str; 14] = [
+    "quad_perm:[1,0,3,2]",
+    "quad_perm:[2,3,0,1]",
+    "quad_perm:[3,3,3,3]",
+    "row_shl:1",
+    "row_shr:3",
+    "row_ror:5",
+    "wave_shl:1",
+    "wave_rol:1",
+    "wave_shr:1",
+    "wave_ror:1",
+    "row_mirror",
+    "row_half_mirror",
+    "row_bcast:15",
+    "row_bcast:31",
+];
+
+#[test]
+fn dpp_moves_permute_lanes_and_keep_or_zero_the_rest() {
+    let inputs = lanes(2, word);
+    for ctrl in DPP_CONTROLS {
+        let body = format!(
+            "v_mov_b32 v20, v2
+             v_mov_b32 v21, v2
+             v_mov_b32_dpp v20, v1 {ctrl} row_mask:0xf bank_mask:0xf
+             v_mov_b32_dpp v21, v1 {ctrl} row_mask:0xf bank_mask:0xf bound_ctrl:1"
+        );
+        Probe::new(2, 2, &body).check(&inputs, |l, x| match dpp_source(ctrl, l) {
+            Some(s) => vec![word(s, 0), word(s, 0)],
+            None => vec![x[1], 0],
+        });
+    }
+}
+
+#[test]
+fn dpp_row_and_bank_masks_leave_lanes_untouched() {
+    let inputs = lanes(2, word);
+    let body = "v_mov_b32 v20, v2
+                v_mov_b32_dpp v20, v1 row_shr:1 row_mask:0x5 bank_mask:0xa";
+    Probe::new(2, 1, body).check(&inputs, |l, x| {
+        let enabled = (0x5 >> (l / 16)) & 1 != 0 && (0xa >> (l / 4 % 4)) & 1 != 0;
+        vec![match dpp_source("row_shr:3", l).map(|_| l - 1) {
+            Some(s) if enabled => word(s, 0),
+            _ => x[1],
+        }]
+    });
+}
+
+#[test]
+fn dpp_arithmetic_gates_the_result_and_the_carry() {
+    let inputs = lanes(2, word);
+    let body = "s_mov_b64 vcc, 0
+                v_mov_b32 v20, v2
+                v_add_u32_dpp v20, vcc, v1, v2 row_shr:1 row_mask:0xf bank_mask:0xf
+                v_cndmask_b32 v21, 0, 1, vcc
+                v_and_b32 v11, 0x3fffffff, v1
+                v_or_b32 v11, 0x00800000, v11
+                v_and_b32 v12, 0x3fffffff, v2
+                v_or_b32 v12, 0x00800000, v12
+                v_mov_b32 v22, v2
+                v_sub_f32_dpp v22, -v11, |v12| row_ror:1 row_mask:0xf bank_mask:0xf bound_ctrl:1";
+    let finite = |w: u32| f32::from_bits(w & 0x3fff_ffff | 0x0080_0000);
+    Probe::new(2, 3, body).check(&inputs, |l, x| {
+        let (sum, carry) = match (l % 16 >= 1).then(|| l - 1) {
+            Some(s) => {
+                let (r, c) = word(s, 0).overflowing_add(x[1]);
+                (r, c as u32)
+            }
+            None => (x[1], 0),
+        };
+        let s = l / 16 * 16 + (l % 16 + 15) % 16;
+        let difference = (-finite(word(s, 0)) - finite(x[1]).abs()).to_bits();
+        vec![sum, carry, difference]
+    });
+}
+
+#[test]
+fn dpp_treats_inactive_sources_as_out_of_bounds() {
+    let inputs = lanes(2, word);
+    let body = "v_mov_b32 v20, v2
+                v_mov_b32 v21, v2
+                v_and_b32 v10, 1, v1
+                v_cmp_ne_u32 vcc, 0, v10
+                s_and_saveexec_b64 s[12:13], vcc
+                v_mov_b32_dpp v20, v1 row_shr:1 row_mask:0xf bank_mask:0xf
+                v_mov_b32_dpp v21, v1 row_shr:1 row_mask:0xf bank_mask:0xf bound_ctrl:1
+                s_mov_b64 exec, s[12:13]";
+    let active = |l: usize| word(l, 0) & 1 != 0;
+    Probe::new(2, 2, &body).check(&inputs, |l, x| {
+        if !active(l) {
+            return vec![x[1], x[1]];
+        }
+        match (l % 16 >= 1 && active(l - 1)).then(|| l - 1) {
+            Some(s) => vec![word(s, 0), word(s, 0)],
+            None => vec![x[1], 0],
+        }
+    });
+}
+
+#[test]
 fn conditional_moves_follow_vcc_and_scalar_masks() {
     let inputs = lanes(3, word);
     Probe::new(3, 1, "v_cmp_gt_u32 vcc, v1, v2\nv_cndmask_b32_e32 v20, v3, v2, vcc").check(&inputs, |_, x| {

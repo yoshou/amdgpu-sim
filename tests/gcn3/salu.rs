@@ -55,8 +55,75 @@ fn unary(op: &str) -> Probe {
     )
 }
 
+fn flag(op: &str) -> Probe {
+    Probe::new(
+        2,
+        1,
+        &format!(
+            "v_readfirstlane_b32 s12, v1
+             v_readfirstlane_b32 s13, v2
+             {op} s12, s13
+             s_cselect_b32 s15, 1, 0
+             v_mov_b32 v20, s15"
+        ),
+    )
+}
+
+fn flag64(op: &str) -> Probe {
+    Probe::new(
+        2,
+        1,
+        &format!(
+            "v_readfirstlane_b32 s12, v1
+             v_readfirstlane_b32 s13, v2
+             {op} s[12:13], s13
+             s_cselect_b32 s15, 1, 0
+             v_mov_b32 v20, s15"
+        ),
+    )
+}
+
 fn scc(a: u32, b: u32) -> u32 {
     (a == b) as u32
+}
+
+#[test]
+fn minima_maxima_and_signed_bit_fields() {
+    let inputs = pairs();
+    binary("s_min_u32").check(&inputs, |_, x| vec![x[0].min(x[1]), (x[0] < x[1]) as u32]);
+    binary("s_min_i32").check(&inputs, |_, x| {
+        vec![(x[0] as i32).min(x[1] as i32) as u32, ((x[0] as i32) < (x[1] as i32)) as u32]
+    });
+    binary("s_max_i32").check(&inputs, |_, x| {
+        vec![(x[0] as i32).max(x[1] as i32) as u32, ((x[0] as i32) >= (x[1] as i32)) as u32]
+    });
+    binary("s_bfe_i32").check(&inputs, |_, x| {
+        let width = ((x[1] >> 16) & 0x7f).min(32);
+        let shifted = x[0] >> (x[1] & 31);
+        let field = if width == 32 { shifted } else { shifted & ((1u32 << width) - 1) };
+        let r = if width == 0 {
+            0
+        } else {
+            let sign = 1u32 << (width - 1);
+            (field ^ sign).wrapping_sub(sign)
+        };
+        vec![r, (r != 0) as u32]
+    });
+}
+
+#[test]
+fn bit_compares_test_one_bit_of_a_word_or_a_pair() {
+    let inputs = pairs();
+    flag("s_bitcmp0_b32").check(&inputs, |_, x| vec![((x[0] >> (x[1] & 31)) & 1 == 0) as u32]);
+    flag("s_bitcmp1_b32").check(&inputs, |_, x| vec![((x[0] >> (x[1] & 31)) & 1 == 1) as u32]);
+}
+
+#[test]
+fn bit_compares_test_one_bit_of_a_pair() {
+    let inputs = pairs();
+    let wide = |x: &[u32]| (x[0] as u64 | (x[1] as u64) << 32) >> (x[1] & 63) & 1;
+    flag64("s_bitcmp0_b64").check(&inputs, |_, x| vec![(wide(x) == 0) as u32]);
+    flag64("s_bitcmp1_b64").check(&inputs, |_, x| vec![(wide(x) == 1) as u32]);
 }
 
 #[test]
@@ -143,7 +210,7 @@ fn bit_fields_multiplies_maxima_and_selects() {
         vec![r, (r != 0) as u32]
     });
     binary("s_mul_i32").check(&inputs, |_, x| vec![x[0].wrapping_mul(x[1]), scc(x[0], x[1])]);
-    binary("s_max_u32").check(&inputs, |_, x| vec![x[0].max(x[1]), (x[0] > x[1]) as u32]);
+    binary("s_max_u32").check(&inputs, |_, x| vec![x[0].max(x[1]), (x[0] >= x[1]) as u32]);
     binary("s_cselect_b32").check(&inputs, |_, x| {
         vec![if x[0] == x[1] { x[0] } else { x[1] }, scc(x[0], x[1])]
     });

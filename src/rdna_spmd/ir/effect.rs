@@ -107,6 +107,13 @@ pub enum Rmw {
     SignedMax,
     UnsignedMin,
     UnsignedMax,
+    And,
+    Or,
+    Xor,
+    Swap,
+    Sub,
+    IncWrap,
+    DecWrap,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Numeric {

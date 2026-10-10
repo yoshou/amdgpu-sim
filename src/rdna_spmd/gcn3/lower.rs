@@ -115,7 +115,7 @@ fn checked_modifiers(inst: &Inst, lowering: &Lowering, abs: u8, neg: u8, clamp: 
             return Err(refuse(inst, "modifies an integer operand"));
         }
     }
-    if (clamp || omod != 0) && !outputs.iter().any(|o| matches!(o.ty(), Ty::F32 | Ty::F64)) {
+    if (clamp && !carry(inst.op) || omod != 0) && !outputs.iter().any(|o| matches!(o.ty(), Ty::F32 | Ty::F64)) {
         return Err(refuse(inst, "clamps or scales an integer result"));
     }
     Ok(())
@@ -140,6 +140,14 @@ fn plain_scalar(op: I) -> Option<I> {
         I::S_CMP_NE_U64 => I::S_CMP_LG_U64,
         I::S_ADDK_I32 => I::S_ADDK_CO_I32,
         I::S_MAX_U32
+        | I::S_MIN_U32
+        | I::S_MAX_I32
+        | I::S_MIN_I32
+        | I::S_BFE_I32
+        | I::S_BITCMP0_B32
+        | I::S_BITCMP1_B32
+        | I::S_BITCMP0_B64
+        | I::S_BITCMP1_B64
         | I::S_MUL_I32
         | I::S_CSELECT_B32
         | I::S_CSELECT_B64
@@ -218,6 +226,10 @@ fn immediate_compare(op: I) -> Option<(I, bool)> {
         I::S_CMPK_LE_U32 => (I::S_CMP_LE_U32, false),
         _ => return None,
     })
+}
+
+pub fn footprint(lowering: &Lowering, lanes: u32) -> lift::BoundaryIo {
+    lift::footprint(lowering, lanes)
 }
 
 fn through(registry: &DialectRegistry, lanes: u32, inst: InstFormat) -> Lowered {
@@ -445,7 +457,10 @@ fn routed(op: I) -> Option<I> {
         I::V_SUBB_U32 => I::V_SUB_CO_CI_U32,
         I::V_SUBBREV_U32 => I::V_SUBREV_CO_CI_U32,
         I::V_MAD_U64_U32 => I::V_MAD_CO_U64_U32,
+        I::V_MAD_I64_I32 => I::V_MAD_CO_I64_I32,
         I::V_FFBH_U32 => I::V_CLZ_I32_U32,
+        I::V_FFBL_B32 => I::V_CTZ_I32_B32,
+        I::V_MUL_HI_U32_U24 | I::V_MUL_HI_I32_I24 => op,
         I::V_MIN_F64 => I::V_MIN_NUM_F64,
         I::V_MAX_F64 => I::V_MAX_NUM_F64,
         I::V_CNDMASK_B32
@@ -515,6 +530,7 @@ fn routed(op: I) -> Option<I> {
         | I::V_FMA_F32
         | I::V_FMA_F64
         | I::V_ALIGNBIT_B32
+        | I::V_SAD_U32
         | I::V_MIN3_I32
         | I::V_MIN3_U32
         | I::V_MAX3_I32
@@ -576,7 +592,7 @@ fn quiet(op: I) -> I {
 fn wide_operands(op: I) -> [bool; 3] {
     match op {
         I::V_LSHLREV_B64 | I::V_LSHRREV_B64 | I::V_ASHRREV_I64 => [false, true, false],
-        I::V_MAD_U64_U32 => [false, false, true],
+        I::V_MAD_U64_U32 | I::V_MAD_I64_I32 => [false, false, true],
         I::V_CMP_I64(_) | I::V_CMP_U64(_) | I::V_CMPX_I64(_) | I::V_CMPX_U64(_) => [true, true, false],
         _ => [false; 3],
     }
@@ -598,9 +614,6 @@ fn routed_lowering(inst: &Inst, v: &Vector, target: &Target) -> Result<(InstForm
             vdst: scalar_dst(v.vdst)?,
         })
     } else if let Some(sdst) = v.sdst {
-        if carry(inst.op) && v.clamp {
-            return Err(refuse(inst, "saturates a carry"));
-        }
         if sdst as u16 == M0 || sdst as u16 == EXEC {
             return Err(refuse(inst, "writes a lane mask into M0 or EXEC"));
         }
@@ -1023,7 +1036,29 @@ fn vector(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
     let lowering = match ext {
         Ext::Plain => lowering,
         Ext::Sdwa(s) => sdwa(inst, &s, &v, lowering, registry)?,
-        Ext::Dpp(_) => return Err(refuse(inst, "uses DPP")),
+        Ext::Dpp(d) => {
+            let Some(format) = scan else {
+                return Err(refuse(inst, "uses DPP on an instruction without a routed form"));
+            };
+            if denormals.inputs || denormals.outputs {
+                return Err(refuse(inst, "uses DPP while denormals are flushed"));
+            }
+            let dpp = rdna::DPP {
+                inner: Box::new(format),
+                ctrl: d.ctrl,
+                sel: None,
+                row_mask: d.row_mask,
+                bank_mask: d.bank_mask,
+                bound_ctrl: d.bound_ctrl,
+                fi: false,
+                neg: d.src0_neg as u8 | (d.src1_neg as u8) << 1,
+                abs: d.src0_abs as u8 | (d.src1_abs as u8) << 1,
+            };
+            return Ok(Lowered {
+                scan: vec![],
+                lowerings: lift::dpp::lowerings(&dpp, registry, target.lanes),
+            });
+        }
     };
     let lowering = if compare_exec(inst.op) {
         with_exec(lowering, registry)
@@ -1064,6 +1099,13 @@ fn global(inst: &Inst) -> Option<I> {
         I::FLAT_ATOMIC_UMIN => I::GLOBAL_ATOMIC_MIN_U32,
         I::FLAT_ATOMIC_UMAX => I::GLOBAL_ATOMIC_MAX_U32,
         I::FLAT_ATOMIC_CMPSWAP => I::GLOBAL_ATOMIC_CMPSWAP_B32,
+        I::FLAT_ATOMIC_AND => I::GLOBAL_ATOMIC_AND_B32,
+        I::FLAT_ATOMIC_OR => I::GLOBAL_ATOMIC_OR_B32,
+        I::FLAT_ATOMIC_XOR => I::GLOBAL_ATOMIC_XOR_B32,
+        I::FLAT_ATOMIC_SWAP => I::GLOBAL_ATOMIC_SWAP_B32,
+        I::FLAT_ATOMIC_SUB => I::GLOBAL_ATOMIC_SUB_U32,
+        I::FLAT_ATOMIC_INC => I::GLOBAL_ATOMIC_INC_U32,
+        I::FLAT_ATOMIC_DEC => I::GLOBAL_ATOMIC_DEC_U32,
         _ => return None,
     })
 }
@@ -1128,7 +1170,33 @@ fn local(op: I) -> Option<I> {
         I::DS_WRITE2_B64 => I::DS_STORE_2ADDR_B64,
         I::DS_WRITE2ST64_B32 => I::DS_STORE_2ADDR_STRIDE64_B32,
         I::DS_WRITE2ST64_B64 => I::DS_STORE_2ADDR_STRIDE64_B64,
-        I::DS_ADD_U32 | I::DS_ADD_RTN_U32 | I::DS_ADD_F32 | I::DS_BPERMUTE_B32 => op,
+        I::DS_ADD_U32
+        | I::DS_ADD_RTN_U32
+        | I::DS_ADD_F32
+        | I::DS_BPERMUTE_B32
+        | I::DS_MIN_I32
+        | I::DS_MIN_RTN_I32
+        | I::DS_MAX_I32
+        | I::DS_MAX_RTN_I32
+        | I::DS_MIN_U32
+        | I::DS_MIN_RTN_U32
+        | I::DS_MAX_U32
+        | I::DS_MAX_RTN_U32
+        | I::DS_AND_B32
+        | I::DS_AND_RTN_B32
+        | I::DS_OR_B32
+        | I::DS_OR_RTN_B32
+        | I::DS_XOR_B32
+        | I::DS_XOR_RTN_B32
+        | I::DS_SUB_U32
+        | I::DS_SUB_RTN_U32
+        | I::DS_INC_U32
+        | I::DS_INC_RTN_U32
+        | I::DS_DEC_U32
+        | I::DS_DEC_RTN_U32 => op,
+        I::DS_WRXCHG_RTN_B32 => I::DS_STOREXCHG_RTN_B32,
+        I::DS_CMPST_B32 => I::DS_CMPSTORE_B32,
+        I::DS_CMPST_RTN_B32 => I::DS_CMPSTORE_RTN_B32,
         _ => return None,
     })
 }
@@ -1156,6 +1224,11 @@ fn ds(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String> {
             _ => return Err(refuse(inst, "runs while M0 may clamp the local data share")),
         }
     }
+    let (data0, data1) = if matches!(inst.op, I::DS_CMPST_B32 | I::DS_CMPST_RTN_B32) {
+        (data1, data0)
+    } else {
+        (data0, data1)
+    };
     let format = InstFormat::DS(rdna::DS {
         offset0,
         offset1,
