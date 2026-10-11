@@ -50,7 +50,7 @@ pub struct ScalarProgram {
     pub blocks: BTreeMap<usize, ScalarBlock>,
 }
 
-fn is_noop(inst: &InstFormat) -> bool {
+pub(super) fn is_noop(inst: &InstFormat) -> bool {
     match inst {
         InstFormat::SOPP(i) => matches!(
             i.op,
@@ -130,7 +130,31 @@ fn lower_terminator(last: &InstFormat, next_pcs: &[usize]) -> Terminator {
     Terminator::Jump(next_pcs[0])
 }
 
-pub fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> ScalarBlock {
+pub fn body(insts: &[InstFormat], pcs: &[usize], end: usize) -> Vec<InstFormat> {
+    insts
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| !is_noop(inst))
+        .map(|(k, inst)| match inst {
+            InstFormat::SOP1(i) if matches!(i.op, I::S_GETPC_B64) => {
+                let next = pcs.get(k + 1).copied().unwrap_or(end);
+                link(i.sdst, next)
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
+pub fn link(sdst: u8, address: usize) -> InstFormat {
+    InstFormat::SOP1(crate::rdna_instructions::SOP1 {
+        ssrc0: crate::rdna_instructions::SourceOperand::IntegerConstant(address as u64),
+        op: I::S_MOV_B64,
+        sdst,
+    })
+}
+
+pub fn lower_block(pc: usize, block: &DecodedBlock, next_pcs: &[usize]) -> ScalarBlock {
+    let insts = &block.insts;
     let (last, head) = insts.split_last().expect("empty block");
 
     let term = lower_terminator(last, next_pcs);
@@ -151,12 +175,14 @@ pub fn lower_block(pc: usize, insts: &[InstFormat], next_pcs: &[usize]) -> Scala
     );
 
     let body_src: &[InstFormat] = if last_is_term { head } else { insts };
-    let body: Vec<InstFormat> = body_src.iter().filter(|i| !is_noop(i)).cloned().collect();
+    let body = body(body_src, &block.pcs, block.end);
     ScalarBlock { pc, body, term }
 }
 
 pub struct DecodedBlock {
     pub insts: Vec<InstFormat>,
+    pub pcs: Vec<usize>,
+    pub end: usize,
     pub next_pcs: Vec<usize>,
 }
 
@@ -165,8 +191,22 @@ pub struct Decoded {
     pub blocks: BTreeMap<usize, DecodedBlock>,
 }
 
+impl Decoded {
+    pub fn span(&self) -> usize {
+        self.blocks.values().map(|b| b.end).max().unwrap_or(0)
+    }
+}
+
+pub fn call_op(inst: &InstFormat) -> Option<I> {
+    match inst {
+        InstFormat::SOP1(i) if matches!(i.op, I::S_SWAPPC_B64 | I::S_SETPC_B64) => Some(i.op),
+        _ => None,
+    }
+}
+
 fn is_terminator(inst: &InstFormat) -> bool {
-    matches!(inst, InstFormat::SOPP(i) if matches!(i.op,
+    call_op(inst).is_some()
+        || matches!(inst, InstFormat::SOPP(i) if matches!(i.op,
         I::S_CBRANCH_SCC0 | I::S_CBRANCH_SCC1 | I::S_CBRANCH_VCCZ | I::S_CBRANCH_VCCNZ | I::S_CBRANCH_EXECZ
         | I::S_CBRANCH_EXECNZ | I::S_BRANCH | I::S_BARRIER_WAIT | I::S_ENDPGM))
 }
@@ -189,6 +229,11 @@ fn scc_branch_follows(memory: &[u8], mut pc: usize) -> bool {
 
 fn successors(pc: usize, inst: &InstFormat) -> Vec<usize> {
     let target = |simm16: u16| ((pc as i64) + (simm16 as i16 as i64) * 4) as usize;
+    match call_op(inst) {
+        Some(I::S_SETPC_B64) => return vec![],
+        Some(_) => return vec![pc],
+        None => {}
+    }
     match inst {
         InstFormat::SOPP(i) => match i.op {
             I::S_CBRANCH_EXECZ
@@ -260,17 +305,27 @@ impl Search<'_> {
     }
 }
 
-pub fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
+pub fn program(entries: &[usize], memory: &[u8]) -> Result<Decoded, String> {
     let mut search = Search {
         memory,
         ranges: BTreeSet::new(),
     };
-    search.walk(entry_pc)?;
+    for &entry in entries {
+        match search.containing(entry) {
+            Some((start, end)) if start < entry => {
+                search.ranges.remove(&(start, end));
+                search.ranges.insert((start, entry));
+                search.ranges.insert((entry, end));
+            }
+            Some(_) => {}
+            None => search.walk(entry)?,
+        }
+    }
     let ranges: Vec<_> = search.ranges.into_iter().collect();
     for pair in ranges.windows(2) {
-        if pair[0].1 != pair[1].0 {
+        if pair[0].1 > pair[1].0 {
             return Err(format!(
-                "decoded ranges are not contiguous: {:#x}..{:#x} and {:#x}..{:#x}",
+                "decoded ranges overlap: {:#x}..{:#x} and {:#x}..{:#x}",
                 pair[0].0, pair[0].1, pair[1].0, pair[1].1
             ));
         }
@@ -278,10 +333,12 @@ pub fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
     let mut blocks = BTreeMap::new();
     for (start, end) in ranges {
         let mut insts = Vec::new();
+        let mut pcs = Vec::new();
         let mut pc = start;
         while pc < end {
             let (inst, size) = decode_at(memory, pc)?;
             insts.push(inst);
+            pcs.push(pc);
             pc += size;
         }
         let next_pcs = successors(
@@ -290,7 +347,7 @@ pub fn program(entry_pc: usize, memory: &[u8]) -> Result<Decoded, String> {
                 .last()
                 .ok_or_else(|| format!("empty range at {start:#x}"))?,
         );
-        blocks.insert(start, DecodedBlock { insts, next_pcs });
+        blocks.insert(start, DecodedBlock { insts, pcs, end, next_pcs });
     }
-    Ok(Decoded { entry_pc, blocks })
+    Ok(Decoded { entry_pc: entries[0], blocks })
 }

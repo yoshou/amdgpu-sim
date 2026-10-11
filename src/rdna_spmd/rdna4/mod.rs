@@ -5,6 +5,7 @@ use std::sync::Arc;
 pub(crate) mod decode;
 pub(crate) mod dialect;
 pub(crate) mod lift;
+mod trace;
 
 pub fn dialect() -> Dialect {
     let mut rdna4 = Dialect::new();
@@ -24,16 +25,52 @@ pub fn supports(arch: &str) -> bool {
 }
 
 pub fn decode(entry_pc: usize, memory: &[u8], lanes: u32, lds: bool) -> Result<Program, String> {
-    let decoded = decode::program(entry_pc, memory)?;
+    use crate::instructions::I;
+    use crate::rdna_instructions::InstFormat;
+    use decode::{ScalarBlock, Terminator};
+    let registry = Arc::new(dialect().registry);
+    let (decoded, traced) = trace::explore(entry_pc, memory, &registry, lanes)?;
+    let span = decoded.span();
+    let mut blocks = std::collections::BTreeMap::new();
+    for &(context, start) in &traced.reached {
+        let block = &decoded.blocks[&start];
+        let last = block.insts.len() - 1;
+        let scalar = match decode::call_op(&block.insts[last]) {
+            Some(I::S_SWAPPC_B64) => {
+                let InstFormat::SOP1(call) = &block.insts[last] else {
+                    unreachable!()
+                };
+                let callee = traced.calls[&(context, start)];
+                let mut body = decode::body(&block.insts[..last], &block.pcs, block.end);
+                body.push(decode::link(call.sdst, block.end));
+                let entry = traced.contexts[callee].entry;
+                ScalarBlock {
+                    pc: start,
+                    body,
+                    term: Terminator::Jump(trace::id(span, callee, entry)),
+                }
+            }
+            Some(_) => {
+                let frame = traced.contexts[context];
+                let parent = frame.parent.expect("a return traced inside a call");
+                ScalarBlock {
+                    pc: start,
+                    body: decode::body(&block.insts[..last], &block.pcs, block.end),
+                    term: Terminator::Jump(trace::id(span, parent, frame.ret)),
+                }
+            }
+            None => {
+                let next: Vec<usize> = block.next_pcs.iter().map(|&pc| trace::id(span, context, pc)).collect();
+                decode::lower_block(start, block, &next)
+            }
+        };
+        blocks.insert(trace::id(span, context, start), scalar);
+    }
     let normalized = decode::ScalarProgram {
         entry_pc: decoded.entry_pc,
-        blocks: decoded
-            .blocks
-            .iter()
-            .map(|(&pc, b)| (pc, decode::lower_block(pc, &b.insts, &b.next_pcs)))
-            .collect(),
+        blocks,
     };
-    lift_program(&normalized, Arc::new(dialect().registry), lanes, lds)
+    lift_program(&normalized, registry, lanes, lds)
 }
 
 pub fn reserves_temporaries(footprints: impl IntoIterator<Item = lift::BoundaryIo>) -> Result<(), String> {
@@ -76,7 +113,8 @@ fn lift_program(
     let lowered: std::collections::BTreeMap<_, Vec<_>> = normalized
         .blocks
         .iter_mut()
-        .map(|(&pc, b)| -> Result<_, String> {
+        .map(|(&id, b)| -> Result<_, String> {
+            let pc = b.pc;
             let mut body = Vec::new();
             let mut lowerings = Vec::new();
             for inst in &b.body {
@@ -115,7 +153,7 @@ fn lift_program(
                 }
             }
             b.body = body;
-            Ok((pc, lowerings))
+            Ok((id, lowerings))
         })
         .collect::<Result<_, String>>()?;
     reserves_temporaries(plain)?;

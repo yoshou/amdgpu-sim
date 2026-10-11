@@ -2,7 +2,7 @@ use super::*;
 
 const EXEC: u32 = 126;
 
-fn scalar_dests(inst: &InstFormat) -> u128 {
+pub fn scalar_dests(inst: &InstFormat) -> u128 {
     let bit = |r: u32| 1u128 << (r & 127);
     let pair = |r: u32| bit(r) | bit(r + 1);
     match inst {

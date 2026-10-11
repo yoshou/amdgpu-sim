@@ -19,6 +19,7 @@ mod scalar;
 mod wave;
 
 pub use control::writes_exec;
+pub use control::scalar_dests;
 pub use half::source as half_source;
 pub use image::sample as image_sample;
 pub use function::lift;

@@ -339,6 +339,13 @@ impl State {
                 self.write(sdst as u16, chosen);
             }
             (I::S_MOVK_I32, Form::Sopk { sdst, simm16 }) => self.write(sdst as u16, Value::Known(simm16 as i16 as i32 as u32)),
+            (I::S_ADDK_I32, Form::Sopk { sdst, simm16 }) => {
+                let sum = match previous.sgprs[sdst as usize] {
+                    Value::Known(v) => Value::Known(v.wrapping_add(simm16 as i16 as i32 as u32)),
+                    _ => Value::Unknown,
+                };
+                self.write(sdst as u16, sum);
+            }
             (I::S_ADD_U32 | I::S_ADDC_U32, Form::Sop2 { sdst, ssrc0, ssrc1 }) => {
                 let carry = if matches!(inst.op, I::S_ADDC_U32) { previous.scc } else { Value::Known(0) };
                 let (result, out) = match (value(ssrc0), value(ssrc1), carry) {

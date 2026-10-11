@@ -906,6 +906,18 @@ s_endpgm
 ";
 
 #[test]
+fn the_scalar_state_adds_immediates_to_a_known_register() {
+    use super::state::{State, Value};
+    let memory = assemble("s_mov_b32 s32, 0\ns_addk_i32 s32, 0x400\ns_addk_i32 s32, 0xfc00\ns_endpgm\n");
+    let graph = super::graph::discover(&[0], &memory).unwrap();
+    let traced = super::trace::trace(&graph, State::entry(0x3f0, vec![])).unwrap();
+    let states = &traced.states[&(0, 0)];
+    assert_eq!(states[1].sgprs[32], Value::Known(0));
+    assert_eq!(states[2].sgprs[32], Value::Known(0x400));
+    assert_eq!(states[3].sgprs[32], Value::Known(0));
+}
+
+#[test]
 fn the_scalar_state_follows_m0_the_mode_and_the_descriptor() {
     use super::state::{State, Value};
     let memory = assemble(SCALARS);

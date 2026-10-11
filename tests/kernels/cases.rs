@@ -1635,3 +1635,29 @@ fn saxpy_runs_workgroups_narrower_than_a_packet() {
         }
     }
 }
+
+#[test]
+fn non_inlined_calls_run_under_divergent_lanes() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x = words(n);
+    let mix_once = |x: u32| x.wrapping_mul(2654435761) ^ (x >> 7);
+    let mix_twice = |x: u32, y: u32| mix_once(x).wrapping_add(mix_once(y.wrapping_add(1)));
+    let sum_table = |x: u32| {
+        let t: Vec<u32> = (0..8u32).map(|i| mix_once(x.wrapping_add(i))).collect();
+        (0..8usize).fold(0u32, |s, i| s.wrapping_add(t[(i * 3) & 7]))
+    };
+    let want: Vec<u32> = x
+        .iter()
+        .enumerate()
+        .map(|(g, &v)| {
+            let r = if v & 1 != 0 { mix_twice(v, g as u32) } else { mix_once(v) };
+            r.wrapping_add(sum_table(v & 15))
+        })
+        .collect();
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        k.run(&Run { kernel: "calls", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("calls", width, "the reference", &y, &want);
+    }
+}
