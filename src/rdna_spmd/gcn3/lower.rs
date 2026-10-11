@@ -666,7 +666,9 @@ fn routed_lowering(inst: &Inst, v: &Vector, target: &Target) -> Result<(InstForm
     };
     let lowering = lift::instruction_with_registry(&format, target.registry, target.lanes)?;
     if !compare(inst.op) {
-        checked_modifiers(inst, &lowering, v.abs, v.neg, v.clamp, v.omod)?;
+        let selects = matches!(inst.op, I::V_CNDMASK_B32);
+        let (abs, neg) = if selects { (0, 0) } else { (v.abs, v.neg) };
+        checked_modifiers(inst, &lowering, abs, neg, v.clamp, v.omod)?;
     }
     Ok((format, lowering))
 }

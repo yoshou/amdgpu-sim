@@ -15,11 +15,114 @@ fn gcd(a: i128, b: i128) -> i128 {
     a
 }
 
+fn aligned((lo, hi): (i128, i128), offset: i128, modulus: i128, span: i128) -> bool {
+    let r = (lo - offset).rem_euclid(modulus);
+    r <= span || hi - lo >= modulus - r
+}
+
 type Shape = (i128, Vec<(i128, Domain)>, Option<(usize, usize)>);
 
 #[derive(Default)]
 pub(super) struct Shapes {
     sets: HashMap<Shape, Option<std::rc::Rc<Values>>>,
+    judgments: HashMap<Judgment, bool>,
+}
+
+impl Shapes {
+    pub(super) fn judged(&self, judgment: &Judgment) -> Option<bool> {
+        self.judgments.get(judgment).copied()
+    }
+
+    pub(super) fn judge(&mut self, judgment: Judgment, overlap: bool) {
+        self.judgments.insert(judgment, overlap);
+    }
+}
+
+struct Pinned(std::rc::Rc<[u32]>);
+
+impl PartialEq for Pinned {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for Pinned {}
+
+impl std::hash::Hash for Pinned {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (std::rc::Rc::as_ptr(&self.0) as *const u32 as usize).hash(state);
+    }
+}
+
+#[derive(PartialEq, Eq, Hash)]
+pub(super) struct Judgment {
+    sides: [(Vec<(usize, u32)>, u32); 2],
+    bytes: [u32; 2],
+    unknowns: Vec<(bool, Option<(u32, u32)>, Option<Pinned>)>,
+    differ: Option<usize>,
+    classes: Vec<(usize, Vec<(usize, u32)>, u32, Vec<(u64, u64)>)>,
+}
+
+impl Judgment {
+    pub(super) fn new(
+        unknowns: &[UnknownInfo],
+        x: &Form,
+        y: &Form,
+        bytes: [u32; 2],
+        variant: &dyn Fn(&UnknownInfo) -> bool,
+        differ: Option<Unknown>,
+        classes: [&Classes; 2],
+    ) -> Self {
+        let mut names: Vec<Unknown> = Vec::new();
+        let rename = |f: &Form, names: &mut Vec<Unknown>| -> (Vec<(usize, u32)>, u32) {
+            let terms = f
+                .terms
+                .iter()
+                .map(|&(u, c)| {
+                    let k = names.iter().position(|&n| n == u).unwrap_or_else(|| {
+                        names.push(u);
+                        names.len() - 1
+                    });
+                    (k, c)
+                })
+                .collect();
+            (terms, f.constant)
+        };
+        let sides = [rename(x, &mut names), rename(y, &mut names)];
+        let mut done = [vec![false; classes[0].len()], vec![false; classes[1].len()]];
+        let mut included = Vec::new();
+        loop {
+            let present = names.len();
+            let mut added = false;
+            for side in 0..2 {
+                for (i, (form, pieces)) in classes[side].iter().enumerate() {
+                    if done[side][i] || !form.terms.iter().any(|&(u, _)| names[..present].contains(&u)) {
+                        continue;
+                    }
+                    done[side][i] = true;
+                    added = true;
+                    let (terms, constant) = rename(form, &mut names);
+                    included.push((side, terms, constant, pieces.clone()));
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+        Judgment {
+            sides,
+            bytes,
+            unknowns: names
+                .iter()
+                .map(|&u| {
+                    let info = &unknowns[u as usize];
+                    (variant(info), info.range, info.values.clone().map(Pinned))
+                })
+                .collect(),
+            differ: differ.and_then(|u| names.iter().position(|&n| n == u)),
+            classes: included,
+        }
+    }
 }
 
 const ENUMERATED: i128 = 1 << 16;
@@ -186,7 +289,7 @@ impl<'a> Encoding<'a> {
         let (lo, hi) = self.window;
         let g = self.difference.terms.iter().fold(0i128, |g, &(_, c)| gcd(g, c));
         let g = if self.modular { gcd(g, WORD) } else { g };
-        if g > 1 && !(lo..=hi).any(|t| (t - self.difference.constant).rem_euclid(g) == 0) {
+        if g > 1 && !aligned((lo, hi), self.difference.constant, g, 0) {
             return true;
         }
         let (low, high) = self.problem.bounds(&self.difference);
@@ -200,7 +303,7 @@ impl<'a> Encoding<'a> {
             return high < lo || low > hi;
         }
         let span = high - low;
-        span + 1 < WORD && !(lo..=hi).any(|t| (t - low).rem_euclid(WORD) <= span)
+        span + 1 < WORD && !aligned((lo, hi), low, WORD, span)
     }
 
     fn shape(&self, copies: Option<(Var, Var)>) -> Option<Shape> {
@@ -482,11 +585,11 @@ pub(super) fn quickly_apart(
             (None, None) => break,
         }
     }
-    if g > 1 && !(lo..=hi).any(|t| (t - constant).rem_euclid(g) == 0) {
+    if g > 1 && !aligned((lo, hi), constant, g, 0) {
         return true;
     }
     let span = high - low;
-    span + 1 < WORD && !(lo..=hi).any(|t| (t - low).rem_euclid(WORD) <= span)
+    span + 1 < WORD && !aligned((lo, hi), low, WORD, span)
 }
 
 
@@ -614,6 +717,24 @@ impl<'a> Encoding<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alignment_matches_a_scan_of_the_window() {
+        let mut state = 7u64;
+        let mut next = |n: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % n
+        };
+        for _ in 0..200000 {
+            let lo = next(64) as i128 - 32;
+            let hi = lo + next(16) as i128;
+            let offset = next(200) as i128 - 100;
+            let modulus = 1 + next(40) as i128;
+            let span = next(modulus as u64) as i128;
+            let scanned = (lo..=hi).any(|t| (t - offset).rem_euclid(modulus) <= span);
+            assert_eq!(aligned((lo, hi), offset, modulus, span), scanned, "{lo}..={hi} offset {offset} modulo {modulus} within {span}");
+        }
+    }
 
     fn holds(e: &Linear, wa: i128, wb: i128) -> i128 {
         e.terms.iter().fold(e.constant, |acc, &(v, c)| acc + c * if v == 0 { wa } else { wb })

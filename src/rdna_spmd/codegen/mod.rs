@@ -102,42 +102,58 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(ir: Builder, f: &Func) -> Self {
+    fn new(ir: Builder, f: &Func, defines: bool) -> Self {
         let counts = std::env::var("AMDGPU_SIM_BLOCK_COUNTS").ok().map(|path| {
             let ty = ir.i64().array(f.blocks.len() as u64);
             let global = ir.add_global("block_counts", ty);
-            global.set_initializer(ty.null());
             let index: BTreeMap<BlockId, usize> = f
                 .blocks
                 .keys()
                 .enumerate()
                 .map(|(i, &id)| (id, i))
                 .collect();
-            let text: String = f
-                .blocks
-                .keys()
-                .map(|id| format!("{} b{:x}\n", index[id], id.0))
-                .collect();
-            std::fs::write(format!("{path}.blocks"), text).unwrap();
+            if defines {
+                global.set_initializer(ty.null());
+                let text: String = f
+                    .blocks
+                    .keys()
+                    .map(|id| format!("{} b{:x}\n", index[id], id.0))
+                    .collect();
+                std::fs::write(format!("{path}.blocks"), text).unwrap();
+            }
             (path, global, index)
         });
         Self {
             counts,
         }
     }
+}
 
-    fn finish(
-        self,
-        native: super::native::jit::Module,
-        symbol: &str,
-        runtime: &[(&str, u64)],
-    ) -> super::native::jit::NativeCode {
-        let mut code = native.optimize().compile(symbol, runtime);
-        if let Some((path, _, index)) = self.counts {
-            code.count_blocks(path, index.len());
+fn each_in_parallel<T: Send, R: Send>(items: Vec<T>, work: impl Fn(T) -> R + Sync) -> Vec<R> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let slots: Vec<Mutex<Option<T>>> = items.into_iter().map(|item| Mutex::new(Some(item))).collect();
+    let results: Vec<Mutex<Option<R>>> = (0..slots.len()).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, slots.len().max(1));
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed);
+                if k >= slots.len() {
+                    break;
+                }
+                let item = slots[k].lock().unwrap().take().unwrap();
+                *results[k].lock().unwrap() = Some(work(item));
+            });
         }
-        code
-    }
+    });
+    results
+        .into_iter()
+        .map(|result| result.into_inner().unwrap().unwrap())
+        .collect()
 }
 
 pub fn compile_regions(
@@ -147,15 +163,28 @@ pub fn compile_regions(
     runtime: &[(&str, u64)],
 ) -> Compiled {
     let regions = region::Regions::new(p);
-    let native = super::native::jit::Module::new(name);
-    let shared = Shared::new(native.builder(), p.ir.func());
     let symbols: Vec<String> = (0..regions.count())
         .map(|r| format!("kernel_{r}"))
         .collect();
-    for (r, symbol) in symbols.iter().enumerate() {
-        emit_function(p, &lowerings, native.builder(), symbol, (&regions, r), &shared);
+    let mut counts = None;
+    let modules: Vec<super::native::jit::Module> = symbols
+        .iter()
+        .enumerate()
+        .map(|(r, symbol)| {
+            let native = super::native::jit::Module::new(&format!("{name}_{r}"));
+            let shared = Shared::new(native.builder(), p.ir.func(), r == 0);
+            emit_function(p, &lowerings, native.builder(), symbol, (&regions, r), &shared);
+            if r == 0 {
+                counts = shared.counts.map(|(path, _, index)| (path, index.len()));
+            }
+            native
+        })
+        .collect();
+    let objects = each_in_parallel(modules, |module| module.optimize().object());
+    let mut code = super::native::jit::link(objects, &symbols[0], runtime);
+    if let Some((path, blocks)) = counts {
+        code.count_blocks(path, blocks);
     }
-    let code = shared.finish(native, &symbols[0], runtime);
     let compiled = symbols
         .iter()
         .enumerate()

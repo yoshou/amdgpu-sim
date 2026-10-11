@@ -1,5 +1,6 @@
 use super::super::analysis::Analyses;
 use super::super::ir::{Cvt, IntOp, Op, Ty, ValueId, *};
+use crate::rdna_spmd::hash::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Simplify;
@@ -227,16 +228,18 @@ fn expand(f: &mut Func) -> usize {
 fn common(f: &mut Func) -> usize {
     let mut map: BTreeMap<ValueId, ValueId> = BTreeMap::new();
     for block in f.blocks.values() {
-        let mut seen: Vec<(Ty, Op, ValueId)> = Vec::new();
+        let mut seen: HashMap<(Ty, Op), ValueId> = HashMap::default();
         for inst in &block.insts {
             let Inst::Core { value, ty, op } = inst else {
                 continue;
             };
-            match seen.iter().find(|(t, o, _)| t == ty && o == op) {
-                Some(&(_, _, previous)) => {
-                    map.insert(*value, previous);
+            match seen.entry((*ty, *op)) {
+                std::collections::hash_map::Entry::Occupied(previous) => {
+                    map.insert(*value, *previous.get());
                 }
-                None => seen.push((*ty, *op, *value)),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(*value);
+                }
             }
         }
     }

@@ -300,6 +300,21 @@ fn dpp_row_and_bank_masks_leave_lanes_untouched() {
 }
 
 #[test]
+fn a_select_applies_sign_modifiers_to_the_words_it_chooses() {
+    let inputs = lanes(3, word);
+    let body = "v_cmp_gt_u32 vcc, v3, v1
+                v_cndmask_b32_e64 v20, -v1, |v2|, vcc
+                v_cndmask_b32_e64 v21, |v1|, -v2, vcc";
+    Probe::new(3, 2, body).check(&inputs, |_, x| {
+        let chosen = x[2] > x[0];
+        vec![
+            if chosen { x[1] & 0x7fff_ffff } else { x[0] ^ 0x8000_0000 },
+            if chosen { x[1] ^ 0x8000_0000 } else { x[0] & 0x7fff_ffff },
+        ]
+    });
+}
+
+#[test]
 fn dpp_arithmetic_gates_the_result_and_the_carry() {
     let inputs = lanes(2, word);
     let body = "s_mov_b64 vcc, 0

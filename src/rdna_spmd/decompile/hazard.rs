@@ -1,5 +1,5 @@
 use super::address::{Addresses, Classes, Form, Region, Regions, Unknown, UnknownInfo, Value, Wide};
-use super::encoding::{quickly_apart, Encoding, Shapes};
+use super::encoding::{quickly_apart, Encoding, Judgment, Shapes};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::environment::Environment;
@@ -984,7 +984,7 @@ fn may_overlap(
     differ: Option<Unknown>,
 ) -> bool {
     let none = Classes::new();
-    may_overlap_within(unknowns, x, y, x_bytes, y_bytes, variant, differ, [&none, &none], &mut Shapes::default())
+    judged(unknowns, x, y, x_bytes, y_bytes, variant, differ, [&none, &none], &mut Shapes::default())
 }
 
 #[derive(Clone)]
@@ -1013,6 +1013,29 @@ fn lane_facts(addresses: &mut Addresses, access: &Access, lane: usize) -> LaneFa
 }
 
 fn may_overlap_within(
+    unknowns: &[UnknownInfo],
+    x: &Form,
+    y: &Form,
+    x_bytes: u32,
+    y_bytes: u32,
+    variant: &dyn Fn(&UnknownInfo) -> bool,
+    differ: Option<Unknown>,
+    classes: [&Classes; 2],
+    cache: &mut Shapes,
+) -> bool {
+    if quickly_apart(unknowns, x, y, x_bytes, y_bytes, variant) {
+        return false;
+    }
+    let judgment = Judgment::new(unknowns, x, y, [x_bytes, y_bytes], variant, differ, classes);
+    if let Some(known) = cache.judged(&judgment) {
+        return known;
+    }
+    let overlap = judged(unknowns, x, y, x_bytes, y_bytes, variant, differ, classes, cache);
+    cache.judge(judgment, overlap);
+    overlap
+}
+
+fn judged(
     unknowns: &[UnknownInfo],
     x: &Form,
     y: &Form,
@@ -1220,6 +1243,76 @@ mod tests {
             overlapping += fresh as usize;
         }
         assert!(overlapping > 1000 && overlapping < 29000, "{} of 30000 overlap", overlapping);
+    }
+
+    fn relabeled(r: &mut Random, unknowns: &[UnknownInfo], forms: &mut [&mut Form], classes: &mut [Classes; 2]) -> Vec<UnknownInfo> {
+        let n = unknowns.len();
+        let gap = r.below(3) as u32;
+        let mut names: Vec<u32> = (0..n as u32).map(|u| u + gap).collect();
+        for i in (1..n).rev() {
+            names.swap(i, r.below(i as u64 + 1) as usize);
+        }
+        let rename = |f: &mut Form| {
+            for (u, _) in &mut f.terms {
+                *u = names[*u as usize];
+            }
+            f.terms.sort_by_key(|&(u, _)| u);
+        };
+        for f in forms.iter_mut() {
+            rename(f);
+        }
+        for side in classes.iter_mut() {
+            for (f, _) in side.iter_mut() {
+                rename(f);
+            }
+        }
+        let mut out: Vec<UnknownInfo> = (0..n as u32 + gap).map(|u| info(n + u as usize, Some((0, 0)))).collect();
+        for (u, info) in unknowns.iter().enumerate() {
+            out[names[u] as usize] = info.clone();
+        }
+        out
+    }
+
+    #[test]
+    fn judgments_shared_across_relabeled_pairs_with_classes_match_fresh_ones() {
+        let mut r = Random::new(23);
+        let mut shared = Shapes::default();
+        let mut limited = 0;
+        for round in 0..500 {
+            let (unknowns, variant, mut x, mut y, a, b) = match round % 3 {
+                0 => random_case(&mut r, false),
+                1 => random_case(&mut r, true),
+                _ => random_set_case(&mut r),
+            };
+            let n = unknowns.len();
+            let mut classes: [Classes; 2] = [Classes::new(), Classes::new()];
+            for side in classes.iter_mut() {
+                for _ in 0..r.below(3) {
+                    let form = random_form(&mut r, n);
+                    let lo = r.below(1 << 8) as u64;
+                    side.push((form, vec![(lo, lo + r.below(1 << 8))]));
+                }
+            }
+            let variant: Vec<bool> = (0..2 * n + 3).map(|i| variant.get(i).copied().unwrap_or(false)).collect();
+            let differ = (r.below(3) == 0).then(|| r.below(n as u64) as Unknown);
+            let (unknowns, differ) = if r.below(2) == 0 {
+                let before = unknowns.clone();
+                let relabeled = relabeled(&mut r, &unknowns, &mut [&mut x, &mut y], &mut classes);
+                let differ = differ.map(|u| relabeled.iter().position(|i| i.rank == before[u as usize].rank).unwrap() as Unknown);
+                (relabeled, differ)
+            } else {
+                (unknowns, differ)
+            };
+            let variant = |i: &UnknownInfo| variant[i.rank];
+            let limits = [&classes[0], &classes[1]];
+            let fresh = may_overlap_within(&unknowns, &x, &y, a, b, &variant, differ, limits, &mut Shapes::default());
+            let reused = may_overlap_within(&unknowns, &x, &y, a, b, &variant, differ, limits, &mut shared);
+            assert_eq!(fresh, reused, "{:?} ({} bytes) and {:?} ({} bytes) under {:?} differing in {:?}", x, a, y, b, classes, differ);
+            let none = Classes::new();
+            let unlimited = may_overlap_within(&unknowns, &x, &y, a, b, &variant, differ, [&none, &none], &mut Shapes::default());
+            limited += (fresh != unlimited) as usize;
+        }
+        assert!(limited > 10, "{} of 500 judgments changed under limits", limited);
     }
 
     #[test]
