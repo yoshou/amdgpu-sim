@@ -595,9 +595,9 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
             if let EffectOp::Memory {
                 op:
                     memory @ (MemoryOp::Store(_)
-                    | MemoryOp::AtomicAdd(_)
-                    | MemoryOp::AtomicRmw(_)
-                    | MemoryOp::AtomicCmpSwap),
+                    | MemoryOp::AtomicAdd(..)
+                    | MemoryOp::AtomicRmw(..)
+                    | MemoryOp::AtomicCmpSwap(_)),
                 semantics,
                 ..
             } = op
@@ -611,7 +611,8 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
                     };
                     let address = self.get(ev, inputs[0]).same;
                     let data = match memory {
-                        MemoryOp::AtomicCmpSwap => match (self.get(ev, inputs[1]).same, self.get(ev, inputs[2]).same) {
+                        op if op.atomic() && op.size() == MemSize::B64 => None,
+                        MemoryOp::AtomicCmpSwap(_) => match (self.get(ev, inputs[1]).same, self.get(ev, inputs[2]).same) {
                             (Some(d), Some(c)) => Some(self.intern(Ty::I64, Form::Core(Ty::I64, Op::Pack64(ValueId(d), ValueId(c))))),
                             _ => None,
                         },

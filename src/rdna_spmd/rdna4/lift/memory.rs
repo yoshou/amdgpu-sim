@@ -58,7 +58,7 @@ impl Memory {
 
     fn word_offset(&self, word: u32) -> u32 {
         match &self.pair {
-            Some(pair) if self.op != MemoryOp::AtomicCmpSwap => {
+            Some(pair) if !matches!(self.op, MemoryOp::AtomicCmpSwap(_)) => {
                 let n = self.words / 2;
                 pair.offsets[(word / n) as usize] + (word % n) * 4
             }
@@ -67,11 +67,12 @@ impl Memory {
     }
     fn data_register(&self, word: u32) -> u32 {
         match &self.pair {
-            Some(pair) if self.op == MemoryOp::AtomicCmpSwap => {
-                if word == 0 {
-                    self.data
+            Some(pair) if matches!(self.op, MemoryOp::AtomicCmpSwap(_)) => {
+                let half = self.data_count() / 2;
+                if word < half {
+                    self.data + word
                 } else {
-                    pair.second_data
+                    pair.second_data + word - half
                 }
             }
             Some(pair) if word >= self.words / 2 => pair.second_data + word - self.words / 2,
@@ -96,7 +97,7 @@ impl Memory {
     }
     fn data_count(&self) -> u32 {
         match self.op {
-            MemoryOp::AtomicCmpSwap => 2,
+            op if op.atomic() => op.data_words() as u32,
             op if op.data_words() > 0 => self.words,
             _ => 0,
         }
@@ -313,50 +314,90 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
         I::GLOBAL_LOAD_D16_B16 | I::FLAT_LOAD_D16_B16 | I::GLOBAL_LOAD_D16_HI_B16
         | I::FLAT_LOAD_D16_HI_B16 => (Load(U16), 1),
         I::GLOBAL_ATOMIC_ADD_U32 | I::FLAT_ATOMIC_ADD_U32 | I::DS_ADD_U32 | I::DS_ADD_RTN_U32 => {
-            (AtomicAdd(Numeric::Unsigned), 1)
+            (AtomicAdd(Numeric::Unsigned, B32), 1)
         }
         I::GLOBAL_ATOMIC_ADD_F32 | I::FLAT_ATOMIC_ADD_F32 | I::DS_ADD_F32 | I::DS_ADD_RTN_F32 => {
-            (AtomicAdd(Numeric::Float), 1)
+            (AtomicAdd(Numeric::Float, B32), 1)
         }
         I::GLOBAL_ATOMIC_MIN_I32 | I::FLAT_ATOMIC_MIN_I32 | I::DS_MIN_I32 | I::DS_MIN_RTN_I32 => {
-            (AtomicRmw(Rmw::SignedMin), 1)
+            (AtomicRmw(Rmw::SignedMin, B32), 1)
         }
         I::GLOBAL_ATOMIC_MAX_I32 | I::FLAT_ATOMIC_MAX_I32 | I::DS_MAX_I32 | I::DS_MAX_RTN_I32 => {
-            (AtomicRmw(Rmw::SignedMax), 1)
+            (AtomicRmw(Rmw::SignedMax, B32), 1)
         }
         I::GLOBAL_ATOMIC_MIN_U32 | I::FLAT_ATOMIC_MIN_U32 | I::DS_MIN_U32 | I::DS_MIN_RTN_U32 => {
-            (AtomicRmw(Rmw::UnsignedMin), 1)
+            (AtomicRmw(Rmw::UnsignedMin, B32), 1)
         }
         I::GLOBAL_ATOMIC_MAX_U32 | I::FLAT_ATOMIC_MAX_U32 | I::DS_MAX_U32 | I::DS_MAX_RTN_U32 => {
-            (AtomicRmw(Rmw::UnsignedMax), 1)
+            (AtomicRmw(Rmw::UnsignedMax, B32), 1)
         }
         I::GLOBAL_ATOMIC_AND_B32 | I::FLAT_ATOMIC_AND_B32 | I::DS_AND_B32 | I::DS_AND_RTN_B32 => {
-            (AtomicRmw(Rmw::And), 1)
+            (AtomicRmw(Rmw::And, B32), 1)
         }
         I::GLOBAL_ATOMIC_OR_B32 | I::FLAT_ATOMIC_OR_B32 | I::DS_OR_B32 | I::DS_OR_RTN_B32 => {
-            (AtomicRmw(Rmw::Or), 1)
+            (AtomicRmw(Rmw::Or, B32), 1)
         }
         I::GLOBAL_ATOMIC_XOR_B32 | I::FLAT_ATOMIC_XOR_B32 | I::DS_XOR_B32 | I::DS_XOR_RTN_B32 => {
-            (AtomicRmw(Rmw::Xor), 1)
+            (AtomicRmw(Rmw::Xor, B32), 1)
         }
         I::GLOBAL_ATOMIC_SWAP_B32 | I::FLAT_ATOMIC_SWAP_B32 | I::DS_STOREXCHG_RTN_B32 => {
-            (AtomicRmw(Rmw::Swap), 1)
+            (AtomicRmw(Rmw::Swap, B32), 1)
         }
         I::GLOBAL_ATOMIC_SUB_U32 | I::FLAT_ATOMIC_SUB_U32 | I::DS_SUB_U32 | I::DS_SUB_RTN_U32 => {
-            (AtomicRmw(Rmw::Sub), 1)
+            (AtomicRmw(Rmw::Sub, B32), 1)
         }
         I::GLOBAL_ATOMIC_INC_U32 | I::FLAT_ATOMIC_INC_U32 | I::DS_INC_U32 | I::DS_INC_RTN_U32 => {
-            (AtomicRmw(Rmw::IncWrap), 1)
+            (AtomicRmw(Rmw::IncWrap, B32), 1)
         }
         I::GLOBAL_ATOMIC_DEC_U32 | I::FLAT_ATOMIC_DEC_U32 | I::DS_DEC_U32 | I::DS_DEC_RTN_U32 => {
-            (AtomicRmw(Rmw::DecWrap), 1)
+            (AtomicRmw(Rmw::DecWrap, B32), 1)
         }
         I::GLOBAL_ATOMIC_CMPSWAP_B32
         | I::FLAT_ATOMIC_CMPSWAP_B32
         | I::DS_CMPSTORE_B32
-        | I::DS_CMPSTORE_RTN_B32 => (AtomicCmpSwap, 1),
+        | I::DS_CMPSTORE_RTN_B32 => (AtomicCmpSwap(B32), 1),
+        I::GLOBAL_ATOMIC_ADD_U64 | I::FLAT_ATOMIC_ADD_U64 | I::DS_ADD_U64 | I::DS_ADD_RTN_U64 => {
+            (AtomicAdd(Numeric::Unsigned, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_MIN_I64 | I::FLAT_ATOMIC_MIN_I64 | I::DS_MIN_I64 | I::DS_MIN_RTN_I64 => {
+            (AtomicRmw(Rmw::SignedMin, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_MAX_I64 | I::FLAT_ATOMIC_MAX_I64 | I::DS_MAX_I64 | I::DS_MAX_RTN_I64 => {
+            (AtomicRmw(Rmw::SignedMax, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_MIN_U64 | I::FLAT_ATOMIC_MIN_U64 | I::DS_MIN_U64 | I::DS_MIN_RTN_U64 => {
+            (AtomicRmw(Rmw::UnsignedMin, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_MAX_U64 | I::FLAT_ATOMIC_MAX_U64 | I::DS_MAX_U64 | I::DS_MAX_RTN_U64 => {
+            (AtomicRmw(Rmw::UnsignedMax, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_AND_B64 | I::FLAT_ATOMIC_AND_B64 | I::DS_AND_B64 | I::DS_AND_RTN_B64 => {
+            (AtomicRmw(Rmw::And, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_OR_B64 | I::FLAT_ATOMIC_OR_B64 | I::DS_OR_B64 | I::DS_OR_RTN_B64 => {
+            (AtomicRmw(Rmw::Or, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_XOR_B64 | I::FLAT_ATOMIC_XOR_B64 | I::DS_XOR_B64 | I::DS_XOR_RTN_B64 => {
+            (AtomicRmw(Rmw::Xor, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_SWAP_B64 | I::FLAT_ATOMIC_SWAP_B64 | I::DS_STOREXCHG_RTN_B64 => {
+            (AtomicRmw(Rmw::Swap, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_SUB_U64 | I::FLAT_ATOMIC_SUB_U64 | I::DS_SUB_U64 | I::DS_SUB_RTN_U64 => {
+            (AtomicRmw(Rmw::Sub, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_INC_U64 | I::FLAT_ATOMIC_INC_U64 | I::DS_INC_U64 | I::DS_INC_RTN_U64 => {
+            (AtomicRmw(Rmw::IncWrap, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_DEC_U64 | I::FLAT_ATOMIC_DEC_U64 | I::DS_DEC_U64 | I::DS_DEC_RTN_U64 => {
+            (AtomicRmw(Rmw::DecWrap, B64), 1)
+        }
+        I::GLOBAL_ATOMIC_CMPSWAP_B64
+        | I::FLAT_ATOMIC_CMPSWAP_B64
+        | I::DS_CMPSTORE_B64
+        | I::DS_CMPSTORE_RTN_B64 => (AtomicCmpSwap(B64), 1),
         I::GLOBAL_WB | I::GLOBAL_INV => (Fence, 0),
-        _ => panic!("unsupported memory lift {:?}", opcode),
+        _ => return None,
     };
 
     let pair = if matches!(
@@ -394,7 +435,10 @@ pub fn instruction(inst: &InstFormat) -> Option<Memory> {
             offsets: [i.offset0 as u32 * stride, i.offset1 as u32 * stride],
             second_data: i.data1 as u32,
         })
-    } else if matches!(opcode, I::DS_CMPSTORE_B32 | I::DS_CMPSTORE_RTN_B32) {
+    } else if matches!(
+        opcode,
+        I::DS_CMPSTORE_B32 | I::DS_CMPSTORE_RTN_B32 | I::DS_CMPSTORE_B64 | I::DS_CMPSTORE_RTN_B64
+    ) {
         let InstFormat::DS(i) = inst else {
             unreachable!()
         };
@@ -488,12 +532,12 @@ impl Memory {
                 offset_by(f, block, ty, address, self.word_offset(k) as u64)
             };
             let exec = flat.as_ref().map_or(mask, |aperture| aperture.outside);
-            let word_data: &[ValueId] = if self.op == MemoryOp::AtomicCmpSwap {
+            let word_data: &[ValueId] = if self.op.atomic() {
                 &data
             } else {
                 data.get(k as usize).map_or(&[], std::slice::from_ref)
             };
-            let mut result = self.effect(
+            let mut results = self.effect(
                 f,
                 block,
                 next_provenance(),
@@ -509,7 +553,7 @@ impl Memory {
                     offset_by(f, block, Ty::I32, aperture.private, k as u64 * 4)
                 };
                 let private = if self.op.atomic() {
-                    None
+                    Vec::new()
                 } else {
                     self.effect(
                         f,
@@ -521,49 +565,48 @@ impl Memory {
                         aperture.inside_exec,
                     )
                 };
-                let local = aperture.group.as_ref().and_then(|group| {
-                    let local_address = if k == 0 {
-                        group.local
-                    } else {
-                        offset_by(f, block, Ty::I32, group.local, k as u64 * 4)
-                    };
-                    self.effect(
-                        f,
-                        block,
-                        next_provenance(),
-                        Space::Lds,
-                        local_address,
-                        word_data,
-                        group.shared_exec,
-                    )
-                });
-                let outer = match (result, local) {
-                    (Some(global), Some(local)) => {
-                        let shared = f.value(Ty::I32);
-                        block.insts.push(Inst::Core {
-                            value: shared,
-                            ty: Ty::I32,
-                            op: Op::Select(aperture.group.as_ref().unwrap().shared, local, global),
-                        });
-                        Some(shared)
+                let local = match &aperture.group {
+                    Some(group) => {
+                        let local_address = if k == 0 {
+                            group.local
+                        } else {
+                            offset_by(f, block, Ty::I32, group.local, k as u64 * 4)
+                        };
+                        self.effect(
+                            f,
+                            block,
+                            next_provenance(),
+                            Space::Lds,
+                            local_address,
+                            word_data,
+                            group.shared_exec,
+                        )
                     }
-                    (global, _) => global,
+                    None => Vec::new(),
                 };
-                result = match (outer, private) {
-                    (Some(outer), Some(private)) => {
-                        let merged = f.value(Ty::I32);
-                        block.insts.push(Inst::Core {
-                            value: merged,
-                            ty: Ty::I32,
-                            op: Op::Select(aperture.inside, private, outer),
-                        });
-                        Some(merged)
+                let select = |f: &mut Func, block: &mut Block, c: ValueId, a: ValueId, b: ValueId| {
+                    let value = f.value(Ty::I32);
+                    block.insts.push(Inst::Core {
+                        value,
+                        ty: Ty::I32,
+                        op: Op::Select(c, a, b),
+                    });
+                    value
+                };
+                for (i, result) in results.iter_mut().enumerate() {
+                    if let Some(&l) = local.get(i) {
+                        let shared = aperture.group.as_ref().unwrap().shared;
+                        *result = select(f, block, shared, l, *result);
                     }
-                    _ => outer,
-                };
+                    if let Some(&p) = private.get(i) {
+                        *result = select(f, block, aperture.inside, p, *result);
+                    }
+                }
             }
             if self.returns {
-                self.write_result(f, block, words, mask, k, result.unwrap());
+                for (i, &result) in results.iter().enumerate() {
+                    self.write_result(f, block, words, mask, k * self.op.size().words() + i as u32, result);
+                }
             }
         }
     }
@@ -701,14 +744,14 @@ impl Memory {
         address: ValueId,
         data: &[ValueId],
         exec: ValueId,
-    ) -> Option<ValueId> {
+    ) -> Vec<ValueId> {
         let mut inputs = vec![address];
         inputs.extend(data.iter().copied());
         inputs.push(exec);
-        let outputs = if self.stores() {
+        let outputs: Vec<(ValueId, Ty)> = if self.stores() {
             vec![]
         } else {
-            vec![(f.value(Ty::I32), Ty::I32)]
+            (0..self.op.size().words()).map(|_| (f.value(Ty::I32), Ty::I32)).collect()
         };
         block.insts.push(Inst::Effect {
             provenance,
@@ -720,7 +763,7 @@ impl Memory {
             inputs,
             outputs: outputs.clone(),
         });
-        outputs.first().map(|o| o.0)
+        outputs.iter().map(|o| o.0).collect()
     }
 
     fn merge_half(
@@ -952,6 +995,58 @@ mod tests {
         block.insts.iter().any(|inst| {
             matches!(inst, Inst::Core { op: Op::Const(Ty::I64, k), .. } if *k == crate::rdna_spmd::SHARED_APERTURE)
         })
+    }
+
+    #[test]
+    fn a_wide_atomic_is_one_effect_with_two_data_words_and_two_results() {
+        let memory = instruction(&InstFormat::VGLOBAL(crate::rdna_instructions::VGLOBAL {
+            op: I::GLOBAL_ATOMIC_ADD_U64,
+            vaddr: 0,
+            vsrc: 2,
+            vdst: 4,
+            scope: 0,
+            th: 1,
+            ioffset: 0,
+            saddr: 124,
+            sve: 0,
+        }))
+        .unwrap();
+        assert_eq!(memory.op, MemoryOp::AtomicAdd(Numeric::Unsigned, MemSize::B64));
+        assert_eq!(memory.reads(), vec![0, 1, 2, 3]);
+        let mut f = Func::new(BlockId(0), Presence::Wave, 32);
+        let regs = [Word::Vgpr(0), Word::Vgpr(1), Word::Vgpr(2), Word::Vgpr(3), Word::Vgpr(4), Word::Vgpr(5), Word::Mask(126)];
+        let params: Vec<_> = regs.iter().map(|r| (f.value(r.ty()), r.ty())).collect();
+        let mut block = Block {
+            params: params.clone(),
+            insts: vec![],
+            term: Term::Ret(vec![]),
+        };
+        let mut words: Words = regs.iter().copied().zip(params.iter().map(|p| p.0)).collect();
+        let mut views = Views::new();
+        let mut provenance = 0;
+        memory.lift(&mut f, &mut block, &mut words, &mut views, &mut provenance, false);
+        let effects: Vec<(usize, usize)> = block
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                Inst::Effect { inputs, outputs, .. } => Some((inputs.len(), outputs.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(effects, vec![(4, 2)], "address, two data words and the mask in; two words out");
+        assert!(words[&Word::Vgpr(4)] != params[4].0 && words[&Word::Vgpr(5)] != params[5].0, "both result words are written");
+        let unsupported = instruction(&InstFormat::VGLOBAL(crate::rdna_instructions::VGLOBAL {
+            op: I::GLOBAL_ATOMIC_ORDERED_ADD_B64,
+            vaddr: 0,
+            vsrc: 2,
+            vdst: 4,
+            scope: 0,
+            th: 1,
+            ioffset: 0,
+            saddr: 124,
+            sve: 0,
+        }));
+        assert!(unsupported.is_none());
     }
 
     #[test]

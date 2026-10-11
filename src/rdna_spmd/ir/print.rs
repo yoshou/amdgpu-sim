@@ -173,23 +173,30 @@ fn effect_op(op: EffectOp) -> String {
             op,
             semantics,
         } => {
+            let wide = |name: &str, size: MemSize| {
+                if size == MemSize::B64 {
+                    format!("{name}.b64")
+                } else {
+                    name.to_string()
+                }
+            };
             let op = match op {
                 MemoryOp::Load(size) => format!("load.{}", mem_size(size)),
                 MemoryOp::Store(size) => format!("store.{}", mem_size(size)),
-                MemoryOp::AtomicAdd(Numeric::Unsigned) => "atomic_add".into(),
-                MemoryOp::AtomicAdd(Numeric::Float) => "atomic_fadd".into(),
-                MemoryOp::AtomicRmw(Rmw::SignedMin) => "atomic_smin".into(),
-                MemoryOp::AtomicRmw(Rmw::SignedMax) => "atomic_smax".into(),
-                MemoryOp::AtomicRmw(Rmw::UnsignedMin) => "atomic_umin".into(),
-                MemoryOp::AtomicRmw(Rmw::UnsignedMax) => "atomic_umax".into(),
-                MemoryOp::AtomicRmw(Rmw::And) => "atomic_and".into(),
-                MemoryOp::AtomicRmw(Rmw::Or) => "atomic_or".into(),
-                MemoryOp::AtomicRmw(Rmw::Xor) => "atomic_xor".into(),
-                MemoryOp::AtomicRmw(Rmw::Swap) => "atomic_swap".into(),
-                MemoryOp::AtomicRmw(Rmw::Sub) => "atomic_sub".into(),
-                MemoryOp::AtomicRmw(Rmw::IncWrap) => "atomic_inc".into(),
-                MemoryOp::AtomicRmw(Rmw::DecWrap) => "atomic_dec".into(),
-                MemoryOp::AtomicCmpSwap => "atomic_cmpswap".into(),
+                MemoryOp::AtomicAdd(Numeric::Unsigned, size) => wide("atomic_add", size),
+                MemoryOp::AtomicAdd(Numeric::Float, size) => wide("atomic_fadd", size),
+                MemoryOp::AtomicRmw(Rmw::SignedMin, size) => wide("atomic_smin", size),
+                MemoryOp::AtomicRmw(Rmw::SignedMax, size) => wide("atomic_smax", size),
+                MemoryOp::AtomicRmw(Rmw::UnsignedMin, size) => wide("atomic_umin", size),
+                MemoryOp::AtomicRmw(Rmw::UnsignedMax, size) => wide("atomic_umax", size),
+                MemoryOp::AtomicRmw(Rmw::And, size) => wide("atomic_and", size),
+                MemoryOp::AtomicRmw(Rmw::Or, size) => wide("atomic_or", size),
+                MemoryOp::AtomicRmw(Rmw::Xor, size) => wide("atomic_xor", size),
+                MemoryOp::AtomicRmw(Rmw::Swap, size) => wide("atomic_swap", size),
+                MemoryOp::AtomicRmw(Rmw::Sub, size) => wide("atomic_sub", size),
+                MemoryOp::AtomicRmw(Rmw::IncWrap, size) => wide("atomic_inc", size),
+                MemoryOp::AtomicRmw(Rmw::DecWrap, size) => wide("atomic_dec", size),
+                MemoryOp::AtomicCmpSwap(size) => wide("atomic_cmpswap", size),
                 MemoryOp::Fence => "fence".into(),
             };
             format!(

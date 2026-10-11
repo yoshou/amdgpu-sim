@@ -1661,3 +1661,133 @@ fn non_inlined_calls_run_under_divergent_lanes() {
         same("calls", width, "the reference", &y, &want);
     }
 }
+
+fn wide_words(n: usize) -> Vec<u64> {
+    words(n).iter().map(|&v| (v as u64) * 0x1_0000_0001 + 3).collect()
+}
+
+#[test]
+fn wide_atomics_update_global_cells() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x = words(n);
+    let v = wide_words(n);
+    let start: Vec<u64> = (0..448u64).map(|j| (j + 1) << 32 | j * 7).collect();
+    let mut cells_want = start.clone();
+    let mut want = vec![0u64; n];
+    for g in 0..n {
+        let j = g % 8;
+        cells_want[j] = cells_want[j].wrapping_add(v[g]);
+        cells_want[8 + j] = cells_want[8 + j].max(v[g]);
+        cells_want[16 + j] = cells_want[16 + j].min(v[g]);
+        cells_want[24 + j] &= !v[g];
+        cells_want[32 + j] |= v[g];
+        cells_want[40 + j] ^= v[g];
+        cells_want[48 + j] = cells_want[48 + j].wrapping_sub(v[g]);
+        let mut r = start[64 + g];
+        cells_want[64 + g] = v[g];
+        r = r.wrapping_add(start[192 + g]);
+        if start[192 + g] == g as u64 {
+            cells_want[192 + g] = v[g];
+        }
+        r = r.wrapping_add(start[320 + g]);
+        if start[320 + g] == 1 {
+            cells_want[320 + g] = v[g];
+        }
+        want[g] = r;
+    }
+    for width in WIDTHS {
+        let mut cells = start.clone();
+        cells[192 + 5] = 5;
+        cells[192 + 70] = 70;
+        cells[320 + 9] = 1;
+        let mut cells_want = cells_want.clone();
+        let mut want = want.clone();
+        for g in [5usize, 70] {
+            want[g] = want[g].wrapping_sub(start[192 + g]).wrapping_add(g as u64);
+            cells_want[192 + g] = v[g];
+        }
+        want[9] = want[9].wrapping_sub(start[320 + 9]).wrapping_add(1);
+        cells_want[320 + 9] = v[9];
+        let mut y = vec![0u64; n];
+        k.run(
+            &Run { kernel: "atomics64", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut cells), Arg::output(&mut y), Arg::input(&x)] },
+            width,
+        );
+        same("atomics64", width, "the reference", &y, &want);
+        same("atomics64 cells", width, "the reference", &cells, &cells_want);
+    }
+}
+
+#[test]
+fn wide_atomics_update_shared_memory() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x = words(n);
+    let v = wide_words(n);
+    let mut want = vec![0u64; n];
+    for b in 0..2 {
+        let mut s: Vec<u64> = (0..16u64).map(|t| (t + 1) << 33).collect();
+        for t in 0..64 {
+            let g = b * 64 + t;
+            s[t % 4] = s[t % 4].wrapping_add(v[g]);
+            s[4 + t % 4] = s[4 + t % 4].max(v[g]);
+            s[8 + t % 4] |= v[g];
+            if t < 4 {
+                s[12 + t] = v[g];
+            }
+        }
+        for t in 0..64 {
+            let g = b * 64 + t;
+            let r = if t < 4 { (13 + t as u64) << 33 } else { 0 };
+            want[g] = r.wrapping_add(s[t % 16]);
+        }
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u64; n];
+        k.run(&Run { kernel: "lds_atomics64", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("lds_atomics64", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn dpp_compares_and_carries_follow_the_moved_lanes() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x = words(n);
+    let mut want = vec![0u32; 2 * n];
+    for g in 0..n {
+        let l = g % 64;
+        let row = l / 16 * 16;
+        let column = l % 16;
+        let v = x[g];
+        let shifted = if column >= 1 { x[g - 1] } else { 0 };
+        let rotated = x[g - l + row + (column + 15) % 16];
+        want[g * 2] = (shifted < v) as u32 | ((rotated == v) as u32) << 1 | ((rotated > shifted) as u32) << 2;
+        let wide = shifted as u64 + v as u64;
+        want[g * 2 + 1] = ((wide >> 32) as u32).wrapping_add((wide as u32).wrapping_mul(3));
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u32; 2 * n];
+        k.run(&Run { kernel: "dpp_compare", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("dpp_compare", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn dpp_moves_of_wide_values_shift_both_halves() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let v = wide_words(n);
+    let mut want = vec![0u64; n];
+    for g in 0..n {
+        let column = g % 16;
+        let shifted = if column >= 1 { v[g - 1] } else { 0 };
+        want[g] = (shifted << 5).wrapping_add(v[g]);
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u64; n];
+        k.run(&Run { kernel: "dpp_wide", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&v)] }, width);
+        same("dpp_wide", width, "the reference", &y, &want);
+    }
+}

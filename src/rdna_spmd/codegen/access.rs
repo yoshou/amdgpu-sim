@@ -42,10 +42,7 @@ impl Access {
     }
 
     pub fn size(&self) -> MemSize {
-        match self.op {
-            MemoryOp::Load(s) | MemoryOp::Store(s) => s,
-            _ => MemSize::B32,
-        }
+        self.op.size()
     }
     pub fn returns(&self) -> bool {
         matches!(self.op, MemoryOp::Load(_))
@@ -156,7 +153,7 @@ struct Word {
     input: ValueId,
     data: Vec<ValueId>,
     mask: ValueId,
-    result: Option<ValueId>,
+    results: Vec<ValueId>,
 }
 
 fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
@@ -164,7 +161,7 @@ fn word(inputs: &[ValueId], outputs: &[(ValueId, Ty)]) -> Word {
         input: inputs[0],
         data: inputs[1..inputs.len() - 1].to_vec(),
         mask: *inputs.last().unwrap(),
-        result: outputs.first().map(|o| o.0),
+        results: outputs.iter().map(|o| o.0).collect(),
     }
 }
 
@@ -331,7 +328,7 @@ pub fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Ac
                         if matches!(defs[c.0], Some(Op::Convert(Cvt::ZExt, Ty::I64, _))) && uniform[a.0]);
                 Form::Global { scalar_base }
             };
-            let results: Vec<ValueId> = words.iter().filter_map(|w| w.result).collect();
+            let results: Vec<ValueId> = words.iter().flat_map(|w| w.results.iter().copied()).collect();
             let merged: Vec<ValueId> = if flat {
                 results
                     .iter()

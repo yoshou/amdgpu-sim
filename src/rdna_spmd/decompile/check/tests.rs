@@ -2508,7 +2508,7 @@ fn prove_converts_a_query_whose_arms_store_one_word_computed_in_each_arm() {
 fn prove_keeps_a_query_whose_arms_add_different_amounts_atomically() {
     let b = arms_store(|b, block, side, p| {
         let amount = b.constant(block, Ty::I32, 1 + side as u64);
-        b.effect(block, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned)), vec![p[1], amount, p[0]]);
+        b.effect(block, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned, MemSize::B32)), vec![p[1], amount, p[0]]);
         None
     });
     assert!(keeps(&b).is_empty(), "{:?}: one arm adds 1 and the other 2", keeps(&b));
@@ -2518,7 +2518,7 @@ fn prove_keeps_a_query_whose_arms_add_different_amounts_atomically() {
 fn prove_converts_a_query_whose_arms_add_the_same_amount_atomically() {
     let b = arms_store(|b, block, _, p| {
         let one = b.constant(block, Ty::I32, 1);
-        b.effect(block, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned)), vec![p[1], one, p[0]]);
+        b.effect(block, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned, MemSize::B32)), vec![p[1], one, p[0]]);
         None
     });
     assert!(converted(&b).is_empty(), "{:?}: both arms add 1 to the lane's own word", converted(&b));
@@ -4358,7 +4358,7 @@ fn prove_keeps_a_query_whose_arms_swap_different_words_atomically() {
     let b = arms_store(|b, block, side, p| {
         let expected = b.constant(block, Ty::I32, 0);
         let desired = b.constant(block, Ty::I32, 1 + side as u64);
-        b.effect(block, memory(Space::Global, MemoryOp::AtomicCmpSwap), vec![p[1], desired, expected, p[0]]);
+        b.effect(block, memory(Space::Global, MemoryOp::AtomicCmpSwap(MemSize::B32)), vec![p[1], desired, expected, p[0]]);
         None
     });
     assert!(keeps(&b).is_empty(), "{:?}: one arm swaps in 1 and the other 2", keeps(&b));
@@ -4369,7 +4369,7 @@ fn prove_converts_a_query_whose_arms_swap_the_same_word_atomically() {
     let b = arms_store(|b, block, _, p| {
         let expected = b.constant(block, Ty::I32, 0);
         let desired = b.constant(block, Ty::I32, 1);
-        b.effect(block, memory(Space::Global, MemoryOp::AtomicCmpSwap), vec![p[1], desired, expected, p[0]]);
+        b.effect(block, memory(Space::Global, MemoryOp::AtomicCmpSwap(MemSize::B32)), vec![p[1], desired, expected, p[0]]);
         None
     });
     assert!(converted(&b).is_empty(), "{:?}: both arms swap 1 into the lane's own word when it holds 0", converted(&b));
@@ -4380,7 +4380,7 @@ fn prove_keeps_a_query_whose_arms_swap_the_same_word_against_different_expected_
     let b = arms_store(|b, block, side, p| {
         let expected = b.constant(block, Ty::I32, 2 * side as u64);
         let desired = b.constant(block, Ty::I32, 1);
-        b.effect(block, memory(Space::Global, MemoryOp::AtomicCmpSwap), vec![p[1], desired, expected, p[0]]);
+        b.effect(block, memory(Space::Global, MemoryOp::AtomicCmpSwap(MemSize::B32)), vec![p[1], desired, expected, p[0]]);
         None
     });
     assert!(keeps(&b).is_empty(), "{:?}: one arm swaps 1 in over 0 and the other over 2", keeps(&b));

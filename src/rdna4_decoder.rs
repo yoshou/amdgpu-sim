@@ -1642,8 +1642,8 @@ const DPP16: u16 = 250;
 const DPP8: u16 = 233;
 const DPP8_FI: u16 = 234;
 
-fn decode_dpp(src0: u16, inner: InstFormat, insts: &[u8]) -> InstFormat {
-    let second = buffer::get_u32(insts, 4);
+fn decode_dpp(src0: u16, inner: InstFormat, insts: &[u8], at: usize) -> InstFormat {
+    let second = buffer::get_u32(insts, at);
     let vgpr = (second & 0xff) as u8;
     let inner = Box::new(match inner {
         InstFormat::VOP1(mut i) => {
@@ -1657,6 +1657,14 @@ fn decode_dpp(src0: u16, inner: InstFormat, insts: &[u8]) -> InstFormat {
         InstFormat::VOPC(mut i) => {
             i.src0 = SourceOperand::VectorRegister(vgpr);
             InstFormat::VOPC(i)
+        }
+        InstFormat::VOP3(mut i) => {
+            i.src0 = SourceOperand::VectorRegister(vgpr);
+            InstFormat::VOP3(i)
+        }
+        InstFormat::VOP3SD(mut i) => {
+            i.src0 = SourceOperand::VectorRegister(vgpr);
+            InstFormat::VOP3SD(i)
         }
         other => other,
     });
@@ -1769,7 +1777,7 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
                 vsrc1: get_bits(inst, 16, 9) as u8,
                 op,
             });
-            return Ok((decode_dpp(src0, inner, inst_stream.insts), 8));
+            return Ok((decode_dpp(src0, inner, inst_stream.insts, 4), 8));
         }
         Ok((
             InstFormat::VOPC(VOPC {
@@ -1831,7 +1839,7 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
                 op,
                 vdst: get_bits(inst, 24, 17) as u8,
             });
-            return Ok((decode_dpp(src0, inner, inst_stream.insts), 8));
+            return Ok((decode_dpp(src0, inner, inst_stream.insts, 4), 8));
         }
         Ok((
             InstFormat::VOP1(VOP1 {
@@ -1852,7 +1860,7 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
                 op,
                 literal_constant: None,
             });
-            return Ok((decode_dpp(src0, inner, inst_stream.insts), 8));
+            return Ok((decode_dpp(src0, inner, inst_stream.insts, 4), 8));
         }
         let literal_constant = if size == 8 {
             Some(buffer::get_u32(inst_stream.insts, 4))
@@ -1878,47 +1886,51 @@ pub fn decode_rdna4(inst_stream: InstStream) -> Result<(InstFormat, usize), ()> 
         let omod = get_bits(inst, 60, 59) as u8;
         let neg = get_bits(inst, 63, 61) as u8;
         let (op, size) = decode_vop3_opcode_rdna4(get_bits(inst, 25, 16) as u32)?;
-
-        if has_scalar_destination(&op) {
-            Ok((
-                InstFormat::VOP3SD(VOP3SD {
-                    vdst,
-                    sdst: get_bits(inst, 14, 8) as u8,
-                    cm,
-                    op,
-                    src0: decode_source_operand(src0, &inst_stream.insts[8..]),
-                    src1: decode_source_operand(src1, &inst_stream.insts[8..]),
-                    src2: decode_source_operand(src2, &inst_stream.insts[8..]),
-                    omod,
-                    neg,
-                }),
-                if src0 == 255 || src1 == 255 || src2 == 255 {
-                    size + 4
-                } else {
-                    size
-                },
-            ))
+        let dpp = is_dpp(src0);
+        let source = |field: u16| {
+            if dpp && field == src0 {
+                SourceOperand::VectorRegister(0)
+            } else {
+                decode_source_operand(field, &inst_stream.insts[8..])
+            }
+        };
+        let decoded = if has_scalar_destination(&op) {
+            InstFormat::VOP3SD(VOP3SD {
+                vdst,
+                sdst: get_bits(inst, 14, 8) as u8,
+                cm,
+                op,
+                src0: source(src0),
+                src1: source(src1),
+                src2: source(src2),
+                omod,
+                neg,
+            })
         } else {
-            Ok((
-                InstFormat::VOP3(VOP3 {
-                    vdst,
-                    abs: get_bits(inst, 10, 8) as u8,
-                    opsel: get_bits(inst, 14, 11) as u8,
-                    cm,
-                    op,
-                    src0: decode_source_operand(src0, &inst_stream.insts[8..]),
-                    src1: decode_source_operand(src1, &inst_stream.insts[8..]),
-                    src2: decode_source_operand(src2, &inst_stream.insts[8..]),
-                    omod,
-                    neg,
-                }),
-                if src0 == 255 || src1 == 255 || src2 == 255 {
-                    size + 4
-                } else {
-                    size
-                },
-            ))
+            InstFormat::VOP3(VOP3 {
+                vdst,
+                abs: get_bits(inst, 10, 8) as u8,
+                opsel: get_bits(inst, 14, 11) as u8,
+                cm,
+                op,
+                src0: source(src0),
+                src1: source(src1),
+                src2: source(src2),
+                omod,
+                neg,
+            })
+        };
+        if dpp {
+            return Ok((decode_dpp(src0, decoded, inst_stream.insts, 8), size + 4));
         }
+        Ok((
+            decoded,
+            if src0 == 255 || src1 == 255 || src2 == 255 {
+                size + 4
+            } else {
+                size
+            },
+        ))
     } else if (get_bits(inst, 31, 24) as u32) == VOP3P_ENCODE {
         let vdst = get_bits(inst, 7, 0) as u8;
         let cm = get_bits(inst, 15, 15) as u8;

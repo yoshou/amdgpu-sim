@@ -37,6 +37,13 @@ impl MemSize {
     pub fn signed(self) -> bool {
         matches!(self, Self::I8 | Self::I16)
     }
+    pub fn words(self) -> u32 {
+        if self == Self::B64 {
+            2
+        } else {
+            1
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scope {
@@ -78,23 +85,34 @@ pub struct MemorySemantics {
 pub enum MemoryOp {
     Load(MemSize),
     Store(MemSize),
-    AtomicAdd(Numeric),
-    AtomicRmw(Rmw),
-    AtomicCmpSwap,
+    AtomicAdd(Numeric, MemSize),
+    AtomicRmw(Rmw, MemSize),
+    AtomicCmpSwap(MemSize),
     Fence,
 }
 impl MemoryOp {
     pub fn atomic(self) -> bool {
         matches!(
             self,
-            MemoryOp::AtomicAdd(_) | MemoryOp::AtomicRmw(_) | MemoryOp::AtomicCmpSwap
+            MemoryOp::AtomicAdd(..) | MemoryOp::AtomicRmw(..) | MemoryOp::AtomicCmpSwap(_)
         )
+    }
+    pub fn size(self) -> MemSize {
+        match self {
+            MemoryOp::Load(size)
+            | MemoryOp::Store(size)
+            | MemoryOp::AtomicAdd(_, size)
+            | MemoryOp::AtomicRmw(_, size)
+            | MemoryOp::AtomicCmpSwap(size) => size,
+            MemoryOp::Fence => MemSize::B32,
+        }
     }
     pub fn data_words(self) -> usize {
         match self {
             MemoryOp::Load(_) | MemoryOp::Fence => 0,
-            MemoryOp::AtomicCmpSwap => 2,
-            _ => 1,
+            MemoryOp::AtomicCmpSwap(size) => 2 * size.words() as usize,
+            MemoryOp::AtomicAdd(_, size) | MemoryOp::AtomicRmw(_, size) => size.words() as usize,
+            MemoryOp::Store(_) => 1,
         }
     }
     pub fn mask_input(self) -> usize {
@@ -154,10 +172,13 @@ impl EffectOp {
                 MemoryOp::Load(_) => (vec![space.address_type(), I1], vec![I32]),
                 MemoryOp::Store(MemSize::B64) => (vec![space.address_type(), I64, I1], vec![]),
                 MemoryOp::Store(_) => (vec![space.address_type(), I32, I1], vec![]),
-                MemoryOp::AtomicAdd(_) | MemoryOp::AtomicRmw(_) => {
-                    (vec![space.address_type(), I32, I1], vec![I32])
+                MemoryOp::AtomicAdd(..) | MemoryOp::AtomicRmw(..) | MemoryOp::AtomicCmpSwap(_) => {
+                    let words = op.size().words() as usize;
+                    let mut inputs = vec![space.address_type()];
+                    inputs.extend(std::iter::repeat(I32).take(op.data_words()));
+                    inputs.push(I1);
+                    (inputs, vec![I32; words])
                 }
-                MemoryOp::AtomicCmpSwap => (vec![space.address_type(), I32, I32, I1], vec![I32]),
                 MemoryOp::Fence => (vec![], vec![]),
             },
             Self::Wave(op) => match op {
@@ -224,5 +245,24 @@ impl EffectOp {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_operations_carry_their_width_through_their_words() {
+        let wide_swap = MemoryOp::AtomicCmpSwap(MemSize::B64);
+        assert_eq!(wide_swap.size(), MemSize::B64);
+        assert_eq!(wide_swap.data_words(), 4);
+        assert_eq!(wide_swap.mask_input(), 5);
+        assert_eq!(MemoryOp::AtomicCmpSwap(MemSize::B32).data_words(), 2);
+        assert_eq!(MemoryOp::AtomicAdd(Numeric::Unsigned, MemSize::B64).data_words(), 2);
+        assert_eq!(MemoryOp::AtomicRmw(Rmw::Or, MemSize::B32).data_words(), 1);
+        assert_eq!(MemoryOp::Load(MemSize::U8).size(), MemSize::U8);
+        assert_eq!(MemoryOp::Fence.size(), MemSize::B32);
+        assert!(MemoryOp::AtomicRmw(Rmw::Swap, MemSize::B64).atomic());
     }
 }

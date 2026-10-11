@@ -111,18 +111,19 @@ pub fn shape(
     if access.scalar() {
         return Shape::ScalarWords;
     }
-    if let MemoryOp::AtomicAdd(kind) = access.op {
+    if let MemoryOp::AtomicAdd(kind, size) = access.op {
         let grouped = kind == Numeric::Unsigned
+            && size == MemSize::B32
             && width >= 4
             && access.space == Space::Global
             && !access.returns()
             && !access.semantics.volatile;
         return Shape::AtomicAdd { grouped, kind };
     }
-    if let MemoryOp::AtomicRmw(op) = access.op {
+    if let MemoryOp::AtomicRmw(op, _) = access.op {
         return Shape::AtomicRmw(op);
     }
-    if access.op == MemoryOp::AtomicCmpSwap {
+    if matches!(access.op, MemoryOp::AtomicCmpSwap(_)) {
         return Shape::AtomicCmpSwap;
     }
     let affine = access.form == (Form::Scratch { uniform: true });
@@ -285,6 +286,13 @@ pub fn clusters(
         start += 1;
     }
     out
+}
+
+#[derive(Clone, Copy)]
+enum WideAtomic {
+    Add(Numeric),
+    Rmw(Rmw),
+    CmpSwap,
 }
 
 struct Words {
@@ -644,7 +652,11 @@ impl<'a> Cg<'a> {
         let (addr, exec) = self.vector_address(index);
         let base = self.p.accesses[index].base;
         let nonempty = self.p.holds_a_lane[index];
+        let wide = words.size == MemSize::B64;
         match shape {
+            Shape::AtomicAdd { kind, .. } if wide => self.emit_wide_atomic(addr, exec, words, WideAtomic::Add(kind)),
+            Shape::AtomicRmw(op) if wide => self.emit_wide_atomic(addr, exec, words, WideAtomic::Rmw(op)),
+            Shape::AtomicCmpSwap if wide => self.emit_wide_atomic(addr, exec, words, WideAtomic::CmpSwap),
             Shape::AtomicAdd { grouped, kind } => {
                 let d = self.vector(words.data[0]);
                 if grouped {
@@ -751,6 +763,52 @@ impl<'a> Cg<'a> {
         }
         if let Some(r) = result_id {
             self.define(r, result);
+        }
+    }
+
+    fn wide_lane(&self, lo: Value, hi: Value, k: u32) -> Value {
+        let ir = self.ir;
+        let lo = ir.zext(ir.extract_at(lo, k), ir.i64());
+        let hi = ir.zext(ir.extract_at(hi, k), ir.i64());
+        ir.or(ir.shl(hi, ir.ci64(32)), lo)
+    }
+
+    fn emit_wide_atomic(&mut self, addr: Value, exec: Value, words: &Words, op: WideAtomic) {
+        let ir = self.ir;
+        let packed_exec = self.vec_to_mask(exec);
+        let ptrs = self.ptr_at_vec(addr, 0);
+        let (lo, hi) = (self.vector(words.data[0]), self.vector(words.data[1]));
+        let cmp = matches!(op, WideAtomic::CmpSwap).then(|| (self.vector(words.data[2]), self.vector(words.data[3])));
+        let mut low_result = self.vi32().poison();
+        let mut high_result = self.vi32().poison();
+        for k in 0..self.width() {
+            let bit = ir.and(ir.lshr(packed_exec, self.ci32(k)), self.ci32(1));
+            let active = ir.icmp(IntPred::Ne, bit, self.ci32(0));
+            let ptr = ir.select(active, ir.extract_at(ptrs, k), self.store_sink);
+            let value = self.wide_lane(lo, hi, k);
+            let old = match op {
+                WideAtomic::Add(Numeric::Unsigned) => {
+                    let value = ir.select(active, value, ir.ci64(0));
+                    ir.atomic_add(ptr, value, Atomic::SequentiallyConsistent)
+                }
+                WideAtomic::Add(Numeric::Float) => {
+                    let addend = ir.bitcast(ir.select(active, value, ir.ci64(0)), ir.f64());
+                    let old = ir.atomic_fadd(ptr, addend, Atomic::SequentiallyConsistent);
+                    ir.bitcast(old, ir.i64())
+                }
+                WideAtomic::Rmw(rmw) => ir.atomic_rmw(rmw, ptr, value, Atomic::SequentiallyConsistent),
+                WideAtomic::CmpSwap => {
+                    let (cmp_lo, cmp_hi) = cmp.unwrap();
+                    let expected = self.wide_lane(cmp_lo, cmp_hi, k);
+                    ir.cmpxchg(ptr, expected, value, Atomic::SequentiallyConsistent)
+                }
+            };
+            low_result = ir.insert_at(low_result, ir.trunc(old, ir.i32()), k);
+            high_result = ir.insert_at(high_result, ir.trunc(ir.lshr(old, ir.ci64(32)), ir.i32()), k);
+        }
+        if let [low, high] = words.results[..] {
+            self.define(low, low_result);
+            self.define(high, high_result);
         }
     }
 

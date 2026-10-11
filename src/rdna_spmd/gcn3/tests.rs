@@ -688,6 +688,19 @@ fn reproduce(paths: &[&str]) -> (usize, Vec<String>) {
 }
 
 #[test]
+fn memory_words_count_the_data_of_wide_atomics() {
+    use super::decode::memory_words;
+    assert_eq!(memory_words(I::DS_ADD_RTN_U64), 2);
+    assert_eq!(memory_words(I::DS_MIN_I64), 2);
+    assert_eq!(memory_words(I::DS_MAX_RTN_F64), 2);
+    assert_eq!(memory_words(I::DS_CMPST_RTN_B64), 2);
+    assert_eq!(memory_words(I::FLAT_ATOMIC_ADD_X2), 2);
+    assert_eq!(memory_words(I::DS_ADD_U32), 1);
+    assert_eq!(memory_words(I::FLAT_ATOMIC_ADD), 1);
+    assert_eq!(memory_words(I::BUFFER_LOAD_DWORDX4), 4);
+}
+
+#[test]
 fn decoding_reproduces_the_llvm_disassembly_of_every_gfx803_object() {
     let (count, mismatches) = reproduce(&OBJECTS);
     assert!(count > 9000, "only {} instructions", count);

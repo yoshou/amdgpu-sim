@@ -176,7 +176,7 @@ pub fn memory_words(op: I) -> u32 {
         4
     } else if n.ends_with("X3") || n.ends_with("XYZ") || n.ends_with("B96") {
         3
-    } else if n.ends_with("X2") || n.ends_with("XY") || n.ends_with("B64") {
+    } else if n.ends_with("X2") || n.ends_with("XY") || n.ends_with("B64") || n.ends_with("U64") || n.ends_with("I64") || n.ends_with("F64") {
         2
     } else {
         1

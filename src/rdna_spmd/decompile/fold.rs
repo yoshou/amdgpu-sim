@@ -402,14 +402,14 @@ mod tests {
         let c = b.cmp(e, IntPred::Ult, lane, five);
         let mask = b.int(e, IntOp::And, c, k.exec);
         b.store(e, Space::Global, MemSize::B32, buf, lane, mask);
-        b.effect(e, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned)), vec![buf, lane, mask]);
+        b.effect(e, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned, MemSize::B32)), vec![buf, lane, mask]);
         let mut f = b.f;
         fold(&mut f, &b.inputs, &BTreeSet::new(), Some(0));
         assert_eq!(stores(&f, e).len(), 1);
         assert!(f.blocks[&e]
             .insts
             .iter()
-            .any(|i| matches!(i, Inst::Effect { op: EffectOp::Memory { op: MemoryOp::AtomicAdd(_), .. }, .. })));
+            .any(|i| matches!(i, Inst::Effect { op: EffectOp::Memory { op: MemoryOp::AtomicAdd(..), .. }, .. })));
     }
 
     #[test]

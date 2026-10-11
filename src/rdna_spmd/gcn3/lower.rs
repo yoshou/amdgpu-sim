@@ -1107,6 +1107,19 @@ fn global(inst: &Inst) -> Option<I> {
         I::FLAT_ATOMIC_SUB => I::GLOBAL_ATOMIC_SUB_U32,
         I::FLAT_ATOMIC_INC => I::GLOBAL_ATOMIC_INC_U32,
         I::FLAT_ATOMIC_DEC => I::GLOBAL_ATOMIC_DEC_U32,
+        I::FLAT_ATOMIC_ADD_X2 => I::GLOBAL_ATOMIC_ADD_U64,
+        I::FLAT_ATOMIC_SMIN_X2 => I::GLOBAL_ATOMIC_MIN_I64,
+        I::FLAT_ATOMIC_SMAX_X2 => I::GLOBAL_ATOMIC_MAX_I64,
+        I::FLAT_ATOMIC_UMIN_X2 => I::GLOBAL_ATOMIC_MIN_U64,
+        I::FLAT_ATOMIC_UMAX_X2 => I::GLOBAL_ATOMIC_MAX_U64,
+        I::FLAT_ATOMIC_CMPSWAP_X2 => I::GLOBAL_ATOMIC_CMPSWAP_B64,
+        I::FLAT_ATOMIC_AND_X2 => I::GLOBAL_ATOMIC_AND_B64,
+        I::FLAT_ATOMIC_OR_X2 => I::GLOBAL_ATOMIC_OR_B64,
+        I::FLAT_ATOMIC_XOR_X2 => I::GLOBAL_ATOMIC_XOR_B64,
+        I::FLAT_ATOMIC_SWAP_X2 => I::GLOBAL_ATOMIC_SWAP_B64,
+        I::FLAT_ATOMIC_SUB_X2 => I::GLOBAL_ATOMIC_SUB_U64,
+        I::FLAT_ATOMIC_INC_X2 => I::GLOBAL_ATOMIC_INC_U64,
+        I::FLAT_ATOMIC_DEC_X2 => I::GLOBAL_ATOMIC_DEC_U64,
         _ => return None,
     })
 }
@@ -1208,10 +1221,35 @@ fn local(op: I) -> Option<I> {
         | I::DS_INC_U32
         | I::DS_INC_RTN_U32
         | I::DS_DEC_U32
-        | I::DS_DEC_RTN_U32 => op,
+        | I::DS_DEC_RTN_U32
+        | I::DS_ADD_U64
+        | I::DS_ADD_RTN_U64
+        | I::DS_MIN_I64
+        | I::DS_MIN_RTN_I64
+        | I::DS_MAX_I64
+        | I::DS_MAX_RTN_I64
+        | I::DS_MIN_U64
+        | I::DS_MIN_RTN_U64
+        | I::DS_MAX_U64
+        | I::DS_MAX_RTN_U64
+        | I::DS_AND_B64
+        | I::DS_AND_RTN_B64
+        | I::DS_OR_B64
+        | I::DS_OR_RTN_B64
+        | I::DS_XOR_B64
+        | I::DS_XOR_RTN_B64
+        | I::DS_SUB_U64
+        | I::DS_SUB_RTN_U64
+        | I::DS_INC_U64
+        | I::DS_INC_RTN_U64
+        | I::DS_DEC_U64
+        | I::DS_DEC_RTN_U64 => op,
         I::DS_WRXCHG_RTN_B32 => I::DS_STOREXCHG_RTN_B32,
+        I::DS_WRXCHG_RTN_B64 => I::DS_STOREXCHG_RTN_B64,
         I::DS_CMPST_B32 => I::DS_CMPSTORE_B32,
         I::DS_CMPST_RTN_B32 => I::DS_CMPSTORE_RTN_B32,
+        I::DS_CMPST_B64 => I::DS_CMPSTORE_B64,
+        I::DS_CMPST_RTN_B64 => I::DS_CMPSTORE_RTN_B64,
         _ => return None,
     })
 }
@@ -1239,7 +1277,7 @@ fn ds(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String> {
             _ => return Err(refuse(inst, "runs while M0 may clamp the local data share")),
         }
     }
-    let (data0, data1) = if matches!(inst.op, I::DS_CMPST_B32 | I::DS_CMPST_RTN_B32) {
+    let (data0, data1) = if matches!(inst.op, I::DS_CMPST_B32 | I::DS_CMPST_RTN_B32 | I::DS_CMPST_B64 | I::DS_CMPST_RTN_B64) {
         (data1, data0)
     } else {
         (data0, data1)

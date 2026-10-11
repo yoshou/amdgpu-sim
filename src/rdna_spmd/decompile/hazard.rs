@@ -389,19 +389,19 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                     outputs,
                 } => {
                     let output = outputs.first().map(|o| o.0);
-                    let used = output.is_some_and(|o| !facts.uses[o.0].is_empty());
+                    let used = outputs.iter().any(|o| !facts.uses[o.0 .0].is_empty());
                     let (kind, bytes) = match *op {
                         MemoryOp::Fence => continue,
                         MemoryOp::Load(size) => (Kind::Read, size.bytes()),
                         MemoryOp::Store(size) => (Kind::Write, size.bytes()),
-                        MemoryOp::AtomicAdd(Numeric::Unsigned) => (
+                        MemoryOp::AtomicAdd(Numeric::Unsigned, size) => (
                             Kind::Update {
                                 commutes: Some(Commutes::Add),
                                 used,
                             },
-                            4,
+                            size.bytes(),
                         ),
-                        MemoryOp::AtomicRmw(rmw) => (
+                        MemoryOp::AtomicRmw(rmw, size) => (
                             Kind::Update {
                                 commutes: (!matches!(
                                     rmw,
@@ -412,14 +412,14 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                                 .then_some(Commutes::Rmw(rmw)),
                                 used,
                             },
-                            4,
+                            size.bytes(),
                         ),
-                        MemoryOp::AtomicAdd(Numeric::Float) | MemoryOp::AtomicCmpSwap => (
+                        MemoryOp::AtomicAdd(Numeric::Float, size) | MemoryOp::AtomicCmpSwap(size) => (
                             Kind::Update {
                                 commutes: None,
                                 used,
                             },
-                            4,
+                            size.bytes(),
                         ),
                     };
                     out.push(Access {
@@ -2642,7 +2642,7 @@ mod tests {
         let out = k.buffer(&mut b, e, 8);
         let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
         let data = |op: MemoryOp| match op {
-            MemoryOp::AtomicCmpSwap => vec![lane, lane],
+            MemoryOp::AtomicCmpSwap(_) => vec![lane, lane],
             _ => vec![lane],
         };
         let a1 = b.here(e);
@@ -2663,13 +2663,13 @@ mod tests {
     fn find_orders_atomics_only_when_their_order_can_show() {
         use MemoryOp::*;
         let cases = [
-            ("two unsigned adds nobody reads", AtomicAdd(Numeric::Unsigned), AtomicAdd(Numeric::Unsigned), false, false),
-            ("an unsigned add whose old value is kept", AtomicAdd(Numeric::Unsigned), AtomicAdd(Numeric::Unsigned), true, true),
-            ("two float adds nobody reads", AtomicAdd(Numeric::Float), AtomicAdd(Numeric::Float), false, true),
-            ("two unsigned maxima nobody reads", AtomicRmw(Rmw::UnsignedMax), AtomicRmw(Rmw::UnsignedMax), false, false),
-            ("a maximum and a minimum nobody reads", AtomicRmw(Rmw::UnsignedMax), AtomicRmw(Rmw::UnsignedMin), false, true),
-            ("an unsigned add and a maximum nobody reads", AtomicAdd(Numeric::Unsigned), AtomicRmw(Rmw::UnsignedMax), false, true),
-            ("two compare-and-swaps", AtomicCmpSwap, AtomicCmpSwap, false, true),
+            ("two unsigned adds nobody reads", AtomicAdd(Numeric::Unsigned, MemSize::B32), AtomicAdd(Numeric::Unsigned, MemSize::B32), false, false),
+            ("an unsigned add whose old value is kept", AtomicAdd(Numeric::Unsigned, MemSize::B32), AtomicAdd(Numeric::Unsigned, MemSize::B32), true, true),
+            ("two float adds nobody reads", AtomicAdd(Numeric::Float, MemSize::B32), AtomicAdd(Numeric::Float, MemSize::B32), false, true),
+            ("two unsigned maxima nobody reads", AtomicRmw(Rmw::UnsignedMax, MemSize::B32), AtomicRmw(Rmw::UnsignedMax, MemSize::B32), false, false),
+            ("a maximum and a minimum nobody reads", AtomicRmw(Rmw::UnsignedMax, MemSize::B32), AtomicRmw(Rmw::UnsignedMin, MemSize::B32), false, true),
+            ("an unsigned add and a maximum nobody reads", AtomicAdd(Numeric::Unsigned, MemSize::B32), AtomicRmw(Rmw::UnsignedMax, MemSize::B32), false, true),
+            ("two compare-and-swaps", AtomicCmpSwap(MemSize::B32), AtomicCmpSwap(MemSize::B32), false, true),
         ];
         let wrong: Vec<(&str, bool)> = cases
             .iter()
@@ -3455,6 +3455,38 @@ mod tests {
         let (s1, s2) = twice(&mut b, join, j[1], j[0]);
         let h = Hazards::find(&b.program(), &env2());
         assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "lane a stores to 8a or 8a + 4, which no other lane touches");
+    }
+
+    #[test]
+    fn a_wide_atomic_is_an_eight_byte_update_whose_high_word_counts_as_a_use() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 8);
+        let zero = b.constant(e, Ty::I32, 0);
+        let one = b.constant(e, Ty::I32, 1);
+        let out = b.effect(e, memory(Space::Global, MemoryOp::AtomicAdd(Numeric::Unsigned, MemSize::B64)), vec![own, one, zero, k.exec]);
+        assert_eq!(out.len(), 2);
+        let high = b.int(e, IntOp::Add, out[1], one);
+        b.store(e, Space::Global, MemSize::B32, own, high, k.exec);
+        let unread = b.effect(e, memory(Space::Global, MemoryOp::AtomicRmw(Rmw::UnsignedMax, MemSize::B64)), vec![own, one, zero, k.exec]);
+        assert_eq!(unread.len(), 2);
+        let program = b.program();
+        let facts = Facts::new(&program.ir, &program.parameter_inputs, &BTreeSet::new());
+        let accesses = accesses(&program, &facts, Some(0));
+        let wide: Vec<(u32, Kind)> = accesses
+            .iter()
+            .filter(|a| matches!(a.kind, Kind::Update { .. }))
+            .map(|a| (a.bytes, a.kind))
+            .collect();
+        assert_eq!(
+            wide,
+            vec![
+                (8, Kind::Update { commutes: Some(Commutes::Add), used: true }),
+                (8, Kind::Update { commutes: Some(Commutes::Rmw(Rmw::UnsignedMax)), used: false }),
+            ]
+        );
     }
 
     #[test]

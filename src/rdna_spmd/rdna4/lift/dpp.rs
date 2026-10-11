@@ -3,33 +3,33 @@ use super::*;
 use crate::rdna_instructions::DPP;
 use crate::rdna_spmd::ir::{Env, WaveOp};
 
-pub const INDEX: u32 = 253;
-pub const VALUE: u32 = 254;
+pub const INDEX: u32 = 252;
+pub const VALUE: u32 = 253;
 pub const ENABLE: u32 = 255;
-pub const TEMPORARIES: [u32; 3] = [INDEX, VALUE, ENABLE];
+pub const TEMPORARIES: [u32; 4] = [INDEX, VALUE, VALUE + 1, ENABLE];
 
-fn source_operand(inner: &InstFormat) -> &SourceOperand {
+fn source_operand(inner: &InstFormat) -> Result<&SourceOperand, String> {
     match inner {
-        InstFormat::VOP1(i) => &i.src0,
-        InstFormat::VOP2(i) => &i.src0,
-        InstFormat::VOPC(i) => &i.src0,
-        InstFormat::VOP3(i) => &i.src0,
-        InstFormat::VOP3SD(i) => &i.src0,
-        other => panic!("DPP wraps a format it cannot modify: {:?}", other),
+        InstFormat::VOP1(i) => Ok(&i.src0),
+        InstFormat::VOP2(i) => Ok(&i.src0),
+        InstFormat::VOPC(i) => Ok(&i.src0),
+        InstFormat::VOP3(i) => Ok(&i.src0),
+        InstFormat::VOP3SD(i) => Ok(&i.src0),
+        other => Err(format!("DPP wraps a format it cannot modify: {}", super::opcode(other))),
     }
 }
 
-fn source_register(inner: &InstFormat) -> u32 {
-    match source_operand(inner) {
-        SourceOperand::VectorRegister(r) => *r as u32,
-        other => panic!("DPP reads a source other than a VGPR: {:?}", other),
+fn source_register(inner: &InstFormat) -> Result<u32, String> {
+    match source_operand(inner)? {
+        SourceOperand::VectorRegister(r) => Ok(*r as u32),
+        other => Err(format!("DPP reads a source other than a VGPR: {:?}", other)),
     }
 }
 
-fn with_source(inner: &InstFormat, register: u32, abs: u8, neg: u8) -> InstFormat {
+fn with_source(inner: &InstFormat, register: u32, abs: u8, neg: u8) -> Result<InstFormat, String> {
     let replaced = SourceOperand::VectorRegister(register as u8);
     let modified = abs | neg != 0;
-    match inner.clone() {
+    Ok(match inner.clone() {
         InstFormat::VOP1(i) if modified => InstFormat::VOP3(crate::rdna_instructions::VOP3 {
             vdst: i.vdst,
             abs,
@@ -77,11 +77,11 @@ fn with_source(inner: &InstFormat, register: u32, abs: u8, neg: u8) -> InstForma
             i.neg |= neg;
             InstFormat::VOP3SD(i)
         }
-        other => panic!("DPP wraps a format it cannot modify: {:?}", other),
-    }
+        other => return Err(format!("DPP wraps a format it cannot modify: {}", super::opcode(&other))),
+    })
 }
 
-pub fn gated(lowering: Lowering, enable: u32, registry: &DialectRegistry) -> Lowering {
+pub fn gated(lowering: Lowering, enable: u32, registry: &DialectRegistry) -> Result<Lowering, String> {
     use crate::rdna_spmd::ir::ExprInst;
     let Lowering::TypedAlu {
         inputs,
@@ -90,9 +90,11 @@ pub fn gated(lowering: Lowering, enable: u32, registry: &DialectRegistry) -> Low
         expr,
     } = lowering
     else {
-        panic!("DPP gates a lowering that is not an ALU expression")
+        return Err("DPP gates a lowering that is not an ALU expression".to_string());
     };
-    assert!(!scalar, "DPP gates a scalar result");
+    if scalar {
+        return Err("DPP gates a scalar result".to_string());
+    }
     let expr = expr.expr().clone();
     let n = inputs.len();
     let mut all = inputs;
@@ -100,14 +102,13 @@ pub fn gated(lowering: Lowering, enable: u32, registry: &DialectRegistry) -> Low
     for output in &outputs {
         match *output {
             Output::Vgpr(r, ty) => {
-                assert_eq!(ty.bits(), 32, "DPP gates a result wider than a word");
-                all.push(input(SourceOperand::VectorRegister(r as u8), Ty::I32));
+                let old = if ty.bits() == 64 { Ty::I64 } else { Ty::I32 };
+                all.push(input(SourceOperand::VectorRegister(r as u8), old));
             }
-            Output::Mask(r) | Output::Compare(r) => all.push(Input {
-                source: InputSource::MaskBit(r),
-                ty: Ty::I1,
-            }),
-            other => panic!("DPP gates a result it cannot keep: {:?}", other),
+            Output::Mask(r) | Output::Compare(r) => {
+                all.push(input(SourceOperand::ScalarRegister(r as u8), Ty::I1));
+            }
+            other => return Err(format!("DPP gates a result it cannot keep: {:?}", other)),
         }
         olds.push(ValueId(all.len() - 1));
     }
@@ -131,7 +132,7 @@ pub fn gated(lowering: Lowering, enable: u32, registry: &DialectRegistry) -> Low
     let mut results = Vec::new();
     for ((output, result), old) in outputs.iter().zip(expr.results).zip(olds) {
         let ty = output.ty();
-        let old = if matches!(ty, Ty::I32 | Ty::I1) {
+        let old = if matches!(ty, Ty::I32 | Ty::I64 | Ty::I1) {
             old
         } else {
             q.push(ty, Op::Convert(Cvt::Bitcast, ty, old))
@@ -139,10 +140,10 @@ pub fn gated(lowering: Lowering, enable: u32, registry: &DialectRegistry) -> Low
         let kept = q.push(ty, Op::Select(on, remap(result), old));
         results.push((*output, kept));
     }
-    q.finish_many(false, results)
+    Ok(q.finish_many(false, results))
 }
 
-fn selection(q: &mut Builder, d: &DPP, lanes: u32) -> (ValueId, ValueId) {
+fn selection(q: &mut Builder, d: &DPP, lanes: u32) -> Result<(ValueId, ValueId), String> {
     let lane = q.push(Ty::I32, Op::Env(Env::LaneId));
     let k = |q: &mut Builder, v: u64| q.k(Ty::I32, v);
     let fifteen = k(q, 15);
@@ -167,10 +168,10 @@ fn selection(q: &mut Builder, d: &DPP, lanes: u32) -> (ValueId, ValueId) {
         let chosen = q.int(IntOp::LShr, packed, shift);
         let chosen = q.int(IntOp::And, chosen, seven);
         let group = q.int(IntOp::Xor, lane, low);
-        return (q.int(IntOp::Or, group, chosen), truth);
+        return Ok((q.int(IntOp::Or, group, chosen), truth));
     }
     let ctrl = d.ctrl as u64;
-    match ctrl {
+    Ok(match ctrl {
         0x000..=0x0ff => {
             let three = k(q, 3);
             let quad = q.int(IntOp::And, lane, three);
@@ -252,13 +253,13 @@ fn selection(q: &mut Builder, d: &DPP, lanes: u32) -> (ValueId, ValueId) {
             let flipped = q.int(IntOp::Xor, column, n);
             (q.int(IntOp::Or, row_base, flipped), truth)
         }
-        _ => panic!("DPP control {:#x} has no lowering", ctrl),
-    }
+        _ => return Err(format!("DPP control {:#x} has no lowering", ctrl)),
+    })
 }
 
-fn plan(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Lowering {
+fn plan(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Result<Lowering, String> {
     let mut q = Builder::new(registry, vec![]);
-    let (source, in_range) = selection(&mut q, d, lanes);
+    let (source, in_range) = selection(&mut q, d, lanes)?;
     let lane = q.push(Ty::I32, Op::Env(Env::LaneId));
     let four = q.k(Ty::I32, 4);
     let row = q.int(IntOp::LShr, lane, four);
@@ -277,21 +278,21 @@ fn plan(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Lowering {
     let in_range = q.push(Ty::I32, Op::Convert(Cvt::ZExt, Ty::I32, in_range));
     let flags = q.int(IntOp::Or, enabled, in_range);
     let address = q.int(IntOp::Shl, source, two);
-    q.finish_many(
+    Ok(q.finish_many(
         false,
         vec![
             (Output::Vgpr(INDEX, Ty::I32), address),
             (Output::Vgpr(ENABLE, Ty::I32), flags),
         ],
-    )
+    ))
 }
 
-fn fetch(fi: bool, source: u32) -> Lowering {
+fn fetch(fi: bool, source: u32, destination: u32) -> Lowering {
     let v = |r: u32| Operand::Source(SourceOperand::VectorRegister(r as u8));
     Lowering::Wave(YieldAction::new(
         EffectOp::Wave(if fi { WaveOp::BpermuteFi } else { WaveOp::Bpermute }),
         vec![v(INDEX), v(source), Operand::Exec],
-        vec![Destination::Vgpr(VALUE)],
+        vec![Destination::Vgpr(destination)],
     ))
 }
 
@@ -304,13 +305,14 @@ fn presence() -> Lowering {
     ))
 }
 
-fn gate(fi: bool, bound_ctrl: bool, registry: &DialectRegistry) -> Lowering {
+fn gate(fi: bool, bound_ctrl: bool, wide: bool, registry: &DialectRegistry) -> Lowering {
     let mut inputs = vec![
         input(SourceOperand::VectorRegister(VALUE as u8), Ty::I32),
         input(SourceOperand::VectorRegister(ENABLE as u8), Ty::I32),
+        input(SourceOperand::VectorRegister(INDEX as u8), Ty::I32),
     ];
-    if !fi {
-        inputs.push(input(SourceOperand::VectorRegister(INDEX as u8), Ty::I32));
+    if wide {
+        inputs.push(input(SourceOperand::VectorRegister(VALUE as u8 + 1), Ty::I32));
     }
     let mut q = Builder::new(registry, inputs);
     let one = q.k(Ty::I32, 1);
@@ -330,25 +332,38 @@ fn gate(fi: bool, bound_ctrl: bool, registry: &DialectRegistry) -> Lowering {
     let zero = q.k(Ty::I32, 0);
     let present = q.push(Ty::I1, Op::Cmp(IntPred::Ne, valid, zero));
     let value = q.push(Ty::I32, Op::Select(present, ValueId(0), zero));
-    q.finish_many(
-        false,
-        vec![
-            (Output::Vgpr(VALUE, Ty::I32), value),
-            (Output::Vgpr(ENABLE, Ty::I32), enabled),
-        ],
-    )
+    let mut outputs = vec![
+        (Output::Vgpr(VALUE, Ty::I32), value),
+        (Output::Vgpr(ENABLE, Ty::I32), enabled),
+    ];
+    if wide {
+        let high = q.push(Ty::I32, Op::Select(present, ValueId(3), zero));
+        outputs.push((Output::Vgpr(VALUE + 1, Ty::I32), high));
+    }
+    q.finish_many(false, outputs)
+}
+
+fn moved(lowering: &Lowering) -> Result<bool, String> {
+    match lowering {
+        Lowering::TypedAlu { inputs, .. } => Ok(inputs.first().is_some_and(|i| i.ty.bits() == 64)),
+        _ => Err("DPP gates a lowering that is not an ALU expression".to_string()),
+    }
 }
 
 pub fn lowerings(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Result<Vec<Lowering>, String> {
-    let source = source_register(&d.inner);
-    let mut out = vec![plan(d, registry, lanes), fetch(d.fi, source)];
+    let source = source_register(&d.inner)?;
+    let inner = with_source(&d.inner, VALUE, d.abs, d.neg)?;
+    let lowering = super::instruction_with_registry(&inner, registry, lanes)?;
+    let wide = moved(&lowering)?;
+    let mut out = vec![plan(d, registry, lanes)?, fetch(d.fi, source, VALUE)];
+    if wide {
+        out.push(fetch(d.fi, source + 1, VALUE + 1));
+    }
     if !d.fi {
         out.push(presence());
     }
-    out.push(gate(d.fi, d.bound_ctrl, registry));
-    let inner = with_source(&d.inner, VALUE, d.abs, d.neg);
-    let lowering = super::instruction_with_registry(&inner, registry, lanes)?;
-    out.push(gated(lowering, ENABLE, registry));
+    out.push(gate(d.fi, d.bound_ctrl, wide, registry));
+    out.push(gated(lowering, ENABLE, registry)?);
     Ok(out)
 }
 
@@ -397,21 +412,98 @@ pub fn permlane_lowerings(
 ) -> Result<Vec<Lowering>, String> {
     let source = match i.src0 {
         SourceOperand::VectorRegister(r) => r as u32,
-        ref other => panic!("permlane reads a source other than a VGPR: {:?}", other),
+        ref other => return Err(format!("permlane reads a source other than a VGPR: {:?}", other)),
     };
     let fi = i.opsel & 1 != 0;
     let bound_ctrl = i.opsel & 2 != 0;
-    let mut out = vec![permlane_plan(i, registry), fetch(fi, source)];
+    let mut out = vec![permlane_plan(i, registry), fetch(fi, source, VALUE)];
     if !fi {
         out.push(presence());
     }
-    out.push(gate(fi, bound_ctrl, registry));
+    out.push(gate(fi, bound_ctrl, false, registry));
     let moved = InstFormat::VOP1(crate::rdna_instructions::VOP1 {
         src0: SourceOperand::VectorRegister(VALUE as u8),
         op: I::V_MOV_B32,
         vdst: i.vdst,
     });
     let lowering = super::instruction_with_registry(&moved, registry, lanes)?;
-    out.push(gated(lowering, ENABLE, registry));
+    out.push(gated(lowering, ENABLE, registry)?);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdna_instructions::{VOP1, VOP3};
+
+    fn wrapped(inner: InstFormat, ctrl: u16) -> DPP {
+        DPP {
+            inner: Box::new(inner),
+            ctrl,
+            sel: None,
+            row_mask: 0xf,
+            bank_mask: 0xf,
+            bound_ctrl: false,
+            fi: false,
+            neg: 0,
+            abs: 0,
+        }
+    }
+
+    fn moved_word(src0: SourceOperand) -> InstFormat {
+        InstFormat::VOP1(VOP1 {
+            src0,
+            op: I::V_MOV_B32,
+            vdst: 6,
+        })
+    }
+
+    #[test]
+    fn a_dpp_source_outside_the_vgprs_or_an_unknown_control_is_refused() {
+        let registry = crate::rdna_spmd::rdna4::dialect().registry;
+        let scalar = wrapped(moved_word(SourceOperand::ScalarRegister(3)), 0x111);
+        assert_eq!(
+            lowerings(&scalar, &registry, 32).err().as_deref(),
+            Some("DPP reads a source other than a VGPR: ScalarRegister(3)")
+        );
+        let unknown = wrapped(moved_word(SourceOperand::VectorRegister(1)), 0x1ff);
+        assert_eq!(lowerings(&unknown, &registry, 32).err().as_deref(), Some("DPP control 0x1ff has no lowering"));
+    }
+
+    #[test]
+    fn a_dpp_operand_of_two_words_fetches_both_halves_and_keeps_a_wide_result() {
+        let registry = crate::rdna_spmd::rdna4::dialect().registry;
+        let add = InstFormat::VOP3(VOP3 {
+            vdst: 6,
+            abs: 0,
+            opsel: 0,
+            cm: 0,
+            op: I::V_ADD_F64,
+            src0: SourceOperand::VectorRegister(0),
+            src1: SourceOperand::VectorRegister(2),
+            src2: SourceOperand::IntegerConstant(0),
+            omod: 0,
+            neg: 0,
+        });
+        let wide = lowerings(&wrapped(add, 0x153), &registry, 32).unwrap();
+        assert_eq!(wide.len(), 6, "plan, two fetches, presence, gate and the gated add");
+        let fetched: Vec<u32> = wide[1..3]
+            .iter()
+            .map(|l| match l {
+                Lowering::Wave(action) => match action.outputs[0] {
+                    Destination::Vgpr(r) => r,
+                    ref other => panic!("{:?}", other),
+                },
+                _ => panic!("a fetch is a wave action"),
+            })
+            .collect();
+        assert_eq!(fetched, vec![VALUE, VALUE + 1]);
+        let Lowering::TypedAlu { outputs, inputs, .. } = &wide[5] else {
+            panic!("the gated add is an ALU expression")
+        };
+        assert!(matches!(outputs[..], [Output::Vgpr(6, Ty::F64)]), "{:?}", outputs);
+        assert!(inputs.iter().any(|i| i.ty == Ty::I64), "the old pair is an input");
+        let narrow = lowerings(&wrapped(moved_word(SourceOperand::VectorRegister(1)), 0x111), &registry, 32).unwrap();
+        assert_eq!(narrow.len(), 5, "a one-word source needs one fetch");
+    }
 }
