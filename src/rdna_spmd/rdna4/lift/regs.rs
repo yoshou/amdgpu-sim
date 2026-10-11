@@ -158,11 +158,12 @@ impl Operands {
             self.bindings.push((input.clone(), value));
             return value;
         }
-        if matches!(
-            input.source,
-            InputSource::Operand(SourceOperand::PrivateBase)
-        ) {
-            let raw = core(f, &mut self.core, Ty::I64, Op::Env(Env::ScratchBase));
+        if let InputSource::Operand(aperture @ (SourceOperand::PrivateBase | SourceOperand::SharedBase)) = input.source {
+            let raw = if matches!(aperture, SourceOperand::PrivateBase) {
+                core(f, &mut self.core, Ty::I64, Op::Env(Env::ScratchBase))
+            } else {
+                core(f, &mut self.core, Ty::I64, Op::Const(Ty::I64, crate::rdna_spmd::SHARED_APERTURE))
+            };
             let value = if input.ty == Ty::I64 {
                 raw
             } else {

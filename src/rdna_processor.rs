@@ -1085,7 +1085,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f32_to_u32(value as f32),
             SourceOperand::ScalarRegister(value) => self.read_sgpr(value as usize),
             SourceOperand::VectorRegister(_) => panic!(),
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1097,6 +1097,7 @@ impl SIMD32 {
             SourceOperand::ScalarRegister(value) => self.read_sgpr_pair(value as usize),
             SourceOperand::VectorRegister(_) => panic!(),
             SourceOperand::PrivateBase => self.ctx.scratch.borrow_mut().as_ptr() as u64,
+            SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1116,7 +1117,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f32_to_u32(value as f32),
             SourceOperand::ScalarRegister(value) => self.read_sgpr(value as usize),
             SourceOperand::VectorRegister(value) => self.read_vgpr(elem, value as usize),
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1131,7 +1132,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 f16::from_bits((self.read_vgpr(elem, value as usize) & 0xFFFF) as u16)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1146,7 +1147,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 f16::from_bits(((self.read_vgpr(elem, value as usize) >> 16) & 0xFFFF) as u16)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1212,7 +1213,7 @@ impl SIMD32 {
                 }
                 return result;
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1223,7 +1224,7 @@ impl SIMD32 {
             SourceOperand::FloatConstant(value) => f64_to_u64(value),
             SourceOperand::ScalarRegister(value) => self.read_sgpr_pair(value as usize),
             SourceOperand::VectorRegister(value) => self.read_vgpr_pair(elem, value as usize),
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1236,7 +1237,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 u32_to_f32(self.read_vgpr(elem, value as usize))
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1272,7 +1273,7 @@ impl SIMD32 {
                 }
                 return result;
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1285,7 +1286,7 @@ impl SIMD32 {
             SourceOperand::VectorRegister(value) => {
                 u64_to_f64(self.read_vgpr_pair(elem, value as usize))
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 

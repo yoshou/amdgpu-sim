@@ -617,10 +617,14 @@ impl<'a> Cg<'a> {
     fn vector_address(&mut self, index: usize) -> (Value, Value) {
         let ir = self.ir;
         let access = &self.p.accesses[index];
-        let (space, inside, address, mask) =
-            (access.space, access.inside, access.address, access.mask);
+        let (space, inside, shared, address, mask) =
+            (access.space, access.inside, access.shared, access.address, access.mask);
         let mut addr = self.vector(address);
-        let exec = self.vector(mask);
+        let mut exec = self.vector(mask);
+        if let Some(shared) = shared {
+            let shared = self.vector(shared);
+            exec = ir.and(exec, ir.not(shared));
+        }
         if space == Space::Scratch {
             addr = ir.add(self.scratch_vec, ir.sext(addr, self.vi64()));
         }

@@ -1264,6 +1264,7 @@ fn flushing_wraps_only_the_operations_that_honor_the_mode() {
             &registry,
             64,
         )
+        .unwrap()
     };
     let size = |l: &Lowering| match l {
         Lowering::TypedAlu { expr, .. } => expr.expr().insts.len(),

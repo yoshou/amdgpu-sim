@@ -55,6 +55,7 @@ fn entry(f: &Func, inputs: &[Parameter], layout: &crate::rdna_spmd::engine::Entr
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fact {
     Uniform,
+    Mask,
     Affine {
         stride: i64,
         span: Option<(u32, u32)>,
@@ -63,6 +64,9 @@ pub enum Fact {
 }
 
 impl Fact {
+    pub fn uniform(self) -> bool {
+        matches!(self, Self::Uniform | Self::Mask)
+    }
     fn meet(self, other: Self) -> Self {
         match (self, other) {
             (Self::Affine { stride: a, span: x }, Self::Affine { stride: b, span: y })
@@ -74,20 +78,22 @@ impl Fact {
                 }
             }
             _ if self == other => self,
+            _ if self.uniform() && other.uniform() => Self::Uniform,
             _ => Self::Varying,
         }
     }
     fn join_all(a: Self, b: Self) -> Self {
-        match (a, b) {
-            (Self::Uniform, Self::Uniform) => Self::Uniform,
-            _ => Self::Varying,
+        if a.uniform() && b.uniform() {
+            Self::Uniform
+        } else {
+            Self::Varying
         }
     }
     fn add(self, other: Self, negate: bool) -> Self {
         match (self, other) {
-            (Self::Uniform, Self::Uniform) => Self::Uniform,
-            (Self::Affine { stride, .. }, Self::Uniform) => Self::Affine { stride, span: None },
-            (Self::Uniform, Self::Affine { stride, .. }) => Self::Affine {
+            (a, b) if a.uniform() && b.uniform() => Self::Uniform,
+            (Self::Affine { stride, .. }, b) if b.uniform() => Self::Affine { stride, span: None },
+            (a, Self::Affine { stride, .. }) if a.uniform() => Self::Affine {
                 stride: if negate {
                     stride.wrapping_neg()
                 } else {
@@ -137,7 +143,7 @@ impl Fact {
         }
         let cleared = whole & !mask;
         match self {
-            Self::Uniform => Self::Uniform,
+            Self::Uniform | Self::Mask => Self::Uniform,
             Self::Affine {
                 stride,
                 span: Some((start, end)),
@@ -178,7 +184,7 @@ impl Fact {
             return self;
         }
         match self {
-            Self::Uniform => Self::Uniform,
+            Self::Uniform | Self::Mask => Self::Uniform,
             Self::Affine {
                 span: Some((_, end)),
                 ..
@@ -199,6 +205,7 @@ impl Fact {
     fn shifted_left(self, amount: u64, bits: u32) -> Self {
         let amount = amount & (bits as u64 - 1);
         match self {
+            Self::Mask if amount != 0 => Self::Uniform,
             Self::Affine { stride, span } => Self::Affine {
                 stride: stride.wrapping_shl(amount as u32),
                 span: span
@@ -211,6 +218,7 @@ impl Fact {
 
     fn widened(self, bits: u32, signed: bool) -> Self {
         match self {
+            Self::Mask if !signed => Self::Uniform,
             Self::Affine {
                 span: Some((_, end)),
                 ..
@@ -244,10 +252,7 @@ pub struct Uniformity {
 
 impl Uniformity {
     pub fn uniform(&self) -> Vec<bool> {
-        self.facts
-            .iter()
-            .map(|&fact| fact == Fact::Uniform)
-            .collect()
+        self.facts.iter().map(|fact| fact.uniform()).collect()
     }
 }
 
@@ -264,7 +269,7 @@ fn effect_output(op: EffectOp, inputs: &[Fact]) -> Fact {
             op: MemoryOp::Load(MemSize::B32 | MemSize::B64),
             ..
         } => {
-            if inputs[0] == Fact::Uniform {
+            if inputs[0].uniform() {
                 Fact::Uniform
             } else {
                 Fact::Varying
@@ -404,10 +409,27 @@ fn packet(
     };
     let transfer = |inst: &Inst, value: ValueId, facts: &[Lane]| {
         let v = |id: ValueId| facts[id.0].fact.get();
+        let all_or_nothing = |id: ValueId| {
+            v(id) == Fact::Mask
+                || constants[id.0].is_some_and(|k| k == 0 || k == Fact::bits(0, f.types[id.0].bits()))
+        };
         let fact = match inst {
             Inst::Core { ty, op, .. } => {
                 let fact = match *op {
                     Op::Const(..) => Fact::Uniform,
+                    Op::Int(IntOp::And | IntOp::Or | IntOp::Xor, a, b)
+                        if all_or_nothing(a) && all_or_nothing(b) =>
+                    {
+                        Fact::Mask
+                    }
+                    Op::Int(IntOp::AShr, a, _) if v(a) == Fact::Mask => Fact::Mask,
+                    Op::Convert(Cvt::Trunc, Ty::I1, a)
+                        if v(a) == Fact::Mask
+                            || matches!(definitions[a.0], Some(Op::Int(IntOp::LShr | IntOp::AShr, x, _)) if v(x) == Fact::Mask) =>
+                    {
+                        Fact::Uniform
+                    }
+                    Op::Convert(Cvt::SExt, _, a) if f.types[a.0] == Ty::I1 && v(a).uniform() => Fact::Mask,
                     Op::Env(Env::LaneId) => Fact::Affine {
                         stride: 1,
                         span: None,
@@ -417,7 +439,7 @@ fn packet(
                     Op::Int(IntOp::Sub, a, b) => v(a).add(v(b), true),
                     Op::Int(IntOp::Mul, a, b) => match (v(a), v(b), constants[a.0], constants[b.0])
                     {
-                        (Fact::Uniform, Fact::Uniform, _, _) => Fact::Uniform,
+                        (x, y, _, _) if x.uniform() && y.uniform() => Fact::Uniform,
                         (fact @ Fact::Affine { .. }, _, _, Some(c))
                         | (_, fact @ Fact::Affine { .. }, Some(c), _) => {
                             if c != 0 && c.is_power_of_two() {
@@ -453,7 +475,7 @@ fn packet(
                         v(a).widened(f.types[a.0].bits(), cvt == Cvt::SExt)
                     }
                     Op::Convert(_, _, a) => {
-                        if v(a) == Fact::Uniform {
+                        if v(a).uniform() {
                             Fact::Uniform
                         } else {
                             Fact::Varying
@@ -462,6 +484,7 @@ fn packet(
                     Op::Pack64(lo, hi) => match facts[lo.0].pair {
                         Pair::Of(h, fact) if h == hi => fact,
                         _ => match (v(lo), v(hi)) {
+                            (Fact::Mask, Fact::Mask) => Fact::Mask,
 
                             (
                                 Fact::Affine {
@@ -483,6 +506,7 @@ fn packet(
                     Op::UnpackLo(a) => v(a).word(32),
                     Op::UnpackHi(a) => match v(a) {
                         Fact::Uniform => Fact::Uniform,
+                        Fact::Mask => Fact::Mask,
                         Fact::Affine {
                             span: Some((_, end)),
                             ..
@@ -505,7 +529,9 @@ fn packet(
                     Op::Select(c, a, b) => {
                         if a == b {
                             v(a)
-                        } else if v(c) == Fact::Uniform {
+                        } else if v(c).uniform() && all_or_nothing(a) && all_or_nothing(b) {
+                            Fact::Mask
+                        } else if v(c).uniform() {
                             v(a).meet(v(b))
                         } else {
                             Fact::Varying
@@ -516,7 +542,7 @@ fn packet(
                     | Op::PopulationCount(a)
                     | Op::ReverseBits(a)
                     | Op::Unary(_, a) => {
-                        if v(a) == Fact::Uniform {
+                        if v(a).uniform() {
                             Fact::Uniform
                         } else {
                             Fact::Varying
@@ -529,10 +555,12 @@ fn packet(
                         Fact::join_all(Fact::join_all(v(a), v(b)), v(c))
                     }
                 };
-                if *ty == Ty::I1 && fact != Fact::Uniform {
-                    Fact::Varying
-                } else {
+                if *ty != Ty::I1 {
                     fact
+                } else if fact.uniform() {
+                    Fact::Uniform
+                } else {
+                    Fact::Varying
                 }
             }
             Inst::Packet { .. } => Fact::Uniform,
@@ -541,7 +569,7 @@ fn packet(
             } => {
                 if provenance.is_some() {
                     Fact::Varying
-                } else if args.values().iter().all(|a| v(*a) == Fact::Uniform) {
+                } else if args.values().iter().all(|a| v(*a).uniform()) {
                     Fact::Uniform
                 } else {
                     Fact::Varying
@@ -608,6 +636,62 @@ mod tests {
         let analyses = Analyses::new(ctx);
         let result = analyses.get::<Uniformity>(&f);
         params.iter().map(|p| result.facts[p.0 .0]).collect()
+    }
+
+    #[test]
+    fn a_lane_bit_of_an_all_or_nothing_mask_word_is_uniform() {
+        let mut f = Func::new(BlockId(0), Presence::Packet, 32);
+        let s = f.value(Ty::I32);
+        let mut insts = Vec::new();
+        let mut core = |f: &mut Func, ty, op| {
+            let value = f.value(ty);
+            insts.push(Inst::Core { value, ty, op });
+            value
+        };
+        let zero = core(&mut f, Ty::I32, Op::Const(Ty::I32, 0));
+        let ones = core(&mut f, Ty::I32, Op::Const(Ty::I32, u32::MAX as u64));
+        let one = core(&mut f, Ty::I32, Op::Const(Ty::I32, 1));
+        let low = core(&mut f, Ty::I32, Op::Const(Ty::I32, 0xff));
+        let lane = core(&mut f, Ty::I32, Op::Env(Env::LaneId));
+        let parity = core(&mut f, Ty::I32, Op::Int(IntOp::And, lane, one));
+        let same_everywhere = core(&mut f, Ty::I1, Op::Cmp(IntPred::Ne, s, zero));
+        let per_lane = core(&mut f, Ty::I1, Op::Cmp(IntPred::Ne, parity, zero));
+        let mask = core(&mut f, Ty::I32, Op::Select(same_everywhere, ones, zero));
+        let lanes = core(&mut f, Ty::I32, Op::Select(per_lane, ones, zero));
+        let joined = core(&mut f, Ty::I32, Op::Int(IntOp::And, mask, ones));
+        let partial = core(&mut f, Ty::I32, Op::Int(IntOp::And, mask, low));
+        let mut bit = |f: &mut Func, word| {
+            let shifted = core(f, Ty::I32, Op::Int(IntOp::LShr, word, lane));
+            core(f, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
+        };
+        let of_mask = bit(&mut f, mask);
+        let of_joined = bit(&mut f, joined);
+        let of_lanes = bit(&mut f, lanes);
+        let of_partial = bit(&mut f, partial);
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![(s, Ty::I32)],
+                insts,
+                term: Term::Ret(vec![of_mask, of_joined, of_lanes, of_partial]),
+            },
+        );
+        let inputs = [Parameter { source: ParameterSource::Sgpr(6), ty: Ty::I32 }];
+        let registry = crate::rdna_spmd::rdna4::dialect().registry;
+        let ctx = Context {
+            packet: Some(Packet { aligned: true }),
+            ..Context::new(&registry, &inputs, usize::MAX, 16, EntryLayout::default())
+        };
+        let result = Analyses::new(ctx).get::<Uniformity>(&f);
+        let fact = |v: ValueId| result.facts[v.0];
+        assert_eq!(fact(mask), Fact::Mask);
+        assert_eq!(fact(joined), Fact::Mask);
+        assert_eq!(fact(partial), Fact::Uniform);
+        assert_eq!(fact(lanes), Fact::Varying);
+        assert_eq!(fact(of_mask), Fact::Uniform);
+        assert_eq!(fact(of_joined), Fact::Uniform);
+        assert_eq!(fact(of_lanes), Fact::Varying);
+        assert_eq!(fact(of_partial), Fact::Varying);
     }
 
     #[test]

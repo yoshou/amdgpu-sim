@@ -23,11 +23,13 @@ pub(super) fn inst<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, inst
             outputs,
         } => match op {
             EffectOp::Wave(op) => wave(q, b, *provenance, *op, inputs, outputs),
+            EffectOp::Memory { .. } if q.program().hazards.never.contains(&(b, index)) => Bdd::FALSE,
             EffectOp::Memory {
                 op: MemoryOp::Load(_),
                 ..
             } => {
-                let fp = q.bit(inputs[1]);
+                let pred = q.program().hazards.settled.get(&(b, index)).copied().unwrap_or(inputs[1]);
+                let fp = q.bit(pred);
                 let absent = q.not(fp);
                 let operands = any_of(q, &inputs[..2]);
                 let differs = q.or(operands, absent);
@@ -296,7 +298,7 @@ fn gated<'a, Q: Queries<'a>>(q: &mut Q, op: WaveOp, mask: ValueId, hx: Bdd) -> B
 
 fn store<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, memory: MemoryOp, inputs: &[ValueId]) -> Bdd {
     let m = memory.mask_input();
-    let pred = inputs[m];
+    let pred = q.program().hazards.settled.get(&(b, index)).copied().unwrap_or(inputs[m]);
     let reachable = q.reachable(b);
     let hp = q.h(pred);
     if hp != Bdd::FALSE {

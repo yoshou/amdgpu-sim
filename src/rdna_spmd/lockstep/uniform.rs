@@ -1,6 +1,5 @@
 use super::mask::Masks;
 use super::Packing;
-use crate::rdna_spmd::analysis::uniformity::Fact;
 use crate::rdna_spmd::analysis::{Analyses, Context, Packet, Uniformity};
 use crate::rdna_spmd::ir::*;
 use crate::rdna_spmd::program::Program;
@@ -42,7 +41,7 @@ pub fn refuted(
             continue;
         }
         let value = folded.get(&atom.value).copied().unwrap_or(atom.value);
-        if facts.facts[value.0] == Fact::Uniform {
+        if facts.facts[value.0].uniform() {
             continue;
         }
         match atom.origin {

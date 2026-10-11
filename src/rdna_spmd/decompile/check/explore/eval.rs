@@ -682,6 +682,8 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
+            never: Default::default(),
+            settled: Default::default(),
         };
         let mut r = Random::new(29);
         let mut wrong = Vec::new();

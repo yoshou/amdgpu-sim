@@ -90,6 +90,8 @@ pub struct Hazards {
     pub apart: BTreeSet<(usize, usize)>,
     pub idle: BTreeSet<(usize, usize, bool, usize)>,
     pub meetings: Vec<(BlockId, usize)>,
+    pub never: BTreeSet<(BlockId, usize)>,
+    pub settled: BTreeMap<(BlockId, usize), ValueId>,
 }
 
 type Judgments = [(bool, [bool; 2]); 2];
@@ -112,6 +114,8 @@ impl Hazards {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
+            never: Default::default(),
+            settled: Default::default(),
         };
         if !hazards
             .accesses
@@ -151,6 +155,7 @@ impl Hazards {
             }
         }
         if candidates.is_empty() {
+            settle_predicates(&mut hazards, &mut addresses, f, &facts);
             return hazards;
         }
         let waves = addresses.waves();
@@ -294,6 +299,7 @@ impl Hazards {
             }
         }
         hazards.meetings = hazards.positions(&facts.order);
+        settle_predicates(&mut hazards, &mut addresses, f, &facts);
         hazards
     }
 
@@ -360,6 +366,8 @@ impl Hazards {
                 .collect(),
             accesses: Vec::new(),
             meetings: Vec::new(),
+            never: Default::default(),
+            settled: Default::default(),
         };
         hazards.accesses = accesses;
         hazards.meetings = hazards.positions(&facts.order);
@@ -565,6 +573,31 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
             })
         })
         .collect()
+}
+
+fn settle_predicates(hazards: &mut Hazards, addresses: &mut Addresses, f: &Func, facts: &Facts) {
+    for i in 0..hazards.accesses.len() {
+        let a = hazards.accesses[i].clone();
+        let dead = (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || !runs(addresses, &a, lane));
+        if dead {
+            hazards.never.insert((a.block, a.index));
+            continue;
+        }
+        let Some(p) = a.predicate else {
+            continue;
+        };
+        let Some(Op::Int(IntOp::And, x, y)) = facts.op(f, p) else {
+            continue;
+        };
+        let holds = |addresses: &mut Addresses, v: ValueId, given: ValueId| {
+            (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || addresses.bit(v, lane, Some(given)).0 == Some(true))
+        };
+        if holds(addresses, y, x) {
+            hazards.settled.insert((a.block, a.index), x);
+        } else if holds(addresses, x, y) {
+            hazards.settled.insert((a.block, a.index), y);
+        }
+    }
 }
 
 fn runs(addresses: &mut Addresses, access: &Access, lane: usize) -> bool {
@@ -3422,6 +3455,35 @@ mod tests {
         let (s1, s2) = twice(&mut b, join, j[1], j[0]);
         let h = Hazards::find(&b.program(), &env2());
         assert!(!h.conflicts().contains(&pair(&h, s1, s2)), "lane a stores to 8a or 8a + 4, which no other lane touches");
+    }
+
+    #[test]
+    fn find_records_the_accesses_that_never_run_and_the_aperture_tests_that_always_hold() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let base = b.core(e, Ty::I64, Op::Env(Env::ScratchBase));
+        let eight = b.constant(e, Ty::I64, 8);
+        let p = b.int(e, IntOp::Add, base, eight);
+        let shared = crate::rdna_spmd::SHARED_APERTURE;
+        let low = b.constant(e, Ty::I64, shared);
+        let high = b.constant(e, Ty::I64, shared + (1 << 32));
+        let above = b.cmp(e, IntPred::Uge, p, low);
+        let below = b.cmp(e, IntPred::Ult, p, high);
+        let in_window = b.int(e, IntOp::And, above, below);
+        let one = b.constant(e, Ty::I1, 1);
+        let outside = b.int(e, IntOp::Xor, in_window, one);
+        let local_exec = b.int(e, IntOp::And, k.exec, in_window);
+        let global_exec = b.int(e, IntOp::And, k.exec, outside);
+        let data = b.constant(e, Ty::I32, 5);
+        let local = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, p));
+        let never = b.here(e);
+        b.store(e, Space::Lds, MemSize::B32, local, data, local_exec);
+        let always = b.here(e);
+        b.store(e, Space::Global, MemSize::B32, p, data, global_exec);
+        let h = Hazards::find(&b.program(), &environment(32, &[]));
+        assert!(h.never.contains(&never), "a scratch pointer never lies in the shared window");
+        assert!(!h.never.contains(&always), "the global store runs");
+        assert_eq!(h.settled.get(&always), Some(&k.exec), "the window test always holds, so the exec mask alone decides");
     }
 
     #[test]

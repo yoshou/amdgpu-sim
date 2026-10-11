@@ -37,6 +37,7 @@ pub struct Facts {
     pub materialized: Vec<bool>,
     pub saturated: Vec<bool>,
     pub viewed: Vec<bool>,
+    pub compared: Vec<u8>,
 }
 
 impl Facts {
@@ -95,13 +96,31 @@ impl Facts {
             materialized: vec![false; n],
             saturated: vec![false; n],
             viewed: vec![false; n],
+            compared: vec![0; n],
         };
+        facts.count_constant_compares(f);
         facts.solve_uniform(f, inputs, conversion);
         facts.solve_lane_words(f);
         facts.solve_materialized(f, kept);
         facts.solve_saturated(f);
         facts.solve_viewed(f);
         facts
+    }
+
+    fn count_constant_compares(&mut self, f: &Func) {
+        for block in f.blocks.values() {
+            for inst in &block.insts {
+                let Inst::Core { op: Op::Cmp(_, a, b), .. } = inst else {
+                    continue;
+                };
+                let word = match (self.constant(f, *a), self.constant(f, *b)) {
+                    (None, Some(_)) => *a,
+                    (Some(_), None) => *b,
+                    _ => continue,
+                };
+                self.compared[word.0] = self.compared[word.0].saturating_add(1);
+            }
+        }
     }
 
     fn solve_viewed(&mut self, f: &Func) {

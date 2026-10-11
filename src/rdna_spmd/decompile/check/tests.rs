@@ -11,6 +11,8 @@ fn no_hazards() -> Hazards {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
+        never: Default::default(),
+        settled: Default::default(),
     }
 }
 
@@ -1066,6 +1068,25 @@ fn converted(b: &Build) -> Vec<&'static str> {
         .filter(|(_, kept)| !kept.queries.is_empty() || !kept.words.is_empty())
         .map(|(name, _)| *name)
         .collect()
+}
+
+#[test]
+fn prove_finishes_on_a_private_array_read_through_a_tree_of_selects() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let index = per_lane(&mut b, &k, e, 0);
+    let words: Vec<ValueId> = (0..40).map(|i| per_lane(&mut b, &k, e, 8 + 8 * i)).collect();
+    let mut acc = b.constant(e, Ty::I32, 0);
+    for (i, &w) in words.iter().enumerate() {
+        let c = b.constant(e, Ty::I32, i as u64);
+        let hit = b.cmp(e, IntPred::Eq, index, c);
+        acc = b.core(e, Ty::I32, Op::Select(hit, w, acc));
+    }
+    let out = k.buffer(&mut b, e, 8 + 8 * words.len() as u64);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, out, lane, 4);
+    b.store(e, Space::Global, MemSize::B32, own, acc, k.exec);
+    assert!(converted(&b).is_empty(), "{:?}: each lane stores its own word", converted(&b));
 }
 
 fn uniform_load(b: &mut Build, k: &Kernel, e: BlockId, offset: u64) -> ValueId {
@@ -4504,6 +4525,8 @@ fn masked_tests_of_words_hold_only_where_inactive_lanes_see_zero() {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
+        never: Default::default(),
+        settled: Default::default(),
     };
     let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
     let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
@@ -4539,6 +4562,8 @@ fn masks_forget_a_parameter_once_one_of_its_arguments_is_not_masked() {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
+        never: Default::default(),
+        settled: Default::default(),
     };
     let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
     let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
@@ -4567,6 +4592,8 @@ fn check_differences(b: &Build, kept: &[Choice], cases: &[Case], exact: bool) ->
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
+        never: Default::default(),
+        settled: Default::default(),
     };
     let kept: BTreeSet<Choice> = kept.iter().copied().collect();
     let logic = Logic::fixed(f, &facts, &kept, &[]);

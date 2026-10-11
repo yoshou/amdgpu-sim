@@ -93,16 +93,18 @@ pub fn decode_program(
     entry_pc: usize,
     memory: &[u8],
     lanes: u32,
+    shared_base: Option<u32>,
+    lds: bool,
 ) -> Result<Program, String> {
     if !matches!(lanes, 32 | 64) {
         return Err(format!("no SPMD target runs waves of {lanes} lanes"));
     }
     let mut program = if super::rdna4::supports(arch) {
-        let mut program = super::rdna4::decode(entry_pc, memory, lanes)?;
+        let mut program = super::rdna4::decode(entry_pc, memory, lanes, lds)?;
         program.entry = super::engine::EntryLayout::of(descriptor);
         program
     } else if super::gcn3::supports(arch) {
-        let (mut program, layout) = super::gcn3::decode(descriptor, entry_pc, memory, lanes)?;
+        let (mut program, layout) = super::gcn3::decode(descriptor, entry_pc, memory, lanes, shared_base, lds)?;
         program.entry = layout;
         program
     } else {

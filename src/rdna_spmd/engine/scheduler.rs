@@ -180,19 +180,11 @@ pub fn run(
         ),
         None => {}
     }
-    if unit == Scheduler::Independent {
-        assert!(
-            wg_size % width == 0,
-            "workgroup size {} not divisible by W={}",
-            wg_size,
-            width
-        );
-    }
     let num_wg = dims.num_wg_x as u64 * dims.num_wg_y as u64 * dims.num_wg_z as u64;
     let packets_per_wave = wave / width;
     let waves_per_wg = wg_size.div_ceil(wave);
     let packets_per_wg = match unit {
-        Scheduler::Independent => wg_size / width,
+        Scheduler::Independent => wg_size.div_ceil(width),
         _ => waves_per_wg * packets_per_wave,
     };
     let (unit_packets, unit_waves) = match unit {

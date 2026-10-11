@@ -16,4 +16,6 @@ mod program;
 mod rdna4;
 mod runtime;
 
+pub(crate) const SHARED_APERTURE: u64 = 1 << 48;
+
 pub use runtime::{Arg, Buffer, Error, Function, Launch, Module, Pod};

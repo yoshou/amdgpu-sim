@@ -861,7 +861,7 @@ impl Emit<'_> {
         self.masks.assume_a_lane(mask);
         self.masks.assume_within(mask, entered);
 
-        let together = self.masks.exact(entered) == *self.full.last().unwrap();
+        let together = self.together(entered);
         self.full.push(if together { mask } else { Bdd::FALSE });
         let mut args: Vec<Option<Val>> = vec![None; self.q.blocks[&header].params.len()];
         let mut current = Vec::with_capacity(carried.len());
@@ -1431,10 +1431,21 @@ impl Emit<'_> {
         })
     }
 
-    fn everyone(&mut self, mask: Bdd) {
+    fn together(&mut self, lanes: Bdd) -> bool {
         let full = *self.full.last().unwrap();
+        if full == Bdd::FALSE {
+            return false;
+        }
+        if self.masks.exact(lanes) == full {
+            return true;
+        }
+        let choice = self.masks.choice(lanes, full);
+        self.masks.uniform(choice)
+    }
+
+    fn everyone(&mut self, mask: Bdd) {
         assert!(
-            full != Bdd::FALSE && self.masks.exact(mask) == full,
+            self.together(mask),
             "b{}: an operation over every lane where lanes may be elsewhere",
             self.at.0
         );

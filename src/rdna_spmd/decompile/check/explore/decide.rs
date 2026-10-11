@@ -202,6 +202,8 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
+            never: Default::default(),
+            settled: Default::default(),
         };
         let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
         let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards);

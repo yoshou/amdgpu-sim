@@ -117,7 +117,7 @@ pub fn instruction(inst: &InstFormat, registry: &DialectRegistry, lanes: u32) ->
             outputs,
             expr,
             scalar: false,
-        } = super::instruction_with_registry(&single, registry, lanes)
+        } = super::instruction_with_registry(&single, registry, lanes).ok()?
         else {
             return None;
         };

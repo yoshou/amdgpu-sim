@@ -8,6 +8,7 @@ pub enum SourceOperand {
     FloatConstant(f64),
     LiteralConstant(u32),
     PrivateBase,
+    SharedBase,
 }
 
 #[derive(Debug, Clone)]

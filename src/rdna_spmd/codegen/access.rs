@@ -25,6 +25,7 @@ pub struct Access {
     pub address: ValueId,
     pub mask: ValueId,
     pub inside: Option<ValueId>,
+    pub shared: Option<ValueId>,
     pub offsets: Vec<u32>,
     pub data: Vec<ValueId>,
     pub results: Vec<ValueId>,
@@ -36,6 +37,7 @@ impl Access {
     pub fn reads(&self) -> impl Iterator<Item = ValueId> + '_ {
         IntoIterator::into_iter([self.base, self.address, self.mask])
             .chain(self.inside)
+            .chain(self.shared)
             .chain(self.data.iter().copied())
     }
 
@@ -90,22 +92,48 @@ fn added_constant(
     ))
 }
 
+fn private_test(v: ValueId, defs: &[Option<Op>]) -> bool {
+    let Some(Op::Int(IntOp::And, x, _)) = defs[v.0] else {
+        return false;
+    };
+    let Some(Op::Cmp(IntPred::Uge, _, low)) = defs[x.0] else {
+        return false;
+    };
+    matches!(defs[low.0], Some(Op::Env(Env::ScratchBase)))
+}
+
 fn flat_parts(
     mask: ValueId,
     defs: &[Option<Op>],
     constants: &[Option<u64>],
-) -> Option<(ValueId, ValueId)> {
-    let outside = |v: ValueId| match defs[v.0] {
+) -> Option<(ValueId, ValueId, Option<ValueId>)> {
+    let negated = |v: ValueId| match defs[v.0] {
         Some(Op::Int(IntOp::Xor, inside, one)) if constants[one.0] == Some(1) => {
             Some((inside, one))
         }
         _ => None,
     };
+    let outside = |v: ValueId| -> Option<(ValueId, ValueId, Option<ValueId>)> {
+        if let Some((inside, one)) = negated(v) {
+            return Some((one, inside, None));
+        }
+        let Some(Op::Int(IntOp::And, a, b)) = defs[v.0] else {
+            return None;
+        };
+        let (Some((p, one)), Some((q, _))) = (negated(a), negated(b)) else {
+            return None;
+        };
+        match (private_test(p, defs), private_test(q, defs)) {
+            (true, false) => Some((one, p, Some(q))),
+            (false, true) => Some((one, q, Some(p))),
+            _ => None,
+        }
+    };
     match defs[mask.0] {
         Some(Op::Int(IntOp::And, a, b)) => outside(b)
-            .map(|(inside, _)| (a, inside))
-            .or_else(|| outside(a).map(|(inside, _)| (b, inside))),
-        _ => outside(mask).map(|(inside, one)| (one, inside)),
+            .map(|(_, inside, shared)| (a, inside, shared))
+            .or_else(|| outside(a).map(|(_, inside, shared)| (b, inside, shared))),
+        _ => outside(mask),
     }
 }
 
@@ -281,13 +309,13 @@ pub fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Ac
             }
             let (base, offset) =
                 added_constant(address, &defs, constants, ty).unwrap_or((address, 0));
-            let (mask, inside) = words.first().map_or((ValueId(0), None), |w| {
+            let (mask, inside, shared) = words.first().map_or((ValueId(0), None, None), |w| {
                 if flat {
-                    let (mask, inside) = flat_parts(w.mask, &defs, constants)
+                    let (mask, inside, shared) = flat_parts(w.mask, &defs, constants)
                         .expect("flat access lacks its aperture test");
-                    (mask, Some(inside))
+                    (mask, Some(inside), shared)
                 } else {
-                    (w.mask, None)
+                    (w.mask, None, None)
                 }
             });
             let form = if flat {
@@ -340,6 +368,7 @@ pub fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Ac
                 address,
                 mask,
                 inside,
+                shared,
                 offsets: offsets.iter().map(|&d| d as u32).collect(),
                 data: words.iter().flat_map(|w| w.data.iter().copied()).collect(),
                 results,
@@ -350,4 +379,55 @@ pub fn accesses(f: &Func, constants: &[Option<u64>], uniform: &[bool]) -> Vec<Ac
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Defs {
+        defs: Vec<Option<Op>>,
+        constants: Vec<Option<u64>>,
+    }
+
+    impl Defs {
+        fn push(&mut self, op: Op, k: Option<u64>) -> ValueId {
+            self.defs.push(Some(op));
+            self.constants.push(k);
+            ValueId(self.defs.len() - 1)
+        }
+        fn parts(&self, mask: ValueId) -> Option<(ValueId, ValueId, Option<ValueId>)> {
+            flat_parts(mask, &self.defs, &self.constants)
+        }
+    }
+
+    #[test]
+    fn flat_parts_find_the_exec_mask_and_the_aperture_tests_of_a_flat_access() {
+        let mut d = Defs { defs: Vec::new(), constants: Vec::new() };
+        let mut push = |op: Op, k: Option<u64>| d.push(op, k);
+        let exec = push(Op::Env(Env::ValidLane), None);
+        let base = push(Op::Env(Env::ScratchBase), None);
+        let size = push(Op::Env(Env::ScratchSize), None);
+        let end = push(Op::Int(IntOp::Add, base, size), None);
+        let p = push(Op::Env(Env::LaneId), None);
+        let ge = push(Op::Cmp(IntPred::Uge, p, base), None);
+        let lt = push(Op::Cmp(IntPred::Ult, p, end), None);
+        let inside = push(Op::Int(IntOp::And, ge, lt), None);
+        let one = push(Op::Const(Ty::I1, 1), Some(1));
+        let not_inside = push(Op::Int(IntOp::Xor, inside, one), None);
+        let only_private = push(Op::Int(IntOp::And, exec, not_inside), None);
+        let low = push(Op::Const(Ty::I64, 1 << 48), Some(1 << 48));
+        let high = push(Op::Const(Ty::I64, (1 << 48) + (1 << 32)), Some((1 << 48) + (1 << 32)));
+        let sge = push(Op::Cmp(IntPred::Uge, p, low), None);
+        let slt = push(Op::Cmp(IntPred::Ult, p, high), None);
+        let shared = push(Op::Int(IntOp::And, sge, slt), None);
+        let not_shared = push(Op::Int(IntOp::Xor, shared, one), None);
+        let neither = push(Op::Int(IntOp::And, not_inside, not_shared), None);
+        let with_lds = push(Op::Int(IntOp::And, exec, neither), None);
+        let swapped = push(Op::Int(IntOp::And, not_shared, not_inside), None);
+        let with_lds_swapped = push(Op::Int(IntOp::And, swapped, exec), None);
+        assert_eq!(d.parts(only_private), Some((exec, inside, None)));
+        assert_eq!(d.parts(with_lds), Some((exec, inside, Some(shared))));
+        assert_eq!(d.parts(with_lds_swapped), Some((exec, inside, Some(shared))));
+    }
 }

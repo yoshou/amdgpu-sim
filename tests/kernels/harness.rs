@@ -66,6 +66,10 @@ impl Kernels {
     }
 
     pub(crate) fn run_threaded(&self, spec: &Run, width: u32, threads: usize) {
+        self.run_with_shared(spec, width, threads, 0)
+    }
+
+    pub(crate) fn run_with_shared(&self, spec: &Run, width: u32, threads: usize, dynamic_shared: u32) {
         let function = self.function(spec.kernel);
         let mut buffers: Vec<Option<Buffer>> = spec
             .args
@@ -90,7 +94,7 @@ impl Kernels {
                 Arg::F32(v) => spmd::Arg::value(v),
             })
             .collect();
-        let launch = Launch::new(spec.grid, spec.wg).width(width).threads(threads);
+        let launch = Launch::new(spec.grid, spec.wg).width(width).threads(threads).dynamic_shared(dynamic_shared);
         function
             .launch(&launch, &bindings)
             .unwrap_or_else(|e| panic!("{}: {}", spec.kernel, e));

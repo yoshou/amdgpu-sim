@@ -420,37 +420,70 @@ fn carry(inst: &InstFormat, registry: &DialectRegistry) -> Option<Lowering> {
     Some(b.finish_many(false, results))
 }
 
-pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry, lanes: u32) -> Lowering {
+pub fn opcode(inst: &InstFormat) -> String {
+    match inst {
+        InstFormat::DPP(d) => opcode(&d.inner),
+        InstFormat::SOP1(i) => format!("{:?}", i.op),
+        InstFormat::SOP2(i) => format!("{:?}", i.op),
+        InstFormat::SOPK(i) => format!("{:?}", i.op),
+        InstFormat::SOPC(i) => format!("{:?}", i.op),
+        InstFormat::SOPP(i) => format!("{:?}", i.op),
+        InstFormat::SMEM(i) => format!("{:?}", i.op),
+        InstFormat::VOP1(i) => format!("{:?}", i.op),
+        InstFormat::VOP2(i) => format!("{:?}", i.op),
+        InstFormat::VOP3(i) => format!("{:?}", i.op),
+        InstFormat::VOP3SD(i) => format!("{:?}", i.op),
+        InstFormat::VOP3P(i) => format!("{:?}", i.op),
+        InstFormat::VOPC(i) => format!("{:?}", i.op),
+        InstFormat::VOPD(i) => format!("{:?} with {:?}", i.opx, i.opy),
+        InstFormat::VFLAT(i) => format!("{:?}", i.op),
+        InstFormat::VGLOBAL(i) => format!("{:?}", i.op),
+        InstFormat::VSCRATCH(i) => format!("{:?}", i.op),
+        InstFormat::VIMAGE(i) => format!("{:?}", i.op),
+        InstFormat::VSAMPLE(i) => format!("{:?}", i.op),
+        InstFormat::DS(i) => format!("{:?}", i.op),
+    }
+}
+
+pub fn instruction_with_registry(
+    inst: &InstFormat,
+    registry: &DialectRegistry,
+    lanes: u32,
+) -> Result<Lowering, String> {
     if let Some(action) = wave::instruction(inst) {
-        return Lowering::Wave(action);
+        return Ok(Lowering::Wave(action));
     }
     if let Some(memory) = memory::instruction(inst) {
-        return Lowering::Memory(memory);
+        return Ok(Lowering::Memory(memory));
     }
     if let Some(image) = image::instruction(inst, registry) {
-        return image;
+        return Ok(image);
     }
     if let Some(alu) = half::instruction(inst, registry) {
-        return alu;
+        return Ok(alu);
     }
     if let Some(alu) = division::instruction(inst, registry) {
-        return alu;
+        return Ok(alu);
     }
     if let Some(alu) = carry(inst, registry).or_else(|| scalar::instruction(inst, registry)) {
-        return alu;
+        return Ok(alu);
     }
     if let Some(alu) = dual::instruction(inst, registry, lanes) {
-        return alu;
+        return Ok(alu);
     }
     if let Some(alu) = compare::instruction(inst, registry) {
-        return alu;
+        return Ok(alu);
     }
     if let Some(alu) = packed::instruction(inst, registry) {
-        return alu;
+        return Ok(alu);
     }
-    let alu = Alu::decode(inst);
+    plain_alu(inst, registry, lanes).ok_or_else(|| format!("{} has no SPMD lowering", opcode(inst)))
+}
+
+fn plain_alu(inst: &InstFormat, registry: &DialectRegistry, lanes: u32) -> Option<Lowering> {
+    let alu = Alu::decode(inst)?;
     let shape = Shape::of(alu.op, registry);
-    let inputs = alu.inputs(&shape, registry);
+    let inputs = alu.inputs(&shape, registry)?;
     let mut q = Builder::new(registry, inputs);
     let mut values = [ValueId(0), ValueId(1), ValueId(2)];
     for index in 0..shape.arity {
@@ -514,8 +547,7 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry, 
         let mut output = Output::Vgpr(dst, shape.float_ty.unwrap_or(Ty::I32));
         let result = lower_integer(&mut q, alu.op, alu.cm, a, b, c, lanes)
             .or_else(|| lower_wide(&mut q, alu.op, a, b, &mut output, dst))
-            .or_else(|| lower_float(&mut q, alu.op, shape.ty, a, b, c))
-            .unwrap_or_else(|| panic!("instruction has no typed IR lowering: {:?}", inst));
+            .or_else(|| lower_float(&mut q, alu.op, shape.ty, a, b, c))?;
         (result, output)
     };
     let result = if !output.ty().integer() {
@@ -535,11 +567,11 @@ pub fn instruction_with_registry(inst: &InstFormat, registry: &DialectRegistry, 
     } else {
         result
     };
-    if writes_a_scalar(alu.op) {
+    Some(if writes_a_scalar(alu.op) {
         q.finish_many(true, vec![(output, result)])
     } else {
         q.finish(output, result)
-    }
+    })
 }
 
 fn writes_a_scalar(op: I) -> bool {
@@ -577,8 +609,8 @@ fn halfword_op(op: I) -> bool {
 }
 
 impl Alu {
-    fn decode(inst: &InstFormat) -> Alu {
-        match inst {
+    fn decode(inst: &InstFormat) -> Option<Alu> {
+        Some(match inst {
             InstFormat::VOP1(i) => Alu {
                 op: i.op,
                 src: vec![i.src0.clone()],
@@ -612,13 +644,13 @@ impl Alu {
                 opsel: i.opsel,
                 literal: None,
             },
-            _ => panic!("instruction has no typed IR lowering: {:?}", inst),
-        }
+            _ => return None,
+        })
     }
 
-    fn inputs(&self, shape: &Shape, registry: &DialectRegistry) -> Vec<Input> {
+    fn inputs(&self, shape: &Shape, registry: &DialectRegistry) -> Option<Vec<Input>> {
         if self.src.len() < shape.arity {
-            panic!("instruction has no typed IR lowering: {:?}", self.op);
+            return None;
         }
         let mut inputs: Vec<_> = self
             .src
@@ -642,10 +674,7 @@ impl Alu {
             inputs.push(input(SourceOperand::VectorRegister(self.dst), Ty::I32));
         }
         if matches!(self.op, I::V_FMAMK_F32 | I::V_FMAAK_F32) {
-            let Some(literal) = self.literal else {
-                panic!("instruction has no typed IR lowering: {:?}", self.op);
-            };
-            inputs.push(input(SourceOperand::LiteralConstant(literal), Ty::F32));
+            inputs.push(input(SourceOperand::LiteralConstant(self.literal?), Ty::F32));
         }
         if matches!(self.op, I::V_CNDMASK_B32) {
 
@@ -663,7 +692,7 @@ impl Alu {
         ) {
             inputs[1].ty = Ty::I64;
         }
-        inputs
+        Some(inputs)
     }
 }
 
@@ -1289,3 +1318,29 @@ fn conversion(op: I) -> Option<(Ty, Ty, Cvt)> {
 }
 
 mod function;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdna_instructions::{SOP1, VOP1};
+
+    #[test]
+    fn an_instruction_without_a_lowering_is_refused_by_name() {
+        let registry = crate::rdna_spmd::rdna4::dialect().registry;
+        let call = InstFormat::SOP1(SOP1 {
+            ssrc0: SourceOperand::ScalarRegister(0),
+            op: I::S_GETPC_B64,
+            sdst: 2,
+        });
+        assert_eq!(
+            instruction_with_registry(&call, &registry, 32).err().as_deref(),
+            Some("S_GETPC_B64 has no SPMD lowering")
+        );
+        let moved = InstFormat::VOP1(VOP1 {
+            src0: SourceOperand::VectorRegister(1),
+            op: I::V_MOV_B32,
+            vdst: 0,
+        });
+        assert!(instruction_with_registry(&moved, &registry, 32).is_ok());
+    }
+}

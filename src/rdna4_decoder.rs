@@ -1621,6 +1621,7 @@ fn decode_source_operand(operand: u16, literal_constant: &[u8]) -> SourceOperand
         0..=127 => SourceOperand::ScalarRegister(operand as u8),
         128..=192 => SourceOperand::IntegerConstant((operand - 128) as u64),
         193..=208 => SourceOperand::IntegerConstant((-((operand - 192) as i64)) as u64),
+        235 => SourceOperand::SharedBase,
         237 => SourceOperand::PrivateBase,
         240 => SourceOperand::FloatConstant(0.5),  // 0.5
         241 => SourceOperand::FloatConstant(-0.5), // -0.5

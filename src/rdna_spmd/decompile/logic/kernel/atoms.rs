@@ -102,7 +102,7 @@ impl Atoms {
                     }
                     None => {
                         assert!(v.0 < 1 << 28, "function too large");
-                        (1 << 30) | ((v.0 as u32) << 1) | view
+                        (1 << 30) | (view << 28) | v.0 as u32
                     }
                 }
             }
@@ -119,8 +119,8 @@ impl Atoms {
                 (1 << 30) | (1 << 29) | (1 << 28) | (rank << 10) | k as u32
             }
             Atom::WordBit(v, i) => {
-                assert!(v.0 < 1 << 26, "function too large");
-                (2 << 30) + 8 + ((v.0 as u32) << 3) + i as u32
+                assert!(v.0 < 1 << 23 && i < 32, "function too large");
+                (1 << 29) + (((1 << 23) - 1 - v.0 as u32) << 5) + i as u32
             }
             Atom::Fresh(PATH, _, i) => {
                 assert!(i < 1 << 16, "too many paths");
@@ -278,9 +278,9 @@ mod tests {
             Atom::Bit(c),
             Atom::View(b),
             Atom::View(d),
+            Atom::WordBit(inner, 0),
             Atom::Bit(inner),
             Atom::Cell(last, 0, 0),
-            Atom::WordBit(inner, 0),
         ];
         let numbers: Vec<u32> = atoms_in_order.iter().map(|&x| atoms.number(x)).collect();
         assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);

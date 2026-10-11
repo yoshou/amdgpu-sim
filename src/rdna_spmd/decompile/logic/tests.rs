@@ -1851,6 +1851,8 @@ fn no_hazards() -> super::super::hazard::Hazards {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
+        never: Default::default(),
+        settled: Default::default(),
     }
 }
 
@@ -1895,4 +1897,65 @@ fn prove_keeps_a_query_whose_answer_a_parameter_carries_into_a_kept_query() {
         }
     }
     assert!(wrong.is_empty(), "{:?}", wrong);
+}
+
+#[test]
+fn constant_tests_of_one_opaque_word_exclude_each_other() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let yes = b.constant(e, Ty::I1, 1);
+    let table = k.buffer(&mut b, e, 8);
+    let u = b.load(e, Space::Global, MemSize::B32, table, yes);
+    let x = b.int(e, IntOp::Mul, u, u);
+    let tests: Vec<(IntPred, u32, bool)> = vec![
+        (IntPred::Ult, 5, false),
+        (IntPred::Ugt, 10, false),
+        (IntPred::Eq, 7, false),
+        (IntPred::Ne, 7, false),
+        (IntPred::Ule, 0x8000_0000, false),
+        (IntPred::Uge, 0xffff_fff0, false),
+        (IntPred::Slt, 0, false),
+        (IntPred::Sgt, 3, false),
+        (IntPred::Sle, 0xffff_ffff, false),
+        (IntPred::Sge, 0x7fff_fff0, false),
+        (IntPred::Ult, 9, true),
+        (IntPred::Sgt, 0xffff_fffe, true),
+        (IntPred::Uge, 1 << 20, true),
+        (IntPred::Eq, 0, true),
+    ];
+    let bits: Vec<ValueId> = tests
+        .iter()
+        .map(|&(p, k, flipped)| {
+            let c = b.constant(e, Ty::I32, k as u64);
+            if flipped {
+                b.cmp(e, p, c, x)
+            } else {
+                b.cmp(e, p, x, c)
+            }
+        })
+        .collect();
+    let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+    let mut logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &[]);
+    let gs: Vec<Bdd> = bits.iter().map(|&v| logic.bit(&b.f, &facts, v)).collect();
+    for &g in &gs {
+        for var in logic.m.support(g) {
+            assert!(matches!(logic.atom_of(var), Atom::WordBit(w, _) if w == x), "{:?}", logic.atom_of(var));
+        }
+    }
+    let mut r = Random::new(11);
+    for _ in 0..300 {
+        let xv = r.next() as u32;
+        for (i, &(p, k, flipped)) in tests.iter().enumerate() {
+            let truth = if flipped { compare(p, k, xv) } else { compare(p, xv, k) };
+            let got = evaluate(&logic.m, gs[i], &|var| match logic.atom_of(var) {
+                Atom::WordBit(_, j) => xv >> j & 1 == 1,
+                _ => unreachable!(),
+            });
+            assert_eq!(got, truth, "{:?} {:#x} flipped {} at {:#x}", p, k, flipped, xv);
+        }
+    }
+    let excluded = logic.m.and(gs[0], gs[1]);
+    assert_eq!(excluded, Bdd::FALSE, "x < 5 and x > 10 never hold together");
+    let covered = logic.m.or(gs[2], gs[3]);
+    assert_eq!(covered, Bdd::TRUE, "x == 7 or x != 7 always holds");
 }

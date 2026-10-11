@@ -9,6 +9,7 @@ pub fn lift(
     program: &ScalarProgram,
     lowerings: &BTreeMap<usize, Vec<&Lowering>>,
     lanes: u32,
+    flat_lds: bool,
 ) -> Program {
     let mut regs = BTreeSet::new();
     for block in lowerings.values() {
@@ -101,7 +102,7 @@ pub fn lift(
                     invalidate(&mut views, &writes);
                 }
                 Lowering::Memory(m) => {
-                    m.lift(&mut f, &mut block, &mut words, &mut views, &mut provenance);
+                    m.lift(&mut f, &mut block, &mut words, &mut views, &mut provenance, flat_lds);
                     invalidate(&mut views, &writes);
                 }
                 Lowering::TypedAlu {

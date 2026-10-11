@@ -456,10 +456,11 @@ impl Memory {
         words: &mut super::regs::Words,
         views: &mut super::regs::Views,
         provenance: &mut u64,
+        lds: bool,
     ) {
         let (base, address, data, mask, ty) = self.operands(f, block, words, views);
         let flat = matches!(self.address, Address::Flat { .. })
-            .then(|| flat_aperture(f, block, base, address, mask));
+            .then(|| flat_aperture(f, block, base, address, mask, lds));
         let instruction = *provenance << 8;
         *provenance += 1;
         let mut sub = 0u64;
@@ -507,24 +508,59 @@ impl Memory {
                 } else {
                     offset_by(f, block, Ty::I32, aperture.private, k as u64 * 4)
                 };
-                let private = self.effect(
-                    f,
-                    block,
-                    next_provenance(),
-                    Space::Scratch,
-                    private_address,
-                    word_data,
-                    aperture.inside_exec,
-                );
-                if let (Some(global), Some(private)) = (result, private) {
-                    let merged = f.value(Ty::I32);
-                    block.insts.push(Inst::Core {
-                        value: merged,
-                        ty: Ty::I32,
-                        op: Op::Select(aperture.inside, private, global),
-                    });
-                    result = Some(merged);
-                }
+                let private = if self.op.atomic() {
+                    None
+                } else {
+                    self.effect(
+                        f,
+                        block,
+                        next_provenance(),
+                        Space::Scratch,
+                        private_address,
+                        word_data,
+                        aperture.inside_exec,
+                    )
+                };
+                let local = aperture.group.as_ref().and_then(|group| {
+                    let local_address = if k == 0 {
+                        group.local
+                    } else {
+                        offset_by(f, block, Ty::I32, group.local, k as u64 * 4)
+                    };
+                    self.effect(
+                        f,
+                        block,
+                        next_provenance(),
+                        Space::Lds,
+                        local_address,
+                        word_data,
+                        group.shared_exec,
+                    )
+                });
+                let outer = match (result, local) {
+                    (Some(global), Some(local)) => {
+                        let shared = f.value(Ty::I32);
+                        block.insts.push(Inst::Core {
+                            value: shared,
+                            ty: Ty::I32,
+                            op: Op::Select(aperture.group.as_ref().unwrap().shared, local, global),
+                        });
+                        Some(shared)
+                    }
+                    (global, _) => global,
+                };
+                result = match (outer, private) {
+                    (Some(outer), Some(private)) => {
+                        let merged = f.value(Ty::I32);
+                        block.insts.push(Inst::Core {
+                            value: merged,
+                            ty: Ty::I32,
+                            op: Op::Select(aperture.inside, private, outer),
+                        });
+                        Some(merged)
+                    }
+                    _ => outer,
+                };
             }
             if self.returns {
                 self.write_result(f, block, words, mask, k, result.unwrap());
@@ -769,7 +805,14 @@ struct Aperture {
     inside: ValueId,
     private: ValueId,
     inside_exec: ValueId,
+    group: Option<GroupAperture>,
     outside: ValueId,
+}
+
+struct GroupAperture {
+    shared: ValueId,
+    local: ValueId,
+    shared_exec: ValueId,
 }
 
 fn flat_aperture(
@@ -778,6 +821,7 @@ fn flat_aperture(
     base: ValueId,
     address: ValueId,
     mask: ValueId,
+    lds: bool,
 ) -> Aperture {
     let sb = f.value(Ty::I64);
     let size = f.value(Ty::I64);
@@ -804,13 +848,37 @@ fn flat_aperture(
     let inside_exec = push(Ty::I1, Op::Int(IntOp::And, mask, inside));
     let one = push(Ty::I1, Op::Const(Ty::I1, 1));
     let outside_lanes = push(Ty::I1, Op::Int(IntOp::Xor, inside, one));
-    let outside = push(Ty::I1, Op::Int(IntOp::And, mask, outside_lanes));
     let off = push(Ty::I64, Op::Int(IntOp::Sub, address, sb));
     let private = push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, off));
+    if !lds {
+        let outside = push(Ty::I1, Op::Int(IntOp::And, mask, outside_lanes));
+        return Aperture {
+            inside,
+            private,
+            inside_exec,
+            group: None,
+            outside,
+        };
+    }
+    let shared_base = push(Ty::I64, Op::Const(Ty::I64, crate::rdna_spmd::SHARED_APERTURE));
+    let shared_end = push(Ty::I64, Op::Const(Ty::I64, crate::rdna_spmd::SHARED_APERTURE + (1 << 32)));
+    let shared_ge = push(Ty::I1, Op::Cmp(IntPred::Uge, base, shared_base));
+    let shared_lt = push(Ty::I1, Op::Cmp(IntPred::Ult, base, shared_end));
+    let shared = push(Ty::I1, Op::Int(IntOp::And, shared_ge, shared_lt));
+    let shared_exec = push(Ty::I1, Op::Int(IntOp::And, mask, shared));
+    let not_shared = push(Ty::I1, Op::Int(IntOp::Xor, shared, one));
+    let outside_lanes = push(Ty::I1, Op::Int(IntOp::And, outside_lanes, not_shared));
+    let outside = push(Ty::I1, Op::Int(IntOp::And, mask, outside_lanes));
+    let local = push(Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, address));
     Aperture {
         inside,
         private,
         inside_exec,
+        group: Some(GroupAperture {
+            shared,
+            local,
+            shared_exec,
+        }),
         outside,
     }
 }
@@ -829,4 +897,74 @@ fn offset_by(f: &mut Func, block: &mut Block, ty: Ty, base: ValueId, offset: u64
         op: Op::Int(IntOp::Add, base, off),
     });
     sum
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::regs::{Views, Word, Words};
+    use super::*;
+    use crate::instructions::I;
+    use crate::rdna_instructions::{InstFormat, VFLAT};
+
+    fn flat_load(lds: bool) -> Block {
+        let memory = instruction(&InstFormat::VFLAT(VFLAT {
+            op: I::FLAT_LOAD_B32,
+            vaddr: 0,
+            vsrc: 0,
+            vdst: 2,
+            scope: 0,
+            th: 0,
+            ioffset: 0,
+            saddr: 124,
+            sve: 0,
+        }))
+        .unwrap();
+        let mut f = Func::new(BlockId(0), Presence::Wave, 32);
+        let regs = [Word::Vgpr(0), Word::Vgpr(1), Word::Vgpr(2), Word::Mask(126)];
+        let params: Vec<_> = regs.iter().map(|r| (f.value(r.ty()), r.ty())).collect();
+        let mut block = Block {
+            params: params.clone(),
+            insts: vec![],
+            term: Term::Ret(vec![]),
+        };
+        let mut words: Words = regs.iter().copied().zip(params.iter().map(|p| p.0)).collect();
+        let mut views = Views::new();
+        let mut provenance = 0;
+        memory.lift(&mut f, &mut block, &mut words, &mut views, &mut provenance, lds);
+        block
+    }
+
+    fn spaces(block: &Block) -> Vec<Space> {
+        block
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                Inst::Effect {
+                    op: EffectOp::Memory { space, .. },
+                    ..
+                } => Some(*space),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn mentions_shared_aperture(block: &Block) -> bool {
+        block.insts.iter().any(|inst| {
+            matches!(inst, Inst::Core { op: Op::Const(Ty::I64, k), .. } if *k == crate::rdna_spmd::SHARED_APERTURE)
+        })
+    }
+
+    #[test]
+    fn a_flat_access_of_a_kernel_without_lds_splits_into_global_and_private_parts() {
+        let block = flat_load(false);
+        assert_eq!(spaces(&block), vec![Space::Global, Space::Scratch]);
+        assert!(!mentions_shared_aperture(&block), "no lane tests the shared aperture");
+    }
+
+    #[test]
+    fn a_flat_access_of_a_kernel_with_lds_also_has_a_local_part() {
+        let block = flat_load(true);
+        assert_eq!(spaces(&block), vec![Space::Global, Space::Scratch, Space::Lds]);
+        assert!(mentions_shared_aperture(&block), "lanes test the shared aperture");
+    }
 }

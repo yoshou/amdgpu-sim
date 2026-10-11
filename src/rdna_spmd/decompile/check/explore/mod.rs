@@ -567,6 +567,8 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
+            never: Default::default(),
+            settled: Default::default(),
         };
         let tags = [Choice::Meet(0)];
         let mut pool: Vec<Atom> = p.iter().chain(&j).map(|&v| Atom::Bit(v)).collect();

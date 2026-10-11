@@ -100,12 +100,35 @@ struct Bound {
     environment: Environment,
 }
 
+fn decode(
+    name: &str,
+    image: &Image,
+    descriptor_address: usize,
+    target: &str,
+    lanes: u32,
+    shared_base: Option<u32>,
+    lds: bool,
+) -> Result<Jit, Error> {
+    let descriptor = decode_kernel_desc(&image.memory[descriptor_address..descriptor_address + 64]);
+    let entry = descriptor_address + descriptor.kernel_code_entry_byte_offset;
+    let program = decode_program(target, &descriptor, entry, &image.memory, lanes, shared_base, lds)
+        .map_err(|e| Error::new(format!("{}: {}", name, e)))?;
+    Ok(Jit::new(program, descriptor.granulated_workitem_vgpr_count))
+}
+
+struct Compiled {
+    jit: Jit,
+    lds: bool,
+}
+
 pub struct Function {
     name: String,
     image: Arc<Image>,
     metadata: KernelMetadata,
     descriptor_address: usize,
-    jit: Mutex<Jit>,
+    target: String,
+    shared_base: Option<u32>,
+    jit: Mutex<Compiled>,
 }
 
 impl Function {
@@ -114,21 +137,25 @@ impl Function {
         let descriptor_address = image
             .symbol(&metadata.symbol)
             .ok_or_else(|| Error::new(format!("{}: no kernel descriptor symbol {}", name, metadata.symbol)))?;
-        let bytes = image
-            .memory
-            .get(descriptor_address..descriptor_address + 64)
-            .ok_or_else(|| Error::new(format!("{}: the kernel descriptor lies outside the code object", name)))?;
-        let descriptor = decode_kernel_desc(bytes);
-        let entry = descriptor_address + descriptor.kernel_code_entry_byte_offset;
-        let program = decode_program(target, &descriptor, entry, &image.memory, metadata.wavefront_size)
-            .map_err(|e| Error::new(format!("{}: {}", name, e)))?;
-        let jit = Mutex::new(Jit::new(program, descriptor.granulated_workitem_vgpr_count));
+        if image.memory.len() < descriptor_address + 64 {
+            return Err(Error::new(format!("{}: the kernel descriptor lies outside the code object", name)));
+        }
+        let shared_base = metadata
+            .args
+            .iter()
+            .find(|a| a.value_kind == "hidden_shared_base")
+            .map(|a| a.offset);
+        let lds = metadata.group_segment_fixed_size > 0
+            || metadata.args.iter().any(|a| a.value_kind == "hidden_dynamic_lds_size");
+        let jit = decode(&name, &image, descriptor_address, target, metadata.wavefront_size, shared_base, lds)?;
         Ok(Self {
             name,
             image,
             metadata,
             descriptor_address,
-            jit,
+            target: target.to_string(),
+            shared_base,
+            jit: Mutex::new(Compiled { jit, lds }),
         })
     }
 
@@ -138,13 +165,13 @@ impl Function {
 
     pub fn prepare(&self, launch: &Launch, args: &[Arg]) -> Result<(), Error> {
         let bound = self.bind(launch, args)?;
-        self.kernel(launch, &bound.environment);
+        self.kernel(launch, &bound.environment)?;
         Ok(())
     }
 
     pub fn launch(&self, launch: &Launch, args: &[Arg]) -> Result<(), Error> {
         let bound = self.bind(launch, args)?;
-        let kernel = self.kernel(launch, &bound.environment);
+        let kernel = self.kernel(launch, &bound.environment)?;
         dispatch(
             &kernel,
             bound.kernarg.as_ptr() as u64,
@@ -157,8 +184,21 @@ impl Function {
         Ok(())
     }
 
-    fn kernel(&self, launch: &Launch, environment: &Environment) -> Arc<Kernel> {
-        self.jit.lock().unwrap().kernel(launch.width, environment)
+    fn kernel(&self, launch: &Launch, environment: &Environment) -> Result<Arc<Kernel>, Error> {
+        let mut compiled = self.jit.lock().unwrap();
+        if launch.dynamic_shared > 0 && !compiled.lds {
+            compiled.jit = decode(
+                &self.name,
+                &self.image,
+                self.descriptor_address,
+                &self.target,
+                self.metadata.wavefront_size,
+                self.shared_base,
+                true,
+            )?;
+            compiled.lds = true;
+        }
+        Ok(compiled.jit.kernel(launch.width, environment))
     }
 
     fn bind(&self, launch: &Launch, args: &[Arg]) -> Result<Bound, Error> {
@@ -246,6 +286,14 @@ impl Function {
                 ("hidden_grid", None) if suffix == "dims" => ((dims.max(1)) as u16).to_le_bytes().to_vec(),
                 ("hidden_dynamic_lds", None) if suffix == "size" => {
                     launch.dynamic_shared.to_le_bytes().to_vec()
+                }
+                ("hidden_shared", None) if suffix == "base" => {
+                    let aperture = crate::rdna_spmd::SHARED_APERTURE;
+                    if meta.size == 4 {
+                        ((aperture >> 32) as u32).to_le_bytes().to_vec()
+                    } else {
+                        aperture.to_le_bytes().to_vec()
+                    }
                 }
                 _ => continue,
             };

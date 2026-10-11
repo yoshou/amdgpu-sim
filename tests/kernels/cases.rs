@@ -1440,3 +1440,198 @@ fn exchange_after_divergent_stores() {
         same("divergent_swap", width, "the reference", &out, &want);
     }
 }
+
+fn scan_per_wave(x: &[u32], lanes: usize) -> Vec<u32> {
+    let mut want = vec![0u32; x.len()];
+    for w in 0..x.len() / lanes {
+        let mut acc = 0u32;
+        for l in 0..lanes {
+            acc = acc.wrapping_add(x[w * lanes + l]);
+            want[w * lanes + l] = acc;
+        }
+    }
+    want
+}
+
+#[test]
+fn block_wide_count_or_and_tests_agree() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x: Vec<u32> = words(n).iter().map(|v| v % 6000).collect();
+    let mut want = vec![0u32; n];
+    for b in 0..2 {
+        let block = &x[b * 64..(b + 1) * 64];
+        let c = block.iter().filter(|&&v| v & 1 != 0).count() as u32;
+        let o = block.iter().any(|&v| v > 1000) as u32;
+        let a = block.iter().all(|&v| v < 5000) as u32;
+        for t in 0..64 {
+            want[b * 64 + t] = c * 100 + o * 10 + a;
+        }
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        k.run(&Run { kernel: "sync_or_and", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("sync_or_and", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn private_array_with_computed_indices_selects_its_words() {
+    let k = Kernels::load();
+    let n = 64usize;
+    let x = words(n);
+    let want: Vec<u32> = x
+        .iter()
+        .map(|&v| {
+            let mut a: Vec<u32> = (0..12).map(|i| v.wrapping_mul(i + 1)).collect();
+            let kk = (v % 12) as usize;
+            for i in 0..6usize {
+                let from = a[(kk + 3 * i) % 12];
+                a[(kk + i) % 12] = a[(kk + i) % 12].wrapping_add(from);
+            }
+            a[kk].wrapping_add(a[(kk + 4) % 12])
+        })
+        .collect();
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        k.run(&Run { kernel: "private_index", wg: [32, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("private_index", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn volatile_shared_memory_scans_each_wave() {
+    let k = Kernels::load();
+    let lanes = crate::LANES;
+    let n = 2 * lanes;
+    let x: Vec<u32> = words(n).iter().map(|v| v % 100).collect();
+    let want = scan_per_wave(&x, lanes);
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        k.run(&Run { kernel: "volatile_scan", wg: [lanes as u32, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("volatile_scan", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn dynamic_shared_memory_reaches_flat_accesses() {
+    let k = Kernels::load();
+    let lanes = crate::LANES;
+    let n = 2 * lanes;
+    let x: Vec<u32> = words(n).iter().map(|v| v % 100).collect();
+    let want = scan_per_wave(&x, lanes);
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        let run = Run { kernel: "dynamic_flat", wg: [lanes as u32, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] };
+        k.run_with_shared(&run, width, 1, 4 * lanes as u32);
+        same("dynamic_flat", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn dpp_moves_permute_within_rows() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x = words(n);
+    let mut want = vec![0u32; 4 * n];
+    for g in 0..n {
+        let l = g % 64;
+        let row = l / 16 * 16;
+        let column = l % 16;
+        let at = |s: usize| x[g - l + s];
+        want[g * 4] = at(l ^ 1);
+        want[g * 4 + 1] = if column >= 1 { at(l - 1) } else { 0xffff };
+        want[g * 4 + 2] = at(row + (column + 13) % 16);
+        want[g * 4 + 3] = at(row + 15 - column);
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u32; 4 * n];
+        k.run(&Run { kernel: "dpp_rows", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("dpp_rows", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn shared_compare_swap_and_max_total_each_block() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x: Vec<u32> = words(n).iter().map(|v| v % 1000).collect();
+    let mut want = vec![0u32; n];
+    for b in 0..2 {
+        let block = &x[b * 64..(b + 1) * 64];
+        let total: u32 = block.iter().sum();
+        let largest = *block.iter().max().unwrap();
+        for t in 0..64 {
+            want[b * 64 + t] = if t == 0 { total } else { largest };
+        }
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        k.run(&Run { kernel: "lds_cas", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::input(&x)] }, width);
+        same("lds_cas", width, "the reference", &y, &want);
+    }
+}
+
+#[test]
+fn bitwise_and_wrapping_atomics_return_the_old_words() {
+    let k = Kernels::load();
+    let n = 128usize;
+    let x = words(n);
+    let start: Vec<u32> = words(n).iter().map(|v| v.rotate_left(13)).collect();
+    let mut want = vec![0u32; n];
+    let mut cells_want = start.clone();
+    for g in 0..n {
+        let v = x[g];
+        let mut c = start[g];
+        let mut r = c;
+        c |= v;
+        r = r.wrapping_add(c);
+        c &= !(v >> 1);
+        r = r.wrapping_add(c);
+        c ^= v << 1;
+        r = r.wrapping_add(c);
+        c = g as u32;
+        r = r.wrapping_add(c);
+        c = if c >= 100 { 0 } else { c + 1 };
+        r = r.wrapping_add(c);
+        c = if c == 0 || c > 100 { 100 } else { c - 1 };
+        r = r.wrapping_add(c);
+        c = c.wrapping_sub(3);
+        want[g] = r;
+        cells_want[g] = c;
+    }
+    for width in WIDTHS {
+        let mut y = vec![0u32; n];
+        let mut cells = start.clone();
+        k.run(
+            &Run { kernel: "bit_atomics", wg: [64, 1, 1], grid: [2, 1, 1], args: &[Arg::output(&mut y), Arg::output(&mut cells), Arg::input(&x)] },
+            width,
+        );
+        same("bit_atomics", width, "the reference", &y, &want);
+        same("bit_atomics cells", width, "the reference", &cells, &cells_want);
+    }
+}
+
+#[test]
+fn saxpy_runs_workgroups_narrower_than_a_packet() {
+    let k = Kernels::load();
+    let n = 300usize;
+    let x = ramp(n, 0.25, -3.0);
+    let a = 2.5f32;
+    let want: Vec<f32> = x.iter().enumerate().map(|(i, &v)| a * v + i as f32).collect();
+    for wg in [48u32, 24, 7] {
+        for width in WIDTHS {
+            let mut y: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            k.run(
+                &Run {
+                    kernel: "saxpy",
+                    wg: [wg, 1, 1],
+                    grid: [(n as u32).div_ceil(wg), 1, 1],
+                    args: &[Arg::output(&mut y), Arg::input(&x), Arg::F32(a), Arg::I32(n as i32)],
+                },
+                width,
+            );
+            same("saxpy", width, "the reference", &y, &want);
+        }
+    }
+}

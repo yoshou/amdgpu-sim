@@ -306,12 +306,39 @@ mod tests {
         }
     }
 
-    fn value(l: &Lowered, logic: &Logic, f: Bdd, assignment: &std::collections::HashMap<Atom, bool>) -> bool {
-        let mut f = f;
-        while let Some((var, low, high)) = logic.m.decompose(f) {
-            f = if assignment[&canonical(l, logic.atom_of(var))] { high } else { low };
+    fn transfer(
+        l: &Lowered,
+        logic: &Logic,
+        f: Bdd,
+        m: &mut crate::rdna_spmd::analysis::bdd::Manager,
+        vars: &mut std::collections::HashMap<Atom, u32>,
+        memo: &mut std::collections::HashMap<Bdd, Bdd>,
+    ) -> Bdd {
+        if let Some(&g) = memo.get(&f) {
+            return g;
         }
-        f == Bdd::TRUE
+        let g = match logic.m.decompose(f) {
+            None => f,
+            Some((var, low, high)) => {
+                let atom = canonical(l, logic.atom_of(var));
+                let next = vars.len() as u32;
+                let id = *vars.entry(atom).or_insert(next);
+                let v = m.var(id);
+                let lo = transfer(l, logic, low, m, vars, memo);
+                let hi = transfer(l, logic, high, m, vars, memo);
+                m.ite(v, hi, lo)
+            }
+        };
+        memo.insert(f, g);
+        g
+    }
+
+    fn same(l: &Lowered, wave: &Logic, lane: &Logic, expected: Bdd, got: Bdd) -> bool {
+        let mut m = crate::rdna_spmd::analysis::bdd::Manager::new();
+        let mut vars = std::collections::HashMap::new();
+        let a = transfer(l, wave, expected, &mut m, &mut vars, &mut Default::default());
+        let b = transfer(l, lane, got, &mut m, &mut vars, &mut Default::default());
+        a == b
     }
 
     fn atoms(l: &Lowered, logic: &mut Logic, f: Bdd) -> Vec<Atom> {
@@ -363,18 +390,6 @@ mod tests {
             .collect();
         let mut lane = Logic::fixed(&l.lane, &lane_facts, &queries, &[]);
         let mut wrong = Vec::new();
-        let same = |l: &Lowered, wave: &mut Logic, lane: &mut Logic, expected: Bdd, got: Bdd| {
-            let mut all: Vec<Atom> = atoms(l, wave, expected);
-            all.extend(atoms(l, lane, got));
-            all.sort_by_key(|a| format!("{:?}", a));
-            all.dedup();
-            assert!(all.len() <= 16, "too many atoms to enumerate");
-            (0..1u32 << all.len()).all(|bits| {
-                let assignment: std::collections::HashMap<Atom, bool> =
-                    all.iter().enumerate().map(|(i, &a)| (a, bits >> i & 1 != 0)).collect();
-                value(l, wave, expected, &assignment) == value(l, lane, got, &assignment)
-            })
-        };
         for &id in &l.wave_facts.order {
             let edges = l.wave.blocks[&id].term.edges().zip(l.lane.blocks[&id].term.edges());
             for (we, le) in edges.collect::<Vec<_>>() {
@@ -388,7 +403,7 @@ mod tests {
                         wave.view(&l.wave, &l.wave_facts, wa)
                     };
                     let got = lane.bit(&l.lane, &lane_facts, la);
-                    if !same(l, &mut wave, &mut lane, expected, got) {
+                    if !same(l, &wave, &lane, expected, got) {
                         eprintln!("b{} -> b{}: the argument for v{} differs", id.0, we.dst.0, param.0);
                         wrong.push(param);
                     }
@@ -413,17 +428,7 @@ mod tests {
                     wave.view(&l.wave, &l.wave_facts, v)
                 };
                 let got = lane.bit(&l.lane, &lane_facts, v);
-                let mut all: Vec<Atom> = atoms(l, &mut wave, expected);
-                all.extend(atoms(l, &mut lane, got));
-                all.sort_by_key(|a| format!("{:?}", a));
-                all.dedup();
-                assert!(all.len() <= 16, "too many atoms to enumerate");
-                let same = (0..1u32 << all.len()).all(|bits| {
-                    let assignment: std::collections::HashMap<Atom, bool> =
-                        all.iter().enumerate().map(|(i, &a)| (a, bits >> i & 1 != 0)).collect();
-                    value(l, &wave, expected, &assignment) == value(l, &lane, got, &assignment)
-                });
-                if !same {
+                if !same(l, &wave, &lane, expected, got) {
                     eprintln!(
                         "v{}: wave {:?} lane {:?}\n  wave inst {:?}\n  lane inst {:?}",
                         v.0,

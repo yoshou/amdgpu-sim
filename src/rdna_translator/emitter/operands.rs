@@ -43,6 +43,7 @@ impl IREmitter {
             }
             SourceOperand::ScalarRegister(value) => self.emit_load_sgpr_u64(*value as u32),
             SourceOperand::PrivateBase => self.scratch_base,
+            SourceOperand::SharedBase => panic!(),
             _ => panic!("Unsupported source operand type: {:?}", operand),
         }
     }
@@ -112,7 +113,7 @@ impl IREmitter {
                 let value = self.emit_load_vgpr_u32(*value as u32, elem);
                 llvm::core::LLVMBuildBitCast(self.builder, value, ty_f32, empty_name.as_ptr())
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -159,7 +160,7 @@ impl IREmitter {
                 }
                 values
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -195,7 +196,7 @@ impl IREmitter {
                 let value = llvm::core::LLVMBuildTrunc(builder, value, ty_i16, empty_name.as_ptr());
                 llvm::core::LLVMBuildBitCast(self.builder, value, ty_f16, empty_name.as_ptr())
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -244,7 +245,7 @@ impl IREmitter {
                 let value = llvm::core::LLVMBuildTrunc(builder, value, ty_i16, empty_name.as_ptr());
                 llvm::core::LLVMBuildBitCast(self.builder, value, ty_f16, empty_name.as_ptr())
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -338,7 +339,7 @@ impl IREmitter {
                 }
                 values
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -362,7 +363,7 @@ impl IREmitter {
             }
             SourceOperand::ScalarRegister(value) => self.emit_load_sgpr_u64(*value as u32),
             SourceOperand::VectorRegister(value) => self.emit_load_vgpr_u64(*value as u32, elem),
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -390,7 +391,7 @@ impl IREmitter {
                 let value = self.emit_load_vgpr_u64(*value as u32, elem);
                 llvm::core::LLVMBuildBitCast(self.builder, value, ty_f64, empty_name.as_ptr())
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -514,7 +515,7 @@ impl IREmitter {
             SourceOperand::VectorRegister(value) => {
                 self.emit_load_vgpr_u64xn::<N>(*value as u32, elem, mask)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -579,7 +580,7 @@ impl IREmitter {
             SourceOperand::VectorRegister(value) => {
                 self.emit_load_vgpr_f64xn::<N>(*value as u32, elem, mask)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -639,7 +640,7 @@ impl IREmitter {
             SourceOperand::VectorRegister(value) => {
                 self.emit_load_vgpr_u32xn::<N>(*value as u32, elem, mask)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -702,7 +703,7 @@ impl IREmitter {
             SourceOperand::VectorRegister(value) => {
                 self.emit_load_vgpr_f32xn::<N>(*value as u32, elem, mask)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -774,7 +775,7 @@ impl IREmitter {
                 }
                 values
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -843,7 +844,7 @@ impl IREmitter {
             SourceOperand::VectorRegister(value) => {
                 self.emit_load_vgpr_f16xn::<N>(*value as u32, elem, mask)
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -933,7 +934,7 @@ impl IREmitter {
                     llvm::core::LLVMBuildBitCast(builder, value, ty_f16xn, empty_name.as_ptr());
                 value
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 
@@ -1079,7 +1080,7 @@ impl IREmitter {
                 }
                 values
             }
-            SourceOperand::PrivateBase => panic!(),
+            SourceOperand::PrivateBase | SourceOperand::SharedBase => panic!(),
         }
     }
 }

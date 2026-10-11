@@ -70,10 +70,16 @@ where
                     q.m().iff(x, y)
                 }
             }
-            Op::Cmp(..) => match cell_bit(q, f, facts, v) {
-                Some(bit) => bit,
-                None => q.atom(opaque),
-            },
+            Op::Cmp(..) => {
+                let cell = cell_bit(q, f, facts, v);
+                let own = q.atom(opaque);
+                let own_var = q.m().decompose(own).map(|(var, _, _)| var);
+                let decided = cell.filter(|&bit| !q.support(bit).iter().any(|&var| Some(var) == own_var));
+                match decided.or_else(|| word_compare(q, f, facts, v)).or(cell) {
+                    Some(bit) => bit,
+                    None => own,
+                }
+            }
             Op::FCmp(p, a, b) => {
                 let within = float_within(q, f, facts, v, p, a, b);
                 let leaf = if within == q.atom(Atom::Bit(v)) { float_relation(q, f, facts, v, p, a, b) } else { within };
@@ -83,6 +89,53 @@ where
         },
         _ => q.atom(opaque),
     }
+}
+
+fn word_compare<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, v: ValueId) -> Option<Bdd> {
+    let Some(Op::Cmp(p, a, b)) = facts.op(f, v) else {
+        return None;
+    };
+    let (w, k, flipped) = match (facts.constant(f, a), facts.constant(f, b)) {
+        (None, Some(k)) => (a, k, false),
+        (Some(k), None) => (b, k, true),
+        _ => return None,
+    };
+    if f.types[w.0] != Ty::I32 || facts.compared[w.0] < 2 {
+        return None;
+    }
+    let signed = matches!(p, IntPred::Slt | IntPred::Sgt | IntPred::Sle | IntPred::Sge);
+    let target = if signed { k as u32 ^ 0x8000_0000 } else { k as u32 };
+    let mut equal = Bdd::TRUE;
+    let mut below = Bdd::FALSE;
+    for i in (0..32u8).rev() {
+        let raw = q.atom(Atom::WordBit(w, i));
+        let x = if signed && i == 31 { q.m().not(raw) } else { raw };
+        let clear = q.m().not(x);
+        if target >> i & 1 == 1 {
+            let here = q.m().and(equal, clear);
+            below = q.m().or(below, here);
+            equal = q.m().and(equal, x);
+        } else {
+            equal = q.m().and(equal, clear);
+        }
+    }
+    let (lhs_below, lhs_equal) = if flipped {
+        let at_most = q.m().or(below, equal);
+        (q.m().not(at_most), equal)
+    } else {
+        (below, equal)
+    };
+    Some(match p {
+        IntPred::Eq => lhs_equal,
+        IntPred::Ne => q.m().not(lhs_equal),
+        IntPred::Ult | IntPred::Slt => lhs_below,
+        IntPred::Ule | IntPred::Sle => q.m().or(lhs_below, lhs_equal),
+        IntPred::Uge | IntPred::Sge => q.m().not(lhs_below),
+        IntPred::Ugt | IntPred::Sgt => {
+            let at_most = q.m().or(lhs_below, lhs_equal);
+            q.m().not(at_most)
+        }
+    })
 }
 
 pub(super) fn compute_view<Q: Queries>(q: &mut Q, f: &Func, facts: &Facts, w: ValueId) -> Bdd

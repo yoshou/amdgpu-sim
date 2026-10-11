@@ -348,6 +348,8 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
+            never: Default::default(),
+            settled: Default::default(),
         };
         let base = Facts::new(f, inputs, &BTreeSet::new());
         let loops = Loops::new(f, &base).unwrap();

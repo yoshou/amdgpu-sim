@@ -339,7 +339,7 @@ fn gate(fi: bool, bound_ctrl: bool, registry: &DialectRegistry) -> Lowering {
     )
 }
 
-pub fn lowerings(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Vec<Lowering> {
+pub fn lowerings(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Result<Vec<Lowering>, String> {
     let source = source_register(&d.inner);
     let mut out = vec![plan(d, registry, lanes), fetch(d.fi, source)];
     if !d.fi {
@@ -347,9 +347,9 @@ pub fn lowerings(d: &DPP, registry: &DialectRegistry, lanes: u32) -> Vec<Lowerin
     }
     out.push(gate(d.fi, d.bound_ctrl, registry));
     let inner = with_source(&d.inner, VALUE, d.abs, d.neg);
-    let lowering = super::instruction_with_registry(&inner, registry, lanes);
+    let lowering = super::instruction_with_registry(&inner, registry, lanes)?;
     out.push(gated(lowering, ENABLE, registry));
-    out
+    Ok(out)
 }
 
 fn permlane_plan(i: &crate::rdna_instructions::VOP3, registry: &DialectRegistry) -> Lowering {
@@ -394,7 +394,7 @@ pub fn permlane_lowerings(
     i: &crate::rdna_instructions::VOP3,
     registry: &DialectRegistry,
     lanes: u32,
-) -> Vec<Lowering> {
+) -> Result<Vec<Lowering>, String> {
     let source = match i.src0 {
         SourceOperand::VectorRegister(r) => r as u32,
         ref other => panic!("permlane reads a source other than a VGPR: {:?}", other),
@@ -411,7 +411,7 @@ pub fn permlane_lowerings(
         op: I::V_MOV_B32,
         vdst: i.vdst,
     });
-    let lowering = super::instruction_with_registry(&moved, registry, lanes);
+    let lowering = super::instruction_with_registry(&moved, registry, lanes)?;
     out.push(gated(lowering, ENABLE, registry));
-    out
+    Ok(out)
 }

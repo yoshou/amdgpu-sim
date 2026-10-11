@@ -39,7 +39,14 @@ fn terminator(inst: &decode::Inst, next: &[usize]) -> Terminator {
     }
 }
 
-pub fn decode(descriptor: &KernelDescriptor, entry_pc: usize, memory: &[u8], lanes: u32) -> Result<(Program, EntryLayout), String> {
+pub fn decode(
+    descriptor: &KernelDescriptor,
+    entry_pc: usize,
+    memory: &[u8],
+    lanes: u32,
+    shared_base: Option<u32>,
+    lds: bool,
+) -> Result<(Program, EntryLayout), String> {
     if lanes != 64 {
         return Err(format!("gfx803 runs waves of 64 lanes, not {lanes}"));
     }
@@ -57,10 +64,19 @@ pub fn decode(descriptor: &KernelDescriptor, entry_pc: usize, memory: &[u8], lan
         .collect();
     let (graph, traced) = trace::explore(entry_pc, memory, state::State::entry(mode, known))?;
     let registry = Arc::new(crate::rdna_spmd::rdna4::dialect().registry);
+    let flat_lds = lds
+        && graph.blocks.values().flat_map(|b| &b.insts).any(|(_, inst)| match inst.form {
+            decode::Form::Smem { sbase, offset, imm: true, .. } => {
+                Some(sbase as u32 * 2) == layout.kernarg_ptr
+                    && shared_base.is_some_and(|at| offset >= at && offset < at + 4)
+            }
+            _ => false,
+        });
     let target = lower::Target {
         registry: &registry,
         lanes,
         descriptor: layout.private_segment_buffer.map(|r| r as u16),
+        flat_lds,
     };
     let span = graph.span();
     let mut blocks = BTreeMap::new();
@@ -113,5 +129,5 @@ pub fn decode(descriptor: &KernelDescriptor, entry_pc: usize, memory: &[u8], lan
     let program = ScalarProgram { entry_pc, blocks };
     super::rdna4::reserves_temporaries(plain)?;
     let refs = lowerings.iter().map(|(&pc, b)| (pc, b.iter().collect())).collect();
-    Ok((lift::lift(registry.clone(), &program, &refs, lanes), layout))
+    Ok((lift::lift(registry.clone(), &program, &refs, lanes, flat_lds), layout))
 }

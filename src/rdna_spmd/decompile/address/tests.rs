@@ -1195,6 +1195,38 @@ fn aperture_tests_find_a_scratch_pointer_below_the_scratch_size() {
     assert_eq!(found, Some(true));
 }
 
+fn shared_window(pointer: impl Fn(&mut Build, BlockId) -> ValueId) -> Option<bool> {
+    let (mut b, _) = Build::kernel();
+    let e = BlockId(0);
+    let p = pointer(&mut b, e);
+    let shared = crate::rdna_spmd::SHARED_APERTURE;
+    let low = b.constant(e, Ty::I64, shared);
+    let high = b.constant(e, Ty::I64, shared + (1 << 32));
+    let above = b.cmp(e, IntPred::Uge, p, low);
+    let below = b.cmp(e, IntPred::Ult, p, high);
+    let inside = b.int(e, IntOp::And, above, below);
+    addresses(&b, &environment(32, &[]), |a| a.bit(inside, 0, None).0)
+}
+
+#[test]
+fn shared_aperture_tests_decide_by_the_high_word_or_the_region() {
+    let shared = crate::rdna_spmd::SHARED_APERTURE;
+    let in_window = shared_window(|b, e| {
+        let low = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let high = b.constant(e, Ty::I32, shared >> 32);
+        b.core(e, Ty::I64, Op::Pack64(low, high))
+    });
+    assert_eq!(in_window, Some(true), "a pointer whose high word names the shared window");
+    let below_window = shared_window(|b, e| {
+        let low = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let high = b.constant(e, Ty::I32, 7);
+        b.core(e, Ty::I64, Op::Pack64(low, high))
+    });
+    assert_eq!(below_window, Some(false), "a pointer whose high word is elsewhere");
+    let private = shared_window(|b, e| scratch(b, e, 8).1);
+    assert_eq!(private, Some(false), "a scratch pointer is never shared");
+}
+
 #[test]
 fn aperture_tests_decide_only_what_their_bound_gives() {
     let found = aperture(|b, e, base| {

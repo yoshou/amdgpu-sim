@@ -68,6 +68,14 @@ impl Masks {
                 self.faithful[param.0] = assumed && word(param);
             }
         }
+        let mut argument = vec![false; n];
+        for block in f.blocks.values() {
+            for edge in block.term.edges() {
+                for &a in &edge.args {
+                    argument[a.0] = true;
+                }
+            }
+        }
         let mut actives: Vec<Option<(Vec<ValueId>, Bdd)>> = vec![None; facts.order.len()];
         let mut changed = true;
         while changed {
@@ -101,6 +109,9 @@ impl Masks {
                     for v in inst.outputs() {
                         let ty = f.types[v.0];
                         if ty != Ty::I1 && !crate::rdna_spmd::analysis::facts::is_word(ty) {
+                            continue;
+                        }
+                        if ty != Ty::I1 && !word(v) && !argument[v.0] {
                             continue;
                         }
                         let formula = if ty == Ty::I1 {

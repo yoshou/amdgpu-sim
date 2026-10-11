@@ -13,6 +13,7 @@ pub struct Target<'a> {
     pub registry: &'a DialectRegistry,
     pub lanes: u32,
     pub descriptor: Option<u16>,
+    pub flat_lds: bool,
 }
 
 #[derive(Default)]
@@ -232,9 +233,9 @@ pub fn footprint(lowering: &Lowering, lanes: u32) -> lift::BoundaryIo {
     lift::footprint(lowering, lanes)
 }
 
-fn through(registry: &DialectRegistry, lanes: u32, inst: InstFormat) -> Lowered {
-    let lowering = lift::instruction_with_registry(&inst, registry, lanes);
-    Lowered::one(Some(inst), lowering)
+fn through(registry: &DialectRegistry, lanes: u32, inst: InstFormat) -> Result<Lowered, String> {
+    let lowering = lift::instruction_with_registry(&inst, registry, lanes)?;
+    Ok(Lowered::one(Some(inst), lowering))
 }
 
 fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String> {
@@ -251,7 +252,7 @@ fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
                 op,
                 sdst: scalar_dst(sdst)?,
             });
-            Ok(through(target.registry, target.lanes, format))
+            through(target.registry, target.lanes, format)
         }
         Form::Sop2 { sdst, ssrc0, ssrc1 } => {
             let op = plain_scalar(inst.op).ok_or_else(|| refuse(inst, "has no SPMD lowering"))?;
@@ -264,7 +265,7 @@ fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
                 sdst: scalar_dst(sdst)?,
                 op,
             });
-            Ok(through(target.registry, target.lanes, format))
+            through(target.registry, target.lanes, format)
         }
         Form::Sopc { ssrc0, ssrc1 } => {
             let op = plain_scalar(inst.op).ok_or_else(|| refuse(inst, "has no SPMD lowering"))?;
@@ -276,7 +277,7 @@ fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
                 ssrc1: source(ssrc1, literal)?,
                 op,
             });
-            Ok(through(target.registry, target.lanes, format))
+            through(target.registry, target.lanes, format)
         }
         Form::Sopk { sdst, simm16 } => {
             if let Some((op, signed)) = immediate_compare(inst.op) {
@@ -286,7 +287,7 @@ fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
                     ssrc1: SourceOperand::LiteralConstant(value),
                     op,
                 });
-                return Ok(through(target.registry, target.lanes, format));
+                return through(target.registry, target.lanes, format);
             }
             match inst.op {
                 I::S_SETREG_B32 | I::S_SETREG_IMM32_B32 => {
@@ -307,7 +308,7 @@ fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
                         op: I::S_MOV_B32,
                         sdst: scalar_dst(sdst)?,
                     });
-                    Ok(through(target.registry, target.lanes, format))
+                    through(target.registry, target.lanes, format)
                 }
                 _ => {
                     let op = plain_scalar(inst.op).ok_or_else(|| refuse(inst, "has no SPMD lowering"))?;
@@ -316,7 +317,7 @@ fn scalar(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
                         sdst: scalar_dst(sdst)?,
                         op,
                     });
-                    Ok(through(target.registry, target.lanes, format))
+                    through(target.registry, target.lanes, format)
                 }
             }
         }
@@ -381,7 +382,7 @@ fn smem(inst: &Inst, target: &Target) -> Result<Lowered, String> {
         scope: if glc { 2 } else { 0 },
         th: 0,
     });
-    Ok(through(target.registry, target.lanes, format))
+    through(target.registry, target.lanes, format)
 }
 
 struct Vector {
@@ -663,7 +664,7 @@ fn routed_lowering(inst: &Inst, v: &Vector, target: &Target) -> Result<(InstForm
             neg: v.neg,
         })
     };
-    let lowering = lift::instruction_with_registry(&format, target.registry, target.lanes);
+    let lowering = lift::instruction_with_registry(&format, target.registry, target.lanes)?;
     if !compare(inst.op) {
         checked_modifiers(inst, &lowering, v.abs, v.neg, v.clamp, v.omod)?;
     }
@@ -829,7 +830,7 @@ fn half_conversion(inst: &Inst, v: &Vector, target: &Target) -> Result<(InstForm
         omod: v.omod,
         neg: v.neg,
     });
-    let mut lowering = lift::instruction_with_registry(&format, target.registry, target.lanes);
+    let mut lowering = lift::instruction_with_registry(&format, target.registry, target.lanes)?;
     if matches!(inst.op, I::V_CVT_F16_F32) {
         let Lowering::TypedAlu { inputs, .. } = &mut lowering else {
             unreachable!()
@@ -1056,7 +1057,7 @@ fn vector(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String
             };
             return Ok(Lowered {
                 scan: vec![],
-                lowerings: lift::dpp::lowerings(&dpp, registry, target.lanes),
+                lowerings: lift::dpp::lowerings(&dpp, registry, target.lanes)?,
             });
         }
     };
@@ -1132,18 +1133,32 @@ fn flat(inst: &Inst, target: &Target) -> Result<Lowered, String> {
     } else {
         (if glc { 2 } else { 0 }, slc as u8)
     };
-    let format = InstFormat::VGLOBAL(rdna::VGLOBAL {
-        op,
-        vaddr: addr,
-        vsrc: data,
-        vdst,
-        scope,
-        th,
-        ioffset: 0,
-        saddr: 124,
-        sve: 0,
-    });
-    Ok(through(target.registry, target.lanes, format))
+    let format = if target.flat_lds {
+        InstFormat::VFLAT(rdna::VFLAT {
+            op,
+            vaddr: addr,
+            vsrc: data,
+            vdst,
+            scope,
+            th,
+            ioffset: 0,
+            saddr: 124,
+            sve: 0,
+        })
+    } else {
+        InstFormat::VGLOBAL(rdna::VGLOBAL {
+            op,
+            vaddr: addr,
+            vsrc: data,
+            vdst,
+            scope,
+            th,
+            ioffset: 0,
+            saddr: 124,
+            sve: 0,
+        })
+    };
+    through(target.registry, target.lanes, format)
 }
 
 fn local(op: I) -> Option<I> {
@@ -1238,7 +1253,7 @@ fn ds(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String> {
         data1,
         vdst,
     });
-    Ok(through(target.registry, target.lanes, format))
+    through(target.registry, target.lanes, format)
 }
 
 fn private(op: I) -> Option<I> {
@@ -1308,7 +1323,7 @@ fn mubuf(inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String>
         saddr: 124,
         sve: offen as u8,
     });
-    Ok(through(target.registry, target.lanes, format))
+    through(target.registry, target.lanes, format)
 }
 
 fn image(inst: &Inst, target: &Target) -> Result<Lowered, String> {
@@ -1367,7 +1382,7 @@ pub fn link(register: u8, address: usize, target: &Target) -> Result<Lowered, St
         op: I::S_MOV_B64,
         sdst: scalar_dst(register)?,
     });
-    Ok(through(target.registry, target.lanes, format))
+    through(target.registry, target.lanes, format)
 }
 
 pub fn lower(pc: usize, inst: &Inst, state: &State, target: &Target) -> Result<Lowered, String> {

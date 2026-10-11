@@ -208,6 +208,21 @@ fn aperture<'a, Q: Queries<'a>>(q: &mut Q, a: ValueId, b: ValueId, lane: usize) 
         Some(Op::Env(e)) => Some(e),
         _ => None,
     };
+    if base != again {
+        return None;
+    }
+    let shared = crate::rdna_spmd::SHARED_APERTURE;
+    if facts.constant(f, low) == Some(shared) && facts.constant(f, high) == Some(shared + (1 << 32)) {
+        if let Some(upper) = super::wide::compute_high(q, base, lane).and_then(|h| h.as_constant()) {
+            return Some(upper == (shared >> 32) as u32);
+        }
+        let (pointer, _) = q.value(base, lane, None);
+        return match pointer.region {
+            Some(Region::Lds) => Some(true),
+            Some(Region::Allocation(_) | Region::Exposed | Region::Kernarg | Region::Dispatch | Region::Private) => Some(false),
+            None => None,
+        };
+    }
     let bounded = match facts.op(f, high) {
         Some(Op::Int(IntOp::Add, x, y)) => matches!(
             (env(x), env(y)),
@@ -215,7 +230,7 @@ fn aperture<'a, Q: Queries<'a>>(q: &mut Q, a: ValueId, b: ValueId, lane: usize) 
         ),
         _ => false,
     };
-    if base != again || env(low) != Some(Env::ScratchBase) || !bounded {
+    if env(low) != Some(Env::ScratchBase) || !bounded {
         return None;
     }
     let (pointer, _) = q.value(base, lane, None);
