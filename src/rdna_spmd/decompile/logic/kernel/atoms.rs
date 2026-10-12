@@ -33,7 +33,7 @@ pub struct Atoms {
     markers_first: bool,
     vars: HashMap<Atom, u32>,
     atoms: HashMap<u32, Atom>,
-    params: HashMap<ValueId, (usize, usize)>,
+    params: HashMap<ValueId, u32>,
     markers: HashMap<Choice, u32>,
     blocks: HashMap<BlockId, u32>,
     detour: HashMap<Atom, u32>,
@@ -42,12 +42,36 @@ pub struct Atoms {
 
 impl Atoms {
     pub(super) fn new(f: &Func, facts: &Facts, markers_first: bool, listed: &[Choice]) -> Self {
-        let mut params = HashMap::default();
-        for (rank, id) in facts.order.iter().enumerate() {
+        let rank: HashMap<BlockId, usize> = facts.order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
+        let mut origins: HashMap<ValueId, (usize, usize, usize)> = HashMap::default();
+        let mut keyed = Vec::new();
+        for (r, id) in facts.order.iter().enumerate() {
             for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
-                params.insert(v, (rank, index));
+                let mut found: Option<Option<(usize, usize, usize)>> = None;
+                for &(pred, slot) in &facts.incoming[id] {
+                    if rank[&pred] >= r {
+                        continue;
+                    }
+                    let arg = f.blocks[&pred].term.edges().nth(slot).unwrap().args[index];
+                    let key = origins.get(&arg).copied().unwrap_or_else(|| match facts.site[arg.0] {
+                        Site::Inst { block, index } => (rank[&block], 1, index),
+                        Site::Param { block, index } => (rank[&block], 0, index),
+                        Site::Unreached => (0, 0, 0),
+                    });
+                    found = match found {
+                        None => Some(Some(key)),
+                        Some(Some(old)) if old == key => Some(Some(old)),
+                        _ => Some(None),
+                    };
+                }
+                let origin = found.flatten().unwrap_or((r, 0, index));
+                origins.insert(v, origin);
+                keyed.push((origin, r, index, v));
             }
         }
+        keyed.sort_unstable();
+        assert!(keyed.len() < 1 << 22, "register layout too large");
+        let params = keyed.into_iter().enumerate().map(|(i, (.., v))| (v, i as u32)).collect();
         assert!(listed.len() < 1 << 16, "too many conversion choices");
         let markers = listed
             .iter()
@@ -93,13 +117,7 @@ impl Atoms {
             Atom::Bit(v) | Atom::View(v) => {
                 let view = matches!(atom, Atom::View(_)) as u32;
                 match self.params.get(&v) {
-                    Some(&(rank, index)) => {
-                        assert!(
-                            index < 1 << 13 && rank < 1 << 15,
-                            "register layout too large"
-                        );
-                        return (1 << 23) + (((index as u32) << 16) | (view << 15) | rank as u32);
-                    }
+                    Some(&order) => return (1 << 23) + (view << 22) + order,
                     None => {
                         assert!(v.0 < 1 << 28, "function too large");
                         (1 << 30) | (view << 28) | v.0 as u32
@@ -288,5 +306,55 @@ mod tests {
         let lane = last_markers.number(Atom::Lane(5));
         let marker = last_markers.number(Atom::Marker(Choice::Meet(0)));
         assert!(lane < last_markers.number(Atom::Fresh(1, ValueId(0), 0)) && marker > last_markers.number(Atom::WordBit(inner, 0)));
+    }
+
+    #[test]
+    fn param_atoms_follow_where_the_values_they_carry_are_defined() {
+        let mut f = Func::new(BlockId(0), Presence::Wave, 64);
+        let (x, y) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (p0, p1) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (q0, q1) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (b1, b2) = (BlockId(1), BlockId(2));
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![],
+                insts: vec![
+                    Inst::Core { value: x, ty: Ty::I32, op: Op::Const(Ty::I32, 1) },
+                    Inst::Core { value: y, ty: Ty::I32, op: Op::Const(Ty::I32, 2) },
+                ],
+                term: Term::Br(Edge { dst: b1, args: vec![y, x] }),
+            },
+        );
+        f.blocks.insert(
+            b1,
+            Block {
+                params: vec![(p0, Ty::I32), (p1, Ty::I32)],
+                insts: vec![],
+                term: Term::Br(Edge { dst: b2, args: vec![p0, p1] }),
+            },
+        );
+        f.blocks.insert(
+            b2,
+            Block {
+                params: vec![(q0, Ty::I32), (q1, Ty::I32)],
+                insts: vec![],
+                term: Term::Ret(vec![]),
+            },
+        );
+        let facts = Facts::new(&f, &[], &BTreeSet::new());
+        let mut atoms = Atoms::new(&f, &facts, false, &[]);
+        let atoms_in_order = [
+            Atom::Bit(p1),
+            Atom::Bit(q1),
+            Atom::Bit(p0),
+            Atom::Bit(q0),
+            Atom::View(p1),
+            Atom::View(q1),
+            Atom::View(p0),
+            Atom::View(q0),
+        ];
+        let numbers: Vec<u32> = atoms_in_order.iter().map(|&a| atoms.number(a)).collect();
+        assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
     }
 }
