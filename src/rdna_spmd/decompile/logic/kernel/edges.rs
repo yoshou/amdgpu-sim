@@ -350,7 +350,7 @@ fn product<Q: Queries>(q: &mut Q, formula_atoms: BTreeSet<u32>, formula: Bdd, li
         .iter()
         .map(|link| q.support(link.bound).iter().any(|v| !link.support.contains(v)))
         .collect();
-    let mut pending: Vec<&Binding> = links
+    let pending: Vec<&Binding> = links
         .iter()
         .zip(&foreign)
         .filter(|&(link, &foreign)| {
@@ -383,24 +383,92 @@ fn product<Q: Queries>(q: &mut Q, formula_atoms: BTreeSet<u32>, formula: Bdd, li
         quantified.sort_unstable();
         return q.m().and_exists(formula, relation, &|v| quantified.binary_search(&v).is_ok());
     }
-    let mut acc = q.exists(&lone, formula);
+    let mut parts = gathered(q, &formula_atoms, &pending);
+    occurrences.clear();
+    for (_, support) in &parts {
+        for &v in support {
+            *occurrences.entry(v).or_default() += 1;
+        }
+    }
+    let acc = q.exists(&lone, formula);
+    fold(q, acc, &mut parts, &mut occurrences)
+}
+
+fn gathered<Q: Queries>(q: &mut Q, formula_atoms: &BTreeSet<u32>, pending: &[&Binding]) -> Vec<(Bdd, Vec<u32>)> {
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let mut parent: Vec<usize> = (0..pending.len()).collect();
+    let mut owner: HashMap<u32, usize> = HashMap::default();
+    for (i, link) in pending.iter().enumerate() {
+        for &v in &link.support {
+            if formula_atoms.contains(&v) {
+                continue;
+            }
+            match owner.get(&v) {
+                Some(&j) => {
+                    let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                    parent[a] = b;
+                }
+                None => {
+                    owner.insert(v, i);
+                }
+            }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..pending.len() {
+        let r = root(&mut parent, i);
+        groups.entry(r).or_default().push(i);
+    }
+    let mut parts = Vec::with_capacity(groups.len());
+    for members in groups.into_values() {
+        let mut own: Vec<(Bdd, Vec<u32>)> = members
+            .iter()
+            .map(|&i| (q.m().iff(pending[i].atom, pending[i].bound), pending[i].support.clone()))
+            .collect();
+        if own.len() == 1 {
+            parts.extend(own);
+            continue;
+        }
+        let mut counts: HashMap<u32, usize> = HashMap::default();
+        for (_, support) in &own {
+            for &v in support {
+                if !formula_atoms.contains(&v) {
+                    *counts.entry(v).or_default() += 1;
+                }
+            }
+        }
+        let kept: BTreeSet<u32> = own.iter().flat_map(|(_, s)| s.iter().copied()).filter(|v| formula_atoms.contains(v)).collect();
+        let relation = fold(q, Bdd::TRUE, &mut own, &mut counts);
+        parts.push((relation, kept.into_iter().collect()));
+    }
+    parts
+}
+
+fn fold<Q: Queries>(q: &mut Q, mut acc: Bdd, parts: &mut Vec<(Bdd, Vec<u32>)>, occurrences: &mut HashMap<u32, usize>) -> Bdd {
     let mut built: BTreeSet<u32> = q.support(acc).iter().copied().collect();
-    while !pending.is_empty() {
+    while !parts.is_empty() {
         let mut best = 0;
         let mut best_key = None;
-        for (j, link) in pending.iter().enumerate() {
-            let shared = link.support.iter().filter(|v| built.contains(v)).count();
-            let key = (shared, std::cmp::Reverse(link.support.len()));
+        for (j, (_, support)) in parts.iter().enumerate() {
+            let shared = support.iter().filter(|v| built.contains(v)).count();
+            let key = (shared, std::cmp::Reverse(support.len()));
             if best_key.map_or(true, |k| key > k) {
                 best = j;
                 best_key = Some(key);
             }
         }
-        let link = pending.swap_remove(best);
-        let relation = q.m().iff(link.atom, link.bound);
+        let (relation, support) = parts.swap_remove(best);
         let mut finished = Vec::new();
-        for &v in &link.support {
-            let count = occurrences.get_mut(&v).unwrap();
+        for &v in &support {
+            let Some(count) = occurrences.get_mut(&v) else {
+                continue;
+            };
             *count -= 1;
             if *count == 0 {
                 finished.push(v);
@@ -416,7 +484,7 @@ fn product<Q: Queries>(q: &mut Q, formula_atoms: BTreeSet<u32>, formula: Bdd, li
         if acc == Bdd::FALSE {
             return acc;
         }
-        built.extend(link.support.iter().copied());
+        built.extend(support.iter().copied());
         for v in &finished {
             built.remove(v);
         }

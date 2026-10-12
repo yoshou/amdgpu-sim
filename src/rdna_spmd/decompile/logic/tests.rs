@@ -702,6 +702,75 @@ fn images_equal_their_projections_whether_or_not_links_join_before_the_product()
     }
 }
 
+#[test]
+fn images_equal_their_projections_when_links_share_word_bits_the_formula_lacks() {
+    for limit in [0, usize::MAX] {
+        with_joint_limit(limit, || {
+            let mut r = Random::new(43);
+            let mut wrong = Vec::new();
+            for round in 0..200 {
+                let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
+                let e = BlockId(0);
+                let (src, s) = b.block(&[Ty::I1, Ty::I1, Ty::I32]);
+                let word = b.constant(e, Ty::I32, r.below(8));
+                b.br(e, src, vec![p[0], p[0], word]);
+                let n = 4;
+                let args: Vec<ValueId> = (0..n)
+                    .map(|_| {
+                        let k = b.constant(src, Ty::I32, r.below(6));
+                        let test = b.cmp(src, IntPred::Eq, s[2], k);
+                        let x = s[r.below(2) as usize];
+                        b.int(src, if r.below(2) == 0 { IntOp::And } else { IntOp::Xor }, test, x)
+                    })
+                    .collect();
+                let (dst, _) = b.block(&vec![Ty::I1; n]);
+                let (exit, _) = b.block(&[]);
+                b.cond_br(src, s[0], (dst, args.clone()), (exit, vec![]));
+                let f = &b.f;
+                let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+                let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+                let mut formula = Bdd::FALSE;
+                for _ in 0..2 {
+                    let mut term = Bdd::TRUE;
+                    for &v in &s[..2] {
+                        let a = logic.bit(f, &facts, v);
+                        let a = match r.below(3) {
+                            0 => a,
+                            1 => logic.m.not(a),
+                            _ => Bdd::TRUE,
+                        };
+                        term = logic.m.and(term, a);
+                    }
+                    formula = logic.m.or(formula, term);
+                }
+                let got = logic.image(f, &facts, src, 0, formula);
+                let mut reached: BTreeSet<u32> = logic.support(formula).iter().copied().filter(|&v| logic.scope(&facts, v) == Some(src)).collect();
+                let mut linked = vec![false; n];
+                loop {
+                    let mut grew = false;
+                    for (k, &arg) in args.iter().enumerate() {
+                        let bound = logic.bit(f, &facts, arg);
+                        let support: Vec<u32> = logic.support(bound).iter().copied().filter(|&v| logic.scope(&facts, v) == Some(src)).collect();
+                        if !linked[k] && support.iter().any(|v| reached.contains(v)) {
+                            linked[k] = true;
+                            reached.extend(support);
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+                let want = projection(&mut logic, f, &facts, src, formula, &linked, false);
+                if got != want {
+                    wrong.push(round);
+                }
+            }
+            assert!(wrong.is_empty(), "limit {}: images that differ from the projection: {:?}", limit, wrong);
+        });
+    }
+}
+
 fn restatements() -> usize {
     let (mut b, p) = Build::new(&[(ParameterSource::MaskBit(EXEC), Ty::I1)]);
     let e = BlockId(0);
