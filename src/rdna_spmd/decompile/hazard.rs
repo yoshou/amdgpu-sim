@@ -869,6 +869,9 @@ fn meet(
     let mut idle: Option<[bool; 2]> = None;
     let mut lanes_p: Vec<Option<LaneFacts>> = vec![None; p.len()];
     let mut lanes_q: Vec<Option<LaneFacts>> = vec![None; q.len()];
+    let mut kinds_p = vec![0; p.len()];
+    let mut kinds_q = vec![0; q.len()];
+    let mut judged: crate::rdna_spmd::hash::HashMap<(usize, usize), bool> = Default::default();
     for (a, x) in p.iter().enumerate() {
         let Some(x) = x else { continue };
         for (b, y) in q.iter().enumerate() {
@@ -894,17 +897,21 @@ fn meet(
             }
             if lanes_p[a].is_none() {
                 lanes_p[a] = Some(lane_facts(addresses, pa, a));
+                kinds_p[a] = kind(p, &lanes_p, &kinds_p, a);
             }
             if lanes_q[b].is_none() {
                 lanes_q[b] = Some(lane_facts(addresses, qa, b));
+                kinds_q[b] = kind(q, &lanes_q, &kinds_q, b);
             }
             let (lp, lq) = (lanes_p[a].as_ref().unwrap(), lanes_q[b].as_ref().unwrap());
             let limits = [&lp.classes, &lq.classes];
-            let apart = !may_overlap_within(addresses.unknowns(), &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, judgments)
-                || match (&lp.wide, &lq.wide) {
-                    (Some(wx), Some(wy)) => wide_apart(addresses.unknowns(), (wx, x.bytes), (wy, y.bytes), variant, differ, limits, judgments),
-                    _ => false,
-                };
+            let apart = *judged.entry((kinds_p[a], kinds_q[b])).or_insert_with(|| {
+                !may_overlap_within(addresses.unknowns(), &xa.form, &ya.form, x.bytes, y.bytes, variant, differ, limits, judgments)
+                    || match (&lp.wide, &lq.wide) {
+                        (Some(wx), Some(wy)) => wide_apart(addresses.unknowns(), (wx, x.bytes), (wy, y.bytes), variant, differ, limits, judgments),
+                        _ => false,
+                    }
+            });
             if apart {
                 continue;
             }
@@ -984,6 +991,19 @@ fn may_overlap(
 struct LaneFacts {
     classes: Classes,
     wide: Option<Wide>,
+}
+
+fn kind(places: &[Option<Place>], facts: &[Option<LaneFacts>], kinds: &[usize], lane: usize) -> usize {
+    let same = |c: usize| match (&places[c], &places[lane], &facts[c], &facts[lane]) {
+        (Some(x), Some(y), Some(fx), Some(fy)) => {
+            x.bytes == y.bytes
+                && x.address.as_ref().map(|v| &v.form) == y.address.as_ref().map(|v| &v.form)
+                && fx.classes == fy.classes
+                && fx.wide == fy.wide
+        }
+        _ => false,
+    };
+    (0..places.len()).find(|&c| c != lane && same(c)).map_or(lane, |c| kinds[c])
 }
 
 fn lane_facts(addresses: &mut Addresses, access: &Access, lane: usize) -> LaneFacts {

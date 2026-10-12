@@ -5,6 +5,8 @@ use crate::rdna_spmd::analysis::facts::Site;
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 
+type Reads = Vec<(ValueId, bool, bool)>;
+
 #[derive(Clone)]
 pub(super) struct Masks {
     masked: Vec<bool>,
@@ -46,6 +48,16 @@ impl Masks {
         self.faithful[v.0]
     }
 
+    fn read(&self, v: ValueId, reads: &mut Reads) -> (bool, bool) {
+        let flags = (self.masked[v.0], self.faithful[v.0]);
+        reads.push((v, flags.0, flags.1));
+        flags
+    }
+
+    fn unchanged(&self, reads: &Reads) -> bool {
+        reads.iter().all(|&(v, masked, faithful)| self.masked[v.0] == masked && self.faithful[v.0] == faithful)
+    }
+
     fn settle(&mut self, program: &Program, logic: &mut Logic) {
         let (f, facts) = (program.f, program.facts);
         let n = f.types.len();
@@ -77,17 +89,22 @@ impl Masks {
             }
         }
         let mut actives: Vec<Option<(Vec<ValueId>, Bdd)>> = vec![None; facts.order.len()];
+        let mut seen: Vec<Option<Reads>> = vec![None; facts.order.len()];
         let mut changed = true;
         while changed {
             changed = false;
             for (rank, &b) in facts.order.iter().enumerate() {
+                if seen[rank].as_ref().is_some_and(|reads| self.unchanged(reads)) {
+                    continue;
+                }
+                let mut reads = Reads::new();
                 let block = &f.blocks[&b];
                 let exec = block.params[ei].0;
                 let known: Vec<ValueId> = block
                     .params
                     .iter()
                     .map(|&(param, _)| param)
-                    .filter(|&param| param == exec || self.masked[param.0])
+                    .filter(|&param| param == exec || self.read(param, &mut reads).0)
                     .collect();
                 let active = match &actives[rank] {
                     Some((same, active)) if *same == known => *active,
@@ -119,14 +136,14 @@ impl Masks {
                         } else {
                             logic.view(f, facts, v)
                         };
-                        let masked = logic.m.implies(formula, active) || (ty == Ty::I1 && self.tests_a_masked_word(program, v));
+                        let masked = logic.m.implies(formula, active) || (ty == Ty::I1 && self.tests_a_masked_word(program, v, &mut reads));
                         if self.masked[v.0] != masked {
                             self.masked[v.0] = masked;
                             changed = true;
                         }
                         if word(v) {
                             let faithful =
-                                self.lockstep_view(program, logic, v, active, &mut lockstep) == Some(formula);
+                                self.lockstep_view(program, logic, v, active, &mut lockstep, &mut reads) == Some(formula);
                             if self.faithful[v.0] != faithful {
                                 self.faithful[v.0] = faithful;
                                 changed = true;
@@ -134,6 +151,9 @@ impl Masks {
                         }
                     }
                 }
+                reads.sort_unstable();
+                reads.dedup();
+                seen[rank] = Some(reads);
             }
             for &b in &facts.order {
                 if b == f.entry {
@@ -164,19 +184,19 @@ impl Masks {
         }
     }
 
-    fn tests_a_masked_word(&self, program: &Program, v: ValueId) -> bool {
+    fn tests_a_masked_word(&self, program: &Program, v: ValueId, reads: &mut Reads) -> bool {
         let (f, facts) = (program.f, program.facts);
         let zero = |x: ValueId| facts.constant(f, x) == Some(0);
         match facts.op(f, v) {
-            Some(Op::Cmp(IntPred::Ne, a, b)) if zero(b) => self.zero_off(program, a, 0),
-            Some(Op::Cmp(IntPred::Ne, a, b)) if zero(a) => self.zero_off(program, b, 0),
-            Some(Op::Cmp(IntPred::Ugt, a, b)) if zero(b) => self.zero_off(program, a, 0),
-            Some(Op::Cmp(IntPred::Ult, a, b)) if zero(a) => self.zero_off(program, b, 0),
+            Some(Op::Cmp(IntPred::Ne, a, b)) if zero(b) => self.zero_off(program, a, 0, reads),
+            Some(Op::Cmp(IntPred::Ne, a, b)) if zero(a) => self.zero_off(program, b, 0, reads),
+            Some(Op::Cmp(IntPred::Ugt, a, b)) if zero(b) => self.zero_off(program, a, 0, reads),
+            Some(Op::Cmp(IntPred::Ult, a, b)) if zero(a) => self.zero_off(program, b, 0, reads),
             _ => false,
         }
     }
 
-    fn zero_off(&self, program: &Program, x: ValueId, depth: usize) -> bool {
+    fn zero_off(&self, program: &Program, x: ValueId, depth: usize, reads: &mut Reads) -> bool {
         let (f, facts) = (program.f, program.facts);
         if facts.constant(f, x) == Some(0) {
             return true;
@@ -184,18 +204,18 @@ impl Masks {
         if depth > 16 {
             return false;
         }
-        let next = |y: ValueId| self.zero_off(program, y, depth + 1);
+        let next = |y: ValueId, reads: &mut Reads| self.zero_off(program, y, depth + 1, reads);
         match facts.op(f, x) {
-            Some(Op::Convert(Cvt::ZExt | Cvt::SExt, _, b)) if f.types[b.0] == Ty::I1 => self.masked[b.0],
-            Some(Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, _, b)) => next(b),
-            Some(Op::Int(IntOp::Mul | IntOp::And, a, b)) => next(a) || next(b),
-            Some(Op::Int(IntOp::Shl | IntOp::LShr | IntOp::AShr, a, _)) => next(a),
-            Some(Op::Int(IntOp::Add | IntOp::Sub | IntOp::Or | IntOp::Xor, a, b)) => next(a) && next(b),
-            Some(Op::Select(k, a, b)) => (self.masked[k.0] && next(b)) || (next(a) && next(b)),
+            Some(Op::Convert(Cvt::ZExt | Cvt::SExt, _, b)) if f.types[b.0] == Ty::I1 => self.read(b, reads).0,
+            Some(Op::Convert(Cvt::ZExt | Cvt::SExt | Cvt::Trunc | Cvt::Bitcast, _, b)) => next(b, reads),
+            Some(Op::Int(IntOp::Mul | IntOp::And, a, b)) => next(a, reads) || next(b, reads),
+            Some(Op::Int(IntOp::Shl | IntOp::LShr | IntOp::AShr, a, _)) => next(a, reads),
+            Some(Op::Int(IntOp::Add | IntOp::Sub | IntOp::Or | IntOp::Xor, a, b)) => next(a, reads) && next(b, reads),
+            Some(Op::Select(k, a, b)) => (self.read(k, reads).0 && next(b, reads)) || (next(a, reads) && next(b, reads)),
             Some(_) => false,
             None => match facts.site[x.0] {
                 Site::Param { block, index } if block != f.entry && Some(index) != program.exec_index => {
-                    facts.arguments(f, block, index).all(next)
+                    facts.arguments(f, block, index).all(|a| next(a, reads))
                 }
                 _ => false,
             },
@@ -209,6 +229,7 @@ impl Masks {
         w: ValueId,
         active: Bdd,
         memo: &mut HashMap<ValueId, Option<Bdd>>,
+        reads: &mut Reads,
     ) -> Option<Bdd> {
         if let Some(&l) = memo.get(&w) {
             return l;
@@ -218,7 +239,7 @@ impl Masks {
             Some(logic.view(f, facts, w))
         } else {
             match facts.inst(f, w) {
-                None => self.faithful[w.0].then(|| logic.view(f, facts, w)),
+                None => self.read(w, reads).1.then(|| logic.view(f, facts, w)),
                 Some(Inst::Effect {
                     op: EffectOp::Wave(WaveOp::Ballot { high }),
                     inputs,
@@ -232,8 +253,8 @@ impl Masks {
                 Some(Inst::Core { op, .. }) => match *op {
                     Op::Int(k @ (IntOp::And | IntOp::Or | IntOp::Xor), a, b) => {
                         match (
-                            self.lockstep_view(program, logic, a, active, memo),
-                            self.lockstep_view(program, logic, b, active, memo),
+                            self.lockstep_view(program, logic, a, active, memo, reads),
+                            self.lockstep_view(program, logic, b, active, memo, reads),
                         ) {
                             (Some(a), Some(b)) => Some(match k {
                                 IntOp::And => logic.m.and(a, b),
@@ -245,8 +266,8 @@ impl Masks {
                     }
                     Op::Select(c, a, b) => {
                         match (
-                            self.lockstep_view(program, logic, a, active, memo),
-                            self.lockstep_view(program, logic, b, active, memo),
+                            self.lockstep_view(program, logic, a, active, memo, reads),
+                            self.lockstep_view(program, logic, b, active, memo, reads),
                         ) {
                             (Some(a), Some(b)) => {
                                 let c = logic.bit(f, facts, c);
@@ -255,13 +276,13 @@ impl Masks {
                             _ => None,
                         }
                     }
-                    Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a) => self.lockstep_view(program, logic, a, active, memo),
+                    Op::Convert(Cvt::Bitcast, Ty::I32 | Ty::I64, a) => self.lockstep_view(program, logic, a, active, memo, reads),
                     Op::Pack64(a, b) => {
-                        let low = self.lockstep_view(program, logic, a, active, memo);
+                        let low = self.lockstep_view(program, logic, a, active, memo, reads);
                         if f.lanes == 32 {
                             low
                         } else {
-                            match (low, self.lockstep_view(program, logic, b, active, memo)) {
+                            match (low, self.lockstep_view(program, logic, b, active, memo, reads)) {
                                 (Some(low), Some(high)) => {
                                     let upper = logic.atom(Atom::Lane(5));
                                     Some(logic.m.ite(upper, high, low))
@@ -270,11 +291,11 @@ impl Masks {
                             }
                         }
                     }
-                    Op::UnpackLo(a) => self.lockstep_view(program, logic, a, active, memo).map(|own| {
+                    Op::UnpackLo(a) => self.lockstep_view(program, logic, a, active, memo, reads).map(|own| {
                         let other = logic.atom(Atom::View(w));
                         logic.half(false, own, other)
                     }),
-                    Op::UnpackHi(a) if f.lanes == 64 => self.lockstep_view(program, logic, a, active, memo).map(|own| {
+                    Op::UnpackHi(a) if f.lanes == 64 => self.lockstep_view(program, logic, a, active, memo, reads).map(|own| {
                         let other = logic.atom(Atom::View(w));
                         logic.half(true, own, other)
                     }),
