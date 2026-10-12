@@ -3,7 +3,7 @@ use super::decompile::{decompile, Hazards, Lane};
 use super::engine::{Kernel, Region, Scheduler};
 use super::environment::Environment;
 use super::ir::{EffectOp, Func};
-use super::pass::{BranchSelects, Dce, Driver, Halves, Idiom, Idioms, PrivateSlots, Simplify, UniformQueries};
+use super::pass::{BranchSelects, Dce, Driver, Halves, Idiom, Idioms, PrivateSlots, Simplify, SkipBranches, UniformQueries};
 use super::program::Program;
 
 fn wave_passes(f: &mut Program, idioms: &[Box<dyn Idiom>]) {
@@ -16,7 +16,7 @@ fn wave_passes(f: &mut Program, idioms: &[Box<dyn Idiom>]) {
             &mut an,
             "wave",
             limit,
-            &[&PrivateSlots, &Halves, &Idioms(idioms), &UniformQueries, &BranchSelects, &Simplify, &Dce],
+            &[&PrivateSlots, &Halves, &Idioms(idioms), &UniformQueries, &BranchSelects, &SkipBranches, &Simplify, &Dce],
         )
         .unwrap();
 }

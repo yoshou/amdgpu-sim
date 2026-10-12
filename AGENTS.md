@@ -70,7 +70,7 @@
   1. `decode_program` lifts the kernel into the SSA IR in `ir/`.
      - gfx1200 goes through `rdna4/`. DPP and `v_permlane16/x16` become a bpermute sequence through VGPRs 253-255 (`rdna4/lift/dpp.rs`); a kernel that uses those registers is refused.
      - gfx803 goes through `gcn3/`. It tracks scalar state (M0, MODE, the scratch descriptor, call targets and return addresses, VGPR lanes written by `v_writelane`) and inlines every call site.
-     - The wave passes in `pass/` then run to a fixpoint: PrivateSlots, Halves, Idioms, UniformQueries, BranchSelects, Simplify and Dce.
+     - The wave passes in `pass/` then run to a fixpoint: PrivateSlots, Halves, Idioms, UniformQueries, BranchSelects, SkipBranches, Simplify and Dce.
   2. `Jit::kernel` runs `Hazards::find` whenever the launch environment changes. This is the address analysis of memory accesses between lanes, in `decompile/address/` and `decompile/hazard.rs`.
   3. `decompile` proves a conversion policy, which wave queries, lane words and meetings the lane program keeps. It then rewrites the wave program into a lane program (`rewrite.rs`, `fold.rs`). The result is cached per distinct set of hazards.
   4. `lockstep/` packs W lanes into a packet whose values are SIMD vectors. `codegen/` emits LLVM IR per region, and `native/jit.rs` optimizes it with the O3 pipeline and compiles it through ORC LLJIT. Kernels are cached per lane program, packet width and workgroup x size.

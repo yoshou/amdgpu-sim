@@ -8,6 +8,7 @@ mod pairs;
 mod predication;
 mod private_slots;
 mod simplify;
+mod skip_branches;
 #[cfg(test)]
 mod testing;
 mod uniform_queries;
@@ -22,6 +23,7 @@ pub use pairs::{Pairs, WideMemory};
 pub use predication::Predication;
 pub use private_slots::PrivateSlots;
 pub use simplify::Simplify;
+pub use skip_branches::SkipBranches;
 pub use uniform_queries::UniformQueries;
 
 use super::analysis::{Analyses, Preserved};
