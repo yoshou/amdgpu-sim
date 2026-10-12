@@ -429,4 +429,44 @@ mod tests {
         assert!(some > 0, "some condition has a choice that violates alone");
         assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
     }
+
+    fn odd_answer_stored_by_one_wave(first: bool, loaded: bool) -> (crate::rdna_spmd::program::Program, ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = if loaded { k.buffer(&mut b, e, 0) } else { b.constant(e, Ty::I64, 0x1000) };
+        let field = b.constant(e, Ty::I32, 0x3ff);
+        let x = b.int(e, IntOp::And, k.item, field);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let parity = b.int(e, IntOp::And, x, one);
+        let odd = b.cmp(e, IntPred::Ne, parity, zero);
+        let asked = b.int(e, IntOp::And, odd, k.exec);
+        let any = b.wave(e, WaveOp::Any, vec![asked]);
+        let value = b.core(e, Ty::I32, Op::Select(any, one, zero));
+        let half = b.constant(e, Ty::I32, 32);
+        let chosen = b.cmp(e, if first { IntPred::Ult } else { IntPred::Uge }, x, half);
+        let runs = b.int(e, IntOp::And, chosen, k.exec);
+        let own = byte_offset(&mut b, e, buf, x, 4);
+        b.store(e, Space::Global, MemSize::B32, own, value, runs);
+        (b.program(), any)
+    }
+
+    #[test]
+    fn prove_keeps_a_query_whose_answer_only_one_wave_stores() {
+        for first in [false, true] {
+            for loaded in [false, true] {
+                let (program, any) = odd_answer_stored_by_one_wave(first, loaded);
+                let mut env = environment(32, &[(0, 1, 0x1000)]);
+                env.block = [64, 1, 1];
+                let hazards = Hazards::find(&program, &env);
+                let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+                assert!(
+                    kept.queries.contains(&any),
+                    "wave {} of two stores whether any of its lanes is odd, which an even lane cannot tell alone (a load pairs with the store: {})",
+                    if first { 0 } else { 1 },
+                    loaded
+                );
+            }
+        }
+    }
 }

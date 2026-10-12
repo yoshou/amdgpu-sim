@@ -576,26 +576,58 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
 }
 
 fn settle_predicates(hazards: &mut Hazards, addresses: &mut Addresses, f: &Func, facts: &Facts) {
-    for i in 0..hazards.accesses.len() {
-        let a = hazards.accesses[i].clone();
-        let dead = (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || !runs(addresses, &a, lane));
-        if dead {
-            hazards.never.insert((a.block, a.index));
+    let n = hazards.accesses.len();
+    let mut alive = vec![false; n];
+    let mut implied: Vec<Option<(ValueId, ValueId, [bool; 2])>> = hazards
+        .accesses
+        .iter()
+        .map(|a| match a.predicate.and_then(|p| facts.op(f, p)) {
+            Some(Op::Int(IntOp::And, x, y)) => Some((x, y, [true; 2])),
+            _ => None,
+        })
+        .collect();
+    let holds = |addresses: &mut Addresses, v: ValueId, given: ValueId| {
+        (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || addresses.bit(v, lane, Some(given)).0 == Some(true))
+    };
+    let current = addresses.wave();
+    let waves: Vec<usize> = std::iter::once(current)
+        .chain((0..addresses.waves()).filter(|&w| w != current))
+        .collect();
+    for (k, &wave) in waves.iter().enumerate() {
+        let open = (0..n).any(|i| !alive[i] || implied[i].is_some_and(|(_, _, held)| held != [false; 2]));
+        if !open {
+            break;
+        }
+        if k > 0 {
+            addresses.enter(wave);
+        }
+        for (i, a) in hazards.accesses.iter().enumerate() {
+            if !alive[i] {
+                alive[i] = (0..addresses.lanes()).any(|lane| addresses.valid(lane) && runs(addresses, a, lane));
+            }
+            if let Some((x, y, held)) = &mut implied[i] {
+                for (still, (v, given)) in held.iter_mut().zip([(*y, *x), (*x, *y)]) {
+                    if *still {
+                        *still = holds(addresses, v, given);
+                    }
+                }
+            }
+        }
+    }
+    for (i, a) in hazards.accesses.iter().enumerate() {
+        let at = (a.block, a.index);
+        if !alive[i] {
+            hazards.never.insert(at);
             continue;
         }
-        let Some(p) = a.predicate else {
-            continue;
-        };
-        let Some(Op::Int(IntOp::And, x, y)) = facts.op(f, p) else {
-            continue;
-        };
-        let holds = |addresses: &mut Addresses, v: ValueId, given: ValueId| {
-            (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || addresses.bit(v, lane, Some(given)).0 == Some(true))
-        };
-        if holds(addresses, y, x) {
-            hazards.settled.insert((a.block, a.index), x);
-        } else if holds(addresses, x, y) {
-            hazards.settled.insert((a.block, a.index), y);
+        match implied[i] {
+            Some((x, _, [true, _])) => {
+                hazards.settled.insert(at, x);
+            }
+            Some((_, y, [false, true])) => {
+                hazards.settled.insert(at, y);
+            }
+            _ => {}
         }
     }
 }
@@ -1648,6 +1680,82 @@ mod tests {
             for &q in &live_stores[i + 1..] {
                 assert!(h.together.contains(&pair(&h, p, q)), "every lane stores the word at {:?} and at {:?}", p, q);
             }
+        }
+    }
+
+    fn item_x(b: &mut Build, k: &Kernel, block: BlockId) -> ValueId {
+        let field = b.constant(block, Ty::I32, 0x3ff);
+        b.int(block, IntOp::And, k.item, field)
+    }
+
+    fn two_waves() -> Environment {
+        let mut env = environment(32, &[(0, 1, 0x1000)]);
+        env.block = [64, 1, 1];
+        env
+    }
+
+    fn base(b: &mut Build, k: &Kernel, block: BlockId, loaded: bool) -> ValueId {
+        if loaded {
+            k.buffer(b, block, 0)
+        } else {
+            b.constant(block, Ty::I64, 0x1000)
+        }
+    }
+
+    fn store_of_one_wave(first: bool, loaded: bool) -> (Hazards, (BlockId, usize)) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = base(&mut b, &k, e, loaded);
+        let x = item_x(&mut b, &k, e);
+        let own = byte_offset(&mut b, e, buf, x, 4);
+        let half = b.constant(e, Ty::I32, 32);
+        let chosen = b.cmp(e, if first { IntPred::Ult } else { IntPred::Uge }, x, half);
+        let runs = b.int(e, IntOp::And, chosen, k.exec);
+        let s = store_at(&mut b, e, own, runs);
+        (Hazards::find(&b.program(), &two_waves()), s)
+    }
+
+    #[test]
+    fn find_keeps_a_store_that_only_one_wave_makes() {
+        for first in [false, true] {
+            for loaded in [false, true] {
+                let (h, s) = store_of_one_wave(first, loaded);
+                assert!(
+                    !h.never.contains(&s),
+                    "wave {} of two makes the store (a load pairs with it: {})",
+                    if first { 0 } else { 1 },
+                    loaded
+                );
+            }
+        }
+    }
+
+    fn settled_between(below: u64, above: u64, loaded: bool) -> (Hazards, (BlockId, usize), ValueId) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = base(&mut b, &k, e, loaded);
+        let x = item_x(&mut b, &k, e);
+        let own = byte_offset(&mut b, e, buf, x, 4);
+        let limit = b.constant(e, Ty::I32, below);
+        let low = b.cmp(e, IntPred::Ult, x, limit);
+        let floor = b.constant(e, Ty::I32, above);
+        let high = b.cmp(e, IntPred::Uge, x, floor);
+        let both = b.int(e, IntOp::And, low, high);
+        let s = store_at(&mut b, e, own, both);
+        (Hazards::find(&b.program(), &two_waves()), s, low)
+    }
+
+    #[test]
+    fn find_settles_a_predicate_only_where_every_wave_implies_its_other_half() {
+        for loaded in [false, true] {
+            let (h, s, _) = settled_between(48, 16, loaded);
+            assert!(
+                !h.settled.contains_key(&s),
+                "x < 48 implies x >= 16 in the second wave but not in the first (a load pairs with the store: {})",
+                loaded
+            );
+            let (h, s, low) = settled_between(48, 0, loaded);
+            assert_eq!(h.settled.get(&s), Some(&low), "x < 48 implies x >= 0 in both waves (a load pairs with the store: {})", loaded);
         }
     }
 

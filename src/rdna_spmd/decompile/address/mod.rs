@@ -80,6 +80,10 @@ impl<'a> Addresses<'a> {
         self.values.symbols().trip(header)
     }
 
+    pub fn wave(&self) -> usize {
+        self.values.symbols().wave
+    }
+
     pub fn waves(&self) -> usize {
         self.values.symbols().waves()
     }
