@@ -18,6 +18,7 @@ use std::rc::Rc;
 pub(super) struct Memo {
     positions: BTreeMap<BlockId, Rc<HashMap<ValueId, usize>>>,
     fresh: Fresh,
+    sites: BTreeMap<Key, ValueId>,
 }
 
 struct Pair {
@@ -33,7 +34,6 @@ pub(super) struct Explore<'c, 'a, Q: Queries<'a>> {
     branch: BlockId,
     visited: BTreeSet<BlockId>,
     headers: BTreeSet<BlockId>,
-    paths: u32,
 }
 
 impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
@@ -46,7 +46,6 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
             branch,
             visited: BTreeSet::new(),
             headers,
-            paths: PATHS,
         }
     }
 
@@ -61,6 +60,11 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
             _ => None,
         };
         Desc { same, bits }
+    }
+
+    fn site(&mut self, key: Key) -> ValueId {
+        let next = ValueId(self.memo.sites.len());
+        *self.memo.sites.entry(key).or_insert(next)
     }
 
     fn positions(&mut self, x: BlockId) -> Rc<HashMap<ValueId, usize>> {
@@ -189,9 +193,10 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
                             if entries.get(&(key, slot)) == Some(&arrival) {
                                 continue;
                             }
+                            let site = self.site(next);
                             let (mcond, msides) = match entries.insert((key, slot), arrival.clone()) {
-                                None => join(self.eval.logic(), &mut self.paths, (ocond, &osides), (arrival.0, &arrival.1)),
-                                Some(_) => joined(self.eval.logic(), &mut self.paths, &entries),
+                                None => join(self.eval.logic(), site, entries.len() as u32 - 2, (ocond, &osides), (arrival.0, &arrival.1)),
+                                Some(_) => joined(self.eval.logic(), site, &entries),
                             };
                             let changed = mcond != ocond || msides != osides;
                             pairs.insert(

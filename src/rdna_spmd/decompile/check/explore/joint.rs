@@ -95,7 +95,7 @@ pub(super) fn canonical(logic: &mut Logic, fresh: &mut Fresh, cond: Bdd, sides: 
     (renamed.next().unwrap(), out)
 }
 
-pub(super) fn join(logic: &mut Logic, paths: &mut u32, (oc, old): (Bdd, &Sides), (nc, new): (Bdd, &Sides)) -> (Bdd, Sides) {
+pub(super) fn join(logic: &mut Logic, site: ValueId, ordinal: u32, (oc, old): (Bdd, &Sides), (nc, new): (Bdd, &Sides)) -> (Bdd, Sides) {
     let mut out = old.clone();
     let differ = old.iter().flatten().zip(new.iter().flatten()).any(|(o, n)| o.bits != n.bits);
     if !differ {
@@ -106,9 +106,8 @@ pub(super) fn join(logic: &mut Logic, paths: &mut u32, (oc, old): (Bdd, &Sides),
         }
         return (logic.m.or(oc, nc), out);
     }
-    assert!(*paths > 0, "too many joins");
-    *paths -= 1;
-    let path = logic.atom(Atom::Fresh(PATH, ValueId(0), *paths));
+    assert!(ordinal < PATHS, "too many joins");
+    let path = logic.atom(Atom::Fresh(PATH, site, ordinal));
     for (d, n) in out.iter_mut().flatten().zip(new.iter().flatten()) {
         let same = if d.same == n.same { d.same } else { None };
         let bits = match (d.bits, n.bits) {
@@ -121,12 +120,12 @@ pub(super) fn join(logic: &mut Logic, paths: &mut u32, (oc, old): (Bdd, &Sides),
     (logic.m.ite(path, oc, nc), out)
 }
 
-pub(super) fn joined(logic: &mut Logic, paths: &mut u32, entries: &BTreeMap<(Key, usize), (Bdd, Sides)>) -> (Bdd, Sides) {
+pub(super) fn joined(logic: &mut Logic, site: ValueId, entries: &BTreeMap<(Key, usize), (Bdd, Sides)>) -> (Bdd, Sides) {
     let mut values = entries.values();
     let (c, s) = values.next().unwrap();
     let mut joined = (*c, s.clone());
-    for (c, s) in values {
-        joined = join(logic, paths, (joined.0, &joined.1), (*c, s));
+    for (ordinal, (c, s)) in values.enumerate() {
+        joined = join(logic, site, ordinal as u32, (joined.0, &joined.1), (*c, s));
     }
     joined
 }
@@ -265,7 +264,6 @@ mod tests {
             let mut r = Random::new(43);
             let context = [Atom::Lane(0), Atom::Lane(1)];
             let unknowns = [Atom::Fresh(WAVE, ValueId(1000), 0), Atom::Fresh(LANE, ValueId(1001), 0), Atom::Fresh(JOINT, ValueId(0), 1)];
-            let mut left = PATHS - 8;
             let paths = [Atom::Fresh(PATH, ValueId(0), PATHS - 1), Atom::Fresh(PATH, ValueId(0), PATHS - 2), Atom::Fresh(PATH, ValueId(0), PATHS)];
             let contexts = contexts(logic, &context);
             let mut wrong = Vec::new();
@@ -281,10 +279,10 @@ mod tests {
                     }
                     arrivals.push(next);
                 }
-                let two = join(logic, &mut left, (arrivals[0].0, &arrivals[0].1), (arrivals[1].0, &arrivals[1].1));
+                let two = join(logic, ValueId(1), 0, (arrivals[0].0, &arrivals[0].1), (arrivals[1].0, &arrivals[1].1));
                 let entries: BTreeMap<(Key, usize), (Bdd, Sides)> =
                     arrivals.iter().enumerate().map(|(i, a)| (([None, None], i), a.clone())).collect();
-                let three = joined(logic, &mut left, &entries);
+                let three = joined(logic, ValueId(1), &entries);
                 for context in &contexts {
                     let each: Vec<BTreeSet<Vec<bool>>> = arrivals.iter().map(|a| held(logic, (a.0, &a.1), context)).collect();
                     let expected_two: BTreeSet<Vec<bool>> = each[0].union(&each[1]).cloned().collect();
@@ -317,6 +315,9 @@ mod tests {
             let paths = [Atom::Fresh(PATH, ValueId(0), PATHS - 1), Atom::Fresh(PATH, ValueId(0), PATHS + 2), Atom::Fresh(PATH, ValueId(0), 5)];
             for position in 1..=unknowns.len() as u32 {
                 logic.atom(Atom::Fresh(JOINT, ValueId(0), position));
+            }
+            for position in PATHS..PATHS + paths.len() as u32 {
+                logic.atom(Atom::Fresh(PATH, ValueId(0), position));
             }
             let contexts = contexts(logic, &context);
             let mut wrong = Vec::new();

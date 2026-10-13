@@ -163,10 +163,6 @@ impl Atoms {
                 assert!(v.0 < 1 << 23 && i < 32, "function too large");
                 (1 << 29) + (((1 << 23) - 1 - v.0 as u32) << 5) + i as u32
             }
-            Atom::Fresh(PATH, _, i) => {
-                assert!(i < 1 << 16, "too many paths");
-                return (1 << 16) + i;
-            }
             Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => {
                 let next = self.detour.len() as u32;
                 assert!(next < 1 << 22, "too many detour values");
@@ -370,13 +366,13 @@ mod tests {
         let atoms_in_order = [
             Atom::Marker(Choice::Meet(0)),
             Atom::Marker(Choice::Word(b)),
-            Atom::Fresh(PATH, ValueId(0), 0),
-            Atom::Fresh(PATH, ValueId(0), (1 << 16) - 1),
             Atom::Lane(5),
             Atom::Lane(0),
             Atom::Lane(4),
             Atom::Fresh(0, ValueId(7), 0),
+            Atom::Fresh(PATH, ValueId(2), 0),
             Atom::Term(3, true),
+            Atom::Fresh(PATH, ValueId(0), (1 << 16) - 1),
             Atom::Fresh(4, ValueId(9), 0),
             Atom::Bit(a),
             Atom::Bit(c),
