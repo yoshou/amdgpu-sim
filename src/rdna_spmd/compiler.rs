@@ -1,5 +1,5 @@
 use super::analysis::{Analyses, Context};
-use super::decompile::{decompile, Hazards, Lane};
+use super::decompile::{agrees, decompile, Hazards, Known, Lane};
 use super::engine::{Kernel, Region, Scheduler};
 use super::environment::Environment;
 use super::ir::{EffectOp, Func};
@@ -157,7 +157,7 @@ pub struct Jit {
     program: Program,
     num_vgprs: usize,
     last: Option<(Environment, usize)>,
-    lanes: Vec<(Hazards, std::sync::Arc<Lane>)>,
+    lanes: Vec<(Hazards, Known, std::sync::Arc<Lane>)>,
     kernels: Vec<((usize, u32, u32), std::sync::Arc<Kernel>)>,
 }
 
@@ -182,11 +182,15 @@ impl Jit {
             Some((last, index)) if last == environment => *index,
             _ => {
                 let hazards = Hazards::find(&self.program, environment);
-                let index = match self.lanes.iter().position(|(h, _)| *h == hazards) {
+                let index = match self
+                    .lanes
+                    .iter()
+                    .position(|(h, known, _)| *h == hazards && agrees(&self.program, &hazards, environment, known))
+                {
                     Some(index) => index,
                     None => {
-                        let lane = decompile(&self.program, &hazards);
-                        self.lanes.push((hazards, std::sync::Arc::new(lane)));
+                        let (lane, known) = decompile(&self.program, &hazards, environment);
+                        self.lanes.push((hazards, known, std::sync::Arc::new(lane)));
                         self.lanes.len() - 1
                     }
                 };
@@ -199,7 +203,7 @@ impl Jit {
         if let Some((_, kernel)) = self.kernels.iter().find(|(k, _)| *k == key) {
             return kernel.clone();
         }
-        let lane = self.lanes[index].1.clone();
+        let lane = self.lanes[index].2.clone();
         let kernel = std::sync::Arc::new(compile_lockstep(
             &lane,
             self.num_vgprs,

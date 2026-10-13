@@ -78,6 +78,7 @@ pub struct Access {
     pub bytes: u32,
     pub address: Option<ValueId>,
     pub predicate: Option<ValueId>,
+    pub halves: Option<(ValueId, ValueId)>,
     pub output: Option<ValueId>,
     pub exec: Option<ValueId>,
     pub reach: Reach,
@@ -90,8 +91,6 @@ pub struct Hazards {
     pub apart: BTreeSet<(usize, usize)>,
     pub idle: BTreeSet<(usize, usize, bool, usize)>,
     pub meetings: Vec<(BlockId, usize)>,
-    pub never: BTreeSet<(BlockId, usize)>,
-    pub settled: BTreeMap<(BlockId, usize), ValueId>,
 }
 
 type Judgments = [(bool, [bool; 2]); 2];
@@ -114,8 +113,6 @@ impl Hazards {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
-            never: Default::default(),
-            settled: Default::default(),
         };
         if !hazards
             .accesses
@@ -155,7 +152,6 @@ impl Hazards {
             }
         }
         if candidates.is_empty() {
-            settle_predicates(&mut hazards, &mut addresses, f, &facts);
             return hazards;
         }
         let waves = addresses.waves();
@@ -299,7 +295,6 @@ impl Hazards {
             }
         }
         hazards.meetings = hazards.positions(&facts.order);
-        settle_predicates(&mut hazards, &mut addresses, f, &facts);
         hazards
     }
 
@@ -366,8 +361,6 @@ impl Hazards {
                 .collect(),
             accesses: Vec::new(),
             meetings: Vec::new(),
-            never: Default::default(),
-            settled: Default::default(),
         };
         hazards.accesses = accesses;
         hazards.meetings = hazards.positions(&facts.order);
@@ -431,6 +424,7 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                         bytes,
                         address: Some(inputs[0]),
                         predicate: Some(inputs[op.mask_input()]),
+                        halves: halves(f, facts, Some(inputs[op.mask_input()])),
                         output,
                         exec,
                         reach: Reach::Anywhere,
@@ -456,6 +450,7 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
                             bytes: RESOURCE_BYTES,
                             address: None,
                             predicate,
+                            halves: halves(f, facts, predicate),
                             output: outputs.first().map(|o| o.0),
                             exec,
                             reach: reach(&program.registry, *op),
@@ -467,6 +462,13 @@ fn accesses(program: &Program, facts: &Facts, exec_index: Option<usize>) -> Vec<
         }
     }
     out
+}
+
+fn halves(f: &Func, facts: &Facts, predicate: Option<ValueId>) -> Option<(ValueId, ValueId)> {
+    match predicate.and_then(|p| facts.op(f, p)) {
+        Some(Op::Int(IntOp::And, x, y)) => Some((x, y)),
+        _ => None,
+    }
 }
 
 fn containing(loops: &Loops, rank: usize) -> Vec<usize> {
@@ -575,60 +577,136 @@ fn places(addresses: &mut Addresses, a: &Access, found: &[Option<Regions>]) -> V
         .collect()
 }
 
-fn settle_predicates(hazards: &mut Hazards, addresses: &mut Addresses, f: &Func, facts: &Facts) {
-    let n = hazards.accesses.len();
-    let mut alive = vec![false; n];
-    let mut implied: Vec<Option<(ValueId, ValueId, [bool; 2])>> = hazards
-        .accesses
-        .iter()
-        .map(|a| match a.predicate.and_then(|p| facts.op(f, p)) {
-            Some(Op::Int(IntOp::And, x, y)) => Some((x, y, [true; 2])),
-            _ => None,
-        })
-        .collect();
-    let holds = |addresses: &mut Addresses, v: ValueId, given: ValueId| {
-        (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || addresses.bit(v, lane, Some(given)).0 == Some(true))
-    };
-    let current = addresses.wave();
-    let waves: Vec<usize> = std::iter::once(current)
-        .chain((0..addresses.waves()).filter(|&w| w != current))
-        .collect();
-    for (k, &wave) in waves.iter().enumerate() {
-        let open = (0..n).any(|i| !alive[i] || implied[i].is_some_and(|(_, _, held)| held != [false; 2]));
-        if !open {
-            break;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Question {
+    Runs(usize),
+    Holds(usize),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Known {
+    pub runs: BTreeMap<usize, bool>,
+    pub holds: BTreeMap<usize, [bool; 2]>,
+}
+
+impl Known {
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty() && self.holds.is_empty()
+    }
+
+    pub fn questions(&self) -> Vec<Question> {
+        let runs = self.runs.keys().map(|&i| Question::Runs(i));
+        runs.chain(self.holds.keys().map(|&i| Question::Holds(i))).collect()
+    }
+}
+
+pub struct Judge<'a> {
+    known: Known,
+    evaluator: Option<Evaluator<'a>>,
+}
+
+struct Evaluator<'a> {
+    program: &'a Program,
+    facts: &'a Facts,
+    env: &'a Environment,
+    accesses: &'a [Access],
+    addresses: Option<Addresses<'a>>,
+}
+
+impl<'a> Judge<'a> {
+    pub fn new(program: &'a Program, facts: &'a Facts, env: &'a Environment, hazards: &'a Hazards) -> Self {
+        Self {
+            known: Known::default(),
+            evaluator: Some(Evaluator {
+                program,
+                facts,
+                env,
+                accesses: &hazards.accesses,
+                addresses: None,
+            }),
         }
-        if k > 0 {
-            addresses.enter(wave);
+    }
+
+    #[cfg(test)]
+    pub fn assumed() -> Self {
+        Self {
+            known: Known::default(),
+            evaluator: None,
         }
-        for (i, a) in hazards.accesses.iter().enumerate() {
-            if !alive[i] {
-                alive[i] = (0..addresses.lanes()).any(|lane| addresses.valid(lane) && runs(addresses, a, lane));
-            }
-            if let Some((x, y, held)) = &mut implied[i] {
-                for (still, (v, given)) in held.iter_mut().zip([(*y, *x), (*x, *y)]) {
-                    if *still {
-                        *still = holds(addresses, v, given);
-                    }
+    }
+
+    pub fn known(&self) -> &Known {
+        &self.known
+    }
+
+    pub fn judge(&mut self, questions: &[Question]) {
+        for &q in questions {
+            match q {
+                Question::Runs(i) if !self.known.runs.contains_key(&i) => {
+                    let runs = self.evaluator.as_mut().is_none_or(|e| e.runs(i));
+                    self.known.runs.insert(i, runs);
                 }
+                Question::Holds(i) if !self.known.holds.contains_key(&i) => {
+                    let holds = self.evaluator.as_mut().map_or([false; 2], |e| e.holds(i));
+                    self.known.holds.insert(i, holds);
+                }
+                _ => {}
             }
         }
     }
-    for (i, a) in hazards.accesses.iter().enumerate() {
-        let at = (a.block, a.index);
-        if !alive[i] {
-            hazards.never.insert(at);
-            continue;
-        }
-        match implied[i] {
-            Some((x, _, [true, _])) => {
-                hazards.settled.insert(at, x);
+}
+
+impl<'a> Evaluator<'a> {
+    fn addresses(&mut self) -> &mut Addresses<'a> {
+        let (program, facts, env) = (self.program, self.facts, self.env);
+        self.addresses.get_or_insert_with(|| {
+            let f = &program.ir;
+            let loops = Loops::new(f, facts).expect("a judged program enters cycles only through their headers");
+            let headers = (0..loops.count()).map(|l| facts.order[loops.header(l)]).collect();
+            let exec = program.registry.registers().exec;
+            let mut addresses = Addresses::new(f, facts, &program.parameter_inputs, exec, program.entry, env, headers, &program.registry);
+            addresses.enter(0);
+            addresses
+        })
+    }
+
+    fn waves(&mut self) -> Vec<usize> {
+        let addresses = self.addresses();
+        let current = addresses.wave();
+        std::iter::once(current).chain((0..addresses.waves()).filter(|&w| w != current)).collect()
+    }
+
+    fn runs(&mut self, i: usize) -> bool {
+        let accesses = self.accesses;
+        let a = &accesses[i];
+        for wave in self.waves() {
+            let addresses = self.addresses();
+            addresses.enter(wave);
+            if (0..addresses.lanes()).any(|lane| addresses.valid(lane) && runs(addresses, a, lane)) {
+                return true;
             }
-            Some((_, y, [false, true])) => {
-                hazards.settled.insert(at, y);
-            }
-            _ => {}
         }
+        false
+    }
+
+    fn holds(&mut self, i: usize) -> [bool; 2] {
+        let Some((x, y)) = self.accesses[i].halves else {
+            return [false; 2];
+        };
+        let mut held = [true; 2];
+        for wave in self.waves() {
+            if held == [false; 2] {
+                break;
+            }
+            let addresses = self.addresses();
+            addresses.enter(wave);
+            for (still, (v, given)) in held.iter_mut().zip([(y, x), (x, y)]) {
+                if *still {
+                    *still = (0..addresses.lanes()).all(|lane| !addresses.valid(lane) || addresses.bit(v, lane, Some(given)).0 == Some(true));
+                }
+            }
+        }
+        held
     }
 }
 
@@ -1702,7 +1780,30 @@ mod tests {
         }
     }
 
-    fn store_of_one_wave(first: bool, loaded: bool) -> (Hazards, (BlockId, usize)) {
+    fn judged(program: &Program, env: &Environment, h: &Hazards, at: (BlockId, usize)) -> Known {
+        let facts = Facts::new(&program.ir, &program.parameter_inputs, &BTreeSet::new());
+        let mut judge = Judge::new(program, &facts, env, h);
+        let i = h.accesses.iter().position(|a| (a.block, a.index) == at).expect("an access at this position");
+        judge.judge(&[Question::Runs(i), Question::Holds(i)]);
+        judge.known().clone()
+    }
+
+    fn runs_at(program: &Program, env: &Environment, h: &Hazards, at: (BlockId, usize)) -> bool {
+        let i = h.accesses.iter().position(|a| (a.block, a.index) == at).unwrap();
+        judged(program, env, h, at).runs[&i]
+    }
+
+    fn settled_at(program: &Program, env: &Environment, h: &Hazards, at: (BlockId, usize)) -> Option<ValueId> {
+        let i = h.accesses.iter().position(|a| (a.block, a.index) == at).unwrap();
+        let (x, y) = h.accesses[i].halves?;
+        match judged(program, env, h, at).holds[&i] {
+            [true, _] => Some(x),
+            [false, true] => Some(y),
+            _ => None,
+        }
+    }
+
+    fn store_of_one_wave(first: bool, loaded: bool) -> bool {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = base(&mut b, &k, e, loaded);
@@ -1712,16 +1813,18 @@ mod tests {
         let chosen = b.cmp(e, if first { IntPred::Ult } else { IntPred::Uge }, x, half);
         let runs = b.int(e, IntOp::And, chosen, k.exec);
         let s = store_at(&mut b, e, own, runs);
-        (Hazards::find(&b.program(), &two_waves()), s)
+        let program = b.program();
+        let env = two_waves();
+        let h = Hazards::find(&program, &env);
+        runs_at(&program, &env, &h, s)
     }
 
     #[test]
-    fn find_keeps_a_store_that_only_one_wave_makes() {
+    fn a_store_that_only_one_wave_makes_runs() {
         for first in [false, true] {
             for loaded in [false, true] {
-                let (h, s) = store_of_one_wave(first, loaded);
                 assert!(
-                    !h.never.contains(&s),
+                    store_of_one_wave(first, loaded),
                     "wave {} of two makes the store (a load pairs with it: {})",
                     if first { 0 } else { 1 },
                     loaded
@@ -1730,7 +1833,7 @@ mod tests {
         }
     }
 
-    fn settled_between(below: u64, above: u64, loaded: bool) -> (Hazards, (BlockId, usize), ValueId) {
+    fn settled_between(below: u64, above: u64, loaded: bool) -> (Option<ValueId>, ValueId) {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let buf = base(&mut b, &k, e, loaded);
@@ -1742,20 +1845,24 @@ mod tests {
         let high = b.cmp(e, IntPred::Uge, x, floor);
         let both = b.int(e, IntOp::And, low, high);
         let s = store_at(&mut b, e, own, both);
-        (Hazards::find(&b.program(), &two_waves()), s, low)
+        let program = b.program();
+        let env = two_waves();
+        let h = Hazards::find(&program, &env);
+        (settled_at(&program, &env, &h, s), low)
     }
 
     #[test]
-    fn find_settles_a_predicate_only_where_every_wave_implies_its_other_half() {
+    fn a_predicate_settles_only_where_every_wave_implies_its_other_half() {
         for loaded in [false, true] {
-            let (h, s, _) = settled_between(48, 16, loaded);
-            assert!(
-                !h.settled.contains_key(&s),
+            let (settled, _) = settled_between(48, 16, loaded);
+            assert_eq!(
+                settled,
+                None,
                 "x < 48 implies x >= 16 in the second wave but not in the first (a load pairs with the store: {})",
                 loaded
             );
-            let (h, s, low) = settled_between(48, 0, loaded);
-            assert_eq!(h.settled.get(&s), Some(&low), "x < 48 implies x >= 0 in both waves (a load pairs with the store: {})", loaded);
+            let (settled, low) = settled_between(48, 0, loaded);
+            assert_eq!(settled, Some(low), "x < 48 implies x >= 0 in both waves (a load pairs with the store: {})", loaded);
         }
     }
 
@@ -3711,7 +3818,7 @@ mod tests {
     }
 
     #[test]
-    fn find_records_the_accesses_that_never_run_and_the_aperture_tests_that_always_hold() {
+    fn accesses_that_never_run_are_judged_so_and_aperture_tests_that_always_hold_settle() {
         let (mut b, k) = Build::kernel();
         let e = BlockId(0);
         let base = b.core(e, Ty::I64, Op::Env(Env::ScratchBase));
@@ -3733,10 +3840,12 @@ mod tests {
         b.store(e, Space::Lds, MemSize::B32, local, data, local_exec);
         let always = b.here(e);
         b.store(e, Space::Global, MemSize::B32, p, data, global_exec);
-        let h = Hazards::find(&b.program(), &environment(32, &[]));
-        assert!(h.never.contains(&never), "a scratch pointer never lies in the shared window");
-        assert!(!h.never.contains(&always), "the global store runs");
-        assert_eq!(h.settled.get(&always), Some(&k.exec), "the window test always holds, so the exec mask alone decides");
+        let program = b.program();
+        let env = environment(32, &[]);
+        let h = Hazards::find(&program, &env);
+        assert!(!runs_at(&program, &env, &h, never), "a scratch pointer never lies in the shared window");
+        assert!(runs_at(&program, &env, &h, always), "the global store runs");
+        assert_eq!(settled_at(&program, &env, &h, always), Some(k.exec), "the window test always holds, so the exec mask alone decides");
     }
 
     #[test]

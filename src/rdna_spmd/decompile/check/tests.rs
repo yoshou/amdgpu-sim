@@ -1,6 +1,8 @@
 use super::super::logic::{float_compare, Atom, Kept};
 use super::super::testing::*;
+use super::super::hazard::Judge;
 use super::super::{direct, search};
+use crate::rdna_spmd::environment::Environment;
 use super::*;
 use crate::rdna_spmd::hash::HashMap;
 
@@ -11,8 +13,6 @@ fn no_hazards() -> Hazards {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
-        never: Default::default(),
-        settled: Default::default(),
     }
 }
 
@@ -119,8 +119,8 @@ fn flagged_in(lanes: u32) -> Flagged {
 
 fn both(b: &Build) -> [Kept; 2] {
     [
-        search::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0,
-        direct::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0,
+        search::prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed()).0,
+        direct::prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed()).0,
     ]
 }
 
@@ -488,8 +488,8 @@ fn prove_demands_every_lane_for_a_kept_query_over_unmasked_bits() {
     let own = byte_offset(&mut b, e, buf, lane, 4);
     b.store(e, Space::Global, MemSize::B32, own, data, k.exec);
     let Inst::Effect { provenance, .. } = b.f.blocks[&e].insts[at.1] else { unreachable!() };
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(kept.queries.contains(&q), "{}: a lane without the flag stores zero", name);
         assert!(everyone.contains(&provenance), "{}: the query reads the flags of lanes whose exec is clear", name);
     }
@@ -497,10 +497,15 @@ fn prove_demands_every_lane_for_a_kept_query_over_unmasked_bits() {
 
 type Position = (BlockId, usize);
 
-fn meetings(program: &crate::rdna_spmd::program::Program, hazards: &Hazards) -> Vec<(&'static str, BTreeSet<Position>)> {
+fn meetings(program: &crate::rdna_spmd::program::Program, hazards: &Hazards, env: Option<&Environment>) -> Vec<(&'static str, BTreeSet<Position>)> {
     let (f, inputs) = (&program.ir, &program.parameter_inputs);
-    let search = search::prove(f, inputs, Some(0), hazards).0;
-    let direct = direct::prove(f, inputs, Some(0), hazards).0;
+    let base = Facts::new(f, inputs, &BTreeSet::new());
+    let runs = || match env {
+        Some(env) => Judge::new(program, &base, env, hazards),
+        None => Judge::assumed(),
+    };
+    let search = search::prove(f, inputs, Some(0), hazards, &mut runs()).0;
+    let direct = direct::prove(f, inputs, Some(0), hazards, &mut runs()).0;
     vec![("search", search), ("direct", direct)]
         .into_iter()
         .map(|(name, kept)| (name, kept.meets.iter().map(|&m| hazards.meetings[m]).collect()))
@@ -510,7 +515,7 @@ fn meetings(program: &crate::rdna_spmd::program::Program, hazards: &Hazards) -> 
 fn keeps_exactly(program: &crate::rdna_spmd::program::Program, hazards: &Hazards, expected: &[Position], why: &str) {
     let expected: BTreeSet<Position> = expected.iter().copied().collect();
     let wrong: Vec<(&str, BTreeSet<Position>)> =
-        meetings(program, hazards).into_iter().filter(|(_, kept)| *kept != expected).collect();
+        meetings(program, hazards, None).into_iter().filter(|(_, kept)| *kept != expected).collect();
     assert!(wrong.is_empty(), "{}: expected meetings before {:?}, kept {:?}", why, expected, wrong);
 }
 
@@ -600,7 +605,7 @@ fn a_check_resumed_after_a_new_meeting_reports_what_a_fresh_check_does() {
     let structure = super::super::logic::Structure::of(f, &facts);
     let fresh = |kept: &BTreeSet<Choice>| {
         let logic = Logic::structured(&structure, f, &facts, kept, &listed);
-        Check::new(f, &facts, inputs, Some(0), &loops, &hazards, logic)
+        Check::new(f, &facts, inputs, Some(0), &loops, &hazards, None, logic)
     };
     let meets: Vec<Choice> = listed.iter().copied().filter(|c| matches!(c, Choice::Meet(_))).collect();
     let mut kept = BTreeSet::new();
@@ -608,7 +613,7 @@ fn a_check_resumed_after_a_new_meeting_reports_what_a_fresh_check_does() {
     let mut outcomes = vec![outcome(&mut check)];
     for &m in &meets {
         kept.insert(m);
-        let mut resumed = Check::resume(f, &facts, inputs, Some(0), &loops, &hazards, check.retire(), &kept);
+        let mut resumed = Check::resume(f, &facts, inputs, Some(0), &loops, &hazards, None, check.retire(), &kept);
         let mut again = fresh(&kept);
         let (got, want) = (outcome(&mut resumed), outcome(&mut again));
         assert_eq!(got, want, "a check that takes over the logic of the last one must report what a new one reports with {:?}", kept);
@@ -761,8 +766,8 @@ fn search_needs_no_meeting_a_query_kept_later_already_orders() {
     b.store(e, Space::Global, MemSize::B32, slot, data, k.exec);
     let program = b.program();
     let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::assumed());
         assert_eq!(kept.queries.len(), 1, "{}: a lane without the flag stores 0 unless the query stays", name);
     }
     keeps_exactly(&program, &hazards, &[], "the kept query between the stores already aligns every lane");
@@ -905,8 +910,8 @@ fn prove_needs_no_meeting_across_a_kept_query() {
         b.store(e, Space::Global, MemSize::B32, slot, data, k.exec);
     });
     let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::assumed());
         assert_eq!(kept.queries.len(), 1, "{}: a lane without the flag stores 0 unless the query stays", name);
     }
     keeps_exactly(&program, &hazards, &[], "the kept query already aligns every lane between the stores");
@@ -930,8 +935,8 @@ fn prove_orders_two_stores_across_a_converted_query() {
         b.store(e, Space::Global, MemSize::B32, slot, data, c);
     });
     let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::assumed());
         assert!(kept.queries.is_empty(), "{}: only lanes with the flag store the answer, and they see true either way", name);
     }
     keeps_exactly(&program, &hazards, &[s2], "the converted query aligns no lanes, so the second store needs its meeting");
@@ -2558,7 +2563,7 @@ fn arms_store_for_neighbours(second: u64) -> Vec<&'static str> {
     let program = b.program();
     let hazards = Hazards::given(&program, &[(stores[0], l), (stores[1], l)], &[], &[]);
     let (f, inputs) = (&program.ir, &program.parameter_inputs);
-    vec![("search", search::prove(f, inputs, Some(0), &hazards).0), ("direct", direct::prove(f, inputs, Some(0), &hazards).0)]
+    vec![("search", search::prove(f, inputs, Some(0), &hazards, &mut Judge::assumed()).0), ("direct", direct::prove(f, inputs, Some(0), &hazards, &mut Judge::assumed()).0)]
         .into_iter()
         .filter(|(_, kept)| kept.queries.contains(&q) == (second == 1))
         .map(|(name, _)| name)
@@ -2600,7 +2605,7 @@ fn prove_keeps_a_query_whose_arms_store_the_same_words_a_neighbour_overwrites() 
     let pairs = [(stores[0].0, stores[0].1), (stores[1].0, stores[1].1), (stores[0].0, stores[1].1), (stores[1].0, stores[0].1)];
     let hazards = Hazards::given(&program, &pairs, &[], &[]);
     let (f, inputs) = (&program.ir, &program.parameter_inputs);
-    let wrong: Vec<&str> = vec![("search", search::prove(f, inputs, Some(0), &hazards).0), ("direct", direct::prove(f, inputs, Some(0), &hazards).0)]
+    let wrong: Vec<&str> = vec![("search", search::prove(f, inputs, Some(0), &hazards, &mut Judge::assumed()).0), ("direct", direct::prove(f, inputs, Some(0), &hazards, &mut Judge::assumed()).0)]
         .into_iter()
         .filter(|(_, kept)| !kept.queries.contains(&q))
         .map(|(name, _)| name)
@@ -2912,8 +2917,8 @@ fn over_active_bits(outside: u64, every: bool) {
     let out = byte_offset(&mut b, then, t[2], lane, 4);
     b.store(then, Space::Global, MemSize::B32, out, data, t[0]);
     let Inst::Effect { provenance, .. } = b.f.blocks[&then].insts[at.1] else { unreachable!() };
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(kept.queries.contains(&q), "{}: a lane whose flag is small stores 1, the others 2", name);
         assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear sees {}", name, outside);
     }
@@ -2947,8 +2952,8 @@ fn over_active_floats(outside: u64, every: bool) {
     let out = byte_offset(&mut b, then, t[2], lane, 4);
     b.store(then, Space::Global, MemSize::B32, out, data, t[0]);
     let Inst::Effect { provenance, .. } = b.f.blocks[&then].insts[at.1] else { unreachable!() };
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(kept.queries.contains(&q), "{}: a lane whose flag is small stores 1, the others 2", name);
         assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear sees {:#x}", name, outside);
     }
@@ -2991,8 +2996,8 @@ fn over_active_products(masked: bool, every: bool) {
     let out = byte_offset(&mut b, then, t[2], lane, 4);
     b.store(then, Space::Global, MemSize::B32, out, data, t[0]);
     let Inst::Effect { provenance, .. } = b.f.blocks[&then].insts[at.1] else { unreachable!() };
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(kept.queries.contains(&q), "{}: a lane whose flag is set stores 1, the others 2", name);
         assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear multiplies its flag by {}", name, !masked as u32);
     }
@@ -3040,8 +3045,8 @@ fn prove_keeps_a_query_whose_arm_holds_a_meeting() {
     b.br(then, join, vec![t[0]]);
     let program = b.program();
     let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::assumed());
         assert!(kept.queries.contains(&q), "{}: a lane without the flag skips the arm whose meeting every lane must reach", name);
         let meets: BTreeSet<Position> = kept.meets.iter().map(|&m| hazards.meetings[m]).collect();
         assert_eq!(meets, BTreeSet::from([s2]), "{}: the second store must follow the first", name);
@@ -3098,8 +3103,8 @@ fn ballot_count(masked: bool) -> (Build, u64) {
 #[test]
 fn prove_demands_every_lane_for_a_ballot_of_unmasked_bits() {
     let (b, provenance) = ballot_count(false);
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (_, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (_, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(everyone.contains(&provenance), "{}: the ballot counts the bits of lanes whose exec is clear", name);
     }
 }
@@ -3107,8 +3112,8 @@ fn prove_demands_every_lane_for_a_ballot_of_unmasked_bits() {
 #[test]
 fn prove_demands_no_lane_for_a_ballot_of_masked_bits() {
     let (b, provenance) = ballot_count(true);
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (_, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (_, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(!everyone.contains(&provenance), "{}: a lane with exec clear adds no bit", name);
     }
 }
@@ -3497,7 +3502,7 @@ fn search_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
         .copied()
         .filter(|&reader| {
             let (b, q) = reads_another_lane(reader);
-            let (kept, _) = search::prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            let (kept, _) = search::prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
             !kept.queries.contains(&q)
         })
         .collect();
@@ -3515,7 +3520,7 @@ fn direct_keeps_a_query_that_another_lane_reads_through_a_lane_exchange() {
         .copied()
         .filter(|&reader| {
             let (b, q) = reads_another_lane(reader);
-            let (kept, _) = direct::prove(&b.f, &b.inputs, Some(0), &no_hazards());
+            let (kept, _) = direct::prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
             !kept.queries.contains(&q)
         })
         .collect();
@@ -3821,8 +3826,8 @@ fn over_active_products_carried(masked: bool, every: bool) {
     let out = byte_offset(&mut b, next, n[1], lane, 4);
     b.store(next, Space::Global, MemSize::B32, out, data, n[0]);
     let Inst::Effect { provenance, .. } = b.f.blocks[&next].insts[at.1] else { unreachable!() };
-    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
-        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards());
+    for (name, prove) in [("search", search::prove as fn(&Func, &[Parameter], Option<usize>, &Hazards, &mut Judge) -> (Kept, BTreeSet<u64>)), ("direct", direct::prove)] {
+        let (kept, everyone) = prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut Judge::assumed());
         assert!(kept.queries.contains(&q), "{}: a lane whose flag is set stores 1, the others 2", name);
         assert_eq!(everyone.contains(&provenance), every, "{}: a lane with exec clear carries its flag times {}", name, !masked as u32);
     }
@@ -4525,11 +4530,9 @@ fn masked_tests_of_words_hold_only_where_inactive_lanes_see_zero() {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
-        never: Default::default(),
-        settled: Default::default(),
     };
     let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
-    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None, logic);
     assert!(check.run());
     let wrong: Vec<String> = tests
         .iter()
@@ -4562,11 +4565,9 @@ fn masks_forget_a_parameter_once_one_of_its_arguments_is_not_masked() {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
-        never: Default::default(),
-        settled: Default::default(),
     };
     let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
-    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None, logic);
     assert!(check.run());
     let masks = check.differences.masks();
     assert!(!masks.masked(t[1]), "the flag is a test every lane makes, active or not");
@@ -4592,12 +4593,10 @@ fn check_differences(b: &Build, kept: &[Choice], cases: &[Case], exact: bool) ->
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
-        never: Default::default(),
-        settled: Default::default(),
     };
     let kept: BTreeSet<Choice> = kept.iter().copied().collect();
     let logic = Logic::fixed(f, &facts, &kept, &[]);
-    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None, logic);
     assert!(check.run(), "the program has no store, so nothing can be violated");
     let mut wrong = Vec::new();
     for case in cases {
@@ -5220,7 +5219,7 @@ fn an_eager_check_stops_early_with_the_same_verdict() {
         let listed = search::listed(&b.f, &facts, &hazards);
         let verdict = |eager: bool| {
             let logic = Logic::fixed(&b.f, &facts, &BTreeSet::new(), &listed);
-            let mut check = Check::new(&b.f, &facts, &b.inputs, Some(0), &loops, &hazards, logic);
+            let mut check = Check::new(&b.f, &facts, &b.inputs, Some(0), &loops, &hazards, None, logic);
             if eager {
                 check.eager();
             }
@@ -5251,8 +5250,8 @@ fn prove_keeps_a_query_whose_arms_read_a_resource_before_and_after_a_store() {
     let wrong: Vec<&str> = ["search", "direct"]
         .iter()
         .zip([
-            search::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards).0,
-            direct::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards).0,
+            search::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::assumed()).0,
+            direct::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::assumed()).0,
         ])
         .filter(|(_, kept)| kept.queries.is_empty())
         .map(|(n, _)| *n)
@@ -5278,9 +5277,12 @@ fn prove_keeps_a_query_whose_arms_read_a_resource_around_a_store_under_found_haz
         _ => None,
     }).unwrap();
     let program = b.program();
-    let hazards = Hazards::find(&program, &environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]));
+    let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]);
+    let hazards = Hazards::find(&program, &env);
     let (f, inputs) = (&program.ir, &program.parameter_inputs);
-    let wrong: Vec<&str> = vec![("search", search::prove(f, inputs, Some(0), &hazards).0), ("direct", direct::prove(f, inputs, Some(0), &hazards).0)]
+    let base = Facts::new(f, inputs, &BTreeSet::new());
+    let runs = || Judge::new(&program, &base, &env, &hazards);
+    let wrong: Vec<&str> = vec![("search", search::prove(f, inputs, Some(0), &hazards, &mut runs()).0), ("direct", direct::prove(f, inputs, Some(0), &hazards, &mut runs()).0)]
         .into_iter()
         .filter(|(_, kept)| !kept.queries.contains(&q))
         .map(|(name, _)| name)
@@ -5488,18 +5490,19 @@ fn inner_then_outer() -> (crate::rdna_spmd::program::Program, Position, Position
 fn orders_a_store_after_an_inner_loop_whose_store_it_overwrites_in_one_outer_iteration() {
     let (program, s, t) = inner_then_outer();
     let hazards = Hazards::given(&program, &[(s, t)], &[], &[]);
-    let wrong: Vec<(&str, BTreeSet<Position>)> = meetings(&program, &hazards).into_iter().filter(|(_, kept)| !kept.contains(&t)).collect();
+    let wrong: Vec<(&str, BTreeSet<Position>)> = meetings(&program, &hazards, None).into_iter().filter(|(_, kept)| !kept.contains(&t)).collect();
     assert!(wrong.is_empty(), "a lane that leaves the inner loop early stores 9 before a slower lane's last inner store: {:?}", wrong);
 }
 
 #[test]
 fn found_hazards_order_a_store_after_an_inner_loop_whose_store_it_overwrites() {
     let (program, s, t) = inner_then_outer();
-    let hazards = Hazards::find(&program, &environment(32, &[(0, 1, 0x1000)]));
+    let env = environment(32, &[(0, 1, 0x1000)]);
+    let hazards = Hazards::find(&program, &env);
     let at = |x: Position| hazards.accesses.iter().position(|a| (a.block, a.index) == x).unwrap();
     let key = (at(s).min(at(t)), at(s).max(at(t)));
     assert!(hazards.together.contains(&key) && !hazards.apart.contains(&key), "the stores meet within one outer iteration only");
-    let wrong: Vec<(&str, BTreeSet<Position>)> = meetings(&program, &hazards).into_iter().filter(|(_, kept)| !kept.contains(&t)).collect();
+    let wrong: Vec<(&str, BTreeSet<Position>)> = meetings(&program, &hazards, Some(&env)).into_iter().filter(|(_, kept)| !kept.contains(&t)).collect();
     assert!(wrong.is_empty(), "a lane that leaves the inner loop early stores 9 before a slower lane's last inner store: {:?} (s at {:?})", wrong, s);
 }
 
@@ -5513,7 +5516,7 @@ fn orderings_pass_over_a_meeting_effect_in_the_wave_program() {
     let s2 = store(&mut b, e, buf, 2, k.exec);
     let program = b.program();
     let hazards = Hazards::given(&program, &[(s1, s2)], &[], &[]);
-    let result = std::panic::catch_unwind(|| meetings(&program, &hazards));
+    let result = std::panic::catch_unwind(|| meetings(&program, &hazards, None));
     assert!(result.is_ok(), "the checker panics on a meeting effect between two conflicting stores");
 }
 

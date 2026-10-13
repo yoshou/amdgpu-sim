@@ -13,7 +13,7 @@ mod verdict;
 #[cfg(test)]
 mod tests;
 
-use super::hazard::Hazards;
+use super::hazard::{Hazards, Known, Question};
 use super::logic::{Choice, Logic};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::{Facts, Site};
@@ -63,10 +63,11 @@ impl<'a> Check<'a> {
         exec_index: Option<usize>,
         loops: &'a Loops,
         hazards: &'a Hazards,
+        known: Option<&'a Known>,
         logic: Logic,
     ) -> Self {
         let mode = if logic.is_open() { Mode::Direct } else { Mode::Search };
-        let program = Program::new(f, facts, inputs, exec_index, loops, hazards);
+        let program = Program::new(f, facts, inputs, exec_index, loops, hazards, known);
         Self {
             schedule: Schedule::new(mode, &program),
             differences: Differences::new(program, logic, mode),
@@ -83,12 +84,13 @@ impl<'a> Check<'a> {
         exec_index: Option<usize>,
         loops: &'a Loops,
         hazards: &'a Hazards,
+        known: Option<&'a Known>,
         basis: Basis,
         kept: &BTreeSet<Choice>,
     ) -> Self {
         let Basis { mut logic, reach, masks } = basis;
         logic.keep(kept);
-        let program = Program::new(f, facts, inputs, exec_index, loops, hazards);
+        let program = Program::new(f, facts, inputs, exec_index, loops, hazards, known);
         Self {
             schedule: Schedule::new(Mode::Search, &program),
             differences: Differences::new(program, logic, Mode::Search).based(reach, masks),
@@ -129,6 +131,14 @@ impl<'a> Check<'a> {
 
     pub fn everyone(&mut self, kept: &BTreeSet<Choice>) -> BTreeSet<u64> {
         self.differences.everyone(kept)
+    }
+
+    pub fn unresolved(&mut self) -> Vec<Question> {
+        self.differences.unresolved()
+    }
+
+    pub fn resolve(&mut self, known: &Known) -> bool {
+        self.differences.resolve(known)
     }
 
     pub fn run(&mut self) -> bool {

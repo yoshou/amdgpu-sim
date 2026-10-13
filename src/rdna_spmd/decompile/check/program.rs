@@ -1,4 +1,4 @@
-use super::super::hazard::Hazards;
+use super::super::hazard::{Hazards, Known};
 use crate::rdna_spmd::analysis::facts::Facts;
 use crate::rdna_spmd::analysis::loops::Loops;
 use crate::rdna_spmd::ir::*;
@@ -11,8 +11,10 @@ pub(super) struct Program<'a> {
     pub(super) exec_index: Option<usize>,
     pub(super) loops: &'a Loops,
     pub(super) hazards: &'a Hazards,
+    pub(super) known: Option<&'a Known>,
     pub(super) meetings: BTreeMap<(BlockId, usize), usize>,
     pub(super) rank: BTreeMap<BlockId, usize>,
+    pub(super) access: BTreeMap<(BlockId, usize), usize>,
 }
 
 impl<'a> Program<'a> {
@@ -23,6 +25,7 @@ impl<'a> Program<'a> {
         exec_index: Option<usize>,
         loops: &'a Loops,
         hazards: &'a Hazards,
+        known: Option<&'a Known>,
     ) -> Self {
         Self {
             f,
@@ -31,6 +34,7 @@ impl<'a> Program<'a> {
             exec_index,
             loops,
             hazards,
+            known,
             meetings: hazards
                 .meetings
                 .iter()
@@ -42,6 +46,12 @@ impl<'a> Program<'a> {
                 .iter()
                 .enumerate()
                 .map(|(r, &b)| (b, r))
+                .collect(),
+            access: hazards
+                .accesses
+                .iter()
+                .enumerate()
+                .map(|(i, a)| ((a.block, a.index), i))
                 .collect(),
         }
     }

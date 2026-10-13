@@ -1,5 +1,5 @@
 use super::check::{Basis, Check};
-use super::hazard::Hazards;
+use super::hazard::{Hazards, Judge, Known, Question};
 use super::logic::{choices, Atom, Choice, Kept, Logic, Structure};
 use crate::rdna_spmd::analysis::bdd::Bdd;
 use crate::rdna_spmd::analysis::facts::{Conversion, Facts, Site};
@@ -13,6 +13,7 @@ pub fn prove(
     inputs: &[Parameter],
     exec_index: Option<usize>,
     hazards: &Hazards,
+    judge: &mut Judge,
 ) -> (Kept, BTreeSet<u64>) {
     let base = Facts::new(f, inputs, &BTreeSet::new());
     let loops = Loops::new(f, &base).unwrap_or_else(|block| {
@@ -33,16 +34,26 @@ pub fn prove(
     let mut basis: Option<Basis> = None;
     loop {
         let facts = Facts::converted(f, inputs, &kept.words, Conversion::Keeping(&kept.queries));
+        let known = judge.known().clone();
         let mut check = match basis.take() {
-            Some(basis) => Check::resume(f, &facts, inputs, exec_index, &loops, hazards, basis, &kept.choices()),
+            Some(basis) => Check::resume(f, &facts, inputs, exec_index, &loops, hazards, Some(&known), basis, &kept.choices()),
             None => {
                 let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
-                Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic)
+                Check::new(f, &facts, inputs, exec_index, &loops, hazards, Some(&known), logic)
             }
         };
-        if check.run() {
+        let proved = check.run();
+        let pending = check.unresolved();
+        if !pending.is_empty() {
+            judge.judge(&pending);
+            if check.resolve(judge.known()) {
+                basis = Some(check.retire());
+                continue;
+            }
+        }
+        if proved {
             let failed = if added.len() == 1 { added.first().copied() } else { None };
-            let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, &base, &structure, &listed, kept.clone(), failed);
+            let minimal = without_redundant_choices(f, inputs, exec_index, &loops, hazards, judge, &base, &structure, &listed, kept.clone(), failed);
             if minimal == kept {
                 let everyone = check.everyone(&BTreeSet::new());
                 return (without_covered_meetings(&mut check, kept), everyone);
@@ -85,12 +96,23 @@ pub fn prove(
         }
     }
     let facts = Facts::converted(f, inputs, &kept.words, Conversion::Keeping(&kept.queries));
-    let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
-    let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, logic);
-    assert!(check.run(), "the conversion policy left after dropping redundant choices no longer proves");
-    let everyone = check.everyone(&BTreeSet::new());
-    let kept = without_covered_meetings(&mut check, kept);
-    (kept, everyone)
+    loop {
+        let known = judge.known().clone();
+        let logic = Logic::structured(&structure, f, &facts, &kept.choices(), &listed);
+        let mut check = Check::new(f, &facts, inputs, exec_index, &loops, hazards, Some(&known), logic);
+        let proved = check.run();
+        let pending = check.unresolved();
+        if !pending.is_empty() {
+            judge.judge(&pending);
+            if check.resolve(judge.known()) {
+                continue;
+            }
+        }
+        assert!(proved, "the conversion policy left after dropping redundant choices no longer proves");
+        let everyone = check.everyone(&BTreeSet::new());
+        let kept = without_covered_meetings(&mut check, kept);
+        return (kept, everyone);
+    }
 }
 
 fn proves(
@@ -99,15 +121,43 @@ fn proves(
     exec_index: Option<usize>,
     loops: &Loops,
     hazards: &Hazards,
+    judge: &mut Judge,
     structure: &Structure,
     listed: &[Choice],
     kept: &Kept,
 ) -> bool {
+    loop {
+        match trial(f, inputs, exec_index, loops, hazards, judge.known(), structure, listed, kept) {
+            Ok(proved) => return proved,
+            Err(pending) => judge.judge(&pending),
+        }
+    }
+}
+
+fn trial(
+    f: &Func,
+    inputs: &[Parameter],
+    exec_index: Option<usize>,
+    loops: &Loops,
+    hazards: &Hazards,
+    known: &Known,
+    structure: &Structure,
+    listed: &[Choice],
+    kept: &Kept,
+) -> Result<bool, Vec<Question>> {
     let facts = Facts::converted(f, inputs, &kept.words, Conversion::Keeping(&kept.queries));
     let logic = Logic::structured(structure, f, &facts, &kept.choices(), listed);
-    let mut check = Check::new(f, &facts, inputs, exec_index, loops, hazards, logic);
+    let mut check = Check::new(f, &facts, inputs, exec_index, loops, hazards, Some(known), logic);
     check.eager();
-    check.run()
+    if check.run() {
+        return Ok(true);
+    }
+    let pending = check.unresolved();
+    if pending.is_empty() {
+        Ok(false)
+    } else {
+        Err(pending)
+    }
 }
 
 fn without_redundant_choices(
@@ -116,6 +166,7 @@ fn without_redundant_choices(
     exec_index: Option<usize>,
     loops: &Loops,
     hazards: &Hazards,
+    judge: &mut Judge,
     base: &Facts,
     structure: &Structure,
     listed: &[Choice],
@@ -134,33 +185,44 @@ fn without_redundant_choices(
         trial.remove(choice);
         trial
     };
-    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(candidates.len().max(1));
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let alone: Vec<bool> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let (candidates, schedule, without, next) = (&candidates, &schedule, &without, &next);
-                scope.spawn(move || {
-                    let mut done = Vec::new();
-                    loop {
-                        let Some(&i) = schedule.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else {
-                            return done;
-                        };
-                        let redundant = Some(candidates[i]) != failed
-                            && proves(f, inputs, exec_index, loops, hazards, structure, listed, &without(candidates[i]));
-                        done.push((i, redundant));
-                    }
+    let mut alone = vec![false; candidates.len()];
+    let mut schedule: Vec<usize> = schedule.into_iter().filter(|&i| Some(candidates[i]) != failed).collect();
+    while !schedule.is_empty() {
+        let known = judge.known();
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(schedule.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut pending: BTreeSet<Question> = BTreeSet::new();
+        let mut undecided = Vec::new();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let (candidates, schedule, without, next) = (&candidates, &schedule, &without, &next);
+                    scope.spawn(move || {
+                        let mut done = Vec::new();
+                        loop {
+                            let Some(&i) = schedule.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else {
+                                return done;
+                            };
+                            done.push((i, trial(f, inputs, exec_index, loops, hazards, known, structure, listed, &without(candidates[i]))));
+                        }
+                    })
                 })
-            })
-            .collect();
-        let mut alone = vec![false; candidates.len()];
-        for handle in handles {
-            for (i, redundant) in handle.join().expect("a redundancy trial panicked") {
-                alone[i] = redundant;
+                .collect();
+            for handle in handles {
+                for (i, outcome) in handle.join().expect("a redundancy trial panicked") {
+                    match outcome {
+                        Ok(redundant) => alone[i] = redundant,
+                        Err(questions) => {
+                            pending.extend(questions);
+                            undecided.push(i);
+                        }
+                    }
+                }
             }
-        }
-        alone
-    });
+        });
+        judge.judge(&pending.into_iter().collect::<Vec<_>>());
+        schedule.retain(|i| undecided.contains(i));
+    }
     let mut first = true;
     for (choice, redundant) in candidates.into_iter().zip(alone) {
         if !redundant {
@@ -168,7 +230,7 @@ fn without_redundant_choices(
         }
         let mut trial = kept.clone();
         trial.remove(choice);
-        if first || proves(f, inputs, exec_index, loops, hazards, structure, listed, &trial) {
+        if first || proves(f, inputs, exec_index, loops, hazards, judge, structure, listed, &trial) {
             kept = trial;
         }
         first = false;
@@ -348,8 +410,6 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
-            never: Default::default(),
-            settled: Default::default(),
         };
         let base = Facts::new(f, inputs, &BTreeSet::new());
         let loops = Loops::new(f, &base).unwrap();
@@ -360,13 +420,14 @@ mod tests {
             assert!(listed.contains(&Choice::Query(q)));
             all.insert(Choice::Query(q));
         }
-        assert!(proves(f, inputs, Some(0), &loops, &hazards, &structure, &listed, &all));
-        assert!(!proves(f, inputs, Some(0), &loops, &hazards, &structure, &listed, &Kept::default()), "a lane without the flag skips the store the wave makes");
-        let minimal = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &base, &structure, &listed, all.clone(), None);
+        let judge = &mut Judge::assumed();
+        assert!(proves(f, inputs, Some(0), &loops, &hazards, judge, &structure, &listed, &all));
+        assert!(!proves(f, inputs, Some(0), &loops, &hazards, judge, &structure, &listed, &Kept::default()), "a lane without the flag skips the store the wave makes");
+        let minimal = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, judge, &base, &structure, &listed, all.clone(), None);
         assert_eq!(minimal.choices(), BTreeSet::from([Choice::Query(needed)]), "every lane computes the same tests the wave asks about");
-        let known = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, &base, &structure, &listed, all, Some(Choice::Query(needed)));
+        let known = without_redundant_choices(f, inputs, Some(0), &loops, &hazards, judge, &base, &structure, &listed, all, Some(Choice::Query(needed)));
         assert_eq!(known.choices(), minimal.choices(), "a choice whose removal the search saw fail stays without a trial");
-        let (kept, _) = prove(f, inputs, Some(0), &hazards);
+        let (kept, _) = prove(f, inputs, Some(0), &hazards, judge);
         assert_eq!(kept.choices(), BTreeSet::from([Choice::Query(needed)]));
     }
 
@@ -459,7 +520,8 @@ mod tests {
                 let mut env = environment(32, &[(0, 1, 0x1000)]);
                 env.block = [64, 1, 1];
                 let hazards = Hazards::find(&program, &env);
-                let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+                let base = Facts::new(&program.ir, &program.parameter_inputs, &BTreeSet::new());
+                let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut Judge::new(&program, &base, &env, &hazards));
                 assert!(
                     kept.queries.contains(&any),
                     "wave {} of two stores whether any of its lanes is odd, which an even lane cannot tell alone (a load pairs with the store: {})",
@@ -468,5 +530,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn odd_answer_stored(scratch: bool) -> (crate::rdna_spmd::program::Program, ValueId, (BlockId, usize)) {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let field = b.constant(e, Ty::I32, 0x3ff);
+        let x = b.int(e, IntOp::And, k.item, field);
+        let one = b.constant(e, Ty::I32, 1);
+        let zero = b.constant(e, Ty::I32, 0);
+        let parity = b.int(e, IntOp::And, x, one);
+        let odd = b.cmp(e, IntPred::Ne, parity, zero);
+        let asked = b.int(e, IntOp::And, odd, k.exec);
+        let any = b.wave(e, WaveOp::Any, vec![asked]);
+        let value = b.core(e, Ty::I32, Op::Select(any, one, zero));
+        let shared = crate::rdna_spmd::SHARED_APERTURE;
+        let p = if scratch {
+            let base = b.core(e, Ty::I64, Op::Env(Env::ScratchBase));
+            let eight = b.constant(e, Ty::I64, 8);
+            b.int(e, IntOp::Add, base, eight)
+        } else {
+            let low = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let high = b.constant(e, Ty::I32, shared >> 32);
+            b.core(e, Ty::I64, Op::Pack64(low, high))
+        };
+        let low = b.constant(e, Ty::I64, shared);
+        let high = b.constant(e, Ty::I64, shared + (1 << 32));
+        let above = b.cmp(e, IntPred::Uge, p, low);
+        let below = b.cmp(e, IntPred::Ult, p, high);
+        let in_window = b.int(e, IntOp::And, above, below);
+        let local_exec = b.int(e, IntOp::And, k.exec, in_window);
+        let local = b.core(e, Ty::I32, Op::Convert(Cvt::Trunc, Ty::I32, p));
+        let s = b.here(e);
+        b.store(e, Space::Lds, MemSize::B32, local, value, local_exec);
+        (b.program(), any, s)
+    }
+
+    #[test]
+    fn prove_judges_only_the_store_whose_running_decides_a_violation() {
+        for scratch in [false, true] {
+            let (program, any, s) = odd_answer_stored(scratch);
+            let env = environment(32, &[]);
+            let hazards = Hazards::find(&program, &env);
+            let base = Facts::new(&program.ir, &program.parameter_inputs, &BTreeSet::new());
+            let mut judge = Judge::new(&program, &base, &env, &hazards);
+            let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut judge);
+            let i = hazards.accesses.iter().position(|a| (a.block, a.index) == s).unwrap();
+            assert_eq!(judge.known().runs, std::collections::BTreeMap::from([(i, !scratch)]), "the store's data depends on the query, so the proof asks whether the store runs (scratch pointer: {})", scratch);
+            assert_eq!(kept.queries.contains(&any), !scratch, "a store that never runs needs no query (scratch pointer: {})", scratch);
+        }
+    }
+
+    #[test]
+    fn prove_judges_nothing_when_no_violation_depends_on_an_access() {
+        let (mut b, k) = Build::kernel();
+        let e = BlockId(0);
+        let buf = k.buffer(&mut b, e, 0);
+        let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+        let own = byte_offset(&mut b, e, buf, lane, 4);
+        let value = b.load(e, Space::Global, MemSize::B32, own, k.exec);
+        b.store(e, Space::Global, MemSize::B32, own, value, k.exec);
+        let program = b.program();
+        let env = environment(32, &[(0, 1, 0x1000)]);
+        let hazards = Hazards::find(&program, &env);
+        let base = Facts::new(&program.ir, &program.parameter_inputs, &BTreeSet::new());
+        let mut judge = Judge::new(&program, &base, &env, &hazards);
+        let (kept, _) = prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut judge);
+        assert!(kept.choices().is_empty());
+        assert!(judge.known().is_empty(), "each lane copies its own word, so nothing turns on whether the copy runs: {:?}", judge.known());
     }
 }

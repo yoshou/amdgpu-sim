@@ -683,15 +683,13 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
-            never: Default::default(),
-            settled: Default::default(),
         };
         let mut r = Random::new(29);
         let mut wrong = Vec::new();
         let mut unknown_somewhere = 0;
         for trial in 0..300 {
             let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
-            let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards);
+            let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None);
             let mut q = Differences::new(program, logic, Mode::Search);
             let lane_bits = q.bit(a);
             let mut pool: Vec<Atom> = q.logic().support(lane_bits).iter().map(|&v| q.logic().atom_of(v)).collect();

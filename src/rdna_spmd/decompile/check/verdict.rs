@@ -74,6 +74,23 @@ impl Verdict {
         self.demands.insert(provenance, joined);
     }
 
+    pub(super) fn conditions(&self) -> impl Iterator<Item = Bdd> + '_ {
+        self.violations.iter().map(|v| v.condition).chain(self.demands.values().copied())
+    }
+
+    pub(super) fn substitute(&mut self, mut f: impl FnMut(Bdd) -> Bdd) -> bool {
+        let before = self.violations.len();
+        for v in &mut self.violations {
+            v.condition = f(v.condition);
+        }
+        self.violations.retain(|v| v.condition != Bdd::FALSE);
+        for c in self.demands.values_mut() {
+            *c = f(*c);
+        }
+        self.demands.retain(|_, c| *c != Bdd::FALSE);
+        self.violations.len() < before
+    }
+
     pub(super) fn everyone(&mut self, logic: &mut Logic, kept: &BTreeSet<Choice>) -> BTreeSet<u64> {
         let demands = std::mem::take(&mut self.demands);
         demands

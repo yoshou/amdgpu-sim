@@ -84,7 +84,7 @@ impl Rules for State {
             Atom::Bit(v) => facts.uniform[v.0] || self.cells.uniform_test(v),
             Atom::View(v) => facts.saturated[v.0],
             Atom::WordBit(v, _) => facts.uniform[v.0],
-            Atom::Marker(_) => true,
+            Atom::Marker(_) | Atom::Runs(_) | Atom::Holds(..) => true,
             Atom::Cell(block, group, bit) => self.cells.uniform_cell(block, group, bit),
             Atom::Some(..) => true,
             Atom::Lane(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => false,

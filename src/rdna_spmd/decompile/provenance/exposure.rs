@@ -360,7 +360,9 @@ mod tests {
         let program = b.program();
         let env = environment(32, &[(0, 1, 0x1000), (8, 2, 0x2000), (16, 3, 0x3000)]);
         let hazards = Hazards::find(&program, &env);
-        let (kept, _) = super::super::super::search::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards);
+        let base = crate::rdna_spmd::analysis::facts::Facts::new(&program.ir, &program.parameter_inputs, &BTreeSet::new());
+        let mut runs = super::super::super::hazard::Judge::new(&program, &base, &env, &hazards);
+        let (kept, _) = super::super::super::search::prove(&program.ir, &program.parameter_inputs, Some(0), &hazards, &mut runs);
         let before = kept.meets.iter().map(|&m| hazards.meetings[m]).collect();
         (before, load, hazards.conflicts().len())
     }

@@ -1920,8 +1920,6 @@ fn no_hazards() -> super::super::hazard::Hazards {
         apart: BTreeSet::new(),
         idle: BTreeSet::new(),
         meetings: Vec::new(),
-        never: Default::default(),
-        settled: Default::default(),
     }
 }
 
@@ -1958,8 +1956,8 @@ fn query_fed_through_a_parameter() -> (Build, ValueId, ValueId) {
 fn prove_keeps_a_query_whose_answer_a_parameter_carries_into_a_kept_query() {
     let (b, a, q) = query_fed_through_a_parameter();
     let mut wrong = Vec::new();
-    let searched = super::super::search::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0;
-    let direct = super::super::direct::prove(&b.f, &b.inputs, Some(0), &no_hazards()).0;
+    let searched = super::super::search::prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut super::super::hazard::Judge::assumed()).0;
+    let direct = super::super::direct::prove(&b.f, &b.inputs, Some(0), &no_hazards(), &mut super::super::hazard::Judge::assumed()).0;
     for (name, kept) in [("search", searched), ("direct", direct)] {
         if !kept.queries.contains(&a) {
             wrong.push(format!("{}: keeps {:?} but not A = {:?} (B = {:?})", name, kept.queries, a, q));

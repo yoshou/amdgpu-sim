@@ -567,8 +567,6 @@ mod tests {
             apart: BTreeSet::new(),
             idle: BTreeSet::new(),
             meetings: Vec::new(),
-            never: Default::default(),
-            settled: Default::default(),
         };
         let tags = [Choice::Meet(0)];
         let mut pool: Vec<Atom> = p.iter().chain(&j).map(|&v| Atom::Bit(v)).collect();
@@ -576,7 +574,7 @@ mod tests {
         let mut r = Random::new(43);
         let mut restated = 0;
         for _ in 0..200 {
-            let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards);
+            let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None);
             let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &tags);
             let mut d = Differences::new(program, logic, Mode::Search);
             let cond = random_function(&mut d.logic, &mut r, &pool, 3);

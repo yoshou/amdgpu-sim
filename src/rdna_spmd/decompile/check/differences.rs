@@ -1,3 +1,4 @@
+use super::super::hazard::{Known, Question};
 use super::super::logic::{Atom, Choice, Logic};
 use super::lattice::{Lattice, Sent};
 use super::masks::Masks;
@@ -59,6 +60,50 @@ impl<'a> Differences<'a> {
 
     pub(super) fn exhausted(&self) -> Option<(BlockId, usize, &'static str)> {
         self.verdict.exhausted()
+    }
+
+    pub(super) fn unresolved(&mut self) -> Vec<Question> {
+        let conditions: Vec<Bdd> = self.verdict.conditions().chain([self.lattice.safe()]).collect();
+        let mut pending = BTreeSet::new();
+        for c in conditions {
+            for &var in self.logic.support(c).iter() {
+                match self.logic.atom_of(var) {
+                    Atom::Runs(i) => pending.insert(Question::Runs(i as usize)),
+                    Atom::Holds(i, _) => pending.insert(Question::Holds(i as usize)),
+                    _ => false,
+                };
+            }
+        }
+        pending.into_iter().collect()
+    }
+
+    pub(super) fn resolve(&mut self, known: &Known) -> bool {
+        let Self { logic, verdict, .. } = self;
+        let value = |atom: Atom| match atom {
+            Atom::Runs(i) => known.runs.get(&(i as usize)).copied(),
+            Atom::Holds(i, k) => known.holds.get(&(i as usize)).map(|h| h[k as usize]),
+            _ => None,
+        };
+        let mut unsettled = false;
+        for v in verdict.violations() {
+            for &var in logic.support(v.condition).iter() {
+                unsettled |= match logic.atom_of(var) {
+                    Atom::Runs(i) => known.runs.get(&(i as usize)) == Some(&false),
+                    Atom::Holds(..) => true,
+                    _ => false,
+                };
+            }
+        }
+        let vanished = verdict.substitute(|c| {
+            let mut c = c;
+            for &var in logic.support(c).iter() {
+                if let Some(answer) = value(logic.atom_of(var)) {
+                    c = logic.m.cofactor(c, var, answer);
+                }
+            }
+            c
+        });
+        unsettled || vanished
     }
 
     pub(super) fn everyone(&mut self, kept: &BTreeSet<Choice>) -> BTreeSet<u64> {

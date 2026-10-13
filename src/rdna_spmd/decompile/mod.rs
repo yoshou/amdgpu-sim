@@ -32,11 +32,23 @@ impl From<Program> for Lane {
     }
 }
 
-pub use hazard::Hazards;
+pub use hazard::{Hazards, Known};
+use hazard::Judge;
+use crate::rdna_spmd::environment::Environment;
 
 const MEETING: u64 = 0xC000_0000_0000_0000;
 
-pub fn decompile(function: &Program, hazards: &Hazards) -> Lane {
+pub fn agrees(function: &Program, hazards: &Hazards, env: &Environment, known: &Known) -> bool {
+    if known.is_empty() {
+        return true;
+    }
+    let base = facts::Facts::new(&function.ir, &function.parameter_inputs, &BTreeSet::new());
+    let mut judge = Judge::new(function, &base, env, hazards);
+    judge.judge(&known.questions());
+    judge.known() == known
+}
+
+pub fn decompile(function: &Program, hazards: &Hazards, env: &Environment) -> (Lane, Known) {
     let f = &function.ir;
     assert!(
         !f.reads_the_packet(),
@@ -47,13 +59,16 @@ pub fn decompile(function: &Program, hazards: &Hazards) -> Lane {
         |p| matches!(p.source, crate::rdna_spmd::ir::ParameterSource::MaskBit(r) if r == exec),
     );
     let inputs = &function.parameter_inputs;
-    assert_premises(f, &facts::Facts::new(f, inputs, &BTreeSet::new()), exec_index);
+    let base = facts::Facts::new(f, inputs, &BTreeSet::new());
+    assert_premises(f, &base, exec_index);
     let meetings = &hazards.meetings;
+    let mut judge = Judge::new(function, &base, env, hazards);
     let (kept, everyone) = match std::env::var("AMDGPU_SIM_PROOF").as_deref() {
-        Ok("direct") => direct::prove(f, inputs, exec_index, hazards),
-        Ok("search") | Err(_) => search::prove(f, inputs, exec_index, hazards),
+        Ok("direct") => direct::prove(f, inputs, exec_index, hazards, &mut judge),
+        Ok("search") | Err(_) => search::prove(f, inputs, exec_index, hazards, &mut judge),
         Ok(other) => panic!("AMDGPU_SIM_PROOF={}: expected search or direct", other),
     };
+    let known = judge.known().clone();
     let facts = facts::Facts::converted(f, &function.parameter_inputs, &kept.words, facts::Conversion::Keeping(&kept.queries));
     if std::env::var_os("AMDGPU_SIM_PRINT_IR").is_some() {
         eprintln!(
@@ -101,15 +116,18 @@ pub fn decompile(function: &Program, hazards: &Hazards) -> Lane {
             e
         );
     }
-    Lane {
-        function: Program {
-            registry: function.registry.clone(),
-            ir: lane,
-            parameter_inputs: function.parameter_inputs.clone(),
-            entry: function.entry,
+    (
+        Lane {
+            function: Program {
+                registry: function.registry.clone(),
+                ir: lane,
+                parameter_inputs: function.parameter_inputs.clone(),
+                entry: function.entry,
+            },
+            everyone,
         },
-        everyone,
-    }
+        known,
+    )
 }
 
 fn assert_exec_position(f: &Func, facts: &facts::Facts, exec_index: Option<usize>) {

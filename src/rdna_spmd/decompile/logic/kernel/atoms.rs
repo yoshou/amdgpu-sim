@@ -16,6 +16,8 @@ pub enum Atom {
     Marker(Choice),
     Cell(BlockId, u16, u8),
     Some(BlockId, u16),
+    Runs(u32),
+    Holds(u32, u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -26,6 +28,7 @@ pub enum Choice {
 }
 
 const MARKERS_LAST: u32 = 0xfffe_0000;
+const RUNS_LAST: u32 = 0xfffd_0000;
 pub const PATH: usize = 3;
 
 pub struct Atoms {
@@ -106,6 +109,14 @@ impl Atoms {
 
     fn number(&mut self, atom: Atom) -> u32 {
         let var = match atom {
+            Atom::Runs(i) => {
+                assert!(i < 1 << 14, "too many accesses");
+                return RUNS_LAST + 4 * i;
+            }
+            Atom::Holds(i, k) => {
+                assert!(i < 1 << 14 && k < 2, "too many accesses");
+                return RUNS_LAST + 4 * i + 1 + k as u32;
+            }
             Atom::Marker(c) => {
                 let i = self.markers[&c];
                 return if self.markers_first {
@@ -213,7 +224,7 @@ pub(super) fn scope(atom: Atom, facts: &Facts) -> Option<BlockId> {
             Site::Unreached => None,
         },
         Atom::Cell(block, ..) | Atom::Some(block, _) => Some(block),
-        Atom::Lane(_) | Atom::Marker(_) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
+        Atom::Lane(_) | Atom::Marker(_) | Atom::Runs(_) | Atom::Holds(..) | Atom::Fresh(..) | Atom::Term(..) | Atom::Next(..) => None,
     }
 }
 

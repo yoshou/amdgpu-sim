@@ -23,24 +23,39 @@ pub(super) fn inst<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, inst
             outputs,
         } => match op {
             EffectOp::Wave(op) => wave(q, b, *provenance, *op, inputs, outputs),
-            EffectOp::Memory { .. } if q.program().hazards.never.contains(&(b, index)) => Bdd::FALSE,
             EffectOp::Memory {
                 op: MemoryOp::Load(_),
                 ..
             } => {
-                let pred = q.program().hazards.settled.get(&(b, index)).copied().unwrap_or(inputs[1]);
-                let fp = q.bit(pred);
-                let absent = q.not(fp);
-                let operands = any_of(q, &inputs[..2]);
-                let differs = q.or(operands, absent);
-                let loaded = q.loaded((b, index)).unwrap_or(Bdd::FALSE);
-                q.or(differs, loaded)
+                let runs = runs(q, b, index);
+                if runs == Bdd::FALSE {
+                    return Bdd::FALSE;
+                }
+                let load = |q: &mut Q, pred: ValueId| {
+                    let fp = q.bit(pred);
+                    let absent = q.not(fp);
+                    let operands = any_of(q, &inputs[..2]);
+                    let differs = q.or(operands, absent);
+                    let loaded = q.loaded((b, index)).unwrap_or(Bdd::FALSE);
+                    [q.or(differs, loaded)]
+                };
+                let [x] = match predicate(q, b, index, inputs[1]) {
+                    Ok(pred) => load(q, pred),
+                    Err(choice) => chosen(q, choice, inputs[1], load),
+                };
+                q.and(x, runs)
             }
             EffectOp::Memory {
                 op: MemoryOp::Fence,
                 ..
             } => Bdd::FALSE,
-            EffectOp::Memory { op: memory, .. } => store(q, b, index, *memory, inputs),
+            EffectOp::Memory { op: memory, .. } => {
+                let runs = runs(q, b, index);
+                if runs == Bdd::FALSE {
+                    return Bdd::FALSE;
+                }
+                store(q, b, index, *memory, inputs, runs)
+            }
             EffectOp::BarrierSignal { .. } | EffectOp::BarrierWait => any_of(q, inputs),
         },
     }
@@ -296,10 +311,88 @@ fn gated<'a, Q: Queries<'a>>(q: &mut Q, op: WaveOp, mask: ValueId, hx: Bdd) -> B
     q.or(hm, set)
 }
 
-fn store<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, memory: MemoryOp, inputs: &[ValueId]) -> Bdd {
+fn runs<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize) -> Bdd {
+    let program = q.program();
+    let (Some(known), Some(&i)) = (program.known, program.access.get(&(b, index))) else {
+        return Bdd::TRUE;
+    };
+    match known.runs.get(&i) {
+        Some(true) => Bdd::TRUE,
+        Some(false) => Bdd::FALSE,
+        None => q.logic().atom(Atom::Runs(i as u32)),
+    }
+}
+
+type Alternatives = ([Bdd; 2], ValueId, ValueId);
+
+fn predicate<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, mask: ValueId) -> Result<ValueId, Alternatives> {
+    let program = q.program();
+    let (Some(known), Some(&i)) = (program.known, program.access.get(&(b, index))) else {
+        return Ok(mask);
+    };
+    let Some((x, y)) = program.hazards.accesses[i].halves else {
+        return Ok(mask);
+    };
+    match known.holds.get(&i) {
+        Some(&[true, _]) => Ok(x),
+        Some(&[false, true]) => Ok(y),
+        Some(_) => Ok(mask),
+        None => {
+            let held = [q.logic().atom(Atom::Holds(i as u32, 0)), q.logic().atom(Atom::Holds(i as u32, 1))];
+            Err((held, x, y))
+        }
+    }
+}
+
+fn chosen<'a, Q: Queries<'a>, const N: usize>(q: &mut Q, (held, x, y): Alternatives, mask: ValueId, rule: impl Fn(&mut Q, ValueId) -> [Bdd; N]) -> [Bdd; N] {
+    let mut out = rule(q, mask);
+    for (k, half) in [(1, y), (0, x)] {
+        let taken = rule(q, half);
+        for n in 0..N {
+            out[n] = q.logic().m.ite(held[k], taken[n], out[n]);
+        }
+    }
+    out
+}
+
+fn store<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, memory: MemoryOp, inputs: &[ValueId], runs: Bdd) -> Bdd {
     let m = memory.mask_input();
-    let pred = q.program().hazards.settled.get(&(b, index)).copied().unwrap_or(inputs[m]);
     let reachable = q.reachable(b);
+    let reachable = q.and(reachable, runs);
+    let pred = match predicate(q, b, index, inputs[m]) {
+        Ok(pred) => pred,
+        Err(choice) => {
+            let [happens, writes, reordered, x] = chosen(q, choice, inputs[m], |q, pred| {
+                let hp = q.h(pred);
+                let happens = q.and(hp, reachable);
+                let fp = q.bit(pred);
+                let operands = any_of(q, &inputs[..m]);
+                let performed = q.and(fp, reachable);
+                let writes = q.and(performed, operands);
+                let reordered = match q.reordered((b, index)) {
+                    Some(order) => q.and(performed, order),
+                    None => Bdd::FALSE,
+                };
+                let absent = q.not(fp);
+                let differs = q.or(operands, absent);
+                let loaded = q.loaded((b, index)).unwrap_or(Bdd::FALSE);
+                [happens, writes, reordered, q.or(differs, loaded)]
+            });
+            for (reason, difference) in [
+                ("whether a store happens depends on the other lanes", happens),
+                ("what a store writes depends on the other lanes", writes),
+                ("another lane may write these bytes on the other side of the store", reordered),
+            ] {
+                if difference != Bdd::FALSE {
+                    q.require(b, index, reason, difference);
+                    if q.stopped() {
+                        return Bdd::FALSE;
+                    }
+                }
+            }
+            return q.and(x, runs);
+        }
+    };
     let hp = q.h(pred);
     if hp != Bdd::FALSE {
         let happens = q.and(hp, reachable);
@@ -344,7 +437,8 @@ fn store<'a, Q: Queries<'a>>(q: &mut Q, b: BlockId, index: usize, memory: Memory
     let absent = q.not(fp);
     let differs = q.or(operands, absent);
     let loaded = q.loaded((b, index)).unwrap_or(Bdd::FALSE);
-    q.or(differs, loaded)
+    let x = q.or(differs, loaded);
+    q.and(x, runs)
 }
 
 pub(super) fn word_difference<'a, Q: Queries<'a>>(q: &mut Q, inst: &Inst, value: ValueId) -> Bdd {
