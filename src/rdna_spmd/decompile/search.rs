@@ -61,23 +61,17 @@ pub fn prove(
             kept = minimal;
             break;
         }
+        let conditions: Vec<Bdd> = check.violations().iter().map(|v| v.condition).collect();
         let mut blamed = BTreeSet::new();
-        for i in 0..check.violations().len() {
-            let condition = check.violations()[i].condition;
-            let mut choices = alone(check.logic(), condition, &order);
-            if choices.is_empty() {
-                choices.extend(named(check.logic(), condition, &order));
+        for (i, v) in blame(check.logic(), &conditions, &order) {
+            if std::env::var_os("AMDGPU_SIM_PRINT_MEETINGS").is_some() {
+                let violation = &check.violations()[i];
+                eprintln!(
+                    "; keeps {:?} for b{}:{}: {}",
+                    v, violation.block.0, violation.index, violation.reason
+                );
             }
-            for v in choices {
-                if std::env::var_os("AMDGPU_SIM_PRINT_MEETINGS").is_some() {
-                    let violation = &check.violations()[i];
-                    eprintln!(
-                        "; keeps {:?} for b{}:{}: {}",
-                        v, violation.block.0, violation.index, violation.reason
-                    );
-                }
-                blamed.insert(v);
-            }
+            blamed.insert(v);
         }
         if blamed.is_empty() {
             let v = &check.violations()[0];
@@ -311,6 +305,40 @@ fn alone(logic: &mut Logic, condition: Bdd, order: &HashMap<Choice, usize>) -> V
     out
 }
 
+fn blame(logic: &mut Logic, conditions: &[Bdd], order: &HashMap<Choice, usize>) -> Vec<(usize, Choice)> {
+    let mut out = Vec::new();
+    let mut open: Vec<(usize, Bdd)> = conditions.iter().copied().enumerate().collect();
+    while !open.is_empty() {
+        let mut round = BTreeSet::new();
+        for &(i, condition) in &open {
+            let mut choices = alone(logic, condition, order);
+            if choices.is_empty() {
+                choices.extend(named(logic, condition, order));
+            }
+            for c in choices {
+                if round.insert(c) {
+                    out.push((i, c));
+                }
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        let marks: Vec<u32> = round.iter().map(|&c| marker(logic, c)).collect();
+        open = open
+            .into_iter()
+            .map(|(i, condition)| (i, marks.iter().fold(condition, |g, &var| logic.m.cofactor(g, var, false))))
+            .filter(|&(_, condition)| condition != Bdd::FALSE)
+            .collect();
+    }
+    out
+}
+
+fn marker(logic: &mut Logic, c: Choice) -> u32 {
+    let atom = logic.atom(Atom::Marker(c));
+    logic.m.decompose(atom).expect("a marker is a variable").0
+}
+
 fn named(logic: &mut Logic, condition: Bdd, order: &HashMap<Choice, usize>) -> Option<Choice> {
     let mut marks: Vec<(usize, u32, Choice)> = logic
         .support(condition)
@@ -429,6 +457,90 @@ mod tests {
         assert_eq!(known.choices(), minimal.choices(), "a choice whose removal the search saw fail stays without a trial");
         let (kept, _) = prove(f, inputs, Some(0), &hazards, judge);
         assert_eq!(kept.choices(), BTreeSet::from([Choice::Query(needed)]));
+    }
+
+    #[test]
+    fn blame_keeps_one_choice_at_a_time_where_no_choice_violates_alone() {
+        let (b, _, _) = needed_and_needless_queries();
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let listed: Vec<Choice> = (0..3).map(Choice::Meet).collect();
+        let order: HashMap<Choice, usize> = listed.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &listed);
+        let marks: Vec<Bdd> = listed.iter().map(|&c| logic.atom(Atom::Marker(c))).collect();
+        let mut two = Bdd::FALSE;
+        for (i, j) in [(0, 1), (1, 2), (0, 2)] {
+            let both = logic.m.and(marks[i], marks[j]);
+            two = logic.m.or(two, both);
+        }
+        let either = logic.m.or(marks[0], marks[2]);
+        assert_eq!(
+            blame(&mut logic, &[two], &order),
+            vec![(0, listed[0]), (0, listed[1])],
+            "any two converted choices violate, so the first two in order are kept one after the other"
+        );
+        assert_eq!(
+            blame(&mut logic, &[either], &order),
+            vec![(0, listed[0]), (0, listed[2])],
+            "either choice violates alone, so both are kept at once"
+        );
+        assert_eq!(
+            blame(&mut logic, &[two, either], &order),
+            vec![(0, listed[0]), (1, listed[2])],
+            "keeping the choices the second violation needs leaves at most one choice of the first converted"
+        );
+    }
+
+    #[test]
+    fn blame_leaves_no_violation_that_a_kept_choice_could_fix() {
+        let (b, _, _) = needed_and_needless_queries();
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let listed: Vec<Choice> = (0..4).map(Choice::Meet).collect();
+        let order: HashMap<Choice, usize> = listed.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+        let mut logic = Logic::fixed(f, &facts, &BTreeSet::new(), &listed);
+        let mut pool: Vec<Atom> = listed.iter().map(|&c| Atom::Marker(c)).collect();
+        pool.extend([Atom::Lane(0), Atom::Lane(1)]);
+        let vars: Vec<u32> = pool.iter().map(|&a| variable(&mut logic, a)).collect();
+        let mut r = Random::new(67);
+        let mut wrong = Vec::new();
+        for trial in 0..400 {
+            let conditions: Vec<Bdd> = (0..1 + r.below(3))
+                .map(|_| {
+                    let mut condition = Bdd::FALSE;
+                    for _ in 0..1 + r.below(3) {
+                        let mut cube = Bdd::TRUE;
+                        for &var in &vars {
+                            let literal = match r.below(4) {
+                                0 => logic.m.var(var),
+                                1 => {
+                                    let v = logic.m.var(var);
+                                    logic.m.not(v)
+                                }
+                                _ => Bdd::TRUE,
+                            };
+                            cube = logic.m.and(cube, literal);
+                        }
+                        condition = logic.m.or(condition, cube);
+                    }
+                    condition
+                })
+                .collect();
+            let blamed: BTreeSet<Choice> = blame(&mut logic, &conditions, &order).into_iter().map(|(_, c)| c).collect();
+            for &condition in &conditions {
+                let mut left = condition;
+                for (i, c) in listed.iter().enumerate() {
+                    if blamed.contains(c) {
+                        left = logic.m.cofactor(left, vars[i], false);
+                    }
+                }
+                let support = logic.support(left);
+                if vars[..listed.len()].iter().any(|v| support.contains(v)) {
+                    wrong.push(format!("trial {} keeps {:?} and still violates through a choice", trial, blamed));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{:?}", &wrong[..wrong.len().min(8)]);
     }
 
     #[test]

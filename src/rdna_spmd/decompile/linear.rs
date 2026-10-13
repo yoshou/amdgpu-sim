@@ -1,6 +1,9 @@
+use crate::rdna_spmd::hash::HashMap;
+use std::sync::{LazyLock, Mutex, PoisonError};
+
 pub type Var = usize;
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Linear {
     pub terms: Vec<(Var, i128)>,
     pub constant: i128,
@@ -97,13 +100,13 @@ impl Domain {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Clause {
     pub equal: Vec<Linear>,
     pub at_least: Vec<Linear>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct Problem {
     pub domains: Vec<Domain>,
     pub equal: Vec<Linear>,
@@ -115,6 +118,10 @@ pub struct Problem {
 const STEPS: usize = 1 << 16;
 const SPLINTERS: u128 = 1 << 20;
 const ENUMERATED: i128 = 1 << 12;
+const REMEMBERED_STEPS: usize = 1 << 12;
+const REMEMBERED: usize = 1 << 12;
+
+static ANSWERS: LazyLock<Mutex<HashMap<Problem, Option<bool>>>> = LazyLock::new(|| Mutex::new(HashMap::default()));
 
 fn narrowest(rows: &[Row], n: usize) -> Option<(Var, i128, i128)> {
     let mut best: Option<(i128, Var, i128, i128)> = None;
@@ -177,9 +184,27 @@ impl Problem {
     }
 
     pub fn feasible(&self) -> Option<bool> {
+        if let Some(&answer) = ANSWERS.lock().unwrap_or_else(PoisonError::into_inner).get(self) {
+            return answer;
+        }
+        let mut steps = 0;
+        let answer = self.search(&mut steps);
+        if steps >= REMEMBERED_STEPS {
+            let mut answers = ANSWERS.lock().unwrap_or_else(PoisonError::into_inner);
+            if answers.len() >= REMEMBERED {
+                answers.clear();
+            }
+            answers.insert(self.clone(), answer);
+        }
+        answer
+    }
+
+    fn search(&self, steps: &mut usize) -> Option<bool> {
         let Some((first, rest)) = self.either.split_first() else {
             let mut solver = Solver { steps: 0 };
-            return solver.split(self, self.domains.clone());
+            let answer = solver.split(self, self.domains.clone());
+            *steps += solver.steps;
+            return answer;
         };
         let mut unknown = false;
         for option in first {
@@ -187,7 +212,7 @@ impl Problem {
             chosen.either = rest.to_vec();
             chosen.equal.extend(option.equal.iter().cloned());
             chosen.at_least.extend(option.at_least.iter().cloned());
-            match chosen.feasible() {
+            match chosen.search(steps) {
                 Some(true) => return Some(true),
                 Some(false) => {}
                 None => unknown = true,
@@ -724,6 +749,31 @@ mod tests {
         p.at_least(Linear::constant(-6).term(0, 3).term(1, -4).term(2, 2));
         let answer = within(20, p);
         assert!(matches!(answer, Ok(Some(false)) | Ok(None)), "x1 = 3 forces 4 x0 = -9: {:?}", answer);
+    }
+
+    #[test]
+    fn feasible_remembers_only_the_answers_that_took_many_steps() {
+        let word = 1i128 << 32;
+        let odd = 0x85eb_ca6b;
+        let mut hard = Problem::default();
+        hard.between(0, word - 1);
+        hard.between(0, word - 1);
+        hard.between(0, 1);
+        hard.between(0, word - 1);
+        hard.between(0, word - 1);
+        hard.between(0, odd - 1);
+        hard.equal(Linear::constant(32).term(0, 1).term(2, -word).term(1, -1));
+        hard.equal(Linear::constant(0).term(3, odd).term(5, -word).term(4, -1));
+        hard.at_least(Linear::constant(-1).term(4, 1).term(1, -1));
+        let answer = hard.feasible();
+        assert_ne!(answer, Some(false), "every word is an odd multiple of some word, so one exceeds x + 32");
+        assert_eq!(ANSWERS.lock().unwrap().get(&hard), Some(&answer), "an answer that took many steps is remembered");
+        assert_eq!(hard.feasible(), answer);
+        let mut easy = Problem::default();
+        easy.between(0, 3);
+        easy.at_least(Linear::constant(-1).term(0, 1));
+        assert_eq!(easy.feasible(), Some(true));
+        assert!(ANSWERS.lock().unwrap().get(&easy).is_none(), "a quick answer is not remembered");
     }
 
     #[test]
