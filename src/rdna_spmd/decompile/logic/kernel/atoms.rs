@@ -48,61 +48,8 @@ pub struct Atoms {
 impl Atoms {
     pub(super) fn new(f: &Func, facts: &Facts, markers_first: bool, listed: &[Choice]) -> Self {
         let rank: HashMap<BlockId, usize> = facts.order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
-        let mut origins: HashMap<ValueId, (usize, usize, usize)> = HashMap::default();
-        let mut spilled: HashMap<(ValueId, u64), Option<ValueId>> = HashMap::default();
-        let mut keyed = Vec::new();
-        let origin_of = |origins: &HashMap<ValueId, (usize, usize, usize)>, v: ValueId| {
-            origins.get(&v).copied().unwrap_or_else(|| match facts.site[v.0] {
-                Site::Inst { block, index } => (rank[&block], 1, index),
-                Site::Param { block, index } => (rank[&block], 0, index),
-                Site::Unreached => (0, 0, 0),
-            })
-        };
-        for (r, id) in facts.order.iter().enumerate() {
-            let preds: Vec<(BlockId, usize)> = facts.incoming[id].iter().copied().filter(|&(pred, _)| rank[&pred] < r).collect();
-            let forward: Vec<Vec<(ValueId, Option<ValueId>)>> = preds
-                .iter()
-                .map(|&(pred, slot)| anchors(f, facts, pred, f.blocks[&pred].term.edges().nth(slot).unwrap(), preds.len() > 1))
-                .collect();
-            for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
-                let mut found: Option<Option<(usize, usize, usize)>> = None;
-                let mut anchored: Option<(usize, usize, usize)> = None;
-                for args in &forward {
-                    let (arg, anchor) = args[index];
-                    let key = origin_of(&origins, arg);
-                    if let Some(anchor) = anchor {
-                        let at = origin_of(&origins, anchor);
-                        anchored = Some(anchored.map_or(at, |a| a.min(at)));
-                    }
-                    found = match found {
-                        None => Some(Some(key)),
-                        Some(Some(old)) if old == key => Some(Some(old)),
-                        _ => Some(None),
-                    };
-                }
-                let origin = found.flatten().or(anchored).unwrap_or((r, 0, index));
-                origins.insert(v, origin);
-                keyed.push((origin, r, index, v));
-            }
-            let count = f.blocks[id].params.len();
-            for (index, inst) in f.blocks[id].insts.iter().enumerate() {
-                let Inst::Effect { op: EffectOp::Wave(WaveOp::ReadLane), inputs, outputs, .. } = inst else {
-                    continue;
-                };
-                if !matches!(facts.site[inputs[0].0], Site::Param { block, .. } if block == *id) {
-                    continue;
-                }
-                let Some(lane) = facts.constant(f, inputs[1]) else {
-                    continue;
-                };
-                let Some(value) = written(f, facts, &rank, &mut spilled, inputs[0], lane & (f.lanes as u64 - 1)) else {
-                    continue;
-                };
-                let origin = origin_of(&origins, value);
-                origins.insert(outputs[0].0, origin);
-                keyed.push((origin, r, count + index, outputs[0].0));
-            }
-        }
+        let (first, _) = placed(f, facts, &rank, &HashMap::default());
+        let (_, mut keyed) = placed(f, facts, &rank, &updated(f, facts, &rank, &first));
         keyed.sort_unstable();
         assert!(keyed.len() < 1 << 22, "register layout too large");
         let params = keyed.into_iter().enumerate().map(|(i, (.., v))| (v, i as u32)).collect();
@@ -224,6 +171,98 @@ impl Atoms {
         self.supports.insert(f, s.clone());
         s
     }
+}
+
+type Origin = (usize, usize, usize);
+
+fn origin_of(origins: &HashMap<ValueId, Origin>, rank: &HashMap<BlockId, usize>, facts: &Facts, v: ValueId) -> Origin {
+    origins.get(&v).copied().unwrap_or_else(|| match facts.site[v.0] {
+        Site::Inst { block, index } => (rank[&block], 1, index),
+        Site::Param { block, index } => (rank[&block], 0, index),
+        Site::Unreached => (0, 0, 0),
+    })
+}
+
+fn placed(
+    f: &Func,
+    facts: &Facts,
+    rank: &HashMap<BlockId, usize>,
+    updated: &HashMap<ValueId, Origin>,
+) -> (HashMap<ValueId, Origin>, Vec<(Origin, usize, usize, ValueId)>) {
+    let mut origins: HashMap<ValueId, Origin> = HashMap::default();
+    let mut spilled: HashMap<(ValueId, u64), Option<ValueId>> = HashMap::default();
+    let mut keyed = Vec::new();
+    for (r, id) in facts.order.iter().enumerate() {
+        let preds: Vec<(BlockId, usize)> = facts.incoming[id].iter().copied().filter(|&(pred, _)| rank[&pred] < r).collect();
+        let forward: Vec<Vec<(ValueId, Option<ValueId>)>> = preds
+            .iter()
+            .map(|&(pred, slot)| anchors(f, facts, pred, f.blocks[&pred].term.edges().nth(slot).unwrap(), preds.len() > 1))
+            .collect();
+        for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
+            let mut found: Option<Option<Origin>> = None;
+            let mut anchored: Option<Origin> = None;
+            for args in &forward {
+                let (arg, anchor) = args[index];
+                let key = origin_of(&origins, rank, facts, arg);
+                if let Some(anchor) = anchor {
+                    let at = origin_of(&origins, rank, facts, anchor);
+                    anchored = Some(anchored.map_or(at, |a| a.min(at)));
+                }
+                found = match found {
+                    None => Some(Some(key)),
+                    Some(Some(old)) if old == key => Some(Some(old)),
+                    _ => Some(None),
+                };
+            }
+            let origin = updated
+                .get(&v)
+                .copied()
+                .unwrap_or_else(|| found.flatten().or(anchored).unwrap_or((r, 0, index)));
+            origins.insert(v, origin);
+            keyed.push((origin, r, index, v));
+        }
+        let count = f.blocks[id].params.len();
+        for (index, inst) in f.blocks[id].insts.iter().enumerate() {
+            let Inst::Effect { op: EffectOp::Wave(WaveOp::ReadLane), inputs, outputs, .. } = inst else {
+                continue;
+            };
+            if !matches!(facts.site[inputs[0].0], Site::Param { block, .. } if block == *id) {
+                continue;
+            }
+            let Some(lane) = facts.constant(f, inputs[1]) else {
+                continue;
+            };
+            let Some(value) = written(f, facts, rank, &mut spilled, inputs[0], lane & (f.lanes as u64 - 1)) else {
+                continue;
+            };
+            let origin = origin_of(&origins, rank, facts, value);
+            origins.insert(outputs[0].0, origin);
+            keyed.push((origin, r, count + index, outputs[0].0));
+        }
+    }
+    (origins, keyed)
+}
+
+fn updated(f: &Func, facts: &Facts, rank: &HashMap<BlockId, usize>, first: &HashMap<ValueId, Origin>) -> HashMap<ValueId, Origin> {
+    let mut updated = HashMap::default();
+    for (r, id) in facts.order.iter().enumerate() {
+        let back: Vec<&Edge> = facts.incoming[id]
+            .iter()
+            .filter(|&&(pred, _)| rank[&pred] >= r)
+            .map(|&(pred, slot)| f.blocks[&pred].term.edges().nth(slot).unwrap())
+            .collect();
+        if back.is_empty() {
+            continue;
+        }
+        for (index, &(v, _)) in f.blocks[id].params.iter().enumerate() {
+            let mut arriving = back.iter().map(|e| origin_of(first, rank, facts, carried(f, facts, e.args[index])));
+            let at = arriving.next().unwrap();
+            if arriving.all(|other| other == at) && at != first[&v] {
+                updated.insert(v, at);
+            }
+        }
+    }
+    updated
 }
 
 fn carried(f: &Func, facts: &Facts, mut v: ValueId) -> ValueId {
@@ -616,6 +655,56 @@ mod tests {
         let facts = Facts::new(&f, &[], &BTreeSet::new());
         let mut atoms = Atoms::new(&f, &facts, false, &[]);
         let atoms_in_order = [Atom::View(read), Atom::View(e), Atom::View(unknown)];
+        let numbers: Vec<u32> = atoms_in_order.iter().map(|&a| atoms.number(a)).collect();
+        assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
+    }
+
+    #[test]
+    fn a_loop_carried_param_the_loop_updates_sits_beside_the_value_its_back_edge_carries() {
+        let mut f = Func::new(BlockId(0), Presence::Wave, 32);
+        let (x, y) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (p, q) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (p2, q2) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (u, c) = (f.value(Ty::I32), f.value(Ty::I1));
+        let (header, latch, exit) = (BlockId(1), BlockId(2), BlockId(3));
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![],
+                insts: vec![
+                    Inst::Core { value: x, ty: Ty::I32, op: Op::Const(Ty::I32, 1) },
+                    Inst::Core { value: y, ty: Ty::I32, op: Op::Const(Ty::I32, 2) },
+                ],
+                term: Term::Br(Edge { dst: header, args: vec![x, y] }),
+            },
+        );
+        f.blocks.insert(
+            header,
+            Block {
+                params: vec![(p, Ty::I32), (q, Ty::I32)],
+                insts: vec![],
+                term: Term::Br(Edge { dst: latch, args: vec![p, q] }),
+            },
+        );
+        f.blocks.insert(
+            latch,
+            Block {
+                params: vec![(p2, Ty::I32), (q2, Ty::I32)],
+                insts: vec![
+                    Inst::Core { value: u, ty: Ty::I32, op: Op::Int(IntOp::Add, p2, p2) },
+                    Inst::Core { value: c, ty: Ty::I1, op: Op::Cmp(IntPred::Eq, u, q2) },
+                ],
+                term: Term::CondBr {
+                    cond: c,
+                    yes: Edge { dst: header, args: vec![u, q2] },
+                    no: Edge { dst: exit, args: vec![] },
+                },
+            },
+        );
+        f.blocks.insert(exit, Block { params: vec![], insts: vec![], term: Term::Ret(vec![]) });
+        let facts = Facts::new(&f, &[], &BTreeSet::new());
+        let mut atoms = Atoms::new(&f, &facts, false, &[]);
+        let atoms_in_order = [Atom::View(q), Atom::View(q2), Atom::View(p), Atom::View(p2)];
         let numbers: Vec<u32> = atoms_in_order.iter().map(|&a| atoms.number(a)).collect();
         assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
     }
