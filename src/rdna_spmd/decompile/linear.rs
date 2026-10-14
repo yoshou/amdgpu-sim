@@ -258,6 +258,96 @@ fn modhat(a: i128, m: i128) -> Option<i128> {
     a.checked_sub(m.checked_mul(floor_div(two_a.checked_add(m)?, m.checked_mul(2)?))?)
 }
 
+fn interval(d: &Domain) -> Option<(i128, i128)> {
+    match d {
+        Domain::Within(pieces) if pieces.len() == 1 => Some(pieces[0]),
+        _ => None,
+    }
+}
+
+fn holds_for_every_rest(e: &Linear, (x, a): (Var, i128), (y, b): (Var, i128), domains: &[Domain]) -> bool {
+    if gcd(a, b) != 1 {
+        return false;
+    }
+    let Some((x_lo, x_hi)) = interval(&domains[x]) else {
+        return false;
+    };
+    if x_hi - x_lo + 1 < b.abs() {
+        return false;
+    }
+    if matches!(domains[y], Domain::Free) {
+        return true;
+    }
+    let Some((y_lo, y_hi)) = interval(&domains[y]) else {
+        return false;
+    };
+    let (mut t_lo, mut t_hi) = (-e.constant, -e.constant);
+    for &(v, c) in &e.terms {
+        if v == x || v == y || c == 0 {
+            continue;
+        }
+        let Some((Some(lo), Some(hi))) = domains[v].hull() else {
+            return false;
+        };
+        let (Some(p), Some(q)) = (c.checked_mul(lo), c.checked_mul(hi)) else {
+            return false;
+        };
+        t_lo -= p.max(q);
+        t_hi -= p.min(q);
+    }
+    let corners = [(t_lo, x_lo), (t_lo, x_hi), (t_hi, x_lo), (t_hi, x_hi)];
+    let mut values = Vec::with_capacity(4);
+    for (t, v) in corners {
+        let Some(n) = a.checked_mul(v).and_then(|ax| t.checked_sub(ax)) else {
+            return false;
+        };
+        values.push(n);
+    }
+    let (n_lo, n_hi) = (*values.iter().min().unwrap(), *values.iter().max().unwrap());
+    let (need_lo, need_hi) = if b > 0 {
+        (ceil_div(n_lo, b), floor_div(n_hi, b))
+    } else {
+        (ceil_div(n_hi, b), floor_div(n_lo, b))
+    };
+    y_lo <= need_lo && need_hi <= y_hi
+}
+
+fn implied_equalities(p: &Problem, domains: &[Domain]) -> Vec<bool> {
+    let mut uses = vec![0usize; domains.len()];
+    for e in p.equal.iter().chain(&p.at_least) {
+        for &(v, c) in &e.terms {
+            if c != 0 {
+                uses[v] += 1;
+            }
+        }
+    }
+    let mut implied = vec![false; p.equal.len()];
+    loop {
+        let mut changed = false;
+        for (i, e) in p.equal.iter().enumerate() {
+            if implied[i] {
+                continue;
+            }
+            let private: Vec<(Var, i128)> = e.terms.iter().copied().filter(|&(v, c)| c != 0 && uses[v] == 1).collect();
+            let [first, second] = private[..] else {
+                continue;
+            };
+            if holds_for_every_rest(e, first, second, domains) || holds_for_every_rest(e, second, first, domains) {
+                implied[i] = true;
+                changed = true;
+                for &(v, c) in &e.terms {
+                    if c != 0 {
+                        uses[v] -= 1;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return implied;
+        }
+    }
+}
+
 impl Solver {
     fn split(&mut self, p: &Problem, domains: Vec<Domain>) -> Option<bool> {
         let n = domains.len();
@@ -277,7 +367,9 @@ impl Solver {
                 rows.push(Row { coef, constant: hi, equality: false });
             }
         }
-        for (list, equality) in [(&p.equal, true), (&p.at_least, false)] {
+        let implied = implied_equalities(p, &domains);
+        let kept = p.equal.iter().zip(&implied).filter(|&(_, &implied)| !implied).map(|(e, _)| e);
+        for (list, equality) in [(kept.collect::<Vec<_>>(), true), (p.at_least.iter().collect(), false)] {
             for e in list {
                 let mut coef = vec![0; n];
                 for &(v, c) in &e.terms {
@@ -765,6 +857,7 @@ mod tests {
         hard.equal(Linear::constant(32).term(0, 1).term(2, -word).term(1, -1));
         hard.equal(Linear::constant(0).term(3, odd).term(5, -word).term(4, -1));
         hard.at_least(Linear::constant(-1).term(4, 1).term(1, -1));
+        hard.at_least(Linear::constant(-1).term(3, 1));
         let answer = hard.feasible();
         assert_ne!(answer, Some(false), "every word is an odd multiple of some word, so one exceeds x + 32");
         assert_eq!(ANSWERS.lock().unwrap().get(&hard), Some(&answer), "an answer that took many steps is remembered");
@@ -774,6 +867,76 @@ mod tests {
         easy.at_least(Linear::constant(-1).term(0, 1));
         assert_eq!(easy.feasible(), Some(true));
         assert!(ANSWERS.lock().unwrap().get(&easy).is_none(), "a quick answer is not remembered");
+    }
+
+    #[test]
+    fn feasible_decides_an_odd_multiple_of_a_word_no_other_constraint_reads_quickly() {
+        let word = 1i128 << 32;
+        let odd = 0x85eb_ca6b;
+        let mut p = Problem::default();
+        p.between(0, word - 1);
+        p.between(0, word - 1);
+        p.between(0, 1);
+        p.between(0, word - 1);
+        p.between(0, word - 1);
+        p.between(0, odd - 1);
+        p.equal(Linear::constant(32).term(0, 1).term(2, -word).term(1, -1));
+        p.equal(Linear::constant(0).term(3, odd).term(5, -word).term(4, -1));
+        p.at_least(Linear::constant(-1).term(4, 1).term(1, -1));
+        let mut steps = 0;
+        assert_eq!(p.search(&mut steps), Some(true), "an odd multiple of a free word takes every word, so it can exceed x + 32");
+        assert!(steps < 100, "{} steps", steps);
+    }
+
+    #[test]
+    fn feasible_agrees_with_brute_force_on_equalities_with_two_private_variables() {
+        let (shift, scale) = knobs();
+        let mut r = Random::new(404 + shift);
+        let mut wrong = Vec::new();
+        let (mut decided, mut dropped) = (0, 0);
+        for trial in 0..300 * scale {
+            let mut p = Problem::default();
+            let others = 1 + r.below(2) as usize;
+            for _ in 0..others {
+                let lo = r.below(13) as i128 - BOX;
+                p.between(lo, (lo + r.below(13) as i128).min(BOX));
+            }
+            let (x, y) = (others, others + 1);
+            let span = r.below(9) as i128;
+            let lo = r.below((13 - span) as u64) as i128 - BOX;
+            p.between(lo, lo + span);
+            let lo = r.below(13) as i128 - BOX;
+            p.between(lo, (lo + r.below(13) as i128).min(BOX));
+            let nonzero = |r: &mut Random| {
+                let c = r.below(8) as i128 - 4;
+                if c >= 0 { c + 1 } else { c }
+            };
+            let mut e = Linear::constant(r.below(13) as i128 - 6).term(x, nonzero(&mut r)).term(y, nonzero(&mut r));
+            for v in 0..others {
+                if r.below(2) == 0 {
+                    e.add(v, r.below(7) as i128 - 3);
+                }
+            }
+            p.equal(e);
+            for _ in 0..r.below(3) {
+                p.at_least(random_linear(&mut r, others, 3, 6));
+            }
+            if r.below(4) == 0 {
+                p.at_least(Linear::constant(r.below(13) as i128 - 6).term(if r.below(2) == 0 { x } else { y }, nonzero(&mut r)));
+            }
+            dropped += implied_equalities(&p, &p.domains)[0] as usize;
+            let truth = brute(&p);
+            match p.feasible() {
+                Some(found) if found != truth => {
+                    wrong.push(format!("trial {}: feasible() says {} but truth is {}: {:?}", trial, found, truth, p));
+                }
+                Some(_) => decided += 1,
+                None => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{} wrong: {:#?}", wrong.len(), &wrong[..wrong.len().min(3)]);
+        assert!(decided > 250 * scale, "only {} decided", decided);
+        assert!(dropped > 10 * scale, "only {} equalities dropped", dropped);
     }
 
     #[test]
