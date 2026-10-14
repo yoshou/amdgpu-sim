@@ -260,6 +260,13 @@ fn binding<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, atom: Atom, bound
 }
 
 fn project<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, formula: Bdd, links: &[Binding]) -> Bdd {
+    match renamed(q, formula, links) {
+        Some((formula, rest)) => schedule(q, facts, src, formula, &rest),
+        None => schedule(q, facts, src, formula, links),
+    }
+}
+
+fn renamed<Q: Queries>(q: &mut Q, formula: Bdd, links: &[Binding]) -> Option<(Bdd, Vec<Binding>)> {
     let mut renamed: HashMap<u32, Bdd> = HashMap::default();
     let mut equalities = Bdd::TRUE;
     let mut rest: Vec<usize> = Vec::new();
@@ -291,7 +298,7 @@ fn project<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, formula: Bdd, lin
         }
     }
     if renamed.is_empty() {
-        return schedule(q, facts, src, formula, links);
+        return None;
     }
     let formula = q.m().compose(formula, &|v| renamed.get(&v).copied());
     let formula = q.m().and(formula, equalities);
@@ -311,27 +318,65 @@ fn project<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, formula: Bdd, lin
             }
         })
         .collect();
-    schedule(q, facts, src, formula, &rest)
+    Some((formula, rest))
 }
 
 pub(super) fn restate<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, formula: Bdd, links: &[(Bdd, Bdd)]) -> Bdd {
-    let foreign = |q: &mut Q, f: Bdd| -> Vec<u32> {
-        q.support(f)
-            .iter()
-            .copied()
-            .filter(|&v| !matches!(q.atoms().of(v), Atom::Marker(_) | Atom::Lane(5)) && q.scope(facts, v) != Some(block))
-            .collect()
-    };
-    let formula_atoms: BTreeSet<u32> = foreign(q, formula).into_iter().collect();
     let links: Vec<Binding> = links
         .iter()
         .map(|&(atom, bound)| Binding {
             atom,
             bound,
-            support: foreign(q, bound),
+            support: foreign(q, facts, block, bound),
         })
         .collect();
-    product(q, formula_atoms, formula, &links)
+    let upper = q
+        .atoms()
+        .var(Atom::Lane(5))
+        .filter(|&var| reads(q, formula, var) || links.iter().any(|l| reads(q, l.bound, var)));
+    let Some(var) = upper else {
+        return restated(q, facts, block, formula, &links);
+    };
+    let [high, low] = [true, false].map(|value| {
+        let formula = q.m().cofactor(formula, var, value);
+        let links: Vec<Binding> = links
+            .iter()
+            .map(|l| {
+                let bound = q.m().cofactor(l.bound, var, value);
+                let support = q.support(bound);
+                Binding {
+                    atom: l.atom,
+                    bound,
+                    support: l.support.iter().copied().filter(|v| support.binary_search(v).is_ok()).collect(),
+                }
+            })
+            .collect();
+        restated(q, facts, block, formula, &links)
+    });
+    let upper = q.m().var(var);
+    q.m().ite(upper, high, low)
+}
+
+fn restated<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, formula: Bdd, links: &[Binding]) -> Bdd {
+    let renamed = renamed(q, formula, links);
+    let (formula, links) = match &renamed {
+        Some((formula, rest)) => (*formula, rest.as_slice()),
+        None => (formula, links),
+    };
+    let formula_atoms: BTreeSet<u32> = foreign(q, facts, block, formula).into_iter().collect();
+    product(q, formula_atoms, formula, links)
+}
+
+fn foreign<Q: Queries>(q: &mut Q, facts: &Facts, block: BlockId, f: Bdd) -> Vec<u32> {
+    q.support(f)
+        .iter()
+        .copied()
+        .filter(|&v| !matches!(q.atoms().of(v), Atom::Marker(_) | Atom::Lane(5)) && q.scope(facts, v) != Some(block))
+        .collect()
+}
+
+fn reads<Q: Queries>(q: &mut Q, f: Bdd, var: u32) -> bool {
+    q.support(f).binary_search(&var).is_ok()
 }
 
 fn schedule<Q: Queries>(q: &mut Q, facts: &Facts, src: BlockId, formula: Bdd, links: &[Binding]) -> Bdd {
