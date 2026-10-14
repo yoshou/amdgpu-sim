@@ -49,6 +49,7 @@ impl Atoms {
     pub(super) fn new(f: &Func, facts: &Facts, markers_first: bool, listed: &[Choice]) -> Self {
         let rank: HashMap<BlockId, usize> = facts.order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
         let mut origins: HashMap<ValueId, (usize, usize, usize)> = HashMap::default();
+        let mut spilled: HashMap<(ValueId, u64), Option<ValueId>> = HashMap::default();
         let mut keyed = Vec::new();
         let origin_of = |origins: &HashMap<ValueId, (usize, usize, usize)>, v: ValueId| {
             origins.get(&v).copied().unwrap_or_else(|| match facts.site[v.0] {
@@ -82,6 +83,24 @@ impl Atoms {
                 let origin = found.flatten().or(anchored).unwrap_or((r, 0, index));
                 origins.insert(v, origin);
                 keyed.push((origin, r, index, v));
+            }
+            let count = f.blocks[id].params.len();
+            for (index, inst) in f.blocks[id].insts.iter().enumerate() {
+                let Inst::Effect { op: EffectOp::Wave(WaveOp::ReadLane), inputs, outputs, .. } = inst else {
+                    continue;
+                };
+                if !matches!(facts.site[inputs[0].0], Site::Param { block, .. } if block == *id) {
+                    continue;
+                }
+                let Some(lane) = facts.constant(f, inputs[1]) else {
+                    continue;
+                };
+                let Some(value) = written(f, facts, &rank, &mut spilled, inputs[0], lane & (f.lanes as u64 - 1)) else {
+                    continue;
+                };
+                let origin = origin_of(&origins, value);
+                origins.insert(outputs[0].0, origin);
+                keyed.push((origin, r, count + index, outputs[0].0));
             }
         }
         keyed.sort_unstable();
@@ -218,6 +237,50 @@ fn carried(f: &Func, facts: &Facts, mut v: ValueId) -> ValueId {
             _ => return v,
         };
     }
+}
+
+fn written(
+    f: &Func,
+    facts: &Facts,
+    rank: &HashMap<BlockId, usize>,
+    memo: &mut HashMap<(ValueId, u64), Option<ValueId>>,
+    mut x: ValueId,
+    lane: u64,
+) -> Option<ValueId> {
+    while let Some(inst) = facts.inst(f, x) {
+        let Inst::Effect { op: EffectOp::Wave(WaveOp::WriteLane), inputs, .. } = inst else {
+            return None;
+        };
+        if facts.constant(f, inputs[1])? & (f.lanes as u64 - 1) == lane {
+            return Some(inputs[0]);
+        }
+        x = inputs[2];
+    }
+    let Site::Param { block, index } = facts.site[x.0] else {
+        return None;
+    };
+    if block == f.entry {
+        return None;
+    }
+    if let Some(&known) = memo.get(&(x, lane)) {
+        return known;
+    }
+    let mut agreed: Option<Option<ValueId>> = None;
+    for &(pred, slot) in &facts.incoming[&block] {
+        if rank[&pred] >= rank[&block] {
+            continue;
+        }
+        let arg = f.blocks[&pred].term.edges().nth(slot).unwrap().args[index];
+        let value = written(f, facts, rank, memo, arg, lane);
+        agreed = match agreed {
+            None => Some(value),
+            Some(old) if old == value => Some(old),
+            _ => Some(None),
+        };
+    }
+    let found = agreed.flatten();
+    memo.insert((x, lane), found);
+    found
 }
 
 fn anchors(f: &Func, facts: &Facts, block: BlockId, edge: &Edge, merging: bool) -> Vec<(ValueId, Option<ValueId>)> {
@@ -495,6 +558,66 @@ mod tests {
         let numbers: Vec<u32> = atoms_in_order.iter().map(|&x| atoms.number(x)).collect();
         assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
         assert_eq!(numbers[5], numbers[4] + 1);
+    }
+
+    #[test]
+    fn a_word_read_back_from_a_lane_another_block_wrote_sits_beside_the_written_word() {
+        let mut f = Func::new(BlockId(0), Presence::Wave, 64);
+        let old = f.value(Ty::I32);
+        let (written, data, four, register, spilled) = (f.value(Ty::I32), f.value(Ty::I32), f.value(Ty::I32), f.value(Ty::I32), f.value(Ty::I32));
+        let (s, e) = (f.value(Ty::I32), f.value(Ty::I32));
+        let (lane, other, from) = (f.value(Ty::I32), f.value(Ty::I32), f.value(Ty::I32));
+        let (read, unknown) = (f.value(Ty::I32), f.value(Ty::I32));
+        let b1 = BlockId(1);
+        let constant = |value: ValueId, k: u64| Inst::Core { value, ty: Ty::I32, op: Op::Const(Ty::I32, k) };
+        f.blocks.insert(
+            BlockId(0),
+            Block {
+                params: vec![(old, Ty::I32)],
+                insts: vec![
+                    constant(written, 7),
+                    constant(data, 9),
+                    constant(four, 4),
+                    constant(register, 30),
+                    Inst::Effect {
+                        provenance: 1,
+                        op: EffectOp::Wave(WaveOp::WriteLane),
+                        inputs: vec![written, four, old, register],
+                        outputs: vec![(spilled, Ty::I32)],
+                    },
+                ],
+                term: Term::Br(Edge { dst: b1, args: vec![spilled, data] }),
+            },
+        );
+        f.blocks.insert(
+            b1,
+            Block {
+                params: vec![(s, Ty::I32), (e, Ty::I32)],
+                insts: vec![
+                    constant(lane, 4),
+                    constant(other, 5),
+                    constant(from, 30),
+                    Inst::Effect {
+                        provenance: 2,
+                        op: EffectOp::Wave(WaveOp::ReadLane),
+                        inputs: vec![s, lane, from],
+                        outputs: vec![(read, Ty::I32)],
+                    },
+                    Inst::Effect {
+                        provenance: 3,
+                        op: EffectOp::Wave(WaveOp::ReadLane),
+                        inputs: vec![s, other, from],
+                        outputs: vec![(unknown, Ty::I32)],
+                    },
+                ],
+                term: Term::Ret(vec![]),
+            },
+        );
+        let facts = Facts::new(&f, &[], &BTreeSet::new());
+        let mut atoms = Atoms::new(&f, &facts, false, &[]);
+        let atoms_in_order = [Atom::View(read), Atom::View(e), Atom::View(unknown)];
+        let numbers: Vec<u32> = atoms_in_order.iter().map(|&a| atoms.number(a)).collect();
+        assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{:x?}", numbers);
     }
 
     #[test]
