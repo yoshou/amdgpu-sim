@@ -1,4 +1,4 @@
-use super::super::logic::{float_compare, Atom, Kept};
+use super::super::logic::{float_compare, Atom, Kept, Structure};
 use super::super::testing::*;
 use super::super::hazard::Judge;
 use super::super::{direct, search};
@@ -3339,6 +3339,159 @@ fn prove_keeps_a_pair_of_ballot_halves_whose_lane_test_masks_a_store() {
         .map(|(name, _)| *name)
         .collect();
     assert!(wrong.is_empty(), "{:?}: a lane without the flag reads its own bit of the pair as zero", wrong);
+}
+
+#[test]
+fn halves_follow_each_half_of_a_mask_to_the_lanes_that_read_it() {
+    use super::program::{Program, LOWER, UPPER};
+    let (mut b, k, _) = Build::kernel_in(&[], 64);
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let wide = b.core(e, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let own = |b: &mut Build, w: ValueId, shift: ValueId| {
+        let shifted = b.int(e, IntOp::LShr, w, shift);
+        b.core(e, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted))
+    };
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
+    let high = b.wave(e, WaveOp::Ballot { high: true }, vec![k.exec]);
+    let pair = b.core(e, Ty::I64, Op::Pack64(low, high));
+    let held = own(&mut b, pair, wide);
+    let upper = b.wave(e, WaveOp::Ballot { high: true }, vec![k.exec]);
+    let lower = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
+    let flipped = b.core(e, Ty::I64, Op::Pack64(upper, lower));
+    let crossed = own(&mut b, flipped, wide);
+    let counted = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
+    let one = b.constant(e, Ty::I32, 1);
+    let count = b.int(e, IntOp::Add, counted, one);
+    let narrow = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
+    let bit = own(&mut b, narrow, lane);
+    let mask = b.int(e, IntOp::And, held, crossed);
+    let mask = b.int(e, IntOp::And, mask, bit);
+    let slot = byte_offset(&mut b, e, buf, lane, 4);
+    b.store(e, Space::Global, MemSize::B32, slot, count, mask);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let loops = Loops::new(f, &facts).unwrap();
+    let hazards = no_hazards();
+    let program = Program::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None);
+    let read = |v: ValueId| program.halves[v.0];
+    assert_eq!(
+        (read(low), read(high)),
+        (LOWER, UPPER),
+        "a pack reads its low word in the lower lanes and its high word in the upper ones"
+    );
+    assert_eq!(
+        (read(upper), read(lower)),
+        (LOWER, UPPER),
+        "a pack reads its words by position, whichever half a ballot took"
+    );
+    assert_eq!(read(pair), LOWER | UPPER, "a lane reads its own bit of the pair in either half");
+    assert_eq!(read(counted), 0, "an add reads the whole word, which makes it materialized");
+    assert_eq!(read(narrow), LOWER | UPPER, "an upper lane that shifts a 32-bit word by its id reads a bit of it too");
+}
+
+#[test]
+fn differences_of_mask_halves_stay_out_of_the_lanes_that_never_read_them() {
+    let (mut b, k, _) = Build::kernel_in(&[], 64);
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let low = b.wave(e, WaveOp::Ballot { high: false }, vec![k.exec]);
+    let high = b.wave(e, WaveOp::Ballot { high: true }, vec![k.exec]);
+    let (next, n) = b.block(&[Ty::I32, Ty::I32, Ty::I64]);
+    b.br(e, next, vec![low, high, buf]);
+    let pair = b.core(next, Ty::I64, Op::Pack64(n[0], n[1]));
+    let lane = b.core(next, Ty::I32, Op::Env(Env::LaneId));
+    let wide = b.core(next, Ty::I64, Op::Convert(Cvt::ZExt, Ty::I64, lane));
+    let shifted = b.int(next, IntOp::LShr, pair, wide);
+    let held = b.core(next, Ty::I1, Op::Convert(Cvt::Trunc, Ty::I1, shifted));
+    let slot = byte_offset(&mut b, next, n[2], lane, 4);
+    let one = b.constant(next, Ty::I32, 1);
+    b.store(next, Space::Global, MemSize::B32, slot, one, held);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let loops = Loops::new(f, &facts).unwrap();
+    let hazards = no_hazards();
+    let logic = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None, logic);
+    assert!(check.run(), "both programs hold the same exec mask, so the store cannot differ");
+    for (name, v) in [("low", low), ("high", high), ("low parameter", n[0]), ("high parameter", n[1])] {
+        assert_eq!(check.differences.h(v), Bdd::FALSE, "the {} half differs only in lanes no use reads", name);
+    }
+}
+
+struct Predicated {
+    b: Build,
+    carried: ValueId,
+    picked: ValueId,
+    acc: ValueId,
+    other: Option<ValueId>,
+}
+
+fn predicated(stored: bool) -> Predicated {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let q = flag_query(&mut b, &k, e);
+    let one = b.constant(e, Ty::I32, 1);
+    let two = b.constant(e, Ty::I32, 2);
+    let answer = b.core(e, Ty::I32, Op::Select(q, one, two));
+    let fresh = per_lane(&mut b, &k, e, 16);
+    let flag = per_lane(&mut b, &k, e, 24);
+    let zero = b.constant(e, Ty::I32, 0);
+    let set = b.cmp(e, IntPred::Ne, flag, zero);
+    let c = b.int(e, IntOp::And, set, k.exec);
+    let buf = k.buffer(&mut b, e, 0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let slot = byte_offset(&mut b, e, buf, lane, 4);
+    let (next, n) = b.block(&[Ty::I1, Ty::I1, Ty::I32, Ty::I32, Ty::I32, Ty::I32, Ty::I64]);
+    b.br(e, next, vec![k.exec, c, fresh, answer, answer, zero, slot]);
+    let (exec, c, fresh, carried, other, acc, slot) = (n[0], n[1], n[2], n[3], n[4], n[5], n[6]);
+    let picked = b.core(next, Ty::I32, Op::Select(c, fresh, carried));
+    let count = b.core(next, Ty::I32, Op::PopulationCount(picked));
+    let sum = b.int(next, IntOp::Add, count, acc);
+    let total = b.core(next, Ty::I32, Op::Select(c, sum, acc));
+    let data = if stored {
+        let either = b.core(next, Ty::I32, Op::Select(c, fresh, other));
+        b.int(next, IntOp::Add, total, either)
+    } else {
+        total
+    };
+    b.store(next, Space::Global, MemSize::B32, slot, data, exec);
+    Predicated { b, carried, picked, acc, other: stored.then_some(other) }
+}
+
+#[test]
+fn a_structured_logic_tracks_no_value_that_only_an_arm_its_own_condition_rules_out_reads() {
+    let Predicated { b, carried, picked, acc, other } = predicated(true);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let structure = Structure::of(f, &facts);
+    let logic = Logic::structured(&structure, f, &facts, &BTreeSet::new(), &[]);
+    assert!(!logic.tracked(carried), "the count reaches the store only where the condition takes the fresh value");
+    assert!(logic.tracked(picked), "the count of the pick reaches the store where the condition holds");
+    assert!(logic.tracked(acc), "the store writes the old sum where the condition fails");
+    assert!(logic.tracked(other.unwrap()), "the store writes the other arm where the condition fails");
+    let lazy = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    assert!(lazy.tracked(carried), "a fixed logic tracks every value");
+}
+
+#[test]
+fn differences_of_a_value_no_use_reads_stay_false() {
+    for stored in [false, true] {
+        let Predicated { b, carried, other, .. } = predicated(stored);
+        let f = &b.f;
+        let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+        let loops = Loops::new(f, &facts).unwrap();
+        let hazards = no_hazards();
+        let structure = Structure::of(f, &facts);
+        let logic = Logic::structured(&structure, f, &facts, &BTreeSet::new(), &[]);
+        let mut check = Check::new(f, &facts, &b.inputs, Some(0), &loops, &hazards, None, logic);
+        assert_eq!(check.run(), !stored, "only the other copy of the local answer reaches the store");
+        assert_eq!(check.differences.h(carried), Bdd::FALSE, "nothing reads the carried answer");
+        if let Some(other) = other {
+            assert_ne!(check.differences.h(other), Bdd::FALSE, "a lane answers the query on its own flag alone");
+        }
+    }
 }
 
 #[test]

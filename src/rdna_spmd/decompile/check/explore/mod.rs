@@ -501,7 +501,7 @@ impl<'c, 'a, Q: Queries<'a>> Explore<'c, 'a, Q> {
         }
         let mut restatements: HashMap<Bdd, Bdd> = HashMap::default();
         for (k, &(param, ty)) in dst.params.iter().enumerate() {
-            if !self.eval.logic().carried(param) {
+            if !self.eval.logic().tracked(param) {
                 continue;
             }
             let (w, l) = (sides[WAVE][k], sides[LANE][k]);

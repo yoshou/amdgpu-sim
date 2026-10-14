@@ -220,7 +220,7 @@ impl<'a> Check<'a> {
             for k in params {
                 let d = &mut self.differences;
                 let param = block.params[k].0;
-                if !d.logic.carried(param) {
+                if !d.logic.tracked(param) {
                     continue;
                 }
                 let mut h = arrivals.as_ref().map_or(Bdd::FALSE, |a| a[k]);
@@ -250,6 +250,8 @@ impl<'a> Check<'a> {
                 }
                 if h != Bdd::FALSE {
                     h = d.and(h, reachable);
+                    let read = d.observed(param);
+                    h = d.and(h, read);
                     self.raise_h(param, h);
                 }
                 if is_word {
@@ -267,11 +269,23 @@ impl<'a> Check<'a> {
             if !self.schedule.take(b, index) {
                 continue;
             }
+            let logic = &self.differences.logic;
+            let unread = match inst {
+                Inst::Core { value, .. } => !logic.tracked(*value),
+                Inst::Target { outputs, .. } => outputs.iter().all(|&(v, _)| !logic.tracked(v)),
+                _ => false,
+            };
+            if unread {
+                continue;
+            }
             let x = rules::inst(&mut self.differences, b, index, inst);
             if self.differences.stopped() {
                 return;
             }
             for (m, v) in inst.outputs().into_iter().enumerate() {
+                if !self.differences.logic.tracked(v) {
+                    continue;
+                }
                 let x = match inst {
                     Inst::Effect {
                         op: EffectOp::Wave(WaveOp::Wmma),
@@ -280,6 +294,8 @@ impl<'a> Check<'a> {
                     } => rules::wmma_output(&mut self.differences, inputs, m),
                     _ => x,
                 };
+                let read = self.differences.observed(v);
+                let x = self.differences.and(x, read);
                 self.raise_h(v, x);
                 if facts.lane_word[v.0] {
                     let mode = self.differences.logic.materialized(facts, v);

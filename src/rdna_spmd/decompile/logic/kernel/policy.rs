@@ -1,7 +1,7 @@
 use super::atoms::{exists, Atom, Atoms, Choice};
 use super::patterns::lane_test;
 use crate::rdna_spmd::analysis::bdd::{Bdd, Manager};
-use crate::rdna_spmd::analysis::facts::{Facts, Site};
+use crate::rdna_spmd::analysis::facts::{Facts, Site, Use};
 use crate::rdna_spmd::hash::HashMap;
 use crate::rdna_spmd::ir::*;
 use std::collections::BTreeSet;
@@ -43,11 +43,13 @@ impl Kept {
 enum Choices {
     Fixed {
         kept: BTreeSet<Choice>,
+        read: Option<Vec<bool>>,
     },
 
     Open {
         whole: Vec<Bdd>,
         live: Vec<bool>,
+        read: Vec<bool>,
         all_local: Bdd,
     },
 }
@@ -58,9 +60,9 @@ pub(super) struct Policy {
 }
 
 impl Policy {
-    pub(super) fn fixed(kept: &BTreeSet<Choice>, listed: &[Choice]) -> Self {
+    pub(super) fn fixed(kept: &BTreeSet<Choice>, listed: &[Choice], read: Option<Vec<bool>>) -> Self {
         Self {
-            choices: Choices::Fixed { kept: kept.clone() },
+            choices: Choices::Fixed { kept: kept.clone(), read },
             listed: listed.to_vec(),
         }
     }
@@ -121,6 +123,7 @@ impl Policy {
             choices: Choices::Open {
                 whole,
                 live: live_values(f, facts),
+                read: read_values(f, facts),
                 all_local,
             },
             listed: listed.to_vec(),
@@ -128,7 +131,7 @@ impl Policy {
     }
 
     pub(super) fn keep(&mut self, kept: &BTreeSet<Choice>) {
-        if let Choices::Fixed { kept: fixed } = &mut self.choices {
+        if let Choices::Fixed { kept: fixed, .. } = &mut self.choices {
             let conversions = |s: &BTreeSet<Choice>| s.iter().filter(|c| !matches!(c, Choice::Meet(_))).copied().collect::<Vec<_>>();
             assert!(conversions(fixed) == conversions(kept), "keep changes only which meetings are kept");
             *fixed = kept.clone();
@@ -140,7 +143,7 @@ impl Policy {
     }
 
     pub(super) fn local(&self, atoms: &mut Atoms, m: &mut Manager, c: Choice) -> Bdd {
-        if let Choices::Fixed { kept } = &self.choices {
+        if let Choices::Fixed { kept, .. } = &self.choices {
             return Manager::constant(!kept.contains(&c));
         }
         if atoms.marks(c) {
@@ -169,6 +172,13 @@ impl Policy {
         match &self.choices {
             Choices::Fixed { .. } => true,
             Choices::Open { live, .. } => live[param.0],
+        }
+    }
+
+    pub(super) fn tracked(&self, v: ValueId) -> bool {
+        match &self.choices {
+            Choices::Fixed { read, .. } => read.as_ref().map_or(true, |read| read[v.0]),
+            Choices::Open { read, .. } => read[v.0],
         }
     }
 
@@ -257,6 +267,103 @@ pub fn live_values(f: &Func, facts: &Facts) -> Vec<bool> {
         }
     }
     live
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Never,
+    Under(ValueId, bool),
+    Always,
+}
+
+impl Read {
+    fn or(self, other: Read) -> Read {
+        match (self, other) {
+            (Read::Never, read) | (read, Read::Never) => read,
+            (a, b) if a == b => a,
+            _ => Read::Always,
+        }
+    }
+
+    fn under(self, c: ValueId, taken: bool) -> Read {
+        match self {
+            Read::Never => Read::Never,
+            Read::Under(d, t) if d == c && t != taken => Read::Never,
+            _ => Read::Under(c, taken),
+        }
+    }
+}
+
+/// The values whose differences some use can read. These are the live values, except a value that
+/// reaches its readers only through an arm of a select whose result is read only where the select's
+/// condition takes the other arm. A select reads each arm only where its condition takes that arm,
+/// and a condition on a block parameter passes to the argument of each edge into the block. A branch
+/// and every effect but a wave query read their inputs in every lane. A wave query, a target op and a
+/// test of a lane word against zero read their inputs in every lane wherever their results are read.
+pub fn read_values(f: &Func, facts: &Facts) -> Vec<bool> {
+    let n = f.types.len();
+    let mut reads = vec![Read::Never; n];
+    let mut pending: Vec<ValueId> = (0..n).map(ValueId).collect();
+    while let Some(v) = pending.pop() {
+        let read = facts.uses[v.0].iter().fold(reads[v.0], |read, &u| read.or(read_by(f, facts, &reads, v, u)));
+        if read == reads[v.0] {
+            continue;
+        }
+        reads[v.0] = read;
+        match facts.site[v.0] {
+            Site::Param { block, index } if block != f.entry => pending.extend(facts.arguments(f, block, index)),
+            Site::Inst { block, index } => pending.extend(f.blocks[&block].insts[index].operands()),
+            _ => {}
+        }
+    }
+    reads.into_iter().map(|read| read != Read::Never).collect()
+}
+
+fn read_by(f: &Func, facts: &Facts, reads: &[Read], v: ValueId, u: Use) -> Read {
+    match u {
+        Use::Arg { block, edge, index } => {
+            let e = f.blocks[&block].term.edges().nth(edge).unwrap();
+            match reads[f.blocks[&e.dst].params[index].0 .0] {
+                Read::Under(c, taken) => match facts.site[c.0] {
+                    Site::Param { block, index } if block == e.dst => Read::Under(e.args[index], taken),
+                    _ => Read::Always,
+                },
+                read => read,
+            }
+        }
+        Use::Inst { block, index } => {
+            let inst = &f.blocks[&block].insts[index];
+            let read = inst.outputs().iter().fold(Read::Never, |read, o| read.or(reads[o.0]));
+            match inst {
+                Inst::Effect {
+                    op: EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. } | WaveOp::ReadFirstLane),
+                    ..
+                }
+                | Inst::Target { .. } => {
+                    if read == Read::Never {
+                        Read::Never
+                    } else {
+                        Read::Always
+                    }
+                }
+                Inst::Effect { .. } => Read::Always,
+                Inst::Core { op: Op::Select(c, a, b), .. } => {
+                    let condition = if *c == v { read } else { Read::Never };
+                    let taken = if *a == v { read.under(*c, true) } else { Read::Never };
+                    let other = if *b == v { read.under(*c, false) } else { Read::Never };
+                    condition.or(taken).or(other)
+                }
+                Inst::Core { op: Op::Cmp(IntPred::Eq | IntPred::Ne, a, b), .. }
+                    if lane_test(f, facts, *a, *b) == Some(v) && read != Read::Never =>
+                {
+                    Read::Always
+                }
+                _ => read,
+            }
+        }
+        Use::Cond(_) => Read::Always,
+        Use::Ret(_) => Read::Never,
+    }
 }
 
 pub fn choices(f: &Func, facts: &Facts) -> Vec<Choice> {

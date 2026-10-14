@@ -3,7 +3,7 @@ use super::super::logic::{Atom, Choice, Logic};
 use super::lattice::{Lattice, Sent};
 use super::masks::Masks;
 use super::orderings::Orderings;
-use super::program::Program;
+use super::program::{Program, LOWER, UPPER};
 use super::queries::Queries;
 use super::rules::settled;
 use super::verdict::Verdict;
@@ -153,6 +153,15 @@ impl<'a> Differences<'a> {
     #[inline]
     pub(super) fn raise_h(&mut self, v: ValueId, x: Bdd) -> bool {
         self.lattice.raise_h(&mut self.logic.m, v, x)
+    }
+
+    pub(super) fn observed(&mut self, v: ValueId) -> Bdd {
+        match self.program.halves[v.0] {
+            0 => Bdd::FALSE,
+            LOWER => self.logic.half(false, Bdd::TRUE, Bdd::FALSE),
+            UPPER => self.logic.half(true, Bdd::TRUE, Bdd::FALSE),
+            _ => Bdd::TRUE,
+        }
     }
 
     #[inline]

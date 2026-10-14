@@ -23,11 +23,17 @@ pub struct Logic {
     kernel: Kernel<State>,
 }
 
-pub struct Structure(rules::Cells);
+pub struct Structure {
+    cells: rules::Cells,
+    read: Vec<bool>,
+}
 
 impl Structure {
     pub fn of(f: &Func, facts: &Facts) -> Self {
-        Self(rules::Cells::of(f, facts))
+        Self {
+            cells: rules::Cells::of(f, facts),
+            read: kernel::read_values(f, facts),
+        }
     }
 }
 
@@ -47,7 +53,7 @@ impl Logic {
     pub fn structured(structure: &Structure, f: &Func, facts: &Facts, kept: &BTreeSet<Choice>, tags: &[Choice]) -> Self {
         Self {
             m: Manager::new(),
-            kernel: Kernel::fixed(f, facts, kept, tags, State::with_cells(structure.0.agreeing(facts))),
+            kernel: Kernel::reading(f, facts, kept, tags, &structure.read, State::with_cells(structure.cells.agreeing(facts))),
         }
     }
 
@@ -79,6 +85,10 @@ impl Logic {
 
     pub fn carried(&self, param: ValueId) -> bool {
         self.kernel.carried(param)
+    }
+
+    pub fn tracked(&self, v: ValueId) -> bool {
+        self.kernel.tracked(v)
     }
 
     pub fn all_local(&self) -> Bdd {

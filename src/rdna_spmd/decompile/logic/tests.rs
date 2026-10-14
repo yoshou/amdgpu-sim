@@ -880,6 +880,32 @@ fn a_structure_built_under_other_facts_reads_every_comparison_as_a_lazy_logic_wi
 }
 
 #[test]
+fn a_structured_logic_tracks_the_differences_of_only_the_parameters_a_branch_or_an_effect_reads() {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let table = k.buffer(&mut b, e, 8);
+    let read = b.load(e, Space::Global, MemSize::B32, table, k.exec);
+    let at = b.constant(e, Ty::I64, 4);
+    let second = b.int(e, IntOp::Add, table, at);
+    let unread = b.load(e, Space::Global, MemSize::B32, second, k.exec);
+    let (next, n) = b.block(&[Ty::I1, Ty::I32, Ty::I32, Ty::I64]);
+    b.br(e, next, vec![k.exec, read, unread, table]);
+    let doubled = b.int(next, IntOp::Add, n[1], n[1]);
+    b.store(next, Space::Global, MemSize::B32, n[3], doubled, n[0]);
+    let f = &b.f;
+    let facts = Facts::new(f, &b.inputs, &BTreeSet::new());
+    let structure = Structure::of(f, &facts);
+    let checked = Logic::structured(&structure, f, &facts, &BTreeSet::new(), &[]);
+    let lazy = Logic::fixed(f, &facts, &BTreeSet::new(), &[]);
+    for &p in &[n[0], n[1], n[3]] {
+        assert!(checked.tracked(p) && lazy.tracked(p), "v{} reaches the store", p.0);
+    }
+    assert!(!checked.tracked(n[2]), "no branch, effect or stored value reads the second load");
+    assert!(lazy.tracked(n[2]), "a fixed logic tracks every parameter");
+    assert!(checked.carried(n[2]), "the link of an untracked parameter still keeps what its argument shares with others");
+}
+
+#[test]
 fn a_structured_logic_reads_every_comparison_and_crossing_as_a_lazy_one() {
     let (mut b, k) = Build::kernel();
     let e = BlockId(0);

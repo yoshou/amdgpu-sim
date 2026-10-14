@@ -7,7 +7,7 @@ mod values;
 
 pub use atoms::{Atom, Choice, PATH};
 pub use patterns::{constant_choices, lane_test, projected_word};
-pub use policy::{choices, Kept};
+pub use policy::{choices, read_values, Kept};
 
 pub(super) use atoms::{exists, forall, Atoms};
 pub(super) use edges::Binding;
@@ -39,7 +39,14 @@ pub struct Kernel<S> {
 impl<S: Rules> Kernel<S> {
     pub fn fixed(f: &Func, facts: &Facts, kept: &BTreeSet<Choice>, tags: &[Choice], state: S) -> Self {
         Self {
-            values: Values::new(Atoms::new(f, facts, false, tags), Policy::fixed(kept, tags), state),
+            values: Values::new(Atoms::new(f, facts, false, tags), Policy::fixed(kept, tags, None), state),
+            edges: Edges::default(),
+        }
+    }
+
+    pub fn reading(f: &Func, facts: &Facts, kept: &BTreeSet<Choice>, tags: &[Choice], read: &[bool], state: S) -> Self {
+        Self {
+            values: Values::new(Atoms::new(f, facts, false, tags), Policy::fixed(kept, tags, Some(read.to_vec())), state),
             edges: Edges::default(),
         }
     }
@@ -95,6 +102,10 @@ impl<S: Rules> Kernel<S> {
 
     pub fn carried(&self, param: ValueId) -> bool {
         self.values.policy.carried(param)
+    }
+
+    pub fn tracked(&self, v: ValueId) -> bool {
+        self.values.policy.tracked(v)
     }
 
     pub fn all_local(&self) -> Bdd {
