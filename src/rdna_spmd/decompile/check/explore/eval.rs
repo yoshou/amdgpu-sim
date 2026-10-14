@@ -559,7 +559,12 @@ impl<'c, 'a, Q: Queries<'a>> Eval<'c, 'a, Q> {
             };
             if collective != Bdd::FALSE {
                 let mut differs = self.q.and(ev.cond, collective);
-                if ev.side == WAVE && matches!(op, EffectOp::Wave(WaveOp::Any | WaveOp::Ballot { .. })) {
+                let anyone = match op {
+                    EffectOp::Wave(WaveOp::Any) => self.q.masked(inputs[0]),
+                    EffectOp::Wave(WaveOp::Ballot { .. }) => self.q.faithful(outputs[0].0),
+                    _ => false,
+                };
+                if ev.side == WAVE && anyone {
                     let bit = self.bits_of(ev, inputs[0]);
                     let present = self.weaken(bit, WAVE);
                     differs = self.q.and(differs, present);

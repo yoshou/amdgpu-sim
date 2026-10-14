@@ -3085,6 +3085,41 @@ fn prove_converts_a_query_whose_arms_carry_the_same_word() {
     assert!(converted(&b).is_empty(), "{:?}: both arms hand the store 1", converted(&b));
 }
 
+fn ballot_of_unmasked_bits_behind_a_query() -> (Build, ValueId) {
+    let (mut b, k) = Build::kernel();
+    let e = BlockId(0);
+    let buf = k.buffer(&mut b, e, 0);
+    let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+    let own = byte_offset(&mut b, e, buf, lane, 4);
+    let five = b.constant(e, Ty::I32, 5);
+    let low = b.cmp(e, IntPred::Ult, lane, five);
+    let c = b.int(e, IntOp::And, low, k.exec);
+    let q = b.wave(e, WaveOp::Any, vec![c]);
+    let (body, p) = b.block(&[Ty::I1, Ty::I1, Ty::I64]);
+    let (join, _) = b.block(&[Ty::I1]);
+    b.cond_br(e, q, (body, vec![k.exec, c, own]), (join, vec![k.exec]));
+    let here = b.core(body, Ty::I32, Op::Env(Env::LaneId));
+    let five = b.constant(body, Ty::I32, 5);
+    let below = b.cmp(body, IntPred::Ult, here, five);
+    let w = b.wave(body, WaveOp::Ballot { high: false }, vec![below]);
+    let count = b.core(body, Ty::I32, Op::PopulationCount(w));
+    b.store(body, Space::Global, MemSize::B32, p[2], count, p[1]);
+    b.br(body, join, vec![p[0]]);
+    (b, q)
+}
+
+#[test]
+fn prove_keeps_the_query_in_front_of_a_ballot_of_unmasked_bits_although_the_lanes_that_skip_add_no_bit() {
+    let (b, q) = ballot_of_unmasked_bits_behind_a_query();
+    let wrong: Vec<&str> = ["search", "direct"]
+        .iter()
+        .zip(both(&b))
+        .filter(|(_, kept)| !kept.queries.contains(&q))
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(wrong.is_empty(), "{:?}: the lanes the query lets skip would leave a ballot that needs every lane together", wrong);
+}
+
 fn ballot_count(masked: bool) -> (Build, u64) {
     let (mut b, k) = Build::kernel();
     let e = BlockId(0);
