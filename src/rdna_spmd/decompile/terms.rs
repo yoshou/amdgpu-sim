@@ -52,7 +52,7 @@ impl<'a> Terms<'a> {
         let lane = match self.lane {
             Some(lane) => lane,
             None => {
-                let lane = self.problem.between(0, 31);
+                let lane = self.problem.between(0, self.f.lanes as i128 - 1);
                 self.lane = Some(lane);
                 lane
             }
@@ -245,7 +245,7 @@ pub(super) fn interval(f: &Func, facts: &Facts, v: ValueId, depth: usize) -> Opt
     let range = |x: ValueId| interval(f, facts, x, depth + 1);
     match facts.inst(f, v)? {
         Inst::Core { op, .. } => match *op {
-            Op::Env(Env::LaneId) => Some((0, 31)),
+            Op::Env(Env::LaneId) => Some((0, f.lanes - 1)),
             Op::Int(IntOp::And, a, b) => {
                 let (x, y) = (range(a).unwrap_or(full), range(b).unwrap_or(full));
                 Some((0, x.1.min(y.1)))
@@ -407,6 +407,20 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{:?}", wrong);
+    }
+
+    #[test]
+    fn a_lane_id_ranges_over_every_lane_of_the_wave() {
+        for lanes in [32, 64] {
+            let (mut b, _, _) = Build::kernel_in(&[], lanes);
+            let e = BlockId(0);
+            let lane = b.core(e, Ty::I32, Op::Env(Env::LaneId));
+            let half = b.constant(e, Ty::I32, 32);
+            let facts = Facts::new(&b.f, &b.inputs, &BTreeSet::new());
+            assert_eq!(interval(&b.f, &facts, lane, 0), Some((0, lanes - 1)), "a wave of {} lanes", lanes);
+            let below = Terms::new(&b.f, &facts).decided(IntPred::Ult, lane, half);
+            assert_eq!(below, (lanes == 32).then_some(true), "lane < 32 on a wave of {} lanes", lanes);
+        }
     }
 
     fn knobs() -> (u64, usize) {
